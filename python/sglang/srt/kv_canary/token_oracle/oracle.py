@@ -25,20 +25,20 @@ class TokenOracle(Protocol):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HashOracle:
-    """token_id = splitmix64(seed XOR req_id XOR position) % vocab_size. Cheap, stateless.
+    """token_id = splitmix64(req_id XOR position) % vocab_size. Cheap, stateless.
 
-    Default oracle. The seed is independent of CANARY_CHAIN_ANCHOR (which lives in jit_kernel
-    and is not run-time configurable).
+    Default oracle. A `seed: int` field can be reintroduced (XOR'd into the hash input) if
+    different installs ever need decorrelated token streams; today every install shares one
+    deterministic mapping, so the field is omitted to avoid the per-call H2D copy that
+    materializing a scalar seed tensor required.
     """
 
-    seed: int
     vocab_size: int
 
     def expected_tokens(
         self, *, req_ids: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
-        seed = torch.tensor(self.seed, dtype=torch.int64, device=req_ids.device)
-        x = req_ids.to(torch.int64) ^ positions.to(torch.int64) ^ seed
+        x = req_ids.to(torch.int64) ^ positions.to(torch.int64)
         x = _splitmix64_tensor(x)
         return _uint64_mod(x, self.vocab_size).to(torch.int32)
 

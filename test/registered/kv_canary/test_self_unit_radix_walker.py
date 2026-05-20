@@ -4,7 +4,7 @@ import unittest
 
 from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import CPU_DEVICE, make_radix_cache
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
@@ -12,7 +12,7 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 
 class TestSelfUnitRadixWalker(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
 
     def test_single_node_chain_positions_increase(self):
         chain = [10, 20, 30, 40]

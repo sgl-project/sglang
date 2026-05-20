@@ -333,7 +333,7 @@ class WriteInvariants:
             fb_out_cache_loc=fb_out_cache_loc,
         )
         if (
-            enable_write_verify_inputs == True
+            enable_write_verify_inputs
             and expected_input_tokens is not None
             and expected_input_positions is not None
         ):
@@ -348,7 +348,7 @@ class WriteInvariants:
                 fb_out_cache_loc=fb_out_cache_loc,
                 plan=plan,
             )
-        elif enable_write_verify_inputs == False:
+        elif not enable_write_verify_inputs:
             WriteInvariants._assert_pseudo_violation_only_on_mismatch(
                 enable_write_verify_inputs=enable_write_verify_inputs,
                 log_before=log_before,
@@ -441,7 +441,7 @@ class WriteInvariants:
         delta = int(log_after.write_index[0].item()) - int(
             log_before.write_index[0].item()
         )
-        if enable_write_verify_inputs == False:
+        if not enable_write_verify_inputs:
             assert (
                 delta == 0
             ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"

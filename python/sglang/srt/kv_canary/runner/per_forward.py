@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -11,6 +12,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_per_forward,
@@ -22,6 +24,10 @@ from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+
+_OVERFLOW_WARN_EVERY_N_STEPS: int = 100
 
 
 class PerForwardOrchestrator:
@@ -53,6 +59,7 @@ class PerForwardOrchestrator:
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
+        d2h_stream: Optional[torch.cuda.Stream] = None,
         token_oracle_manager: Optional[TokenOracleManager] = None,
     ) -> None:
         self._config = config
@@ -62,6 +69,7 @@ class PerForwardOrchestrator:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._perturb_hook = perturb_hook
+        self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
@@ -87,6 +95,11 @@ class PerForwardOrchestrator:
         self._write_entry_capacity = write_entry_capacity
         self._verify_capacity = max(1, per_forward_verify_capacity)
 
+        self._pending_enable_future: Optional[FutureTensor] = None
+        self._overflow_count_total: int = 0
+        self._overflow_count_since_warn: int = 0
+        self._step_count_since_warn: int = 0
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
@@ -97,29 +110,17 @@ class PerForwardOrchestrator:
             raise RuntimeError(
                 f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
                 f"write_req_capacity={self._write_req_capacity}; raise --cuda-graph-max-bs "
-                f"or check install_canary._compute_launch_capacities"
+                f"or check CanaryLaunchCapacities.from_args"
             )
         if num_tokens > self._write_entry_capacity:
             raise RuntimeError(
                 f"kv-canary: forward_batch token count={num_tokens} exceeds pre-allocated "
                 f"write_entry_capacity={self._write_entry_capacity}; raise "
                 f"--chunked-prefill-size / --max-prefill-tokens or check "
-                f"install_canary._compute_launch_capacities"
+                f"CanaryLaunchCapacities.from_args"
             )
 
-        # verify_num_valid produced by canary_plan_step equals sum_r prefix_lens[r] for the FULL
-        # group; if it exceeds verify_capacity the plan kernel masks stores past capacity while
-        # the kernel grid's tail threads still read up to active, OOB-loading verify_slot_indices.
-        # Fail loudly host-side using the ForwardBatch CPU mirrors so it never reaches the kernel
-        # (RuntimeError, not assert, so `python -O` cannot strip the check).
-        prefix_lens_sum = _sum_prefix_lens(forward_batch=forward_batch, bs=bs)
-        if prefix_lens_sum > self._verify_capacity:
-            raise RuntimeError(
-                f"kv-canary: forward_batch sum(prefix_lens)={prefix_lens_sum} exceeds "
-                f"pre-allocated per_forward_verify_capacity={self._verify_capacity}; raise the "
-                f"verify capacity in install_canary._compute_launch_capacities (or "
-                f"_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
-            )
+        self._drain_pending_enable_mirror()
 
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
@@ -192,22 +193,36 @@ class PerForwardOrchestrator:
                 input_check_mode=self._config.input_check_mode,
             )
 
+    def end_of_step(self) -> None:
+        if self._config.mode == "off":
+            return
+        self._pending_enable_future = FutureTensor.create(
+            src_device=self._verify_plan_per_forward.enable,
+            stream=self._d2h_stream,
+        )
 
-def _sum_prefix_lens(*, forward_batch: "ForwardBatch", bs: int) -> int:
-    """Host-side sum of per-req prefix lens, matching the prefix_lens computed by
-    fill_plan_input_per_forward: extend → sum(extend_prefix_lens_cpu); decode → seq_lens_sum - bs.
-    The scheduler always populates these CPU mirrors, so this never triggers a D2H sync.
-    """
-    forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend():
-        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
-        if extend_prefix_lens_cpu is None:
-            raise RuntimeError(
-                "kv-canary: extend forward_batch is missing extend_prefix_lens_cpu; "
-                "scheduler should populate it before forward"
-            )
-        return int(sum(extend_prefix_lens_cpu[:bs]))
-    return int(forward_batch.seq_lens_sum) - bs
+    def _drain_pending_enable_mirror(self) -> None:
+        future = self._pending_enable_future
+        if future is None:
+            return
+        self._pending_enable_future = None
+        enable_value = int(future.wait().item())
+        self._step_count_since_warn += 1
+        if enable_value == 0:
+            self._overflow_count_total += 1
+            self._overflow_count_since_warn += 1
+        if self._step_count_since_warn >= _OVERFLOW_WARN_EVERY_N_STEPS:
+            if self._overflow_count_since_warn > 0:
+                logger.warning(
+                    "kv-canary: per-forward verify skipped %d/%d recent steps due to overflow "
+                    "(total=%d, capacity=%d); check ServerArgs / pool sizing",
+                    self._overflow_count_since_warn,
+                    self._step_count_since_warn,
+                    self._overflow_count_total,
+                    self._verify_capacity,
+                )
+            self._overflow_count_since_warn = 0
+            self._step_count_since_warn = 0
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

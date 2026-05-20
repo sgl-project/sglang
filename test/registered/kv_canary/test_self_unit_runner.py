@@ -8,20 +8,28 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES
+from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
+from sglang.jit_kernel.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
+    CanaryLaunchTag,
+    VerifyPlan,
+)
+from sglang.jit_kernel.kv_canary.verify_ref import (
+    canary_verify_step_torch_reference,
+)
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
-from sglang.srt.kv_canary.runner.canary_runner import (
-    CanaryLaunchCapacities,
-    CanaryRunner,
-)
+from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
-    CPU_DEVICE,
+    DEFAULT_DEVICE,
     make_radix_cache,
     make_req_to_token_pool,
 )
@@ -106,7 +114,7 @@ def _make_runner(
 
 class TestSelfUnitRunner(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
             patch.object(launch_module, "canary_plan_step", lambda **kwargs: None),
@@ -208,8 +216,32 @@ class TestSelfUnitRunner(CustomTestCase):
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
+        runner._health_and_stats.health_check_step()
+        runner._pump_and_allreduce._step_counter = 2000
         with self.assertRaises(RuntimeError):
             runner._health_and_stats.health_check_step()
+
+    def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
+        config = CanaryConfig(
+            mode=CanaryMode.RAISE,
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            sweep_interval=0,
+            allreduce_violation_signal=False,
+        )
+        runner = _make_runner(device=self.device, config=config)
+        runner._device_state.kernel_run_counters.zero_()
+        for tag in (
+            CanaryLaunchTag.HEAD_K_FULL,
+            CanaryLaunchTag.HEAD_V_FULL,
+            CanaryLaunchTag.TAIL_K_FULL,
+            CanaryLaunchTag.TAIL_V_FULL,
+        ):
+            runner._device_state.kernel_run_counters[tag.value] = 1
+
+        runner._pump_and_allreduce._step_counter = 1000
+        runner._health_and_stats.health_check_step()
+        runner._pump_and_allreduce._step_counter = 2000
+        runner._health_and_stats.health_check_step()
 
     def test_runner_disabled_short_circuits(self):
         config = CanaryConfig(mode=CanaryMode.OFF)
@@ -271,17 +303,13 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
 
-    def test_before_forward_throws_when_sum_prefix_lens_exceeds_verify_capacity(self):
-        # Multi-req batch whose summed prefix lens exceeds any single req's length: with the old
-        # sizing (per_forward_verify_capacity = max_seq_len_per_req) this slipped past the plan
-        # kernel's silent cap_mask and OOB-read the verify kernel's tail threads. The runtime
-        # check must throw (not silently execute) so the kernel never launches with a busted plan.
+    def test_before_forward_does_not_throw_on_oversized_prefix_sum(self):
+        # Overflow no longer raises host-side: the plan kernel sets VerifyPlan.enable=0 and the
+        # verify kernel skips the step on-device; host logs a throttled warning instead.
         runner = _make_runner(device=self.device, per_forward_verify_capacity=4)
-        # decode: sum(prefix_lens) = (5 - 1) + (5 - 1) = 8 > capacity=4
         fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with self.assertRaisesRegex(RuntimeError, "sum\\(prefix_lens\\)=8"):
-            with runner.with_forward_pass(fb):
-                pass
+        with runner.with_forward_pass(fb):
+            pass
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self):
         # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
@@ -304,64 +332,130 @@ class TestSelfUnitRunner(CustomTestCase):
 
 class TestComputeLaunchCapacities(CustomTestCase):
     @staticmethod
-    def _make_model_runner(*, max_bs, max_seq_len, max_total_num_tokens=None):
+    def _make_server_args(*, max_bs):
+        return SimpleNamespace(
+            cuda_graph_max_bs=max_bs,
+            speculative_num_draft_tokens=0,
+            chunked_prefill_size=None,
+            max_prefill_tokens=128,
+        )
+
+    @staticmethod
+    def _from_args(*, max_bs, max_seq_len, max_total_num_tokens=None):
         if max_total_num_tokens is None:
             max_total_num_tokens = max_bs * max_seq_len
-        return SimpleNamespace(
-            server_args=SimpleNamespace(
-                cuda_graph_max_bs=max_bs,
-                speculative_num_draft_tokens=0,
-                chunked_prefill_size=None,
-                max_prefill_tokens=128,
-            ),
-            req_to_token_pool=SimpleNamespace(
-                size=max_bs,
-                req_to_token=torch.zeros(max_bs, max_seq_len, dtype=torch.int32),
-            ),
-            max_total_num_tokens=max_total_num_tokens,
+        return CanaryLaunchCapacities.from_args(
+            server_args=TestComputeLaunchCapacities._make_server_args(max_bs=max_bs),
+            req_to_token_pool_size=max_bs,
+            max_seq_len_per_req=max_seq_len,
+            pool_slot_count=max_total_num_tokens,
         )
 
     def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self):
-        from sglang.srt.kv_canary.api import _compute_launch_capacities
-
         max_bs = 8
         max_seq_len = 64
-        model_runner = self._make_model_runner(max_bs=max_bs, max_seq_len=max_seq_len)
-        capacities = _compute_launch_capacities(model_runner=model_runner)
-        # Old buggy sizing was max_seq_len (= 64); new sizing must fit the full table extent so a
-        # multi-req batch with sum(prefix_lens) up to max_bs * max_seq_len never OOBs.
-        self.assertGreaterEqual(
-            capacities.per_forward_verify_capacity, max_bs * max_seq_len
+        max_total_num_tokens = 1024
+        capacities = self._from_args(
+            max_bs=max_bs,
+            max_seq_len=max_seq_len,
+            max_total_num_tokens=max_total_num_tokens,
+        )
+        self.assertEqual(
+            capacities.per_forward_verify_capacity,
+            max(1, int(max_total_num_tokens * 1.2)),
         )
 
-    def test_per_forward_install_throws_when_upper_exceeds_safe_ceiling(self):
-        from sglang.srt.kv_canary import api as api_module
 
-        # Pick dims so max_bs * max_seq_len > the safe ceiling but pool stays under it.
-        ceiling = api_module._MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY
-        max_bs = 2
-        max_seq_len = ceiling  # upper = 2 * ceiling > ceiling
-        model_runner = self._make_model_runner(
-            max_bs=max_bs, max_seq_len=max_seq_len, max_total_num_tokens=ceiling
+class TestPlanRefOverflowGate(CustomTestCase):
+    def setUp(self):
+        self.device = CPU_DEVICE
+
+    @staticmethod
+    def _empty_extras(device):
+        return (
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
         )
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "per-forward verify capacity .* exceeds the cuda-grid-safe ceiling",
-        ):
-            api_module._compute_launch_capacities(model_runner=model_runner)
 
-    def test_sweep_install_throws_when_pool_exceeds_safe_ceiling(self):
-        from sglang.srt.kv_canary import api as api_module
-
-        ceiling = api_module._MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY
-        # Per-forward stays safe (max_bs * max_seq_len = 8 < ceiling), but pool is bigger.
-        model_runner = self._make_model_runner(
-            max_bs=2, max_seq_len=4, max_total_num_tokens=ceiling + 1
+    def _run_plan_ref(
+        self, *, verify_capacity: int, bs: int, prefix_lens: list[int]
+    ) -> VerifyPlan:
+        max_seq_len = max(prefix_lens) + 1
+        verify_plan = VerifyPlan.allocate(
+            verify_capacity=verify_capacity, device=self.device
         )
-        with self.assertRaisesRegex(
-            RuntimeError, "sweep verify capacity .* exceeds the cuda-grid-safe ceiling"
-        ):
-            api_module._compute_launch_capacities(model_runner=model_runner)
+        write_plan = WritePlan.allocate(write_req_capacity=bs, device=self.device)
+        fb_req_pool_indices = torch.tensor(
+            list(range(1, bs + 1)), dtype=torch.int32, device=self.device
+        )
+        fb_prefix_lens = torch.tensor(
+            prefix_lens, dtype=torch.int32, device=self.device
+        )
+        fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        req_to_token = torch.arange(
+            (bs + 1) * max_seq_len, dtype=torch.int32, device=self.device
+        ).reshape(bs + 1, max_seq_len)
+        extras = self._empty_extras(self.device)
+        canary_plan_step_torch_reference(
+            verify_plan_out=verify_plan,
+            write_plan_out=write_plan,
+            fb_req_pool_indices=fb_req_pool_indices,
+            fb_prefix_lens=fb_prefix_lens,
+            fb_extend_seq_lens=fb_extend_seq_lens,
+            req_to_token=req_to_token,
+            extra_verify_slot_indices=extras[0],
+            extra_verify_positions=extras[1],
+            extra_verify_prev_slot_indices=extras[2],
+            extra_verify_num_valid=extras[3],
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
+        )
+        return verify_plan
+
+    def test_plan_ref_sets_enable_zero_and_clamps_when_overflow(self):
+        # requested = sum(prefix_lens) = 8 > capacity = 4.
+        plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
+        self.assertEqual(int(plan.enable[0].item()), 0)
+        self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
+
+    def test_plan_ref_sets_enable_one_when_within_capacity(self):
+        # requested = 4 <= capacity = 16.
+        plan = self._run_plan_ref(verify_capacity=16, bs=2, prefix_lens=[2, 2])
+        self.assertEqual(int(plan.enable[0].item()), 1)
+        self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
+
+    def test_verify_ref_skips_when_enable_zero(self):
+        plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
+        self.assertEqual(int(plan.enable[0].item()), 0)
+
+        canary_buf = torch.zeros(64, 32, dtype=torch.uint8, device=self.device)
+        violation_ring = torch.zeros(
+            4, consts.VIOLATION_FIELDS, dtype=torch.int64, device=self.device
+        )
+        violation_write_index = torch.zeros(1, dtype=torch.int32, device=self.device)
+        slot_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
+        kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
+        ring_before = violation_ring.clone()
+
+        canary_verify_step_torch_reference(
+            canary_buf=canary_buf,
+            plan=plan,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=violation_ring,
+            violation_write_index=violation_write_index,
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            real_kv_sources=(),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+        )
+        # kernel_run_counter bumps regardless of enable; everything else must be untouched.
+        self.assertEqual(int(kernel_run_counter[0].item()), 1)
+        self.assertEqual(int(violation_write_index[0].item()), 0)
+        self.assertEqual(int(slot_run_counter[0].item()), 0)
+        self.assertTrue(torch.equal(violation_ring, ring_before))
 
 
 if __name__ == "__main__":

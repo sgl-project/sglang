@@ -31,6 +31,7 @@ struct VerifyKernelParams {
   const int32_t* verify_positions;
   const int32_t* verify_prev_slot_indices;
   const int32_t* verify_num_valid;
+  const int32_t* verify_enable;
   int32_t verify_capacity;
 
   // Violation sink (ring + write_index + capacity + kernel_kind bundled in canary_common.cuh).
@@ -53,6 +54,13 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   // "canary actually ran" across warmup forwards with all-padding plans.
   if (tid == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
+  }
+
+  // Partial-fallback gate: when the plan kernel detects requested > verify_capacity it sets
+  // verify_enable[0] = 0 to skip the whole verify launch this step. Done after the kernel_run_counter bump
+  // so the "canary actually ran" health signal is preserved; slot_run_counter stays at 0 for the skipped step.
+  if (*p.verify_enable == 0) {
+    return;
   }
 
   const int32_t active = *p.verify_num_valid;
@@ -143,6 +151,7 @@ inline void canary_verify_step_cuda(
     tvm::ffi::TensorView verify_positions,
     tvm::ffi::TensorView verify_prev_slot_indices,
     tvm::ffi::TensorView verify_num_valid,
+    tvm::ffi::TensorView verify_enable,
     int64_t kernel_kind,
     tvm::ffi::TensorView violation_ring,
     tvm::ffi::TensorView violation_write_index,
@@ -172,6 +181,7 @@ inline void canary_verify_step_cuda(
       .verify(verify_positions)
       .verify(verify_prev_slot_indices);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_num_valid);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(verify_enable);
 
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(violation_write_index);
   SymbolicSize N_ring = {"ring_capacity"};
@@ -241,6 +251,7 @@ inline void canary_verify_step_cuda(
   p.verify_positions = static_cast<const int32_t*>(verify_positions.data_ptr());
   p.verify_prev_slot_indices = static_cast<const int32_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
+  p.verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr());
   p.verify_capacity = verify_capacity;
   p.violation_sink.ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_sink.write_index = static_cast<int32_t*>(violation_write_index.data_ptr());

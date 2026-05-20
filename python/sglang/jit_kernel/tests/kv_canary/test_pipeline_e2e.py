@@ -83,6 +83,7 @@ def _run_pipeline(
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=verify_capacity,
     )
     write_fn(
         canary_buf=canary_buf,
@@ -640,6 +641,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=0,
         full_to_swa_index_mapping=None,
+        verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
     )
     canary_plan_step_torch_reference(
         verify_plan_out=plan_v_ref,
@@ -654,6 +656,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=0,
         full_to_swa_index_mapping=None,
+        verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),
     )
 
     canary_verify_step(

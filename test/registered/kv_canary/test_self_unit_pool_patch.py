@@ -16,7 +16,7 @@ from sglang.srt.kv_canary.pool_patch.api import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
-    CPU_DEVICE,
+    DEFAULT_DEVICE,
     make_base_config,
     make_dsv4_pool,
     make_mha_pool,
@@ -29,7 +29,7 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 class TestSelfUnitPoolPatch(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = DEFAULT_DEVICE
         self.config = make_base_config()
 
     def test_canary_buffer_group_allocate_full_only(self):

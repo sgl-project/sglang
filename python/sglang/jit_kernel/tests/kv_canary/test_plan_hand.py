@@ -939,6 +939,7 @@ def _run_label(
         extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=verify_capacity,
     )
     torch.cuda.synchronize()
     return verify_plan, write_plan
@@ -1336,6 +1337,7 @@ def test_shrink_bs_clears_stale_write_offsets() -> None:
             extra_verify_num_valid=extras[3],
             swa_window_size=0,
             full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
         )
         torch.cuda.synchronize()
         runner(
@@ -1351,6 +1353,7 @@ def test_shrink_bs_clears_stale_write_offsets() -> None:
             extra_verify_num_valid=extras[3],
             swa_window_size=0,
             full_to_swa_index_mapping=None,
+            verify_capacity=verify_capacity,
         )
         torch.cuda.synchronize()
         n_active = int(write_plan.write_num_valid_reqs[0].item())

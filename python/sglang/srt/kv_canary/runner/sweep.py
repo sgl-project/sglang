@@ -101,8 +101,7 @@ class SweepOrchestrator:
                 raise RuntimeError(
                     f"kv-canary: radix-walker emitted {walker_output_size} sweep verify entries, "
                     f"exceeding pre-allocated sweep_verify_capacity={sweep_capacity}; raise the "
-                    f"sweep capacity in install_canary._compute_launch_capacities (or "
-                    f"_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY)"
+                    f"sweep capacity in CanaryLaunchCapacities.from_args"
                 )
             invoke_plan(
                 plan_input=radix_input,

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Optional
 
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
+from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
@@ -31,36 +31,6 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class CanaryLaunchCapacities:
-    """Pre-allocation sizes for the per-forward and sweep tensors a CanaryRunner owns. Computed
-    once at install_canary from ServerArgs + ModelRunner metadata; all four fields are upper
-    bounds - actual per-step usage may be smaller but never larger.
-
-    Fields:
-        per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
-            launches. Sized to the total verify entries the per-forward path may produce in one
-            step (= sum_r prefix_lens[r] for the FULL group), upper-bounded by max_bs *
-            max_seq_len_per_req (the req_to_token table extent). install_canary refuses to silently
-            cap this value: if the upper exceeds _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY it raises with
-            an actionable knob list. PerForwardOrchestrator.before_forward additionally throws on
-            the per-step actual sum so an undersized capacity fails fast instead of OOB-reading
-            the tail threads of the verify kernel grid.
-        per_forward_write_req_capacity: WritePlan row capacity for per-forward writes, also used
-            to size the static fb_* PlanInput buffers (= max batch size under cuda graph).
-        per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,
-            one entry per token written in a single forward.
-        sweep_verify_capacity: VerifyPlan row capacity for the radix sweep launch, sized to the
-            pool slot count. install_canary throws when this exceeds
-            _MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY for the same reason as per-forward.
-    """
-
-    per_forward_verify_capacity: int
-    per_forward_write_req_capacity: int
-    per_forward_write_entry_capacity: int
-    sweep_verify_capacity: int
 
 
 class CanaryRunner:
@@ -108,11 +78,7 @@ class CanaryRunner:
             sorted(active, key=lambda tag: tag.value)
         )
 
-        self._d2h_stream: Optional[torch.cuda.Stream] = (
-            torch.cuda.Stream(device=device)
-            if device.type == "cuda" and torch.cuda.is_available()
-            else None
-        )
+        self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
@@ -155,6 +121,7 @@ class CanaryRunner:
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
+            d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
         )
         self._health_and_stats = HealthAndStats(
@@ -215,6 +182,7 @@ class CanaryRunner:
         if self.config.mode == "off":
             return
 
+        self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
         any_rank_errored = self._pump_and_allreduce.pump_and_drain()
         self._health_and_stats.health_check_step()

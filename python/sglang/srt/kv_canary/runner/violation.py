@@ -2,12 +2,22 @@ from __future__ import annotations
 
 import logging
 
+from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
+
+_WRITE_BITS = FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
+_REASON_LABELS: dict[FailReason, str] = {
+    FailReason.CHAIN_HASH: "chain_hash",
+    FailReason.POSITION: "position",
+    FailReason.REAL_KV_HASH: "real_kv_hash",
+    FailReason.WRITE_TOKEN_MISMATCH: "write_token",
+    FailReason.WRITE_POSITION_MISMATCH: "write_position",
+}
 
 
 class ViolationReporter:
@@ -85,37 +95,47 @@ def _format_violation(
     except ValueError:
         tag_label = f"unknown({int(kernel_kind)})"
         canary_kind = tag_label
-    bits = int(fail_reason_bits)
-    reasons: list[str] = []
-    if bits & 0x1:
-        reasons.append("chain_hash")
-    if bits & 0x2:
-        reasons.append("position")
-    if bits & 0x4:
-        reasons.append("real_kv_hash")
+    bits_int = int(fail_reason_bits)
+    reasons = [label for bit, label in _REASON_LABELS.items() if bits_int & int(bit)]
+    is_write = bool(bits_int & int(_WRITE_BITS))
     u64_mask = (1 << 64) - 1
-    stored_prev_hash = int(stored_chain_hash) & u64_mask
-    expected_prev_hash = int(expected_aux) & u64_mask
 
-    return "\n".join(
-        [
+    header = (
+        f"KV cache canary violation detected (kernel_kind={tag_label}, "
+        f"slot_idx={int(slot_idx)}, position={int(position)})"
+    )
+    kind_line = f"canary_kind:       {canary_kind}"
+    reasons_line = f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}"
+    footer = (
+        f"  total_violations={total} ring_overflow={ring_overflow} "
+        f"step_when_pumped={step_when_pumped}"
+    )
+
+    if is_write:
+        # Write-path row layout: POSITION holds the actually-written position; EXPECTED_AUX holds
+        # the expected position (NOT a chain hash); EXPECTED_TOKEN holds the expected token.
+        # STORED_CHAIN_HASH is the running chain hash at write time (kept for debug context).
+        running_prev_hash = int(stored_chain_hash) & u64_mask
+        body = [
             (
-                f"KV cache canary violation detected (kernel_kind={tag_label}, "
-                f"slot_idx={int(slot_idx)}, position={int(position)})"
+                f"  actual:   token_id={int(stored_token)}   position={int(position)} "
+                f"prev_hash={running_prev_hash:#018x}"
             ),
-            f"canary_kind:       {canary_kind}",
-            f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}",
+            (
+                f"  expected: token_id={int(expected_token)}   position={int(expected_aux)}"
+            ),
+        ]
+    else:
+        # Verify-path row layout: POSITION holds the stored position; EXPECTED_AUX holds the
+        # expected chain hash; EXPECTED_TOKEN is unused (always 0) so don't print it.
+        stored_prev_hash = int(stored_chain_hash) & u64_mask
+        expected_prev_hash = int(expected_aux) & u64_mask
+        body = [
             (
                 f"  stored:   token_id={int(stored_token)}   position={int(position)} "
                 f"prev_hash={stored_prev_hash:#018x}"
             ),
-            (
-                f"  expected: token_id={int(expected_token)}   position={int(position)} "
-                f"prev_hash={expected_prev_hash:#018x}"
-            ),
-            (
-                f"  total_violations={total} ring_overflow={ring_overflow} "
-                f"step_when_pumped={step_when_pumped}"
-            ),
+            f"  expected: prev_hash={expected_prev_hash:#018x}",
         ]
-    )
+
+    return "\n".join([header, kind_line, reasons_line, *body, footer])

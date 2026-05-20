@@ -59,29 +59,20 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
-        mode_raw = (server_args.kv_canary or "").strip().lower()
+        mode_raw = server_args.kv_canary.strip().lower()
         if mode_raw not in ("off", "log", "raise"):
             raise ValueError(
                 f"kv-canary: kv_canary must be one of off/log/raise, got {mode_raw!r}"
             )
 
-        real_kv_raw = (server_args.kv_canary_real_data or "").strip().upper()
-        if real_kv_raw not in RealKvHashMode.__members__:
-            raise ValueError(
-                f"kv-canary: kv_canary_real_data must be one of "
-                f"{list(RealKvHashMode.__members__)}, got {real_kv_raw!r}"
-            )
-
-        input_check_mode = bool(envs.SGLANG_KV_CANARY_INPUT_CHECK.get())
-
-        sweep_interval = int(server_args.kv_canary_sweep_interval or 0)
+        real_kv_raw = server_args.kv_canary_real_data.strip().upper()
 
         return cls(
             mode=mode_raw,  # type: ignore[arg-type]
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
-            sweep_interval=sweep_interval,
+            sweep_interval=server_args.kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],
-            input_check_mode=input_check_mode,
+            input_check_mode=envs.SGLANG_KV_CANARY_INPUT_CHECK.get(),
             stats_print_every_n_steps=envs.SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS.get(),
             allreduce_violation_signal=envs.SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL.get(),
         )

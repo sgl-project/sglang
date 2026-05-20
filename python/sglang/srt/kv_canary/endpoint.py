@@ -73,9 +73,6 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        """Call canary_verify_step then canary_write_step against this endpoint's canary_buf. Both use
-        the shared violation_log. Used by head and tail endpoints; sweep endpoints raise NotImplementedError.
-        """
         if _is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_per_forward not supported on sweep endpoint {self.kernel_kind.name}"
@@ -92,23 +89,26 @@ class CanaryEndpoint:
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
         )
+
         # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
-        # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". FULL endpoints pass
-        # fb_out_cache_loc through unchanged. Under cuda-graph capture the two implicit allocations
-        # (int64 cast of fb_out_cache_loc + the gather output) are routed through PyTorch's private
-        # mempool — addresses are pinned on first capture and reused on replay.
+        # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". Under cuda-graph capture the
+        # implicit casts/gather below are routed through PyTorch's private mempool — addresses are pinned on
+        # first capture and reused on replay.
+        fb_input_ids_for_canary = fb_input_ids.to(torch.int32)
+        fb_positions_for_canary = fb_positions.to(torch.int32)
         if self.full_to_swa_index_mapping is not None:
             fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
                 fb_out_cache_loc.to(torch.int64)
             ]
         else:
             fb_out_cache_loc_for_canary = fb_out_cache_loc
+        fb_out_cache_loc_for_canary = fb_out_cache_loc_for_canary.to(torch.int32)
 
         canary_write_step(
             canary_buf=self.canary_buf,
             plan=write_plan,
-            fb_input_ids=fb_input_ids,
-            fb_positions=fb_positions,
+            fb_input_ids=fb_input_ids_for_canary,
+            fb_positions=fb_positions_for_canary,
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             enable_write_verify_inputs=input_check_mode,
@@ -129,9 +129,6 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        """Call only canary_verify_step against this endpoint's canary_buf. Used by sweep endpoints;
-        head/tail endpoints raise NotImplementedError.
-        """
         if not _is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_sweep not supported on non-sweep endpoint {self.kernel_kind.name}"

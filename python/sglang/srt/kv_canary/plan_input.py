@@ -102,11 +102,9 @@ def fill_plan_input_per_forward(
 
     - plan_input_out.fb_req_pool_indices[:bs] ← forward_batch.req_pool_indices; rows beyond bs
       are zeroed (padding sentinel).
-    - plan_input_out.fb_prefix_lens[:bs] ← extend mode: forward_batch.extend_prefix_lens;
-      decode mode: forward_batch.seq_lens - 1. Rows beyond bs are zeroed (padding skipped via
-      req_pool_indices sentinel; the lens value there is irrelevant).
-    - plan_input_out.fb_extend_seq_lens[:bs] ← extend: forward_batch.extend_seq_lens;
-      decode: all-ones.
+    - plan_input_out.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
+      forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
+      via req_pool_indices sentinel; the lens value there is irrelevant).
     - extra_verify_* untouched — they stay all-zero / num_valid = 0 (allocated once with 0
       capacity).
 
@@ -126,19 +124,54 @@ def fill_plan_input_per_forward(
     plan_input_out.fb_prefix_lens.zero_()
     plan_input_out.fb_extend_seq_lens.zero_()
 
+    # Enumerate per forward_mode rather than trusting forward_batch.extend_prefix_lens /
+    # extend_seq_lens for every mode — those two fields are unreliable for spec-decode paths:
+    # TARGET_VERIFY skips populating them in ForwardBatch.init_new (the is_decode-or-target_verify
+    # branch around forward_batch_info.py:618), and DRAFT_EXTEND_V2's cuda-graph replay
+    # (multi_layer_eagle_draft_extend_cuda_graph_runner.py:replay_forward_batch around line 392)
+    # omits extend_prefix_lens from its synthetic ForwardBatch. Mirrors the per-mode dispatch
+    # the attention backends already do for the same reason:
+    # - trtllm_mha_backend.py target_verify branch derives the per-req length from
+    #   speculative_num_draft_tokens (== spec_info.draft_token_num).
+    # - flashattention_backend.py is_draft_extend_v2 branch reads spec_info.extend_seq_lens_tensor
+    #   (with spec_info.num_tokens_per_req as fallback) instead of forward_batch.extend_seq_lens.
+    # TODO: once ForwardMode is refactored upstream so every mode ships a canonical
+    # (prefix_lens, extend_seq_lens) pair on forward_batch, collapse this back to a single
+    # unconditional copy.
     forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend():
+    spec_info = forward_batch.spec_info
+    if forward_mode is None or forward_mode.is_decode_or_idle():
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            (forward_batch.seq_lens[:bs] - 1).to(torch.int32)
+        )
+        plan_input_out.fb_extend_seq_lens[:bs].fill_(1)
+    elif forward_mode.is_target_verify():
+        # seq_lens has NOT been bumped at TARGET_VERIFY (prepare_for_v2_verify only flips the
+        # forward_mode and assigns out_cache_loc for positions [seq_lens, seq_lens +
+        # draft_token_num)). So prefix == current seq_lens, extend == uniform draft_token_num.
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            forward_batch.seq_lens[:bs].to(torch.int32)
+        )
+        plan_input_out.fb_extend_seq_lens[:bs].fill_(int(spec_info.draft_token_num))
+    elif forward_mode.is_draft_extend_v2():
+        # seq_lens HAS been bumped at DRAFT_EXTEND_V2 (prepare_for_extend_to_fill_draft_kvcache
+        # adds num_draft_tokens). forward_batch.extend_seq_lens is populated in both eager (via
+        # init_new) and cuda-graph (the synthetic ForwardBatch sets it explicitly); only
+        # extend_prefix_lens is missing in cuda-graph, so derive it as seq_lens - extend_seq_lens.
+        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int32)
+        plan_input_out.fb_extend_seq_lens[:bs].copy_(extend_seq_lens)
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            forward_batch.seq_lens[:bs].to(torch.int32) - extend_seq_lens
+        )
+    else:
+        # EXTEND / MIXED / DRAFT_EXTEND / SPLIT_PREFILL / DLLM_EXTEND — extend_*_lens guaranteed
+        # populated by init_new's else branch.
         plan_input_out.fb_prefix_lens[:bs].copy_(
             forward_batch.extend_prefix_lens.to(torch.int32)
         )
         plan_input_out.fb_extend_seq_lens[:bs].copy_(
             forward_batch.extend_seq_lens.to(torch.int32)
         )
-    else:
-        plan_input_out.fb_prefix_lens[:bs].copy_(
-            (forward_batch.seq_lens - 1).to(torch.int32)
-        )
-        plan_input_out.fb_extend_seq_lens[:bs].fill_(1)
 
     return bs
 

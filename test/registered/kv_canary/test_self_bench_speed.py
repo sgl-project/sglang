@@ -19,13 +19,24 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
+_CONTEXT_LENGTH_SLACK = 16
+_PIECEWISE_CUDA_GRAPH_MAX_TOKENS = 8192
+_MAX_TOTAL_TOKENS_SLACK = 8192
 
 
-def _make_server_args(*, canary_on: bool) -> ServerArgs:
+def _make_server_args(
+    *, canary_on: bool, batch_size: int, input_len: int, output_len: int
+) -> ServerArgs:
     # DO NOT add --disable-cuda-graph or --disable-piecewise-cuda-graph below.
     # The canary kernel must run inside the cuda graph alongside the real attn
     # kernel; an overhead measurement taken with the graph disabled does not
     # represent the production path canary actually ships on.
+    context_length = max(
+        input_len + output_len + _CONTEXT_LENGTH_SLACK,
+        _PIECEWISE_CUDA_GRAPH_MAX_TOKENS,
+    )
+    max_total_tokens = batch_size * (input_len + output_len) + _MAX_TOTAL_TOKENS_SLACK
+
     extra: List[str] = [
         "--model-path",
         _QWEN3_MODEL,
@@ -33,6 +44,14 @@ def _make_server_args(*, canary_on: bool) -> ServerArgs:
         _NUM_LAYERS_OVERRIDE,
         "--mem-fraction-static",
         "0.65",
+        "--max-running-requests",
+        str(batch_size),
+        "--cuda-graph-max-bs",
+        str(batch_size),
+        "--context-length",
+        str(context_length),
+        "--max-total-tokens",
+        str(max_total_tokens),
     ]
     if canary_on:
         extra += ["--kv-canary", "raise"]
@@ -60,7 +79,12 @@ def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> Ben
 def _run_one_canary_setting(
     *, canary_on: bool, batch_size: int, input_len: int, output_len: int
 ) -> BenchOneCaseResult:
-    server_args = _make_server_args(canary_on=canary_on)
+    server_args = _make_server_args(
+        canary_on=canary_on,
+        batch_size=batch_size,
+        input_len=input_len,
+        output_len=output_len,
+    )
     bench_args = _make_bench_args(
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )

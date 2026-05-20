@@ -16,6 +16,14 @@ logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
 
 _HEALTH_CHECK_EVERY_N_STEPS: int = 1000
 _HEALTH_CHECK_WARMUP_STEPS: int = 100
+_SWEEP_TAGS: frozenset[CanaryLaunchTag] = frozenset(
+    (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    )
+)
 
 
 class HealthAndStats:
@@ -28,7 +36,7 @@ class HealthAndStats:
         active_tags: tuple[CanaryLaunchTag, ...],
         pump_and_allreduce: PumpAndAllreduce,
         sweep_orchestrator: SweepOrchestrator,
-        d2h_stream: Optional[torch.cuda.Stream],
+        d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
@@ -52,9 +60,8 @@ class HealthAndStats:
         device_state = self._device_state
         if self._previous_health_future is not None:
             counters = self._previous_health_future.wait().tolist()
-            zero_tags = [
-                tag for tag in self._active_tags if int(counters[tag.value]) == 0
-            ]
+            expected_tags = self._expected_active_tags_for_health_check()
+            zero_tags = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
             if zero_tags:
                 names = ", ".join(tag.name for tag in zero_tags)
                 raise RuntimeError(
@@ -65,6 +72,11 @@ class HealthAndStats:
         self._previous_health_future = FutureTensor.create(
             src_device=device_state.kernel_run_counters, stream=self._d2h_stream
         )
+
+    def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
+        if self._config.sweep_interval > 0:
+            return self._active_tags
+        return tuple(tag for tag in self._active_tags if tag not in _SWEEP_TAGS)
 
     def print_periodic_stats(self) -> None:
         period = self._config.stats_print_every_n_steps

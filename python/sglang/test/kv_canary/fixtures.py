@@ -18,7 +18,7 @@ from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     make_row_source,
 )
 
-CPU_DEVICE: torch.device = torch.device("cpu")
+DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
 
 @dataclass
@@ -127,7 +127,7 @@ class FakeDsv4SubPool:
 
 
 def make_mha_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     num_slots: int = 16,
     dim: int = 8,
@@ -145,7 +145,7 @@ def make_mha_pool(
 
 
 def make_swa_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     full_slots: int = 16,
     swa_slots: int = 8,
@@ -180,7 +180,7 @@ def make_swa_pool(
 
 
 def make_dsv4_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     full_slots: int = 16,
     swa_slots: int = 8,
@@ -217,7 +217,7 @@ def make_base_config() -> CanaryConfig:
 
 
 def make_req_to_token_pool(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     max_reqs: int = 8,
     max_seq_len: int = 32,
@@ -227,34 +227,51 @@ def make_req_to_token_pool(
 
 
 def make_forward_batch(
-    device: torch.device = CPU_DEVICE,
+    device: torch.device = DEFAULT_DEVICE,
     *,
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
+    seq_lens_sum: Optional[int] = None,
     extend_prefix_lens: Optional[torch.Tensor] = None,
+    extend_prefix_lens_cpu: Optional[list] = None,
     extend_seq_lens: Optional[torch.Tensor] = None,
+    extend_seq_lens_cpu: Optional[list] = None,
     is_extend: bool = False,
+    is_target_verify: bool = False,
+    is_draft_extend_v2: bool = False,
+    spec_info: Optional[object] = None,
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
 ) -> SimpleNamespace:
+    is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
     mode = SimpleNamespace(
-        is_extend=lambda: is_extend,
+        is_extend=lambda include_draft_extend_v2=False: is_extend
+        or (include_draft_extend_v2 and is_draft_extend_v2),
         is_mixed=lambda: False,
+        is_decode_or_idle=lambda: is_decode_or_idle,
+        is_target_verify=lambda: is_target_verify,
+        is_draft_extend_v2=lambda: is_draft_extend_v2,
     )
     return SimpleNamespace(
         forward_mode=mode,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
+        seq_lens_sum=seq_lens_sum,
         extend_prefix_lens=extend_prefix_lens,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu,
         extend_seq_lens=extend_seq_lens,
+        extend_seq_lens_cpu=extend_seq_lens_cpu,
+        spec_info=spec_info,
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
     )
 
 
-def make_radix_cache(slot_lists: List[List[int]], device: torch.device = CPU_DEVICE):
+def make_radix_cache(
+    slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE
+):
     """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path.
 
     slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.

@@ -20,13 +20,9 @@ _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 # is unrelated to canary, and sglang's own error message suggests this
 # workaround.
 
-# Cap canary install-time capacities below the cuda-grid-safe ceiling
-# enforced by install_canary (4M, see api.py::_MAX_CUDA_GRID_SAFE_VERIFY_CAPACITY).
-# Two guards trip otherwise:
-#   per-forward: max(cuda_graph_max_bs, max_running_requests) * max_seq_len_per_req
-#   sweep:       max_total_num_tokens
-# All three sources must be capped or the pool sizing (driven by
-# mem_fraction_static) blows past the ceiling.
+# Caps kept small to keep the e2e test cheap (run time + device memory budget for the canary
+# buffers). Not load-bearing on canary's overflow behavior; partial fallback would absorb
+# oversized configurations on its own.
 _CANARY_CAPACITY_CAPS: List[str] = [
     "--cuda-graph-max-bs",
     "8",
