@@ -299,9 +299,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # The indices of output tokens in the token_to_kv_pool_swa
     out_cache_loc_swa: Optional[torch.Tensor] = None
 
-    # KV cache type info — derived from token_to_kv_pool, set in prepare phase
-    kv_cache_dtype: Optional[torch.dtype] = None  # token_to_kv_pool.dtype
-    is_swa: bool = False  # isinstance(token_to_kv_pool, SWAKVPool)
     # The indices to track mamba state with
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     # The mask to track mamba state if needed
@@ -664,11 +661,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             )
 
-        # Populate pool-derived fields so forward-time code reads from ForwardBatch
-        ForwardBatch.populate_pool_fields_static(
-            ret, model_runner.token_to_kv_pool, model_runner.is_hybrid_swa
-        )
-
         # Init lora information
         if model_runner.server_args.enable_lora:
             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
@@ -679,21 +671,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             model_runner.lora_manager.prepare_lora_batch(ret)
 
         return ret
-
-    @staticmethod
-    def populate_pool_fields_static(
-        forward_batch: "ForwardBatch", token_to_kv_pool, is_hybrid_swa: bool
-    ) -> None:
-        """Populate kv_cache_dtype / is_swa from the KV pool.
-
-        Called from init_new and from graph-runner capture paths (which construct
-        ForwardBatch directly, bypassing init_new).
-        """
-        forward_batch.kv_cache_dtype = getattr(token_to_kv_pool, "dtype", None)
-        if is_hybrid_swa:
-            from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-
-            forward_batch.is_swa = isinstance(token_to_kv_pool, SWAKVPool)
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
         """Make num_token_non_padded local to this attention-TP rank."""

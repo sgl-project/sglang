@@ -605,7 +605,9 @@ class SarvamMoEMLAAttention(nn.Module):
                 self.current_attention_backend == "fa3"
                 and self.kv_cache_dtype != "auto"
             ):
-                attn_dtype = forward_batch.kv_cache_dtype
+                from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
+
+                attn_dtype = getattr(get_token_to_kv_pool(), "dtype", k_nope.dtype)
             else:
                 attn_dtype = k_nope.dtype
             k = k_nope.new_empty(*k_shape, dtype=attn_dtype)

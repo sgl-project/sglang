@@ -1063,13 +1063,6 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
         )
-        # Populate kv_cache_dtype / is_swa so fused-set-kv and dtype logic works
-        # correctly inside the captured graph (this ctor bypasses init_new).
-        ForwardBatch.populate_pool_fields_static(
-            forward_batch,
-            self.model_runner.token_to_kv_pool,
-            self.model_runner.is_hybrid_swa,
-        )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
         forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
