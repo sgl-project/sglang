@@ -31,6 +31,14 @@ use crate::policies::kv_events::EventConfig;
 /// payload served by SGLang's HTTP server.
 const SERVER_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Retry budget for transient `/server_info` failures (connect/timeout/5xx).
+/// 4xx + JSON-parse errors short-circuit — they're authoritative.
+/// EndpointSlice can flip ready=true before the worker's HTTP server is
+/// actually serving; without retry, that race lands a worker in the
+/// registry with empty model_ids and chat dispatch fails with 502.
+const FETCH_MAX_ATTEMPTS: u32 = 3;
+const FETCH_BACKOFF_BASE: Duration = Duration::from_millis(100);
+
 /// Resolved per-worker bootstrap state.
 ///
 /// `served_model_name` populates the registry; `event_config` is handed
@@ -92,37 +100,17 @@ impl WorkerIntrospector {
     /// `ServerInfo` with both halves `None`. Callers register the
     /// worker with empty model IDs and no event subscription on the
     /// failure path; future re-discovery will retry.
+    ///
+    /// Transient failures (network errors, 5xx) are retried up to
+    /// `FETCH_MAX_ATTEMPTS` times with exponential backoff. 4xx
+    /// responses and JSON-parse errors short-circuit immediately —
+    /// the worker answered authoritatively, retrying won't help.
     pub async fn fetch(&self, worker_url: &str) -> ServerInfo {
         let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
-        let resp = match self.client.get(&server_info_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    worker_url = %worker_url,
-                    error = %e,
-                    "introspect: /server_info request failed; registering worker with empty model_ids"
-                );
-                return ServerInfo::default();
-            }
-        };
-        if !resp.status().is_success() {
-            warn!(
-                worker_url = %worker_url,
-                status = %resp.status(),
-                "introspect: /server_info returned non-2xx; registering worker with empty model_ids"
-            );
-            return ServerInfo::default();
-        }
-        let parsed: ServerInfoBody = match resp.json().await {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    worker_url = %worker_url,
-                    error = %e,
-                    "introspect: /server_info JSON parse failed; registering worker with empty model_ids"
-                );
-                return ServerInfo::default();
-            }
+        let parsed = match Self::fetch_with_retry(&self.client, &server_info_url, worker_url).await
+        {
+            Some(p) => p,
+            None => return ServerInfo::default(),
         };
 
         let served_model_name = match parsed.served_model_name {
@@ -152,6 +140,66 @@ impl WorkerIntrospector {
             event_config,
             disaggregation_role,
         }
+    }
+
+    /// Issue the `/server_info` GET with bounded retry on transient
+    /// errors. Returns `Some(body)` on success, `None` after exhausting
+    /// retries (the caller falls back to default `ServerInfo`).
+    async fn fetch_with_retry(
+        client: &reqwest::Client,
+        server_info_url: &str,
+        worker_url: &str,
+    ) -> Option<ServerInfoBody> {
+        let mut delay = FETCH_BACKOFF_BASE;
+        for attempt in 1..=FETCH_MAX_ATTEMPTS {
+            match client.get(server_info_url).send().await {
+                Err(e) => {
+                    warn!(
+                        worker_url = %worker_url,
+                        attempt,
+                        error = %e,
+                        "introspect: /server_info request failed; will retry"
+                    );
+                }
+                Ok(resp) if resp.status().is_server_error() => {
+                    warn!(
+                        worker_url = %worker_url,
+                        attempt,
+                        status = %resp.status(),
+                        "introspect: /server_info returned 5xx; will retry"
+                    );
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    warn!(
+                        worker_url = %worker_url,
+                        status = %resp.status(),
+                        "introspect: /server_info returned non-2xx; registering worker with empty model_ids"
+                    );
+                    return None;
+                }
+                Ok(resp) => match resp.json::<ServerInfoBody>().await {
+                    Ok(body) => return Some(body),
+                    Err(e) => {
+                        warn!(
+                            worker_url = %worker_url,
+                            error = %e,
+                            "introspect: /server_info JSON parse failed; registering worker with empty model_ids"
+                        );
+                        return None;
+                    }
+                },
+            }
+            if attempt < FETCH_MAX_ATTEMPTS {
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+        }
+        warn!(
+            worker_url = %worker_url,
+            attempts = FETCH_MAX_ATTEMPTS,
+            "introspect: /server_info failed after retries; registering worker with empty model_ids"
+        );
+        None
     }
 }
 
