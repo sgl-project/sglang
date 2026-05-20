@@ -682,9 +682,6 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    kv_canary: str = "off"
-    kv_canary_real_data: str = "off"
-    kv_canary_sweep_interval: int = 0
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -750,6 +747,9 @@ class ServerArgs:
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "off"
+    kv_canary_real_data: str = "off"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
