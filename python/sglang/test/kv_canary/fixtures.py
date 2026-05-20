@@ -256,7 +256,9 @@ def make_forward_batch(
     )
 
 
-def make_radix_cache(slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE):
+def make_radix_cache(
+    slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE
+):
     """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path.
 
     slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.
