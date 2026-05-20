@@ -25,10 +25,13 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromIPCReqInput,
 )
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
@@ -47,6 +50,8 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     maybe_detect_nan,
     maybe_detect_oob,
+    record_stream_each,
+    record_stream_for_v2_verify,
     select_top_k_tokens,
 )
 from sglang.srt.utils.common import empty_context, fast_topk
@@ -123,7 +128,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -169,9 +174,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_runner_list[0].tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.draft_runner_list[0].tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -223,11 +229,11 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                 forward_batch, batch_result
             )
 
-    def draft(self, model_worker_batch: ModelWorkerBatch):
-        draft_input: EagleDraftInput = model_worker_batch.spec_info
+    def draft(self, batch: ScheduleBatch):
+        draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
-            model_worker_batch,
+            batch,
             self.cuda_graph_runner,
             self.draft_runner_list[0],
             self.topk,
@@ -237,7 +243,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Run draft
         parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
 
-        if model_worker_batch.forward_mode.is_idle():
+        if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
@@ -261,8 +267,8 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             parent_list,
             top_scores_index,
             draft_tokens,
-            model_worker_batch.seq_lens,
-            model_worker_batch.seq_lens_sum,
+            batch.seq_lens,
+            batch.seq_lens_sum,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
@@ -362,7 +368,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
     def _draft_extend_for_prefill(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
     ):
@@ -386,9 +392,20 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         batch.spec_info = next_draft_input
 
+        # Chain-style MTP needs FULL to get all-token hidden states;
+        # non-chain only needs LAST (the target model's hidden states).
+        # STANDALONE skips hidden states end-to-end.
+        if self.speculative_algorithm.is_standalone():
+            draft_capture_hidden_mode = CaptureHiddenMode.NULL
+        elif self.chain_mtp_hidden_states:
+            draft_capture_hidden_mode = CaptureHiddenMode.FULL
+        else:
+            draft_capture_hidden_mode = CaptureHiddenMode.LAST
+
         # Run forward
+        batch.capture_hidden_mode = draft_capture_hidden_mode
+        batch.return_hidden_states_before_norm = True
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner_list[0])
-        forward_batch.return_hidden_states_before_norm = True
 
         # Construct input_ids
         if not batch.forward_mode.is_idle():
@@ -449,7 +466,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         return next_draft_input
 
     def _draft_extend_for_decode(
-        self, batch: ModelWorkerBatch, batch_result: GenerationBatchResult
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
@@ -652,64 +669,58 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
-        if (
-            model_worker_batch.forward_mode.is_extend()
-            or model_worker_batch.is_extend_in_batch
-        ):
+    def forward_batch_generation(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(
-                model_worker_batch
+            target_capture_mode = (
+                CaptureHiddenMode.NULL
+                if self.speculative_algorithm.is_standalone()
+                else CaptureHiddenMode.FULL
             )
+            batch.capture_hidden_mode = target_capture_mode
+            batch_output = self.target_worker.forward_batch_generation(batch)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
-            model_worker_batch.capture_hidden_mode = (
-                CaptureHiddenMode.FULL
-                if self.draft_worker.chain_mtp_hidden_states
-                else CaptureHiddenMode.LAST
-            )
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
-                model_worker_batch,
+                batch,
                 batch_output.logits_output.hidden_states,
                 batch_output.next_token_ids,
             )
             return batch_output
         else:
-            if model_worker_batch.spec_info is None:
-                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+            if batch.spec_info is None:
+                capture_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
+                batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
                     hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
                     dtype=EagleDraftInput.dtype_for(self.draft_worker),
                     topk=self.topk * self.speculative_num_steps,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                    capture_hidden_mode=capture_mode,
                 )
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             # Record a CUDA event after draft() GPU work is dispatched.
             if self.plan_stream:
                 self._draft_done_event = torch.get_device_module(self.device).Event()
                 self._draft_done_event.record()
-            model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch)
-            self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            batch.spec_info = verify_input
+            batch_output = self.verify(batch)
+            self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
     def verify(
         self,
-        batch: ModelWorkerBatch,
+        batch: ScheduleBatch,
     ):
-        # Since batch.seq_lens is allocated in another stream, we need
-        # record_stream() to prevent pytorch gc and reuse the gpu memory
-        # while forward_stream is still running.
-        batch.seq_lens.record_stream(
-            torch.get_device_module(self.device).current_stream()
-        )
-
-        # Parse args
+        fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
+        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -726,6 +737,9 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     self.target_worker,
                 )
             )
+
+        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
+        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
         # Correct some buffers due to the overlap plan
         if self.plan_stream:
@@ -746,7 +760,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             )
         # Run target verify batch in the main compute stream
         forward_batch_output = self.target_worker.forward_batch_generation(
-            model_worker_batch=None,
+            batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True,
@@ -781,12 +795,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        # Construct the next draft input
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
             verify_done=verify_done,
         )
+        # verify_forward_batch transitively holds verify-time GPU tensors that
+        # must outlive the imminent batch.input_ids rebind; scheduler pins it
+        # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -796,6 +812,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
+            extra_keep_alive_refs=[verify_forward_batch],
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):

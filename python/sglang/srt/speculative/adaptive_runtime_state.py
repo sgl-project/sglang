@@ -1,7 +1,7 @@
 import bisect
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import (
     DEFAULT_BS_HYSTERESIS,
@@ -65,7 +65,7 @@ class AdaptiveSpecWorker(Protocol):
         self,
         speculative_num_steps: int,
         speculative_num_draft_tokens: int,
-        cuda_graph_bs: List[int] | None = None,
+        cuda_graph_bs: list[int] | None = None,
         init_max_bs: int | None = None,
     ) -> SpecRuntimeState: ...
 
@@ -88,8 +88,8 @@ class AdaptiveController:
     def __init__(
         self,
         worker: AdaptiveSpecWorker,
-        config_path: Optional[str] = None,
-        preset: Optional[str] = None,
+        config_path: str | None = None,
+        preset: str | None = None,
     ):
         self.worker = worker
 
@@ -113,18 +113,18 @@ class AdaptiveController:
             }
 
         self._init_per_bs(cfg, bs_config)
-        self._states: Dict[int, SpecRuntimeState] = {}
-        self._cuda_graph_bs: List[int] | None = None
+        self._states: dict[int, SpecRuntimeState] = {}
+        self._cuda_graph_bs: list[int] | None = None
 
         logger.info(
             f"AdaptiveController initialized: bs_list={self._bs_list}, "
             f"candidate_steps={self.candidate_steps}"
         )
 
-    def _init_per_bs(self, cfg: dict, bs_config: Dict[int, dict]):
+    def _init_per_bs(self, cfg: dict, bs_config: dict[int, dict]):
         """Initialize per-BS adaptive params from *bs_config*."""
         self._bs_list = sorted(bs_config.keys())
-        self._bs_params: Dict[int, AdaptiveSpeculativeParams] = {}
+        self._bs_params: dict[int, AdaptiveSpeculativeParams] = {}
 
         for bs, entry in sorted(bs_config.items()):
             steps = entry.get("steps", DEFAULT_BS_STEPS.get(bs, [1, 3, 7]))
@@ -143,11 +143,11 @@ class AdaptiveController:
                 params_cfg["ceiling_coeff"] = entry["ceiling_coeff"]
             self._bs_params[bs] = AdaptiveSpeculativeParams(
                 initial_steps=initial,
-                config=params_cfg,
+                cfg_path=params_cfg,
             )
 
     @property
-    def candidate_steps(self) -> List[int]:
+    def candidate_steps(self) -> list[int]:
         """Union of all BS slots' candidate steps."""
         all_steps: set[int] = set()
         for params in self._bs_params.values():
@@ -187,8 +187,8 @@ class AdaptiveController:
         self._states[key] = state
 
     def _cuda_graph_bs_for_step(
-        self, step: int, all_cuda_graph_bs: List[int]
-    ) -> List[int]:
+        self, step: int, all_cuda_graph_bs: list[int]
+    ) -> list[int]:
         """Return the cuda_graph_bs values that need to be *captured* for *step*.
 
         A cuda_graph_bs entry *v* covers actual batch sizes in (prev_v, v].  We
@@ -196,7 +196,7 @@ class AdaptiveController:
         one BS slot whose candidate_steps contains *step*.
 
         """
-        relevant_ranges: List[tuple] = []
+        relevant_ranges: list[tuple] = []
         for i, slot_key in enumerate(self._bs_list):
             if step in self._bs_params[slot_key].candidate_steps:
                 lo = slot_key
@@ -208,7 +208,7 @@ class AdaptiveController:
         if not relevant_ranges:
             return []
 
-        result: List[int] = []
+        result: list[int] = []
         prev = 0
         for v in sorted(all_cuda_graph_bs):
             lo_actual = prev + 1
@@ -221,7 +221,7 @@ class AdaptiveController:
 
         return result
 
-    def init_states(self, cuda_graph_bs: List[int] | None = None) -> None:
+    def init_states(self, cuda_graph_bs: list[int] | None = None) -> None:
         """Build and register runtime states for all candidate steps.
 
         Args:
@@ -240,21 +240,16 @@ class AdaptiveController:
         init_max_bs = max(cuda_graph_bs) if cuda_graph_bs is not None else None
 
         for steps in self.candidate_steps:
-            if steps in self._states:
-                pruned_bs = (
-                    self._cuda_graph_bs_for_step(steps, cuda_graph_bs)
-                    if cuda_graph_bs is not None
-                    else None
-                )
-                logger.info(
-                    f"init_states: step={steps}, cuda_graph_bs={pruned_bs} (pre-registered)"
-                )
-                continue
             pruned_bs = (
                 self._cuda_graph_bs_for_step(steps, cuda_graph_bs)
                 if cuda_graph_bs is not None
                 else None
             )
+            if steps in self._states:
+                logger.info(
+                    f"init_states: step={steps}, cuda_graph_bs={pruned_bs} (pre-registered)"
+                )
+                continue
             logger.info(
                 f"init_states: step={steps}, cuda_graph_bs={pruned_bs}, "
                 f"init_max_bs={init_max_bs}"
@@ -272,7 +267,7 @@ class AdaptiveController:
 
     def on_verify_complete(
         self,
-        accept_lengths: list[int],
+        num_correct_drafts_per_req: list[int],
         batch_size: int = 0,
     ) -> None:
         """Feed verify results to the matching BS slot's params."""
@@ -283,7 +278,7 @@ class AdaptiveController:
         params = self._bs_params[bs]
         old_steps = params.current_steps
 
-        changed = params.update(accept_lengths)
+        changed = params.update(num_correct_drafts_per_req)
 
         if changed:
             logger.info(

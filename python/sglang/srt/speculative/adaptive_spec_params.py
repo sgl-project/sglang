@@ -9,7 +9,7 @@ import bisect
 import json
 import logging
 import math
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING
 
 from sglang.srt.utils import log_info_on_rank0
 
@@ -22,13 +22,13 @@ logger = logging.getLogger(__name__)
 # Default per-BS config (used when no preset or config file is specified)
 # Keys are lower bounds of BS ranges: 1 covers [1,64), 64 covers [64,128), etc.
 # ---------------------------------------------------------------------------
-DEFAULT_BS_HYSTERESIS: Dict[int, Dict[str, float]] = {
+DEFAULT_BS_HYSTERESIS: dict[int, dict[str, float]] = {
     1: {"up_hysteresis": 0.0, "down_hysteresis": -0.25},
     64: {"up_hysteresis": 0.0, "down_hysteresis": 0.0},
     128: {"up_hysteresis": -0.1, "down_hysteresis": 0.25},
 }
 
-DEFAULT_BS_STEPS: Dict[int, list] = {
+DEFAULT_BS_STEPS: dict[int, list] = {
     1: [1, 3, 7],
     64: [1, 2, 5],
     128: [1, 2, 6],
@@ -39,7 +39,7 @@ DEFAULT_BS_STEPS: Dict[int, list] = {
 # Users pick one based on draft model quality. Per-model config files
 # override these when --speculative-adaptive-config is provided.
 # ---------------------------------------------------------------------------
-PRESET_CONFIGS: Dict[str, dict] = {
+PRESET_CONFIGS: dict[str, dict] = {
     # TODO: add step=0 (nospec fallback) for BS>=64 once supported —
     # on hard workloads, even step=1 loses to nospec at high batch sizes.
     "conservative": {
@@ -156,7 +156,7 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def _bisect_lookup(table: Dict[int, dict], bs: int) -> dict:
+def _bisect_lookup(table: dict[int, dict], bs: int) -> dict:
     """Find the entry in *table* whose key is the largest <= *bs*."""
     keys = sorted(table.keys())
     idx = bisect.bisect_right(keys, bs) - 1
@@ -164,7 +164,7 @@ def _bisect_lookup(table: Dict[int, dict], bs: int) -> dict:
     return table[keys[idx]]
 
 
-def get_default_hysteresis(bs: int) -> Dict[str, float]:
+def get_default_hysteresis(bs: int) -> dict[str, float]:
     return _bisect_lookup(DEFAULT_BS_HYSTERESIS, bs)
 
 
@@ -190,7 +190,7 @@ def load_adaptive_config(path: str | None) -> dict:
     return cfg
 
 
-def load_bs_config(config: dict) -> Optional[Dict[int, dict]]:
+def load_bs_config(config: dict) -> dict[int, dict] | None:
     """Parse per-BS config from the loaded JSON.
 
     The config is a flat dict whose keys are BS lower-bound strings::
@@ -202,7 +202,7 @@ def load_bs_config(config: dict) -> Optional[Dict[int, dict]]:
 
     Returns ``{bs_int: entry_dict}`` or ``None`` when no BS entries found.
     """
-    result: Dict[int, dict] = {}
+    result: dict[int, dict] = {}
     for key, entry in config.items():
         try:
             bs = int(key)
@@ -214,6 +214,35 @@ def load_bs_config(config: dict) -> Optional[Dict[int, dict]]:
             result[bs] = entry
 
     return result if result else None
+
+
+def resolve_candidate_steps_from_config(
+    initial_steps: int,
+    cfg_path: str | None = None,
+    preset: str | None = None,
+) -> list[int]:
+    """Load adaptive config and resolve candidate steps.
+
+    Used by ``ServerArgs.effective_max_speculative_num_draft_tokens()``
+    to determine the max draft-token count without building the full
+    AdaptiveController.
+    """
+    if cfg_path is not None:
+        cfg = load_adaptive_config(cfg_path)
+    elif preset is not None:
+        cfg = get_preset_config(preset)
+    else:
+        cfg = {}
+    bs_config = load_bs_config(cfg)
+    all_steps: set[int] = set()
+    if bs_config:
+        for entry in bs_config.values():
+            steps = entry.get("steps", [1, 3, 7])
+            all_steps.update(steps)
+    else:
+        all_steps.update(cfg.get("candidate_steps", [1, 3, 7]))
+    all_steps.add(initial_steps)
+    return sorted(all_steps)
 
 
 class AdaptiveSpeculativeParams:
@@ -232,22 +261,23 @@ class AdaptiveSpeculativeParams:
     def __init__(
         self,
         initial_steps: int,
-        config: dict | None = None,
+        cfg_path: str | dict | None = None,
     ):
-        cfg = config or {}
+        if isinstance(cfg_path, dict):
+            cfg = cfg_path
+        else:
+            cfg = load_adaptive_config(cfg_path)
         candidates = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
 
         assert len(candidates) >= 1, "candidate_steps must have at least 1 value"
         self.candidate_steps = candidates
 
-        self.min_steps = self.candidate_steps[0]
-        self.max_steps = self.candidate_steps[-1]
         self.ema_alpha = cfg.get("ema_alpha", 0.2)
         self.update_interval = cfg.get("update_interval", 5)
         self.warmup_batches = cfg.get("warmup_batches", 10)
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
-        self.ceiling_coeff = cfg.get("ceiling_coeff", 1.67)
+        self.ceiling_coeff = cfg.get("ceiling_coeff", 0)
 
         if initial_steps in self.candidate_steps:
             self.current_steps = initial_steps
