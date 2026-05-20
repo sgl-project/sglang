@@ -47,6 +47,7 @@ from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
     ScatterMode,
+    gather_hidden_states_and_residual_for_pp,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -843,6 +844,11 @@ class Qwen2MoeModel(nn.Module):
                     )
 
         if not self.pp_group.is_last_rank:
+            hidden_states, residual = gather_hidden_states_and_residual_for_pp(
+                hidden_states,
+                residual,
+                self.layers[self.end_layer - 1].layer_scatter_modes,
+            )
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,

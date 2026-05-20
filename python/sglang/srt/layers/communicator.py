@@ -32,6 +32,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.distributed.parallel_state import get_pp_group
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
@@ -368,6 +370,15 @@ class LayerScatterModes:
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
         if context.layer_id == 0:
             return ScatterMode.model_input_output()
+
+        pp_group = get_pp_group()
+        if not pp_group.is_first_rank:
+            start_layer, _ = get_pp_indices(
+                context.num_layers, pp_group.rank_in_group, pp_group.world_size
+            )
+            if context.layer_id == start_layer:
+                return ScatterMode.model_input_output()
+
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
@@ -424,6 +435,33 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def gather_hidden_states_and_residual_for_pp(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    layer_scatter_modes: LayerScatterModes,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if layer_scatter_modes.layer_output_mode == ScatterMode.SCATTERED:
+        attn_tp_size = get_attention_tp_size()
+        if attn_tp_size > 1:
+            output = torch.empty(
+                (hidden_states.shape[0] * attn_tp_size, *hidden_states.shape[1:]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            attn_tp_all_gather_into_tensor(output, hidden_states)
+            hidden_states = output
+            if residual is not None:
+                output = torch.empty(
+                    (residual.shape[0] * attn_tp_size, *residual.shape[1:]),
+                    dtype=residual.dtype,
+                    device=residual.device,
+                )
+                attn_tp_all_gather_into_tensor(output, residual)
+                residual = output
+
+    return hidden_states, residual
 
 
 class LayerCommunicator:
