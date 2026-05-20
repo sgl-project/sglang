@@ -151,6 +151,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
+        self._pending_output_results: deque[
+            tuple[bytes | None, OutputBatch, bool]
+        ] = deque()
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -571,6 +574,59 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
     ) -> List[OutputBatch]:
         return [OutputBatch(error=error_msg) for _ in reqs]
 
+    def _finish_output_save_if_ready(
+        self, output_batch: OutputBatch, *, wait: bool = False
+    ) -> bool:
+        future = output_batch.output_save_future
+        if future is None:
+            return True
+        if not wait and not future.done():
+            return False
+
+        try:
+            output_paths = future.result()
+            if output_paths is not None and output_batch.output_file_paths is None:
+                output_batch.output_file_paths = output_paths
+        except Exception as e:
+            logger.error("Async output save failed: %s", e, exc_info=True)
+            output_batch.error = f"Async output save failed: {e}"
+            output_batch.output_file_paths = None
+        finally:
+            output_batch.output_save_future = None
+        return True
+
+    def _return_or_defer_result(
+        self,
+        output_batch: OutputBatch,
+        identity: bytes | None,
+        *,
+        should_not_return: bool,
+    ) -> None:
+        if self._finish_output_save_if_ready(output_batch):
+            self.return_result(
+                output_batch, identity, should_not_return=should_not_return
+            )
+            return
+        self._pending_output_results.append((identity, output_batch, should_not_return))
+
+    def _drain_pending_output_results(self, *, wait: bool = False) -> None:
+        pending = self._pending_output_results
+        self._pending_output_results = deque()
+
+        while pending:
+            identity, output_batch, should_not_return = pending.popleft()
+            if not self._finish_output_save_if_ready(output_batch, wait=wait):
+                self._pending_output_results.append(
+                    (identity, output_batch, should_not_return)
+                )
+                continue
+            try:
+                self.return_result(
+                    output_batch, identity, should_not_return=should_not_return
+                )
+            except zmq.ZMQError as e:
+                logger.error(f"ZMQ error sending delayed reply: {e}")
+
     def return_result(
         self,
         output_batch: OutputBatch,
@@ -738,6 +794,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                 output_file_paths=self._slice_batched_value(
                     output_batch.output_file_paths, start, end, total_items
                 ),
+                output_save_future=output_batch.output_save_future,
                 metrics=deepcopy(output_batch.metrics),
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
@@ -965,6 +1022,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         )
 
         while self._running:
+            self._drain_pending_output_results()
             # Update queue depth for metrics
             if self._disagg_metrics:
                 self._disagg_metrics.update_queue_depth(len(self.waiting_queue))
@@ -1051,19 +1109,21 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     if is_warmup and should_return_warmup_result(processed_req):
                         # only keep the necessary lightweight payloads
                         output_batch.drop_payload_for_warmup()
-                        self.return_result(
-                            output_batch, identity, should_not_return=False
-                        )
+                        should_not_return = False
                     else:
-                        self.return_result(
-                            output_batch, identity, should_not_return=is_warmup
-                        )
+                        should_not_return = is_warmup
+
+                    self._return_or_defer_result(
+                        output_batch, identity, should_not_return=should_not_return
+                    )
             except zmq.ZMQError as e:
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
 
+        self._drain_pending_output_results(wait=True)
         self._log_batch_metrics_summary()
+        self.worker.shutdown_output_save_executor()
 
         if self.receiver is not None:
             self.receiver.close()

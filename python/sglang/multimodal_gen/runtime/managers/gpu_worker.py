@@ -7,6 +7,7 @@ import multiprocessing as mp
 import os
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
@@ -16,6 +17,7 @@ import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -121,6 +123,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self._output_save_executor: ThreadPoolExecutor | None = None
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -577,6 +580,73 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         )
         return np.asarray(materialized.frames)
 
+    def _can_async_save_output_paths(self, req: Req) -> bool:
+        return (
+            self.server_args.disagg_role == RoleType.MONOLITHIC
+            and not current_platform.is_cpu()
+            and req.save_output
+            and req.return_file_paths_only
+            and not req.enable_frame_interpolation
+            and not req.enable_upscaling
+        )
+
+    def _get_output_save_executor(self) -> ThreadPoolExecutor:
+        if self._output_save_executor is None:
+            self._output_save_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"sgl-diffusion-output-save-r{self.rank}",
+            )
+        return self._output_save_executor
+
+    @staticmethod
+    def _materialize_audio_for_async_save(audio: Any) -> Any:
+        if isinstance(audio, torch.Tensor):
+            return audio.detach().cpu()
+        return audio
+
+    def _submit_async_output_save(
+        self,
+        output_batch: OutputBatch,
+        req: Req,
+        output_paths: list[str],
+    ) -> None:
+        outputs = [
+            self._materialize_frame_output(output, output_batch, req)
+            for output in output_batch.output
+        ]
+        audio = self._materialize_audio_for_async_save(output_batch.audio)
+        data_type = req.data_type
+        fps = req.fps
+        audio_sample_rate = output_batch.audio_sample_rate
+        output_compression = req.output_compression
+
+        def save_task() -> list[str]:
+            return save_outputs(
+                outputs,
+                data_type,
+                fps,
+                True,
+                lambda idx: output_paths[idx],
+                audio=audio,
+                audio_sample_rate=audio_sample_rate,
+                output_compression=output_compression,
+                enable_frame_interpolation=False,
+                enable_upscaling=False,
+            )
+
+        output_batch.output_save_future = self._get_output_save_executor().submit(
+            save_task
+        )
+        output_batch.output_file_paths = output_paths
+        output_batch.output = None
+        output_batch.audio = None
+        output_batch.audio_sample_rate = None
+
+    def shutdown_output_save_executor(self) -> None:
+        if self._output_save_executor is not None:
+            self._output_save_executor.shutdown(wait=True)
+            self._output_save_executor = None
+
     def _record_output_peak_memory(self, output_batch: OutputBatch) -> None:
         if self.rank != 0 or current_platform.is_cpu():
             return
@@ -619,12 +689,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             def build_output_path(idx: int) -> str:
                 return req.output_file_path(num_outputs, idx)
 
+        output_paths = [
+            build_output_path(idx) for idx in range(len(output_batch.output))
+        ]
+        if self._can_async_save_output_paths(req):
+            self._submit_async_output_save(output_batch, req, output_paths)
+            return
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             req.data_type,
             req.fps,
             True,
-            build_output_path,
+            lambda idx: output_paths[idx],
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=req.output_compression,
@@ -650,12 +727,17 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             )
 
         first_req = reqs[0]
+        output_paths = [req.output_file_path(1, 0) for req in reqs]
+        if self._can_async_save_output_paths(first_req):
+            self._submit_async_output_save(output_batch, first_req, output_paths)
+            return
+
         output_batch.output_file_paths = save_outputs(
             output_batch.output,
             first_req.data_type,
             first_req.fps,
             True,
-            lambda idx: reqs[idx].output_file_path(1, 0),
+            lambda idx: output_paths[idx],
             audio=output_batch.audio,
             audio_sample_rate=output_batch.audio_sample_rate,
             output_compression=first_req.output_compression,
