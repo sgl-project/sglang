@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from sglang.jit_kernel.kv_canary.verify_ref import splitmix64
+
 
 class Oracle(Protocol):
     """Deterministic (req_id, position) -> token_id mapping.
@@ -27,20 +29,4 @@ class HashOracle:
     vocab_size: int
 
     def expected_token(self, *, req_id: int, position: int) -> int:
-        mixed = (self.seed ^ req_id ^ position) & _U64_MASK
-        return _splitmix64(mixed) % self.vocab_size
-
-
-_U64_MASK = (1 << 64) - 1
-
-
-def _splitmix64(value: int) -> int:
-    """Standard splitmix64 finalizer over a single uint64.
-
-    Byte-equal mirror of the kernel-side splitmix64_finalize (also mirrored in
-    sglang.jit_kernel.kv_canary.verify_ref._splitmix64_python).
-    """
-    x = value & _U64_MASK
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64_MASK
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64_MASK
-    return (x ^ (x >> 31)) & _U64_MASK
+        return splitmix64(self.seed ^ req_id ^ position) % self.vocab_size

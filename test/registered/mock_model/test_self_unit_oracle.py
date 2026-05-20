@@ -1,14 +1,10 @@
-"""HashOracle determinism + splitmix64 finalizer behavior."""
+"""HashOracle determinism."""
 
 from __future__ import annotations
 
 import pytest
 
-from sglang.srt.kv_canary.mock_model.oracle import (
-    HashOracle,
-    Oracle,
-    _splitmix64,
-)
+from sglang.srt.kv_canary.mock_model.oracle import HashOracle, Oracle
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
@@ -64,19 +60,6 @@ def test_hash_oracle_satisfies_oracle_protocol() -> None:
     oracle: Oracle = HashOracle(seed=0, vocab_size=100)
 
     assert oracle.expected_token(req_id=0, position=0) is not None
-
-
-def test_splitmix64_finalizer_is_deterministic() -> None:
-    assert _splitmix64(0) == _splitmix64(0)
-    assert _splitmix64(1) != _splitmix64(0)
-
-
-def test_splitmix64_output_is_uint64() -> None:
-    mask = (1 << 64) - 1
-
-    for value in (0, 1, 0xDEADBEEF, mask):
-        result = _splitmix64(value)
-        assert 0 <= result <= mask
 
 
 def test_hash_oracle_is_frozen_dataclass() -> None:
