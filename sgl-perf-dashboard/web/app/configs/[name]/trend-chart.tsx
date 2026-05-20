@@ -1,6 +1,6 @@
 "use client";
 
-import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   CartesianGrid,
   Line,
@@ -16,15 +16,23 @@ import type { TrendPoint } from "@/lib/api";
 type ChartRow = TrendPoint & { tsMs: number };
 
 export default function TrendChart({ data }: { data: TrendPoint[] }) {
+  const router = useRouter();
   const rows: ChartRow[] = data.map((p) => ({
     ...p,
     tsMs: Date.parse(p.started_at),
   }));
 
   return (
-    <div className="h-80 w-full">
+    <div className="h-80 w-full cursor-pointer">
       <ResponsiveContainer>
-        <LineChart data={rows} margin={{ top: 16, right: 24, bottom: 8, left: 0 }}>
+        <LineChart
+          data={rows}
+          margin={{ top: 16, right: 24, bottom: 8, left: 0 }}
+          onClick={(state: { activePayload?: { payload: ChartRow }[] } | null) => {
+            const point = state?.activePayload?.[0]?.payload;
+            if (point?.run_id) router.push(`/runs/${point.run_id}`);
+          }}
+        >
           <CartesianGrid
             stroke="hsl(var(--border))"
             strokeDasharray="2 4"
@@ -88,12 +96,7 @@ function CustomTooltip(props: TooltipProps<number, string>) {
           )}
         </p>
       )}
-      <Link
-        href={`/runs/${row.run_id}`}
-        className="mt-2 inline-block text-[11px] text-primary transition hover:underline"
-      >
-        → run detail
-      </Link>
+      <p className="mt-2 text-[11px] text-muted-foreground/70">click to open run</p>
     </div>
   );
 }
