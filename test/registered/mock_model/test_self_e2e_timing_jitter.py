@@ -2,8 +2,8 @@
 
 Group A (no-bug-no-violation) and group B (perturb-survives-jitter) run against the standard MHA
 fixture (Qwen3-0.6B with num_hidden_layers=1) — the same shape as ``test_self_e2e_mha_full.py``.
-Group C (known-race speed-up) is parked as ``pytest.skip`` until SteppableEngine lands; the file
-keeps the case so reviewers see the planned shape.
+Group C (known-race speed-up) is parked as ``pytest.skip`` until SteppableEngine is implemented;
+the file keeps the case so reviewers see the planned shape.
 """
 
 from __future__ import annotations
@@ -142,7 +142,7 @@ class TestJitterAlonePerturbZeroNoFalseViolation(_JitterE2EBase, unittest.TestCa
         self.assert_health_ok()
 
 
-@unittest.skip("depends on SteppableEngine; tracked alongside the steppable-engine MVP")
+@unittest.skip("depends on SteppableEngine (not yet implemented)")
 class TestJitterSpeedsUpKnownRaceDetection(unittest.TestCase):
     """Group C: jitter halves the time-to-first-violation against a revertable known-race PR.
 
@@ -151,7 +151,9 @@ class TestJitterSpeedsUpKnownRaceDetection(unittest.TestCase):
     """
 
     def test_jitter_speeds_up_race_detection_eagle_positions(self) -> None:
-        self.skipTest("phase-2: revert + baseline vs jitter wall-time comparison")
+        self.skipTest(
+            "revert + baseline vs jitter wall-time comparison; needs SteppableEngine"
+        )
 
 
 if __name__ == "__main__":
