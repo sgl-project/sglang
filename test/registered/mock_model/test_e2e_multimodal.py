@@ -1,4 +1,4 @@
-"""End-to-end multimodal smoke under token_oracle + canary."""
+"""End-to-end multimodal smoke under mock_model + canary."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import pytest
 from sglang.srt.entrypoints.engine import Engine
 from sglang.test.ci.ci_register import register_cuda_ci
 
-from .utils import token_oracle_engine_kwargs
+from .utils import mock_model_engine_kwargs
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
@@ -23,7 +23,7 @@ def _fake_prompt(length: int) -> list[int]:
 def test_multimodal_no_canary_violation() -> None:
     engine = Engine(
         model_path="Qwen/Qwen3-0.6B",
-        **token_oracle_engine_kwargs(),
+        **mock_model_engine_kwargs(),
     )
     try:
         engine.generate(
