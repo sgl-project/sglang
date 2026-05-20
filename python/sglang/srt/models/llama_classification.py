@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -29,6 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaForClassification(nn.Module):
@@ -76,6 +79,9 @@ class LlamaForClassification(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "classification_head" in name:
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

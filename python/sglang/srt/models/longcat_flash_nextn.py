@@ -541,11 +541,20 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             "model.mtp.layers.0.transformer_layer.mlp.up_proj.weight_scale_inv": "layers.0.mlp.up_proj.weight_scale_inv",
             "model.mtp.norm.weight": "layers.0.final_layernorm.weight",
         }
+
+        def track_future(name):
+            if futures and id(futures[-1]) not in future_to_name:
+                future_to_name[id(futures[-1])] = name
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+            future_to_name = {}
             for name, loaded_weight in weights:
+                logger.debug(
+                    f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+                )
                 if ".mtp." not in name:
                     continue
                 if name in weight_names_mapping:
@@ -600,6 +609,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                     futures.append(
                         executor.submit(weight_loader, param, loaded_weight, shard_id)
                     )
+                    track_future(name)
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -653,6 +663,7 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                             futures.append(
                                 executor.submit(weight_loader, param, fused_weight)
                             )
+                            track_future(param_name)
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
                     else:
@@ -677,6 +688,20 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                         futures.append(
                             executor.submit(weight_loader, param, loaded_weight)
                         )
+                        track_future(name)
+
+            # Wait for all tasks to complete and raise any exceptions.
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    future.result()
+                except Exception as e:
+                    idx = futures.index(future) if future in futures else -1
+                    fname = future_to_name.get(id(future), "unknown")
+                    logger.error(
+                        f"Async weight loading failed: name={fname}, future_index={idx}"
+                    )
+                    raise
+
         self.post_load_weights()
 
 

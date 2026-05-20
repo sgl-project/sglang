@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -39,6 +41,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
 from sglang.srt.server_args import get_global_server_args
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -314,6 +318,9 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         }
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for legacy, new in legacy_name_map.items():
                 if legacy in name:
                     name = name.replace(legacy, new)

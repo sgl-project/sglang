@@ -18,6 +18,7 @@
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/xverse.py#L1
 """Inference-only XVERSE model compatible with HuggingFace weights."""
 
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -44,6 +45,8 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 
 class XverseMLP(nn.Module):
@@ -376,6 +379,9 @@ class XverseForCausalLM(nn.Module):
 
         if name is None or loaded_weight is None:
             for name, loaded_weight in weights:
+                logger.debug(
+                    f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+                )
                 load_weights_per_param(name, loaded_weight)
         else:
             load_weights_per_param(name, loaded_weight)

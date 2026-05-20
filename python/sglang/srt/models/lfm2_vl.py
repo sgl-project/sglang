@@ -297,6 +297,9 @@ class Lfm2VlForConditionalGeneration(nn.Module):
         lm_weights = []
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("model.vision_tower."):
                 # model.vision_tower.* → * (strip model.vision_tower. prefix)
                 # siglip2.py expects names like "vision_model.embeddings.patch_embedding.weight"

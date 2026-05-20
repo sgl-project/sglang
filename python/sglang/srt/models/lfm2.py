@@ -510,6 +510,9 @@ class Lfm2ForCausalLM(nn.Module):
         embed_tokens_weight = None
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
 

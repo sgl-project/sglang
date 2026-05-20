@@ -187,6 +187,9 @@ class MistralForCausalLMEagle(LlamaForCausalLMEagle):
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Iterable[Tuple[str, torch.Tensor]]:
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("model.") or name.startswith("lm_head."):
                 yield name, loaded_weight
                 continue

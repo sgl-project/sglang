@@ -628,6 +628,9 @@ class SDARMoeForCausalLM(nn.Module):
         params_dict = self._cached_params_dict
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if not name.startswith("model.") and (
                 name.startswith("layers.")
                 or name.startswith("embed_tokens.")

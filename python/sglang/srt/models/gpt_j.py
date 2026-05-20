@@ -19,6 +19,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gpt_j.py
 """Inference-only GPT-J model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -46,6 +47,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class GPTJAttention(nn.Module):
@@ -288,6 +291,9 @@ class GPTJForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "attn.bias" in name or "attn.masked_bias" in name:
                 continue
 

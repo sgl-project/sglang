@@ -64,6 +64,9 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Remap Mistral native format weight names to HF/Llama format."""
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # Pass through weights already in HF/Llama layout so this loader
             # tolerates mixed-format checkpoints (e.g. native body + HF-style
             # multi_modal_projector weights spliced in by a parent class).

@@ -585,6 +585,9 @@ class ApertusForCausalLM(nn.Module):
                 params_dict[name] = buffer
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None

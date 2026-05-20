@@ -1341,6 +1341,9 @@ class Glm4MoeForCausalLM(nn.Module):
 
         weight_names = []
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             weight_names.append(name)
 
             if not is_nextn:

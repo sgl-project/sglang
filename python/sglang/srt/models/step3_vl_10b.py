@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """This is basically a copy from perception_models/core/vision_encoder/pe.py"""
 
+import logging
 from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple
 
@@ -29,6 +30,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_NORM_LAYER = partial(nn.LayerNorm, eps=1e-5)
 
@@ -552,6 +555,9 @@ class StepVLForConditionalGeneration(nn.Module):
         language_weights = []
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "vision_model" in name or "vit_large_projector" in name:
                 name = name.replace(r".attn.in_proj_weight", r".attn.qkv_proj.weight")
                 name = name.replace(r".attn.in_proj_bias", r".attn.qkv_proj.bias")

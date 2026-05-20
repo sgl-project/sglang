@@ -1,4 +1,5 @@
 import copy
+import logging
 from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -21,6 +22,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
 from sglang.srt.models.qwen2_vl import Qwen2VisionPatchMerger, Qwen2VisionTransformer
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen2VisionTransformerForNavitPOINTS(Qwen2VisionTransformer):
@@ -150,6 +153,9 @@ class POINTSV15ChatModel(nn.Module):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
 

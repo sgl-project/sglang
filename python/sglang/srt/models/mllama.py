@@ -4,6 +4,7 @@
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
 
+import logging
 import math
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -41,6 +42,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -1021,6 +1024,9 @@ class MllamaForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
         updated_params = set()
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "patch_embedding.weight" in name:
                 name = name.replace(
                     "patch_embedding.weight", "patch_embedding._linear.weight"

@@ -3,6 +3,7 @@
 - SarvamMoEForCausalLM (30B)
 """
 
+import logging
 import math
 from enum import IntEnum, auto
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -95,6 +96,9 @@ else:
     concat_mla_k = None
     merge_state_v2 = None
     per_tensor_quant_mla_fp8 = None
+
+
+logger = logging.getLogger(__name__)
 
 
 class AttnForwardMethod(IntEnum):
@@ -1360,6 +1364,9 @@ class SarvamMLAForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.start_layer or layer_id >= self.end_layer

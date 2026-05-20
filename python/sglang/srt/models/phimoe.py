@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -29,6 +30,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+
+logger = logging.getLogger(__name__)
 
 
 class PhiMoEConfig(PretrainedConfig):
@@ -515,6 +518,9 @@ class PhiMoEForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue

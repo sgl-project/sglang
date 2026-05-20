@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import logging
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -56,6 +58,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 
 class SolarMLP(nn.Module):
@@ -474,6 +478,9 @@ class SolarForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
 
             is_packed = False
             for packed_name, sources in self.packed_modules_mapping.items():

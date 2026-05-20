@@ -41,6 +41,7 @@
 # This file is based on the LLama model definition file in transformers
 """PyTorch Cohere model."""
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -70,6 +71,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, get_compiler_backend, set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -399,6 +402,9 @@ class CohereForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue

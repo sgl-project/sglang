@@ -247,6 +247,9 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         loaded_params: set[str] = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
 

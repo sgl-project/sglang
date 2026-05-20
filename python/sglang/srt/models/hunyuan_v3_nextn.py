@@ -181,6 +181,9 @@ class HYV3ForCausalLMNextN(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith(nextn_prefix):
                 subname = name[len(nextn_prefix) :]
                 if any(subname.startswith(s) for s in spec_weight_names):

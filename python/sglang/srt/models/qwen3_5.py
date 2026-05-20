@@ -1172,6 +1172,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1315,6 +1318,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1518,6 +1524,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1765,6 +1774,9 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:

@@ -18,6 +18,7 @@
 # limitations under the License.
 """Inference-only GPT-2 model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple, Type
 
 import torch
@@ -38,6 +39,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class GPT2Attention(nn.Module):
@@ -261,6 +264,9 @@ class GPT2LMHeadModel(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "lm_head.weight" in name:
                 # GPT-2 ties the weights of the embedding layer and the final
                 # linear layer.

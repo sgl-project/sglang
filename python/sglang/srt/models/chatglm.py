@@ -16,6 +16,7 @@
 # https://github.com/THUDM/ChatGLM2-6B
 """Inference-only ChatGLM model compatible with THUDM weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -42,6 +43,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 LoraConfig = None
 
@@ -408,6 +411,9 @@ class ChatGLMForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_pos_emb.inv_freq" in name:
                 continue
             if "word_embeddings" in name:

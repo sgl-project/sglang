@@ -648,6 +648,9 @@ class Llama4ForConditionalGeneration(nn.Module):
         loaded_params = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if self._should_skip_weight(name):
                 continue
 

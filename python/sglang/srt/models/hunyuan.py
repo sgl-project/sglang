@@ -13,6 +13,7 @@
 # limitations under the License.
 """Inference-only HunYuan model compatible with HuggingFace weights."""
 
+import logging
 import re
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -54,6 +55,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -676,6 +679,9 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "gate_proj_bias" in name:

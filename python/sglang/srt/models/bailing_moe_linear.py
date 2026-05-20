@@ -1399,6 +1399,9 @@ class BailingMoELinearForCausalLM(nn.Module):
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("model.mtp"):
                 continue
             layer_idx = None

@@ -683,6 +683,9 @@ class LagunaForCausalLM(nn.Module):
         ]
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             layer_id = get_layer_id(name)
             if layer_id is not None and (
                 layer_id < self.start_layer or layer_id >= self.end_layer

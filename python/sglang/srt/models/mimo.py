@@ -1,5 +1,6 @@
 # Adapted from qwen2.py
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -13,6 +14,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2Model
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 MiMoConfig = None
 
@@ -108,6 +111,9 @@ class MiMoForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if (
                 "rotary_emb.inv_freq" in name
                 or "projector" in name

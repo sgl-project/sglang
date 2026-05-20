@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -20,6 +21,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekVL2MlpProjector(nn.Module):
@@ -245,6 +248,9 @@ class DeepseekVL2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         weights = list(weights)
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "language" in name:
                 name = name.replace("language.", "")
                 self.language_model.load_weights([(name, loaded_weight)])

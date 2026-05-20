@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import os
 from typing import Iterable, Optional, Tuple
 
@@ -14,6 +15,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bert import BertEncoder
 from sglang.srt.utils.hf_transformers_utils import download_from_hf
+
+logger = logging.getLogger(__name__)
 
 RobertaConfig = None
 
@@ -166,6 +169,9 @@ class XLMRobertaBaseModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = name.replace("self", "self_attn")
             if self.pooler is None and "pooler" in name:
                 continue

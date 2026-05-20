@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -49,6 +50,8 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 
 class HYV3FeedForward(nn.Module):
@@ -531,6 +534,9 @@ class HYV3ForCausalLM(nn.Module):
         num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "lm_head.weight" in name and getattr(
                 self.config, "tie_word_embeddings", False
             ):

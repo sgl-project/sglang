@@ -19,6 +19,7 @@
 # https://github.com/vllm-project/vllm/blob/07eb6f19f3b0ee9f7adf6eb689607028aa40bfd5/vllm/model_executor/models/gpt_bigcode.py
 """Inference-only GPTBigCode model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -39,6 +40,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class GPTBigCodeAttention(nn.Module):
@@ -287,6 +290,9 @@ class GPTBigCodeForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "lm_head.weight" in name:
                 continue
             if ".attn.bias" in name:

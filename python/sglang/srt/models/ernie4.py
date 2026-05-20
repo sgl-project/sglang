@@ -14,6 +14,7 @@
 
 """Inference-only Ernie4.5 model compatible with baidu/ERNIE-4.5-*-PT weights."""
 
+import logging
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -44,6 +45,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 
 class MoEGate(nn.Module):
@@ -336,6 +339,9 @@ class Ernie4_5_ForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             for param_name, weight_name, shard_id in self.stacked_params_mapping:
@@ -370,6 +376,9 @@ class Ernie4_5_MoeForCausalLM(Ernie4_5_ForCausalLM):
         )
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if self.config.tie_word_embeddings and "lm_head.weight" in name:
                 continue
             if name.startswith("model.mtp_"):

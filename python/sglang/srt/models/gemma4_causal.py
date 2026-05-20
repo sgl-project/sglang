@@ -1160,6 +1160,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
 
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = name.replace("model.language_model.", "model.")
 
             # HF has router.per_expert_scale and experts.* on the decoder layer;

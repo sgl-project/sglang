@@ -13,6 +13,7 @@
 # ==============================================================================
 """Inference-only MiniCPM3 model compatible with HuggingFace weights."""
 
+import logging
 import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -69,6 +70,9 @@ if is_cuda():
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
+
+
+logger = logging.getLogger(__name__)
 
 
 class MiniCPM3MLP(nn.Module):
@@ -488,6 +492,9 @@ class MiniCPM3ForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

@@ -462,6 +462,9 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = re.sub(r"^model\.", "", name)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

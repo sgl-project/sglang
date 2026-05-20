@@ -1354,6 +1354,10 @@ class DeepseekV4ForCausalLM(nn.Module):
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
+        def track_future(name):
+            if futures and id(futures[-1]) not in future_to_name:
+                future_to_name[id(futures[-1])] = name
+
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names_out_of_layer = [
@@ -1376,7 +1380,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
+            future_to_name = {}
             for name, loaded_weight in weights:
+                logger.debug(
+                    f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+                )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
 
@@ -1461,6 +1469,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                             func=weight_loader,
                             func_args=(param, loaded_weight, shard_id),
                         )
+                        track_future(name)
                         loaded_params.add(name)
                         break
                     else:
@@ -1490,6 +1499,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     "expert_id": expert_id,
                                 },
                             )
+                            track_future(name)
                             loaded_params.add(name)
                             break
                         else:
@@ -1540,6 +1550,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func=weight_loader,
                                         func_args=(param, fused_weight),
                                     )
+                                    track_future(param_name)
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
                             elif fuse_wqa_wkv and (
@@ -1571,6 +1582,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func=weight_loader,
                                         func_args=(param, fused_weight),
                                     )
+                                    track_future(param_name)
                                     loaded_params.add(param_name)
                                     cache_wqkv_a_weight.pop(param_name)
                             else:
@@ -1599,13 +1611,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     func=weight_loader,
                                     func_args=(param, loaded_weight),
                                 )
+                                track_future(name)
                                 loaded_params.add(name)
                 except Exception as e:
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    future.result()
+                except Exception as e:
+                    idx = futures.index(future) if future in futures else -1
+                    fname = future_to_name.get(id(future), "unknown")
+                    logger.error(
+                        f"Async weight loading failed: name={fname}, future_index={idx}"
+                    )
+                    raise
 
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()

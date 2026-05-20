@@ -22,6 +22,7 @@ Inference-only StableLM-2 (https://huggingface.co/stabilityai/stablelm-2-1_6b)
 model compatible with HuggingFace weights.
 """
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -46,6 +47,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -321,6 +324,9 @@ class StableLmForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

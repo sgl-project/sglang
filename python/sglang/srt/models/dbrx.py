@@ -18,6 +18,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/dbrx.py#L1
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -55,6 +56,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -447,6 +450,9 @@ class DbrxForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for param_name, weight_name in expert_params_mapping:
                 if weight_name not in name:
                     continue
