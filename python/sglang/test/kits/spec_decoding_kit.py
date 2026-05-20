@@ -14,8 +14,9 @@ class SpecDecodingMixin:
         acc_length, speed = 0.0, 0.0
         for attempt in range(1, self.bs_1_speed_attempts + 1):
             requests.get(self.base_url + "/flush_cache")
-            acc_length, speed = send_one_prompt(args)
-            print(f"attempt {attempt}: {acc_length=:.2f} {speed=:.2f}")
+            acc_length, speed = send_one_prompt(
+                args, label=f"attempt {attempt}", print_output=False
+            )
             if acc_length > self.accept_length_thres and speed > self.bs_1_speed_thres:
                 break
         requests.get(self.base_url + "/flush_cache")

@@ -349,7 +349,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:

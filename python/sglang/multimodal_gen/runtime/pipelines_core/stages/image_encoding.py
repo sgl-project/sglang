@@ -490,7 +490,9 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
-        if server_args.should_configure_layerwise_offload_for_lazy_component():
+        if server_args.should_configure_layerwise_offload_for_lazy_component(
+            "condition_image_encoder"
+        ):
             modules = {"condition_image_encoder": self._condition_image_encoder}
             configure_layerwise_offload_modules(
                 modules,

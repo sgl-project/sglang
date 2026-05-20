@@ -101,6 +101,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+      - id: rustfmt-sgl-model-gateway
+        name: rustfmt sgl-model-gateway (nightly)
+        entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
+        language: system
+        files: ^sgl-model-gateway/.*\.rs$
+        pass_filenames: false
   - repo: https://github.com/lycheeverse/lychee.git
     rev: lychee-v0.22.0
     hooks:
