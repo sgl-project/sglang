@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.mock_model.oracle import Oracle
+from sglang.srt.kv_canary.mock_model.oracle import TokenIdOracle
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class OracleSamplerHook:
+class TokenIdOracleManager:
     """One-per-server state for the oracle sampler integration. Owns the oracle and the per-step
     row -> req-id mapping. Both canary's input-check path (fill_expected_inputs) and sglang's
     sampler dispatch (_OracleSampler) operate on the same instance.
@@ -21,7 +21,7 @@ class OracleSamplerHook:
     populate the row -> req-id stash that _OracleSampler will read at sample time.
     """
 
-    def __init__(self, *, oracle: Oracle) -> None:
+    def __init__(self, *, oracle: TokenIdOracle) -> None:
         self.oracle = oracle
         self._req_pool_indices_per_row: Optional[List[int]] = None
 
@@ -92,7 +92,7 @@ class OracleSamplerHook:
         req_pool_indices_per_row = self._req_pool_indices_per_row
         if req_pool_indices_per_row is None:
             raise RuntimeError(
-                "OracleSamplerHook.sample: req_pool_indices not stashed; "
+                "TokenIdOracleManager.sample: req_pool_indices not stashed; "
                 "fill_expected_inputs must be called before sampling "
                 "(input_check_mode == ON required)"
             )
@@ -101,7 +101,7 @@ class OracleSamplerHook:
         bs = int(logits.shape[0])
 
         assert len(req_pool_indices_per_row) == bs, (
-            f"OracleSamplerHook.sample: stashed req_pool_indices length "
+            f"TokenIdOracleManager.sample: stashed req_pool_indices length "
             f"{len(req_pool_indices_per_row)} != logits batch size {bs}"
         )
 

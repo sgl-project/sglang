@@ -6,10 +6,10 @@ from typing import Protocol
 from sglang.jit_kernel.kv_canary.verify_ref import splitmix64
 
 
-class Oracle(Protocol):
+class TokenIdOracle(Protocol):
     """Deterministic (req_id, position) -> token_id mapping.
 
-    The oracle has NO knowledge of canary. Both the OracleSampler (output side) and
+    The oracle has NO knowledge of canary. Both the _OracleSampler (output side) and
     fill_expected_inputs (input-check side) consume the same oracle so the two perspectives
     agree by construction.
     """

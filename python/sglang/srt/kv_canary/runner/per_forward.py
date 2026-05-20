@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.mock_model.oracle_manager import OracleSamplerHook
+from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
@@ -62,7 +62,7 @@ class PerForwardOrchestrator:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._perturb_hook = perturb_hook
-        self._oracle_sampler_hook: Optional[OracleSamplerHook] = None
+        self._token_id_oracle_manager: Optional[TokenIdOracleManager] = None
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=max(1, per_forward_verify_capacity), device=device
@@ -85,8 +85,8 @@ class PerForwardOrchestrator:
 
         self._last_forward_batch: Optional["ForwardBatch"] = None
 
-    def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
-        self._oracle_sampler_hook = hook
+    def attach_token_id_oracle_manager(self, manager: TokenIdOracleManager) -> None:
+        self._token_id_oracle_manager = manager
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
@@ -97,14 +97,14 @@ class PerForwardOrchestrator:
         self._last_forward_batch = forward_batch
 
         if self._config.input_check_mode == CanaryInputCheckMode.ON:
-            hook = self._oracle_sampler_hook
-            if hook is None:
+            manager = self._token_id_oracle_manager
+            if manager is None:
                 raise RuntimeError(
-                    "kv-canary: input_check_mode=ON requires an OracleSamplerHook; call "
-                    "CanaryRunner.attach_oracle_sampler_hook(hook) where hook is the return "
-                    "value of install_oracle_sampler(oracle=...)"
+                    "kv-canary: input_check_mode=ON requires a TokenIdOracleManager; call "
+                    "CanaryRunner.attach_token_id_oracle_manager(manager) where manager is "
+                    "the return value of install_oracle_sampler(oracle=...)"
                 )
-            hook.fill_expected_inputs(
+            manager.fill_expected_inputs(
                 forward_batch=forward_batch,
                 expected_inputs_out=self._expected_inputs,
             )

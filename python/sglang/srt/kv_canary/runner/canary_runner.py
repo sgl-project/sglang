@@ -14,7 +14,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.mock_model.oracle_manager import OracleSamplerHook
+from sglang.srt.kv_canary.mock_model.oracle_manager import TokenIdOracleManager
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
@@ -176,12 +176,12 @@ class CanaryRunner:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_hook.attach_radix_cache(radix_cache)
 
-    def attach_oracle_sampler_hook(self, hook: OracleSamplerHook) -> None:
-        """Bind the OracleSamplerHook returned by install_oracle_sampler so the per-forward
+    def attach_token_id_oracle_manager(self, manager: TokenIdOracleManager) -> None:
+        """Bind the TokenIdOracleManager returned by install_oracle_sampler so the per-forward
         input-check path (input_check_mode == ON) can fill expected_input_* tensors from the
         same oracle that drives sampling.
         """
-        self._per_forward_orchestrator.attach_oracle_sampler_hook(hook)
+        self._per_forward_orchestrator.attach_token_id_oracle_manager(manager)
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:

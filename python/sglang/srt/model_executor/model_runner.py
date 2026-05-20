@@ -639,7 +639,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
-        self._mock_model_oracle_hook = install_mock_model_sampler(
+        self._mock_model_oracle_manager = install_mock_model_sampler(
             server_args=server_args,
             vocab_size=self.model_config.vocab_size,
         )
@@ -752,7 +752,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.canary_runner = install_canary(
             server_args=server_args,
             model_runner=self,
-            oracle_sampler_hook=self._mock_model_oracle_hook,
+            token_id_oracle_manager=self._mock_model_oracle_manager,
         )
 
         # Init ngram embedding token table
