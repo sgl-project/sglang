@@ -79,6 +79,54 @@ def _filename_concurrency(path: str) -> Optional[int]:
     return None
 
 
+def _percentile(values: List[float], pct: float) -> Optional[float]:
+    """Return the percentile of a list without depending on numpy."""
+
+    if not values:
+        return None
+    sorted_v = sorted(values)
+    if len(sorted_v) == 1:
+        return float(sorted_v[0])
+    k = (len(sorted_v) - 1) * (pct / 100.0)
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_v) - 1)
+    frac = k - lo
+    return float(sorted_v[lo] * (1.0 - frac) + sorted_v[hi] * frac)
+
+
+def _per_request_output_tps(summary: Dict) -> Tuple[Optional[float], Optional[float]]:
+    """Derive per-request output tok/s P50/P99 from bench_serving arrays.
+
+    bench_serving with --output-details emits ``output_lens``, ``itls``, and
+    ``ttfts`` arrays. Per-request TPS = ``output_lens[i] / (ttfts[i] +
+    sum(itls[i]))``. Returns (None, None) if any required array is missing.
+    """
+
+    output_lens = summary.get("output_lens")
+    itls = summary.get("itls")
+    ttfts = summary.get("ttfts")
+    if not (isinstance(output_lens, list) and isinstance(itls, list)
+            and isinstance(ttfts, list)):
+        return None, None
+    n = min(len(output_lens), len(itls), len(ttfts))
+    if n == 0:
+        return None, None
+    per_req: List[float] = []
+    for i in range(n):
+        olen = output_lens[i]
+        if not isinstance(olen, (int, float)) or olen <= 0:
+            continue
+        ttft = ttfts[i] if isinstance(ttfts[i], (int, float)) else 0.0
+        itl_row = itls[i] if isinstance(itls[i], list) else []
+        itl_sum = sum(v for v in itl_row if isinstance(v, (int, float)))
+        duration = float(ttft) + float(itl_sum)
+        if duration > 0:
+            per_req.append(float(olen) / duration)
+    if not per_req:
+        return None, None
+    return _percentile(per_req, 50.0), _percentile(per_req, 99.0)
+
+
 def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
     if not os.path.isfile(path):
         raise FileNotFoundError(f"bench file not found: {path}")
@@ -88,16 +136,28 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         raise ValueError(f"bench file is empty: {path}")
     summary = rows[-1] if isinstance(rows[-1], dict) else rows[0]
 
+    # bench_serving nests hardware / TP / radix metadata under server_info.
+    # Hand-crafted fixtures may put them at the top level; honor both.
+    server_info = summary.get("server_info") or {}
+    if not isinstance(server_info, dict):
+        server_info = {}
+
+    def _from_either(key: str):
+        return server_info.get(key) if key in server_info else summary.get(key)
+
     concurrency = (
         summary.get("max_concurrency")
         or summary.get("concurrency")
+        or server_info.get("max_concurrency")
         or _filename_concurrency(path)
     )
     context = RunContext(
-        gpu_id=str(summary.get("gpu_id") or summary.get("device") or ""),
-        tp_size=summary.get("tp_size"),
-        page_size=summary.get("page_size"),
-        disable_radix_cache=summary.get("disable_radix_cache"),
+        gpu_id=str(
+            _from_either("gpu_id") or _from_either("device") or ""
+        ),
+        tp_size=_from_either("tp_size"),
+        page_size=_from_either("page_size"),
+        disable_radix_cache=_from_either("disable_radix_cache"),
         concurrency=int(concurrency) if concurrency is not None else None,
     )
 
@@ -109,21 +169,31 @@ def _read_bench_jsonl(path: str) -> Tuple[RunContext, RunMetrics]:
         v = summary.get(key)
         return int(v) if isinstance(v, (int, float)) else None
 
+    def _ms_to_s(key: str) -> Optional[float]:
+        v = _float(key)
+        return None if v is None else v / 1000.0
+
+    # Per-request output tok/s — derived from bench_serving --output-details
+    # arrays when present; fall back to legacy fields for fixture compat.
+    per_req_p50, per_req_p99 = _per_request_output_tps(summary)
+    if per_req_p50 is None:
+        per_req_p50 = _float("output_throughput_p50") or _float(
+            "per_req_output_tps_p50"
+        )
+    if per_req_p99 is None:
+        per_req_p99 = _float("output_throughput_p99") or _float(
+            "per_req_output_tps_p99"
+        )
+
     metrics = RunMetrics(
         concurrency=int(concurrency or 0),
         num_prompts=_int("num_prompts") or 0,
         isl=_int("input_len") or _int("median_input_len") or _int("isl") or 0,
         osl=_int("output_len") or _int("median_output_len") or _int("osl") or 0,
-        output_tps_p50=_float("output_throughput_p50")
-        or _float("per_req_output_tps_p50"),
-        output_tps_p99=_float("output_throughput_p99")
-        or _float("per_req_output_tps_p99"),
-        ttft_p50_s=_float("median_ttft_ms")
-        and (_float("median_ttft_ms") or 0) / 1000.0
-        or _float("ttft_p50_s"),
-        ttft_p99_s=_float("p99_ttft_ms")
-        and (_float("p99_ttft_ms") or 0) / 1000.0
-        or _float("ttft_p99_s"),
+        output_tps_p50=per_req_p50,
+        output_tps_p99=per_req_p99,
+        ttft_p50_s=_ms_to_s("median_ttft_ms") or _float("ttft_p50_s"),
+        ttft_p99_s=_ms_to_s("p99_ttft_ms") or _float("ttft_p99_s"),
         tpot_p50_ms=_float("median_tpot_ms"),
         tpot_p99_ms=_float("p99_tpot_ms"),
         goodput_under_slo=_float("goodput_under_slo"),

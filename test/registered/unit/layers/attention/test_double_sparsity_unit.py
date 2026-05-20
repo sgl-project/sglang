@@ -822,6 +822,249 @@ class TestChannelMaskSlicePerRank(unittest.TestCase):
         self.assertIn("slice_per_rank", str(ctx.exception))
 
 
+class TestBindRuntimeDataDeviceAlignment(unittest.TestCase):
+    """Round-4 fix [P2]: bind_runtime_data must align a CPU-loaded mask
+    onto the page-signature table's device.
+    """
+
+    def test_bind_moves_cpu_mask_onto_table_device(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=torch.device("cpu"),
+        )
+        # Table and mask on the same (CPU) device — no-op move, but the
+        # bind path must still succeed.
+        table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+            page_size=64, dtype=torch.float16, device=torch.device("cpu"),
+        )
+        mask = ChannelMask(
+            channel_selection=torch.zeros(2, 4, 8, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 4, 8, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=8, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+        # Mask now lives on the table's device.
+        self.assertEqual(
+            sel.channel_mask.channel_selection.device,
+            table.signatures.device,
+        )
+        self.assertEqual(
+            sel.channel_mask.channel_weights.device,
+            table.signatures.device,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA needed for cross-device alignment test")
+    def test_bind_moves_cpu_mask_onto_cuda_table(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cuda_dev = torch.device("cuda")
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=4, head_dim=128, device=cuda_dev,
+        )
+        table = allocate_page_signature_table(
+            num_layers_local=2, max_pages=8, num_heads_local=4, label_dim=8,
+            page_size=64, dtype=torch.float16, device=cuda_dev,
+        )
+        # Mask loaded on CPU (the load_channel_mask default path).
+        mask = ChannelMask(
+            channel_selection=torch.zeros(2, 4, 8, dtype=torch.int32),
+            channel_weights=torch.zeros(2, 4, 8, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=128, page_size=64,
+            label_dim=8, content_sha256="x",
+        )
+        self.assertEqual(mask.channel_selection.device.type, "cpu")
+        sel.bind_runtime_data(table, mask)
+        self.assertEqual(sel.channel_mask.channel_selection.device.type, "cuda")
+        self.assertEqual(sel.channel_mask.channel_weights.device.type, "cuda")
+        # Original mask object is unchanged (caller's reference is intact).
+        self.assertEqual(mask.channel_selection.device.type, "cpu")
+
+
+class TestSanityProbeRealSelector(unittest.TestCase):
+    """Round-4 fix [P2]: sanity probe must plant a real signal and discriminate."""
+
+    def test_probe_finds_planted_needle(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, startup_sanity_probe,
+        )
+        from sglang.srt.layers.attention.double_sparsity.page_signature_table import (
+            allocate_page_signature_table,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
+        )
+        table = allocate_page_signature_table(
+            num_layers_local=1, max_pages=16, num_heads_local=2, label_dim=4,
+            page_size=64, dtype=torch.float32, device=torch.device("cpu"),
+        )
+        # A deterministic non-trivial channel mask: heads point at distinct
+        # channel indices in the first label-dim slot.
+        sel_tensor = torch.zeros(1, 2, 4, dtype=torch.int32)
+        sel_tensor[0, 0, 0] = 3
+        sel_tensor[0, 1, 0] = 7
+        # Other label-dim slots index other channels (just to fill).
+        sel_tensor[0, 0, 1] = 4
+        sel_tensor[0, 0, 2] = 5
+        sel_tensor[0, 0, 3] = 6
+        sel_tensor[0, 1, 1] = 8
+        sel_tensor[0, 1, 2] = 9
+        sel_tensor[0, 1, 3] = 10
+        w_tensor = torch.ones(1, 2, 4, dtype=torch.float32)
+        mask = ChannelMask(
+            channel_selection=sel_tensor,
+            channel_weights=w_tensor,
+            schema_version="1", dtype="fp8_e4m3", head_dim=64, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        sel.bind_runtime_data(table, mask)
+
+        result = startup_sanity_probe(
+            mask, sel, haystack_pages=8, page_size=64, needle_page=4,
+        )
+        self.assertTrue(result.passed,
+                        f"probe should find planted needle; got {result}")
+        self.assertEqual(result.score, 1.0)
+        self.assertEqual(result.needle_position, 4)
+        # The probe must restore the table after running.
+        self.assertTrue(torch.equal(
+            table.signatures[0, :8],
+            torch.zeros_like(table.signatures[0, :8]),
+        ))
+        self.assertTrue(torch.equal(
+            table.valid_mask[0, :8],
+            torch.zeros_like(table.valid_mask[0, :8]),
+        ))
+
+    def test_probe_returns_no_table_when_unbound(self):
+        from sglang.srt.layers.attention.double_sparsity.channel_mask import (
+            ChannelMask, startup_sanity_probe,
+        )
+        cfg = parse_double_sparsity_config(_valid_payload())
+        # Construct selector, manually flip IS_PLACEHOLDER without binding a
+        # table — exercises the new "no_page_signature_table" branch.
+        sel = DoubleSparsitySelector(
+            config=cfg, num_local_heads=2, head_dim=64, device=torch.device("cpu"),
+        )
+        sel.IS_PLACEHOLDER = False
+        sel.page_signature_table = None
+        mask = ChannelMask(
+            channel_selection=torch.zeros(1, 2, 4, dtype=torch.int32),
+            channel_weights=torch.zeros(1, 2, 4, dtype=torch.float32),
+            schema_version="1", dtype="fp8_e4m3", head_dim=64, page_size=64,
+            label_dim=4, content_sha256="x",
+        )
+        r = startup_sanity_probe(mask, sel, haystack_pages=8, needle_page=4)
+        self.assertFalse(r.passed)
+        self.assertEqual(r.skipped_reason, "no_page_signature_table")
+
+
+class TestBenchmarkCompareReader(unittest.TestCase):
+    """Round-4 fix [P2]: benchmark_compare must read server_info nested
+    fields and derive per-request TPS from bench_serving --output-details
+    arrays."""
+
+    def _import_compare(self):
+        import importlib
+        import sys as _sys
+        # Walk up from the test file to find the project's `development/` dir.
+        cur = os.path.dirname(os.path.abspath(__file__))
+        development_dir = None
+        for _ in range(8):
+            candidate = os.path.join(cur, "development", "benchmark_compare.py")
+            if os.path.isfile(candidate):
+                development_dir = os.path.dirname(candidate)
+                break
+            cur = os.path.dirname(cur)
+        if development_dir is None:
+            raise FileNotFoundError("development/benchmark_compare.py not found")
+        if development_dir not in _sys.path:
+            _sys.path.insert(0, development_dir)
+        if "benchmark_compare" in _sys.modules:
+            return _sys.modules["benchmark_compare"]
+        return importlib.import_module("benchmark_compare")
+
+    def _write_jsonl(self, tmpdir, name, payload):
+        import json as _json
+        path = os.path.join(tmpdir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(_json.dumps(payload) + "\n")
+        return path
+
+    def test_reads_server_info_nested_context(self):
+        bc = self._import_compare()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "max_concurrency": 32,
+                "median_ttft_ms": 800.0,
+                "p99_ttft_ms": 21000.0,
+                "median_tpot_ms": 4.0,
+                "p99_tpot_ms": 12.0,
+                "output_lens": [100, 110, 90, 105, 95, 100, 100, 100],
+                "ttfts": [0.5, 0.6, 0.4, 0.55, 0.5, 0.5, 0.5, 0.5],
+                "itls": [[0.01] * 99, [0.01] * 109, [0.01] * 89,
+                         [0.01] * 104, [0.01] * 94, [0.01] * 99,
+                         [0.01] * 99, [0.01] * 99],
+                "server_info": {
+                    "tp_size": 8,
+                    "page_size": 64,
+                    "disable_radix_cache": True,
+                    "gpu_id": "H200",
+                },
+            }
+            path = self._write_jsonl(tmp, "ds_c32.jsonl", payload)
+            ctx, m = bc._read_bench_jsonl(path)
+            self.assertEqual(ctx.tp_size, 8)
+            self.assertEqual(ctx.page_size, 64)
+            self.assertEqual(ctx.disable_radix_cache, True)
+            self.assertEqual(ctx.concurrency, 32)
+            # P50 of 100/(0.5+0.99)=~67 tok/s for each row -> P50 close to 67.
+            self.assertIsNotNone(m.output_tps_p50)
+            self.assertGreater(m.output_tps_p50, 50)
+            self.assertLess(m.output_tps_p50, 120)
+            # TTFT P50 / P99 in seconds.
+            self.assertAlmostEqual(m.ttft_p50_s, 0.8, places=3)
+            self.assertAlmostEqual(m.ttft_p99_s, 21.0, places=3)
+
+    def test_refuses_mismatch_when_server_info_disagrees(self):
+        bc = self._import_compare()
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {
+                "max_concurrency": 32,
+                "median_ttft_ms": 800.0, "p99_ttft_ms": 21000.0,
+                "median_tpot_ms": 4.0, "p99_tpot_ms": 12.0,
+                "output_lens": [100, 100], "ttfts": [0.5, 0.5],
+                "itls": [[0.01] * 99, [0.01] * 99],
+                "server_info": {"tp_size": 8, "page_size": 64,
+                                "disable_radix_cache": True},
+            }
+            ds_diff = dict(base)
+            ds_diff["server_info"] = {"tp_size": 4, "page_size": 64,
+                                       "disable_radix_cache": True}
+            p1 = self._write_jsonl(tmp, "base.jsonl", base)
+            p2 = self._write_jsonl(tmp, "ds.jsonl", ds_diff)
+            b_ctx, _ = bc._read_bench_jsonl(p1)
+            d_ctx, _ = bc._read_bench_jsonl(p2)
+            reasons = bc._match_or_refuse(b_ctx, d_ctx)
+            self.assertTrue(any("tp_size" in r for r in reasons),
+                            f"expected tp_size mismatch, got {reasons}")
+
+
 class TestMetrics(unittest.TestCase):
     def test_meta_info_shape(self):
         from sglang.srt.layers.attention.double_sparsity import metrics as m

@@ -425,31 +425,87 @@ def startup_sanity_probe(
             skipped_reason="placeholder_selector",
         )
 
-    # Real-selector path: build a synthetic K cache where one page has
-    # high projection signal on a known channel, and ask the selector to
-    # retrieve it. The selector is expected to put `needle_page` into
-    # `selected_indices`. Caller plumbs through the page-signature table.
-    device = mask.channel_selection.device
-    seq_len = haystack_pages * page_size
-    req_pool_indices = torch.tensor([0], dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
-    sparse_mask = torch.ones(1, haystack_pages, dtype=torch.int32, device=device)
+    # Real-selector path: plant a needle directly in the page-signature
+    # table (label-dim 0 set high at `needle_page`, low at the others), build
+    # a query that projects onto label-dim 0 via the loaded channel mask, and
+    # ask the selector to retrieve a SMALL top-K. The probe must discriminate
+    # the needle from the haystack — a trivial top_k >= haystack_pages passes
+    # by inclusion alone, so this overrides max_top_k to a sharp value.
+    table = getattr(selector, "page_signature_table", None)
+    if table is None:
+        msg = (
+            "channel mask sanity probe needs a bound page_signature_table "
+            "on the selector; got None. Call bind_runtime_data first."
+        )
+        if abort_on_placeholder:
+            raise RuntimeError(msg)
+        logger.warning(msg)
+        return SanityProbeResult(
+            passed=False,
+            score=0.0,
+            needle_position=needle_page,
+            selected_indices=None,
+            skipped_reason="no_page_signature_table",
+        )
 
-    queries = torch.zeros(
-        1, getattr(selector, "num_local_heads", 1), getattr(selector, "head_dim", 128),
-        device=device,
+    from sglang.srt.layers.attention.double_sparsity.selection_kernel import (
+        retrieve_topk_via_signatures,
     )
-    selected_indices, valid_lengths = selector.retrieve_topk(
-        queries=queries,
-        layer_id=0,
-        req_pool_indices=req_pool_indices,
-        sparse_mask=sparse_mask,
-        seq_lens=seq_lens,
-    )
+
+    device = table.signatures.device
+    num_heads = int(getattr(selector, "num_local_heads", table.signatures.shape[2]))
+    head_dim = int(getattr(selector, "head_dim", 128))
+    layer_id = 0
+
+    # Move per-layer mask slices onto the table device.
+    sel_layer = mask.channel_selection[layer_id].to(device)  # [H, label_dim] int32
+    w_layer = mask.channel_weights[layer_id].to(device)  # [H, label_dim] fp32
+
+    # Snapshot the layer's signatures and valid_mask so we can restore on exit.
+    sig_snapshot = table.signatures[layer_id, :haystack_pages].clone()
+    valid_snapshot = table.valid_mask[layer_id, :haystack_pages].clone()
+
+    try:
+        # Plant: weak baseline along label-dim 0, strong signal at needle_page.
+        table.signatures[layer_id, :haystack_pages].zero_()
+        table.signatures[layer_id, :haystack_pages, :, 0] = 0.1
+        table.signatures[layer_id, needle_page, :, 0] = 10.0
+        table.valid_mask[layer_id, :haystack_pages] = True
+
+        # Build a query that, when projected through (sel_layer, w_layer),
+        # has its first label-dim slot equal to ~1.0 per head.
+        queries = torch.zeros(1, num_heads, head_dim, device=device, dtype=torch.float32)
+        for h in range(min(num_heads, sel_layer.shape[0])):
+            ch_idx = int(sel_layer[h, 0].item())
+            if ch_idx >= head_dim:
+                continue
+            weight = float(w_layer[h, 0].item())
+            queries[0, h, ch_idx] = 1.0 / weight if abs(weight) > 1e-6 else 1.0
+
+        # Sharp top-K so the probe must discriminate.
+        probe_top_k = max(1, haystack_pages // 4)
+        per_request_valid = torch.zeros(
+            1, table.signatures.shape[1], dtype=torch.bool, device=device
+        )
+        per_request_valid[0, :haystack_pages] = True
+
+        selected_indices, valid_lengths = retrieve_topk_via_signatures(
+            queries=queries,
+            page_signatures=table.signatures,
+            valid_mask=table.valid_mask,
+            channel_selection=mask.channel_selection.to(device),
+            channel_weights=mask.channel_weights.to(device),
+            layer_id=layer_id,
+            max_top_k=probe_top_k,
+            per_request_valid=per_request_valid,
+        )
+    finally:
+        table.signatures[layer_id, :haystack_pages] = sig_snapshot
+        table.valid_mask[layer_id, :haystack_pages] = valid_snapshot
 
     row = selected_indices[0]
     length = int(valid_lengths[0])
-    unpadded = row[:length].tolist()
+    unpadded = [int(v) for v in row[:length].tolist() if v >= 0]
     passed = needle_page in unpadded
     score = 1.0 if passed else 0.0
     return SanityProbeResult(

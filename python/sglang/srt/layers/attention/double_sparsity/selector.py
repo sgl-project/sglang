@@ -13,6 +13,7 @@ The class does NOT inherit from any HiSparse base and is NOT registered in
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Optional, Sequence, Tuple
 
 import torch
@@ -108,6 +109,18 @@ class DoubleSparsitySelector:
                 "artifact is TP-agnostic (H_full); call "
                 "channel_mask.slice_per_rank(mask, num_local_heads=..., rank=..., "
                 "tp_size=...) before bind_runtime_data."
+            )
+
+        # The mask is typically loaded from disk on CPU while the page
+        # signature table + queries live on the selector's device. Align the
+        # mask tensors to the table's device so retrieve_topk's torch.gather
+        # and weight-multiply don't trip a device mismatch.
+        target_device = page_signature_table.signatures.device
+        if channel_mask.channel_selection.device != target_device:
+            channel_mask = replace(
+                channel_mask,
+                channel_selection=channel_mask.channel_selection.to(target_device),
+                channel_weights=channel_mask.channel_weights.to(target_device),
             )
 
         self.page_signature_table = page_signature_table
