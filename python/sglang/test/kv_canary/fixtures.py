@@ -308,7 +308,6 @@ def _attach_fake_dsv4(
     pool: FakeDsv4Pool,
     device: torch.device,
     read_bytes: int,
-    allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
     """MLA-style packed pool (single ``kv_buffer`` per sub-pool, no V half). Real DSV4's
     multi-segment c4/indexer/c128 layout isn't replicated in the fake — each sub-pool gets a
