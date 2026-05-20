@@ -236,7 +236,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)
 
-    def test_sweep_path_detects_chain_mismatch(self):
+    def test_sweep_path_launches_sweep_kernels(self):
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
