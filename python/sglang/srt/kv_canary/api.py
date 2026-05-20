@@ -49,9 +49,6 @@ def install_canary(
        only — they execute inside cuda graph capture region and therefore get captured into the
        graph, auto-replaying every step.
 
-    NO patching of CudaGraphRunner / EAGLEDraftCudaGraphRunner / PiecewiseCudaGraphRunner /
-    BreakableCudaGraphRunner / any speculative graph runner subclass.
-
     The host-side hooks are exposed as a single context manager
     ``canary_runner.with_forward_pass(forward_batch)``. ``ModelRunner.forward`` wraps its
     ``_forward_raw(...)`` call with that context (falling back to contextlib.nullcontext when
