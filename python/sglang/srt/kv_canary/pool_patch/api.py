@@ -1,28 +1,46 @@
 from __future__ import annotations
 
-from typing import (
-    Callable,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Protocol,
-    Type,
-)
+from typing import Callable, Dict, Optional, Type
 
 import torch
 
-from sglang.jit_kernel.kv_canary_verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.pool_patch.utils import (
-    _CANARY_ATTACHED_ATTR,
-    _CANARY_BUFFER_GROUPS_ATTR,
-    _build_buffer_group,
-    _ensure_swa_lut_int32,
-    _resolve_read_bytes,
+from sglang.srt.kv_canary.pool_patch.adapters.dsv4 import attach_dsv4
+from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
+from sglang.srt.kv_canary.pool_patch.adapters.mla import attach_mla, attach_nsa
+from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
+from sglang.srt.kv_canary.pool_patch.utils import resolve_read_bytes
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    KVCache,
+    MHATokenToKVPool,
+    MHATokenToKVPoolFP4,
+    MLATokenToKVPool,
+    MLATokenToKVPoolFP4,
+    NSATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+PoolAttacher = Callable[..., tuple[CanaryBufferGroup, ...]]
+
+_CANARY_ATTACHED_ATTR = "_kv_canary_attached"
+_CANARY_BUFFER_GROUPS_ATTR = "_kv_canary_buffer_groups"
+
+_POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
+    MHATokenToKVPool: attach_mha,
+    MHATokenToKVPoolFP4: attach_mha,
+    MLATokenToKVPool: attach_mla,
+    MLATokenToKVPoolFP4: attach_mla,
+    NSATokenToKVPool: attach_nsa,
+    SWAKVPool: attach_swa,
+    DeepSeekV4TokenToKVPool: attach_dsv4,
+}
+
+
+def register_pool_attacher(pool_class: Type, attacher: PoolAttacher) -> None:
+    """Register an attacher for an additional pool class. Used by tests with fake pools."""
+    _POOL_ATTACHERS[pool_class] = attacher
 
 
 def attach_canary_buffers(
@@ -32,63 +50,43 @@ def attach_canary_buffers(
     device: torch.device,
     allocator: Optional[object] = None,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple (1 entry per
-    pool sub-group: FULL only, or FULL + SWA). Patches the pool's get_contiguous_buf_infos to expose
-    canary slots at head and tail so the rest of sglang's plumbing (PD transfer, hicache, etc.) sees
-    them as first-class KV bytes.
+    """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple
+    (1 entry per pool sub-group: FULL only, or FULL + SWA). Patches the pool's
+    ``get_contiguous_buf_infos`` (and ``get_state_buf_infos`` for SWA pools) to expose canary slots
+    at head and tail so the rest of sglang's plumbing (PD transfer, hicache, etc.) sees them as
+    first-class KV bytes.
 
-    Per-pool dispatch is done via a registered adapter (CanaryPoolAdapter) keyed on pool kind. Adapters
-    own the layout knowledge: where to insert head/tail canary buffers in the pool's internal storage,
-    how to expose RealKvSource for the canary's real-KV mixin, and which monkeypatches are needed.
+    Per-pool dispatch is via a small ``type(pool) -> attacher`` table. New pool classes (including
+    test fakes) register via :func:`register_pool_attacher`.
 
-    Idempotent: calling twice on the same pool is an error (raises). To re-attach, detach first.
+    Idempotent: calling twice on the same pool raises. To re-attach, detach first.
 
-    allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Required for
-    SWA pools whose ``full_to_swa_index_mapping`` LUT is stored as int64: canary kernels read the LUT as
-    int32, so an int32 mirror is stashed on the pool and the allocator's LUT-mutating methods are
-    monkeypatched to mirror each allocation. Pools with an int32 LUT or no SWA group are left untouched.
+    allocator (optional): the SWA-aware token allocator wrapping this pool, when present. Required
+    for SWA pools whose ``full_to_swa_index_mapping`` LUT is stored as int64: canary kernels read the
+    LUT as int32, so an int32 mirror is stashed on the pool and the allocator's LUT-mutating methods
+    are monkeypatched to mirror each allocation. Pools with an int32 LUT or no SWA group are left
+    untouched.
     """
     if getattr(pool, _CANARY_ATTACHED_ATTR, False):
         raise RuntimeError(
             f"kv-canary: pool {type(pool).__name__} already has canary buffers attached"
         )
 
-    adapter = _resolve_adapter(pool)
-    read_bytes = _resolve_read_bytes(config)
-    groups: List[CanaryBufferGroup] = []
-
-    if adapter.is_swa(pool):
-        _ensure_swa_lut_int32(pool=pool, allocator=allocator)
-
-    full_group = _build_buffer_group(
-        pool=pool,
-        adapter=adapter,
-        kind=PoolKind.FULL,
-        device=device,
-        read_bytes=read_bytes,
-    )
-    adapter.install_full_group(pool, full_group)
-    groups.append(full_group)
-
-    if adapter.is_swa(pool):
-        swa_group = _build_buffer_group(
-            pool=pool,
-            adapter=adapter,
-            kind=PoolKind.SWA,
-            device=device,
-            read_bytes=read_bytes,
+    attacher = _POOL_ATTACHERS.get(type(pool))
+    if attacher is None:
+        raise NotImplementedError(
+            f"kv-canary: no attacher registered for pool class {type(pool).__name__}; "
+            f"supported: {sorted(cls.__name__ for cls in _POOL_ATTACHERS)}"
         )
-        adapter.install_swa_group(pool, swa_group)
-        groups.append(swa_group)
+
+    read_bytes = resolve_read_bytes(config)
+    groups = attacher(
+        pool=pool, device=device, read_bytes=read_bytes, allocator=allocator
+    )
 
     setattr(pool, _CANARY_ATTACHED_ATTR, True)
-    groups_tuple = tuple(groups)
-    setattr(
-        pool,
-        _CANARY_BUFFER_GROUPS_ATTR,
-        {group.kind: group for group in groups_tuple},
-    )
-    return groups_tuple
+    setattr(pool, _CANARY_BUFFER_GROUPS_ATTR, {group.kind: group for group in groups})
+    return groups
 
 
 def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]:
@@ -101,82 +99,3 @@ def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]
             f"kv-canary: pool {type(pool).__name__} has no canary buffers attached"
         )
     return groups
-
-
-class CanaryPoolAdapter(Protocol):
-    """Per-pool-kind adapter. One implementation per pool class (MHATokenToKVPool, MLATokenToKVPool,
-    SWATokenToKVPool, FP4TokenToKVPool, NSATokenToKVPool, DSV4PackedPool, ...). Registered via
-    @register_canary_adapter(PoolClass) decorator at module import.
-
-    Each method is given the pool + a freshly-allocated CanaryBufferGroup (head + tail buffers already
-    allocated to the right slot count) and is responsible for wiring it into the pool.
-    """
-
-    def is_swa(self, pool: KVCache) -> bool:
-        """Return True iff this pool exposes a SWA sub-pool. If True, attach_canary_buffers allocates
-        two CanaryBufferGroup instances (FULL + SWA) and calls install_swa_group as well.
-        """
-
-    def has_v_half(self, pool: KVCache) -> bool:
-        """False for MLA-style pools (single tensor for compressed KV)."""
-
-    def install_full_group(
-        self,
-        pool: KVCache,
-        group: CanaryBufferGroup,
-    ) -> None:
-        """Wire group.k_head / k_tail (+ v_head / v_tail if has_v_half) into the pool's FULL sub-pool.
-        Patches get_contiguous_buf_infos to prepend the head buffer and append the tail buffer to the
-        K/V buf list (per Rule: PD layout is k0 k1 ... kN v0 v1 ... vN — the head/tail canary buffers
-        sit at index 0 / N+1 within EACH half, not at the absolute ends of the combined list).
-        """
-
-    def install_swa_group(
-        self,
-        pool: KVCache,
-        group: CanaryBufferGroup,
-    ) -> None:
-        """Same as install_full_group but for the SWA sub-pool. Only called when is_swa returns True."""
-
-    def build_real_kv_sources(
-        self,
-        pool: KVCache,
-        kind: PoolKind,  # FULL or SWA
-        half: Literal["K", "V"],
-        read_bytes: int,
-    ) -> tuple[RealKvSource, ...]:
-        """Return up to 4 RealKvSource entries (kernels.md §2.4.1) describing the real-KV bytes the
-        canary should fingerprint for this (kind, half). read_bytes is the leading-byte budget per
-        slot per source. Empty tuple disables the mixin for this endpoint."""
-
-
-_ADAPTERS: Dict[Type, CanaryPoolAdapter] = {}
-
-
-def register_canary_adapter(
-    pool_class: Type,
-) -> Callable[[Type], Type]:
-    def _decorator(adapter_class: Type) -> Type:
-        _ADAPTERS[pool_class] = adapter_class()
-        return adapter_class
-
-    return _decorator
-
-
-def _resolve_adapter(pool: KVCache) -> CanaryPoolAdapter:
-    adapter = _ADAPTERS.get(type(pool))
-    if adapter is None:
-        raise NotImplementedError(
-            f"kv-canary: no CanaryPoolAdapter registered for pool class "
-            f"{type(pool).__name__}; supported: "
-            f"{sorted(cls.__name__ for cls in _ADAPTERS)}"
-        )
-    return adapter
-
-
-from sglang.srt.kv_canary.pool_patch.adapters import (  # noqa: F401  # side-effect: register adapters
-    dsv4,
-    mha,
-    mla,
-    swa,
-)

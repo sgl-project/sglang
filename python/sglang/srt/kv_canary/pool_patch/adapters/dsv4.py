@@ -1,108 +1,136 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Literal
+from typing import Any, Callable, List, Optional
 
-from sglang.jit_kernel.kv_canary_verify import RealKvSource
+import torch
+
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.pool_patch.api import register_canary_adapter
 from sglang.srt.kv_canary.pool_patch.utils import (
-    _BufInfoTriple,
-    _make_packed_source,
-    _make_row_source,
-    _splice_packed_buf_info,
-    _wrap_method,
+    BufInfoTriple,
+    alloc_canary_buf_pair,
+    ensure_swa_lut_int32,
+    make_packed_source,
+    make_row_source,
+    splice_segmented_buf_info,
+    swa_index_lut,
+    wrap_method,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 
-@register_canary_adapter(DeepSeekV4TokenToKVPool)
-class _DeepSeekV4Adapter:
-    def is_swa(self, pool: DeepSeekV4TokenToKVPool) -> bool:
-        return True
+def attach_dsv4(
+    *,
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+    allocator: Optional[object] = None,
+) -> tuple[CanaryBufferGroup, ...]:
+    """Attach canary buffers to a DSV4 packed pool.
 
-    def has_v_half(self, pool: DeepSeekV4TokenToKVPool) -> bool:
-        return False
+    FULL group covers three segments (c4 / indexer / c128) and splices into ``get_contiguous_buf_infos``;
+    SWA group is a single-segment row pool and splices into ``get_state_buf_infos``.
+    """
+    ensure_swa_lut_int32(pool=pool, allocator=allocator)
 
-    def build_real_kv_sources(
-        self,
-        pool: DeepSeekV4TokenToKVPool,
-        kind: PoolKind,
-        half: Literal["K", "V"],
-        read_bytes: int,
-    ) -> tuple[RealKvSource, ...]:
-        if half == "V":
-            return ()
-        if kind is PoolKind.SWA:
-            swa_buf = pool.swa_kv_pool.kv_buffer[0]
-            return _make_row_source(layer_buffer=swa_buf, read_bytes=read_bytes)
+    full_group = _build_full_group(pool=pool, device=device, read_bytes=read_bytes)
+    swa_group = _build_swa_group(pool=pool, device=device, read_bytes=read_bytes)
 
-        c4_buf = pool.c4_kv_pool.kv_buffer[0]
-        c4_page_size = pool.c4_kv_pool.page_size
-        c4_bytes_per_token = pool.c4_kv_pool.get_bytes_per_token()
-        c4_sources = _make_packed_source(
-            page_buffer=c4_buf,
-            page_size=c4_page_size,
-            bytes_per_token=c4_bytes_per_token,
+    _patch_contiguous_buf_info(pool, group=full_group)
+    _patch_state_buf_info(pool, group=swa_group)
+
+    return (full_group, swa_group)
+
+
+def _build_full_group(
+    *,
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+) -> CanaryBufferGroup:
+    c4_pool = pool.c4_kv_pool
+    indexer_pool = pool.c4_indexer_kv_pool
+    c128_pool = pool.c128_kv_pool
+
+    num_slots = int(c4_pool.kv_buffer[0].shape[0]) * c4_pool.page_size
+    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+
+    indexer_buf = indexer_pool.index_k_with_scale_buffer[0]
+    indexer_bytes_per_token = int(indexer_buf.shape[1]) // indexer_pool.page_size
+
+    sources = (
+        make_packed_source(
+            page_buffer=c4_pool.kv_buffer[0],
+            page_size=c4_pool.page_size,
+            bytes_per_token=c4_pool.get_bytes_per_token(),
             read_bytes=read_bytes,
         )
-
-        indexer_buf = pool.c4_indexer_kv_pool.index_k_with_scale_buffer[0]
-        indexer_page_size = pool.c4_indexer_kv_pool.page_size
-        indexer_bytes_per_token = int(indexer_buf.shape[1]) // indexer_page_size
-        indexer_sources = _make_packed_source(
+        + make_packed_source(
             page_buffer=indexer_buf,
-            page_size=indexer_page_size,
+            page_size=indexer_pool.page_size,
             bytes_per_token=indexer_bytes_per_token,
             read_bytes=read_bytes,
         )
-
-        c128_buf = pool.c128_kv_pool.kv_buffer[0]
-        c128_page_size = pool.c128_kv_pool.page_size
-        c128_bytes_per_token = pool.c128_kv_pool.get_bytes_per_token()
-        c128_sources = _make_packed_source(
-            page_buffer=c128_buf,
-            page_size=c128_page_size,
-            bytes_per_token=c128_bytes_per_token,
+        + make_packed_source(
+            page_buffer=c128_pool.kv_buffer[0],
+            page_size=c128_pool.page_size,
+            bytes_per_token=c128_pool.get_bytes_per_token(),
             read_bytes=read_bytes,
         )
+    )
 
-        return c4_sources + indexer_sources + c128_sources
+    return CanaryBufferGroup(
+        kind=PoolKind.FULL,
+        k_head=k_head,
+        k_tail=k_tail,
+        v_head=None,
+        v_tail=None,
+        real_kv_sources_k=sources,
+        real_kv_sources_v=(),
+        swa_index_lut=None,
+    )
 
-    def install_full_group(
-        self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
-    ) -> None:
-        _patch_dsv4_contiguous_buf_info(pool, group=group)
 
-    def install_swa_group(
-        self, pool: DeepSeekV4TokenToKVPool, group: CanaryBufferGroup
-    ) -> None:
-        _patch_dsv4_state_buf_info(pool, group=group)
-
-
-def _patch_dsv4_contiguous_buf_info(
-    pool: DeepSeekV4TokenToKVPool,
+def _build_swa_group(
     *,
-    group: CanaryBufferGroup,
-) -> None:
+    pool: object,
+    device: torch.device,
+    read_bytes: int,
+) -> CanaryBufferGroup:
+    swa_pool = pool.swa_kv_pool
+    num_slots = int(swa_pool.kv_buffer[0].shape[0]) * swa_pool.page_size
+    k_head, k_tail = alloc_canary_buf_pair(num_slots=num_slots, device=device)
+    return CanaryBufferGroup(
+        kind=PoolKind.SWA,
+        k_head=k_head,
+        k_tail=k_tail,
+        v_head=None,
+        v_tail=None,
+        real_kv_sources_k=make_row_source(
+            layer_buffer=swa_pool.kv_buffer[0], read_bytes=read_bytes
+        ),
+        real_kv_sources_v=(),
+        swa_index_lut=swa_index_lut(pool),
+    )
+
+
+def _patch_contiguous_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
     c4_layer_num = len(pool.c4_kv_pool.kv_buffer)
     indexer_layer_num = len(pool.c4_indexer_kv_pool.index_k_with_scale_buffer)
     c128_layer_num = len(pool.c128_kv_pool.kv_buffer)
-    segment_offsets = [
+    segment_offsets: List[int] = [
         0,
         c4_layer_num,
         c4_layer_num + indexer_layer_num,
     ]
     expected_total = c4_layer_num + indexer_layer_num + c128_layer_num
-
     page_size = pool.page_size
 
-    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> _BufInfoTriple:
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:
         ptrs, lens, item_lens = original(*args, **kwargs)
         if len(ptrs) != expected_total:
             raise RuntimeError(
                 f"DSV4 buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
             )
-        return _splice_packed_buf_info(
+        return splice_segmented_buf_info(
             ptrs=ptrs,
             lens=lens,
             item_lens=item_lens,
@@ -111,14 +139,10 @@ def _patch_dsv4_contiguous_buf_info(
             page_size=page_size,
         )
 
-    _wrap_method(pool, "get_contiguous_buf_infos", wrapper=_with_splice)
+    wrap_method(pool, "get_contiguous_buf_infos", wrapper=_with_splice)
 
 
-def _patch_dsv4_state_buf_info(
-    pool: DeepSeekV4TokenToKVPool,
-    *,
-    group: CanaryBufferGroup,
-) -> None:
+def _patch_state_buf_info(pool: object, *, group: CanaryBufferGroup) -> None:
     swa_layer_num = len(pool.swa_kv_pool.kv_buffer)
     compress_state_count = sum(1 for p in pool.compress_state_pools if p is not None)
     indexer_compress_state_count = sum(
@@ -129,22 +153,21 @@ def _patch_dsv4_state_buf_info(
             "kv-canary: DSV4 SWA segmentation has empty compress_state_pools and "
             "indexer_compress_state_pools — cannot splice head/tail canary per segment"
         )
-    segment_offsets = [
+    segment_offsets: List[int] = [
         0,
         swa_layer_num,
         swa_layer_num + compress_state_count,
     ]
     expected_total = swa_layer_num + compress_state_count + indexer_compress_state_count
-
     page_size = pool.page_size
 
-    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> _BufInfoTriple:
+    def _with_splice(original: Callable, *args: Any, **kwargs: Any) -> BufInfoTriple:
         ptrs, lens, item_lens = original(*args, **kwargs)
         if len(ptrs) != expected_total:
             raise RuntimeError(
                 f"DSV4 state buf_info layout drifted: got {len(ptrs)}, expected {expected_total}"
             )
-        return _splice_packed_buf_info(
+        return splice_segmented_buf_info(
             ptrs=ptrs,
             lens=lens,
             item_lens=item_lens,
@@ -153,4 +176,4 @@ def _patch_dsv4_state_buf_info(
             page_size=page_size,
         )
 
-    _wrap_method(pool, "get_state_buf_infos", wrapper=_with_splice)
+    wrap_method(pool, "get_state_buf_infos", wrapper=_with_splice)
