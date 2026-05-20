@@ -92,10 +92,12 @@ class SWAKVPool(BaseSWAKVPool):
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
-        # Cached per-batch SWA loc translation (same pattern as DSV4 cached_loc).
-        # Invalidated when layer_id_pool == 0 (first SWA layer of a new batch),
-        # which guarantees recomputation at the start of every forward pass.
+        # Per-batch translation cache: keyed on loc.data_ptr() so the result is
+        # reused for every SWA layer that sees the same loc tensor in one forward
+        # pass, without relying on layer ordering. Both set_kv_buffer and any
+        # direct calls to translate_loc_from_full_to_swa() share this cache.
         self._cached_swa_loc: Optional[torch.Tensor] = None
+        self._cached_loc_ptr: Optional[int] = None
 
         k_size, v_size = self.get_kv_size_bytes()
         self.mem_usage = (k_size + v_size) / GB
@@ -162,12 +164,22 @@ class SWAKVPool(BaseSWAKVPool):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
-    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_swa_index_mapping is not None
 
-        # Note: kv_indices could have -1 values (from alloc_extend), which will be mapped to -1
-        # since the last item of full_to_swa_index_mapping is -1.
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        # Cache on data_ptr: same underlying buffer = same result, regardless of
+        # which caller (set_kv_buffer or trtllm_mha_backend._get_layer_cache_loc).
+        # Invalidated automatically when a new batch brings a different loc tensor.
+        ptr = kv_indices.data_ptr()
+        if self._cached_loc_ptr != ptr:
+            # Note: kv_indices could have -1 values (from alloc_extend), which
+            # will be mapped to -1 since the last item of full_to_swa_index_mapping
+            # is -1.
+            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
+                torch.int32
+            )
+            self._cached_loc_ptr = ptr
+        return self._cached_swa_loc
 
     def set_kv_buffer(
         self,
@@ -182,13 +194,9 @@ class SWAKVPool(BaseSWAKVPool):
         layer_id = layer.layer_id
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
         if is_swa_layer:
-            # Translate once per batch: layer_id_pool == 0 is the first SWA
-            # layer in every forward pass, so it acts as a per-batch invalidation
-            # signal. All subsequent SWA layers reuse the cached result.
-            # Mirrors the `layer_id == self.start_layer` pattern in DSV4.
-            if layer_id_pool == 0:
-                self._cached_swa_loc = self.translate_loc_from_full_to_swa(loc)
-            loc = self._cached_swa_loc
+            # translate_loc_from_full_to_swa() is memoised on loc.data_ptr():
+            # O(1) for all but the first SWA layer per batch.
+            loc = self.translate_loc_from_full_to_swa(loc)
             self.swa_kv_pool.set_kv_buffer(
                 None,
                 loc,
