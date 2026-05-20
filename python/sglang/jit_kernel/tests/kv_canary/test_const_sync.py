@@ -159,10 +159,10 @@ def test_fail_reason_bits() -> None:
 
 
 def test_real_kv_hash_mode_enum() -> None:
-    """C++ ``RealKvHashMode {kOff, kBit, kAll}`` parity with Python ``RealKvHashMode``."""
+    """C++ ``RealKvHashMode {kOff, kPartial, kAll}`` parity with Python ``RealKvHashMode``."""
     members = _parse_enum_values(source=_read_cuh(), enum_name="RealKvHashMode")
     assert members["kOff"] == int(RealKvHashMode.OFF)
-    assert members["kBit"] == int(RealKvHashMode.BIT)
+    assert members["kPartial"] == int(RealKvHashMode.PARTIAL)
     assert members["kAll"] == int(RealKvHashMode.ALL)
 
 

@@ -84,7 +84,9 @@ def _stamp_clean_chain(
 
 
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
-    hash_mode = rng.choice([RealKvHashMode.OFF, RealKvHashMode.BIT, RealKvHashMode.ALL])
+    hash_mode = rng.choice(
+        [RealKvHashMode.OFF, RealKvHashMode.PARTIAL, RealKvHashMode.ALL]
+    )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])
     bytes_per = rng.choice([8, 64, 128])

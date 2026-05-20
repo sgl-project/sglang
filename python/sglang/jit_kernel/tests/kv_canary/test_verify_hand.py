@@ -672,8 +672,8 @@ def _run_real_kv_mode_byte_equal_case(mode: RealKvHashMode) -> None:
     assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
-def test_real_kv_mode_bit_byte_equal() -> None:
-    _run_real_kv_mode_byte_equal_case(RealKvHashMode.BIT)
+def test_real_kv_mode_partial_byte_equal() -> None:
+    _run_real_kv_mode_byte_equal_case(RealKvHashMode.PARTIAL)
 
 
 def test_real_kv_mode_all_byte_equal() -> None:
@@ -1673,16 +1673,27 @@ def test_violation_bit_injection_position_ring_state_matrix(
         ), "write_index did not advance beyond ring_capacity after overflow"
 
 
-def _hand_fold_bit(raw_bytes: bytes) -> int:
-    """BIT-mode fold: parity of low bits across all read bytes, then splitmix64 mix into acc=0."""
+def _hand_fold_partial(raw_bytes: bytes) -> int:
+    """PARTIAL-mode fold: first min(16, len) bytes, little-endian word-pack + splitmix64, same as ALL."""
     _u64 = (1 << 64) - 1
-    parity = sum(b & 1 for b in raw_bytes) & 1
-    source_hash = parity
-    combined = 0 ^ source_hash
-    x = combined & _u64
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _u64
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _u64
-    return (x ^ (x >> 31)) & _u64
+
+    def _sm64(v: int) -> int:
+        v = v & _u64
+        v = ((v ^ (v >> 30)) * 0xBF58476D1CE4E5B9) & _u64
+        v = ((v ^ (v >> 27)) * 0x94D049BB133111EB) & _u64
+        return (v ^ (v >> 31)) & _u64
+
+    truncated = raw_bytes[: min(16, len(raw_bytes))]
+    pad = (8 - len(truncated) % 8) % 8
+    padded = bytes(truncated) + bytes(pad)
+    num_words = len(padded) // 8
+    acc = 0
+    for w in range(num_words):
+        chunk = padded[w * 8 : (w + 1) * 8]
+        word = sum(b << (8 * k) for k, b in enumerate(chunk))
+        acc = _sm64(acc ^ word)
+    source_hash = acc
+    return _sm64(0 ^ source_hash)
 
 
 def _hand_fold_all(raw_bytes: bytes) -> int:
@@ -1710,10 +1721,10 @@ def _hand_fold_all(raw_bytes: bytes) -> int:
 @pytest.mark.parametrize(
     "mode,fold_fn,expected_hash",
     [
-        (RealKvHashMode.BIT, _hand_fold_bit, 0x5692161D100B05E5),
+        (RealKvHashMode.PARTIAL, _hand_fold_partial, 0xC4C41792E6578644),
         (RealKvHashMode.ALL, _hand_fold_all, 0xC4C41792E6578644),
     ],
-    ids=["bit", "all"],
+    ids=["partial", "all"],
 )
 def test_real_kv_hash_fold_mode_hardcoded(
     mode: RealKvHashMode,
@@ -1985,7 +1996,7 @@ def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
             stored_prev_hash_signed=chain_anchor_signed(),
             stored_real_kv_hash_signed=to_signed_int64(stored_rkv_val),
             real_kv_sources=sources_cuda,
-            real_kv_hash_mode=RealKvHashMode.BIT,
+            real_kv_hash_mode=RealKvHashMode.PARTIAL,
         )
     )
 
@@ -2076,12 +2087,11 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
     assert int(cuda_log.write_index[0].item()) == 0
 
 
-def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
-    """BIT mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
+def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
+    """PARTIAL mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
     cuda_buf, ref_buf = _setup_pair_with_canned_chain()
     sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=8, device=_DEVICE)
     slot_idx = 3
-    rkv_clean = 0
     row_bytes = (
         sources_cuda[0]
         .tensor[slot_idx, : sources_cuda[0].read_bytes]
@@ -2089,10 +2099,7 @@ def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
         .cpu()
         .tolist()
     )
-    fold = 0
-    for b in row_bytes:
-        fold ^= int(b) & 1
-    rkv_clean = fold
+    rkv_clean = _hand_fold_partial(bytes(row_bytes))
     for buf in (cuda_buf, ref_buf):
         write_slot_fields(
             canary_buf=buf,
@@ -2138,7 +2145,7 @@ def test_real_kv_hash_bit_mode_detects_single_bit_flip() -> None:
         ref_log=ref_log,
         real_kv_sources_cuda=sources_cuda,
         real_kv_sources_ref=sources_ref,
-        real_kv_hash_mode=RealKvHashMode.BIT,
+        real_kv_hash_mode=RealKvHashMode.PARTIAL,
     )
 
     assert int(cuda_log.write_index[0].item()) >= 1

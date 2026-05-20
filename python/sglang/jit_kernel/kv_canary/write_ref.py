@@ -75,20 +75,28 @@ def canary_write_step_torch_reference(
     if active_reqs <= 0:
         return
 
-    write_offsets_host = plan.write_offsets.detach().to(device=work_device, dtype=torch.int64)
+    write_offsets_host = plan.write_offsets.detach().to(
+        device=work_device, dtype=torch.int64
+    )
     seed_slot_indices_host = plan.write_seed_slot_indices[:active_reqs].to(
         device=work_device, dtype=torch.int64
     )
     fb_input_ids_host = fb_input_ids.detach().to(device=work_device, dtype=torch.int64)
     fb_positions_host = fb_positions.detach().to(device=work_device, dtype=torch.int64)
-    fb_out_cache_loc_host = fb_out_cache_loc.detach().to(device=work_device, dtype=torch.int64)
+    fb_out_cache_loc_host = fb_out_cache_loc.detach().to(
+        device=work_device, dtype=torch.int64
+    )
 
     total_entries = int(write_offsets_host[active_reqs].item())
     if total_entries <= 0:
         return
 
     buf_i64 = (
-        canary_buf.detach().to(device=work_device).contiguous().view(torch.int64).clone()
+        canary_buf.detach()
+        .to(device=work_device)
+        .contiguous()
+        .view(torch.int64)
+        .clone()
     )
     slot_stride_i64 = int(buf_i64.shape[1])
     if slot_stride_i64 < 4:
@@ -99,7 +107,9 @@ def canary_write_step_torch_reference(
     chain_anchor_u64 = _splitmix64_python(CANARY_CHAIN_ANCHOR)
 
     pseudo_mode_on = int(pseudo_mode) != int(CanaryPseudoMode.OFF)
-    pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(device=work_device, dtype=torch.int64)
+    pseudo_expected_tokens_host = pseudo_expected_tokens.detach().to(
+        device=work_device, dtype=torch.int64
+    )
     pseudo_expected_positions_host = pseudo_expected_positions.detach().to(
         device=work_device, dtype=torch.int64
     )
@@ -160,7 +170,9 @@ def canary_write_step_torch_reference(
                     row[_VIOLATION_FIELD_POSITION] = position
                     row[_VIOLATION_FIELD_STORED_TOKEN] = token
                     row[_VIOLATION_FIELD_EXPECTED_TOKEN] = expected_token
-                    row[_VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(running_prev_hash)
+                    row[_VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                        running_prev_hash
+                    )
                     row[_VIOLATION_FIELD_EXPECTED_AUX] = expected_position
                     row[_VIOLATION_FIELD_FAIL_REASON_BITS] = mismatch_bits
                     violation_rows.append(row)

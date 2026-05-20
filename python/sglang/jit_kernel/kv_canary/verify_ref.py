@@ -67,8 +67,12 @@ def canary_verify_step_torch_reference(
     if active <= 0:
         return
 
-    slot_indices_host = plan.verify_slot_indices[:active].to(device=work_device, dtype=torch.int64)
-    expected_positions_host = plan.verify_positions[:active].to(device=work_device, dtype=torch.int64)
+    slot_indices_host = plan.verify_slot_indices[:active].to(
+        device=work_device, dtype=torch.int64
+    )
+    expected_positions_host = plan.verify_positions[:active].to(
+        device=work_device, dtype=torch.int64
+    )
     prev_slot_indices_host = plan.verify_prev_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
@@ -205,9 +209,10 @@ def _compute_real_kv_hash_scalar(
 ) -> int:
     """Compute one uint64 real-KV fingerprint for a single slot index.
 
-    Off mode or no sources -> 0. BIT mode -> XOR-fold low bit of each read byte. ALL mode ->
-    splitmix64-fold every 8-byte little-endian word (zero-padded). Each source's contribution is mixed
-    into the running accumulator via splitmix64(acc ^ source_hash).
+    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold first min(16, read_bytes) bytes
+    (little-endian word-pack, at most 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian
+    word (zero-padded). Each source's contribution is mixed into the running accumulator via
+    splitmix64(acc ^ source_hash). When read_bytes <= 16, PARTIAL and ALL produce identical hashes.
     """
     mode = int(real_kv_hash_mode)
     if mode == int(RealKvHashMode.OFF) or len(real_kv_sources) == 0:
@@ -230,19 +235,14 @@ def _compute_real_kv_hash_scalar(
         col_within_page = slot_idx % page_size
         col_start = col_within_page * num_bytes_per_token
 
+        effective_read_bytes = (
+            min(16, read_bytes) if mode == int(RealKvHashMode.PARTIAL) else read_bytes
+        )
         raw_bytes: list[int] = []
-        for b in range(read_bytes):
+        for b in range(effective_read_bytes):
             raw_bytes.append(int(tensor_u8[row, col_start + b].item()))
 
-        if mode == int(RealKvHashMode.BIT):
-            xor_fold = 0
-            for byte_val in raw_bytes:
-                xor_fold ^= byte_val & 1
-            source_hash = xor_fold & _U64_MASK
-        elif mode == int(RealKvHashMode.ALL):
-            source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
-        else:
-            raise ValueError(f"kv-canary: unknown RealKvHashMode {mode}")
+        source_hash = _splitmix64_fold_bytes_scalar(raw_bytes=raw_bytes)
 
         combined = acc ^ source_hash
         acc = _splitmix64_python(combined)
@@ -270,6 +270,7 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
 
 # The vectorised helpers below are kept because write_ref.py (and the real-KV path in verify) originally
 # imported them. They remain correct but are no longer called from the main verify loop above.
+
 
 def _splitmix64_finalize_vec(words: torch.Tensor) -> torch.Tensor:
     """Vectorised splitmix64 finalizer on a flat int64 tensor."""

@@ -190,7 +190,7 @@ def canary_write_step(
         kernel_run_counter: Health counter, shape [1], int64. Incremented by 1 per call.
         real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
             tuple disables the mixin. Folded sequentially via splitmix64 to produce one int64 fingerprint per slot.
-        real_kv_hash_mode: RealKvHashMode (OFF / BIT / ALL). Applies uniformly across all sources.
+        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
 
     Implementation:
         - CUDA __global__ `canary_write_kernel`: 1-D grid `(write_req_capacity, 1, 1)` blocks × `(1, 1, 1)` thread
