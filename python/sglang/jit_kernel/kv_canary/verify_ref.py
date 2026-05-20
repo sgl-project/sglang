@@ -80,6 +80,17 @@ def canary_verify_step_torch_reference(
     prev_slot_indices = plan.verify_prev_slot_indices[:active].to(
         device=work_device, dtype=torch.int64
     )
+    # sglang reserves KV slot 0 as the padded-output sink (memory_pool.py free_slots
+    # starts at 1); req_to_token entries of 0 mean "unfilled position" (e.g.
+    # page-padded range beyond real tokens). Skip those entries to mirror the CUDA
+    # kernel's early return at canary_verify.cuh.
+    pad_mask = slot_indices != 0
+    if not bool(pad_mask.all()):
+        slot_indices = slot_indices[pad_mask]
+        expected_positions = expected_positions[pad_mask]
+        prev_slot_indices = prev_slot_indices[pad_mask]
+        if slot_indices.numel() == 0:
+            return
 
     buf_i64 = canary_buf.detach().to(device=work_device).contiguous().view(torch.int64)
     slot_stride_i64 = (
