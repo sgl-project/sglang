@@ -2510,7 +2510,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # Avoid GPU .sum().item() D2H here; consolidated sync is at forward
+        # entry (scheduler.py). seq_lens_cpu may be one iter stale in spec_v2
+        # overlap, but it gets refreshed before any forward consumer reads.
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
         if self.output_ids is not None:
             self.output_ids = self.output_ids[keep_indices_device]
