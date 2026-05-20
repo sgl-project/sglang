@@ -190,45 +190,6 @@ def make_padding_mask(
     raise ValueError(f"unknown PaddingKind: {kind}")
 
 
-ExtrasKind = Literal["none", "few", "tile_boundary_64", "many_129"]
-
-
-def make_extras(
-    *,
-    kind: ExtrasKind,
-    capacity: int,
-    device: torch.device,
-    rng: Optional[random.Random] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if kind == "none":
-        n_valid = 0
-    elif kind == "few":
-        if rng is None:
-            rng = random.Random(0)
-        n_valid = rng.randint(1, 6)
-    elif kind == "tile_boundary_64":
-        n_valid = 64
-    elif kind == "many_129":
-        n_valid = 129
-    else:
-        raise ValueError(f"unknown ExtrasKind: {kind}")
-    n_valid = min(n_valid, capacity)
-    slots = torch.zeros(capacity, dtype=torch.int32, device=device)
-    positions = torch.zeros(capacity, dtype=torch.int32, device=device)
-    prevs = torch.zeros(capacity, dtype=torch.int32, device=device)
-    if n_valid > 0:
-        if rng is None:
-            rng = random.Random(0)
-        slot_pool = rng.sample(range(500, 500 + max(1000, n_valid * 8)), k=n_valid)
-        slots[:n_valid] = torch.tensor(slot_pool, dtype=torch.int32, device=device)
-        pos_list = [rng.randint(0, 0xFFFF) for _ in range(n_valid)]
-        positions[:n_valid] = torch.tensor(pos_list, dtype=torch.int32, device=device)
-        prev_list = [-1] + slot_pool[: n_valid - 1]
-        prevs[:n_valid] = torch.tensor(prev_list, dtype=torch.int32, device=device)
-    num_valid = torch.tensor([n_valid], dtype=torch.int32, device=device)
-    return slots, positions, prevs, num_valid
-
-
 CapacityKind = Literal["loose", "tight_match", "under_by_one"]
 
 

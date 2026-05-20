@@ -93,13 +93,13 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
 }
 
 // Fold all configured real-KV sources for a given slot. Iterates sequentially and combines each source's
-// contribution via acc = splitmix64(acc XOR source_hash); matches _compute_real_kv_hash_vec in
+// contribution via acc = splitmix64(acc XOR source_hash); matches _compute_real_kv_hash_scalar in
 // kv_canary/verify_ref.py.
 //
 // In OFF mode the function returns 0 unconditionally (the running real_kv_hash field is always 0). Sources
 // with read_bytes == 0 contribute nothing (their source_hash is 0 and acc = splitmix64(acc ^ 0)).
 //
-// IMPORTANT: the Python ref ONLY enters the fold loop when read_bytes > 0 (see _compute_real_kv_hash_vec
+// IMPORTANT: the Python ref ONLY enters the fold loop when read_bytes > 0 (see _compute_real_kv_hash_scalar
 // in kv_canary/verify_ref.py: `if source.read_bytes <= 0: continue`). To stay byte-equal, this
 // helper must skip the splitmix64 step entirely for read_bytes == 0 sources rather than treating them as
 // "fold 0".
