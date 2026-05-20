@@ -1,6 +1,5 @@
-"""Basic sanity for stage-a with EAGLE3 spec decoding. Mirrors
-test_basic_sanity.py but launches the same target model with EAGLE3
-draft so the gate covers the spec-decoding path."""
+"""Stage-a basic sanity with EAGLE3 spec decoding enabled. Mirrors
+test_basic_sanity.py with the spec-decoding path active."""
 
 import unittest
 
@@ -10,6 +9,7 @@ from sglang.test.kits.basic_api_contract_kit import BasicAPIContractMixin
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
 from sglang.test.kits.basic_scheduler_stress_kit import BasicSchedulerStressMixin
 from sglang.test.kits.fwd_occupancy_kit import FwdOccupancyMixin
+from sglang.test.kits.hellaswag_kit import HellaswagMixin
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -28,12 +28,12 @@ class TestBasicSanityEagle3(
     BasicDecodeCorrectnessMixin,
     BasicSchedulerStressMixin,
     FwdOccupancyMixin,
+    HellaswagMixin,
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
-    # EAGLE3 spec decoding does more GPU work per wall-clock step than
-    # vanilla decode -- threshold can stay tight. Start at 97 like the
-    # vanilla gate; adjust per CI calibration.
+    # Match vanilla gate at 97; EAGLE3 spec should sustain similar
+    # single-batch occupancy. Adjust per CI calibration.
     fwd_occupancy_threshold = 97.0
 
     @classmethod
@@ -73,23 +73,6 @@ class TestBasicSanityEagle3(
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-
-    def test_accuracy_floor(self):
-        # Stage-a's own accuracy gate -- catches systematic regressions
-        # that pass every cheap probe but tank multi-choice reasoning.
-        import sglang as sgl
-        from sglang.test.test_programs import test_hellaswag_select
-
-        sgl.set_default_backend(sgl.RuntimeEndpoint(self.base_url))
-        try:
-            accuracy, _ = test_hellaswag_select()
-        finally:
-            sgl.set_default_backend(None)
-        self.assertGreater(
-            accuracy,
-            0.60,
-            f"hellaswag accuracy floor breached: {accuracy:.3f}",
-        )
 
 
 if __name__ == "__main__":

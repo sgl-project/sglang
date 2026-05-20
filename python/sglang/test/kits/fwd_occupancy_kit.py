@@ -38,9 +38,10 @@ class FwdOccupancyMixin:
 
     # Spec-decoding accept-length floor. Only enforced when the server
     # is running with a spec algorithm (avg_spec_accept_length present
-    # in /server_info); silently skipped otherwise. Below ~2.0 means
-    # spec barely accepts -- effectively falling back to vanilla.
-    spec_accept_length_threshold: float = 2.0
+    # in /server_info); silently skipped otherwise. EAGLE3 3/1/4 on
+    # 5090 + Llama-3.1-8B measured ~2.0 in CI; 1.8 leaves a small
+    # buffer while still catching silent fallback to vanilla (~1.0).
+    spec_accept_length_threshold: float = 1.8
 
     # Warmup: one short request to fill cuda graphs + get the
     # device-timer past its first NaN window.
@@ -122,7 +123,6 @@ class FwdOccupancyMixin:
         """Background-fire one long single-batch request, scrape
         /metrics on the foreground; return non-NaN samples."""
         samples = []
-        samples_lock = threading.Lock()
         request_done = threading.Event()
 
         def fire_one():
@@ -140,8 +140,7 @@ class FwdOccupancyMixin:
         while not request_done.is_set():
             v = self._scrape_fwd_occupancy()
             if v is not None:
-                with samples_lock:
-                    samples.append(v)
+                samples.append(v)
             time.sleep(self.fwd_occupancy_scrape_interval)
 
         firer.join(timeout=_GENERATE_REQUEST_TIMEOUT)
