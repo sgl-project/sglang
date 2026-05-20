@@ -24,7 +24,7 @@ from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
-from sglang.jit_kernel.tests.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     chain_anchor_signed,

@@ -23,7 +23,7 @@ from sglang.jit_kernel.kv_canary.write import (
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
-from sglang.jit_kernel.tests.canary_helpers import (
+from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
@@ -272,7 +272,7 @@ def test_seed_slot_chain_link_continuous() -> None:
 
     # Step 2: verify slot[2] with prev=7 — expects no violation.
     from sglang.jit_kernel.kv_canary.verify import canary_verify_step
-    from sglang.jit_kernel.tests.canary_helpers import make_verify_plan
+    from sglang.jit_kernel.tests.kv_canary.canary_helpers import make_verify_plan
 
     verify_plan = make_verify_plan(
         slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
@@ -545,7 +545,7 @@ def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     assert int(cuda_log.write_index[0].item()) == 3
     # Run a downstream verify — it must see no chain mismatch because chain advanced on actuals.
     from sglang.jit_kernel.kv_canary.verify import canary_verify_step
-    from sglang.jit_kernel.tests.canary_helpers import make_verify_plan
+    from sglang.jit_kernel.tests.kv_canary.canary_helpers import make_verify_plan
 
     verify_plan = make_verify_plan(
         slot_indices=[0, 1, 2],
