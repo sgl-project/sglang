@@ -13,7 +13,7 @@
 # ==============================================================================
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import ClassVar, Dict, Literal, Optional, Tuple
 
 import torch
 
@@ -32,16 +32,27 @@ class ExpertLocationDispatchInfo:
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
 
+    # Cache keyed on (id(metadata_object), layer_id). id() changes when
+    # rebalance installs a new metadata object, so dynamic-EPLB still gets
+    # fresh info after each rebalance. Static EPLB (placement loaded once,
+    # never updated) caches forever.
+    _cache: ClassVar[Dict[Tuple[int, int], "ExpertLocationDispatchInfo"]] = {}
+
     @classmethod
     def init_new(cls, layer_id: int):
         ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
-        expert_location_metadata = get_global_expert_location_metadata()
-        assert expert_location_metadata is not None
-
         if ep_dispatch_algorithm is None:
             return None
 
-        return cls(
+        expert_location_metadata = get_global_expert_location_metadata()
+        assert expert_location_metadata is not None
+
+        cache_key = (id(expert_location_metadata), layer_id)
+        cached = cls._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        info = cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
             partial_logical_to_rank_dispatch_physical_map=(
                 expert_location_metadata.logical_to_rank_dispatch_physical_map[
@@ -59,6 +70,8 @@ class ExpertLocationDispatchInfo:
             ],
             num_physical_experts=expert_location_metadata.num_physical_experts,
         )
+        cls._cache[cache_key] = info
+        return info
 
 
 def transform_select_experts_inputs(

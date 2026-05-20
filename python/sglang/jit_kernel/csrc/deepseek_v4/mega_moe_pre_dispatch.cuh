@@ -17,9 +17,10 @@ namespace {
 using deepseek_v4::fp8::cast_to_ue8m0;
 using deepseek_v4::fp8::pack_fp8;
 
+template <typename TopkIdxT>
 struct MegaMoEPreDispatchParams {
   const bf16_t* __restrict__ x;            // [num_tokens, hidden]
-  const int32_t* __restrict__ topk_idx;    // [num_tokens, top_k]
+  const TopkIdxT* __restrict__ topk_idx;   // [num_tokens, top_k]
   const float* __restrict__ topk_weights;  // [num_tokens, top_k]
 
   fp8_e4m3_t* __restrict__ buf_x;        // [padded_max, hidden]
@@ -35,9 +36,9 @@ struct MegaMoEPreDispatchParams {
 };
 
 // kGroupSize must match sglang_per_token_group_quant_fp8_ue8m0(group_size=).
-template <uint32_t kGroupSize, bool kUsePDL>
+template <uint32_t kGroupSize, bool kUsePDL, typename TopkIdxT>
 __global__ __launch_bounds__(1024, 2) void  //
-    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams __grid_constant__ params) {
+    mega_moe_pre_dispatch_kernel(const MegaMoEPreDispatchParams<TopkIdxT> __grid_constant__ params) {
   using namespace device;
 
   constexpr uint32_t kVecElems = 8;  // 8 bf16 = 16B load per thread
@@ -120,10 +121,10 @@ __global__ __launch_bounds__(1024, 2) void  //
 // ---- Host wrapper
 // ------------------------------------------------------------------------------------------------------------------------
 
-template <int64_t kGroupSize, bool kUsePDL>
+template <int64_t kGroupSize, bool kUsePDL, typename TopkIdxT>
 struct MegaMoEPreDispatchKernel {
   static_assert(kGroupSize == 32 || kGroupSize == 64 || kGroupSize == 128, "unsupported group_size");
-  static constexpr auto kernel = mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL>;
+  static constexpr auto kernel = mega_moe_pre_dispatch_kernel<static_cast<uint32_t>(kGroupSize), kUsePDL, TopkIdxT>;
 
   static void
   run(const tvm::ffi::TensorView x,
@@ -148,7 +149,7 @@ struct MegaMoEPreDispatchKernel {
         .with_device(device)
         .verify(x);
     TensorMatcher({M, K})  // topk_idx
-        .with_dtype<int32_t>()
+        .with_dtype<TopkIdxT>()
         .with_device(device)
         .verify(topk_idx);
     TensorMatcher({M, K})  // topk_weights
@@ -195,9 +196,9 @@ struct MegaMoEPreDispatchKernel {
     const uint32_t num_pad_blocks = pad_slots == 0 ? 0u : ((pad_slots + num_threads - 1u) / num_threads);
     const auto num_total_blocks = num_tokens + num_pad_blocks;
 
-    const auto params = MegaMoEPreDispatchParams{
+    const auto params = MegaMoEPreDispatchParams<TopkIdxT>{
         .x = static_cast<const bf16_t*>(x.data_ptr()),
-        .topk_idx = static_cast<const int32_t*>(topk_idx.data_ptr()),
+        .topk_idx = static_cast<const TopkIdxT*>(topk_idx.data_ptr()),
         .topk_weights = static_cast<const float*>(topk_weights.data_ptr()),
         .buf_x = static_cast<fp8_e4m3_t*>(buf_x.data_ptr()),
         .buf_x_sf = static_cast<int32_t*>(buf_x_sf.data_ptr()),
