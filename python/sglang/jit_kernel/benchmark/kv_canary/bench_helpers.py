@@ -1,10 +1,3 @@
-"""Shared bench helpers for the kv_canary jit_kernel benchmarks (perf_report style).
-
-Exposes the sweep axes, ``BenchCase`` dataclass, fast / full case factories, and the two naive
-baselines used by the 3 per-kernel bench files. Per-kernel input builders and the
-``triton.testing.perf_report`` decorators stay in each ``bench_*.py``.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,12 +29,6 @@ class BenchCase:
 
 
 def build_fast_matrix_cases() -> list[BenchCase]:
-    """~12 representative points covering the corners of the sweep matrix.
-
-    Includes the two scenarios named in user-instruction b (bs=32 isl=16384 extend, bs=256 isl=4096 decode)
-    plus latency / throughput / SWA-window samples. Mirror set kept identical across plan / verify / write
-    so cross-kernel comparisons line up.
-    """
     return [
         BenchCase(bs=1, prefix_len=0, mode="decode", extend_len=1, pool_kind="full"),
         BenchCase(
@@ -93,7 +80,6 @@ def build_fast_matrix_cases() -> list[BenchCase]:
 
 
 def build_full_matrix_cases() -> list[BenchCase]:
-    """Full cartesian product (~360 cases); superset of build_fast_matrix_cases."""
     fast = build_fast_matrix_cases()
     fast_keys = {c.case_id for c in fast}
     full: list[BenchCase] = list(fast)
@@ -118,12 +104,10 @@ def build_full_matrix_cases() -> list[BenchCase]:
 
 
 def cases_to_x_vals(cases: list[BenchCase]) -> list[tuple[int, int, str, int, str]]:
-    """Flatten BenchCase list into the tuple form ``triton.testing.Benchmark`` expects for x_vals."""
     return [(c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind) for c in cases]
 
 
 def naive_slot_copy_fn(*, total: int, device: torch.device) -> Callable[[], None]:
-    """Return a no-arg callable that does a naive ``kv_buf[slot] = payload`` of ``total`` slots."""
     n_slots = max(total, 1)
     payload = torch.zeros(n_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     sink = torch.zeros_like(payload)
@@ -136,7 +120,6 @@ def naive_slot_copy_fn(*, total: int, device: torch.device) -> Callable[[], None
 
 
 def naive_cumsum_fn(*, bs: int, device: torch.device) -> Callable[[], None]:
-    """Return a no-arg callable that runs ``torch.cumsum`` on a ``bs``-length int32 vector."""
     counts = torch.zeros(max(bs, 1), dtype=torch.int32, device=device)
 
     def baseline() -> None:

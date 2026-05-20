@@ -1,10 +1,3 @@
-"""Differential (CUDA/Triton vs torch reference) run + byte-equal-assert helpers.
-
-Three independent kernel-specific pairs live here — they are NOT unified because each kernel's input
-surface and equality contract differs. Each pair is a verbatim move from the legacy per-kernel test
-file (``test_plan.py`` / ``test_verify.py`` / ``test_write.py``).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, replace

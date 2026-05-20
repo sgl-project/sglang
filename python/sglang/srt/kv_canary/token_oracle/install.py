@@ -15,13 +15,8 @@ if TYPE_CHECKING:
 def install_token_oracle_from_env(
     *, server_args: "ServerArgs", vocab_size: int
 ) -> Optional[TokenOracleManager]:
-    """Register the oracle sampler backend when sampling_backend == "token_oracle".
-
-    Must be called before create_sampler() so the factory is present when the
-    Sampler is first constructed.  Returns the TokenOracleManager so the caller
-    can attach it to a CanaryRunner after install_canary completes; returns
-    None when sampling_backend is anything other than "token_oracle".
-    """
+    # Must be called before create_sampler() so the factory is present when the
+    # Sampler is first constructed.
     if server_args.sampling_backend != _TOKEN_ORACLE_BACKEND_NAME:
         return None
 

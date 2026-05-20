@@ -23,10 +23,9 @@ _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
     # DO NOT add --disable-cuda-graph or --disable-piecewise-cuda-graph below.
-    # user-instruction.md b 段 requires the canary kernel to run inside the cuda
-    # graph alongside the real attn kernel; an overhead measurement taken with
-    # the graph disabled does not represent the production path canary actually
-    # ships on.
+    # The canary kernel must run inside the cuda graph alongside the real attn
+    # kernel; an overhead measurement taken with the graph disabled does not
+    # represent the production path canary actually ships on.
     extra: List[str] = [
         "--model-path",
         _QWEN3_MODEL,

@@ -13,9 +13,9 @@ _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _NUM_LAYERS_OVERRIDE = '{"num_hidden_layers": 1}'
 
 # DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
-# canary e2e test. user-instruction.md b 段 requires the canary kernel to run
-# inside the cuda graph alongside the real attn kernel; disabling the graph
-# silently bypasses the only path that exercises that invariant end-to-end.
+# canary e2e test. The canary kernel must run inside the cuda graph alongside
+# the real attn kernel; disabling the graph silently bypasses the only path
+# that exercises that invariant end-to-end.
 
 
 class _MhaFullBase(CanaryE2EBase):

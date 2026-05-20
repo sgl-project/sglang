@@ -12,16 +12,6 @@ if TYPE_CHECKING:
 
 
 class TokenOracleManager:
-    """One-per-server state for the oracle sampler integration. Owns the oracle and the per-step
-    row -> req-id mapping. Both canary's input-check path (fill_expected_inputs) and sglang's
-    sampler dispatch (_OracleSampler) operate on the same instance.
-
-    Lifecycle: install_oracle_sampler constructs one and registers it as the "token_oracle"
-    sampler factory. The returned hook is then attached to the CanaryRunner so its
-    before_forward can populate the row -> req-id stash that _OracleSampler will read at
-    sample time.
-    """
-
     def __init__(self, *, oracle: TokenOracle) -> None:
         self.oracle = oracle
         self._req_pool_indices_per_row: Optional[torch.Tensor] = None
@@ -32,9 +22,7 @@ class TokenOracleManager:
         forward_batch: "ForwardBatch",
         expected_inputs_out: ExpectedInputs,
     ) -> None:
-        """Per-token compute expected (token, position) from oracle and write into placeholders.
-
-        Called by CanaryRunner BEFORE its per-forward write launch when
+        """Called by CanaryRunner BEFORE its per-forward write launch when
         CanaryConfig.input_check_mode is ON. Layout of the output tensors mirrors
         forward_batch.input_ids / forward_batch.positions — flat, indexed by the same
         write_offsets canary uses. Capacity of the placeholders is sized at CanaryRunner install
@@ -65,9 +53,6 @@ class TokenOracleManager:
         expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int32))
 
     def sample(self, *, logits: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        """Produce one token per row from the oracle, using the row -> req-id stash filled by
-        fill_expected_inputs. Caller is _OracleSampler.forward.
-        """
         stash = self._req_pool_indices_per_row
         if stash is None:
             raise RuntimeError(

@@ -241,10 +241,6 @@ def _splitmix64_fold_bytes_scalar(*, raw_bytes: list[int]) -> int:
     return acc
 
 
-# The vectorised helpers below are kept because write_ref.py (and the real-KV path in verify) originally
-# imported them. They remain correct but are no longer called from the main verify loop above.
-
-
 def _splitmix64_finalize_vec(words: torch.Tensor) -> torch.Tensor:
     x = words
     x = _xor_shift_mul(x, 30, _to_signed_int64(0xBF58476D1CE4E5B9))

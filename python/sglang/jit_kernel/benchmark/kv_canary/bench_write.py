@@ -1,5 +1,3 @@
-"""Sweep-matrix benchmark for canary_write_step (triton.testing.perf_report style)."""
-
 from __future__ import annotations
 
 from typing import Tuple

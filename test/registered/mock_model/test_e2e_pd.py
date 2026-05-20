@@ -20,10 +20,9 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 
 # DO NOT pass --disable-cuda-graph or --disable-piecewise-cuda-graph in any
-# canary e2e test. user-instruction.md b 段 requires the canary kernel to run
-# inside the cuda graph alongside the real attn kernel; disabling the graph
-# silently bypasses the only path that exercises that invariant end-to-end.
-
+# canary e2e test. The canary kernel must run inside the cuda graph alongside
+# the real attn kernel; disabling the graph silently bypasses the only path
+# that exercises that invariant end-to-end.
 _MODEL = "Qwen/Qwen3-0.6B"
 
 _MOCK_PD_COMMON_ARGS: List[str] = [
@@ -53,8 +52,6 @@ def _send_parallel_requests(
     timeout: float = 60.0,
     max_workers: int = 16,
 ) -> List[Dict[str, object]]:
-    """Fire N /generate requests concurrently; return raw response dicts."""
-
     def _one(i: int) -> Dict[str, object]:
         prompt = _DEFAULT_PROMPTS[i % len(_DEFAULT_PROMPTS)]
         payload = {
@@ -77,7 +74,6 @@ def _send_parallel_requests(
 
 
 def _tee_stream(src: object, sinks: List[object]) -> None:
-    """Read lines from src and write to all sinks (thread target)."""
     for line in iter(src.readline, ""):
         for sink in sinks:
             sink.write(line)
@@ -93,7 +89,6 @@ def _popen_pd_with_capture(
     stdout_buf: io.StringIO,
     stderr_buf: io.StringIO,
 ) -> subprocess.Popen:
-    """Launch a PD server process with tee'd stdout/stderr capture."""
     _, host, port = base_url.split(":")
     host = host[2:]
     command = [
@@ -132,8 +127,6 @@ def _popen_pd_with_capture(
 
 
 class _MockModelPDBase(PDDisaggregationServerBase):
-    """PD fixture for mock-model + canary e2e tests."""
-
     model: ClassVar[str] = _MODEL
     extra_prefill_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS
     extra_decode_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS
