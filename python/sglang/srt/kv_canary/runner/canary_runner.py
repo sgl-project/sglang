@@ -82,6 +82,7 @@ class CanaryRunner:
         radix_cache: Optional["BasePrefixCache"] = None,
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
+        token_oracle_manager: Optional[TokenOracleManager] = None,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
@@ -154,6 +155,7 @@ class CanaryRunner:
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
+            token_oracle_manager=token_oracle_manager,
         )
         self._health_and_stats = HealthAndStats(
             config=config,
@@ -175,13 +177,6 @@ class CanaryRunner:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_hook.attach_radix_cache(radix_cache)
-
-    def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
-        """Bind the TokenOracleManager returned by install_oracle_sampler so the per-forward
-        input-check path (input_check_mode is True) can fill expected_input_* tensors from the
-        same oracle that drives sampling.
-        """
-        self._per_forward_orchestrator.attach_token_oracle_manager(manager)
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:

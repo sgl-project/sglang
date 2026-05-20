@@ -40,10 +40,10 @@ def install_canary(
     2. attach_canary_buffers on model_runner.token_to_kv_pool.
     3. Build CanaryEndpoint tuple.
     4. Allocate CanaryDeviceState (violation log, counters, pump bufs).
-    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers).
-    6. Bind ``token_oracle_manager`` (when provided) so the per-forward input-check path
-       can fill expected_input_* tensors from the same oracle that drives sampling.
-    7. Monkeypatch the model nn.Module's ``.forward`` to bracket the original with
+    5. Construct CanaryRunner (which also allocates static per-forward PlanInput buffers and,
+       when ``token_oracle_manager`` is provided, wires it into the per-forward input-check path
+       so expected_input_* tensors are filled from the same oracle that drives sampling).
+    6. Monkeypatch the model nn.Module's ``.forward`` to bracket the original with
        ``canary_runner.launch_head_kernels(forward_batch)`` +
        ``canary_runner.launch_tail_kernels(forward_batch)``. These two calls run kernel launches
        only — they execute inside cuda graph capture region and therefore get captured into the
@@ -74,10 +74,8 @@ def install_canary(
         radix_cache=None,
         launch_capacities=_compute_launch_capacities(model_runner=model_runner),
         swa_window_size=int(model_runner.sliding_window_size or 0),
+        token_oracle_manager=token_oracle_manager,
     )
-
-    if token_oracle_manager is not None:
-        runner.attach_token_oracle_manager(token_oracle_manager)
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
 

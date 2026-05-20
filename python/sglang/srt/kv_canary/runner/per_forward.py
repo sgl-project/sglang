@@ -53,6 +53,7 @@ class PerForwardOrchestrator:
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
+        token_oracle_manager: Optional[TokenOracleManager] = None,
     ) -> None:
         self._config = config
         self._device_state = device_state
@@ -61,7 +62,7 @@ class PerForwardOrchestrator:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._perturb_hook = perturb_hook
-        self._token_oracle_manager: Optional[TokenOracleManager] = None
+        self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=max(1, per_forward_verify_capacity), device=device
@@ -85,9 +86,6 @@ class PerForwardOrchestrator:
         self._write_req_capacity = write_req_capacity
         self._write_entry_capacity = write_entry_capacity
         self._verify_capacity = max(1, per_forward_verify_capacity)
-
-    def attach_token_oracle_manager(self, manager: TokenOracleManager) -> None:
-        self._token_oracle_manager = manager
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
@@ -130,9 +128,9 @@ class PerForwardOrchestrator:
             manager = self._token_oracle_manager
             if manager is None:
                 raise RuntimeError(
-                    "kv-canary: input_check_mode=True requires a TokenOracleManager; call "
-                    "CanaryRunner.attach_token_oracle_manager(manager) where manager is "
-                    "the return value of install_oracle_sampler(oracle=...)"
+                    "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
+                    "token_oracle_manager=install_oracle_sampler(oracle=...) into "
+                    "install_canary(...)"
                 )
             manager.fill_expected_inputs(
                 forward_batch=forward_batch,
