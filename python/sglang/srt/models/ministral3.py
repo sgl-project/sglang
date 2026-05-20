@@ -11,7 +11,7 @@ from sglang.srt.models.llama import (
     LlamaForCausalLM,
     LlamaModel,
 )
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.utils import add_prefix
 
 
 def _get_llama_4_attn_scale(
@@ -122,17 +122,17 @@ class Ministral3Model(LlamaModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        # Override layer creation to use Ministral3Attention
-        super().__init__(config, quant_config, prefix)
-
-        self.layers, self.start_layer, self.end_layer = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: Ministral3DecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+        # Build Ministral3 decoder layers once (LlamaModel supports a custom builder).
+        super().__init__(
+            config,
+            quant_config,
+            prefix,
+            decoder_layer_builder=lambda idx, prefix: Ministral3DecoderLayer(
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
+                prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
-            prefix="model.layers",
         )
 
 

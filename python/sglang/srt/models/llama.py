@@ -19,7 +19,7 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
-from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -336,6 +336,7 @@ class LlamaModel(nn.Module):
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        decoder_layer_builder: Optional[Callable[[int, str], nn.Module]] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -352,11 +353,14 @@ class LlamaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        if decoder_layer_builder is None:
+            decoder_layer_builder = lambda idx, prefix: LlamaDecoderLayer(
+                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+            )
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: LlamaDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
-            ),
+            decoder_layer_builder,
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
             prefix="model.layers",
