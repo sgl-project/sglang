@@ -366,6 +366,11 @@ class BreakableCudaGraphRunner:
     def can_run(self, forward_batch: "ForwardBatch"):
         if self.layer_model is None:
             return False
+        # MTP draft workers feed dynamic target hidden states through an outer
+        # pre-fc path before entering the inner Qwen layer stack. Capturing only
+        # the inner stack ignores that input and corrupts draft logits.
+        if self.model_runner.is_draft_worker:
+            return False
         if forward_batch.forward_mode.is_target_verify():
             return False
         if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
@@ -438,11 +443,13 @@ class BreakableCudaGraphRunner:
         # outer forward the captured hidden_states; logits_processor / pooler
         # then runs eagerly on top with the live multi-req forward_batch.
         def replay_layer_forward(*args, **layer_kwargs):
-            ie = layer_kwargs.get("input_embeds") or (
-                args[self._input_embeds_arg_idx]
-                if self.use_input_embeds and len(args) > self._input_embeds_arg_idx
-                else None
-            )
+            ie = layer_kwargs.get("input_embeds")
+            if (
+                ie is None
+                and self.use_input_embeds
+                and len(args) > self._input_embeds_arg_idx
+            ):
+                ie = args[self._input_embeds_arg_idx]
             if self.use_input_embeds:
                 if ie is None:
                     raise ValueError("BCG replay expects input_embeds but got None")
@@ -483,17 +490,22 @@ class BreakableCudaGraphRunner:
             # Slice trailing-padding off hidden_states; next_token_logits is
             # bs-shaped from logits_processor (bs <= raw_num_tokens), so the
             # slice is a no-op for that field but matches PCG's pattern.
+            hidden_states = output.hidden_states
+
             mm_input_embeds = None
-            if (
-                self.model_runner.spec_algorithm.is_speculative()
-                and output.mm_input_embeds is not None
-            ):
-                mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
+            output_mm_input_embeds = output.mm_input_embeds
+            if output_mm_input_embeds is None:
+                # Qwen MTP draft prefill consumes the target output's
+                # mm_input_embeds. If logits_processor does not return it, keep
+                # the live replay_prepare value; do not fall back to input_embeds.
+                output_mm_input_embeds = static_forward_batch.mm_input_embeds
+            if output_mm_input_embeds is not None:
+                mm_input_embeds = output_mm_input_embeds[: self.raw_num_tokens]
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_tokens],
                 hidden_states=(
-                    output.hidden_states[: self.raw_num_tokens]
-                    if output.hidden_states is not None
+                    hidden_states[: self.raw_num_tokens]
+                    if hidden_states is not None
                     else None
                 ),
                 mm_input_embeds=mm_input_embeds,
