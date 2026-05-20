@@ -18,7 +18,7 @@ from sglang.jit_kernel.kv_canary.write import (
     canary_write_step,
 )
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.violation_state import (
+from sglang.srt.kv_canary.state import (
     CanaryDeviceState,
     ViolationLog,
 )

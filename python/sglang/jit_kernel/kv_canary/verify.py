@@ -42,7 +42,7 @@ VIOLATION_FIELDS: Final[int] = 8
 
 # Violation-row field offsets. C++ counterpart (kViolationField*) lives in canary_common.cuh. These constants are
 # private to this module + the torch reference; downstream readers should consume the schema through
-# violation_state helpers, not by indexing positionally.
+# sglang.srt.kv_canary.state helpers, not by indexing positionally.
 #
 # Column 6 (_VIOLATION_FIELD_EXPECTED_AUX) is reason-agnostic: its interpretation depends on
 # (kernel_kind, fail_reason_bits). Verify launches store ``expected_chain_hash`` there; write launches

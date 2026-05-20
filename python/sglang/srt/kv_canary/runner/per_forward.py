@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.launch import (
     launch_endpoints_per_forward,
 )
 from sglang.srt.kv_canary.runner.perturb import PerturbHook
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool

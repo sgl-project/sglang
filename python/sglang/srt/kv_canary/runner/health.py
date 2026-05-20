@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.d2h_pipeline import CanaryD2HPipeline
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState, CanaryHostState
+from sglang.srt.kv_canary.state import CanaryDeviceState, CanaryHostState
 
 logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
 

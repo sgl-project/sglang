@@ -21,7 +21,7 @@ from sglang.srt.kv_canary.runner.perturb import PerturbHook
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState, CanaryHostState
+from sglang.srt.kv_canary.state import CanaryDeviceState, CanaryHostState
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator

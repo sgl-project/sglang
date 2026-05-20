@@ -5,7 +5,7 @@ import logging
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.d2h_pipeline import CanaryD2HPipeline
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState, CanaryHostState
+from sglang.srt.kv_canary.state import CanaryDeviceState, CanaryHostState
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator

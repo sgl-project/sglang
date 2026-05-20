@@ -19,7 +19,7 @@ from sglang.srt.kv_canary.endpoint import (
     CanaryEndpoint,
     build_endpoints_from_group,
 )
-from sglang.srt.kv_canary.violation_state import (
+from sglang.srt.kv_canary.state import (
     CanaryDeviceState,
     ViolationLog,
 )

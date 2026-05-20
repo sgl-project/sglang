@@ -16,7 +16,7 @@ from sglang.srt.kv_canary.runner.launch import (
     launch_endpoints_sweep,
 )
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
-from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache

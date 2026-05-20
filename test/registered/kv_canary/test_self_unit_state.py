@@ -13,7 +13,7 @@ if str(CURRENT_DIR) not in sys.path:
 from _fixtures import CPU_DEVICE  # noqa: E402
 
 from sglang.jit_kernel.kv_canary.verify import VIOLATION_FIELDS  # noqa: E402
-from sglang.srt.kv_canary.violation_state import ViolationLog  # noqa: E402
+from sglang.srt.kv_canary.state import ViolationLog  # noqa: E402
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 from sglang.test.test_utils import CustomTestCase  # noqa: E402
 
