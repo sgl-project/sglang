@@ -6132,9 +6132,7 @@ class ServerArgs:
                 "records mismatches to a violation buffer and logs them while the "
                 "server keeps running (production-safe). 'raise' performs a "
                 "cross-rank allreduce of the error flag and raises on every rank "
-                "to avoid TP deadlocks (CI lane). "
-                "Three-state by design: 'log' and 'raise' are independent "
-                "violation-handling modes, not flavors of a bool toggle."
+                "to avoid TP deadlocks (CI lane)."
             ),
         )
         parser.add_argument(
@@ -6156,9 +6154,7 @@ class ServerArgs:
                 "corruption that the pure-canary path misses because the "
                 "canary slot itself is intact but the real KV got written "
                 "wrong (attn-kernel idle-logic misconfig; PD transfer "
-                "bit-rot). "
-                "Mirrors the RealKvHashMode enum (kernel-side 3-state); the "
-                "CLI surface tracks the enum 1:1, this is not a bool toggle."
+                "bit-rot)."
             ),
         )
         parser.add_argument(
