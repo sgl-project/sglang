@@ -1,92 +1,76 @@
+import subprocess
 import unittest
-from urllib.parse import urlparse
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.test_ascend_utils import (
+    QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH,
+    write_results_to_github_step_summary,
+)
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
-    popen_launch_server,
     run_bench_one_batch,
 )
 
 register_npu_ci(est_time=400, suite="stage-b-test-1-npu-a2", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
-MODEL = "/root/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct"
-GSM8K_EXP_ACCURACY = 0.84
-EXP_PREFILL_LATENCY = 0.045
+
 TOKENS_TO_CAPTURE = [i for i in range(128, 4096, 128)]
 
 
-class TestPiecewiseGraphPrefillCorrectness(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.model = MODEL
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.url = urlparse(DEFAULT_URL_FOR_TEST)
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                0.8,
-                "--attention-backend",
-                "ascend",
-                "--cuda-graph-bs",
-                128,
-                "--enforce-piecewise-cuda-graph",
-                "--piecewise-cuda-graph-tokens",
-                *TOKENS_TO_CAPTURE,
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        print(f"##=== Testing accuracy: {self.model} ===##")
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=1319,
-            max_new_tokens=512,
-            parallel=128,
-            host=f"http://{self.url.hostname}",
-            port=int(self.url.port),
-        )
-
-        metrics = run_eval_few_shot_gsm8k(args)
-        self.assertGreaterEqual(
-            metrics["accuracy"],
-            GSM8K_EXP_ACCURACY,
-        )
+class TestPiecewiseGraphPrefillCorrectness(GSM8KAscendMixin, CustomTestCase):
+    model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        0.8,
+        "--attention-backend",
+        "ascend",
+        "--cuda-graph-bs",
+        128,
+        "--enforce-piecewise-cuda-graph",
+        "--piecewise-cuda-graph-tokens",
+        *TOKENS_TO_CAPTURE,
+    ]
+    accuracy = 0.84
+    num_questions = 1319
 
 
 class TestPiecewiseGraphPrefillBenchmark(CustomTestCase):
+    model = QWEN2_5_7B_INSTRUCT_WEIGHTS_PATH
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        0.8,
+        "--attention-backend",
+        "ascend",
+        "--enforce-piecewise-cuda-graph",
+        "--piecewise-cuda-graph-tokens",
+    ] + TOKENS_TO_CAPTURE
+
+    latency = 0.045
 
     def test_latency(self):
-        print(f"##=== Testing prefill latency: {MODEL} ===##")
-        prefill_latency, _, _ = run_bench_one_batch(
-            MODEL,
-            other_args=[
-                "--trust-remote-code",
-                "--mem-fraction-static",
-                0.8,
-                "--attention-backend",
-                "ascend",
-                "--enforce-piecewise-cuda-graph",
-                "--piecewise-cuda-graph-tokens",
-            ]
-            + TOKENS_TO_CAPTURE,
-        )
-        self.assertLess(prefill_latency, EXP_PREFILL_LATENCY)
+        print(f"##=== Testing prefill latency: {self.model} ===##")
+        model_metrics = {
+            "server": subprocess.list2cmdline(map(str, self.other_args)),
+            "client": "bench_one_batch",
+            "latency_threshold": self.latency,
+        }
+        try:
+            prefill_latency, _, _ = run_bench_one_batch(
+                self.model,
+                other_args=self.other_args,
+            )
+            model_metrics["latency"] = float(prefill_latency)
+            self.assertLess(prefill_latency, self.latency)
+        except Exception as e:
+            model_metrics["error"] = e
+            print(f"Error testing {self.model}: {e}")
+            self.fail(f"Test failed for {self.model}: {e}")
+        finally:
+            write_results_to_github_step_summary({self.model: model_metrics})
 
 
 if __name__ == "__main__":

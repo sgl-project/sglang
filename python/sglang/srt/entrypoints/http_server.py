@@ -146,7 +146,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -333,7 +332,7 @@ async def lifespan(fast_api_app: FastAPI):
         _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_tokenize = OpenAIServingTokenize(
-        _global_state.tokenizer_manager
+        _global_state.tokenizer_manager, _global_state.template_manager
     )
     fast_api_app.state.openai_serving_detokenize = OpenAIServingDetokenize(
         _global_state.tokenizer_manager
@@ -636,10 +635,7 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
-    # This field is not serializable.
-    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
-        del _global_state.tokenizer_manager.server_args.model_config
-
+    # server_args.model_config is not serializable but should be excluded by asdict.
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -650,12 +646,29 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead)."""
+    """Get load metrics (deprecated - use /v1/loads instead).
+
+    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
+    num_pending_tokens, ts_tic) so existing clients keep working.
+    """
     logger.warning(
         "Endpoint '/get_load' is deprecated and will be removed in a future version. "
         "Please use '/v1/loads' instead."
     )
-    return await _global_state.tokenizer_manager.get_load()
+    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
+    ts = time.perf_counter()
+    return [
+        {
+            "dp_rank": r.dp_rank,
+            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
+            "num_waiting_reqs": r.num_waiting_reqs,
+            "num_tokens": r.num_total_tokens,
+            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
+            "ts_tic": ts,
+        }
+        for r in load_results
+    ]
 
 
 # example usage:
@@ -814,7 +827,7 @@ async def list_external_corpora():
     return ORJSONResponse(
         {
             "success": result.success,
-            "corpus_ids": result.corpus_ids,
+            "corpus_token_counts": result.corpus_token_counts,
             "message": result.message,
         },
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
@@ -1281,11 +1294,13 @@ async def resume_memory_occupation(
 @app.post("/weights_checker")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(obj: CheckWeightsReqInput, request: Request):
-    success, message = await _global_state.tokenizer_manager.check_weights(obj, request)
-    return ORJSONResponse(
-        {"success": success, "message": message},
-        status_code=200 if success else HTTPStatus.BAD_REQUEST,
+    success, message, ranks = await _global_state.tokenizer_manager.check_weights(
+        obj, request
     )
+    body = {"success": success, "message": message}
+    if ranks is not None:
+        body["ranks"] = ranks
+    return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
 @app.api_route("/slow_down", methods=["GET", "POST"])
@@ -1950,6 +1965,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1976,14 +1992,15 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
             if res.status_code == 200:
                 logger.info(
-                    f"End of prefill disaggregation mode warmup with status {res.status_code}, resp: {res.json()}"
+                    f"Disaggregation warmup request completed with status {res.status_code}, resp: {res.json()}"
                 )
+                logger.info("End of disaggregation warmup")
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    server_args.disaggregation_mode,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
@@ -2265,7 +2282,6 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
 
             if server_args.enable_ssl_refresh:
                 logger.warning(
@@ -2281,6 +2297,7 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,

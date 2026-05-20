@@ -2,6 +2,7 @@
 
 Tests the Ray actor scheduler backend:
   - Offline inference via Engine(use_ray=True) inside a Ray actor on a placement group
+  - Data parallel (DP) and DP attention support
   - Error paths in RayEngine._launch_scheduler_processes()
   - HTTP server launched via --use-ray flag
 
@@ -14,6 +15,8 @@ Usage:
     # 2-GPU tests
     python -m pytest test/manual/test_ray_engine.py::TestRayEngineOfflineTP2 -v -s
     python -m pytest test/manual/test_ray_engine.py::TestRayEngineOfflinePP2 -v -s
+    python -m pytest test/manual/test_ray_engine.py::TestRayEngineOfflineDP2 -v -s
+    python -m pytest test/manual/test_ray_engine.py::TestRayEngineOfflineDPAttention -v -s
 """
 
 from __future__ import annotations
@@ -28,6 +31,11 @@ from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
 # Allow overriding the model via env var for environments without gated access
 _MODEL = os.environ.get("SGLANG_TEST_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+
+# DP attention requires a model whose num_kv_heads divides evenly across the
+# attention-TP dimension.  Qwen2.5-0.5B (kv_heads=2, attn_heads=14) hits a
+# shape mismatch in the KV cache, so we use a larger model here.
+_DP_ATTN_MODEL = os.environ.get("SGLANG_TEST_DP_ATTN_MODEL", "Qwen/Qwen3-8B")
 
 try:
     import ray
@@ -64,7 +72,9 @@ _PROMPTS = [
 # ---------------------------------------------------------------------------
 
 
-def _create_engine_on_pg(tp_size, pp_size=1, model=_MODEL, extra_kwargs=None):
+def _create_engine_on_pg(
+    tp_size, pp_size=1, dp_size=1, model=_MODEL, extra_kwargs=None
+):
     """Create an EngineActor on a placement group and wait for it to be ready.
 
     Returns (engine_actor, placement_group).
@@ -88,7 +98,12 @@ def _create_engine_on_pg(tp_size, pp_size=1, model=_MODEL, extra_kwargs=None):
                 self.engine.shutdown()
                 self.engine = None
 
-    total_gpus = tp_size * pp_size
+    enable_dp_attention = (extra_kwargs or {}).get("enable_dp_attention", False)
+    if enable_dp_attention:
+        # DP attention folds DP into TP — total GPUs = tp_size * pp_size
+        total_gpus = tp_size * pp_size
+    else:
+        total_gpus = dp_size * tp_size * pp_size
     pg = placement_group(
         [{"CPU": 1, "GPU": total_gpus}],
         strategy="STRICT_PACK",
@@ -99,6 +114,7 @@ def _create_engine_on_pg(tp_size, pp_size=1, model=_MODEL, extra_kwargs=None):
         model_path=model,
         tp_size=tp_size,
         pp_size=pp_size,
+        dp_size=dp_size,
     )
     if extra_kwargs:
         kwargs.update(extra_kwargs)
@@ -245,6 +261,87 @@ class TestRayEngineOfflinePP2(unittest.TestCase):
 
 
 @unittest.skipUnless(_has_ray, "ray is not installed")
+@unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
+class TestRayEngineOfflineDP2(unittest.TestCase):
+    """Test Ray engine with dp_size=2, tp_size=1."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not ray.is_initialized():
+            ray.init(log_to_driver=True, runtime_env=_RAY_RUNTIME_ENV)
+        cls.actor, cls.pg = _create_engine_on_pg(tp_size=1, dp_size=2)
+
+    @classmethod
+    def tearDownClass(cls):
+        _cleanup(cls.actor, cls.pg)
+        ray.shutdown()
+
+    def test_offline_generate_dp2(self):
+        result = ray.get(
+            self.actor.generate.remote("The capital of France is", _SAMPLING_PARAMS)
+        )
+        self.assertIn("text", result)
+        self.assertGreater(len(result["text"]), 0)
+        print(f"Generated (DP=2): {result['text'][:200]}")
+
+    def test_batch_generate_dp2(self):
+        for prompt in _PROMPTS:
+            result = ray.get(self.actor.generate.remote(prompt, _SAMPLING_PARAMS))
+            self.assertIn("text", result)
+            self.assertGreater(len(result["text"]), 0, f"Empty output for: {prompt}")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Offline DP Attention (dp=2, tp=2)
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_has_ray, "ray is not installed")
+@unittest.skipUnless(_NUM_GPUS >= 2, "requires at least 2 GPUs")
+class TestRayEngineOfflineDPAttention(unittest.TestCase):
+    """Test Ray engine with dp_size=2, tp_size=2, enable_dp_attention=True."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not ray.is_initialized():
+            ray.init(log_to_driver=True, runtime_env=_RAY_RUNTIME_ENV)
+        cls.actor, cls.pg = _create_engine_on_pg(
+            tp_size=2,
+            dp_size=2,
+            model=_DP_ATTN_MODEL,
+            extra_kwargs={
+                "enable_dp_attention": True,
+                "disable_cuda_graph": True,
+                "port": 31500,
+            },
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        _cleanup(cls.actor, cls.pg)
+        ray.shutdown()
+
+    def test_offline_generate_dp_attention(self):
+        result = ray.get(
+            self.actor.generate.remote("The capital of France is", _SAMPLING_PARAMS)
+        )
+        self.assertIn("text", result)
+        self.assertGreater(len(result["text"]), 0)
+        print(f"Generated (DP-Attention): {result['text'][:200]}")
+
+    def test_batch_generate_dp_attention(self):
+        for prompt in _PROMPTS:
+            result = ray.get(self.actor.generate.remote(prompt, _SAMPLING_PARAMS))
+            self.assertIn("text", result)
+            self.assertGreater(len(result["text"]), 0, f"Empty output for: {prompt}")
+
+
+# ---------------------------------------------------------------------------
+# Tests: Error paths
+# ---------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_has_ray, "ray is not installed")
 @unittest.skipUnless(_NUM_GPUS >= 1, "requires at least 1 GPU")
 class TestRayEngineErrors(unittest.TestCase):
 
@@ -256,44 +353,6 @@ class TestRayEngineErrors(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         ray.shutdown()
-
-    def test_dp_greater_than_1_raises(self):
-        """RayEngine with dp_size > 1 should raise NotImplementedError."""
-
-        @ray.remote
-        class _BadActor:
-            def try_create(self):
-                from sglang.srt.ray.engine import RayEngine
-
-                try:
-                    RayEngine(
-                        model_path=_MODEL,
-                        tp_size=1,
-                        dp_size=2,
-                        use_ray=True,
-                    )
-                    return None
-                except (NotImplementedError, RuntimeError) as e:
-                    return str(e)
-
-        pg = placement_group([{"CPU": 1, "GPU": 1}], strategy="STRICT_PACK")
-        ray.get(pg.ready())
-
-        actor = _BadActor.options(
-            num_cpus=1,
-            num_gpus=0,
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=0,
-            ),
-        ).remote()
-
-        try:
-            error_msg = ray.get(actor.try_create.remote(), timeout=120)
-            self.assertIsNotNone(error_msg, "Expected error but RayEngine created OK")
-            self.assertIn("dp_size", error_msg.lower())
-        finally:
-            ray.util.remove_placement_group(pg)
 
     def test_missing_placement_group_raises(self):
         """RayEngine without a placement group should raise RuntimeError."""

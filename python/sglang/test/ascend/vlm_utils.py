@@ -4,6 +4,7 @@ import os
 import subprocess
 
 from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import write_results_to_github_step_summary
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -96,6 +97,8 @@ class TestVLMModels(CustomTestCase):
             timeout=3600,
         )
 
+        return subprocess.list2cmdline(cmd)  # Return the command for logging purposes
+
     def _run_vlm_mmmu_test(
         self,
         output_path="./logs",
@@ -115,8 +118,15 @@ class TestVLMModels(CustomTestCase):
         """
         print(f"\nTesting model: {self.model}{test_name}")
 
+        model_metrics = {
+            "server": subprocess.list2cmdline(map(str, self.other_args)),
+            "client": "mmmu_eval",
+            "accuracy_threshold": self.mmmu_accuracy,
+        }
+
         process = None
         server_output = ""
+        mmmu_accuracy = None
 
         try:
             # Prepare environment variables
@@ -143,8 +153,10 @@ class TestVLMModels(CustomTestCase):
                 ),
             )
 
+            model_metrics["server"] = subprocess.list2cmdline(process.args)
+
             # Run evaluation
-            self.run_mmmu_eval(self.model, output_path, limit)
+            model_metrics["client"] = self.run_mmmu_eval(self.model, output_path, limit)
 
             # Get the result file
             result_file_path = glob.glob(f"{output_path}/*.json")[0]
@@ -163,6 +175,8 @@ class TestVLMModels(CustomTestCase):
             if capture_output and process:
                 server_output = self._read_output_from_files()
 
+            model_metrics["accuracy"] = mmmu_accuracy
+
             # Assert performance meets expected threshold
             self.assertGreaterEqual(
                 mmmu_accuracy,
@@ -173,10 +187,12 @@ class TestVLMModels(CustomTestCase):
             return server_output
 
         except Exception as e:
+            model_metrics["error"] = e
             print(f"Error testing {self.model}{test_name}: {e}")
             self.fail(f"Test failed for {self.model}{test_name}: {e}")
-
         finally:
+            write_results_to_github_step_summary({self.model: model_metrics})
+
             # Ensure process cleanup happens regardless of success/failure
             if process is not None and process.poll() is None:
                 print(f"Cleaning up process {process.pid}")

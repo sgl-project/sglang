@@ -729,8 +729,6 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
 //
 at::Tensor
 weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::weight_packed_linear", std::vector<c10::IValue>({mat1, mat2, bias}));
-
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
   bool use_fma_gemm = false;
   if (packed_w.scalar_type() == at::kFloat) {
@@ -804,8 +802,6 @@ at::Tensor fused_linear_sigmoid_mul(
     const std::optional<at::Tensor>& bias,
     bool is_vnni,
     const at::Tensor& post_mul_mat) {
-  RECORD_FUNCTION("sgl-kernel::fused_linear_sigmoid_mul", std::vector<c10::IValue>({mat1, mat2, bias, post_mul_mat}));
-
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
   TORCH_CHECK(packed_w.scalar_type() == at::kFloat, "fused_linear_sigmoid_mul requires packed float weight")
 

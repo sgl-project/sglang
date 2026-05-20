@@ -63,7 +63,10 @@ class TestDeepseekR1FP4Unified(unittest.TestCase):
             models=variants,
             test_name="DeepSeek-V3-0324-FP4 Unified",
             accuracy_params=AccuracyTestParams(
-                dataset="gsm8k", baseline_accuracy=0.935
+                dataset="gsm8k",
+                baseline_accuracy=0.935,
+                num_examples=200,
+                api="completion",
             ),
             performance_params=PerformanceTestParams(
                 profile_dir="performance_profiles_deepseek_v3_fp4",

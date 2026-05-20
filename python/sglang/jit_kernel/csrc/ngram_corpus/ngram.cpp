@@ -92,12 +92,21 @@ void Ngram::finishExternalCorpusLoad(const std::string& corpus_id) {
   }
   // Only lock briefly to install the completed SAM.
   std::unique_lock<std::mutex> lock(mutex_);
-  sams_[corpus_id] = std::move(staging_sam_);
+  if (sams_.find(corpus_id) != sams_.end()) {
+    throw std::runtime_error(
+        "External corpus '" + corpus_id + "' already exists. Remove it before adding a new corpus with the same id.");
+  }
+  sams_.emplace(corpus_id, std::move(staging_sam_));
 }
 
 void Ngram::removeExternalCorpus(const std::string& corpus_id) {
   std::unique_lock<std::mutex> lock(mutex_);
   sams_.erase(corpus_id);
+}
+
+void Ngram::resetStagingSam() {
+  // staging_sam_ is only accessed from the loading thread — no lock needed.
+  staging_sam_.reset();
 }
 
 void Ngram::clearExternalCorpus() {
@@ -106,14 +115,14 @@ void Ngram::clearExternalCorpus() {
   staging_sam_.reset();
 }
 
-std::vector<std::string> Ngram::listExternalCorpora() const {
+std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const {
   std::unique_lock<std::mutex> lock(mutex_);
-  std::vector<std::string> ids;
-  ids.reserve(sams_.size());
-  for (const auto& [id, _] : sams_) {
-    ids.push_back(id);
+  std::vector<std::pair<std::string, int64_t>> entries;
+  entries.reserve(sams_.size());
+  for (const auto& [id, sam] : sams_) {
+    entries.emplace_back(id, sam->tokenCount());
   }
-  return ids;
+  return entries;
 }
 
 void Ngram::insertWorker() {
@@ -128,35 +137,6 @@ void Ngram::insertWorker() {
     lock.unlock();
     sync_cv_.notify_all();
   }
-}
-
-Result Ngram::batchMatch(const std::vector<std::vector<int32_t>>& tokens) {
-  std::unique_lock<std::mutex> lock(mutex_);
-
-  using BuildFn = Result (Trie::*)(const int32_t*, size_t, int32_t, size_t, const Param&, MatchState&, size_t) const;
-  BuildFn build_fn;
-  if (param_.match_type == "BFS") {
-    build_fn = &Trie::buildRecency;
-  } else if (param_.match_type == "PROB") {
-    build_fn = &Trie::buildFrequency;
-  } else {
-    throw std::runtime_error("Unknown match_type: '" + param_.match_type + "'. Must be 'BFS' or 'PROB'.");
-  }
-
-  Result merged;
-  for (size_t i = 0; i < tokens.size(); ++i) {
-    const auto& suffix = tokens[i];
-    if (suffix.empty()) {
-      throw std::runtime_error("batchMatch received an empty token tail");
-    }
-    MatchState temp_state;
-    auto draft_token_num = param_.get_draft_token_num(tokens.size());
-    auto res = (trie_.get()->*build_fn)(
-        suffix.data(), suffix.size(), suffix.back(), draft_token_num, param_, temp_state, suffix.size());
-    merged.token.insert(merged.token.end(), res.token.begin(), res.token.end());
-    merged.mask.insert(merged.mask.end(), res.mask.begin(), res.mask.end());
-  }
-  return merged;
 }
 
 Result Ngram::batchMatch(

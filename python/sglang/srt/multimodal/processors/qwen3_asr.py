@@ -12,7 +12,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 
 AUDIO_PLACEHOLDER = "<|audio_start|><|audio_pad|><|audio_end|>"
 
-_DEFAULT_ASR_PROMPT = (
+DEFAULT_ASR_PROMPT = (
     f"<|im_start|>user\n"
     f"{AUDIO_PLACEHOLDER}"
     f"<|im_end|>\n"
@@ -47,7 +47,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
         if isinstance(input_text, list):
             input_text = self._tokenizer.decode(input_text)
         if not input_text or not input_text.strip():
-            return _DEFAULT_ASR_PROMPT
+            return DEFAULT_ASR_PROMPT
         return input_text
 
     def compute_mrope_positions(self, input_ids, mm_items):

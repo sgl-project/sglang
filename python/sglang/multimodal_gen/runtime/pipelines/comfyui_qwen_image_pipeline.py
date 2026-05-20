@@ -247,7 +247,9 @@ class ComfyUIQwenImagePipelineBase(LoRAPipeline, ComposedPipelineBase):
                     reshard_after_forward=True,
                     mp_policy=mp_policy,
                     mesh=device_mesh,
-                    fsdp_shard_conditions=model._fsdp_shard_conditions,
+                    fsdp_shard_conditions=getattr(
+                        model, "_fsdp_shard_conditions", None
+                    ),
                     pin_cpu_memory=server_args.pin_cpu_memory,
                 )
         finally:
