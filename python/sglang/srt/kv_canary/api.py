@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
@@ -102,10 +103,12 @@ def _compute_launch_capacities(
     max_bs = max(cuda_graph_max_bs, max_running_requests)
     chunked_prefill_size = server_args.chunked_prefill_size
     max_prefill_tokens = server_args.max_prefill_tokens
-    if chunked_prefill_size is None or chunked_prefill_size < 0:
-        max_extend_tokens_per_forward = max_prefill_tokens
-    else:
-        max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_prefill_size)
+    chunked_limit = (
+        chunked_prefill_size
+        if chunked_prefill_size is not None and chunked_prefill_size >= 0
+        else math.inf
+    )
+    max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_limit)
     pool_slot_count = model_runner.max_total_num_tokens
     write_entry_capacity = max(
         1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
