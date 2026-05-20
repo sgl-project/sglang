@@ -1046,7 +1046,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
