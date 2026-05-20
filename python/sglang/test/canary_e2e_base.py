@@ -36,7 +36,7 @@ class CanaryE2EBase(CustomTestCase):
 
     Subclasses set ``model`` and (optionally) ``extra_server_args``,
     ``perturb_prob``, ``perturb_seed``. ``setUpClass`` launches the server
-    with ``--kv-cache-canary=raise`` and ``--mem-fraction-static=0.65``
+    with ``--kv-canary=raise`` and ``--mem-fraction-static=0.65``
     (canary K/V tensors need headroom); subclasses can layer more args on
     via ``extra_server_args``.
 
@@ -87,7 +87,7 @@ class CanaryE2EBase(CustomTestCase):
             env.pop("SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED", None)
 
         other_args: List[str] = [
-            "--kv-cache-canary",
+            "--kv-canary",
             "raise",
             "--mem-fraction-static",
             "0.65",

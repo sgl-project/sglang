@@ -1,8 +1,8 @@
-"""Shared fixtures and helpers for the kv_cache_canary jit_kernel diff tests.
+"""Shared fixtures and helpers for the kv_canary jit_kernel diff tests.
 
 These helpers exist purely so the three per-kernel test files
-(``test_kv_cache_canary_verify.py`` / ``test_kv_cache_canary_write.py`` /
-``test_kv_cache_canary_plan.py``) can compose plans, canary buffers, violation
+(``test_kv_canary_verify.py`` / ``test_kv_canary_write.py`` /
+``test_kv_canary_plan.py``) can compose plans, canary buffers, violation
 logs, and real-KV sources without copy-pasting glue. They are not part of the
 public jit_kernel API surface; downstream code must not import from here.
 """
@@ -14,14 +14,14 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_cache_canary_verify import (
+from sglang.jit_kernel.kv_canary_verify import (
     CANARY_CHAIN_ANCHOR,
     CANARY_SLOT_BYTES,
     VIOLATION_FIELDS,
     RealKvSource,
     VerifyPlan,
 )
-from sglang.jit_kernel.kv_cache_canary_write import WritePlan
+from sglang.jit_kernel.kv_canary_write import WritePlan
 
 # Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
 # stay realistic without bloating the assertion surface.

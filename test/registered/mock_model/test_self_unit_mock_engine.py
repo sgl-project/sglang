@@ -1,7 +1,7 @@
 """MockEngine thin-shell API tests.
 
 The MockEngine / MockReqHandle / MockOracle classes that this file targeted were removed when
-the mock-mode subsystem was redesigned. The new kv_cache_canary.mock_model surface is
+the mock-mode subsystem was redesigned. The new kv_canary.mock_model surface is
 class-free: oracle.py exposes only Oracle implementations, sampler.py exposes free functions
 (install_oracle_sampler, fill_expected_inputs), and args_modifier.py exposes
 apply_mock_model_defaults. There is no engine wrapper that owns admit/step/preempt/abort —
@@ -18,7 +18,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
 pytestmark = pytest.mark.skip(
-    reason="MockEngine / MockReqHandle classes were removed; the new kv_cache_canary.mock_model is class-free (only free functions + Oracle dataclasses)."
+    reason="MockEngine / MockReqHandle classes were removed; the new kv_canary.mock_model is class-free (only free functions + Oracle dataclasses)."
 )
 
 

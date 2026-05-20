@@ -9,9 +9,9 @@ object across repeated installs, and the stashed oracle reference flips on secon
 
 from __future__ import annotations
 
-from sglang.srt.kv_cache_canary.mock_model import sampler as oracle_sampler_module
-from sglang.srt.kv_cache_canary.mock_model.oracle import HashOracle, ScriptedOracle
-from sglang.srt.kv_cache_canary.mock_model.sampler import install_oracle_sampler
+from sglang.srt.kv_canary.mock_model import sampler as oracle_sampler_module
+from sglang.srt.kv_canary.mock_model.oracle import HashOracle, ScriptedOracle
+from sglang.srt.kv_canary.mock_model.sampler import install_oracle_sampler
 from sglang.srt.layers.sampler import _CUSTOM_SAMPLER_FACTORIES
 from sglang.srt.server_args import SAMPLING_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_cuda_ci

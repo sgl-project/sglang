@@ -662,7 +662,7 @@ class Envs:
     # KV cache canary perturbation (testing only).
     # When >0, the canary install hooks corrupt ``req_to_token_pool`` rows
     # with this per-write probability so the canary should fire. Combined
-    # with ``--kv-cache-canary=raise`` this gives a fault-injection harness
+    # with ``--kv-canary=raise`` this gives a fault-injection harness
     # for regression-testing the canary itself.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_SEED = EnvInt(0)
@@ -670,7 +670,7 @@ class Envs:
     # When >0, the canary self-test hook flips one byte of the real KV pool
     # at an alive-but-not-verified-this-step slot with this probability per
     # forward, proving the periodic sweep's independent detection value.
-    # Requires --kv-cache-canary-real-data-sweep-every-n-steps > 0.
+    # Requires --kv-canary-real-data-sweep-every-n-steps > 0.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_SEED = EnvInt(0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)

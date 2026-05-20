@@ -9,12 +9,12 @@ import dataclasses
 import pytest
 import torch
 
-from sglang.srt.kv_cache_canary.mock_model import sampler as oracle_sampler_module
-from sglang.srt.kv_cache_canary.mock_model.args_modifier import (
+from sglang.srt.kv_canary.mock_model import sampler as oracle_sampler_module
+from sglang.srt.kv_canary.mock_model.args_modifier import (
     apply_mock_model_defaults,
 )
-from sglang.srt.kv_cache_canary.mock_model.oracle import ScriptedOracle
-from sglang.srt.kv_cache_canary.mock_model.sampler import (
+from sglang.srt.kv_canary.mock_model.oracle import ScriptedOracle
+from sglang.srt.kv_canary.mock_model.sampler import (
     fill_expected_inputs,
     install_oracle_sampler,
 )
@@ -150,8 +150,8 @@ def test_apply_mock_model_defaults_fills_holes_when_enabled() -> None:
     assert result.load_format == "dummy"
     assert result.num_hidden_layers_override == 1
     assert result.sampling_backend == "oracle"
-    assert result.kv_cache_canary == "raise"
-    assert result.kv_cache_canary_input_check_mode == "ON"
+    assert result.kv_canary == "raise"
+    assert result.kv_canary_input_check_mode == "ON"
 
 
 def test_apply_mock_model_defaults_preserves_user_overrides() -> None:
@@ -161,12 +161,12 @@ def test_apply_mock_model_defaults_preserves_user_overrides() -> None:
         model_path="dummy",
         mock_model_enabled=True,
         num_hidden_layers_override=4,
-        kv_cache_canary="on",
+        kv_canary="on",
     )
     result = apply_mock_model_defaults(original)
 
     assert result.num_hidden_layers_override == 4
-    assert result.kv_cache_canary == "on"
+    assert result.kv_canary == "on"
     assert result.load_format == "dummy"
 
 
@@ -179,4 +179,4 @@ def test_apply_mock_model_defaults_is_idempotent() -> None:
 
     assert first.load_format == second.load_format
     assert first.sampling_backend == second.sampling_backend
-    assert first.kv_cache_canary == second.kv_cache_canary
+    assert first.kv_canary == second.kv_canary

@@ -976,9 +976,9 @@ class Scheduler(
         ):
             self.tree_cache = StreamingSession(self.tree_cache)
 
-        # Local import: kv_cache_canary.api pulls in jit_kernel modules; keep it lazy so non-canary
+        # Local import: kv_canary.api pulls in jit_kernel modules; keep it lazy so non-canary
         # scheduler instances don't pay the load cost.
-        from sglang.srt.kv_cache_canary.api import get_canary_runner
+        from sglang.srt.kv_canary.api import get_canary_runner
 
         canary_runner = get_canary_runner(self.tp_worker.model_runner)
         if canary_runner is not None:
@@ -3058,8 +3058,8 @@ class Scheduler(
                 batch.sampling_info = sched_sampling_info
 
     def _push_canary_alive_reqs_snapshot(self, batch: ScheduleBatch) -> None:
-        from sglang.srt.kv_cache_canary.api import get_canary_runner
-        from sglang.srt.kv_cache_canary.plan_input import AliveReqSnapshot
+        from sglang.srt.kv_canary.api import get_canary_runner
+        from sglang.srt.kv_canary.plan_input import AliveReqSnapshot
 
         canary_runner = get_canary_runner(self.tp_worker.model_runner)
         if canary_runner is None:

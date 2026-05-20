@@ -27,7 +27,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.jit_kernel.kv_cache_canary_verify import RealKvHashMode
+from sglang.jit_kernel.kv_canary_verify import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -676,10 +676,10 @@ class ServerArgs:
 
     # Optimization/debug options
     disable_radix_cache: bool = False
-    kv_cache_canary: str = "off"
-    kv_cache_canary_real_data: str = "off"
-    kv_cache_canary_real_data_sweep_every_n_steps: int = 0
-    kv_cache_canary_input_check_mode: Optional[str] = None
+    kv_canary: str = "off"
+    kv_canary_real_data: str = "off"
+    kv_canary_real_data_sweep_every_n_steps: int = 0
+    kv_canary_input_check_mode: Optional[str] = None
     mock_model_enabled: bool = False
     num_hidden_layers_override: Optional[int] = None
     cuda_graph_max_bs: Optional[int] = None
@@ -1184,7 +1184,7 @@ class ServerArgs:
         fields back into self because __post_init__ cannot reassign self. apply_mock_model_defaults
         itself is contractually side-effect free.
         """
-        from sglang.srt.kv_cache_canary.mock_model.args_modifier import (
+        from sglang.srt.kv_canary.mock_model.args_modifier import (
             apply_mock_model_defaults,
         )
 
@@ -6059,9 +6059,9 @@ class ServerArgs:
             help="Disable RadixAttention for prefix caching.",
         )
         parser.add_argument(
-            "--kv-cache-canary",
+            "--kv-canary",
             type=str,
-            default=ServerArgs.kv_cache_canary,
+            default=ServerArgs.kv_canary,
             choices=["off", "log", "raise"],
             help=(
                 "KV cache canary mode. 'off' disables the canary (default). 'log' "
@@ -6072,14 +6072,14 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--kv-cache-canary-real-data",
+            "--kv-canary-real-data",
             type=str,
-            default=ServerArgs.kv_cache_canary_real_data,
+            default=ServerArgs.kv_canary_real_data,
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
                 "chain hash. Choices are derived from the ``RealKvHashMode`` "
-                "enum (kv_cache_canary_verify.py) so the CLI surface and the "
+                "enum (kv_canary_verify.py) so the CLI surface and the "
                 "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
                 "leaves the real_kv_hash slot field at zero. 'bit' XOR-folds a "
                 "single bit per real-KV byte at write time and verifies on "
@@ -6093,9 +6093,9 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--kv-cache-canary-real-data-sweep-every-n-steps",
+            "--kv-canary-real-data-sweep-every-n-steps",
             type=int,
-            default=ServerArgs.kv_cache_canary_real_data_sweep_every_n_steps,
+            default=ServerArgs.kv_canary_real_data_sweep_every_n_steps,
             help=(
                 "Every N forward steps, run a full-pool sweep that verifies "
                 "real_kv_hash on every slot owned by an alive req in the "
@@ -6105,14 +6105,14 @@ class ServerArgs:
                 "writes; the sweep also catches drift on history slots that "
                 "were frozen earlier (e.g. PD-transfer bit-rot, idle dummy "
                 "writes, rowhammer-style flips). Requires "
-                "--kv-cache-canary-real-data in {bit, all} and "
-                "--kv-cache-canary in {log, raise}."
+                "--kv-canary-real-data in {bit, all} and "
+                "--kv-canary in {log, raise}."
             ),
         )
         parser.add_argument(
-            "--kv-cache-canary-input-check-mode",
+            "--kv-canary-input-check-mode",
             type=str,
-            default=ServerArgs.kv_cache_canary_input_check_mode,
+            default=ServerArgs.kv_canary_input_check_mode,
             choices=[None, "off", "on"],
             help=(
                 "Enable comparison of forward_batch.input_ids/positions against "
@@ -7131,16 +7131,16 @@ class ServerArgs:
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_cache_canary_real_data_sweep_every_n_steps > 0:
-            if self.kv_cache_canary_real_data == "off":
+        if self.kv_canary_real_data_sweep_every_n_steps > 0:
+            if self.kv_canary_real_data == "off":
                 raise ValueError(
-                    "--kv-cache-canary-real-data-sweep-every-n-steps requires "
-                    "--kv-cache-canary-real-data in {bit, all}"
+                    "--kv-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-canary-real-data in {bit, all}"
                 )
-            if self.kv_cache_canary == "off":
+            if self.kv_canary == "off":
                 raise ValueError(
-                    "--kv-cache-canary-real-data-sweep-every-n-steps requires "
-                    "--kv-cache-canary in {log, raise}"
+                    "--kv-canary-real-data-sweep-every-n-steps requires "
+                    "--kv-canary in {log, raise}"
                 )
 
     def check_lora_server_args(self):

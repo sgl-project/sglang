@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from sglang.srt.kv_cache_canary.mock_model.oracle import (
+from sglang.srt.kv_canary.mock_model.oracle import (
     HashOracle,
     Oracle,
     ScriptedOracle,

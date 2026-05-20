@@ -1,0 +1,817 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Callable, Optional
+
+import torch
+import torch.distributed as dist
+
+from sglang.jit_kernel.kv_canary_plan import canary_plan_step
+from sglang.jit_kernel.kv_canary_verify import (
+    CanaryLaunchTag,
+    VerifyPlan,
+)
+from sglang.jit_kernel.kv_canary_write import CanaryPseudoMode as CanaryInputCheckMode
+from sglang.jit_kernel.kv_canary_write import (
+    WritePlan,
+)
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.endpoint import (
+    CanaryEndpoint,
+    build_endpoints_from_group,
+)
+from sglang.srt.kv_canary.mock_model.sampler import fill_expected_inputs
+from sglang.srt.kv_canary.plan_input import (
+    AliveReqSnapshot,
+    PlanInput,
+    build_plan_input_per_forward,
+    build_plan_input_radix_sweep,
+    build_plan_input_running_sweep,
+    walk_radix_cache_for_canary,
+)
+from sglang.srt.kv_canary.pool_patch import attach_canary_buffers
+from sglang.srt.kv_canary.violation_state import CanaryDeviceState
+
+if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+logger = logging.getLogger(__name__)
+
+_HEALTH_CHECK_EVERY_N_STEPS: int = 1000
+_HEALTH_CHECK_WARMUP_STEPS: int = 100
+_ON_MODE_VERBOSE_LIMIT: int = 10
+
+
+class CanaryRunner:
+    """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives until
+    server shutdown.
+
+    Internal state (private — never touched outside this class):
+        config: CanaryConfig
+        device_state: CanaryDeviceState
+        endpoints_per_pool: tuple[tuple[CanaryEndpoint, ...], ...]  # one tuple per pool
+        verify_plan_per_forward / write_plan_per_forward: VerifyPlan / WritePlan sized for per-forward
+            capacity (= max_batch_size × max_seq_len for verify, max_batch_size for write).
+        verify_plan_sweep / write_plan_sweep: sized for sweep capacity (= total pool slots).
+        step_counter: int, host-side, bumped per forward.
+        last_sweep_step: int, host-side.
+    """
+
+    def __init__(
+        self,
+        *,
+        config: CanaryConfig,
+        pools: Optional[list["KVCache"]] = None,
+        device: torch.device,
+        tp_group: Optional["GroupCoordinator"] = None,
+        req_to_token_pool: Optional["ReqToTokenPool"] = None,
+        radix_cache: Optional["BasePrefixCache"] = None,
+        per_forward_verify_capacity: int,
+        per_forward_write_req_capacity: int,
+        per_forward_write_entry_capacity: int,
+        sweep_verify_capacity: int,
+        swa_window_size: int = 0,
+        buffer_groups_per_pool: Optional[list[tuple[CanaryBufferGroup, ...]]] = None,
+        token_pool_allocator: Optional[object] = None,
+    ) -> None:
+        self.config = config
+        self._device = device
+        self._tp_group = tp_group
+        self._req_to_token_pool = req_to_token_pool
+        self._radix_cache = radix_cache
+        self._swa_window_size = int(swa_window_size)
+
+        if buffer_groups_per_pool is not None:
+            if pools is not None:
+                raise ValueError(
+                    "kv-canary: pass either pools or buffer_groups_per_pool, not both"
+                )
+            self._groups_per_pool = tuple(
+                tuple(groups) for groups in buffer_groups_per_pool
+            )
+        else:
+            if pools is None:
+                raise ValueError(
+                    "kv-canary: either pools or buffer_groups_per_pool must be provided"
+                )
+            groups_per_pool: list[tuple[CanaryBufferGroup, ...]] = []
+            for pool in pools:
+                groups_per_pool.append(
+                    attach_canary_buffers(
+                        pool=pool,
+                        config=config,
+                        device=device,
+                        allocator=token_pool_allocator,
+                    )
+                )
+            self._groups_per_pool = tuple(groups_per_pool)
+
+        self._device_state = CanaryDeviceState.allocate(
+            config=config, device=device, num_tags=len(CanaryLaunchTag)
+        )
+
+        endpoints_per_pool: list[tuple[CanaryEndpoint, ...]] = []
+        for groups in self._groups_per_pool:
+            pool_endpoints: list[CanaryEndpoint] = []
+            for group in groups:
+                pool_endpoints.extend(
+                    build_endpoints_from_group(
+                        group=group, device_state=self._device_state
+                    )
+                )
+            endpoints_per_pool.append(tuple(pool_endpoints))
+        self._endpoints_per_pool: tuple[tuple[CanaryEndpoint, ...], ...] = tuple(
+            endpoints_per_pool
+        )
+
+        self._verify_plan_per_forward = VerifyPlan.allocate(
+            verify_capacity=max(1, per_forward_verify_capacity), device=device
+        )
+        self._write_plan_per_forward = WritePlan.allocate(
+            write_req_capacity=max(1, per_forward_write_req_capacity), device=device
+        )
+        self._verify_plan_sweep_running = VerifyPlan.allocate(
+            verify_capacity=max(1, sweep_verify_capacity), device=device
+        )
+        self._verify_plan_sweep_radix = VerifyPlan.allocate(
+            verify_capacity=max(1, sweep_verify_capacity), device=device
+        )
+        self._write_plan_sweep = WritePlan.allocate(write_req_capacity=1, device=device)
+
+        write_entry_capacity = max(1, per_forward_write_entry_capacity)
+        self._expected_input_tokens = torch.zeros(
+            write_entry_capacity, dtype=torch.int32, device=device
+        )
+        self._expected_input_positions = torch.zeros(
+            write_entry_capacity, dtype=torch.int32, device=device
+        )
+
+        use_cuda_pump = device.type == "cuda" and torch.cuda.is_available()
+        self._pump_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=device) if use_cuda_pump else None
+        )
+        self._pump_event: Optional[torch.cuda.Event] = (
+            torch.cuda.Event() if use_cuda_pump else None
+        )
+        self._previous_pump_event: Optional[torch.cuda.Event] = None
+
+        self._step_counter: int = 0
+        self._last_sweep_step: int = -1
+        self._sweep_passes: int = 0
+        self._raised: bool = False
+        self._on_mode_violations_logged: int = 0
+        self._perturb_undo: Optional[tuple[int, int, int]] = None
+        self._last_forward_batch: Optional["ForwardBatch"] = None
+        self._alive_reqs_snapshot: Optional[AliveReqSnapshot] = None
+        self._alive_reqs_fallback_warned: bool = False
+
+        assert (
+            self._req_to_token_pool is not None
+        ), "kv-canary: req_to_token_pool must be bound at construction"
+
+        active: set[CanaryLaunchTag] = set()
+        for endpoints in self._endpoints_per_pool:
+            for endpoint in endpoints:
+                active.add(endpoint.kernel_kind)
+        self._active_tags: tuple[CanaryLaunchTag, ...] = tuple(
+            sorted(active, key=lambda tag: tag.value)
+        )
+
+    @property
+    def active_tag_count(self) -> int:
+        return len(self._active_tags)
+
+    def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
+        self._radix_cache = radix_cache
+
+    def set_alive_reqs_snapshot(self, snapshot: Optional[AliveReqSnapshot]) -> None:
+        """Bind the running-reqs snapshot used for sweep coverage.
+
+        Scheduler should call this every step (or whenever the alive set changes) so sweep covers
+        all alive running reqs (including paused) per SOT §4.1. None clears the snapshot; the
+        runner then falls back to deriving it from forward_batch (degraded coverage).
+        """
+        self._alive_reqs_snapshot = snapshot
+
+    def forward_step_before_model(self, forward_batch: "ForwardBatch") -> None:
+        """SOT §6.2 step 1: perturb hook + plan + head launches. Stashes plan for the tail launches."""
+        if self.config.mode == "off":
+            return
+
+        self.perturb_hook(forward_batch)
+        self._perturb_real_kv_hook(forward_batch)
+        self._last_forward_batch = forward_batch
+
+        if self.config.input_check_mode == CanaryInputCheckMode.ON:
+            fill_expected_inputs(
+                forward_batch=forward_batch,
+                expected_input_tokens_out=self._expected_input_tokens,
+                expected_input_positions_out=self._expected_input_positions,
+            )
+
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                plan_input = build_plan_input_per_forward(
+                    forward_batch=forward_batch,
+                    swa_window_size=(
+                        self._swa_window_size if group.kind is PoolKind.SWA else 0
+                    ),
+                    full_to_swa_index_mapping=group.swa_index_lut,
+                )
+                self._invoke_plan(
+                    plan_input=plan_input,
+                    verify_plan=self._verify_plan_per_forward,
+                    write_plan=self._write_plan_per_forward,
+                    group=group,
+                )
+                self._launch_endpoints(
+                    pool_idx=pool_idx,
+                    group=group,
+                    tag_filter=_is_head_tag,
+                    verify_plan=self._verify_plan_per_forward,
+                    forward_batch=forward_batch,
+                )
+
+    def forward_step_after_model(self) -> None:
+        """SOT §6.2 step 3: tail launches reusing the plan stashed by forward_step_before_model."""
+        if self.config.mode == "off":
+            return
+        forward_batch = self._last_forward_batch
+        if forward_batch is None:
+            return
+
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                self._launch_endpoints(
+                    pool_idx=pool_idx,
+                    group=group,
+                    tag_filter=_is_tail_tag,
+                    verify_plan=self._verify_plan_per_forward,
+                    forward_batch=forward_batch,
+                )
+
+    def forward_step(
+        self,
+        forward_batch: "ForwardBatch",
+        run_model: Callable[[], object],
+    ) -> object:
+        """Convenience wrapper: head launches -> run_model() -> tail launches -> end_of_step.
+
+        SOT §6.2 sequence. Callers that need finer control (e.g. cuda-graph replay) should call
+        forward_step_before_model / forward_step_after_model / end_of_step explicitly.
+        """
+        self.forward_step_before_model(forward_batch)
+        output = run_model()
+        self.forward_step_after_model()
+        self.end_of_step()
+        return output
+
+    def end_of_step(self) -> None:
+        """SOT §6.4: sweep + async D2H pump + step bump + drain previous pump + allreduce + raise."""
+        if self.config.mode == "off":
+            return
+
+        self.maybe_run_sweep()
+
+        if self._pump_stream is not None and self._pump_event is not None:
+            violation_log = self._device_state.violation_log
+            default_stream = torch.cuda.current_stream(self._device)
+            self._pump_stream.wait_stream(default_stream)
+            with torch.cuda.stream(self._pump_stream):
+                signal = (violation_log.violation_write_index > 0).to(torch.uint8)
+                self._device_state.violation_signal_host.copy_(
+                    signal.view(-1)[:1], non_blocking=True
+                )
+                self._pump_event.record()
+
+        self._step_counter += 1
+
+        if self._previous_pump_event is not None:
+            self._previous_pump_event.synchronize()
+            local_errored = bool(int(self._device_state.violation_signal_host.item()))
+        else:
+            local_errored = False
+        self._previous_pump_event = self._pump_event
+        if self._device.type == "cuda" and torch.cuda.is_available():
+            self._pump_event = torch.cuda.Event()
+
+        any_rank_errored = local_errored
+        allreduce_buf = self._device_state.allreduce_buf
+        if (
+            self.config.allreduce_violation_signal
+            and allreduce_buf is not None
+            and self._tp_group is not None
+            and dist.is_initialized()
+        ):
+            allreduce_buf.fill_(int(local_errored))
+            dist.all_reduce(
+                allreduce_buf,
+                op=dist.ReduceOp.MAX,
+                group=self._tp_group.device_group,
+            )
+            any_rank_errored = bool(int(allreduce_buf.item()))
+
+        self.health_check_step()
+        self._print_periodic_stats()
+
+        if self._perturb_undo is not None:
+            row, col, original = self._perturb_undo
+            self._req_to_token_pool.req_to_token[row, col] = original
+            self._perturb_undo = None
+
+        if any_rank_errored and not self._raised:
+            self._raise_violation()
+
+    def maybe_run_sweep(self) -> None:
+        if self.config.sweep_every_n_steps == 0:
+            return
+        if (
+            self._last_sweep_step >= 0
+            and self._step_counter - self._last_sweep_step
+            < self.config.sweep_every_n_steps
+        ):
+            return
+        self._last_sweep_step = self._step_counter
+
+        running_snapshot = self._resolve_running_sweep_snapshot()
+
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                window = self._swa_window_size if group.kind is PoolKind.SWA else 0
+                if running_snapshot is not None:
+                    running_input = build_plan_input_running_sweep(
+                        req_to_token_pool=self._req_to_token_pool,
+                        alive_reqs=running_snapshot,
+                        swa_window_size=window,
+                        full_to_swa_index_mapping=group.swa_index_lut,
+                    )
+                    self._invoke_plan(
+                        plan_input=running_input,
+                        verify_plan=self._verify_plan_sweep_running,
+                        write_plan=self._write_plan_sweep,
+                        group=group,
+                    )
+                    self._launch_endpoints(
+                        pool_idx=pool_idx,
+                        group=group,
+                        tag_filter=_is_sweep_tag,
+                        verify_plan=self._verify_plan_sweep_running,
+                        forward_batch=None,
+                    )
+
+                if self._radix_cache is not None:
+                    radix_input = build_plan_input_radix_sweep(
+                        radix_cache=self._radix_cache,
+                        swa_window_size=window,
+                        full_to_swa_index_mapping=group.swa_index_lut,
+                    )
+                    self._invoke_plan(
+                        plan_input=radix_input,
+                        verify_plan=self._verify_plan_sweep_radix,
+                        write_plan=self._write_plan_sweep,
+                        group=group,
+                    )
+                    self._launch_endpoints(
+                        pool_idx=pool_idx,
+                        group=group,
+                        tag_filter=_is_sweep_tag,
+                        verify_plan=self._verify_plan_sweep_radix,
+                        forward_batch=None,
+                    )
+
+        self._sweep_passes += 1
+
+    def _raise_violation(self) -> None:
+        violation_log = self._device_state.violation_log
+        write_index = int(violation_log.violation_write_index.cpu().item())
+        if write_index == 0:
+            return
+        ring = violation_log.violation_ring.cpu()
+        ring_overflow = write_index > int(ring.shape[0])
+        message = _format_violation(
+            row=ring[0].tolist(),
+            total=write_index,
+            ring_overflow=ring_overflow,
+            step_when_pumped=self._step_counter,
+        )
+        if self.config.mode == "on":
+            self._on_mode_violations_logged += 1
+            if self._on_mode_violations_logged <= _ON_MODE_VERBOSE_LIMIT:
+                logger.warning(message)
+            else:
+                logger.debug(message)
+            return
+        self._raised = True
+        raise RuntimeError(message)
+
+    def health_check_step(self) -> None:
+        if self._step_counter < _HEALTH_CHECK_WARMUP_STEPS:
+            return
+        if self._step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
+            return
+
+        if not self._active_tags:
+            return
+        counters = self._device_state.kernel_run_counters.detach().cpu().tolist()
+        zero_tags = [tag for tag in self._active_tags if int(counters[tag.value]) == 0]
+        if zero_tags:
+            names = ", ".join(tag.name for tag in zero_tags)
+            raise RuntimeError(
+                f"kv-canary: kernel_run_counter is zero after warmup for tags=[{names}] "
+                f"at step={self._step_counter}; canary path is not executing"
+            )
+
+    def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+        if self.config.perturb_req_to_token_prob <= 0.0:
+            return
+        table = self._req_to_token_pool.req_to_token
+        if not isinstance(table, torch.Tensor) or table.numel() == 0:
+            return
+        if forward_batch is None:
+            return
+        if torch.rand((), device="cpu").item() >= self.config.perturb_req_to_token_prob:
+            return
+
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        if req_pool_indices is None or seq_lens is None:
+            return
+
+        req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
+        seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+        active_pairs: list[tuple[int, int]] = []
+        for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+            req_pool_idx_int = int(req_pool_idx)
+            seq_len_int = int(seq_len)
+            if seq_len_int <= 0:
+                continue
+            for pos in range(seq_len_int):
+                active_pairs.append((req_pool_idx_int, pos))
+        if not active_pairs:
+            return
+
+        pick = int(torch.randint(0, len(active_pairs), (1,)).item())
+        req_pool_idx, position = active_pairs[pick]
+        rows, cols = int(table.shape[0]), int(table.shape[1])
+        if req_pool_idx < 0 or req_pool_idx >= rows or position < 0 or position >= cols:
+            return
+
+        original = int(table[req_pool_idx, position].item())
+        slot_upper = rows * cols
+        if slot_upper <= 1:
+            return
+        new_value = int(torch.randint(0, slot_upper, (1,)).item())
+        if new_value == original:
+            new_value = (original + 1) % slot_upper
+        table[req_pool_idx, position] = new_value
+        self._perturb_undo = (req_pool_idx, position, original)
+
+    def _perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+        if self.config.perturb_real_kv_prob <= 0.0:
+            return
+        if forward_batch is None:
+            return
+        if torch.rand((), device="cpu").item() >= self.config.perturb_real_kv_prob:
+            return
+
+        candidate_slots = self._collect_real_kv_perturb_candidates(forward_batch)
+        if not candidate_slots:
+            return
+
+        groups_for_pools: list[tuple[int, CanaryBufferGroup]] = []
+        for pool_idx, groups in enumerate(self._groups_per_pool):
+            for group in groups:
+                if group.real_kv_sources_k:
+                    groups_for_pools.append((pool_idx, group))
+        if not groups_for_pools:
+            return
+
+        pool_pick = int(torch.randint(0, len(groups_for_pools), (1,)).item())
+        _, group = groups_for_pools[pool_pick]
+        sources = group.real_kv_sources_k
+        source_pick = int(torch.randint(0, len(sources), (1,)).item())
+        source = sources[source_pick]
+        if source.read_bytes <= 0 or source.num_bytes_per_token <= 0:
+            return
+
+        slot_pick = int(torch.randint(0, len(candidate_slots), (1,)).item())
+        slot_idx = int(candidate_slots[slot_pick])
+        row = slot_idx // max(1, source.page_size)
+        col_base = (slot_idx % max(1, source.page_size)) * source.num_bytes_per_token
+        max_offset = min(int(source.read_bytes), int(source.num_bytes_per_token))
+        if max_offset <= 0:
+            return
+        if row < 0 or row >= int(source.tensor.shape[0]):
+            return
+        byte_offset = int(torch.randint(0, max_offset, (1,)).item())
+        col = col_base + byte_offset
+        if col < 0 or col >= int(source.tensor.shape[1]):
+            return
+
+        flat = source.tensor
+        original_byte = int(flat[row, col].item())
+        flat[row, col] = original_byte ^ 0xFF
+
+    def _collect_real_kv_perturb_candidates(
+        self, forward_batch: "ForwardBatch"
+    ) -> list[int]:
+        out_cache_loc = forward_batch.out_cache_loc
+        excluded: set[int] = set()
+        if out_cache_loc is not None:
+            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
+
+        orphan_slots = self._collect_radix_orphan_slots(excluded=excluded)
+        if orphan_slots:
+            return orphan_slots
+        if self.config.perturb_real_kv_require_orphan:
+            return []
+        return self._collect_running_req_slots(
+            forward_batch=forward_batch, excluded=excluded
+        )
+
+    def _collect_radix_orphan_slots(self, *, excluded: set[int]) -> list[int]:
+        if self._radix_cache is None:
+            return []
+        slot_tensor, _, _ = walk_radix_cache_for_canary(
+            radix_cache=self._radix_cache,
+            alive_running_req_pool_indices=set(),
+        )
+        if slot_tensor.numel() == 0:
+            return []
+        candidates: list[int] = []
+        for raw_slot in slot_tensor.tolist():
+            slot = int(raw_slot)
+            if slot < 0:
+                continue
+            if slot in excluded:
+                continue
+            candidates.append(slot)
+        return candidates
+
+    def _collect_running_req_slots(
+        self,
+        *,
+        forward_batch: "ForwardBatch",
+        excluded: set[int],
+    ) -> list[int]:
+        snapshot = self._alive_reqs_snapshot
+        if snapshot is not None:
+            req_pool_indices = snapshot.req_pool_indices
+            seq_lens = snapshot.seq_lens
+        else:
+            req_pool_indices = forward_batch.req_pool_indices
+            seq_lens = forward_batch.seq_lens
+        if req_pool_indices is None or seq_lens is None:
+            return []
+
+        table = self._req_to_token_pool.req_to_token
+        if not isinstance(table, torch.Tensor) or table.numel() == 0:
+            return []
+
+        req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
+        seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+        rows, cols = int(table.shape[0]), int(table.shape[1])
+        candidate_slots: list[int] = []
+        for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+            req_pool_idx_int = int(req_pool_idx)
+            seq_len_int = int(seq_len)
+            if req_pool_idx_int < 0 or req_pool_idx_int >= rows:
+                continue
+            upper = min(seq_len_int, cols)
+            if upper <= 0:
+                continue
+            row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+            for raw_slot in row_slots:
+                slot = int(raw_slot)
+                if slot < 0:
+                    continue
+                if slot in excluded:
+                    continue
+                candidate_slots.append(slot)
+        return candidate_slots
+
+    def _print_periodic_stats(self) -> None:
+        period = self.config.stats_print_every_n_steps
+        if period <= 0:
+            return
+        if self._step_counter == 0 or self._step_counter % period != 0:
+            return
+        protected = int(self._device_state.slot_run_counters.sum().item())
+        violations = int(self._device_state.violation_log.violation_write_index.item())
+        active = len(self._active_tags)
+        logger.info(
+            "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
+            "launch_tags_active=%d/%d",
+            self._step_counter,
+            protected,
+            self._sweep_passes,
+            violations,
+            active,
+            len(CanaryLaunchTag),
+        )
+
+    def _resolve_running_sweep_snapshot(self) -> Optional[AliveReqSnapshot]:
+        snapshot = self._alive_reqs_snapshot
+        if snapshot is not None:
+            return snapshot
+        forward_batch = self._last_forward_batch
+        if forward_batch is None:
+            return None
+        if forward_batch.req_pool_indices is None or forward_batch.seq_lens is None:
+            return None
+        if not self._alive_reqs_fallback_warned:
+            logger.warning(
+                "kv-canary: alive_reqs_snapshot not bound; sweep falls back to forward_batch "
+                "(misses paused reqs per SOT §4.1)"
+            )
+            self._alive_reqs_fallback_warned = True
+        return AliveReqSnapshot(
+            req_pool_indices=forward_batch.req_pool_indices,
+            seq_lens=forward_batch.seq_lens,
+        )
+
+    def _invoke_plan(
+        self,
+        *,
+        plan_input: PlanInput,
+        verify_plan: VerifyPlan,
+        write_plan: WritePlan,
+        group: CanaryBufferGroup,
+    ) -> None:
+        window = self._swa_window_size if group.kind is PoolKind.SWA else 0
+        canary_plan_step(
+            verify_plan_out=verify_plan,
+            write_plan_out=write_plan,
+            fb_req_pool_indices=plan_input.fb_req_pool_indices,
+            fb_prefix_lens=plan_input.fb_prefix_lens,
+            fb_extend_seq_lens=plan_input.fb_extend_seq_lens,
+            req_to_token=self._req_to_token_pool.req_to_token,
+            extra_verify_slot_indices=plan_input.extra_verify_slot_indices,
+            extra_verify_positions=plan_input.extra_verify_positions,
+            extra_verify_prev_slot_indices=plan_input.extra_verify_prev_slot_indices,
+            extra_verify_num_valid=plan_input.extra_verify_num_valid,
+            swa_window_size=window,
+            full_to_swa_index_mapping=group.swa_index_lut,
+        )
+
+    def _launch_endpoints(
+        self,
+        *,
+        pool_idx: int,
+        group: CanaryBufferGroup,
+        tag_filter: Callable[[CanaryLaunchTag], bool],
+        verify_plan: VerifyPlan,
+        forward_batch: Optional["ForwardBatch"],
+    ) -> None:
+        violation_log = self._device_state.violation_log
+        positions: Optional[torch.Tensor] = None
+        out_cache_loc: Optional[torch.Tensor] = None
+        input_ids: Optional[torch.Tensor] = None
+        if forward_batch is not None:
+            positions = forward_batch.positions
+            if positions.dtype != torch.int32:
+                positions = positions.to(torch.int32)
+            out_cache_loc = forward_batch.out_cache_loc
+            if out_cache_loc is not None and out_cache_loc.dtype != torch.int32:
+                out_cache_loc = out_cache_loc.to(torch.int32)
+            input_ids = forward_batch.input_ids
+            if input_ids is not None and input_ids.dtype != torch.int32:
+                input_ids = input_ids.to(torch.int32)
+
+        for endpoint in self._endpoints_per_pool[pool_idx]:
+            if not _endpoint_belongs_to_group(endpoint, group):
+                continue
+            if not tag_filter(endpoint.kernel_kind):
+                continue
+            if _is_sweep_tag(endpoint.kernel_kind):
+                endpoint.launch_sweep(
+                    verify_plan=verify_plan,
+                    violation_log=violation_log,
+                    real_kv_hash_mode=self.config.real_kv_hash_mode,
+                )
+                continue
+            assert forward_batch is not None and positions is not None
+            num_tokens = int(positions.shape[0])
+            expected_tokens_slice = self._expected_input_tokens[:num_tokens]
+            expected_positions_slice = self._expected_input_positions[:num_tokens]
+            endpoint.launch_per_forward(
+                verify_plan=verify_plan,
+                write_plan=self._write_plan_per_forward,
+                fb_input_ids=input_ids,
+                fb_positions=positions,
+                fb_out_cache_loc=out_cache_loc,
+                input_check_mode=self.config.input_check_mode,
+                expected_input_tokens=expected_tokens_slice,
+                expected_input_positions=expected_positions_slice,
+                violation_log=violation_log,
+                real_kv_hash_mode=self.config.real_kv_hash_mode,
+            )
+
+
+def _is_head_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.HEAD_K_FULL,
+        CanaryLaunchTag.HEAD_V_FULL,
+        CanaryLaunchTag.HEAD_K_SWA,
+        CanaryLaunchTag.HEAD_V_SWA,
+    )
+
+
+def _is_tail_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.TAIL_K_FULL,
+        CanaryLaunchTag.TAIL_V_FULL,
+        CanaryLaunchTag.TAIL_K_SWA,
+        CanaryLaunchTag.TAIL_V_SWA,
+    )
+
+
+def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
+    return tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    )
+
+
+def _endpoint_belongs_to_group(
+    endpoint: CanaryEndpoint, group: CanaryBufferGroup
+) -> bool:
+    suffix = endpoint.kernel_kind.name.rsplit("_", 1)[1]
+    return suffix == group.kind.name
+
+
+def _canary_kind_label(tag: CanaryLaunchTag) -> str:
+    name_lower = tag.name.lower()
+    if tag in (
+        CanaryLaunchTag.SWEEP_K_FULL,
+        CanaryLaunchTag.SWEEP_V_FULL,
+        CanaryLaunchTag.SWEEP_K_SWA,
+        CanaryLaunchTag.SWEEP_V_SWA,
+    ):
+        return name_lower
+    return f"per_forward_{name_lower}"
+
+
+def _format_violation(
+    *,
+    row: list[int],
+    total: int,
+    ring_overflow: bool,
+    step_when_pumped: int,
+) -> str:
+    (
+        kernel_kind,
+        slot_idx,
+        position,
+        stored_token,
+        expected_token,
+        stored_chain_hash,
+        expected_aux,
+        fail_reason_bits,
+    ) = row
+    try:
+        tag_label = CanaryLaunchTag(int(kernel_kind)).name
+        canary_kind = _canary_kind_label(CanaryLaunchTag(int(kernel_kind)))
+    except ValueError:
+        tag_label = f"unknown({int(kernel_kind)})"
+        canary_kind = tag_label
+    bits = int(fail_reason_bits)
+    reasons: list[str] = []
+    if bits & 0x1:
+        reasons.append("chain_hash")
+    if bits & 0x2:
+        reasons.append("position")
+    if bits & 0x4:
+        reasons.append("real_kv_hash")
+    u64_mask = (1 << 64) - 1
+    stored_prev_hash = int(stored_chain_hash) & u64_mask
+    expected_prev_hash = int(expected_aux) & u64_mask
+
+    return "\n".join(
+        [
+            (
+                f"KV cache canary violation detected (kernel_kind={tag_label}, "
+                f"slot_idx={int(slot_idx)}, position={int(position)})"
+            ),
+            f"canary_kind:       {canary_kind}",
+            f"  fail_reasons: {' '.join(reasons) if reasons else 'none'}",
+            (
+                f"  stored:   token_id={int(stored_token)}   position={int(position)} "
+                f"prev_hash={stored_prev_hash:#018x}"
+            ),
+            (
+                f"  expected: token_id={int(expected_token)}   position={int(position)} "
+                f"prev_hash={expected_prev_hash:#018x}"
+            ),
+            (
+                f"  total_violations={total} ring_overflow={ring_overflow} "
+                f"step_when_pumped={step_when_pumped}"
+            ),
+        ]
+    )

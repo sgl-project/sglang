@@ -743,9 +743,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
-        # Local import: kv_cache_canary.api imports ModelRunner globally, so
+        # Local import: kv_canary.api imports ModelRunner globally, so
         # importing it at module top here would form a cycle.
-        from sglang.srt.kv_cache_canary.api import install_canary
+        from sglang.srt.kv_canary.api import install_canary
 
         install_canary(server_args=server_args, model_runner=self)
 
