@@ -99,7 +99,7 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
-def is_deepseek_nsa(config) -> bool:
+def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
         in (
@@ -121,31 +121,31 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
-def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config) or is_deepseek_v4(config)
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
 
 
-def get_nsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_topk
 
 
-def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_n_heads
 
 
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
-    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    DSA models (V3.2) instantiate an Indexer on every transformer layer.
     With index_topk_freq > 1 some layers reuse prev layer's topk; those still
     get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
     layers whose compress_ratio == 4. Other architectures: set
     num_indexer_layers on hf_text_config; 0 disables the capturer.
     """
-    if is_deepseek_nsa(config):
+    if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
@@ -329,7 +329,7 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or is_deepseek_nsa(self.hf_text_config)
+            or is_deepseek_dsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -622,8 +622,8 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
+                get_dsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
             # Handle rope scaling
