@@ -20,6 +20,7 @@ from sglang.srt.kv_canary.mock_model.sampler import OracleSamplerHook
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.runner.health import HealthAndStats
+from sglang.srt.kv_canary.runner.jitter import JitterRunner, JitterSlot
 from sglang.srt.kv_canary.runner.per_forward import (
     PerForwardOrchestrator,
     _endpoint_belongs_to_group,
@@ -164,6 +165,11 @@ class CanaryRunner:
         self._violation = ViolationReporter(owner=self)
         self._perturb = PerturbHook(owner=self)
         self._health = HealthAndStats(owner=self)
+        self._jitter: Optional[JitterRunner] = (
+            JitterRunner(config=config.jitter_config, device=device)
+            if config.jitter_config.enabled and config.mode != "off"
+            else None
+        )
 
     @property
     def active_tag_count(self) -> int:
@@ -204,16 +210,26 @@ class CanaryRunner:
         region. Prefer ``with_forward_pass`` over calling this + ``end_of_step`` directly.
         """
         self._per_forward.before_forward(forward_batch)
+        if self._jitter is not None:
+            self._jitter.randomize_for_next_step()
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
         ``model.forward`` — kernels here are captured into the cuda graph.
         """
+        if self._jitter is not None:
+            self._jitter.launch_slot(slot=JitterSlot.PRE_HEAD)
         self._per_forward.launch_head_kernels(forward_batch)
+        if self._jitter is not None:
+            self._jitter.launch_slot(slot=JitterSlot.POST_HEAD)
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
+        if self._jitter is not None:
+            self._jitter.launch_slot(slot=JitterSlot.POST_ATTN)
         self._per_forward.launch_tail_kernels(forward_batch)
+        if self._jitter is not None:
+            self._jitter.launch_slot(slot=JitterSlot.POST_TAIL)
 
     def end_of_step(self) -> None:
         """Sweep + async D2H pump + step bump + drain previous pump + allreduce + raise.

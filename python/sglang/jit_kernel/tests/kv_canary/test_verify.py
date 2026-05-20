@@ -86,6 +86,34 @@ def _run_both(
     torch.cuda.synchronize()
 
 
+def _run_both_and_assert_state_equal(
+    *,
+    cuda_canary_buf: torch.Tensor,
+    ref_canary_buf: torch.Tensor,
+    plan_cuda,
+    plan_ref,
+    cuda_log: FakeViolationLog,
+    ref_log: FakeViolationLog,
+    real_kv_sources_cuda: tuple[RealKvSource, ...],
+    real_kv_sources_ref: tuple[RealKvSource, ...],
+    real_kv_hash_mode: RealKvHashMode,
+    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+) -> None:
+    _run_both(
+        cuda_canary_buf=cuda_canary_buf,
+        ref_canary_buf=ref_canary_buf,
+        plan_cuda=plan_cuda,
+        plan_ref=plan_ref,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_cuda,
+        real_kv_sources_ref=real_kv_sources_ref,
+        real_kv_hash_mode=real_kv_hash_mode,
+        kernel_kind=kernel_kind,
+    )
+    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
+
+
 def _setup_pair_with_canned_chain(
     *,
     num_slots: int = 16,
@@ -801,7 +829,7 @@ def test_real_kv_source_padding_below_4() -> None:
     cuda_log = FakeViolationLog.allocate(device=_DEVICE)
     ref_log = FakeViolationLog.allocate(device=_DEVICE)
 
-    _run_both(
+    _run_both_and_assert_state_equal(
         cuda_canary_buf=cuda_buf,
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
@@ -812,8 +840,6 @@ def test_real_kv_source_padding_below_4() -> None:
         real_kv_sources_ref=sources,
         real_kv_hash_mode=RealKvHashMode.OFF,
     )
-
-    assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
 
 def test_real_kv_source_above_4_raises() -> None:
