@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 class CanaryMode(str, Enum):
     OFF = "off"
-    ON = "on"
+    LOG = "log"
     RAISE = "raise"
 
 
@@ -26,7 +26,7 @@ class CanaryConfig:
     install_canary(server_args, model_runner) once. Subsequent runtime never mutates it.
 
     Fields:
-        mode: "off" | "on" | "raise". off = no canary installed; on = canary runs, violations are logged
+        mode: "off" | "log" | "raise". off = no canary installed; log = canary runs, violations are logged
             but do NOT raise (used for production observability + canary self-test perturb); raise =
             violations propagate to host as RuntimeError after the next D2H pump.
         ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously
@@ -47,7 +47,7 @@ class CanaryConfig:
             but produces partial-failure logs across TP groups). Default True.
     """
 
-    mode: Literal["off", "on", "raise"]
+    mode: Literal["off", "log", "raise"]
     ring_capacity: int = 1024
     sweep_interval: int = 64
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.PARTIAL
@@ -58,9 +58,9 @@ class CanaryConfig:
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
         mode_raw = (server_args.kv_canary or "").strip().lower()
-        if mode_raw not in ("off", "on", "raise"):
+        if mode_raw not in ("off", "log", "raise"):
             raise ValueError(
-                f"kv-canary: kv_canary must be one of off/on/raise, got {mode_raw!r}"
+                f"kv-canary: kv_canary must be one of off/log/raise, got {mode_raw!r}"
             )
 
         real_kv_raw = (server_args.kv_canary_real_data or "").strip().upper()
