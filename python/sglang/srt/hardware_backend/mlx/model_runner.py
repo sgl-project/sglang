@@ -262,15 +262,29 @@ class MlxModelRunner:
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
         """Return (n_kv_heads, head_dim, dtype) from the model."""
-        layer_list, attn_attr = find_attention_layers(self.model)
+        layer_list, attn_attrs = find_attention_layers(self.model)
         if not layer_list:
             raise RuntimeError("Cannot determine attention config: no layers found")
-        sample_attn = getattr(layer_list[0], attn_attr)
+        sample_attn = None
+        for layer, attn_attr in zip(layer_list, attn_attrs): # i still need this loop since the first layer can be None
+            if attn_attr is not None:
+                sample_attn = getattr(layer, attn_attr)
+                break
+        if sample_attn is None:
+            raise RuntimeError("Cannot determine attention config: no attention module found")
         if isinstance(sample_attn, MLXAttentionWrapper):
             sample_attn = sample_attn._inner
-        n_kv_heads = sample_attn.n_kv_heads
+        n_kv_heads = (
+            getattr(sample_attn, "n_kv_heads", None)
+            or getattr(sample_attn, "num_k_heads", None)
+            or getattr(sample_attn, "num_key_value_heads", None)
+        )
+        if n_kv_heads is None:
+            raise RuntimeError("Cannot determine n_kv_heads from attention module")
         if hasattr(sample_attn, "head_dim"):
             head_dim = sample_attn.head_dim
+        elif hasattr(sample_attn, "hidden_size") and hasattr(sample_attn, "num_k_heads"):
+            head_dim = sample_attn.hidden_size // sample_attn.num_k_heads
         elif hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
             head_dim = sample_attn.k_proj.weight.shape[0] // n_kv_heads
         else:
