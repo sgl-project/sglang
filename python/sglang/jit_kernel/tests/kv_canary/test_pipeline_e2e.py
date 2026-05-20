@@ -5,21 +5,17 @@ from typing import Any, Callable, Optional
 import pytest
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
-    RealKvHashMode,
     RealKvSource,
     VerifyPlan,
     canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
-from sglang.jit_kernel.kv_canary.write import (
-    CanaryPseudoMode,
-    WritePlan,
-    canary_write_step,
-)
+from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
 from sglang.jit_kernel.tests.kv_canary._fixtures import clone_real_kv_sources
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import (
@@ -73,11 +69,11 @@ def _run_pipeline(
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     kernel_kind: CanaryLaunchTag,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: torch.Tensor,
     pseudo_expected_positions: torch.Tensor,
     real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: RealKvHashMode,
+    real_kv_hash_mode: consts.RealKvHashMode,
     verify_capacity: int,
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
@@ -147,12 +143,12 @@ def _run_both_and_assert_pipeline_equal(
     swa_window_size: int = 0,
     full_to_swa_index_mapping: Optional[torch.Tensor] = None,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
-    pseudo_mode: CanaryPseudoMode = CanaryPseudoMode.OFF,
+    pseudo_mode: consts.CanaryPseudoMode = consts.CanaryPseudoMode.OFF,
     pseudo_expected_tokens: Optional[torch.Tensor] = None,
     pseudo_expected_positions: Optional[torch.Tensor] = None,
     real_kv_sources_real: tuple[RealKvSource, ...] = (),
     real_kv_sources_ref: tuple[RealKvSource, ...] = (),
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF,
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
     ring_capacity: int = 64,
     verify_capacity: int = 256,
     write_req_capacity: int = 16,
@@ -388,9 +384,9 @@ def test_pipeline_sweep_no_write() -> None:
 
 @pytest.mark.parametrize(
     "real_kv_hash_mode",
-    [RealKvHashMode.OFF, RealKvHashMode.PARTIAL, RealKvHashMode.ALL],
+    [consts.RealKvHashMode.OFF, consts.RealKvHashMode.PARTIAL, consts.RealKvHashMode.ALL],
 )
-def test_pipeline_real_kv_mode(real_kv_hash_mode: RealKvHashMode) -> None:
+def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None:
     """real_kv_hash_mode OFF/PARTIAL/ALL: real and ref use cloned sources to prevent ALL-mode hash aliasing."""
     max_seq_len = 16
     req_to_token = _build_req_to_token(max_reqs=4, max_seq_len=max_seq_len)
@@ -456,7 +452,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
         req_to_token=req_to_token,
         num_slots=64,
         extras=_empty_extras(),
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_expected_tokens,
         pseudo_expected_positions=pseudo_expected_positions,
     )
@@ -495,7 +491,7 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
         req_to_token=req_to_token,
         num_slots=64,
         extras=_empty_extras(),
-        pseudo_mode=CanaryPseudoMode.ON,
+        pseudo_mode=consts.CanaryPseudoMode.ON,
         pseudo_expected_tokens=pseudo_expected_tokens,
         pseudo_expected_positions=pseudo_expected_positions,
         ring_capacity=64,
@@ -656,7 +652,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         slot_run_counter=log_real.slot_run_counter,
         kernel_run_counter=log_real.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 
@@ -669,7 +665,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         slot_run_counter=log_ref.slot_run_counter,
         kernel_run_counter=log_ref.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # Step 3: write_index byte-equal; ring contents relaxed (atomic order not guaranteed under overflow).

@@ -11,19 +11,15 @@ import random
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_CHAIN_ANCHOR,
     CanaryLaunchTag,
-    RealKvHashMode,
     canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     canary_verify_step_torch_reference,
 )
-from sglang.jit_kernel.kv_canary.write import (
-    CanaryPseudoMode,
-    canary_write_step,
-)
+from sglang.jit_kernel.kv_canary.write import canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import (
     canary_write_step_torch_reference,
 )
@@ -64,7 +60,7 @@ def _verify_both(
         slot_run_counter=cuda_log.slot_run_counter,
         kernel_run_counter=cuda_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     canary_verify_step_torch_reference(
         canary_buf=ref_canary_buf,
@@ -75,7 +71,7 @@ def _verify_both(
         slot_run_counter=ref_log.slot_run_counter,
         kernel_run_counter=ref_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 
@@ -231,7 +227,7 @@ def test_empty_plan_keeps_slot_counter_unchanged() -> None:
 
 def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50() -> None:
     random.seed(0)
-    expected_prev_hash_signed = to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    expected_prev_hash_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
 
     for _ in range(50):
         token = random.randint(0, 0x7FFFFFFF)
@@ -320,7 +316,7 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
         slot_run_counter=cuda_log.slot_run_counter,
         kernel_run_counter=cuda_log.kernel_run_counter,
         real_kv_sources=(garbage_source,),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     canary_verify_step_torch_reference(
         canary_buf=ref_buf,
@@ -331,7 +327,7 @@ def test_real_kv_off_does_not_deref_real_kv_sources() -> None:
         slot_run_counter=ref_log.slot_run_counter,
         kernel_run_counter=ref_log.kernel_run_counter,
         real_kv_sources=(garbage_source,),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 
@@ -370,7 +366,7 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=garbage_expected_tokens,
         pseudo_expected_positions=garbage_expected_positions,
         violation_ring=cuda_log.ring,
@@ -378,7 +374,7 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         slot_run_counter=cuda_log.slot_run_counter,
         kernel_run_counter=cuda_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     canary_write_step_torch_reference(
         canary_buf=ref_buf,
@@ -387,7 +383,7 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         fb_positions=fb_positions,
         fb_out_cache_loc=fb_out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        pseudo_mode=CanaryPseudoMode.OFF,
+        pseudo_mode=consts.CanaryPseudoMode.OFF,
         pseudo_expected_tokens=garbage_expected_tokens,
         pseudo_expected_positions=garbage_expected_positions,
         violation_ring=ref_log.ring,
@@ -395,7 +391,7 @@ def test_pseudo_off_does_not_deref_pseudo_expected() -> None:
         slot_run_counter=ref_log.slot_run_counter,
         kernel_run_counter=ref_log.kernel_run_counter,
         real_kv_sources=(),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
     torch.cuda.synchronize()
 

@@ -22,11 +22,10 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
-    VIOLATION_FIELDS,
     CanaryLaunchTag,
-    RealKvHashMode,
     VerifyPlan,
     canary_verify_step,
 )
@@ -100,7 +99,7 @@ def _build_verify_inputs(
     )
 
     violation_ring = torch.zeros(
-        RING_CAPACITY, VIOLATION_FIELDS, dtype=torch.int64, device=device
+        RING_CAPACITY, consts.VIOLATION_FIELDS, dtype=torch.int64, device=device
     )
     violation_write_index = torch.zeros(1, dtype=torch.int32, device=device)
     slot_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
@@ -166,7 +165,7 @@ def benchmark(
                 slot_run_counter=slot_run_counter,
                 kernel_run_counter=kernel_run_counter,
                 real_kv_sources=(),
-                real_kv_hash_mode=RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
             )
 
     else:

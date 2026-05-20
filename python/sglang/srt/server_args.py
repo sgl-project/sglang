@@ -27,7 +27,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.jit_kernel.kv_canary.verify import RealKvHashMode
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -6056,7 +6056,7 @@ class ServerArgs:
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
                 "chain hash. Choices are derived from the ``RealKvHashMode`` "
-                "enum (kv_canary/verify.py) so the CLI surface and the "
+                "enum (kv_canary/consts.py) so the CLI surface and the "
                 "kernel-side enum stay byte-for-byte in sync. 'off' (default) "
                 "leaves the real_kv_hash slot field at zero. 'partial' "
                 "splitmix64-folds the first min(16, read_bytes) bytes of "

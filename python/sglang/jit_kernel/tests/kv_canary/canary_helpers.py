@@ -5,10 +5,9 @@ from typing import Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_CHAIN_ANCHOR,
     CANARY_SLOT_BYTES,
-    VIOLATION_FIELDS,
     VerifyPlan,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
@@ -64,7 +63,7 @@ class FakeViolationLog:
     ) -> "FakeViolationLog":
         return cls(
             ring=torch.zeros(
-                capacity, VIOLATION_FIELDS, dtype=torch.int64, device=device
+                capacity, consts.VIOLATION_FIELDS, dtype=torch.int64, device=device
             ),
             write_index=torch.zeros(1, dtype=torch.int32, device=device),
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
@@ -176,7 +175,7 @@ def to_signed_int64(value: int) -> int:
 
 
 def chain_anchor_signed() -> int:
-    return to_signed_int64(splitmix64(CANARY_CHAIN_ANCHOR))
+    return to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
 
 
 def write_slot_fields(
@@ -213,7 +212,7 @@ def stamp_clean_chain(
 ) -> list[int]:
     n = len(tokens)
     real_kv_hashes = real_kv_hashes if real_kv_hashes is not None else [0] * n
-    running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)
+    running_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
     stored_prev_hashes: list[int] = []
     for slot_idx, token, position, real_kv_hash in zip(
         slot_indices, tokens, positions, real_kv_hashes

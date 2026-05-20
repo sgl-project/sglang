@@ -11,13 +11,9 @@ from typing import Optional
 
 import torch
 
-from sglang.jit_kernel.kv_canary.verify import (
-    _VIOLATION_FIELD_KERNEL_KIND,
-    _VIOLATION_FIELD_SLOT_IDX,
-    CanaryLaunchTag,
-    VerifyPlan,
-)
-from sglang.jit_kernel.kv_canary.write import CanaryPseudoMode, WritePlan
+from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary.canary_helpers import FakeViolationLog
 
 # Plan invariants
@@ -235,11 +231,11 @@ def assert_violation_rows_have_valid_slot_and_kernel_kind(
     plan_slots = set(plan.verify_slot_indices[:n_active].detach().cpu().tolist())
     rows = log_after.ring[visible_start:visible_end].detach().cpu()
     for i in range(rows.shape[0]):
-        kind = int(rows[i, _VIOLATION_FIELD_KERNEL_KIND].item())
+        kind = int(rows[i, consts.VIOLATION_FIELD_KERNEL_KIND].item())
         assert kind == int(
             kernel_kind
         ), f"row {visible_start + i} kernel_kind {kind} != expected {int(kernel_kind)}"
-        slot = int(rows[i, _VIOLATION_FIELD_SLOT_IDX].item())
+        slot = int(rows[i, consts.VIOLATION_FIELD_SLOT_IDX].item())
         assert (
             slot in plan_slots
         ), f"row {visible_start + i} slot {slot} not in plan_slots"
@@ -360,7 +356,7 @@ def assert_slot_minus_one_skipped(
 
 def assert_pseudo_violation_only_on_mismatch(
     *,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     log_before: FakeViolationLog,
     log_after: FakeViolationLog,
     pseudo_expected_tokens: torch.Tensor,
@@ -371,7 +367,7 @@ def assert_pseudo_violation_only_on_mismatch(
     plan: WritePlan,
 ) -> None:
     delta = int(log_after.write_index[0].item()) - int(log_before.write_index[0].item())
-    if pseudo_mode == CanaryPseudoMode.OFF:
+    if pseudo_mode == consts.CanaryPseudoMode.OFF:
         assert delta == 0, f"pseudo_mode=OFF must produce no violations, got {delta}"
         return
     n_active = int(plan.write_num_valid_reqs[0].item())
@@ -438,7 +434,7 @@ def assert_all_write_invariants(
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    pseudo_mode: CanaryPseudoMode,
+    pseudo_mode: consts.CanaryPseudoMode,
     pseudo_expected_tokens: Optional[torch.Tensor],
     pseudo_expected_positions: Optional[torch.Tensor],
     log_before: FakeViolationLog,
@@ -458,7 +454,7 @@ def assert_all_write_invariants(
         fb_out_cache_loc=fb_out_cache_loc,
     )
     if (
-        pseudo_mode == CanaryPseudoMode.ON
+        pseudo_mode == consts.CanaryPseudoMode.ON
         and pseudo_expected_tokens is not None
         and pseudo_expected_positions is not None
     ):
@@ -473,7 +469,7 @@ def assert_all_write_invariants(
             fb_out_cache_loc=fb_out_cache_loc,
             plan=plan,
         )
-    elif pseudo_mode == CanaryPseudoMode.OFF:
+    elif pseudo_mode == consts.CanaryPseudoMode.OFF:
         assert_pseudo_violation_only_on_mismatch(
             pseudo_mode=pseudo_mode,
             log_before=log_before,
