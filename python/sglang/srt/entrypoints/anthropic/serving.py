@@ -6,6 +6,7 @@ OpenAIServingChat for processing, and converts responses back to Anthropic forma
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -14,18 +15,34 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
 
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicContentBlock,
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
-    AnthropicDelta,
     AnthropicError,
     AnthropicErrorResponse,
+    AnthropicMessageEndDelta,
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
     AnthropicStreamEvent,
     AnthropicUsage,
+    ContentBlockDeltaEvent,
+    ContentBlockStartEvent,
+    ContentBlockStopEvent,
+    ErrorEvent,
+    InputJsonDelta,
+    MessageDeltaEvent,
+    MessageStartEvent,
+    MessageStopEvent,
+    SignatureDelta,
+    TextBlock,
+    TextDelta,
+    ThinkingBlock,
+    ThinkingDelta,
+    ToolUseBlock,
+    is_server_tool,
 )
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -70,10 +87,20 @@ def _cached_prompt_tokens(usage) -> int:
 
 
 def _anthropic_input_tokens(usage) -> int:
-    return max(
-        (getattr(usage, "prompt_tokens", 0) or 0) - _cached_prompt_tokens(usage),
-        0,
-    )
+    prompt = getattr(usage, "prompt_tokens", 0) or 0
+    cached = _cached_prompt_tokens(usage)
+    if cached > prompt:
+        # Upstream telemetry bug: cached cannot exceed the prompt it caches.
+        # Clamping silently here would hide the discrepancy from billing
+        # dashboards, so make it visible at WARNING level.
+        logger.warning(
+            "Cached tokens (%d) exceed prompt tokens (%d); clamping "
+            "input_tokens to 0. This usually indicates an upstream "
+            "telemetry bug.",
+            cached,
+            prompt,
+        )
+    return max(prompt - cached, 0)
 
 
 def _anthropic_usage_from_openai(
@@ -107,6 +134,29 @@ def _wrap_sse_event(data: str, event_type: str) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+def _scrub_error_message(message: str, status_code: int) -> str:
+    """Return a safe outward-facing error message.
+
+    5xx is always generic — never echo upstream ``str(e)`` payloads, which
+    may contain stack frames, file paths, or PII. 4xx keeps the original
+    message (truncated and with obvious traceback lines stripped) so
+    callers see the real validation failure.
+    """
+    if status_code >= 500:
+        return "Internal server error"
+    if not message:
+        return "Request failed"
+    safe_lines = [
+        ln
+        for ln in message.splitlines()
+        if not ln.startswith("Traceback") and 'File "/' not in ln
+    ]
+    cleaned = "\n".join(safe_lines).strip()
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500] + "…"
+    return cleaned or "Request failed"
+
+
 class AnthropicServing:
     """Handler for Anthropic Messages API requests.
 
@@ -125,6 +175,8 @@ class AnthropicServing:
         """Main entry point for /v1/messages endpoint."""
         try:
             chat_request = self._convert_to_chat_completion_request(request)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Error converting Anthropic request: %s", e)
             return self._error_response(
@@ -145,8 +197,12 @@ class AnthropicServing:
         openai_messages = []
 
         def _convert_anthropic_image_source_to_openai_part(
-            source: Optional[dict[str, Any] | str],
+            source: Any,
         ) -> Optional[dict]:
+            # Source may arrive as a Pydantic model (typed ImageBlock.source)
+            # or as a raw dict when parsed from a nested tool_result payload.
+            if isinstance(source, BaseModel):
+                source = source.model_dump(exclude_none=True)
             if not isinstance(source, dict):
                 return None
 
@@ -204,14 +260,21 @@ class AnthropicServing:
             return "\n".join(search_parts)
 
         def _convert_tool_result_content(
-            content: Optional[str | list[dict]],
-        ) -> tuple[str | list[dict], str]:
+            content: Any,
+        ) -> tuple[Union[str, list[dict]], str]:
             if isinstance(content, list):
                 tool_content_parts = []
                 tool_text_parts = []
 
-                for item in content:
-                    if not isinstance(item, dict):
+                for raw_item in content:
+                    # Items may be typed Pydantic blocks (after request
+                    # validation) or raw dicts (from legacy callers). Coerce
+                    # to dict so the existing key-based logic still works.
+                    if isinstance(raw_item, BaseModel):
+                        item = raw_item.model_dump(exclude_none=True)
+                    elif isinstance(raw_item, dict):
+                        item = raw_item
+                    else:
                         continue
 
                     item_type = item.get("type")
@@ -379,15 +442,22 @@ class AnthropicServing:
         if anthropic_request.tools:
             converted_tools = []
             for tool in anthropic_request.tools:
-                tool_type = tool.type or ""
-                is_builtin_server_tool = tool_type.startswith(
-                    "web_search"
-                ) or tool.name.startswith("web_search")
-                if tool.input_schema is None:
-                    if is_builtin_server_tool:
-                        continue
-                    raise ValueError("input_schema is required for custom tools")
+                if is_server_tool(tool):
+                    # Anthropic server-side tools (web_search_*, computer_*,
+                    # bash_*, text_editor_*) have no client-side input_schema
+                    # because Anthropic provides the implementation. We can't
+                    # forward them to the OpenAI tools array (which requires a
+                    # schema), so skip with a visible log.
+                    logger.info(
+                        "Skipping built-in Anthropic server tool %r (type=%r): "
+                        "no native support in the OpenAI-compatible backend",
+                        tool.name,
+                        tool.type,
+                    )
+                    continue
 
+                # Custom tools always have a validated input_schema
+                # (enforced at Pydantic parse time).
                 converted_tools.append(
                     Tool(
                         type="function",
@@ -460,12 +530,15 @@ class AnthropicServing:
             response = await self.openai_serving_chat._handle_non_streaming_request(
                 adapted_request, processed_request, raw_request
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
                 status_code=500,
-                error_type="internal_error",
+                error_type="api_error",
                 message="Internal server error",
+                exception_name=type(e).__name__,
             )
 
         # Check for error responses from OpenAI handler
@@ -506,12 +579,15 @@ class AnthropicServing:
             adapted_request.validation_time = validation_time
             adapted_request.received_time = received_time
             adapted_request.received_time_perf = received_time_perf
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
                 status_code=500,
-                error_type="internal_error",
+                error_type="api_error",
                 message="Internal server error",
+                exception_name=type(e).__name__,
             )
 
         return StreamingResponse(
@@ -539,19 +615,19 @@ class AnthropicServing:
             adapted_request, processed_request, raw_request
         )
 
-        # State tracking
         content_block_index = 0
         content_block_open = False
         content_block_type: Optional[str] = None
+        captured_thinking_signature: str = ""
         finish_reason: Optional[str] = None
         final_usage: Optional[AnthropicUsage] = None
         message_started = False
+        had_content_delta = False
         message_id = f"msg_{uuid.uuid4().hex}"
         model = anthropic_request.model
 
-        def _message_start_event(usage) -> AnthropicStreamEvent:
-            return AnthropicStreamEvent(
-                type="message_start",
+        def _message_start_event(usage) -> MessageStartEvent:
+            return MessageStartEvent(
                 message=AnthropicMessagesResponse(
                     id=message_id,
                     content=[],
@@ -565,60 +641,54 @@ class AnthropicServing:
                 ),
             )
 
-        def _close_content_block_events() -> list[tuple[str, AnthropicStreamEvent]]:
-            nonlocal content_block_index, content_block_open, content_block_type
+        def _emit(event: AnthropicStreamEvent) -> str:
+            return _wrap_sse_event(
+                event.model_dump_json(exclude_none=True),
+                event.type,
+            )
 
-            events = []
+        def _close_content_block_events() -> list[AnthropicStreamEvent]:
+            nonlocal content_block_index, content_block_open
+            nonlocal content_block_type, captured_thinking_signature
+
+            events: list[AnthropicStreamEvent] = []
             if not content_block_open:
                 return events
 
-            if content_block_type == "thinking":
+            # Only emit signature_delta when a real signature is available.
+            # Anthropic's spec treats absence as "unsigned thinking"; an
+            # empty-string signature would fail downstream verifiers.
+            if content_block_type == "thinking" and captured_thinking_signature:
                 events.append(
-                    (
-                        "content_block_delta",
-                        AnthropicStreamEvent(
-                            type="content_block_delta",
-                            index=content_block_index,
-                            delta=AnthropicDelta(
-                                type="signature_delta",
-                                signature="",
-                            ),
+                    ContentBlockDeltaEvent(
+                        index=content_block_index,
+                        delta=SignatureDelta(
+                            signature=captured_thinking_signature,
                         ),
                     )
                 )
 
-            events.append(
-                (
-                    "content_block_stop",
-                    AnthropicStreamEvent(
-                        type="content_block_stop",
-                        index=content_block_index,
-                    ),
-                )
-            )
+            events.append(ContentBlockStopEvent(index=content_block_index))
             content_block_open = False
             content_block_type = None
             content_block_index += 1
+            captured_thinking_signature = ""
             return events
 
         def _ensure_content_block_events(
             block_type: str,
             content_block: AnthropicContentBlock,
-        ) -> list[tuple[str, AnthropicStreamEvent]]:
+        ) -> list[AnthropicStreamEvent]:
             nonlocal content_block_open, content_block_type
 
-            events = []
+            events: list[AnthropicStreamEvent] = []
             if content_block_open and content_block_type != block_type:
                 events.extend(_close_content_block_events())
             if not content_block_open:
                 events.append(
-                    (
-                        "content_block_start",
-                        AnthropicStreamEvent(
-                            type="content_block_start",
-                            index=content_block_index,
-                            content_block=content_block,
-                        ),
+                    ContentBlockStartEvent(
+                        index=content_block_index,
+                        content_block=content_block,
                     )
                 )
                 content_block_open = True
@@ -633,55 +703,70 @@ class AnthropicServing:
 
             if data_str == "[DONE]":
                 if not message_started:
-                    start_event = _message_start_event(None)
-                    yield _wrap_sse_event(
-                        start_event.model_dump_json(exclude_none=True),
-                        "message_start",
-                    )
+                    yield _emit(_message_start_event(None))
                     message_started = True
 
-                # Close any open content block
-                for event_name, event in _close_content_block_events():
-                    yield _wrap_sse_event(
-                        event.model_dump_json(exclude_none=True),
-                        event_name,
+                # Detect an empty completion: stream finished without ever
+                # producing a content delta. Don't ship a successful
+                # zero-content message — surface as an explicit error so
+                # operators don't see silent success on backend failures.
+                if not had_content_delta:
+                    logger.warning(
+                        "Stream produced no content before [DONE]; "
+                        "emitting api_error event"
                     )
+                    yield _emit(
+                        ErrorEvent(
+                            error=AnthropicError(
+                                type="api_error",
+                                message="Backend produced no content",
+                            ),
+                        )
+                    )
+                    yield _emit(MessageStopEvent())
+                    continue
+
+                # Close any open content block
+                for event in _close_content_block_events():
+                    yield _emit(event)
 
                 # Emit message_delta with stop_reason and usage
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
-                delta_event = AnthropicStreamEvent(
-                    type="message_delta",
-                    delta=AnthropicDelta(stop_reason=stop_reason),
-                    usage=final_usage or AnthropicUsage(output_tokens=0),
-                )
-                yield _wrap_sse_event(
-                    delta_event.model_dump_json(exclude_none=True),
-                    "message_delta",
+                yield _emit(
+                    MessageDeltaEvent(
+                        delta=AnthropicMessageEndDelta(stop_reason=stop_reason),
+                        usage=final_usage or AnthropicUsage(output_tokens=0),
+                    )
                 )
 
-                # Emit message_stop
-                stop_msg = AnthropicStreamEvent(type="message_stop")
-                yield _wrap_sse_event(
-                    stop_msg.model_dump_json(exclude_none=True),
-                    "message_stop",
-                )
+                yield _emit(MessageStopEvent())
                 continue
 
             # Parse the OpenAI chunk
             try:
                 chunk = ChatCompletionStreamResponse.model_validate_json(data_str)
-            except Exception:
-                logger.debug("Failed to parse stream chunk: %s", data_str)
-                error_event = AnthropicStreamEvent(
-                    type="error",
-                    error=AnthropicError(
-                        type="api_error", message="Stream processing error"
-                    ),
+            except (ValidationError, json.JSONDecodeError, UnicodeDecodeError) as e:
+                logger.warning(
+                    "Failed to parse Anthropic stream chunk (%s): %s",
+                    type(e).__name__,
+                    data_str[:200],
                 )
-                yield _wrap_sse_event(
-                    error_event.model_dump_json(exclude_none=True), "error"
+                # If message_start hasn't been sent yet, send a minimal one
+                # so the wire format stays valid (clients require the
+                # message_start frame before any other event).
+                if not message_started:
+                    yield _emit(_message_start_event(None))
+                    message_started = True
+                yield _emit(
+                    ErrorEvent(
+                        error=AnthropicError(
+                            type="api_error", message="Stream processing error"
+                        ),
+                    )
                 )
-                continue
+                # Don't leave the stream half-open — close it cleanly.
+                yield _emit(MessageStopEvent())
+                return
 
             if chunk.usage is not None:
                 final_usage = _anthropic_usage_from_openai(
@@ -699,20 +784,19 @@ class AnthropicServing:
 
             choice = chunk.choices[0]
 
-            # Capture finish reason
             if choice.finish_reason is not None:
                 finish_reason = choice.finish_reason
                 if not message_started:
-                    start_event = _message_start_event(chunk.usage)
-                    yield _wrap_sse_event(
-                        start_event.model_dump_json(exclude_none=True),
-                        "message_start",
-                    )
+                    yield _emit(_message_start_event(chunk.usage))
                     message_started = True
                 continue
 
             delta = choice.delta
 
+            # Defer message_start until the first chunk carrying real prompt
+            # usage or content. OpenAI streams emit a role-only chunk before
+            # usage is available; emitting message_start there would ship
+            # input_tokens=0 to the client.
             has_delta_payload = bool(
                 delta.reasoning_content
                 or delta.tool_calls
@@ -720,11 +804,7 @@ class AnthropicServing:
                 or chunk.usage
             )
             if has_delta_payload and not message_started:
-                start_event = _message_start_event(chunk.usage)
-                yield _wrap_sse_event(
-                    start_event.model_dump_json(exclude_none=True),
-                    "message_start",
-                )
+                yield _emit(_message_start_event(chunk.usage))
                 message_started = True
 
             if (
@@ -736,31 +816,19 @@ class AnthropicServing:
 
             # Handle reasoning content deltas
             if delta.reasoning_content:
-                for event_name, event in _ensure_content_block_events(
+                for event in _ensure_content_block_events(
                     "thinking",
-                    AnthropicContentBlock(
-                        type="thinking",
-                        thinking="",
-                        signature="",
-                    ),
+                    ThinkingBlock(thinking=""),
                 ):
-                    yield _wrap_sse_event(
-                        event.model_dump_json(exclude_none=True),
-                        event_name,
-                    )
+                    yield _emit(event)
 
-                delta_event = AnthropicStreamEvent(
-                    type="content_block_delta",
-                    index=content_block_index,
-                    delta=AnthropicDelta(
-                        type="thinking_delta",
-                        thinking=delta.reasoning_content,
-                    ),
+                yield _emit(
+                    ContentBlockDeltaEvent(
+                        index=content_block_index,
+                        delta=ThinkingDelta(thinking=delta.reasoning_content),
+                    )
                 )
-                yield _wrap_sse_event(
-                    delta_event.model_dump_json(exclude_none=True),
-                    "content_block_delta",
-                )
+                had_content_delta = True
 
             # Handle tool call deltas
             if delta.tool_calls:
@@ -770,86 +838,69 @@ class AnthropicServing:
 
                     # New tool call: close previous block, start new one
                     if tc_func and tc_func.name:
-                        # Start tool_use content block
-                        for event_name, event in _ensure_content_block_events(
+                        for event in _ensure_content_block_events(
                             "tool_use",
-                            AnthropicContentBlock(
-                                type="tool_use",
+                            ToolUseBlock(
                                 id=tc_id or f"toolu_{uuid.uuid4().hex}",
                                 name=tc_func.name,
                                 input={},
                             ),
                         ):
-                            yield _wrap_sse_event(
-                                event.model_dump_json(exclude_none=True),
-                                event_name,
-                            )
+                            yield _emit(event)
 
-                        # Stream initial arguments if present
                         if tc_func.arguments:
-                            delta_event = AnthropicStreamEvent(
-                                type="content_block_delta",
-                                index=content_block_index,
-                                delta=AnthropicDelta(
-                                    type="input_json_delta",
-                                    partial_json=tc_func.arguments,
-                                ),
+                            yield _emit(
+                                ContentBlockDeltaEvent(
+                                    index=content_block_index,
+                                    delta=InputJsonDelta(
+                                        partial_json=tc_func.arguments,
+                                    ),
+                                )
                             )
-                            yield _wrap_sse_event(
-                                delta_event.model_dump_json(exclude_none=True),
-                                "content_block_delta",
-                            )
+                            had_content_delta = True
 
                     elif tc_func and tc_func.arguments:
                         # Continuing arguments for current tool call
                         if content_block_type != "tool_use":
+                            logger.warning(
+                                "Dropping tool_call argument delta with no "
+                                "open tool_use block: %r",
+                                (tc_func.arguments or "")[:100],
+                            )
                             continue
-                        delta_event = AnthropicStreamEvent(
-                            type="content_block_delta",
-                            index=content_block_index,
-                            delta=AnthropicDelta(
-                                type="input_json_delta",
-                                partial_json=tc_func.arguments,
-                            ),
+                        yield _emit(
+                            ContentBlockDeltaEvent(
+                                index=content_block_index,
+                                delta=InputJsonDelta(
+                                    partial_json=tc_func.arguments,
+                                ),
+                            )
                         )
-                        yield _wrap_sse_event(
-                            delta_event.model_dump_json(exclude_none=True),
-                            "content_block_delta",
-                        )
+                        had_content_delta = True
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
-                # Start a text content block if needed
-                for event_name, event in _ensure_content_block_events(
+                for event in _ensure_content_block_events(
                     "text",
-                    AnthropicContentBlock(type="text", text=""),
+                    TextBlock(text=""),
                 ):
-                    yield _wrap_sse_event(
-                        event.model_dump_json(exclude_none=True),
-                        event_name,
-                    )
+                    yield _emit(event)
 
-                # Emit text delta
-                delta_event = AnthropicStreamEvent(
-                    type="content_block_delta",
-                    index=content_block_index,
-                    delta=AnthropicDelta(
-                        type="text_delta",
-                        text=delta.content,
-                    ),
+                yield _emit(
+                    ContentBlockDeltaEvent(
+                        index=content_block_index,
+                        delta=TextDelta(text=delta.content),
+                    )
                 )
-                yield _wrap_sse_event(
-                    delta_event.model_dump_json(exclude_none=True),
-                    "content_block_delta",
-                )
+                had_content_delta = True
 
     def _convert_response(
         self, response: ChatCompletionResponse
     ) -> AnthropicMessagesResponse:
-        """Convert an OpenAI ChatCompletionResponse to an Anthropic response."""
+        """Convert an OpenAI ChatCompletionResponse to an Anthropic Messages response."""
         if not response.choices:
             return AnthropicMessagesResponse(
-                content=[AnthropicContentBlock(type="text", text="")],
+                content=[TextBlock(text="")],
                 model=response.model,
                 stop_reason="end_turn",
                 usage=AnthropicUsage(input_tokens=0, output_tokens=0),
@@ -858,33 +909,36 @@ class AnthropicServing:
         choice = response.choices[0]
         content: list[AnthropicContentBlock] = []
 
-        # Add reasoning content
+        # Add reasoning content as a thinking block. signature is omitted
+        # entirely when the backend doesn't provide one — empty strings
+        # would fail downstream Anthropic signature verifiers.
         if choice.message.reasoning_content:
-            content.append(
-                AnthropicContentBlock(
-                    type="thinking",
-                    thinking=choice.message.reasoning_content,
-                    signature="",
-                )
-            )
+            content.append(ThinkingBlock(thinking=choice.message.reasoning_content))
 
         # Add text content
         if choice.message.content:
-            content.append(
-                AnthropicContentBlock(type="text", text=choice.message.content)
-            )
+            content.append(TextBlock(text=choice.message.content))
 
         # Add tool calls
         if choice.message.tool_calls:
             for tool_call in choice.message.tool_calls:
+                raw_args = tool_call.function.arguments
                 try:
-                    tool_input = json.loads(tool_call.function.arguments)
+                    tool_input = json.loads(raw_args)
                 except (json.JSONDecodeError, TypeError):
+                    # Surface invalid tool arguments so an empty-dict
+                    # tool call is never indistinguishable from a real
+                    # one when something downstream goes wrong.
+                    logger.warning(
+                        "Tool %r emitted invalid JSON arguments: %r — "
+                        "defaulting to empty input",
+                        tool_call.function.name,
+                        (raw_args or "")[:200],
+                    )
                     tool_input = {}
 
                 content.append(
-                    AnthropicContentBlock(
-                        type="tool_use",
+                    ToolUseBlock(
                         id=tool_call.id,
                         name=tool_call.function.name,
                         input=tool_input,
@@ -907,31 +961,48 @@ class AnthropicServing:
         )
 
     def _convert_openai_error_response(self, response) -> JSONResponse:
+        """Forward an upstream OpenAI-handler error as an Anthropic error.
+
+        The original error message is preserved for 4xx (after light
+        sanitization) so callers see the real validation failure. For 5xx
+        we always return a generic ``"Internal server error"`` to avoid
+        leaking ``str(e)`` payloads that the OpenAI handler builds from
+        raw exceptions (paths, tracebacks, prompt fragments, etc.).
+        """
         status_code = getattr(response, "status_code", 500)
+        body = getattr(response, "body", b"") or b""
         error_type = ERROR_TYPE_MAP.get(status_code, "api_error")
-        message = "Internal processing error"
 
-        body = getattr(response, "body", None)
-        if body:
+        upstream_message: Optional[str] = None
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else None
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Non-JSON body (HTML gateway error, plain text, ...). Use a
+            # bounded slice of the raw body so the client still has a
+            # useful hint instead of a generic placeholder.
             try:
-                payload = json.loads(body.decode("utf-8"))
+                upstream_message = body.decode("utf-8", errors="replace")[:500]
             except Exception:
-                payload = None
-
+                upstream_message = None
+        else:
             if isinstance(payload, dict):
                 error_payload = payload.get("error", payload)
                 if isinstance(error_payload, dict):
-                    message = (
-                        error_payload.get("message")
-                        or payload.get("message")
-                        or message
+                    upstream_message = error_payload.get("message") or payload.get(
+                        "message"
                     )
-                    error_type = error_payload.get("type") or error_type
+                    # Honor the upstream error.type only for 4xx; 5xx is
+                    # normalized below.
+                    if status_code < 500:
+                        upstream_type = error_payload.get("type")
+                        if isinstance(upstream_type, str) and upstream_type:
+                            error_type = upstream_type
                 elif isinstance(error_payload, str):
-                    message = error_payload
-                elif payload.get("message"):
-                    message = payload["message"]
+                    upstream_message = error_payload
+                elif isinstance(payload.get("message"), str):
+                    upstream_message = payload["message"]
 
+        message = _scrub_error_message(upstream_message or "", status_code)
         return self._error_response(
             status_code=status_code,
             error_type=error_type,
@@ -943,10 +1014,20 @@ class AnthropicServing:
         status_code: int,
         error_type: str,
         message: str,
+        exception_name: Optional[str] = None,
     ) -> JSONResponse:
-        """Create an Anthropic-format error response."""
+        """Create an Anthropic-format error response.
+
+        ``exception_name`` is appended to ``error.type`` when provided (e.g.
+        ``"api_error:KeyError"``) so operators can grep server-side errors
+        without having to log-dive — without ever exposing the exception
+        message itself, which may contain stack frames or PII.
+        """
+        outward_type = (
+            f"{error_type}:{exception_name}" if exception_name else error_type
+        )
         error_resp = AnthropicErrorResponse(
-            error=AnthropicError(type=error_type, message=message)
+            error=AnthropicError(type=outward_type, message=message)
         )
         return JSONResponse(
             status_code=status_code,
@@ -974,6 +1055,8 @@ class AnthropicServing:
                 tool_choice=request.tool_choice,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Error converting count_tokens request: %s", e)
             return self._error_response(
@@ -1002,10 +1085,13 @@ class AnthropicServing:
                     input_tokens=input_tokens
                 ).model_dump()
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(
                 status_code=500,
-                error_type="internal_error",
+                error_type="api_error",
                 message="Internal server error",
+                exception_name=type(e).__name__,
             )
