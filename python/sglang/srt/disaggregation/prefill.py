@@ -388,6 +388,123 @@ class SchedulerDisaggregationPrefillMixin:
 
         return batch
 
+    def _prepare_pipelined_state_indices(self: Scheduler, batch) -> None:
+        """Pre-compute state indices for hybrid models and attach to each req.
+
+        Mirrors the state_indices computation in send_kv_chunk, but stores
+        the result on req.pipelined_state_indices so that run_batch_pipelined
+        can pass it through the last send_layer call.
+        """
+        page_size = self.token_to_kv_pool_allocator.page_size
+        state_types = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
+
+        for req in batch.reqs:
+            state_indices = None
+            if state_types:
+                seq_len = len(req.fill_ids)
+
+                def _mamba_payload():
+                    return [
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.req_pool_idx
+                        ]
+                        .cpu()
+                        .numpy()
+                    ]
+
+                def _swa_payload():
+                    window_size = self.sliding_window_size
+                    window_start = max(0, seq_len - window_size)
+                    window_start = (window_start // page_size) * page_size
+                    window_kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, window_start:seq_len
+                    ]
+                    window_kv_indices_swa = (
+                        self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                            window_kv_indices_full
+                        )
+                    )
+                    return kv_to_page_indices(
+                        window_kv_indices_swa.cpu().numpy(), page_size
+                    )
+
+                def _nsa_payload():
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        req.req_pool_idx, :seq_len
+                    ]
+                    return kv_to_page_indices(kv_indices_full.cpu().numpy(), page_size)
+
+                state_indices = []
+                for st in state_types:
+                    if st == StateType.MAMBA:
+                        state_indices.append(_mamba_payload())
+                    elif st == StateType.SWA:
+                        state_indices.append(_swa_payload())
+                    elif st == StateType.NSA:
+                        state_indices.append(_nsa_payload())
+                    else:
+                        state_indices.append(None)
+
+            req.pipelined_state_indices = state_indices
+
+    def _get_pipeline_group_size(self: Scheduler, batch) -> int:
+        """Return adaptive group_size, or 0 if pipelining should not be used."""
+        if not envs.SGLANG_PIPELINED_KV_TRANSFER.get():
+            return 0
+
+        # Layer-pipelined transfer currently requires the mooncake backend.
+        if self.transfer_backend not in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.FAKE,
+        ):
+            return 0
+
+        # PP (pipeline parallelism) is not yet supported — send_kvcache_layer
+        # indexes kv_data_ptrs with global layer_id which is incompatible with
+        # PP's per-stage pointer slicing.
+        if self.ps.pp_size > 1:
+            return 0
+
+        # Universal guard: model must implement forward_split_prefill to use
+        # pipelined transfer. Models without it (e.g. Mamba-only, hybrid models
+        # that haven't added support) safely fallback to the normal path.
+        model = self.tp_worker.model_runner.model
+        if not hasattr(model, "forward_split_prefill"):
+            logger.debug(
+                "Pipeline skip: model %s lacks forward_split_prefill",
+                type(model).__name__,
+            )
+            return 0
+
+        min_tokens = envs.SGLANG_PIPELINE_MIN_TOKENS.get()
+        avg_tokens = sum(req.extend_input_len for req in batch.reqs) // len(batch.reqs)
+        if avg_tokens < min_tokens:
+            return 0
+
+        # If user explicitly set group_size, respect it (backward compatible)
+        if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
+            return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
+
+        # Adaptive group_size: balance pipeline parallelism vs overhead.
+        #
+        # Fewer iterations (larger groups) → less pipeline overlap but lower
+        # per-group dispatch overhead. More iterations (smaller groups) → better
+        # overlap of transfer with GPU compute but more RDMA doorbell calls.
+        #
+        # For short prompts (<4096 tokens), prefill compute per group is small,
+        # so we use more groups (10 iterations) to maximize overlap opportunity.
+        # For long prompts (>=8192), each group already has enough compute to
+        # fully overlap transfer, so fewer groups (6 iterations) suffice and
+        # reduce dispatch overhead.
+        num_layers = self.model_config.num_hidden_layers
+        if avg_tokens < 4096:
+            target_iters = 10
+        elif avg_tokens < 8192:
+            target_iters = 8
+        else:
+            target_iters = 6
+        return max(1, num_layers // target_iters)
+
     @torch.no_grad()
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
@@ -411,8 +528,15 @@ class SchedulerDisaggregationPrefillMixin:
             if batch:
                 if self.enable_staging:
                     self.maybe_prefetch_staging_for_batch(batch)
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
+                group_size = self._get_pipeline_group_size(batch)
+                if group_size > 0:
+                    result = self.run_batch_pipelined(batch, group_size=group_size)
+                    self.process_batch_result_disagg_prefill(
+                        batch, result, pipelined=True
+                    )
+                else:
+                    result = self.run_batch(batch)
+                    self.process_batch_result(batch, result)
             else:
                 self.on_idle()
 
@@ -470,10 +594,15 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler,
         batch: ScheduleBatch,
         result: GenerationBatchResult,
+        pipelined: bool = False,
     ) -> None:
         """
-        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
-        Adapted from process_batch_result_prefill
+        Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
+        Adapted from process_batch_result_prefill.
+
+        When pipelined=True, KV data was already sent per-layer in
+        run_batch_pipelined, so only the metadata buffer is set here
+        instead of calling send_kv_chunk.
         """
         (
             logits_output,
@@ -544,7 +673,13 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+
+                if pipelined:
+                    # KV already sent per-layer in run_batch_pipelined.
+                    # Only set the metadata buffer here.
+                    self.disagg_metadata_buffers.set_buf(req)
+                else:
+                    self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
                 if req.grammar is not None:

@@ -24,7 +24,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -71,8 +71,7 @@ class FalconH1MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.layer_id = layer_id
@@ -101,7 +100,6 @@ class FalconH1MLP(nn.Module):
 
 
 class FalconH1HybridAttentionDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: FalconH1Config,
@@ -500,6 +498,55 @@ class FalconH1ForCausalLM(nn.Module):
             input_ids, hidden_states, self.lm_head, forward_batch
         )
 
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],
+        input_embeds: torch.Tensor = None,
+    ) -> Optional["LogitsProcessorOutput"]:
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = (
+                    self.model.embed_tokens(input_ids) * self.model.embedding_multiplier
+                )
+            else:
+                forward_batch.hidden_states = (
+                    input_embeds * self.model.embedding_multiplier
+                )
+        # decoder layers
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                layer_id=i,
+                positions=positions,
+                hidden_states=forward_batch.hidden_states,
+                residual=forward_batch.residual,
+                forward_batch=forward_batch,
+            )
+
+        if end == self.config.num_hidden_layers:
+            # norm
+            if forward_batch.residual is None:
+                hidden_states = self.model.final_layernorm(forward_batch.hidden_states)
+            else:
+                hidden_states, _ = self.model.final_layernorm(
+                    forward_batch.hidden_states, forward_batch.residual
+                )
+            forward_batch.hidden_states = hidden_states
+            # logits
+            result = self.logits_processor(
+                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            result = None
+
+        return result
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
@@ -526,7 +573,6 @@ class FalconH1ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-
             if "rotary_emb.inv_freq" in name:
                 continue
 
