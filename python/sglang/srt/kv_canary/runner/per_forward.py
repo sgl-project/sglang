@@ -28,6 +28,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _CanaryEnableWarner:
+    """Double-buffered host mirror of ``VerifyPlan.enable``. Each call to :meth:`tick` drains the
+    previous step's async d2h (warn-logging when that step's plan kernel set enable=0 due to
+    capacity overflow) and enqueues a new copy for the current step. Drain happens right before
+    the slot is overwritten so the d2h gets a full forward pass of pipelining headroom.
+    """
+
+    def __init__(
+        self, *, verify_capacity: int, d2h_stream: Optional[torch.cuda.Stream]
+    ) -> None:
+        self._verify_capacity = verify_capacity
+        self._d2h_stream = d2h_stream
+        self._pending_future: Optional[FutureTensor] = None
+        self._overflow_count_total: int = 0
+
+    def tick(self, enable_device: torch.Tensor) -> None:
+        self._drain_previous()
+        self._pending_future = FutureTensor.create(
+            src_device=enable_device,
+            stream=self._d2h_stream,
+        )
+
+    def _drain_previous(self) -> None:
+        previous = self._pending_future
+        if previous is None:
+            return
+        enable_value = int(previous.wait().item())
+        if enable_value == 0:
+            self._overflow_count_total += 1
+            logger.warning(
+                "kv-canary: per-forward verify skipped this step due to overflow "
+                "(total=%d, capacity=%d); check ServerArgs / pool sizing",
+                self._overflow_count_total,
+                self._verify_capacity,
+            )
+
+
 class PerForwardOrchestrator:
     """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
     capture boundary:
@@ -93,8 +130,10 @@ class PerForwardOrchestrator:
         self._write_entry_capacity = write_entry_capacity
         self._verify_capacity = max(1, per_forward_verify_capacity)
 
-        self._pending_enable_future: Optional[FutureTensor] = None
-        self._overflow_count_total: int = 0
+        self._enable_warner = _CanaryEnableWarner(
+            verify_capacity=self._verify_capacity,
+            d2h_stream=d2h_stream,
+        )
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
@@ -190,28 +229,7 @@ class PerForwardOrchestrator:
     def end_of_step(self) -> None:
         if self._config.mode == "off":
             return
-        # Drain the previous step's enable mirror right before overwriting the slot, matching the
-        # double-buffer pattern PumpAndAllreduce uses for its violation signal: the wait stalls the
-        # host as late as possible so the d2h copy gets a full forward pass of headroom.
-        self._drain_previous_enable_mirror()
-        self._pending_enable_future = FutureTensor.create(
-            src_device=self._verify_plan_per_forward.enable,
-            stream=self._d2h_stream,
-        )
-
-    def _drain_previous_enable_mirror(self) -> None:
-        previous = self._pending_enable_future
-        if previous is None:
-            return
-        enable_value = int(previous.wait().item())
-        if enable_value == 0:
-            self._overflow_count_total += 1
-            logger.warning(
-                "kv-canary: per-forward verify skipped this step due to overflow "
-                "(total=%d, capacity=%d); check ServerArgs / pool sizing",
-                self._overflow_count_total,
-                self._verify_capacity,
-            )
+        self._enable_warner.tick(self._verify_plan_per_forward.enable)
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
