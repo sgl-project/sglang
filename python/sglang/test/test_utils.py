@@ -5,6 +5,7 @@ import asyncio
 import copy
 import doctest
 import inspect
+import io
 import json
 import logging
 import os
@@ -988,8 +989,8 @@ def popen_launch_pd_server(
     timeout: float,
     api_key: Optional[str] = None,
     other_args: list[str] = (),
-    env: Optional[dict] = None,
-    return_stdout_stderr: Optional[tuple] = None,
+    env: Optional[dict[str, str]] = None,
+    return_stdout_stderr: Optional[tuple[io.StringIO, io.StringIO]] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
