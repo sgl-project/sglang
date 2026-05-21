@@ -40,11 +40,6 @@ else:
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
-    # Cross-stream barrier event signaling that forward stream has finished
-    # producing this future (i.e., the buf slots at `indices` are written).
-    # Consumers on schedule stream wait on this before reading the buf.
-    # Recorded by Scheduler AFTER store_to_map on the forward stream.
-    done: Optional["torch.cuda.Event"] = None
 
 
 class FutureMap:
@@ -68,6 +63,13 @@ class FutureMap:
             )
         else:
             self.buf_initialized = False
+
+        # Single cross-stream fence covering "all buf writes dispatched so far".
+        # Recorded on forward stream at the tail of every store_to_map; waited
+        # on by schedule-stream consumers (e.g. resolve_seq_lens_cpu) before
+        # reading the buf. Lives on FutureMap so callers can't forget to
+        # propagate it through filter/merge/etc.
+        self._last_store_done: Optional[torch.cuda.Event] = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -134,18 +136,26 @@ class FutureMap:
         """Schedule-stream counterpart of resolve_future for the CPU mirror.
 
         Reads post-verify seq_lens from new_seq_lens_buf into batch.seq_lens_cpu
-        and recomputes batch.seq_lens_sum. future_indices.done provides the
-        cross-stream barrier — Scheduler records it AFTER store_to_map, so the
-        wait ensures the buf write is visible from schedule stream. No-op for
+        and recomputes batch.seq_lens_sum. Waits on _last_store_done so the
+        D2H sees all forward-stream buf writes dispatched so far. No-op for
         paths without future state (first iter / no spec_info).
         """
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
-        if fi.done is not None:
-            fi.done.wait()
+        if self._last_store_done is not None:
+            self._last_store_done.wait()
         batch.seq_lens_cpu = self.new_seq_lens_buf[fi.indices].cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
+    def _record_store_done(self) -> None:
+        # Must be called on forward stream right after a store_to_map write.
+        # Reuses the same Event across iters; record() repositions it to the
+        # current forward-stream point. FIFO of forward stream guarantees the
+        # new position is at-or-past every prior store_to_map.
+        if self._last_store_done is None:
+            self._last_store_done = torch.get_device_module(self.device).Event()
+        self._last_store_done.record()
 
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
@@ -163,6 +173,7 @@ class FutureMap:
         else:
             draft_input: EagleDraftInput = batch_result.next_draft_input
             self.store_to_map_for_new_batch(future_indices, draft_input)
+        self._record_store_done()
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput

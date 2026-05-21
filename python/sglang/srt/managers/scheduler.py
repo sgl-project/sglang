@@ -2864,14 +2864,6 @@ class Scheduler(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
                             )
-                            # Mark the future as ready: record an event on
-                            # forward stream AFTER store_to_map. The event is
-                            # attached to the future handle itself; next iter's
-                            # FutureMap.resolve_seq_lens_cpu waits on it as
-                            # the cross-stream barrier.
-                            if batch.is_spec_v2:
-                                future_indices.done = self.device_module.Event()
-                                future_indices.done.record()
                         else:
                             batch_result.future_indices = future_indices
 
@@ -2975,11 +2967,6 @@ class Scheduler(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
-            # Mark the future as ready (delay-sample path; see Scheduler.run_batch
-            # for the non-delay path).
-            if batch_result.future_indices is not None:
-                batch_result.future_indices.done = self.device_module.Event()
-                batch_result.future_indices.done.record()
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
