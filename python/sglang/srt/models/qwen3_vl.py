@@ -1222,7 +1222,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             grid_thw = grid_thw.cpu().to(dtype=torch.int32)
             grid_thw_list = grid_thw.tolist()
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = self.fast_pos_embed_interpolate_from_list(grid_thw_list)
         x += pos_embeds
 
         # rotary embedding -> (cos, sin)
