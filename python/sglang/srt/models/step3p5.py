@@ -51,18 +51,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_non_idle_and_non_empty,
-    is_npu,
-    make_layers,
-)
+from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
 
 Step3p5Config = None
 
 _is_cuda = is_cuda()
-_is_npu = is_npu()
 
 
 class Step3p5MLP(nn.Module):
@@ -168,11 +161,6 @@ class Step3p5MoEMLP(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
             gemm1_clamp_limit=self.limit,
-            **(
-                {"activation": config.hidden_act}
-                if _is_npu and self.limit is not None
-                else {}
-            ),
         )
 
         self.gate = ReplicatedLinear(
