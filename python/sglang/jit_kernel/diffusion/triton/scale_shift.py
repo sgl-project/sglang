@@ -343,6 +343,8 @@ def fuse_scale_shift_kernel(
 
     B, L, C = x.shape
     output = torch.empty_like(x)
+    if x.numel() == 0:
+        return output
 
     if scale.dim() == 4:
         # scale/shift: [B, F, 1, C]
@@ -661,6 +663,11 @@ if current_platform.is_npu():
 
 if current_platform.is_mps():
     from .mps_fallback import fuse_scale_shift_kernel_native
+
+    fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
+
+if current_platform.is_musa():
+    from .torch_fallback import fuse_scale_shift_kernel_native
 
     fuse_scale_shift_kernel = fuse_scale_shift_kernel_native
 

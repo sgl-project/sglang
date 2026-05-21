@@ -4,7 +4,6 @@ import logging
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.mem_cache.base_prefix_cache import DecLockRefParams
 from sglang.srt.utils import get_bool_env_var
 
 _ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
@@ -35,7 +34,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_in_seq_split
+from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
 from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -106,11 +105,13 @@ def match_prefix_for_req(
         req.prefix_indices,
         req.last_node,
         req.last_host_node,
+        req.best_match_node,
         req.host_hit_length,
     ) = (
         match_result.device_indices,
         match_result.last_device_node,
         match_result.last_host_node,
+        match_result.best_match_node,
         match_result.host_hit_length,
     )
     if match_result.mamba_branching_seqlen is not None:
@@ -159,19 +160,17 @@ class SchedulePolicy:
 
     def calc_priority(
         self, waiting_queue: List[Req], running_batch: Optional[ScheduleBatch] = None
-    ) -> bool:
+    ) -> None:
         if self.policy == CacheAgnosticPolicy.FCFS:
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return False
+            return
 
         policy = self._determine_active_policy(waiting_queue)
 
-        prefix_computed = False
         if isinstance(policy, CacheAwarePolicy):
-            prefix_computed = True
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -199,7 +198,6 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
-        return prefix_computed
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
@@ -469,7 +467,7 @@ class PrefillAdder:
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
         )
-        self.nsa_prefill_cp_in_seq_split = is_nsa_prefill_cp_in_seq_split()
+        self.dsa_prefill_cp_in_seq_split = is_dsa_prefill_cp_in_seq_split()
         self.max_running_requests = max_running_requests
         self.prefill_context_parallel_enabled = is_prefill_context_parallel_enabled()
         self.prefill_max_requests = prefill_max_requests
@@ -701,16 +699,18 @@ class PrefillAdder:
 
     @contextmanager
     def _lock_node(self, last_node: TreeNode):
+        dec_lock_params = None
         try:
             result = self.tree_cache.inc_lock_ref(last_node)
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                swa_uuid_for_lock = result.swa_uuid_for_lock
+            if self.tree_cache.is_tree_cache():
+                # init_load_back may revive SWA/Mamba tombstones while this
+                # temporary admission lock is held. Release must mirror the
+                # exact nodes skipped at acquire time.
+                dec_lock_params = result.to_dec_params()
             yield None
         finally:
-            if self.tree_cache.supports_swa() and self.tree_cache.is_tree_cache():
-                self.tree_cache.dec_lock_ref(
-                    last_node, DecLockRefParams(swa_uuid_for_lock=swa_uuid_for_lock)
-                )
+            if dec_lock_params is not None:
+                self.tree_cache.dec_lock_ref(last_node, dec_lock_params)
             else:
                 self.tree_cache.dec_lock_ref(last_node)
 
@@ -826,7 +826,7 @@ class PrefillAdder:
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (
-            self.nsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
+            self.dsa_prefill_cp_in_seq_split or self.prefill_context_parallel_enabled
         ) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
@@ -860,7 +860,14 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
-        if real_input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+        if (
+            self.rem_chunk_tokens is None
+            and len(self.can_run_list) != 0
+            and real_input_tokens >= self.rem_input_tokens
+        ):
+            # If without chunked prefill:
+            # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+            # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
         with self._lock_node(req.last_node):
@@ -876,7 +883,7 @@ class PrefillAdder:
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
-                        last_host_node=req.last_host_node,
+                        best_match_node=req.best_match_node,
                         host_hit_length=req.host_hit_length,
                         req=req,
                     )
@@ -888,7 +895,14 @@ class PrefillAdder:
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
-            if input_tokens >= self.rem_input_tokens and len(self.can_run_list) != 0:
+            if (
+                self.rem_chunk_tokens is None
+                and len(self.can_run_list) != 0
+                and input_tokens >= self.rem_input_tokens
+            ):
+                # If without chunked prefill:
+                # - if the can_run_list is not empty, we satisfy the constraint of (max_prefill_tokens)
+                # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
             if self.dllm_config is not None:
@@ -960,7 +974,7 @@ class PrefillAdder:
         priority_sign = 1 if server_args.schedule_low_priority_values_first else -1
 
         # NOTE: A request finishes in two phases:
-        #   1) check_finished + release_kv_cache  (in process_batch_result)
+        #   1) update_finish_state + release_kv_cache  (in process_batch_result)
         #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
         # Preemption runs between these two phases (inside get_new_batch_prefill),
         # so running_batch may still contain requests whose KV cache is already freed.

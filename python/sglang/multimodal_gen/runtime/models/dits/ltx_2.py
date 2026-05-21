@@ -4,11 +4,8 @@
 
 from __future__ import annotations
 
-import functools
-import math
 from typing import Any, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +31,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
     QuantizationConfig,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -96,17 +95,6 @@ def _ltx2_build_batched_perturbation_states(
                 mask_cache[cache_key] = mask
             states[block_idx] = (mask, False)
     return states
-
-
-@functools.lru_cache(maxsize=5)
-def _ltx2_rope_freq_grid_np(theta: float, num_pos_dims: int, dim: int) -> torch.Tensor:
-    # Official LTX uses NumPy float64 for double-precision RoPE frequencies.
-    n_elem = 2 * num_pos_dims
-    pow_indices = np.power(
-        theta,
-        np.linspace(0.0, 1.0, dim // n_elem, dtype=np.float64),
-    )
-    return torch.tensor(pow_indices * math.pi / 2.0, dtype=torch.float32)
 
 
 def apply_interleaved_rotary_emb(
@@ -351,22 +339,20 @@ class LTX2AudioVideoRotaryPosEmbed(nn.Module):
         ).to(device)
 
         num_rope_elems = num_pos_dims * 2
-        if self.double_precision:
-            freqs = _ltx2_rope_freq_grid_np(self.theta, num_pos_dims, self.dim).to(
-                device=device
-            )
-        else:
-            pow_indices = torch.pow(
-                self.theta,
-                torch.linspace(
-                    start=0.0,
-                    end=1.0,
-                    steps=self.dim // num_rope_elems,
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            )
-            freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
+        # LTX-2.3 HQ is sensitive to RoPE rounding; keep frequency generation on
+        # the target device instead of caching a CPU/NumPy tensor.
+        freqs_dtype = torch.float64 if self.double_precision else torch.float32
+        pow_indices = torch.pow(
+            self.theta,
+            torch.linspace(
+                start=0.0,
+                end=1.0,
+                steps=self.dim // num_rope_elems,
+                dtype=freqs_dtype,
+                device=device,
+            ),
+        )
+        freqs = (pow_indices * torch.pi / 2.0).to(dtype=torch.float32)
 
         freqs = (grid.unsqueeze(-1) * 2 - 1) * freqs
         freqs = freqs.transpose(-1, -2).flatten(2)
@@ -647,6 +633,8 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
+                allow_cudnn_sdp=True,
             )
         else:
             self.attn = USPAttention(
@@ -658,6 +646,8 @@ class LTX2Attention(nn.Module):
                 causal=False,
                 supported_attention_backends=supported_attention_backends,
                 prefix=f"{prefix}.attn",
+                # official LTX2 torch_sdpa uses cuDNN; cuda setup disables it
+                allow_cudnn_sdp=True,
             )
 
     def forward(
@@ -1247,7 +1237,7 @@ class LTX2TransformerBlock(nn.Module):
         return hidden_states, audio_hidden_states
 
 
-class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _fsdp_shard_conditions = LTX2ArchConfig()._fsdp_shard_conditions
     _compile_conditions = LTX2ArchConfig()._compile_conditions
     _supported_attention_backends = LTX2ArchConfig()._supported_attention_backends
@@ -1422,8 +1412,17 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             if hasattr(arch.rope_type, "value")
             else str(arch.rope_type)
         )
-        rope_double_precision = bool(
-            hf_config.get("rope_double_precision", arch.double_precision_rope)
+        frequencies_precision = hf_config.get("frequencies_precision")
+        if frequencies_precision is None:
+            frequencies_precision = getattr(arch, "frequencies_precision", None)
+
+        # diffusers/LTX configs use `frequencies_precision` for this RoPE switch
+        rope_double_precision = (
+            str(frequencies_precision) == "float64"
+            if frequencies_precision is not None
+            else bool(
+                hf_config.get("rope_double_precision", arch.double_precision_rope)
+            )
         )
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)

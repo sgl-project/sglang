@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 # Force registration of torch.ops.sglang.cute_dsl_fp8_paged_mqa_logits.
-import sglang.srt.layers.attention.nsa.cute_dsl_paged_mqa_logits  # noqa: F401
+import sglang.srt.layers.attention.dsa.cute_dsl_paged_mqa_logits  # noqa: F401
 from sglang.srt.utils import is_sm100_supported
 
 
