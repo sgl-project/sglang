@@ -2204,20 +2204,26 @@ def _prepare_uds_path(path: str) -> None:
 
 
 def _run_granian_server(server_args: ServerArgs):
-    """Launch Granian with HTTP/2 support"""
+    """Launch Granian with HTTP/2 support."""
+    from pathlib import Path
+
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
 
     granian_kwargs = dict(
         target="sglang.srt.entrypoints.http_server:app",
-        address=server_args.host,
-        port=server_args.port,
         interface=Interfaces.ASGI,
         http=HTTPModes.auto,
         loop=Loops.uvloop,
         log_level=server_args.log_level_http or server_args.log_level or "info",
         workers=1,
     )
+
+    if server_args.uds:
+        granian_kwargs["uds"] = Path(server_args.uds)
+    else:
+        granian_kwargs["address"] = server_args.host
+        granian_kwargs["port"] = server_args.port
 
     ssl_enabled = server_args.ssl_certfile and server_args.ssl_keyfile
     if ssl_enabled:
@@ -2274,7 +2280,7 @@ def _setup_and_run_http_server(
                 )
             logger.info(
                 f"Starting Granian HTTP/2 server on "
-                f"{server_args.host}:{server_args.port}"
+                f"{_format_listen_addr(server_args)}"
             )
             # Propagate the main process PID via os.environ so Granian
             # workers (forked or spawned) can locate the shared memory
