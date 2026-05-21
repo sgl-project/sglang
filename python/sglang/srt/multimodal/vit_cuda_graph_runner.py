@@ -259,20 +259,6 @@ class ViTCudaGraphRunner:
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
 
-        # Warm up the eager path on the DEFAULT stream.
-        # Capture warmup runs on a dedicated capture stream, which does not
-        # initialize the default stream's kernel dispatch state.  Without
-        # this, the first eager fallback pays a multi-second cold-start.
-        device_module = torch.get_device_module(self.device)
-        B = self.BUCKET_SIZES[-1]
-        self.vit.run_blocks(
-            self.input_bufs[B],
-            self.forward_metadatas[B],
-            self.rotary_cos_bufs[B],
-            self.rotary_sin_bufs[B],
-        )
-        device_module.synchronize()
-
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
