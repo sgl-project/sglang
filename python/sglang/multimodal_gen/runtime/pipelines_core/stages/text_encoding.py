@@ -87,8 +87,10 @@ class TextEncodingStage(PipelineStage):
         self.text_encoders = text_encoders
         self._negative_text_cache_key = None
         self._negative_text_cache_value = None
-        self._text_outputs_cache_key = None
-        self._text_outputs_cache_value = None
+
+        # single-slot cache seeded by request warmup and read by the real request
+        self._request_warmup_text_outputs_cache_key = None
+        self._request_warmup_text_outputs_cache_value = None
         self._logged_request_warmup_text_cache = False
 
     def component_uses(
@@ -107,9 +109,7 @@ class TextEncodingStage(PipelineStage):
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
-        cached_negative = self._get_cached_negative_text_embedding(
-            batch, server_args, all_indices
-        )
+        cached_negative = self._get_cached_negative_text_embedding(batch, all_indices)
         if cached_negative is None:
             (
                 neg_embeds_list,
@@ -124,10 +124,9 @@ class TextEncodingStage(PipelineStage):
                 return_attention_mask=True,
             )
 
-            if self._should_cache_negative_text_embedding(batch, server_args):
+            if self._should_store_negative_text_cache(batch, server_args):
                 self._cache_negative_text_embedding(
                     batch,
-                    server_args,
                     all_indices,
                     neg_embeds_list,
                     neg_masks_list,
@@ -151,17 +150,18 @@ class TextEncodingStage(PipelineStage):
             neg_seq_lens_list,
         )
 
-    def _should_cache_negative_text_embedding(
+    def _should_store_negative_text_cache(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
-        return (not batch.is_warmup) or bool(
+        # real requests can share negative prompts; serve warmup may seed it
+        return not batch.is_warmup or bool(
             server_args.enable_request_warmup_text_cache
         )
 
-    def _should_cache_text_outputs(
+    def _should_store_request_warmup_text_outputs_cache(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
-        return (not batch.is_warmup) or bool(
+        return batch.is_warmup and bool(
             server_args.enable_request_warmup_text_cache
         )
 
@@ -179,12 +179,12 @@ class TextEncodingStage(PipelineStage):
         self._logged_request_warmup_text_cache = True
 
     def _get_cached_negative_text_embedding(
-        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
+        self, batch: Req, encoder_indices: list[int]
     ):
         if batch.is_warmup:
             return None
         negative_cache_key = self._build_negative_text_cache_key(
-            batch, server_args, encoder_indices
+            batch, encoder_indices
         )
         if self._negative_text_cache_key == negative_cache_key:
             return self._negative_text_cache_value
@@ -193,7 +193,6 @@ class TextEncodingStage(PipelineStage):
     def _cache_negative_text_embedding(
         self,
         batch: Req,
-        server_args: ServerArgs,
         encoder_indices: list[int],
         neg_embeds_list,
         neg_masks_list,
@@ -201,9 +200,8 @@ class TextEncodingStage(PipelineStage):
         neg_embeds_masks_list,
         neg_seq_lens_list,
     ) -> None:
-        self._maybe_log_request_warmup_text_cache(batch, server_args)
         self._negative_text_cache_key = self._build_negative_text_cache_key(
-            batch, server_args, encoder_indices
+            batch, encoder_indices
         )
         self._negative_text_cache_value = (
             tuple(neg_embeds_list),
@@ -213,32 +211,29 @@ class TextEncodingStage(PipelineStage):
             tuple(neg_seq_lens_list),
         )
 
-    def _build_negative_text_cache_key(
-        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
-    ):
+    def _build_negative_text_cache_key(self, batch: Req, encoder_indices: list[int]):
         # Negative text encoding changes when the template or max length changes,
         # even if the visible negative prompt string is the same.
         return (
-            server_args.pipeline_class_name,
             tuple(encoder_indices),
             self.freeze_for_dedup(batch.negative_prompt),
             self.freeze_for_dedup(batch.prompt_template),
             batch.max_sequence_length,
         )
 
-    def _get_cached_text_outputs(
+    def _get_cached_request_warmup_text_outputs(
         self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
     ):
         if batch.is_warmup:
             return None
-        cache_key = self._build_text_outputs_cache_key(
+        cache_key = self._build_request_warmup_text_outputs_cache_key(
             batch, server_args, encoder_indices
         )
-        if self._text_outputs_cache_key == cache_key:
-            return self._text_outputs_cache_value
+        if self._request_warmup_text_outputs_cache_key == cache_key:
+            return self._request_warmup_text_outputs_cache_value
         return None
 
-    def _cache_text_outputs(
+    def _cache_request_warmup_text_outputs(
         self,
         batch: Req,
         server_args: ServerArgs,
@@ -255,10 +250,12 @@ class TextEncodingStage(PipelineStage):
         neg_seq_lens_list=None,
     ) -> None:
         self._maybe_log_request_warmup_text_cache(batch, server_args)
-        self._text_outputs_cache_key = self._build_text_outputs_cache_key(
-            batch, server_args, encoder_indices
+        self._request_warmup_text_outputs_cache_key = (
+            self._build_request_warmup_text_outputs_cache_key(
+                batch, server_args, encoder_indices
+            )
         )
-        self._text_outputs_cache_value = (
+        self._request_warmup_text_outputs_cache_value = (
             tuple(prompt_embeds_list),
             tuple(prompt_masks_list),
             tuple(pooler_embeds_list),
@@ -271,11 +268,10 @@ class TextEncodingStage(PipelineStage):
             None if neg_seq_lens_list is None else tuple(neg_seq_lens_list),
         )
 
-    def _build_text_outputs_cache_key(
+    def _build_request_warmup_text_outputs_cache_key(
         self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
     ):
         return (
-            server_args.pipeline_class_name,
             tuple(encoder_indices),
             self.build_dedup_fingerprint(batch, server_args),
         )
@@ -459,6 +455,113 @@ class TextEncodingStage(PipelineStage):
         # were encoded in the same batch; keep that path on separated encoding
         return not hasattr(server_args.pipeline_config, "dmd_denoising_steps")
 
+    def _get_or_encode_text_outputs(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        prompt_text: str | list[str],
+        all_indices: list[int],
+        max_seq_length: int | None,
+    ):
+        cached_outputs = self._get_cached_request_warmup_text_outputs(
+            batch, server_args, all_indices
+        )
+        if cached_outputs is not None:
+            return cached_outputs
+
+        cached_negative = None
+        if batch.do_classifier_free_guidance:
+            cached_negative = self._get_cached_negative_text_embedding(
+                batch, all_indices
+            )
+
+        if cached_negative is not None:
+            prompt_outputs = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+                max_length=max_seq_length,
+            )
+            return (*prompt_outputs, *cached_negative)
+
+        if self._should_encode_cfg_text_batch(batch, server_args):
+            outputs = self._encode_cfg_text_batch(
+                batch, server_args, prompt_text, all_indices, max_seq_length
+            )
+            (
+                _,
+                _,
+                _,
+                _,
+                _,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            ) = outputs
+            if self._should_store_negative_text_cache(batch, server_args):
+                self._cache_negative_text_embedding(
+                    batch,
+                    all_indices,
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                )
+            return outputs
+
+        (
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            prompt_seq_lens_list,
+        ) = self.encode_text(
+            prompt_text,
+            server_args,
+            encoder_index=all_indices,
+            return_attention_mask=True,
+            max_length=max_seq_length,
+        )
+        if not batch.do_classifier_free_guidance:
+            return (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        (
+            neg_embeds_list,
+            neg_masks_list,
+            neg_pooler_embeds_list,
+            neg_embeds_masks_list,
+            neg_seq_lens_list,
+        ) = self.get_or_compute_negative_text_embedding(
+            batch, server_args, all_indices
+        )
+        return (
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            prompt_seq_lens_list,
+            neg_embeds_list,
+            neg_masks_list,
+            neg_pooler_embeds_list,
+            neg_embeds_masks_list,
+            neg_seq_lens_list,
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -482,107 +585,27 @@ class TextEncodingStage(PipelineStage):
         # Get max_sequence_length from batch if available
         max_seq_length = getattr(batch, "max_sequence_length", None)
 
-        cached_text_outputs = self._get_cached_text_outputs(
-            batch, server_args, all_indices
+        (
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            prompt_seq_lens_list,
+            neg_embeds_list,
+            neg_masks_list,
+            neg_pooler_embeds_list,
+            neg_embeds_masks_list,
+            neg_seq_lens_list,
+        ) = self._get_or_encode_text_outputs(
+            batch, server_args, prompt_text, all_indices, max_seq_length
         )
-        if cached_text_outputs is not None:
-            (
-                prompt_embeds_list,
-                prompt_masks_list,
-                pooler_embeds_list,
-                prompt_embeds_masks_list,
-                prompt_seq_lens_list,
-                neg_embeds_list,
-                neg_masks_list,
-                neg_pooler_embeds_list,
-                neg_embeds_masks_list,
-                neg_seq_lens_list,
-            ) = cached_text_outputs
-        else:
-            cached_negative = None
-            if batch.do_classifier_free_guidance:
-                cached_negative = self._get_cached_negative_text_embedding(
-                    batch, server_args, all_indices
-                )
-
-            if cached_negative is not None:
-                (
-                    prompt_embeds_list,
-                    prompt_masks_list,
-                    pooler_embeds_list,
-                    prompt_embeds_masks_list,
-                    prompt_seq_lens_list,
-                ) = self.encode_text(
-                    prompt_text,
-                    server_args,
-                    encoder_index=all_indices,
-                    return_attention_mask=True,
-                    max_length=max_seq_length,
-                )
-                (
-                    neg_embeds_list,
-                    neg_masks_list,
-                    neg_pooler_embeds_list,
-                    neg_embeds_masks_list,
-                    neg_seq_lens_list,
-                ) = cached_negative
-            elif self._should_encode_cfg_text_batch(batch, server_args):
-                (
-                    prompt_embeds_list,
-                    prompt_masks_list,
-                    pooler_embeds_list,
-                    prompt_embeds_masks_list,
-                    prompt_seq_lens_list,
-                    neg_embeds_list,
-                    neg_masks_list,
-                    neg_pooler_embeds_list,
-                    neg_embeds_masks_list,
-                    neg_seq_lens_list,
-                ) = self._encode_cfg_text_batch(
-                    batch, server_args, prompt_text, all_indices, max_seq_length
-                )
-                if self._should_cache_negative_text_embedding(batch, server_args):
-                    self._cache_negative_text_embedding(
-                        batch,
-                        server_args,
-                        all_indices,
-                        neg_embeds_list,
-                        neg_masks_list,
-                        neg_pooler_embeds_list,
-                        neg_embeds_masks_list,
-                        neg_seq_lens_list,
-                    )
-            else:
-                (
-                    prompt_embeds_list,
-                    prompt_masks_list,
-                    pooler_embeds_list,
-                    prompt_embeds_masks_list,
-                    prompt_seq_lens_list,
-                ) = self.encode_text(
-                    prompt_text,
-                    server_args,
-                    encoder_index=all_indices,
-                    return_attention_mask=True,
-                    max_length=max_seq_length,
-                )
-                if batch.do_classifier_free_guidance:
-                    (
-                        neg_embeds_list,
-                        neg_masks_list,
-                        neg_pooler_embeds_list,
-                        neg_embeds_masks_list,
-                        neg_seq_lens_list,
-                    ) = self.get_or_compute_negative_text_embedding(
-                        batch, server_args, all_indices
-                    )
 
         # In sglang serve, request-based warmup runs a deep copy of the first
         # real request. Text outputs are deterministic and independent of
         # warmup step count, so the first request can reuse them. Offline
         # sglang generate leaves warmup uncached to keep profiling fair.
-        if self._should_cache_text_outputs(batch, server_args):
-            self._cache_text_outputs(
+        if self._should_store_request_warmup_text_outputs_cache(batch, server_args):
+            self._cache_request_warmup_text_outputs(
                 batch,
                 server_args,
                 all_indices,
