@@ -143,6 +143,10 @@ class TestEaglePositionsMatchWithFix(CustomTestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         health = requests.get(self.base_url + "/health", timeout=10.0)
         self.assertEqual(health.status_code, 200, health.text)
+        haystack = (self._stderr_buf.getvalue() if self._stderr_buf else "") + (
+            self._stdout_buf.getvalue() if self._stdout_buf else ""
+        )
+        self.assertNotIn("kv_canary violation:", haystack)
 
 
 if __name__ == "__main__":
