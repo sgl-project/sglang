@@ -213,7 +213,7 @@ async def forward_to_scheduler(
     try:
         response = await async_scheduler_client.forward(req_obj)
         if response.output is None and response.output_file_paths is None:
-            raise RuntimeError("Model generation returned no output.")
+            raise RuntimeError(response.error or "Model generation returned no output.")
 
         if response.output_file_paths:
             output_file_path = response.output_file_paths[0]

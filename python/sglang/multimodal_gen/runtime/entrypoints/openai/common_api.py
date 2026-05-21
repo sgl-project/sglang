@@ -168,7 +168,9 @@ async def list_loras():
         if output.error is None:
             return output.output or {}
         else:
-            raise HTTPException(status_code=500, detail=output.error)
+            raise HTTPException(
+                status_code=output.status_code or 500, detail=output.error
+            )
     except Exception as e:
         if isinstance(e, HTTPException):
             raise

@@ -252,6 +252,7 @@ class ServerArgs(DisaggArgsMixin):
     batching_delay_ms: float = 0.0
     batching_config: str | None = None
     enable_batching_metrics: bool = False
+    max_queued_requests: int | None = None
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -1373,6 +1374,16 @@ class ServerArgs(DisaggArgsMixin):
             help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
         )
         parser.add_argument(
+            "--max-queued-requests",
+            type=int,
+            default=ServerArgs.max_queued_requests,
+            help=(
+                "Maximum number of generation requests allowed to wait in the "
+                "scheduler queue. Additional requests are rejected with HTTP 503. "
+                "Defaults to unlimited. Ignored when using --disagg-mode."
+            ),
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -1894,6 +1905,8 @@ class ServerArgs(DisaggArgsMixin):
             raise ValueError("batching_max_size must be >= 1")
         if self.batching_delay_ms < 0:
             raise ValueError("batching_delay_ms must be >= 0")
+        if self.max_queued_requests is not None and self.max_queued_requests < 1:
+            raise ValueError("max_queued_requests must be >= 1 when set")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""

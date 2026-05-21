@@ -999,6 +999,58 @@ class Scheduler(SchedulerDisaggMixin):
 
         return input_path
 
+    def _enforce_queue_cap(
+        self, new_reqs: List[tuple[bytes, Any]]
+    ) -> List[tuple[bytes, Any]]:
+        """Reject incoming generation reqs once the waiting queue is full.
+
+        Rejected reqs get an OutputBatch with status_code=503 sent back over the
+        ZMQ ROUTER and never enter the waiting queue. Warmup reqs and
+        control-plane reqs (SetLoraReq, ShutdownReq, etc.) bypass the cap and
+        are admitted unconditionally — they are rare/internal and may transiently
+        push the queue depth above the cap.
+        """
+        cap = self.server_args.max_queued_requests
+        if cap is None:
+            return new_reqs
+
+        admitted: list[tuple[bytes, Any]] = []
+        available = max(0, cap - len(self.waiting_queue))
+        for identity, req_or_group in new_reqs:
+            is_generation = self._first_generation_req(req_or_group) is not None
+            is_warmup = self._is_warmup_item(req_or_group)
+            if not is_generation or is_warmup:
+                admitted.append((identity, req_or_group))
+                continue
+            if available > 0:
+                admitted.append((identity, req_or_group))
+                available -= 1
+                continue
+            logger.warning(
+                "Rejecting request: waiting queue full (cap=%d, depth=%d).",
+                cap,
+                len(self.waiting_queue) + len(admitted),
+            )
+            try:
+                self.return_result(
+                    OutputBatch(
+                        error="The request queue is full.",
+                        status_code=503,
+                    ),
+                    identity,
+                )
+            except zmq.ZMQError as e:
+                # Don't let a transient ZMQ failure on the rejection reply
+                # trip the outer event_loop's _consecutive_error_count and
+                # tear down the scheduler — the rejected req is already lost,
+                # we just want to keep serving.
+                logger.error(
+                    "Failed to send queue-full rejection over ZMQ to identity=%r: %s",
+                    identity,
+                    e,
+                )
+        return admitted
+
     def process_received_reqs_with_req_based_warmup(
         self, recv_reqs: List[tuple[bytes, Any]]
     ) -> List[tuple[bytes, Any]]:
@@ -1122,6 +1174,7 @@ class Scheduler(SchedulerDisaggMixin):
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+                new_reqs = self._enforce_queue_cap(new_reqs)
                 now = time.monotonic()
                 self.waiting_queue.extend(
                     [(identity, req, now) for identity, req in new_reqs]
