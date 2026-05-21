@@ -177,6 +177,16 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.megamoe = "disabled";
       }
+      // Switching to max-throughput on supported hardware: default MegaMoE to
+      // W4A8 if it's currently disabled (best throughput config).
+      if (
+        (optionName === "recipe" || optionName === "hardware") &&
+        next.recipe === "max-throughput" &&
+        next.megamoe === "disabled" &&
+        !isMegamoeUnsupported(next)
+      ) {
+        next.megamoe = "w4a8";
+      }
       return next;
     });
   };
