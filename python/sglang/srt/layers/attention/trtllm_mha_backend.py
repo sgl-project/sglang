@@ -443,6 +443,54 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
 
             self.draft_extend_metadata[bs] = metadata
+        else:
+            # Prefill / extend path — invoked by piecewise / breakable cuda
+            # graph capture for non-decode modes. Mirrors the eager body's
+            # ``else:`` clause: build metadata from the live
+            # ``req_to_token_pool`` view (no pre-allocated buffer reuse).
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                extend_seq_lens = forward_batch.extend_seq_lens
+                # NOTE: in piecewise CUDA graph warmup, extend_seq_lens_cpu is a torch.Tensor;
+                # Python's max() returns a 0-d tensor, but flashinfer expects an int.
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                metadata.max_seq_len_q = metadata.max_seq_len_k
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+
+            # SWA page table + strided conversion (mirrors eager).
+            metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+            if self.page_size > 1:
+                self.strided_indices = torch.arange(
+                    0,
+                    metadata.page_table.shape[1],
+                    self.page_size,
+                    device=self.device,
+                )
+                metadata.page_table = (
+                    metadata.page_table[:, self.strided_indices] // self.page_size
+                )
+                if metadata.swa_page_table is not None:
+                    metadata.swa_page_table = (
+                        metadata.swa_page_table[:, self.strided_indices]
+                        // self.page_size
+                    )
         self.forward_metadata = metadata
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
