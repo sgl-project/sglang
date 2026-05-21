@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple
 
 import numpy as np
@@ -74,21 +74,13 @@ class ViTGraphCapturable(Protocol):
         ...
 
 
-@dataclass
-class _Bin:
-    """A single bin in the greedy bin-packing algorithm."""
-
-    bucket_size: int
-    remaining: int
-    image_indices: List[int] = field(default_factory=list)
-
-
 class ViTCudaGraphRunner:
-    """Generic ViT CUDA Graph Runner with bucket-based capture and bin-packing replay.
+    """Generic ViT CUDA Graph Runner with bucket-based capture.
 
     Eagerly captures CUDA graphs for a fixed set of bucket sizes at init.
-    At runtime, packs multiple images into bins via greedy first-fit-decreasing,
-    and replays the corresponding graph for each bin.
+    At runtime, finds the smallest bucket that fits the total token count,
+    copies data into pre-allocated buffers, and replays the captured graph.
+    Falls back to eager execution when total tokens exceed the max bucket.
     """
 
     BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384]
@@ -105,8 +97,6 @@ class ViTCudaGraphRunner:
         self.config = config
         self.device = config.device
         self.dtype = config.dtype
-
-        M = self.MAX_IMAGES_PER_BUCKET
 
         # Per-bucket-size state
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
@@ -126,56 +116,6 @@ class ViTCudaGraphRunner:
         if idx < len(self.BUCKET_SIZES):
             return self.BUCKET_SIZES[idx]
         return None
-
-    # ------------------------------------------------------------------
-    # Bin-packing
-    # ------------------------------------------------------------------
-
-    def bin_pack(self, image_token_counts: List[int]) -> Tuple[List[_Bin], List[int]]:
-        """Greedy first-fit-decreasing bin-packing.
-
-        Args:
-            image_token_counts: token count per image.
-
-        Returns:
-            (bins, eager_indices): bins for graph replay, and indices of
-            images too large for any bucket (fall back to eager).
-        """
-        M = self.MAX_IMAGES_PER_BUCKET
-        sorted_indices = sorted(
-            range(len(image_token_counts)),
-            key=lambda i: -image_token_counts[i],
-        )
-
-        bins: List[_Bin] = []
-        eager_indices: List[int] = []
-
-        for idx in sorted_indices:
-            size = image_token_counts[idx]
-            bucket = self.find_bucket(size)
-            if bucket is None:
-                eager_indices.append(idx)
-                continue
-
-            # First-fit
-            placed = False
-            for b in bins:
-                if b.remaining >= size and len(b.image_indices) < M:
-                    b.remaining -= size
-                    b.image_indices.append(idx)
-                    placed = True
-                    break
-
-            if not placed:
-                bins.append(
-                    _Bin(
-                        bucket_size=bucket,
-                        remaining=bucket - size,
-                        image_indices=[idx],
-                    )
-                )
-
-        return bins, eager_indices
 
     # ------------------------------------------------------------------
     # Buffer allocation
@@ -308,83 +248,80 @@ class ViTCudaGraphRunner:
     # Replay
     # ------------------------------------------------------------------
 
-    def _prepare_metadata(
+    def _copy_metadata_to_buffers(
         self,
         bucket_size: int,
-        image_token_counts: List[int],
+        forward_metadata: VisionAttentionMetadata,
     ) -> None:
-        """Fill all metadata buffers for a packed bin of images."""
+        """Copy forward_metadata fields into the pre-allocated graph buffers."""
         B = bucket_size
         M = self.MAX_IMAGES_PER_BUCKET
-        cfg = self.config
-        metadata = self.forward_metadatas[B]
-        N = len(image_token_counts)
+        buf = self.forward_metadatas[B]
 
-        # Cumulative token offsets
-        offsets = np.zeros(N + 1, dtype=np.int32)
-        for i, s in enumerate(image_token_counts):
-            offsets[i + 1] = offsets[i] + s
-        S_total = int(offsets[N])
+        src_cu = forward_metadata.cu_seqlens
+        src_sl = forward_metadata.seq_lens
+        N = src_sl.shape[0]  # number of real sequences
 
-        # Token cu_seqlens: [0, s1, s1+s2, ..., S, S, ..., B]
-        cu_vals = np.full(M + 1, S_total, dtype=np.int32)
-        cu_vals[0] = 0
-        for i in range(N):
-            cu_vals[i + 1] = offsets[i + 1]
-        cu_vals[M] = B  # last sequence gets padding tokens
-        metadata.cu_seqlens.copy_(torch.from_numpy(cu_vals))
+        # cu_seqlens: [N+1] -> [M+1], pad tail with last value, set [M]=B
+        buf.cu_seqlens[: N + 1].copy_(src_cu[: N + 1])
+        if N + 1 < M + 1:
+            buf.cu_seqlens[N + 1 :].fill_(int(src_cu[N].item()))
+        buf.cu_seqlens[M] = B  # last slot absorbs padding tokens
 
-        # seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        sl_vals = np.zeros(M, dtype=np.int32)
-        for i in range(N):
-            sl_vals[i] = image_token_counts[i]
-        padding = B - S_total
-        if padding > 0 and N < M:
-            sl_vals[N] = padding  # padding sequence
-        elif padding > 0:
-            sl_vals[M - 1] = padding  # overflow to last slot
-        metadata.seq_lens.copy_(torch.from_numpy(sl_vals))
+        # seq_lens: [N] -> [M], pad with 0
+        buf.seq_lens[:N].copy_(src_sl[:N])
+        if N < M:
+            buf.seq_lens[N:].zero_()
+            # last slot gets padding tokens
+            S_total = int(src_cu[N].item())
+            if B > S_total:
+                buf.seq_lens[N] = B - S_total
 
-        metadata.max_seqlen = B
+        buf.max_seqlen = B
 
         # FlashInfer packed_indptrs
-        if metadata.packed_indptrs is not None:
-            elem = cfg.elem_per_token
-            indptr = np.full(M + 1, S_total * elem, dtype=np.int32)
-            indptr[0] = 0
-            for i in range(N):
-                indptr[i + 1] = offsets[i + 1] * elem
-            indptr[M] = B * elem
-            packed = np.concatenate([indptr, indptr, indptr])
-            metadata.packed_indptrs.copy_(torch.from_numpy(packed))
+        if (
+            buf.packed_indptrs is not None
+            and forward_metadata.packed_indptrs is not None
+        ):
+            src_pi = forward_metadata.packed_indptrs
+            src_len = src_pi.shape[0]
+            buf_len = buf.packed_indptrs.shape[0]
+            copy_len = min(src_len, buf_len)
+            buf.packed_indptrs[:copy_len].copy_(src_pi[:copy_len])
+            if copy_len < buf_len:
+                buf.packed_indptrs[copy_len:].fill_(int(src_pi[-1].item()))
 
-        if metadata.sequence_lengths is not None:
-            fi_sl = np.zeros(M, dtype=np.int32)
-            for i in range(N):
-                fi_sl[i] = image_token_counts[i]
-            if padding > 0 and N < M:
-                fi_sl[N] = padding
-            metadata.sequence_lengths.copy_(torch.from_numpy(fi_sl).view(M, 1, 1, 1))
+        if (
+            buf.sequence_lengths is not None
+            and forward_metadata.sequence_lengths is not None
+        ):
+            src_seql = forward_metadata.sequence_lengths.view(-1)
+            buf_seql = buf.sequence_lengths.view(-1)
+            copy_n = min(src_seql.shape[0], buf_seql.shape[0])
+            buf_seql[:copy_n].copy_(src_seql[:copy_n])
+            if copy_n < buf_seql.shape[0]:
+                buf_seql[copy_n:].zero_()
 
-        if metadata.flashinfer_max_seqlen is not None:
-            metadata.flashinfer_max_seqlen = B
+        if buf.flashinfer_max_seqlen is not None:
+            buf.flashinfer_max_seqlen = B
 
     def replay(
         self,
         bucket_size: int,
         x: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
-        token_cu_seqlens: np.ndarray,
     ) -> torch.Tensor:
         """Replay a captured graph on a packed tensor.
 
         Args:
             bucket_size: the bucket to replay.
             x: [S, 1, hidden_dim] packed image tokens (already 3D).
+            forward_metadata: pre-computed attention metadata.
             rotary_pos_emb_cos: [S, rotary_dim]
             rotary_pos_emb_sin: [S, rotary_dim]
-            token_cu_seqlens: numpy [N+1] token-based cumsum.
 
         Returns:
             [S_merged, out_dim] packed merged output (only valid portion).
@@ -393,21 +330,15 @@ class ViTCudaGraphRunner:
         S = x.shape[0]
         merge_unit = self.config.spatial_merge_unit
 
-        # Prepare metadata buffers from cu_seqlens
-        image_token_counts = (token_cu_seqlens[1:] - token_cu_seqlens[:-1]).tolist()
-        self._prepare_metadata(B, image_token_counts)
+        # Copy metadata into graph buffers
+        self._copy_metadata_to_buffers(B, forward_metadata)
 
         # Copy input (already 3D [S, 1, H])
         self.input_bufs[B][:S].copy_(x[:S])
-        if S < B:
-            self.input_bufs[B][S:].zero_()
 
         # Copy rotary embeddings
         self.rotary_cos_bufs[B][:S].copy_(rotary_pos_emb_cos)
         self.rotary_sin_bufs[B][:S].copy_(rotary_pos_emb_sin)
-        if S < B:
-            self.rotary_cos_bufs[B][S:].zero_()
-            self.rotary_sin_bufs[B][S:].zero_()
 
         # Replay
         self.graphs[B].replay()
@@ -423,18 +354,18 @@ class ViTCudaGraphRunner:
     def run(
         self,
         x: torch.Tensor,
-        token_cu_seqlens: np.ndarray,
+        forward_metadata: VisionAttentionMetadata,
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
     ) -> torch.Tensor:
         """Run ViT forward with CUDA graph.
 
-        If total tokens fit in a bucket, replay one graph directly on the
-        packed tensor.  Otherwise bin-pack image groups into multiple replays.
+        If total tokens fit in a bucket, replay one graph directly.
+        Otherwise fall back to eager.
 
         Args:
             x: [total_tokens, 1, hidden_dim] all images packed, 3D.
-            token_cu_seqlens: numpy [N+1] token-based cumsum.
+            forward_metadata: pre-computed VisionAttentionMetadata.
             rotary_pos_emb_cos: [total_tokens, rotary_dim]
             rotary_pos_emb_sin: [total_tokens, rotary_dim]
 
@@ -444,64 +375,14 @@ class ViTCudaGraphRunner:
         total_tokens = x.shape[0]
         bucket = self.find_bucket(total_tokens)
 
-        # Fast path: everything fits in one bucket
+        # Fast path: fits in a bucket
         if bucket is not None:
             return self.replay(
-                bucket, x, rotary_pos_emb_cos, rotary_pos_emb_sin, token_cu_seqlens
+                bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
 
-        # Slow path: total tokens exceed max bucket, bin-pack by image groups
-        merge_unit = self.config.spatial_merge_unit
-        image_token_counts = (token_cu_seqlens[1:] - token_cu_seqlens[:-1]).tolist()
-        bins, eager_indices = self.bin_pack(image_token_counts)
-
-        results: List[torch.Tensor] = []
-
-        for b in bins:
-            B = b.bucket_size
-            indices = b.image_indices
-            # Slice the packed tensor for this group
-            group_slices = []
-            group_cos = []
-            group_sin = []
-            group_offsets = [0]
-            for i in indices:
-                start = int(token_cu_seqlens[i])
-                end = int(token_cu_seqlens[i + 1])
-                group_slices.append(x[start:end])
-                group_cos.append(rotary_pos_emb_cos[start:end])
-                group_sin.append(rotary_pos_emb_sin[start:end])
-                group_offsets.append(group_offsets[-1] + (end - start))
-            group_x = torch.cat(group_slices, dim=0)
-            group_cu = np.array(group_offsets, dtype=np.int32)
-            merged = self.replay(
-                B,
-                group_x,
-                torch.cat(group_cos, dim=0),
-                torch.cat(group_sin, dim=0),
-                group_cu,
-            )
-            results.append(merged)
-
-        # Eager fallback for oversized images
-        for idx in eager_indices:
-            start = int(token_cu_seqlens[idx])
-            end = int(token_cu_seqlens[idx + 1])
-            img_x = x[start:end]
-            S = img_x.shape[0]
-            img_cu = np.array([0, S], dtype=np.int32)
-
-            from sglang.srt.layers.attention.vision import (
-                prepare_vision_attention_metadata,
-            )
-
-            metadata = prepare_vision_attention_metadata(
-                torch.from_numpy(img_cu), device=self.device
-            )
-            cos = rotary_pos_emb_cos[start:end]
-            sin = rotary_pos_emb_sin[start:end]
-            block_out, ds_outs = self.vit.run_blocks(img_x, metadata, cos, sin)
-            merged = self.vit.run_merger(block_out, ds_outs)
-            results.append(merged)
-
-        return torch.cat(results, dim=0)
+        # Fallback: total tokens exceed max bucket, run eager
+        block_out, ds_outs = self.vit.run_blocks(
+            x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
+        )
+        return self.vit.run_merger(block_out, ds_outs)

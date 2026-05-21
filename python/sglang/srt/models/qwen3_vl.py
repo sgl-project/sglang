@@ -882,12 +882,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
-        # CUDA graph path: bin-pack and replay captured graphs
-        if self.cuda_graph_runner is not None:
-            return self._forward_with_cuda_graph(
-                x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
-            )
-
         forward_metadata = prepare_vision_attention_metadata(
             cu_seqlens,
             device=self.device,
@@ -899,6 +893,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             sequence_lengths=sequence_lengths,
             flashinfer_max_seqlen=max_seqlen,
         )
+
+        # CUDA graph path
+        if self.cuda_graph_runner is not None:
+            return self.cuda_graph_runner.run(
+                x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
 
         deepstack_feature_lists = []
         num_deepstack_captured = 0
@@ -922,25 +922,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
         return hidden_states
-
-    def _forward_with_cuda_graph(
-        self,
-        x: torch.Tensor,
-        token_cu_seqlens: np.ndarray,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-    ) -> torch.Tensor:
-        """Dispatch to CUDA graph runner.
-
-        Args:
-            x: [total_tokens, 1, hidden_dim] - all images packed, 3D.
-            token_cu_seqlens: numpy [N+1] token-based cumsum boundaries.
-            rotary_pos_emb_cos: [total_tokens, rotary_dim]
-            rotary_pos_emb_sin: [total_tokens, rotary_dim]
-        """
-        return self.cuda_graph_runner.run(
-            x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
-        )
 
     def forward_with_npu_graph(
         self,
