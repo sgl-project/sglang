@@ -25,19 +25,19 @@ _SCALE_STRIDE = _NUM_TILES + 1  # 8 bytes / token (7 scales + 1 pad)
 @triton.jit
 def _gather_dequant_kernel(
     # Inputs (2D: n_rows x n_cols)
-    indices_ptr,                    # [n_rows, n_cols] int32
+    indices_ptr,  # [n_rows, n_cols] int32
     indices_row_stride: tl.int64,
-    invalid_ptr,                    # [n_rows, n_cols] uint8
+    invalid_ptr,  # [n_rows, n_cols] uint8
     invalid_row_stride: tl.int64,
     # Paged KV (3 typed views of the same uint8 buffer)
-    cache_fp8_ptr,                  # float8_e4m3fn view
-    cache_uint8_ptr,                # uint8 view (for UE8M0 scale bytes)
-    cache_bf16_ptr,                 # bfloat16 view (for ROPE region)
+    cache_fp8_ptr,  # float8_e4m3fn view
+    cache_uint8_ptr,  # uint8 view (for UE8M0 scale bytes)
+    cache_bf16_ptr,  # bfloat16 view (for ROPE region)
     # Output (3D: n_rows_max x total_cols x _D), pre-allocated workspace.
     # We write rows [0, n_rows) and cols [out_col_offset, out_col_offset+n_cols).
     out_ptr,
-    out_row_stride: tl.int64,       # = total_cols * _D, in elements
-    out_col_offset: tl.int32,       # column index to start writing at
+    out_row_stride: tl.int64,  # = total_cols * _D, in elements
+    out_col_offset: tl.int32,  # column index to start writing at
     # Invalid-mask output (1 byte / col), strided like out's (n_rows, total_cols).
     # Fuses the host-side `inv_chunk.copy_(invalid_mask)` step into the gather.
     inv_out_ptr,
@@ -47,14 +47,14 @@ def _gather_dequant_kernel(
     n_rows: tl.int32,
     n_cols: tl.int32,
     page_size: tl.int32,
-    page_bytes: tl.int64,           # k_cache.stride(0) in bytes
-    scale_section_off: tl.int64,    # page_size * 576
+    page_bytes: tl.int64,  # k_cache.stride(0) in bytes
+    scale_section_off: tl.int64,  # page_size * 576
     # Constexprs
-    NOPE_PAD: tl.constexpr,         # 512 (padded from 448 to power of 2)
-    ROPE_DIM: tl.constexpr,         # 64
-    NOPE_DIM_RT: tl.int32,          # 448
-    OUT_D_STRIDE: tl.constexpr,     # 512 (== _D)
-    BLOCK_C: tl.constexpr,          # cols per program
+    NOPE_PAD: tl.constexpr,  # 512 (padded from 448 to power of 2)
+    ROPE_DIM: tl.constexpr,  # 64
+    NOPE_DIM_RT: tl.int32,  # 448
+    OUT_D_STRIDE: tl.constexpr,  # 512 (== _D)
+    BLOCK_C: tl.constexpr,  # cols per program
 ):
     """Gather + dequant BLOCK_C cols of one row into the workspace.
 
@@ -78,10 +78,9 @@ def _gather_dequant_kernel(
 
     # Fused: also write the invalid byte into the inv workspace slice so the
     # downstream softmax kernel can read it directly (no torch copy / cat).
-    inv_out_addrs = (
-        pid_r.to(tl.int64) * inv_out_row_stride
-        + (inv_out_col_offset + c_offs).to(tl.int64)
-    )
+    inv_out_addrs = pid_r.to(tl.int64) * inv_out_row_stride + (
+        inv_out_col_offset + c_offs
+    ).to(tl.int64)
     tl.store(inv_out_ptr + inv_out_addrs, invalid, mask=c_mask)
 
     page_ids = (raw_indices // page_size).to(tl.int64)
@@ -89,35 +88,29 @@ def _gather_dequant_kernel(
     token_data_bases = page_ids * page_bytes + page_offs * 576  # [BLOCK_C]
 
     # ---- NOPE FP8 gather ----
-    nope_offs = tl.arange(0, NOPE_PAD)              # [NOPE_PAD]
-    nope_d_mask = nope_offs < NOPE_DIM_RT           # [NOPE_PAD]
+    nope_offs = tl.arange(0, NOPE_PAD)  # [NOPE_PAD]
+    nope_d_mask = nope_offs < NOPE_DIM_RT  # [NOPE_PAD]
     nope_full_mask = valid[:, None] & nope_d_mask[None, :]
     nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
-    kv_nope_fp8 = tl.load(
-        cache_fp8_ptr + nope_addrs, mask=nope_full_mask, other=0.0
-    )
+    kv_nope_fp8 = tl.load(cache_fp8_ptr + nope_addrs, mask=nope_full_mask, other=0.0)
 
     # ---- Scale gather + dequant ----
     # 7 UE8M0 scales / token, one per 64-wide group along NOPE.
-    group_ids = (nope_offs // 64).to(tl.int64)      # [NOPE_PAD] in {0..6} for valid d
+    group_ids = (nope_offs // 64).to(tl.int64)  # [NOPE_PAD] in {0..6} for valid d
     scale_bases = page_ids * page_bytes + scale_section_off + page_offs * 8
     scale_addrs = scale_bases[:, None] + group_ids[None, :]
-    scale_raw = tl.load(
-        cache_uint8_ptr + scale_addrs, mask=nope_full_mask, other=127
-    )
+    scale_raw = tl.load(cache_uint8_ptr + scale_addrs, mask=nope_full_mask, other=127)
     scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
     # Masked loads already returned 0 for invalid/out-of-bounds, so the
     # bf16 product is 0 there too — no extra tl.where needed.
     kv_nope_bf16 = (kv_nope_fp8.to(tl.float32) * scale_f32).to(tl.bfloat16)
 
     # ---- ROPE BF16 gather ----
-    rope_offs = tl.arange(0, ROPE_DIM)              # [ROPE_DIM]
-    rope_byte_bases = token_data_bases + 448        # rope starts after NOPE
+    rope_offs = tl.arange(0, ROPE_DIM)  # [ROPE_DIM]
+    rope_byte_bases = token_data_bases + 448  # rope starts after NOPE
     rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)  # bytes -> bf16 elements
     rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
-    kv_rope_bf16 = tl.load(
-        cache_bf16_ptr + rope_addrs, mask=valid[:, None], other=0.0
-    )
+    kv_rope_bf16 = tl.load(cache_bf16_ptr + rope_addrs, mask=valid[:, None], other=0.0)
 
     # ---- Store output into strided workspace slice ----
     # Target element addr: pid_r * out_row_stride + (out_col_offset + c) * _D + d
@@ -126,21 +119,19 @@ def _gather_dequant_kernel(
     nope_out_addrs = col_bases[:, None] + nope_offs[None, :].to(tl.int64)
     nope_store_mask = c_mask[:, None] & nope_d_mask[None, :]
     tl.store(out_ptr + nope_out_addrs, kv_nope_bf16, mask=nope_store_mask)
-    rope_out_addrs = (
-        col_bases[:, None] + NOPE_DIM_RT + rope_offs[None, :].to(tl.int64)
-    )
+    rope_out_addrs = col_bases[:, None] + NOPE_DIM_RT + rope_offs[None, :].to(tl.int64)
     tl.store(out_ptr + rope_out_addrs, kv_rope_bf16, mask=c_mask[:, None])
 
 
 def _triton_gather_into(
     k_cache: torch.Tensor,
-    indices: torch.Tensor,            # (n_rows, n_cols) int
-    invalid_mask: torch.Tensor,       # (n_rows, n_cols) bool/uint8
+    indices: torch.Tensor,  # (n_rows, n_cols) int
+    invalid_mask: torch.Tensor,  # (n_rows, n_cols) bool/uint8
     page_size: int,
-    out_buffer: torch.Tensor,         # (n_rows_max, total_cols, _D) bf16, contig
-    out_col_offset: int,              # KV column index to start writing at
-    inv_out_buffer: torch.Tensor,     # (n_rows_max, total_cols) uint8, contig
-    inv_out_col_offset: int,          # inv  column index to start writing at
+    out_buffer: torch.Tensor,  # (n_rows_max, total_cols, _D) bf16, contig
+    out_col_offset: int,  # KV column index to start writing at
+    inv_out_buffer: torch.Tensor,  # (n_rows_max, total_cols) uint8, contig
+    inv_out_col_offset: int,  # inv  column index to start writing at
 ) -> None:
     """Gather + dequant into pre-allocated KV and invalid-mask workspaces.
 
@@ -202,17 +193,17 @@ def _triton_gather_into(
 
 @triton.jit
 def _softmax_epilogue_kernel(
-    scores_ptr,                  # (n, H_q, T) fp32
+    scores_ptr,  # (n, H_q, T) fp32
     scores_n_stride: tl.int64,
     scores_h_stride: tl.int64,
-    inv_ptr,                     # (n, T) uint8 (from gather workspace)
+    inv_ptr,  # (n, T) uint8 (from gather workspace)
     inv_n_stride: tl.int64,
-    weights_ptr,                 # (n, H_q, T) bf16
+    weights_ptr,  # (n, H_q, T) bf16
     weights_n_stride: tl.int64,
     weights_h_stride: tl.int64,
-    lse_ptr,                     # (n, H_q) fp32 — raw lse (no sink)
+    lse_ptr,  # (n, H_q) fp32 — raw lse (no sink)
     lse_n_stride: tl.int64,
-    sink_ptr,                    # (H_q,) fp32 (unused if HAS_SINK==False)
+    sink_ptr,  # (H_q,) fp32 (unused if HAS_SINK==False)
     softmax_scale,
     T: tl.int32,
     HAS_SINK: tl.constexpr,
@@ -293,14 +284,13 @@ def _softmax_epilogue_kernel(
 
 
 def _triton_softmax_epilogue(
-    scores: torch.Tensor,           # (n, H_q, T) fp32, contiguous
-    inv_chunk_u8: torch.Tensor,     # (n, T) uint8, contiguous
+    scores: torch.Tensor,  # (n, H_q, T) fp32, contiguous
+    inv_chunk_u8: torch.Tensor,  # (n, T) uint8, contiguous
     softmax_scale: float,
     attn_sink: Optional[torch.Tensor],  # (H_q,) fp32 or None
-    lse_out: torch.Tensor,          # (n, H_q) fp32, contiguous (written in place)
+    lse_out: torch.Tensor,  # (n, H_q) fp32, contiguous (written in place)
 ) -> torch.Tensor:
-    """Run ``_softmax_epilogue_kernel`` and return the bf16 weights tensor.
-    """
+    """Run ``_softmax_epilogue_kernel`` and return the bf16 weights tensor."""
     assert scores.is_contiguous() and scores.dtype == torch.float32
     assert inv_chunk_u8.is_contiguous() and inv_chunk_u8.dtype == torch.uint8
     n, H_q, T = scores.shape
@@ -356,8 +346,7 @@ def flash_mla_with_kvcache_triton(
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sparse MLA decode using a fused Triton gather + torch GEMM math.
-    """
+    """Sparse MLA decode using a fused Triton gather + torch GEMM math."""
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -388,16 +377,16 @@ def flash_mla_with_kvcache_triton(
         )
         extra_max_valid = extra_num_pages * extra_page_size
         if extra_topk_length is not None:
-            extra_range = torch.arange(extra_topk, device=device).view(
-                1, 1, extra_topk
-            )
+            extra_range = torch.arange(extra_topk, device=device).view(1, 1, extra_topk)
             extra_invalid = (
                 (extra_indices_in_kvcache < 0)
                 | (extra_indices_in_kvcache >= extra_max_valid)
                 | (extra_range >= extra_topk_length.view(B, 1, 1))
             )
         else:
-            extra_invalid = (extra_indices_in_kvcache < 0) | (extra_indices_in_kvcache >= extra_max_valid)
+            extra_invalid = (extra_indices_in_kvcache < 0) | (
+                extra_indices_in_kvcache >= extra_max_valid
+            )
     else:
         extra_topk = 0
 
@@ -418,9 +407,7 @@ def flash_mla_with_kvcache_triton(
     # 512 MiB target — for typical workloads this collapses the loop to a
     # single iteration; only the extreme tail (very large B * topk) chunks.
     bytes_per_row = total_topk * _D * 2
-    chunk_rows = max(
-        1, min(R, (512 * 1024 * 1024) // max(1, bytes_per_row))
-    )
+    chunk_rows = max(1, min(R, (512 * 1024 * 1024) // max(1, bytes_per_row)))
 
     # Pre-allocate the KV tile + invalid-mask workspaces once.  Main and extra
     # gathers both write directly into slices of `kv_workspace` AND
@@ -443,7 +430,7 @@ def flash_mla_with_kvcache_triton(
         n = end - start
 
         # Views into the pre-allocated workspaces (no allocation, no copy).
-        kv_chunk = kv_workspace[:n]    # (n, total_topk, _D) bf16
+        kv_chunk = kv_workspace[:n]  # (n, total_topk, _D) bf16
         inv_chunk = inv_workspace[:n]  # (n, total_topk) uint8
 
         # Main gather: writes kv_chunk[:, :topk, :] AND inv_chunk[:, :topk].
@@ -490,9 +477,7 @@ def flash_mla_with_kvcache_triton(
 
         # PV: bf16 @ bf16 -> bf16.  kv_chunk[..., :head_dim_v] is a free view
         # when head_dim_v == _D.
-        out_chunk = torch.einsum(
-            "nht,ntv->nhv", weights, kv_chunk[..., :head_dim_v]
-        )
+        out_chunk = torch.einsum("nht,ntv->nhv", weights, kv_chunk[..., :head_dim_v])
         out_rows[start:end] = out_chunk
 
         del q_chunk, scores, weights, out_chunk
