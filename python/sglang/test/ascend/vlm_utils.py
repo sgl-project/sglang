@@ -43,7 +43,9 @@ class TestVLMModels(CustomTestCase):
         os.environ["OPENAI_API_KEY"] = cls.api_key
         os.environ["OPENAI_API_BASE"] = f"{cls.base_url}/v1"
 
-        os.environ["TRANSFORMERS_VERBOSITY"] = os.getenv("TRANSFORMERS_VERBOSITY", "error")
+        os.environ["TRANSFORMERS_VERBOSITY"] = os.getenv(
+            "TRANSFORMERS_VERBOSITY", "error"
+        )
 
     def run_mmmu_eval(
         self,
