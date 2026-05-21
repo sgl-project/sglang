@@ -507,9 +507,12 @@ class ModelRunnerKVCacheMixin:
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-                pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
-                    self.server_args
-                ).host_to_device_ratio
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                use_hisparse_memory_config = getattr(
+                    self, "use_hisparse_memory_config", False
+                )
+                pool_kwargs["host_to_device_ratio"] = hisparse_cfg.host_to_device_ratio
+                pool_kwargs["use_hisparse_memory_config"] = use_hisparse_memory_config
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -720,6 +723,9 @@ class ModelRunnerKVCacheMixin:
                         )
 
                         hisparse_cfg = parse_hisparse_config(self.server_args)
+                        use_hisparse_memory_config = getattr(
+                            self, "use_hisparse_memory_config", False
+                        )
                         self.token_to_kv_pool_allocator = (
                             HiSparseTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
@@ -729,6 +735,7 @@ class ModelRunnerKVCacheMixin:
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
                                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                                use_hisparse_memory_config=(use_hisparse_memory_config),
                             )
                         )
                     elif self.page_size == 1:
@@ -881,6 +888,9 @@ class ModelRunnerKVCacheMixin:
         page_size = self.server_args.page_size
 
         configurator = create_memory_pool_configurator(self)
+        self.use_hisparse_memory_config = getattr(
+            configurator, "use_hisparse_memory_config", False
+        )
         config = configurator.calculate_pool_sizes(available_bytes, page_size)
 
         # Apply external constraints (user cap, page alignment, PP sync)
