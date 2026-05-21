@@ -124,6 +124,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PostProcessWeightsReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -1334,6 +1335,10 @@ class Scheduler(
                     CheckWeightsReqInput,
                     self.weight_updater.check_weights,
                 ),
+                (
+                    PostProcessWeightsReqInput,
+                    self.weight_updater.post_process_weights,
+                ),
                 (SlowDownReqInput, self.slow_down),
                 (
                     ProfileReq,
@@ -1576,6 +1581,9 @@ class Scheduler(
             memory_saver_adapter=self.memory_saver_adapter,
             flush_cache=self.flush_cache,
             is_fully_idle=self.is_fully_idle,
+            disaggregation_mode=self.disaggregation_mode,
+            get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
+            get_disagg_prefill_bootstrap_queue=lambda: self.disagg_prefill_bootstrap_queue,
             metrics_collector=self.metrics_collector,
         )
 

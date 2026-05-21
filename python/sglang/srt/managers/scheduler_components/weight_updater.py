@@ -16,6 +16,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -25,6 +26,8 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PostProcessWeightsReqInput,
+    PostProcessWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -77,6 +80,9 @@ class SchedulerWeightUpdaterManager:
     memory_saver_adapter: Any
     flush_cache: Callable[..., bool]
     is_fully_idle: Callable[..., bool]
+    disaggregation_mode: Any
+    get_disagg_decode_prealloc_queue: Callable
+    get_disagg_prefill_bootstrap_queue: Callable
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
@@ -175,6 +181,11 @@ class SchedulerWeightUpdaterManager:
         parameter = self.tp_worker.get_weights_by_name(recv_req)
         return GetWeightsByNameReqOutput(parameter)
 
+    def post_process_weights(self, recv_req: PostProcessWeightsReqInput):
+        """Optional post-processing for updated weights (e.g., Marlin conversion)."""
+        success, message = self.tp_worker.post_process_weights(recv_req)
+        return PostProcessWeightsReqOutput(success, message)
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         assert (
             self.is_fully_idle()
@@ -191,6 +202,15 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                queue = self.get_disagg_decode_prealloc_queue()
+                if queue is not None:
+                    queue.release_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                queue = self.get_disagg_prefill_bootstrap_queue()
+                if queue is not None:
+                    queue.release_memory_occupation()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self.stashed_model_static_state = _export_static_state(
@@ -229,6 +249,15 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                queue = self.get_disagg_decode_prealloc_queue()
+                if queue is not None:
+                    queue.resume_memory_occupation()
+            elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+                queue = self.get_disagg_prefill_bootstrap_queue()
+                if queue is not None:
+                    queue.resume_memory_occupation()
 
         return ResumeMemoryOccupationReqOutput()
 
