@@ -124,6 +124,21 @@ def fill_plan_input_per_forward(
     plan_input_out.fb_prefix_lens.zero_()
     plan_input_out.fb_extend_seq_lens.zero_()
 
+    _fill_prefix_lens_and_extend_seq_lens(
+        forward_batch=forward_batch,
+        plan_input_out=plan_input_out,
+        bs=bs,
+    )
+
+    return bs
+
+
+def _fill_prefix_lens_and_extend_seq_lens(
+    *,
+    forward_batch: "ForwardBatch",
+    plan_input_out: PlanInput,
+    bs: int,
+) -> None:
     # Enumerate per forward_mode rather than trusting forward_batch.extend_prefix_lens /
     # extend_seq_lens for every mode — those two fields are unreliable for spec-decode paths:
     # TARGET_VERIFY skips populating them in ForwardBatch.init_new (the is_decode-or-target_verify
@@ -172,8 +187,6 @@ def fill_plan_input_per_forward(
         plan_input_out.fb_extend_seq_lens[:bs].copy_(
             forward_batch.extend_seq_lens.to(torch.int64)
         )
-
-    return bs
 
 
 def build_plan_input_radix_sweep(

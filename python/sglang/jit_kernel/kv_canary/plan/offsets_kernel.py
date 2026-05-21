@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -12,6 +14,7 @@ from sglang.jit_kernel.kv_canary.plan.utils import (
     _require_len,
     _require_min_len,
     _require_same_device,
+    _resolve_swa_lut,
     _swa_translate_tile,
 )
 from sglang.jit_kernel.kv_canary.verify import _assert_contiguous
@@ -28,7 +31,7 @@ def launch_plan_offsets_kernel(
     fb_prefix_lens: torch.Tensor,
     fb_extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
-    lut_tensor: torch.Tensor,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
     extra_verify_num_valid: torch.Tensor,
     verify_offsets_scratch: torch.Tensor,
     write_offsets: torch.Tensor,
@@ -36,15 +39,17 @@ def launch_plan_offsets_kernel(
     verify_num_valid: torch.Tensor,
     verify_enable: torch.Tensor,
     write_num_valid_reqs: torch.Tensor,
-    bs: int,
-    req_to_token_stride0: int,
-    lut_len: int,
     swa_window_size: int,
-    has_swa_lut: bool,
-    write_offsets_len: int,
-    write_req_capacity: int,
     verify_capacity: int,
 ) -> None:
+    bs = int(fb_req_pool_indices.shape[0])
+    lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
+        full_to_swa_index_mapping, verify_offsets_scratch.device
+    )
+    req_to_token_stride0 = int(req_to_token.stride(0))
+    write_offsets_len = int(write_offsets.shape[0])
+    write_req_capacity = int(write_seed_slot_indices.shape[0])
+
     _validate_offsets_kernel_inputs(
         fb_req_pool_indices=fb_req_pool_indices,
         fb_prefix_lens=fb_prefix_lens,
