@@ -10,6 +10,10 @@ on:
   push:
     paths:
       - 'docker/rocm.Dockerfile'  # Trigger when AITER version might change
+  # [TEST ONLY] Trigger on PR for testing
+  pull_request:
+    paths:
+      - '.github/workflows/release-whl-sglang-rocm.yml'
   # Manual trigger for testing and releases
   workflow_dispatch:
     inputs:
