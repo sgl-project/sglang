@@ -55,7 +55,26 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
     ),
     "swa": _ModeConfig(
         model_path="google/gemma-3-1b-it",
-        json_model_override_args=json.dumps({"num_hidden_layers": 6}),
+        # Gemma 3 1B-it's HF config carries layer-typed rope params; SGLang's
+        # parser also needs an explicit rope_type / factor on full_attention,
+        # otherwise the swa-mode server fails to launch. Passing these via
+        # --json-model-override-args avoids touching the model source.
+        json_model_override_args=json.dumps(
+            {
+                "num_hidden_layers": 6,
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 10000,
+                    },
+                    "full_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 1000000,
+                        "factor": 8.0,
+                    },
+                },
+            }
+        ),
         cuda_graph_max_bs=8,
         max_running_requests=32,
         context_length=8192,
