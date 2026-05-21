@@ -2270,6 +2270,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if require_gathered_buffer(self.server_args):
             assert require_mlp_tp_gather_ or require_attn_tp_gather(self.server_args)
 
+        require_attn_tp_gather_ = require_attn_tp_gather(self.server_args)
         buffers: DecodeInputBuffers = DecodeInputBuffers.create(
             device=self.device,
             max_bs=batch_size,
@@ -2281,6 +2282,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             pp_size=self.server_args.pp_size,
             is_encoder_decoder=self.model_config.is_encoder_decoder,
             require_mlp_tp_gather=require_mlp_tp_gather_,
+            require_attn_tp_gather=require_attn_tp_gather_,
             seq_len_fill_value=seq_len_fill_value,
             encoder_len_fill_value=(
                 getattr(self.model_config.hf_config, "max_source_positions", 0)
@@ -2320,7 +2322,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 {k: v[:num_tokens] for k, v in buffers.pp_proxy_tensors.items()}
             )
 
-        if require_mlp_tp_gather_:
+        if require_mlp_tp_gather_ or require_attn_tp_gather_:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
                     [num_tokens] * self.server_args.dp_size,
@@ -2336,22 +2338,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             )
             global_dp_buffer_len = num_tokens * self.server_args.dp_size
-        elif require_attn_tp_gather(self.server_args):
-            buffers.global_num_tokens_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            buffers.global_num_tokens_for_logprob_gpu.copy_(
-                torch.tensor(
-                    [num_tokens],
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            )
-            global_dp_buffer_len = num_tokens
         else:
             global_dp_buffer_len = None
 

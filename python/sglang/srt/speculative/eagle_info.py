@@ -257,6 +257,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
 
+        # DP-attention may pad logits beyond bs * draft_token_num; truncate.
+        real_tokens = bs * self.draft_token_num
+        if logits_output.next_token_logits.shape[0] > real_tokens:
+            logits_output.next_token_logits = logits_output.next_token_logits[
+                :real_tokens
+            ]
+
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)

@@ -1968,6 +1968,10 @@ def _wait_and_warmup(
     else:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
+    # Reset heartbeat so /health_generate doesn't see a stale timestamp from
+    # before CUDA graph capture.
+    _global_state.tokenizer_manager.last_receive_tstamp = time.time()
+
     # The server is ready for requests
     logger.info("The server is fired up and ready to roll!")
 
