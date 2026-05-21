@@ -272,25 +272,38 @@ class ViTCudaGraphRunner:
         # Allocate buffers for the largest bucket (needed by _timed_eager)
         self._alloc_buffers(B_max)
 
-        # Test A: eager baseline BEFORE any capture or stream switch
-        _timed_eager("A_baseline_before_anything")
-
-        # Test B: enter/exit graph_capture() WITHOUT capturing, then eager
-        with graph_capture() as ctx:
-            pass  # just stream switch + NCCL state change, no capture
-        _timed_eager("B_after_graph_capture_ctx_only")
-
-        # Test C: capture on DEFAULT stream (no graph_capture ctx), then eager
-        self._capture_no_stream(B_max)
-        _timed_eager("C_after_capture_default_stream")
-
-        # Now do the real capture
+        # Do the real capture
         with graph_capture() as graph_capture_context:
             stream = graph_capture_context.stream
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
 
-        _timed_eager("D_after_full_capture")
+        # Test: warmup with B_max (16384), then test with a DIFFERENT size
+        _timed_eager("E1_warmup_16384")  # absorbs cold-start
+        # Now allocate a different-sized buffer and test
+        cfg = self.config
+        novel_x = torch.zeros(
+            33600, 1, cfg.hidden_dim, device=self.device, dtype=self.dtype
+        )
+        novel_cos = torch.zeros(
+            33600, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+        novel_sin = torch.zeros(
+            33600, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+        novel_cu = torch.tensor([0, 33600], device=self.device, dtype=torch.int32)
+        novel_sl = torch.tensor([33600], device=self.device, dtype=torch.int32)
+        novel_meta = VisionAttentionMetadata(
+            cu_seqlens=novel_cu,
+            seq_lens=novel_sl,
+            max_seqlen=33600,
+        )
+        t0 = _time.monotonic()
+        self.vit.run_blocks(novel_x, novel_meta, novel_cos, novel_sin)
+        device_module.synchronize()
+        dt = (_time.monotonic() - t0) * 1000
+        logger.info("[VIT_GRAPH] E2_novel_33600_after_warmup: %.1fms", dt)
+        del novel_x, novel_cos, novel_sin, novel_cu, novel_sl, novel_meta
 
     def _capture_no_stream(self, bucket_size: int) -> None:
         """Capture on default stream (no graph_capture context) for diagnosis."""
