@@ -160,6 +160,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
 
+    def log_tail(self, lines: int = 200) -> str:
+        """Return recent server output for failure diagnostics."""
+        try:
+            content = self.stdout_file.read_text(encoding="utf-8", errors="ignore")
+            return "\n".join(content.splitlines()[-lines:])
+        except Exception:
+            return ""
+
     def cleanup(self) -> None:
         """Clean up server resources."""
         try:
