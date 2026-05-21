@@ -2889,7 +2889,7 @@ class Scheduler(
                             batch_result.future_indices = future_indices
 
                 # Placeholder for next iter's resolve_future to look up the
-                # real token from token_ids_buf via the negated indices.
+                # real token from output_tokens_buf via the negated indices.
                 batch.input_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
