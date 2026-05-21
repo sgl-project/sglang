@@ -29,16 +29,12 @@ class _ModeConfig:
 
     Fields:
         model_path: HF model id used by popen_launch_server.
-        context_length: Value passed to --context-length.
         json_model_override_args: JSON string passed to --json-model-override-args, or
             None to omit the flag entirely.
-        extra_server_args: Mode-specific launch args added before per-test args.
     """
 
     model_path: str
-    context_length: int = 8192
     json_model_override_args: Optional[str] = None
-    extra_server_args: tuple[str, ...] = ()
 
 
 _MODE_CONFIGS: dict[str, _ModeConfig] = {
@@ -67,24 +63,6 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
             }
         ),
     ),
-    "spec_eagle": _ModeConfig(
-        model_path="Qwen/Qwen3-0.6B",
-        context_length=2048,
-        json_model_override_args=json.dumps({"num_hidden_layers": 1}),
-        extra_server_args=(
-            "--sampling-backend",
-            "token_oracle",
-            "--speculative-algorithm",
-            "EAGLE",
-            "--cuda-graph-max-bs",
-            "8",
-            "--max-running-requests",
-            "32",
-            "--max-total-tokens",
-            "16384",
-            "--disable-piecewise-cuda-graph",
-        ),
-    ),
 }
 
 
@@ -108,7 +86,7 @@ class CanaryE2EBase(CustomTestCase):
         ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
     """
 
-    model_mode: ClassVar[Literal["mha", "swa", "spec_eagle"]]
+    model_mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[Literal["off", "log", "raise"]]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
@@ -133,8 +111,7 @@ class CanaryE2EBase(CustomTestCase):
             "--kv-canary",
             cls.kv_canary_mode,
             "--context-length",
-            str(cls._cfg.context_length),
-            *cls._cfg.extra_server_args,
+            "8192",
             *cls.extra_server_args,
         ]
         if cls._cfg.json_model_override_args is not None:
@@ -199,29 +176,6 @@ class CanaryE2EBase(CustomTestCase):
                 self.assertEqual(result.get("status_code"), 200, result)
 
         return results
-
-    def send_token_id_request(
-        self,
-        input_ids: list[int],
-        *,
-        max_new_tokens: int = 4,
-        timeout: float = 60.0,
-    ) -> requests.Response:
-        return requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "max_new_tokens": max_new_tokens,
-                    "temperature": 0.0,
-                },
-            },
-            timeout=timeout,
-        )
-
-    def assert_server_healthy(self, *, timeout: float = 10.0) -> None:
-        health = requests.get(self.base_url + "/health", timeout=timeout)
-        self.assertEqual(health.status_code, 200, health.text)
 
     def assert_per_forward_violation_reported(
         self,
