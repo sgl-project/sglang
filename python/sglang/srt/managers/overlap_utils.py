@@ -103,6 +103,18 @@ class FutureMap:
 
     def resolve_future(self, batch: ScheduleBatch):
         if self.spec_algo.is_none():
+            if batch.prefill_input_ids_cpu is not None:
+                prefill_dev = batch.prefill_input_ids_cpu.to(
+                    self.device, non_blocking=True
+                )
+                if batch.mix_running_input_ids is not None:
+                    batch.input_ids = torch.cat(
+                        [prefill_dev, batch.mix_running_input_ids]
+                    )
+                else:
+                    batch.input_ids = prefill_dev
+                batch.prefill_input_ids_cpu = None
+                batch.mix_running_input_ids = None
             _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
         else:
             draft_input: EagleDraftInput = batch.spec_info
