@@ -13,6 +13,7 @@
 # ==============================================================================
 """Inference-only Yi-VL model."""
 
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -22,6 +23,8 @@ from transformers import CLIPVisionModel, LlavaConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llava import LlavaLlamaForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
@@ -80,6 +83,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         params_dict = dict(self.named_parameters())
         weights = list(weights)
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "projector" in name or "vision_tower" in name:
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:

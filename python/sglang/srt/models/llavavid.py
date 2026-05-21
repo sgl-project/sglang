@@ -13,6 +13,7 @@
 # ==============================================================================
 """Inference-only LLaVa video model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -27,6 +28,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class LlavaVidForCausalLM(nn.Module):
@@ -263,6 +266,9 @@ class LlavaVidForCausalLM(nn.Module):
         }
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # FIXME: why projector weights read two times?
             if "projector" in name or "vision_tower" in name or "image_newline" in name:
                 for weight_name, param_name in projector_weights.items():

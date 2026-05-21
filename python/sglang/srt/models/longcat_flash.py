@@ -878,11 +878,20 @@ class LongcatFlashForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+
+        def track_future(name):
+            if futures and id(futures[-1]) not in future_to_name:
+                future_to_name[id(futures[-1])] = name
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+            future_to_name = {}
             for name, loaded_weight in weights:
+                logger.debug(
+                    f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+                )
                 use_async_loading = should_async_load(loaded_weight)
                 if "mtp" in name:
                     continue
@@ -920,6 +929,7 @@ class LongcatFlashForCausalLM(nn.Module):
                         func=weight_loader,
                         func_args=(param, loaded_weight, shard_id),
                     )
+                    track_future(name)
                     break
                 else:
                     for mapping in expert_params_mapping:
@@ -940,6 +950,7 @@ class LongcatFlashForCausalLM(nn.Module):
                                 "expert_id": expert_id,
                             },
                         )
+                        track_future(name)
                         break
                     else:
                         # Skip loading extra bias for GPTQ models.
@@ -999,6 +1010,7 @@ class LongcatFlashForCausalLM(nn.Module):
                                     func=weight_loader,
                                     func_args=(param, fused_weight),
                                 )
+                                track_future(param_name)
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
                         else:
@@ -1029,10 +1041,19 @@ class LongcatFlashForCausalLM(nn.Module):
                                 func=weight_loader,
                                 func_args=(param, loaded_weight),
                             )
+                            track_future(name)
 
             # Wait for all tasks to complete and raise any exceptions.
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    future.result()
+                except Exception as e:
+                    idx = futures.index(future) if future in futures else -1
+                    fname = future_to_name.get(id(future), "unknown")
+                    logger.error(
+                        f"Async weight loading failed: name={fname}, future_index={idx}"
+                    )
+                    raise
 
         self.post_load_weights(weight_names=weight_names)
 

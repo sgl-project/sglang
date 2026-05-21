@@ -357,6 +357,9 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
         # it does not belong to this pipeline stage, thus we simply continue.
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "language_model" in name:

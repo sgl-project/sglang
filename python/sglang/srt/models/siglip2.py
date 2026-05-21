@@ -21,6 +21,7 @@
 # Unlike Siglip v1 which uses fixed-size images, Siglip2 handles images of different
 # sizes by packing them into sequences and using cu_seqlens for attention.
 
+import logging
 from collections.abc import Iterable
 from typing import Optional
 
@@ -38,6 +39,8 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class Siglip2VisionEmbeddings(nn.Module):
@@ -545,6 +548,9 @@ class Siglip2Model(nn.Module):
         layer_count = len(self.vision_model.encoder.layers)
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # post_layernorm is optional in Siglip2Model
             if (
                 name.startswith("vision_model.post_layernorm")

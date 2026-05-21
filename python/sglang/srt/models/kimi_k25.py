@@ -761,6 +761,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
 
         def stream_language_weights():
             for name, loaded_weight in weights:
+                logger.debug(
+                    f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+                )
                 if "vision_tower" in name or "mm_projector" in name:
                     if vision_params is None:
                         continue

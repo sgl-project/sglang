@@ -158,6 +158,9 @@ class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):
         params_dict = dict(self.named_parameters())
         weight_names = []
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "language_model." in name:
                 name = name.replace("language_model.", "")
             if "model.visual." in name:

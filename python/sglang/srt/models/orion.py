@@ -8,6 +8,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/orion.py
 """Inference-only Orion-14B model compatible with HuggingFace weights."""
 
+import logging
 from collections.abc import Iterable
 from typing import Any, Optional, Tuple
 
@@ -36,6 +37,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 
 class OrionMLP(nn.Module):
@@ -336,6 +339,9 @@ class OrionForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
 

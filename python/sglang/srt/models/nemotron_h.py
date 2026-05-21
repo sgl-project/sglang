@@ -912,6 +912,9 @@ class NemotronHForCausalLM(nn.Module):
         # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
         # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = replace_prefix(name, self.remap_prefix)
             name = replace_substrings(name, self.remap_substr)
             if is_mtp:

@@ -16,6 +16,7 @@
 Using mistral-community/pixtral-12b as reference.
 """
 
+import logging
 from dataclasses import dataclass, fields
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -48,6 +49,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
+logger = logging.getLogger(__name__)
 USE_XFORMERS_OPS = False
 PATCH_MERGE = "patch_merge"
 
@@ -1011,6 +1013,9 @@ class PixtralHFVisionModel(nn.Module):
 
         # Process each weight
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name in name:
                     # Replace the weight name part with the combined parameter name

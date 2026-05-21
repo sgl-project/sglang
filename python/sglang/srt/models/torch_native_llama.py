@@ -25,6 +25,7 @@ Reference: https://pytorch.org/docs/stable/distributed.tensor.parallel.html
 Here is a quick example to enable TP:
 ```python
 from sglang.srt.layers.model_parallel import tensor_parallel
+import logging
 
 device_mesh = torch.distributed.init_device_mesh("cuda", (tp_size,))
 tensor_parallel(model, device_mesh)
@@ -42,6 +43,7 @@ $ python3 -m sglang.bench_one_batch --correct \
 We will enable CUDA Graph support soon.
 """
 
+import logging
 import types
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -67,6 +69,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 tp_size: Optional[int] = None
 tp_rank: Optional[int] = None
@@ -464,6 +468,9 @@ class TorchNativeLlamaForCausalLM(nn.Module):
         params_dict = dict(module.named_parameters(prefix=fqn, recurse=False))
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

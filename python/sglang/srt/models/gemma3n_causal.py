@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -27,6 +28,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3TextScaledWordEmbedding
 from sglang.srt.utils import add_prefix, make_layers
+
+logger = logging.getLogger(__name__)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -970,6 +973,9 @@ class Gemma3nForCausalLM(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = name.replace("model.language_model.", "model.")
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:

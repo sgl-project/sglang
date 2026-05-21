@@ -605,6 +605,9 @@ class Qwen3ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if not name.startswith("model.") and (
                 name.startswith("layers.")
                 or name.startswith("embed_tokens.")

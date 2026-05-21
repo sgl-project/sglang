@@ -1,3 +1,4 @@
+import logging
 from typing import Iterable, Tuple
 
 import torch
@@ -9,6 +10,8 @@ from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaModel
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaEmbeddingModel(nn.Module):
@@ -51,6 +54,9 @@ class LlamaEmbeddingModel(nn.Module):
         params_dict = dict(self.model.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 return
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

@@ -12,6 +12,7 @@ Key MoE characteristics:
 - Post-hoc normalization of top-k weights
 """
 
+import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -47,6 +48,8 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+
+logger = logging.getLogger(__name__)
 
 
 class Lfm2MoeMLP(nn.Module):
@@ -596,6 +599,9 @@ class Lfm2MoeForCausalLM(nn.Module):
         embed_tokens_weight = None
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
 

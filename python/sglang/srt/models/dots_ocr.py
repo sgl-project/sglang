@@ -140,6 +140,9 @@ class DotsOCRForCausalLM(nn.Module):
         language_weights = []
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("vision_tower."):
                 vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 

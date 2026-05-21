@@ -1281,6 +1281,9 @@ class MiMoV2ForCausalLM(nn.Module):
             )
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if not self._is_multimodal and _is_vision_audio_weight(name):
                 continue
 

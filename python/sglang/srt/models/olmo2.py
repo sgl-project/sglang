@@ -18,6 +18,7 @@
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/olmo2.py
 """Inference-only OLMo2 model compatible with HuggingFace weights."""
 
+import logging
 from functools import partial
 from typing import Iterable, Optional, Tuple
 
@@ -50,6 +51,8 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -452,6 +455,9 @@ class Olmo2ForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

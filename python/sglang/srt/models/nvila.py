@@ -1,4 +1,5 @@
 import itertools
+import logging
 import math
 from collections.abc import Iterable
 from typing import Any
@@ -26,6 +27,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
+
+logger = logging.getLogger(__name__)
 
 MM_HIDDEN_SIZE = 3456
 
@@ -207,6 +210,9 @@ class NVILAForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:

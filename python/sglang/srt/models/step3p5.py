@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -52,6 +53,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_cuda, is_non_idle_and_non_empty, make_layers
+
+logger = logging.getLogger(__name__)
 
 Step3p5Config = None
 
@@ -933,6 +936,9 @@ class Step3p5ForCausalLM(nn.Module):
             return shard_id_matches
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # Filter nextn layer weights.
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)

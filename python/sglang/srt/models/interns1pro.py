@@ -240,6 +240,9 @@ class InternS1ProForConditionalGeneration(Qwen3VLMoeForConditionalGeneration):
         params_dict = self._cached_params_dict
         other_weights = dict()
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "sin_coef" in name or "cos_coef" in name:
                 name = name.replace(r"model.language_model.", r"model.")
                 self._load_fope_weights(name, loaded_weight, params_dict)

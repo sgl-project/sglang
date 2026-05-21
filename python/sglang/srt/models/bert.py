@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -19,6 +20,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
+
+logger = logging.getLogger(__name__)
 
 BertConfig = None
 
@@ -412,6 +415,9 @@ class BertModel(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = name.replace("self", "self_attn")
             if not self.use_bert_pooler and "pooler" in name:
                 continue

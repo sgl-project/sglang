@@ -1,6 +1,7 @@
 # Adapted from
 # https://github.com/huggingface/transformers/blob/af9b2eaa54c150741f298d6db939af6328e1dc38/src/transformers/models/clip/modeling_clip.py
 
+import logging
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type, Union
 
@@ -19,6 +20,8 @@ from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.model_runner import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, flatten_nested_list
+
+logger = logging.getLogger(__name__)
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -484,6 +487,9 @@ class CLIPModel(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "position_ids" in name:
                 continue
             if "out_proj" in name:

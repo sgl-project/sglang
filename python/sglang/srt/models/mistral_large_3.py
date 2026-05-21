@@ -1,12 +1,15 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/mistral_large_3.py
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
 from collections.abc import Iterable
 
 import regex as re
 import torch
 
 from sglang.srt.models.deepseek_v2 import DeepseekV3ForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
@@ -51,6 +54,9 @@ class MistralLarge3ForCausalLM(DeepseekV3ForCausalLM):
     ) -> Iterable[tuple[str, torch.Tensor]]:
         """Remap Mistral parameters to DeepseekV2 parameters."""
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for k, v in self.remapping.items():
                 match = re.fullmatch(k, name)
                 if match:

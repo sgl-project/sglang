@@ -86,6 +86,9 @@ class Qwen3ForPooledOutput(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # Skip lm_head weights (pooled output models don't have lm_head)
             if name.startswith("lm_head"):
                 continue

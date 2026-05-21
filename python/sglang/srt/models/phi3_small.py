@@ -1,3 +1,4 @@
+import logging
 import math
 from typing import Iterable, Optional, Tuple, Union
 
@@ -26,6 +27,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+
+logger = logging.getLogger(__name__)
 
 
 @torch.jit.script
@@ -461,6 +464,9 @@ class Phi3SmallForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if name.endswith(".bias") and name not in params_dict:

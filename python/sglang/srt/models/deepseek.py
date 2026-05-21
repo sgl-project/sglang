@@ -18,6 +18,7 @@
 # https://github.com/vllm-project/vllm/blob/14f91fe67c2342f2fe859dc6a5c40810df0e1c61/vllm/model_executor/models/deepseek.py
 """Inference-only Deepseek model."""
 
+import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
@@ -57,6 +58,8 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 if _is_cpu and _is_cpu_amx_available:
     import sgl_kernel  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 
 class DeepseekMLP(nn.Module):
@@ -478,6 +481,9 @@ class DeepseekForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:

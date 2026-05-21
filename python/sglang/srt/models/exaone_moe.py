@@ -787,6 +787,9 @@ class ExaoneMoEForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if is_mtp:
                 if "mtp" not in name:
                     continue

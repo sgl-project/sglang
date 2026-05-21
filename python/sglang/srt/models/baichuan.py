@@ -23,6 +23,7 @@
 # limitations under the License.
 """Inference-only BaiChuan model compatible with HuggingFace weights."""
 
+import logging
 import math
 from typing import Iterable, Optional, Tuple
 
@@ -53,6 +54,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -402,6 +405,9 @@ class BaiChuanBaseForCausalLM(nn.Module):
         ]
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq" in name:
                 continue
             if name == "lm_head.weight":

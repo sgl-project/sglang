@@ -17,6 +17,7 @@
 # limitations under the License.
 """Inference-only Dots-VL model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -35,6 +36,8 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 from .dots_vlm_vit import DotsVisionTransformer
+
+logger = logging.getLogger(__name__)
 
 
 class DotsVLMForCausalLM(nn.Module):
@@ -97,6 +100,9 @@ class DotsVLMForCausalLM(nn.Module):
         language_weights = []
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("vision_tower."):
                 vision_name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                 vision_weights.append((vision_name, loaded_weight))

@@ -183,6 +183,9 @@ class Sarashina2VisionForCausalLM(nn.Module):
         gate_up_weights = {}
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             # Handle weight name mappings
 
             # Map visual attention weights: qkv -> qkv_proj

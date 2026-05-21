@@ -1,3 +1,4 @@
+import logging
 import math
 from collections.abc import Iterable
 
@@ -23,6 +24,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.jet_nemotron import JetNemotronForCausalLM
+
+logger = logging.getLogger(__name__)
 
 MM_HIDDEN_SIZE = 1152
 
@@ -124,6 +127,9 @@ class JetVLMForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name.startswith("llm."):
                 self.llm.load_weights([(name[len("llm.") :], loaded_weight)])
             else:

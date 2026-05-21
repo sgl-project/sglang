@@ -912,6 +912,9 @@ class Step3VLForConditionalGeneration(nn.Module):
             return shard_id_matches
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "vision_model" in name:
                 name = name.replace("self_attn", "self_attn.attn")
                 name = name.replace("out_proj", "proj")

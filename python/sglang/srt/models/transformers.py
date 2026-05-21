@@ -425,6 +425,9 @@ class TransformersFusedMoE(nn.Module):
         loaded: set[str] = set()
         param_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             matched = False
             for param_name, weight_name, expert_id, shard_id in self._expert_mapping:
                 if weight_name not in name:

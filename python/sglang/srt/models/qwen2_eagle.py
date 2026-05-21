@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+
 from sglang.srt.utils import add_prefix
 
 # Adapted from
@@ -33,6 +35,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
+
+logger = logging.getLogger(__name__)
 
 Qwen2Config = None
 
@@ -138,6 +142,9 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "lm_head" not in name:
                 name = "model." + name
                 super().load_weights([(name, loaded_weight)])

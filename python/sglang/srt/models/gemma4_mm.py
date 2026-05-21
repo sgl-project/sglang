@@ -832,6 +832,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
                 continue
             if self.audio_tower is None and (

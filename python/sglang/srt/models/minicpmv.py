@@ -21,6 +21,7 @@
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
 
+import logging
 import types
 from functools import partial
 from itertools import chain
@@ -70,6 +71,7 @@ from sglang.srt.models.qwen3 import Qwen3Config, Qwen3ForCausalLM
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
 from sglang.srt.utils import add_prefix, flatten_nested_list
 
+logger = logging.getLogger(__name__)
 RawImageType = Union[Image.Image, torch.Tensor]
 
 
@@ -1706,6 +1708,9 @@ class MiniCPMV:
 
         params_dict = dict(self.minicpmv.named_parameters())
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freq~" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:

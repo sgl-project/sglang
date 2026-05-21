@@ -230,6 +230,9 @@ class Qwen3VLMoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
             if (

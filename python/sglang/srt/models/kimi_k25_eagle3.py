@@ -383,6 +383,9 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         cached_a_proj: dict[str, torch.Tensor] = {}
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if name == "d2t" or name.endswith(".d2t"):
                 # d2t stores diffs between draft id and target id; absent in
                 # checkpoints whose draft_vocab_size equals vocab_size.

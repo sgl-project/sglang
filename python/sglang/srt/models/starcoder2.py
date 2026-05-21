@@ -22,6 +22,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/starcoder2.py
 """PyTorch Starcoder2 model."""
 
+import logging
 from collections.abc import Iterable
 from typing import Optional, Tuple
 
@@ -48,6 +49,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
+
+logger = logging.getLogger(__name__)
 
 
 class Starcoder2Attention(nn.Module):
@@ -330,6 +333,9 @@ class Starcoder2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
 
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             if "rotary_emb.inv_freqs" in name:
                 continue
 

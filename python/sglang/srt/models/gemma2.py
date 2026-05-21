@@ -18,6 +18,7 @@
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/56b325e977435af744f8b3dca7af0ca209663558/vllm/model_executor/models/gemma2.py
 
+import logging
 from typing import Iterable, Optional, Set, Tuple
 
 import torch
@@ -43,6 +44,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, is_npu, make_layers
+
+logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
@@ -469,6 +472,9 @@ class Gemma2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
+            logger.debug(
+                f"Loading weight: {name}, dtype={loaded_weight.dtype}, shape={loaded_weight.shape}"
+            )
             for param_name, shard_name, shard_id in stacked_params_mapping:
                 if shard_name not in name:
                     continue
