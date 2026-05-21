@@ -259,6 +259,7 @@ class StreamingSession(BasePrefixCache):
             device_indices=device_indices,
             last_device_node=slot.virtual_node,
             last_host_node=slot.virtual_node,
+            best_match_node=slot.virtual_node,
             cache_protected_len=slot.cache_protected_len,
         )
 
