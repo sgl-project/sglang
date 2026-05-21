@@ -144,8 +144,8 @@ class CanaryE2EBase(CustomTestCase):
         self,
         n: int,
         *,
-        assert_all_successs: bool,
-        max_new_tokens: int = 16,
+        assert_all_successs: bool = True,
+        max_new_tokens: int = 200,
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
@@ -176,15 +176,6 @@ class CanaryE2EBase(CustomTestCase):
                 self.assertEqual(result.get("status_code"), 200, result)
 
         return results
-
-    def send_successful_perturb_requests(
-        self, *, n: int = 4, max_new_tokens: int = 200
-    ) -> list[dict]:
-        return self.send_parallel_requests(
-            n=n,
-            assert_all_successs=True,
-            max_new_tokens=max_new_tokens,
-        )
 
     def assert_per_forward_violation_reported(
         self,
