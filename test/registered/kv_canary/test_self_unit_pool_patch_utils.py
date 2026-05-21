@@ -40,6 +40,13 @@ class TestPoolPatchUtils(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "already wrapped by kv-canary"):
             wrap_method(obj, "greet", wrapper=lambda orig, *a, **kw: orig(*a, **kw))
 
+    def test_wrap_method_preserves_functools_wraps_metadata(self) -> None:
+        """Verify wrapping preserves method metadata."""
+        obj = _FakeObj()
+        original_name = obj.greet.__name__
+        wrap_method(obj, "greet", wrapper=lambda orig, *a, **kw: orig(*a, **kw))
+        self.assertEqual(obj.greet.__name__, original_name)
+
 
 if __name__ == "__main__":
     unittest.main()

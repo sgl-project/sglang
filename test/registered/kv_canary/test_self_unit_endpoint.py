@@ -118,6 +118,42 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertIn(("verify", CanaryLaunchTag.TAIL_V_SWA), captured)
         self.assertIn(("write", CanaryLaunchTag.TAIL_V_SWA), captured)
 
+    def test_endpoint_shares_violation_log_across_launches(self):
+        """Verify endpoints can reuse the same violation log."""
+        captured_rings: list[int] = []
+        with patch.object(
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            lambda **kwargs: captured_rings.append(
+                kwargs["context"].violation_ring.data_ptr()
+            ),
+        ), patch.object(
+            endpoint_module,
+            "launch_canary_write_kernel",
+            lambda **kwargs: None,
+        ):
+            shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
+            ep_a = _make_endpoint(
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
+            )
+            ep_b = _make_endpoint(
+                device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_V_FULL
+            )
+
+            plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
+            ep_a.launch_sweep(
+                verify_plan=plan,
+                violation_log=shared_log,
+                real_kv_hash_mode=RealKvHashMode.OFF,
+            )
+            ep_b.launch_sweep(
+                verify_plan=plan,
+                violation_log=shared_log,
+                real_kv_hash_mode=RealKvHashMode.OFF,
+            )
+        self.assertEqual(captured_rings[0], captured_rings[1])
+        self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())
+
     def test_swa_endpoint_pre_translates_out_cache_loc(self):
         """Verify SWA endpoints translate cache locations before write launch."""
         captured: list[torch.Tensor] = []
