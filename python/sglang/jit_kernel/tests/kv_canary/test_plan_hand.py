@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import launch_canary_plan_kernels_torch_reference
+from sglang.jit_kernel.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import run_plan_diff
@@ -84,7 +86,11 @@ def _run_label(
     write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=_DEVICE
     )
-    runner = canary_plan_step if label == "real" else launch_canary_plan_kernels_torch_reference
+    runner = (
+        canary_plan_step
+        if label == "real"
+        else launch_canary_plan_kernels_torch_reference
+    )
     runner(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,

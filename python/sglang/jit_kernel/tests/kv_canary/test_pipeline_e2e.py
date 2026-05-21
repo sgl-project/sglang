@@ -7,16 +7,22 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import launch_canary_plan_kernels_torch_reference
+from sglang.jit_kernel.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary.verify_ref import launch_canary_verify_kernel_torch_reference
+from sglang.jit_kernel.kv_canary.verify_ref import (
+    launch_canary_verify_kernel_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
-from sglang.jit_kernel.kv_canary.write_ref import launch_canary_write_kernel_torch_reference
+from sglang.jit_kernel.kv_canary.write_ref import (
+    launch_canary_write_kernel_torch_reference,
+)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
