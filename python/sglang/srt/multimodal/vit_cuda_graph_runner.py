@@ -262,27 +262,56 @@ class ViTCudaGraphRunner:
                 self._capture(B, stream)
 
         device_module = torch.get_device_module(self.device)
-
-        # After capture, do one replay + one eager forward to prime
-        # the default-stream execution path.  Graph replay changes
-        # internal CUDA / NCCL state; the first post-replay eager call
-        # on a novel shape pays a one-time initialization cost.
-        B = self.BUCKET_SIZES[0]  # smallest bucket for fast replay
-        self.graphs[B].replay()
-        device_module.synchronize()
-
-        # Now run eager on the largest bucket to warm up default stream
         B_max = self.BUCKET_SIZES[-1]
+
+        def _timed_eager(label):
+            t0 = _time.monotonic()
+            self.vit.run_blocks(
+                self.input_bufs[B_max],
+                self.forward_metadatas[B_max],
+                self.rotary_cos_bufs[B_max],
+                self.rotary_sin_bufs[B_max],
+            )
+            device_module.synchronize()
+            dt = (_time.monotonic() - t0) * 1000
+            logger.info("[VIT_GRAPH] %s: %.1fms", label, dt)
+
+        # --- Diagnostic: understand replay → eager interaction ---
+
+        # Test 1: eager BEFORE any replay (baseline after capture)
+        _timed_eager("eager_before_replay")
+
+        # Test 2: replay smallest graph, then eager
+        B_small = self.BUCKET_SIZES[0]
+        self.graphs[B_small].replay()
+        device_module.synchronize()
+        _timed_eager("eager_after_replay_1st")
+
+        # Test 3: eager again (already warmed after replay)
+        _timed_eager("eager_after_replay_2nd")
+
+        # Test 4: replay again, then eager (repeatable?)
+        self.graphs[B_small].replay()
+        device_module.synchronize()
+        _timed_eager("eager_after_replay2_1st")
+
+        # Test 5: empty_cache then eager
+        self.graphs[B_small].replay()
+        device_module.synchronize()
+        torch.cuda.empty_cache()
+        _timed_eager("eager_after_replay+empty_cache")
+
+        # Test 6: just a large alloc after replay (isolate allocator)
+        self.graphs[B_small].replay()
+        device_module.synchronize()
         t0 = _time.monotonic()
-        self.vit.run_blocks(
-            self.input_bufs[B_max],
-            self.forward_metadatas[B_max],
-            self.rotary_cos_bufs[B_max],
-            self.rotary_sin_bufs[B_max],
+        tmp = torch.empty(
+            33600, 1, self.config.hidden_dim, device=self.device, dtype=self.dtype
         )
         device_module.synchronize()
         t1 = _time.monotonic()
-        logger.info("[VIT_GRAPH] post-replay eager warmup: %.1fms", (t1 - t0) * 1000)
+        del tmp
+        logger.info("[VIT_GRAPH] alloc_33600_after_replay: %.1fms", (t1 - t0) * 1000)
 
     # ------------------------------------------------------------------
     # Replay
