@@ -83,7 +83,7 @@ class ViTCudaGraphRunner:
     Falls back to eager execution when total tokens exceed the max bucket.
     """
 
-    BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384, 40960]
+    BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384]
     MAX_IMAGES_PER_BUCKET = 16
 
     _graph_memory_pool = None
@@ -258,6 +258,20 @@ class ViTCudaGraphRunner:
             # is big enough for smaller graphs to reuse.
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
+
+        # Warm up the eager path on the DEFAULT stream.
+        # Capture warmup runs on a dedicated capture stream, which does not
+        # initialize the default stream's kernel dispatch state.  Without
+        # this, the first eager fallback pays a multi-second cold-start.
+        device_module = torch.get_device_module(self.device)
+        B = self.BUCKET_SIZES[-1]
+        self.vit.run_blocks(
+            self.input_bufs[B],
+            self.forward_metadatas[B],
+            self.rotary_cos_bufs[B],
+            self.rotary_sin_bufs[B],
+        )
+        device_module.synchronize()
 
     # ------------------------------------------------------------------
     # Replay
