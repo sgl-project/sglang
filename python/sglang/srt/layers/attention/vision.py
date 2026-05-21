@@ -499,6 +499,9 @@ class VisionFlash4Attention(nn.Module):
             seq_lens = cu_seqlens_gpu[1:] - cu_seqlens_gpu[:-1]
             max_seqlen = seq_lens.max().item()
 
+        # num_splits=1: FA4 does not support num_splits=0 (dynamic heuristic)
+        # with CUDA Graph capture.  Setting 1 keeps behavior consistent
+        # across capture, replay, and eager fallback paths.
         output = flash_attn_varlen_func(
             q,
             k,
@@ -508,6 +511,7 @@ class VisionFlash4Attention(nn.Module):
             max_seqlen_q=max_seqlen,
             max_seqlen_k=max_seqlen,
             softmax_scale=softmax_scale,
+            num_splits=1,
             ver=4,
         )
 

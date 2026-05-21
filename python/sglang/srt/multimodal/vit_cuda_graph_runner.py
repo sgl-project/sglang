@@ -259,19 +259,6 @@ class ViTCudaGraphRunner:
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
 
-        # Run one eager forward on the default stream to absorb any
-        # remaining first-call initialization cost (capture runs on a
-        # dedicated stream which doesn't warm the default stream path).
-        device_module = torch.get_device_module(self.device)
-        B = self.BUCKET_SIZES[-1]
-        self.vit.run_blocks(
-            self.input_bufs[B],
-            self.forward_metadatas[B],
-            self.rotary_cos_bufs[B],
-            self.rotary_sin_bufs[B],
-        )
-        device_module.synchronize()
-
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
@@ -411,10 +398,6 @@ class ViTCudaGraphRunner:
 
         # Fallback: total tokens exceed max bucket, run eager
         block_out, ds_outs = self.vit.run_blocks(
-            x,
-            forward_metadata,
-            rotary_pos_emb_cos,
-            rotary_pos_emb_sin,
-            debug_per_block=True,
+            x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
         return self.vit.run_merger(block_out, ds_outs)
