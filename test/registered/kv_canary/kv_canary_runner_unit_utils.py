@@ -13,8 +13,11 @@ from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=1, stage="extra-a", runner_config="1-gpu-large")
 
 
 def make_group(
