@@ -12,6 +12,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -59,6 +61,7 @@ def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:
     return summary
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyTextModelsPerfAMD(unittest.TestCase):
     """AMD Nightly performance benchmark for text models (2-GPU)."""
 

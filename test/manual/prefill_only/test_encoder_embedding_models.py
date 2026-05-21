@@ -129,6 +129,11 @@ class TestEncoderEmbeddingModels(CustomTestCase):
             for attention_backend in ATTENTION_BACKEND:
                 for batch_size in BATCH_SIZE:
                     for torch_dtype in TORCH_DTYPES:
+                        if not torch.cuda.is_available() and attention_backend in [
+                            "triton",
+                            "flashinfer",
+                        ]:
+                            raise unittest.SkipTest("Test requires CUDA")
                         # NOTE: FlashInfer currently has limitations with head_dim = 32 or
                         # other dimensions.
                         # The FlashInfer head_dim limitation itself is tracked here:

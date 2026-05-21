@@ -126,6 +126,7 @@ def create_lora_adapter_with_lm_head(base_model_name: str, output_dir: str):
     torch.cuda.empty_cache()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRATiedLMHead(CustomTestCase):
     """
     Test that LoRA works correctly on models with tied lm_head.

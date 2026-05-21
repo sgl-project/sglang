@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.performance_test_runner import PerformanceTestParams
@@ -29,6 +31,7 @@ MTP_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGlm5Nvfp4(unittest.TestCase):
     """GLM-5 NVFP4 on GB300 (4x B200 NVL4, tp=4)."""
 

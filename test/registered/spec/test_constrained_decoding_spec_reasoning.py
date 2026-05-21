@@ -2,6 +2,7 @@ import json
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -17,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=137, stage="base-b", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class ServerWithGrammar(CustomTestCase):
     json_schema = json.dumps(
         {

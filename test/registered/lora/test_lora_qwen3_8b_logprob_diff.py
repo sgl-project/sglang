@@ -102,6 +102,7 @@ def _build_qwen3_mock():
     return model
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
 
     def test_auto_detect_lora_target_modules(self):

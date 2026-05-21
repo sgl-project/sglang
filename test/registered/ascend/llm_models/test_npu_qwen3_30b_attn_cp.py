@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ascend.test_ascend_utils import QWEN3_30B_A3B_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -24,6 +26,7 @@ _NPU_ENV_VARS = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen330BAttnCP(CustomTestCase):
     """GSM8K accuracy test for Qwen3-30B-A3B mixed deployment on 4 NPUs.
 

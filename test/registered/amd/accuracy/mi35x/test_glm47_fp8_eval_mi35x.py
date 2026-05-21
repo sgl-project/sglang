@@ -13,6 +13,8 @@ os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_combined_tests import run_combined_tests
@@ -28,6 +30,7 @@ register_amd_ci(
 GLM_4_7_FP8_MODEL_PATH = "zai-org/GLM-4.7-FP8"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM47FP8EvalMI35x(unittest.TestCase):
     """GLM-4.7-FP8 GSM8K Accuracy Evaluation Test for MI35x."""
 

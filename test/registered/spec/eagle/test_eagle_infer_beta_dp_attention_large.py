@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -42,6 +43,7 @@ def test_gsm8k(base_url: str, model: str):
     return metrics, avg_spec_accept_length
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagleDPAttnServerLarge(CustomTestCase):
     # FIXME: move this large mode test into nightly tests
     @classmethod

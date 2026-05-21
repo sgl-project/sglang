@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import openai
 import requests
+import torch
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_amd_ci
@@ -21,6 +22,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=600, suite="stage-b-test-large-8-gpu-mi35x-disaggregation-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -217,6 +219,7 @@ class TestDisaggregationAccuracy(PDDisaggregationServerBase):
 
 
 # register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -331,6 +334,7 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
 
 
 # register_amd_ci(est_time=300, suite="stage-b-test-2-gpu-large-amd")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationSimulatedRetract(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):

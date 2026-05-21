@@ -31,6 +31,7 @@ DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMemoryConsumptionAscend(CustomTestCase):
 
     def test_memory_consumption(self):

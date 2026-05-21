@@ -81,6 +81,7 @@ class TestAWQTriton(CustomTestCase):
                             group_size=group_size,
                         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def _run_dequant_case(self, qweight_rows, qweight_cols, group_size):
         if group_size == -1:
             group_size = qweight_rows
@@ -136,6 +137,7 @@ class TestAWQTriton(CustomTestCase):
                                     splitK=splitK,
                                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def _run_gemm_case(self, N, K, M, group_size, splitK):
         if group_size == -1:
             group_size = K

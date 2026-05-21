@@ -6,6 +6,8 @@ python3 -m unittest test_intel_xpu_backend.TestIntelXPUBackend.test_latency_qwen
 import unittest
 from functools import wraps
 
+import torch
+
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_BASE,
@@ -53,6 +55,7 @@ def intel_xpu_benchmark(
     return decorator
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestIntelXPUBackend(CustomTestCase):
 
     @intel_xpu_benchmark(min_throughput=10, mem_fraction_static="0.3")

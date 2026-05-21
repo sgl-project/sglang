@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 import zmq
 from msgspec.msgpack import Decoder
 
@@ -28,6 +29,7 @@ QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 ACC_THRESHOLDS = {QWEN35_27B_MODEL: {"gsm8k": 0.8}}
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35WithHiCache(CustomTestCase):
     @classmethod
     def setUpClass(cls):

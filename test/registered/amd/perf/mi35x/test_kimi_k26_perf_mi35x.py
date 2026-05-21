@@ -22,6 +22,8 @@ os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -65,6 +67,7 @@ KIMI_K26_MODEL_PATH = os.environ.get("KIMI_K26_MODEL_PATH", "moonshotai/Kimi-K2.
 PROFILE_DIR = "performance_profiles_kimi_k26_mi35x"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyKimiK26PerformanceMI35x(unittest.TestCase):
     """MI35x Nightly performance benchmark for Kimi-K2.6 model.
 

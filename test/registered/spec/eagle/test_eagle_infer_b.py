@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -25,6 +26,7 @@ from sglang.test.test_utils import DEFAULT_TARGET_MODEL_EAGLE, run_logprob_check
 register_cuda_ci(est_time=847, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEServerBasic(EagleServerBase):
     """Core tests that run on every server config variant."""
 
@@ -83,6 +85,7 @@ class TestEAGLEServerBasic(EagleServerBase):
         time.sleep(4)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEServerAdditional(TestEAGLEServerBasic):
     spec_topk = 5
     spec_steps = 8
@@ -315,6 +318,7 @@ class TestEAGLEServerAdditional(TestEAGLEServerBasic):
         self.assertTrue(is_valid_json)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLERetract(TestEAGLEServerBasic):
     extra_args = [
         "--chunked-prefill-size=128",
@@ -329,10 +333,12 @@ class TestEAGLERetract(TestEAGLEServerBasic):
             super().setUpClass()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEServerTriton(TestEAGLEServerBasic):
     extra_args = ["--attention-backend=triton", "--max-running-requests=8"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEServerPageSize(TestEAGLEServerBasic):
     spec_steps = 5
     spec_topk = 1
@@ -351,6 +357,7 @@ class TestEAGLEServerPageSize(TestEAGLEServerBasic):
             super().setUpClass()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     # default topk=8 and tokens=64
     extra_args = [
@@ -361,11 +368,13 @@ class TestEAGLEServerPageSizeTopk(TestEAGLEServerBasic):
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEAbortAll(AbortAllMixin, EagleServerBase):
     abort_all_max_new_tokens = 4000
     extra_args = ["--max-running-requests=8"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEWaitingTimeout(WaitingTimeoutMixin, EagleServerBase):
     extra_args = ["--max-running-requests=1"]
 
@@ -375,6 +384,7 @@ class TestEAGLEWaitingTimeout(WaitingTimeoutMixin, EagleServerBase):
             super().setUpClass()
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLERunningTimeout(RunningTimeoutTwoWaveMixin, EagleServerBase):
     # Regression test for https://github.com/sgl-project/sglang/pull/18760
     extra_args = ["--max-running-requests=16"]

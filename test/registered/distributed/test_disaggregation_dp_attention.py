@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.bench_serving import run_benchmark
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,6 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=443, stage="base-c", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     PREFILL_DP_SIZE = 4
     DECODE_DP_SIZE = 4
@@ -108,6 +111,7 @@ class TestDisaggregationDPAttention(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "round_robin"
     # TODO: add a balancedness metric
@@ -129,6 +133,7 @@ class TestDisaggregationDPAttentionRoundRobin(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 1000)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttentionTotalRequests(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "total_requests"
     test_gsm8k = unittest.skip(
@@ -150,6 +155,7 @@ class TestDisaggregationDPAttentionTotalRequests(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 256)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttentionTotalTokens(TestDisaggregationDPAttention):
     LOAD_BALANCE_METHOD = "total_tokens"
     test_gsm8k = unittest.skip(
@@ -171,6 +177,7 @@ class TestDisaggregationDPAttentionTotalTokens(TestDisaggregationDPAttention):
         self.assertEqual(result["completed"], 256)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skip(
     "Skip this test until new testing logic in mini-lb has been updated in docker image."
 )

@@ -2,6 +2,7 @@ import logging
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import QWEN3_VL_4B_INSTRUCT_WEIGHTS_PATH
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNpuApi(CustomTestCase):
     """Testcase: Verify the availability and correctness of the /encode API on Ascend backend with GME_QWEN2_VL_2B_INSTRUCT model.
 

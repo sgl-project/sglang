@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     LLAMA_4_SCOUT_17B_16E_INSTRUCT_WEIGHTS_PATH,
@@ -15,6 +17,7 @@ register_npu_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLlama4(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the meta-llama/Llama-4-Scout-17B-16E-Instruct model on the GSM8K dataset is no less than 0.9.
 

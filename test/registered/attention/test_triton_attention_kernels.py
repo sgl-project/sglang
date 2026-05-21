@@ -149,6 +149,7 @@ def decode_attention_fwd_torch(
     return o_ref
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonAttention(CustomTestCase):
 
     def _set_all_seeds(self, seed):

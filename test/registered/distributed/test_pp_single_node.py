@@ -15,6 +15,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.bench_one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
@@ -41,6 +42,7 @@ register_cuda_ci(est_time=554, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=650, suite="stage-c-test-4-gpu-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,6 +111,7 @@ class TestPPAccuracy(unittest.TestCase):
 
 
 @unittest.skipIf(is_in_amd_ci(), "MLA model with DP attention not yet supported on AMD")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionDP2PP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -152,6 +155,7 @@ class TestDPAttentionDP2PP2(CustomTestCase):
     is_in_amd_ci(),
     "VLM PP accuracy too low on AMD (0.48-0.50 with both aiter and triton)",
 )
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwenVLPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -207,6 +211,7 @@ class TestQwenVLPPAccuracy(unittest.TestCase):
         self.assertGreater(metrics["score"], 0.26)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_amd_ci(),
     "Gemma4 PP not yet validated on AMD",
@@ -285,6 +290,7 @@ class TestGemma4PPAccuracy(unittest.TestCase):
         self.assertGreater(metrics["score"], 0.65)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_amd_ci(),
     "Gemma4 PP not yet validated on AMD",
@@ -338,6 +344,7 @@ class TestGemma4PLEPPAccuracy(unittest.TestCase):
         time.sleep(4)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwenPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -392,6 +399,7 @@ class TestQwenPPAccuracy(unittest.TestCase):
 
 
 @unittest.skipIf(is_in_amd_ci(), "PP consistency too flaky on AMD 4-GPU runners")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -446,6 +454,7 @@ class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwenMoePPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -501,6 +510,7 @@ class TestQwenMoePPAccuracy(unittest.TestCase):
 @unittest.skipIf(
     is_in_ci(), "Qwen35 PP consistency too flaky on H100 and AMD 4-GPU runners"
 )
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35PPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -557,6 +567,7 @@ class TestQwen35PPAccuracy(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPMixedChunk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -604,6 +615,7 @@ class TestPPMixedChunk(CustomTestCase):
         time.sleep(4)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFixedBugs(unittest.TestCase):
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -633,6 +645,7 @@ class TestFixedBugs(unittest.TestCase):
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(
     is_in_ci(), "Skipping GLM41V PP accuracy test before it gets more stable"
 )

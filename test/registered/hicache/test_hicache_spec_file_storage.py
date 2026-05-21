@@ -15,6 +15,7 @@ from typing import Dict, List
 
 import psutil
 import requests
+import torch
 
 from sglang.benchmark.utils import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
@@ -33,6 +34,7 @@ from sglang.utils import wait_for_http_ready
 register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_hip(), "HiCache + EAGLE3 file-storage loadback e2e is CUDA-only.")
 class TestHiCacheSpecFileStorage(CustomTestCase):
     model = DEFAULT_TARGET_MODEL_EAGLE3
