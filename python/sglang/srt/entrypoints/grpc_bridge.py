@@ -10,27 +10,56 @@ import asyncio
 import dataclasses
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional
+
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
 
-class MockRequest:
-    """Lightweight stand-in for fastapi.Request when called from gRPC.
+class _CaseInsensitiveHeaders:
+    """Minimal read-only header view with case-insensitive lookup.
 
-    The OpenAI serving classes expect a fastapi.Request for disconnect
-    detection and routing key extraction. This satisfies that interface
-    without importing FastAPI.
+    Mirrors the only Starlette ``Headers`` surface the OpenAI serving classes
+    use (``.get(name)``), without importing Starlette or FastAPI.
     """
 
+    __slots__ = ("_data",)
+
     def __init__(self, headers: Optional[Dict[str, str]] = None):
-        self.headers = headers or {}
-        self.url = type("URL", (), {"path": "/grpc"})()
-        self.state = type("State", (), {})()
-        self.app = type("App", (), {"state": type("AppState", (), {})()})()
+        self._data = {k.lower(): v for k, v in (headers or {}).items()}
+
+    def get(self, name: str, default: Optional[str] = None) -> Optional[str]:
+        return self._data.get(name.lower(), default)
+
+
+class MockRequest:
+    """Stand-in for ``fastapi.Request`` when serving classes are called from gRPC.
+
+    Implements the three surfaces the OpenAI serving classes actually touch:
+      * ``headers.get(name)`` — case-insensitive, matches HTTP semantics
+      * ``state.<attr>`` — attribute namespace for downstream mutations
+      * ``await is_disconnected()`` — client-cancellation probe
+
+    ``is_disconnected_fn`` is an optional sync callable the Rust side can pass
+    that reads its Tonic ``CancellationToken``. When omitted, the request is
+    treated as always-connected (current Rust behaviour).
+    """
+
+    def __init__(
+        self,
+        headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
+    ):
+        self.headers = _CaseInsensitiveHeaders(headers)
+        self.state = SimpleNamespace()
+        self._is_disconnected_fn = is_disconnected_fn
 
     async def is_disconnected(self) -> bool:
-        return False
+        if self._is_disconnected_fn is None:
+            return False
+        return bool(self._is_disconnected_fn())
 
 
 class RuntimeHandle:
@@ -56,21 +85,25 @@ class RuntimeHandle:
 
         self._openai_serving_classes = None
 
+        # Ensure the handle_loop task exists before any gRPC RPC is dispatched.
+        # auto_create_handle_loop is idempotent (no-op if the loop is already
+        # running) and uses get_or_create_event_loop on the calling thread, so
+        # constructing RuntimeHandle from the launcher's main thread pins the
+        # loop where handle_loop's signal handlers expect it.
+        self.tokenizer_manager.auto_create_handle_loop()
+        self._event_loop = self.tokenizer_manager.event_loop
+
     @property
     def _tm_loop(self):
-        """Return the tokenizer_manager's event loop (uvicorn loop).
+        """Return the tokenizer_manager's event loop.
 
         Communicator-based async methods (flush_cache, get_load, etc.) use
         asyncio.Event internally, which only works within a single event
         loop. These must run on the same loop as handle_loop(), i.e. the
-        tokenizer_manager's event_loop.
+        tokenizer_manager's event_loop. Cached at construction time so RPCs
+        never race the loop's creation.
         """
-        loop = getattr(self.tokenizer_manager, "event_loop", None)
-        if loop is None:
-            raise RuntimeError(
-                "TokenizerManager event loop not ready - server still starting"
-            )
-        return loop
+        return self._event_loop
 
     def _safe_callback(self, chunk_callback, payload, *, finished: bool, error=None):
         try:
@@ -79,14 +112,7 @@ class RuntimeHandle:
             pass
 
     def _submit_on_tm_loop(self, coro_factory, chunk_callback, *, empty_response):
-        try:
-            loop = self._tm_loop
-        except RuntimeError as e:
-            self._safe_callback(
-                chunk_callback, empty_response, finished=True, error=str(e)
-            )
-            return
-        asyncio.run_coroutine_threadsafe(coro_factory(), loop)
+        asyncio.run_coroutine_threadsafe(coro_factory(), self._tm_loop)
 
     def _get_openai_serving(self):
         """Lazily initialize OpenAI serving classes."""
@@ -197,11 +223,7 @@ class RuntimeHandle:
 
     def abort(self, rid: str = "", abort_all: bool = False):
         """Abort a request by request ID or abort all active requests."""
-        try:
-            loop = self._tm_loop
-        except RuntimeError:
-            self.tokenizer_manager.abort_request(rid=rid, abort_all=abort_all)
-            return
+        loop = self._tm_loop
 
         try:
             running_loop = asyncio.get_running_loop()
@@ -498,6 +520,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI chat completion (JSON pass-through)."""
         self._submit_on_tm_loop(
@@ -507,6 +530,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=True,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -518,6 +542,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI completion (JSON pass-through)."""
         self._submit_on_tm_loop(
@@ -527,6 +552,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=True,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -538,6 +564,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI embedding (JSON pass-through, unary)."""
         self._submit_on_tm_loop(
@@ -547,6 +574,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=False,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -558,6 +586,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI classify (JSON pass-through, unary)."""
         self._submit_on_tm_loop(
@@ -567,6 +596,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=False,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -578,6 +608,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI score (JSON pass-through, unary)."""
         self._submit_on_tm_loop(
@@ -587,6 +618,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=False,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -598,6 +630,7 @@ class RuntimeHandle:
         json_body: bytes,
         chunk_callback,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Submit OpenAI rerank (JSON pass-through, unary)."""
         self._submit_on_tm_loop(
@@ -607,6 +640,7 @@ class RuntimeHandle:
                 chunk_callback,
                 streaming=False,
                 trace_headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
             ),
             chunk_callback,
             empty_response=b"",
@@ -639,6 +673,7 @@ class RuntimeHandle:
         chunk_callback,
         streaming: bool,
         trace_headers: Optional[Dict[str, str]] = None,
+        is_disconnected_fn: Optional[Callable[[], bool]] = None,
     ):
         """Generic OpenAI pass-through handler.
 
@@ -647,11 +682,30 @@ class RuntimeHandle:
         """
         try:
             serving = self._get_openai_serving()[serving_key]
-            request_dict = json.loads(json_body)
-            mock_request = MockRequest(headers=trace_headers)
 
-            request_cls = self._get_openai_request_class(serving_key)
-            request_obj = request_cls(**request_dict)
+            # JSON parse + Pydantic validation are client errors. Surface
+            # them with status_code=400 so the Rust side maps them to
+            # INVALID_ARGUMENT instead of INTERNAL. They always happen
+            # before any stream chunks are emitted, so it is safe to send a
+            # single status-bearing chunk even on streaming endpoints.
+            try:
+                request_dict = json.loads(json_body)
+                request_cls = self._get_openai_request_class(serving_key)
+                request_obj = request_cls(**request_dict)
+            except (json.JSONDecodeError, ValidationError) as e:
+                error_body = json.dumps(
+                    {"error": {"message": str(e), "type": "BadRequest"}}
+                ).encode("utf-8")
+                try:
+                    chunk_callback(error_body, finished=True, status_code=400)
+                except Exception:
+                    pass
+                return
+
+            mock_request = MockRequest(
+                headers=trace_headers,
+                is_disconnected_fn=is_disconnected_fn,
+            )
 
             result = await serving.handle_request(request_obj, mock_request)
 
