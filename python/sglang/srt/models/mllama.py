@@ -204,8 +204,6 @@ class MllamaVisionEncoderLayer(nn.Module):
             self.num_attention_heads,
             self.hidden_size,
             use_qkv_parallel=True,
-            qkv_bias=False,
-            proj_bias=False,
             quant_config=quant_config,
             flatten_batch=False,
             prefix=add_prefix("self_attn", prefix),
