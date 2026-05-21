@@ -125,6 +125,33 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertEqual(mm_items[0].hash, 12345)
         self.assertEqual(mm_items[0].pad_value, _compute_pad_value(12345))
 
+    def test_processor_output_preserves_precomputed_offsets(self):
+        processor = make_processor()
+        input_ids = [1, 42, 42, 2]
+        processor_output = {
+            "format": "processor_output",
+            "input_ids": torch.tensor([input_ids]),
+            "pixel_values": torch.arange(8).reshape(2, 4),
+            "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            "offsets": [(1, 2)],
+        }
+        base_output = BaseMultiModalProcessorOutput(
+            input_text="",
+            input_ids=input_ids,
+            images=[processor_output],
+        )
+
+        def fail_offset_scan(*args, **kwargs):
+            raise AssertionError("offset scan should not run")
+
+        processor.get_mm_items_offset = fail_offset_scan
+        mm_items, _, _ = processor.process_and_combine_mm_data(
+            base_output,
+            MultimodalSpecialTokens(image_token_id=42),
+        )
+
+        self.assertEqual(mm_items[0].offsets, [(1, 2)])
+
     def test_processor_output_multi_image_split_uses_grid_lengths(self):
         processor = make_processor()
         input_ids = [1, 42, 42, 2, 42, 42, 42, 3]

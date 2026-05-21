@@ -1083,7 +1083,14 @@ class BaseMultimodalProcessor(ABC):
 
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
-            if attr_name in ("input_ids", "format", "modality", "hash", "pad_value"):
+            if attr_name in (
+                "input_ids",
+                "format",
+                "modality",
+                "hash",
+                "pad_value",
+                "offsets",
+            ):
                 continue
 
             # Get modality for this attribute
@@ -1112,6 +1119,12 @@ class BaseMultimodalProcessor(ABC):
 
         if len(items) == 1:
             item = next(iter(items.values()))
+            offsets = data_dict.get("offsets")
+            if offsets is not None:
+                if isinstance(offsets, torch.Tensor):
+                    offsets = offsets.detach().cpu().tolist()
+                item.offsets = [(int(start), int(end)) for start, end in offsets]
+
             hash_value = data_dict.get("hash")
             if hash_value is not None:
                 if isinstance(hash_value, torch.Tensor):
@@ -1274,6 +1287,8 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
+            if mm_item.offsets is not None:
+                continue
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")
