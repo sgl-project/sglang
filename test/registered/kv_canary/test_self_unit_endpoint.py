@@ -108,11 +108,11 @@ class TestSelfUnitEndpoint(CustomTestCase):
         with patch.object(
             endpoint_module,
             "launch_canary_verify_kernel",
-            lambda **kwargs: captured.append(("verify", kwargs["kernel_kind"])),
+            lambda **kwargs: captured.append(("verify", kwargs["context"].kernel_kind)),
         ), patch.object(
             endpoint_module,
             "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(("write", kwargs["kernel_kind"])),
+            lambda **kwargs: captured.append(("write", kwargs["context"].kernel_kind)),
         ):
             ep = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.TAIL_V_SWA
@@ -161,7 +161,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
         with patch.object(
             endpoint_module,
             "launch_canary_verify_kernel",
-            lambda **kwargs: captured_rings.append(kwargs["violation_ring"].data_ptr()),
+            lambda **kwargs: captured_rings.append(
+                kwargs["context"].violation_ring.data_ptr()
+            ),
         ), patch.object(
             endpoint_module, "launch_canary_write_kernel", lambda **kwargs: None
         ):

@@ -60,6 +60,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         """Verify too many real KV sources are rejected."""
         from sglang.jit_kernel.kv_canary.verify import (
             CanaryLaunchTag,
+            VerifyOrWriteContext,
             VerifyPlan,
             launch_canary_verify_kernel,
         )
@@ -82,15 +83,17 @@ class TestSelfUnitPoolPatch(CustomTestCase):
 
         with self.assertRaises(ValueError):
             launch_canary_verify_kernel(
-                canary_buf=canary_buf,
+                context=VerifyOrWriteContext(
+                    canary_buf=canary_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=violation_ring,
+                    violation_write_index=violation_write_index,
+                    slot_run_counter=slot_run_counter,
+                    kernel_run_counter=kernel_run_counter,
+                    real_kv_sources=sources,
+                    real_kv_hash_mode=RealKvHashMode.OFF,
+                ),
                 plan=plan,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                violation_ring=violation_ring,
-                violation_write_index=violation_write_index,
-                slot_run_counter=slot_run_counter,
-                kernel_run_counter=kernel_run_counter,
-                real_kv_sources=sources,
-                real_kv_hash_mode=RealKvHashMode.OFF,
             )
 
     def test_get_contiguous_buf_infos_inserts_canary_entries(self):

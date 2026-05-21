@@ -35,11 +35,15 @@ class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
         ), patch.object(
             endpoint_module,
             "launch_canary_verify_kernel",
-            lambda **kwargs: calls.append(("verify", kwargs["kernel_kind"].name)),
+            lambda **kwargs: calls.append(
+                ("verify", kwargs["context"].kernel_kind.name)
+            ),
         ), patch.object(
             endpoint_module,
             "launch_canary_write_kernel",
-            lambda **kwargs: calls.append(("write", kwargs["kernel_kind"].name)),
+            lambda **kwargs: calls.append(
+                ("write", kwargs["context"].kernel_kind.name)
+            ),
         ):
             runner = make_runner(device=self.device)
             forward_batch = make_forward_batch(self.device)

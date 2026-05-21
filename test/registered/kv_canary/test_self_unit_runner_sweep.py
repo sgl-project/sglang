@@ -83,7 +83,9 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         with patch.object(
             endpoint_module,
             "launch_canary_verify_kernel",
-            lambda **kwargs: sweep_kernel_kinds.append(kwargs["kernel_kind"].name),
+            lambda **kwargs: sweep_kernel_kinds.append(
+                kwargs["context"].kernel_kind.name
+            ),
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in kind for kind in sweep_kernel_kinds))

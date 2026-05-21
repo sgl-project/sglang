@@ -7,8 +7,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    CanaryLaunchTag,
-    RealKvSource,
+    VerifyOrWriteContext,
     _assert_contiguous,
     _build_real_kv_source_abi,
 )
@@ -72,21 +71,14 @@ class WritePlan:
 
 def launch_canary_write_kernel(
     *,
-    canary_buf: torch.Tensor,
+    context: VerifyOrWriteContext,
     plan: WritePlan,
     fb_input_ids: torch.Tensor,
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
-    kernel_kind: CanaryLaunchTag,
     enable_assert_inputs: bool,
     expected_input_tokens: torch.Tensor | None,
     expected_input_positions: torch.Tensor | None,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     """Write canary fingerprints into one canary buffer per a WritePlan.
 
@@ -121,7 +113,8 @@ def launch_canary_write_kernel(
     them.
 
     Args:
-        canary_buf: Canary buffer this launch writes into, shape [num_slots, slot_stride_bytes], uint8.
+        context: Shared verify/write launch context, including canary buffer, launch tag, violation sink,
+            health counters, and real KV fingerprint sources.
         plan: Pre-allocated WritePlan.
         fb_input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int64.
             Flattened across reqs in plan.write_offsets order; tail beyond
@@ -132,8 +125,6 @@ def launch_canary_write_kernel(
             groups (typically a host-side LUT gather in the endpoint); FULL groups pass it through
             unchanged. A -1 entry signals skip-this-token (used for SWA out-of-window slots or padding).
             The kernel does not consult any LUT.
-        kernel_kind: CanaryLaunchTag stamped into violation rows (see launch_canary_verify_kernel). Sweep callers do not
-            invoke this kernel.
         enable_assert_inputs: bool toggle. False = expected_input_* tensors must be None. True = compare
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
         expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int64. Only read
@@ -143,14 +134,6 @@ def launch_canary_write_kernel(
             knows no oracle.
         expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int64, or None.
             Same shape/layout/lifetime rules as expected_input_tokens.
-        violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared with
-            verify launches.
-        violation_write_index: Global monotonic violation counter, shape [1], int32.
-        slot_run_counter: Health counter, shape [1], int64. Incremented by the number of write entries processed.
-        kernel_run_counter: Health counter, shape [1], int64. Incremented by 1 per call.
-        real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
-            tuple disables the mixin. Folded sequentially via splitmix64 to produce one int64 fingerprint per slot.
-        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
 
     Implementation:
         - CUDA __global__ `canary_write_kernel`: 1-D grid `(write_req_capacity, 1, 1)` blocks × `(1, 1, 1)` thread
@@ -191,6 +174,8 @@ def launch_canary_write_kernel(
     :func:`sglang.jit_kernel.kv_canary.write_ref.run_canary_write_torch_reference`; CUDA must match
     byte-for-byte.
     """
+    canary_buf = context.canary_buf
+    real_kv_sources = context.real_kv_sources
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
             f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
@@ -220,10 +205,10 @@ def launch_canary_write_kernel(
             )
         expected_input_tokens_for_cuda = fb_input_ids
         expected_input_positions_for_cuda = fb_positions
-    _assert_contiguous(violation_ring, "violation_ring")
-    _assert_contiguous(violation_write_index, "violation_write_index")
-    _assert_contiguous(slot_run_counter, "slot_run_counter")
-    _assert_contiguous(kernel_run_counter, "kernel_run_counter")
+    _assert_contiguous(context.violation_ring, "violation_ring")
+    _assert_contiguous(context.violation_write_index, "violation_write_index")
+    _assert_contiguous(context.slot_run_counter, "slot_run_counter")
+    _assert_contiguous(context.kernel_run_counter, "kernel_run_counter")
 
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
@@ -238,21 +223,21 @@ def launch_canary_write_kernel(
         fb_input_ids,
         fb_positions,
         fb_out_cache_loc,
-        int(kernel_kind),
+        int(context.kernel_kind),
         int(enable_assert_inputs),
         expected_input_tokens_for_cuda,
         expected_input_positions_for_cuda,
-        violation_ring,
-        violation_write_index,
-        slot_run_counter,
-        kernel_run_counter,
+        context.violation_ring,
+        context.violation_write_index,
+        context.slot_run_counter,
+        context.kernel_run_counter,
         padded_bufs[0],
         padded_bufs[1],
         padded_bufs[2],
         padded_bufs[3],
         source_params,
         len(real_kv_sources),
-        int(real_kv_hash_mode),
+        int(context.real_kv_hash_mode),
     )
 
 
