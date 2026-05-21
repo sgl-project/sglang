@@ -75,7 +75,12 @@ def _build_req_id_per_token(
     rids_per_row: torch.Tensor,
 ) -> torch.Tensor:
     forward_mode = forward_batch.forward_mode
-    if forward_mode.is_extend():
+    if forward_mode.is_target_verify():
+        lens = torch.full_like(
+            rids_per_row, int(forward_batch.spec_info.draft_token_num)
+        )
+        result = torch.repeat_interleave(rids_per_row, lens)
+    elif forward_mode.is_extend():
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
             raise RuntimeError(
