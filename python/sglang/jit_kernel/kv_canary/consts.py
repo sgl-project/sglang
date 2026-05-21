@@ -5,9 +5,9 @@ from typing import Final
 
 CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
 
-# Slot 0 of every canary buffer is a reserved padding sentinel. Pools that attach a canary MUST reserve
-# slot 0 (free_slots starts at 1) so unfilled req_to_token entries (zero-initialized) translate to this
-# slot and the verify kernel skips them instead of raising spurious chain_hash / position violations.
+# Mirrors SGLang's ReqToTokenPool contract: row 0 is reserved as the CUDA-graph padding row and real
+# req_pool_idx values start at 1. Canary-attached pools reserve the same slot so zero-initialized
+# req_to_token entries translate to a skipped padding sentinel instead of spurious violations.
 CANARY_RESERVED_SLOT: Final[int] = 0
 
 CANARY_FIELDS_PER_SLOT: Final[int] = 4

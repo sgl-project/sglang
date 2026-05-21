@@ -277,7 +277,7 @@ def _plan_offsets_kernel(
         extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0
     )  # [BS_BLOCK]
 
-    # Req pool idx 0 is the reserved CUDA-graph padding row.
+    # SGLang's ReqToTokenPool reserves req_pool_idx 0 as the CUDA-graph padding row.
     is_active = (rpi != RESERVED_SLOT) & bs_mask  # [BS_BLOCK] bool
     has_prefix = is_active & (prefix_lens > 0)  # [BS_BLOCK] bool
 

@@ -207,7 +207,7 @@ def _plan_entries_kernel(
     rpi = tl.load(req_pool_indices_ptr + r)  # scalar
     prefix_lens = tl.load(prefix_lens_ptr + r)  # scalar
 
-    # Skip the reserved CUDA-graph padding row entirely.
+    # SGLang's ReqToTokenPool reserves req_pool_idx 0 as the CUDA-graph padding row.
     if rpi == RESERVED_SLOT:
         return
 
