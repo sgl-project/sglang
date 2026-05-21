@@ -1930,7 +1930,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 get_activation_type,
             )
 
-            activation_type = get_activation_type(self.moe_runner_config.activation)
+            activation_type = get_activation_type(
+                self.moe_runner_config.activation,
+                is_gated=self.moe_runner_config.is_gated,
+            )
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
