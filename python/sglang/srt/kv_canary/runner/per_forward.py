@@ -155,7 +155,7 @@ class PerForwardOrchestrator:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._perturb_hook.perturb_hook(forward_batch)
+        self._perturb_hook.perturb_req_to_token_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
 
         if self._config.input_check_mode:

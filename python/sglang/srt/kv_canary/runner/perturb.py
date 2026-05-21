@@ -70,7 +70,7 @@ class PerturbHook:
             self._warmup_enable_logged = True
         return False
 
-    def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_req_to_token_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.req_to_token_prob <= 0.0:
             return
         if self._is_in_warmup():

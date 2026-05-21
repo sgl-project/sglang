@@ -252,7 +252,7 @@ class TestSelfUnitRunner(CustomTestCase):
         forward_batch = _make_forward_batch(self.device, bs=2, seq_lens_list=(3, 3))
 
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
-            hook.perturb_hook(forward_batch)
+            hook.perturb_req_to_token_hook(forward_batch)
 
         row, col, original = hook._perturb_undo
         replacement = int(pool.req_to_token[row, col].item())
