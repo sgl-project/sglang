@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -8,7 +9,6 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +27,15 @@ class WarmupGate:
         self,
         *,
         config: PerturbConfig,
-        violation_pump: ViolationPump,
+        step_counter_getter: Callable[[], int],
     ) -> None:
         self._config = config
-        self._violation_pump = violation_pump
+        self._step_counter_getter = step_counter_getter
         self._warmup_disable_logged: bool = False
         self._warmup_enable_logged: bool = False
 
     def is_in_warmup(self) -> bool:
-        step = self._violation_pump.step_counter
+        step = self._step_counter_getter()
         warmup_steps = self._config.warmup_steps
 
         if step < warmup_steps:

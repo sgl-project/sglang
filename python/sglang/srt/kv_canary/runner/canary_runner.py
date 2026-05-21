@@ -22,8 +22,7 @@ from sglang.srt.kv_canary.runner.health import (
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
-from sglang.srt.kv_canary.runner.violation import ViolationReporter
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
+from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
     until server shutdown. The runner itself is a thin facade; per-concern state and behavior
-    live on the component classes (ViolationPump, SweepOrchestrator, ViolationReporter,
+    live on the component classes (ViolationManager, SweepOrchestrator,
     PerturbManager, PerForwardOrchestrator, KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger).
     """
@@ -60,6 +59,7 @@ class CanaryRunner:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
+        self._step_counter: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -83,7 +83,7 @@ class CanaryRunner:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
-        self._violation_pump = ViolationPump(
+        self._violation_manager = ViolationManager(
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
@@ -97,18 +97,13 @@ class CanaryRunner:
             req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
             sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
-            violation_pump=self._violation_pump,
-        )
-        self._violation_reporter = ViolationReporter(
-            config=config,
-            device_state=self._device_state,
-            violation_pump=self._violation_pump,
+            step_counter_getter=self._get_step_counter,
         )
         self._perturb_manager = PerturbManager(
             config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
-            violation_pump=self._violation_pump,
+            step_counter_getter=self._get_step_counter,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,
@@ -129,14 +124,14 @@ class CanaryRunner:
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            violation_pump=self._violation_pump,
+            step_counter_getter=self._get_step_counter,
             d2h_stream=self._d2h_stream,
         )
         self._stats_logger = PeriodicCanaryStatsLogger(
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            violation_pump=self._violation_pump,
+            step_counter_getter=self._get_step_counter,
             sweep_orchestrator=self._sweep_orchestrator,
             d2h_stream=self._d2h_stream,
         )
@@ -144,6 +139,9 @@ class CanaryRunner:
     @property
     def active_tag_count(self) -> int:
         return len(self._active_tags)
+
+    def _get_step_counter(self) -> int:
+        return self._step_counter
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
@@ -188,9 +186,7 @@ class CanaryRunner:
 
         self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
-        any_rank_errored = self._violation_pump.pump_and_drain()
+        self._step_counter += 1
+        self._violation_manager.step(step_counter=self._step_counter)
         self._health_checker.step()
         self._stats_logger.step()
-
-        if any_rank_errored and not self._violation_reporter.is_raised:
-            self._violation_reporter.log_or_raise_violation()
