@@ -1,3 +1,6 @@
+from dataclasses import replace
+from pathlib import Path
+
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
@@ -8,8 +11,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
-    MODELOPT_WAN22_FP8_TRANSFORMER,
-    MODELOPT_WAN22_NVFP4_TRANSFORMER,
+    MODELOPT_WAN22_FP8_MODEL,
+    MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+    MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -49,6 +53,8 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_WAN_2_2_TI2V_5B_MODEL_NAME_FOR_TEST,
 )
 
+_CACHE_DIT_CONFIG_DIR = Path(__file__).parent / "configs"
+
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
 ONE_GPU_CASES: list[DiffusionTestCase] = [
@@ -67,6 +73,28 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             enable_cache_dit=True,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "qwen_image_t2i_cache_dit_scm_config_diffusers_1gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            extras=[
+                "--backend",
+                "diffusers",
+                "--cache-dit-config",
+                str(_CACHE_DIT_CONFIG_DIR / "cache_dit_scm_config.yaml"),
+            ],
+        ),
+        replace(
+            T2I_sampling_params,
+            output_size="512x512",
+            extras={"num_inference_steps": 8, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
     ),
     DiffusionTestCase(
         "flux_image_t2i",
@@ -378,17 +406,21 @@ if not current_platform.is_hip():
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
-# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
+# Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
+# quantization coverage in the B200 suite.
 if current_platform.is_hip():
-    ONE_GPU_MODELOPT_CASES = []
+    ONE_GPU_MODELOPT_FP8_CASES = []
+    ONE_GPU_MODELOPT_NVFP4_CASES = []
 else:
-    ONE_GPU_MODELOPT_CASES = [
+    ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_fp8_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_fp8_t2i",
@@ -396,13 +428,15 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_FP8_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+            extras=[],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "hunyuanvideo_modelopt_fp8_t2v",
@@ -430,6 +464,8 @@ else:
             sampling_params=MODELOPT_TI2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
+    ]
+    ONE_GPU_MODELOPT_NVFP4_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -437,6 +473,7 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -445,16 +482,20 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            extras=[],
+            env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
     ]
+
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
@@ -522,6 +563,26 @@ TWO_GPU_CASES = [
         T2V_sampling_params,
     ),
     DiffusionTestCase(
+        "wan2_1_t2v_1_3b_cache_dit_sp_only_2gpu",
+        DiffusionServerArgs(
+            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
+            ulysses_degree=2,
+            enable_cache_dit=True,
+            env_vars={"SGLANG_CACHE_DIT_WARMUP": "2"},
+        ),
+        replace(
+            T2V_sampling_params,
+            output_size="832x480",
+            num_frames=5,
+            extras={"num_inference_steps": 8, "seed": 0},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
+        run_models_api_check=False,
+        run_t2v_input_reference_check=False,
+    ),
+    DiffusionTestCase(
         "fsdp-inference",
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -554,8 +615,7 @@ TWO_GPU_CASES = [
         "ltx_2_two_stage_t2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2",
-            ulysses_degree=2,
-            dit_layerwise_offload=True,
+            cfg_parallel=True,
             extras=["--pipeline-class-name LTX2TwoStagePipeline"],
         ),
         T2V_sampling_params,
@@ -566,7 +626,7 @@ TWO_GPU_CASES = [
             model_path="Lightricks/LTX-2.3",
             cfg_parallel=True,
             extras=[
-                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
+                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original",
             ],
         ),
         TI2V_sampling_params,
@@ -587,10 +647,10 @@ TWO_GPU_CASES = [
             cfg_parallel=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
-                "--ltx2-two-stage-device-mode original",
+                "--component-attention-backends transformer=fa",
             ],
         ),
-        T2V_sampling_params,
+        DiffusionSamplingParams(prompt=T2V_PROMPT, extras={"seed": 42}),
         run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
@@ -661,7 +721,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            ulysses_degree=2,
+            cfg_parallel=True,
         ),
         TI2V_sampling_params,
         run_component_accuracy_check=False,
@@ -681,5 +741,5 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)

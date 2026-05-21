@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.utils import is_arch_support_pdl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -20,8 +19,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_device_core_count,
     get_int_env_var,
+    is_cuda,
     next_power_of_2,
 )
+
+_is_cuda = is_cuda()
+
+if _is_cuda:
+    from sgl_kernel.utils import is_arch_support_pdl
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -148,7 +153,10 @@ class TritonAttnBackend(AttentionBackend):
                 self.device_core_count,
                 self.max_context_len,
             )
-        self.use_pdl = is_arch_support_pdl()
+        if _is_cuda:
+            self.use_pdl = is_arch_support_pdl()
+        else:
+            self.use_pdl = False
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph
@@ -416,9 +424,9 @@ class TritonAttnBackend(AttentionBackend):
             kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
             # TODO(FIXME): This will trigger an invalid Eagle tree when using
-            # `max(spec_info.num_accepted_tokens_cpu)`.
+            # `max(spec_info.num_accept_tokens_cpu)`.
             # It might have been forgotten to update somewhere.
-            max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
+            max_extend_len = torch.max(spec_info.num_accept_tokens).item()
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
@@ -1049,9 +1057,6 @@ class TritonAttnBackend(AttentionBackend):
             prefix_kv_indices = self.forward_metadata.kv_indices
             window_start_pos = None
 
-        # For SWA layers, mirror SWAKVPool.set_kv_buffer: read from the
-        # precomputed pool.swa_loc. Translate out_cache_loc to SWA-pool index space
-        # as a fallback when pool.swa_loc is not pre-populated.
         extend_kv_indices = forward_batch.out_cache_loc
         pool = forward_batch.token_to_kv_pool
         if (
@@ -1060,12 +1065,7 @@ class TritonAttnBackend(AttentionBackend):
             and isinstance(pool, SWAKVPool)
             and pool.layers_mapping[layer.layer_id][1]
         ):
-            if pool.swa_loc is not None:
-                extend_kv_indices = pool.swa_loc
-            else:
-                extend_kv_indices = pool.translate_loc_from_full_to_swa(
-                    extend_kv_indices
-                )
+            extend_kv_indices = pool.translate_loc_from_full_to_swa(extend_kv_indices)
 
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
