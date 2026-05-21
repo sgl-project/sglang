@@ -9,6 +9,9 @@ from kv_canary_runner_unit_utils import make_forward_batch, make_pool
 
 from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.perturb import (
+    real_kv_unused_cache as real_kv_unused_cache_module,
+)
 from sglang.srt.kv_canary.perturb.config import (
     PerturbConfig,
     TargetGroupKind,
@@ -16,7 +19,10 @@ from sglang.srt.kv_canary.perturb.config import (
 )
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
-from sglang.srt.kv_canary.perturb.utils import pick_target_group
+from sglang.srt.kv_canary.perturb.utils import (
+    flip_first_byte_in_source,
+    pick_target_group,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
@@ -169,6 +175,184 @@ class TestPerturb(CustomTestCase):
         self.assertNotEqual(replacement, original)
         self.assertFalse(bool(diff[1, 0].item()))
 
+    def test_real_kv_used_flips_first_real_kv_byte_for_active_full_slot(
+        self,
+    ) -> None:
+        """Verify real_kv_used flips only the first real KV byte for an active FULL slot."""
+        device = DEFAULT_DEVICE
+        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool.req_to_token.fill_(-1)
+        pool.req_to_token[1, 0] = 2
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor.copy_(
+            torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
+                source.tensor
+            )
+        )
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=0.0,
+                real_kv_used_prob=1.0,
+                real_kv_unused_cache_prob=0.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=0,
+            ),
+            req_to_token_pool=pool,
+            buffer_groups=(group,),
+            step_counter_getter=lambda: 10,
+        )
+        forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
+        forward_batch.out_cache_loc = torch.tensor(
+            [99], dtype=torch.int32, device=device
+        )
+
+        snapshot = source.tensor.clone()
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
+            manager.perturb_real_kv_used(forward_batch)
+
+        expected = snapshot.clone()
+        expected[2, 0] = int(snapshot[2, 0].item()) ^ 0xFF
+        self.assertTrue(torch.equal(source.tensor, expected))
+
+    def test_real_kv_unused_cache_flips_first_real_kv_byte_for_orphan_slot(
+        self,
+    ) -> None:
+        """Verify real_kv_unused_cache flips only the first real KV byte for an orphan slot."""
+        device = DEFAULT_DEVICE
+        pool = make_pool(device, max_reqs=4, max_seq=8)
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor.copy_(
+            torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
+                source.tensor
+            )
+        )
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=0.0,
+                real_kv_used_prob=0.0,
+                real_kv_unused_cache_prob=1.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=0,
+            ),
+            req_to_token_pool=pool,
+            buffer_groups=(group,),
+            step_counter_getter=lambda: 10,
+        )
+        manager.attach_radix_cache(cast("BasePrefixCache", object()))
+
+        snapshot = source.tensor.clone()
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
+            real_kv_unused_cache_module,
+            "pick_orphan_slot",
+            return_value=3,
+        ):
+            manager.perturb_real_kv_unused_cache(None)
+
+        expected = snapshot.clone()
+        expected[3, 0] = int(snapshot[3, 0].item()) ^ 0xFF
+        self.assertTrue(torch.equal(source.tensor, expected))
+
+    def test_flip_first_byte_in_source_maps_swa_logical_slot_through_lut(
+        self,
+    ) -> None:
+        """Verify SWA groups map logical slots through swa_index_lut before flipping bytes."""
+        source = RealKvSource(
+            tensor=torch.arange(32, dtype=torch.uint8).view(2, 16),
+            page_size=2,
+            num_bytes_per_token=8,
+            read_bytes=8,
+        )
+        group = _make_group(
+            kind=PoolKind.SWA,
+            has_real_kv=True,
+            source=source,
+            swa_index_lut=torch.tensor([0, 3], dtype=torch.int32),
+        )
+
+        snapshot = source.tensor.clone()
+        result = flip_first_byte_in_source(group=group, source=source, slot_idx=1)
+
+        self.assertEqual(result, (1, 8, int(snapshot[1, 8].item())))
+        expected = snapshot.clone()
+        expected[1, 8] = int(snapshot[1, 8].item()) ^ 0xFF
+        self.assertTrue(torch.equal(source.tensor, expected))
+
+    def test_warmup_gate_prevents_perturbation_when_probabilities_are_one(self) -> None:
+        """Verify warmup prevents all perturbations even when every probability is one."""
+        device = DEFAULT_DEVICE
+        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool.req_to_token.fill_(-1)
+        pool.req_to_token[1, 0] = 2
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor.copy_(
+            torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
+                source.tensor
+            )
+        )
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=1.0,
+                real_kv_used_prob=1.0,
+                real_kv_unused_cache_prob=1.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=20,
+            ),
+            req_to_token_pool=pool,
+            buffer_groups=(group,),
+            step_counter_getter=lambda: 10,
+        )
+        manager.attach_radix_cache(cast("BasePrefixCache", object()))
+        forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
+        forward_batch.out_cache_loc = torch.tensor(
+            [99], dtype=torch.int32, device=device
+        )
+
+        pool_snapshot = pool.req_to_token.clone()
+        source_snapshot = source.tensor.clone()
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
+            real_kv_unused_cache_module,
+            "pick_orphan_slot",
+            return_value=3,
+        ):
+            manager.perturb(forward_batch)
+
+        self.assertTrue(torch.equal(pool.req_to_token, pool_snapshot))
+        self.assertTrue(torch.equal(source.tensor, source_snapshot))
+
+    def test_real_kv_unused_cache_skips_without_radix_cache_when_forward_batch_is_none(
+        self,
+    ) -> None:
+        """Verify unused-cache perturbation accepts no forward batch but skips without radix_cache."""
+        device = DEFAULT_DEVICE
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor.copy_(
+            torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
+                source.tensor
+            )
+        )
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=0.0,
+                real_kv_used_prob=0.0,
+                real_kv_unused_cache_prob=1.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=0,
+            ),
+            req_to_token_pool=make_pool(device),
+            buffer_groups=(group,),
+            step_counter_getter=lambda: 10,
+        )
+
+        snapshot = source.tensor.clone()
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
+            manager.perturb_real_kv_unused_cache(None)
+
+        self.assertTrue(torch.equal(source.tensor, snapshot))
+
     def test_collect_active_slots_ignores_padded_out_cache_loc(self) -> None:
         """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE
@@ -190,8 +374,14 @@ class TestPerturb(CustomTestCase):
         self.assertEqual([target.value for target in targets], [0])
 
 
-def _make_group(*, kind: PoolKind, has_real_kv: bool) -> CanaryBufferGroup:
-    source = RealKvSource(
+def _make_group(
+    *,
+    kind: PoolKind,
+    has_real_kv: bool,
+    source: RealKvSource | None = None,
+    swa_index_lut: torch.Tensor | None = None,
+) -> CanaryBufferGroup:
+    source = source or RealKvSource(
         tensor=torch.zeros(4, 16, dtype=torch.uint8),
         page_size=1,
         num_bytes_per_token=16,
@@ -206,7 +396,7 @@ def _make_group(*, kind: PoolKind, has_real_kv: bool) -> CanaryBufferGroup:
         v_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8),
         real_kv_sources_k=real_kv_sources,
         real_kv_sources_v=real_kv_sources,
-        swa_index_lut=None,
+        swa_index_lut=swa_index_lut,
     )
 
 
