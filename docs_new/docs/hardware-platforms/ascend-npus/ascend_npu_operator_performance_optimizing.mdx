@@ -245,18 +245,24 @@ Input Shapes set to an empty value indicates that when the format is "; ; ; ;", 
 # Optimization
 
 ## Specification
-1. Ascend core compute units
-AI Core: the core that actually performs matrix/vector computation
-Vector Unit: responsible for SIMD computation (similar to CUDA Core)
-Scalar Unit: responsible for control/loop
-L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
-2. Ascend memory hierarchy (from fastest to slowest)
+### 1. Ascend core compute units
+#### AI Core: the core that actually performs matrix/vector computation
+#### Vector Unit: responsible for SIMD computation (similar to CUDA Core)
+#### Scalar Unit: responsible for control/loop
+#### L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
+### 2. Ascend memory hierarchy (from fastest to slowest)
 Register → Fastest
+```
 L0/L1 cache → Very fast
+```
+```
 On-chip cache (L2) → Fast
+```
+```
 DDR (host memory) → Slowest
-Golden rule of tuning: 90% of performance problems are caused by inefficient memory movement.
-3. Characteristics of Ascend instructions
+```
+
+### 3. Characteristics of Ascend instructions
 Good at accessing large contiguous memory blocks
 Dislikes discrete access, stride access, and random access
 Must be 128-bit/256-bit aligned
