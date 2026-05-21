@@ -252,6 +252,7 @@ class MockModelRunner:
                 "dsa_decode_backend": "fa3",
             },
         )()
+        self.hisparse_coordinator = None
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
