@@ -761,8 +761,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
-            # Init hisparse coordinator (must happen before init_attention_backend()
-            # so backends can capture it at construction time)
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config

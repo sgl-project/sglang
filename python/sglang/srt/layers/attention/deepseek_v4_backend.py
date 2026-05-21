@@ -354,11 +354,8 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        # Pool refs — captured at construction so they survive deletion of the
-        # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
-        # Keep a runner ref for other live state that needs runtime reads.
         self.model_runner = model_runner
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
