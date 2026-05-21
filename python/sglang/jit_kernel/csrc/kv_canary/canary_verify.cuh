@@ -60,7 +60,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     return;
   }
 
-  const int32_t active = *p.verify_num_valid;
+  const int32_t active = min(*p.verify_num_valid, p.verify_capacity);
 
   uint32_t local_active_count = 0;
   for (uint32_t entry_idx = tid; entry_idx < static_cast<uint32_t>(active); entry_idx += stride) {
