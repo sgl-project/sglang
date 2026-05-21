@@ -33,7 +33,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 class ImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = [
         "model.encoder.layer",
         "model.vision_model.encoder.layers",
@@ -213,7 +213,7 @@ def build_image_encoder(config):
 
 
 class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",
         "main_image_encoder.model.vision_model.encoder.layers",
@@ -250,7 +250,7 @@ class DualImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
 
 
 class SingleImageEncoder(nn.Module, LayerwiseOffloadableModuleMixin):
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = [
         "main_image_encoder.model.encoder.layer",
         "main_image_encoder.model.vision_model.encoder.layers",

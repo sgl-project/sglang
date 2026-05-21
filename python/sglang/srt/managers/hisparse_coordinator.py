@@ -9,7 +9,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     DeepSeekV4SingleKVPoolHost,
-    HiSparseNSATokenToKVPool,
+    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
@@ -67,7 +67,9 @@ class HiSparseCoordinator:
             self.mem_pool_device = self.token_to_kv_pool_allocator.hisparse_kvcache
             host_size = self.token_to_kv_pool_allocator.size_full // self.compress_ratio
             self.mem_pool_host = DeepSeekV4SingleKVPoolHost(
-                self.mem_pool_device, host_size, 1
+                self.mem_pool_device,
+                host_size,
+                page_size=self.mem_pool_device.page_size,
             )
             self.item_size_bytes = (
                 self.mem_pool_host.kv_cache_total_dim
@@ -77,18 +79,19 @@ class HiSparseCoordinator:
             assert isinstance(
                 self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
             )
-            self.mem_pool_device: HiSparseNSATokenToKVPool = (
+            self.mem_pool_device: HiSparseDSATokenToKVPool = (
                 self.token_to_kv_pool_allocator.get_kvcache()
             )
             self.mem_pool_host = MLATokenToKVPoolHost(
                 device_pool=self.mem_pool_device,
                 host_to_device_ratio=host_to_device_ratio,
                 host_size=0,
-                page_size=1,
+                page_size=self.mem_pool_device.page_size,
                 layout="layer_first",
                 override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
             )
             self.item_size_bytes = self.mem_pool_host.token_stride_size
+        self.page_size = self.mem_pool_device.page_size
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -110,10 +113,13 @@ class HiSparseCoordinator:
             max_num_req_slots, dtype=torch.int64, device="cpu"
         )
         self.req_to_host_pool = torch.full(
-            (max_num_req_slots, max_compressed_context_len),
+            (max_num_req_slots, max_compressed_context_len + self.page_size),
             -1,
             dtype=torch.int64,
             device=device,
+        )
+        self.req_to_host_pool_allocated_len = torch.zeros(
+            max_num_req_slots, dtype=torch.int64, device="cpu"
         )
 
         self.write_staging_stream = device_module.Stream()
@@ -200,18 +206,13 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
-        host_indices = self.mem_pool_host.alloc(prefill_len)
-        if host_indices is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d tokens (req %s)",
-                prefill_len,
-                req.rid,
-            )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {prefill_len} tokens"
-            )
-        host_indices = host_indices.to(device=self.device)
-        self.req_to_host_pool[req.req_pool_idx, :prefill_len] = host_indices
+        host_indices = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req.req_pool_idx,
+            0,
+            prefill_len,
+        )
 
         start_event = device_module.Event()
         finish_event = device_module.Event()
@@ -549,17 +550,19 @@ class HiSparseCoordinator:
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
 
-        host_locs = self.mem_pool_host.alloc(len(device_locs))
-        if host_locs is None:
-            logger.error(
-                "HiSparse: host mem pool alloc failed for %d decode backup tokens",
-                len(device_locs),
+        host_locs_list = []
+        for i in backup_indices:
+            req_idx = int(req_pool_indices_cpu[i])
+            start_pos = (int(seq_lens_cpu[i]) - 1) // self.compress_ratio - 1
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                req_idx,
+                start_pos,
+                1,
             )
-            raise RuntimeError(
-                f"HiSparse host mem pool alloc failed for {len(device_locs)} decode backup tokens"
-            )
-        host_locs = host_locs.to(device=self.device)
-        self.req_to_host_pool[backup_req_indices, actual_compressed_pos] = host_locs
+            host_locs_list.append(host_locs)
+        host_locs = torch.cat(host_locs_list)
 
         self.wait_for_pending_backup()
         schedule_stream = device_module.current_stream()
@@ -702,12 +705,15 @@ class HiSparseCoordinator:
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
         # Free host memory that was allocated during admit_request_into_staging
-        compressed_len = prefill_len // self.compress_ratio
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self._skip_first_backup[req.req_pool_idx] = False
         req.hisparse_staging = False
 
@@ -730,7 +736,6 @@ class HiSparseCoordinator:
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         allocated_len = req.kv_allocated_len
-        compressed_len = allocated_len // self.compress_ratio
 
         # release memory -- only free actually-allocated buffer indices
         current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
@@ -748,8 +753,11 @@ class HiSparseCoordinator:
         )
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = 0
 
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :compressed_len]
-        host_indices = host_indices[host_indices >= 0]
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool,
+            req.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+        )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
@@ -759,6 +767,7 @@ class HiSparseCoordinator:
         self.req_to_device_buffer[req.req_pool_idx, :] = 0
         self.req_device_buffer_size[req.req_pool_idx] = 0
         self.req_to_host_pool[req.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
 
