@@ -109,6 +109,10 @@ def main(args):
             "answer",
             max_tokens=args.max_new_tokens,
             stop=["Question", "Assistant:", "<|separator|>"],
+            return_logprob=args.return_logprob if args.return_logprob else None,
+            top_logprobs_num=(
+                args.top_logprobs_num if args.top_logprobs_num > 0 else None
+            ),
         )
 
     #####################################
@@ -121,6 +125,7 @@ def main(args):
         arguments,
         temperature=args.temperature,
         top_p=args.top_p,
+        top_k=args.top_k,
         num_threads=args.parallel,
         progress_bar=True,
     )
@@ -179,6 +184,23 @@ if __name__ == "__main__":
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=-1,
+        help="Top-k sampling: keep only top-k tokens for sampling (-1 to disable)",
+    )
+    parser.add_argument(
+        "--return-logprob",
+        action="store_true",
+        help="Return log probabilities for generated tokens",
+    )
+    parser.add_argument(
+        "--top-logprobs-num",
+        type=int,
+        default=0,
+        help="Number of top logprobs to return per token (0 to disable)",
+    )
     parser.add_argument(
         "--enable-thinking",
         action="store_true",
