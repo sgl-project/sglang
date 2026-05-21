@@ -747,6 +747,8 @@ class TestExtras:
         assert (
             n_real <= verify_capacity
         ), f"real n_valid {n_real} exceeded cap {verify_capacity}"
+        assert int(real_v.enable[0].item()) == 0
+        assert int(ref_v.enable[0].item()) == 0
 
 
 class TestMisc:
