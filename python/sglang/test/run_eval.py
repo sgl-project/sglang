@@ -78,10 +78,16 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             stop=stop,
         )
     else:
+        # Chat mode: stop seq is opt-in (caller passes via args.stop). Evals like
+        # GSM8K need ["\nQuestion:", "\n\nQuestion:"] to prevent the model from
+        # hallucinating additional Q&A pairs after the target question, which
+        # otherwise breaks `numbers[-1]` answer extraction.
+        chat_stop = getattr(args, "stop", None)
         sampler = ChatCompletionSampler(
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
+            stop=chat_stop,
         )
 
     # Run eval
