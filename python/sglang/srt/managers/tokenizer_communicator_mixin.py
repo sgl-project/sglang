@@ -76,6 +76,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -538,6 +539,29 @@ class TokenizerCommunicatorMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def update_relay_weights_from_distributed(
+        self: TokenizerManager,
+        obj: UpdateRelayWeightsFromDistributedReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        async with self.is_pause_cond:
+            if not self.is_pause:
+                return (
+                    False,
+                    "relay distributed weight transfer requires paused generation. "
+                    "Pause generation before receiving relay weights so the asynchronous load "
+                    "cannot race with active inference.",
+                )
+            if obj.abort_all_requests:
+                self.abort_request(abort_all=True)
+            results = await self.update_weights_from_distributed_communicator(obj)
+        return _Communicator.merge_results(results)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,

@@ -1303,6 +1303,19 @@ class UpdateWeightsFromDistributedReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateRelayWeightsFromDistributedReqInput(BaseReq):
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+    # The group name
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+
+
+@dataclass
 class UpdateWeightsFromTensorReqInput(BaseReq):
     """Update model weights from tensor input.
 
@@ -1435,6 +1448,11 @@ class InitWeightsUpdateGroupReqInput(BaseReq):
 class InitWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class InitRelayWeightsUpdateGroupReqInput(InitWeightsUpdateGroupReqInput):
+    pass
 
 
 @dataclass

@@ -24,7 +24,7 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -261,6 +261,34 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 logger = logging.getLogger(__name__)
 
 
+_DEFAULT_WEIGHT_SYNC_P2P_OPS_PER_BATCH = 64
+_DEFAULT_MAX_PENDING_RELAY_BYTES = 8 * 1024 * 1024 * 1024
+
+
+def _run_weight_sync_p2p_ops(ops):
+    ops_per_batch = int(
+        os.environ.get(
+            "WEIGHT_SYNC_P2P_OPS_PER_BATCH",
+            _DEFAULT_WEIGHT_SYNC_P2P_OPS_PER_BATCH,
+        )
+    )
+
+    batch = []
+
+    def flush_batch():
+        if not batch:
+            return
+        for work in dist.batch_isend_irecv(batch):
+            work.wait()
+        batch.clear()
+
+    for op in ops:
+        batch.append(op)
+        if len(batch) >= ops_per_batch:
+            flush_batch()
+    flush_batch()
+
+
 def resolve_language_model(model: nn.Module) -> nn.Module:
     model_cls_name = model.__class__.__name__
     if model_cls_name == "Qwen3OmniMoeForConditionalGeneration":
@@ -287,6 +315,12 @@ class ModelRunnerOutput:
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[RoutedExpertsOutput] = None
+
+
+@dataclass
+class _PendingRelayWeightUpdate:
+    weights: List[Tuple[str, torch.Tensor]]
+    total_bytes: int
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -449,7 +483,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For weight updates
         self._model_update_group = {}
+        self._skipped_model_update_groups = set()
         self._weights_send_group = {}
+        self._relay_weight_pending_updates: deque[_PendingRelayWeightUpdate] = deque()
+        self._relay_weight_pending_count = 0
+        self._relay_weight_load_worker: threading.Thread | None = None
+        self._relay_weight_pending_cond = threading.Condition()
+        self._relay_weight_dist_lock = threading.Lock()
+        self._relay_weight_pending_bytes = 0
+        self._relay_weight_pending_error: str | None = None
+        self._relay_weight_max_pending_bytes = int(
+            os.environ.get(
+                "WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES",
+                _DEFAULT_MAX_PENDING_RELAY_BYTES,
+            )
+        )
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -1564,6 +1612,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ports,
         group_name,
     ):
+        self._flush_pending_relay_weight_updates()
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
@@ -1576,9 +1625,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         group_port = ports_list[self.tp_rank]
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
 
-        if self._weights_send_group[group_name] is not None:
-            send_group = self._weights_send_group[group_name]
-        else:
+        send_group = self._weights_send_group.get(group_name)
+        if send_group is None:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
             logger.error(message)
             return False, message
@@ -1605,6 +1653,119 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.distributed.distributed_c10d.destroy_process_group(send_group)
         torch.cuda.empty_cache()
         return success, message
+
+    def _compute_relay_weight_update_bytes(self, dtypes, shapes):
+        total_bytes = 0
+        for dtype, shape in zip(dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            numel = 1
+            for dim in shape:
+                numel *= dim
+            total_bytes += numel * torch.empty((), dtype=target_dtype).element_size()
+        return total_bytes
+
+    def _check_relay_weight_load_error_locked(self):
+        if self._relay_weight_pending_error is not None:
+            raise RuntimeError(self._relay_weight_pending_error)
+
+    def _reserve_relay_weight_memory(self, total_bytes):
+        with self._relay_weight_pending_cond:
+            max_pending_bytes = self._relay_weight_max_pending_bytes
+            while (
+                max_pending_bytes > 0
+                and self._relay_weight_pending_bytes > 0
+                and self._relay_weight_pending_bytes + total_bytes > max_pending_bytes
+            ):
+                self._check_relay_weight_load_error_locked()
+                self._relay_weight_pending_cond.wait()
+            self._check_relay_weight_load_error_locked()
+            self._relay_weight_pending_bytes += total_bytes
+
+    def _release_relay_weight_memory(self, total_bytes):
+        with self._relay_weight_pending_cond:
+            self._relay_weight_pending_bytes -= total_bytes
+            self._relay_weight_pending_cond.notify_all()
+
+    def _ensure_relay_weight_load_worker(self):
+        if self._relay_weight_load_worker is not None:
+            return
+        self._relay_weight_load_worker = threading.Thread(
+            target=self._relay_weight_load_worker_loop,
+            name=f"miles-relay-weight-load-tp{self.tp_rank}",
+            daemon=True,
+        )
+        self._relay_weight_load_worker.start()
+
+    def _relay_weight_load_worker_loop(self):
+        torch.get_device_module(self.device).set_device(self.gpu_id)
+        while True:
+            with self._relay_weight_pending_cond:
+                while not self._relay_weight_pending_updates:
+                    self._relay_weight_pending_cond.wait()
+                update = self._relay_weight_pending_updates.popleft()
+            try:
+                with self._relay_weight_pending_cond:
+                    has_error = self._relay_weight_pending_error is not None
+                if not has_error:
+                    self._apply_relay_weight_update(update)
+            except Exception as exc:
+                error_message = (
+                    f"Failed to finish pending relay weight load on TP rank "
+                    f"{self.tp_rank}: {exc}"
+                )
+                logger.exception(error_message)
+                with self._relay_weight_pending_cond:
+                    if self._relay_weight_pending_error is None:
+                        self._relay_weight_pending_error = error_message
+                    self._relay_weight_pending_cond.notify_all()
+            finally:
+                update.weights.clear()
+                with self._relay_weight_pending_cond:
+                    self._relay_weight_pending_bytes -= update.total_bytes
+                    self._relay_weight_pending_count -= 1
+                    self._relay_weight_pending_cond.notify_all()
+
+    def _enqueue_relay_weight_update(self, weights, total_bytes):
+        self._ensure_relay_weight_load_worker()
+        with self._relay_weight_pending_cond:
+            self._relay_weight_pending_updates.append(
+                _PendingRelayWeightUpdate(
+                    weights=weights,
+                    total_bytes=total_bytes,
+                )
+            )
+            self._relay_weight_pending_count += 1
+            self._relay_weight_pending_cond.notify_all()
+
+    def _flush_pending_relay_weight_updates(self):
+        if (
+            self._relay_weight_load_worker is not None
+            and threading.current_thread() is self._relay_weight_load_worker
+        ):
+            return
+        with self._relay_weight_pending_cond:
+            while self._relay_weight_pending_count > 0:
+                self._check_relay_weight_load_error_locked()
+                self._relay_weight_pending_cond.wait()
+            self._check_relay_weight_load_error_locked()
+
+    def _apply_relay_weight_update(self, update: _PendingRelayWeightUpdate):
+        weights = update.weights
+
+        if self.tp_size > 1:
+            src_rank = self.tp_group.ranks[0]
+            with self._relay_weight_dist_lock:
+                for _, weight in weights:
+                    dist.broadcast(
+                        weight,
+                        src=src_rank,
+                        group=self.tp_group.device_group,
+                    )
+
+        self.model.load_weights(weights)
+        torch.get_device_module(self.device).synchronize()
 
     def init_weights_update_group(
         self,
@@ -1646,9 +1807,51 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 rank=rank,
                 group_name=group_name,
             )
+            self._skipped_model_update_groups.discard(group_name)
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
+            logger.error(message)
+            return False, message
+
+    def init_relay_weights_update_group(
+        self,
+        master_address,
+        master_port,
+        rank_offset,
+        world_size,
+        group_name,
+        backend="nccl",
+    ):
+        """Initialize the trainer-to-relay process group on TP0 only."""
+        assert (
+            torch.distributed.is_initialized()
+        ), "Default torch process group must be initialized"
+        assert group_name != "", "Group name cannot be empty"
+
+        if self.tp_rank != 0:
+            self._skipped_model_update_groups.add(group_name)
+            return True, "Skipped custom process group on non-participant TP rank."
+
+        rank = rank_offset
+        logger.info(
+            f"init relay custom process group: master_address={master_address}, master_port={master_port}, "
+            f"rank_offset={rank_offset}, rank={rank}, world_size={world_size}, group_name={group_name}, backend={backend}"
+        )
+
+        try:
+            na = NetworkAddress(master_address, master_port)
+            self._model_update_group[group_name] = init_custom_process_group(
+                backend=backend,
+                init_method=na.to_tcp(),
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+            )
+            self._skipped_model_update_groups.discard(group_name)
+            return True, "Succeeded to initialize relay custom process group."
+        except Exception as e:
+            message = f"Failed to initialize relay custom process group: {e}."
             logger.error(message)
             return False, message
 
@@ -1657,7 +1860,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
                 torch.distributed.destroy_process_group(pg)
+                self._skipped_model_update_groups.discard(group_name)
                 return True, "Succeeded to destroy custom process group."
+            elif group_name in self._skipped_model_update_groups:
+                self._skipped_model_update_groups.remove(group_name)
+                return True, "Succeeded to clear skipped custom process group."
             else:
                 return False, "The group to be destroyed does not exist."
         except Exception as e:
@@ -1683,6 +1890,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
+        self._flush_pending_relay_weight_updates()
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -1716,6 +1924,69 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return True, "Succeeded to update parameter online."
 
         except Exception as e:
+            error_msg = (
+                f"Failed to update parameter online: {e}. "
+                f"The full weights of the ModelRunner are partially updated. "
+                f"Please discard the whole weights."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def update_relay_weights_from_distributed(self, names, dtypes, shapes, group_name):
+        total_bytes = self._compute_relay_weight_update_bytes(dtypes, shapes)
+        reserved_pending_bytes = False
+        try:
+            is_receiver = self.tp_rank == 0
+            if is_receiver:
+                if group_name not in self._model_update_group:
+                    message = (
+                        f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+                        "Please call `init_relay_weights_update_group` first."
+                    )
+                    logger.error(message)
+                    return False, message
+                send_group = self._model_update_group[group_name]
+            elif group_name not in self._skipped_model_update_groups:
+                message = (
+                    f"Group {group_name} is neither initialized nor marked as skipped. "
+                    "Please call `init_relay_weights_update_group` first."
+                )
+                logger.error(message)
+                return False, message
+
+            self._reserve_relay_weight_memory(total_bytes)
+            reserved_pending_bytes = True
+            weights = []
+            recv_ops = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = (
+                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                )
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                if is_receiver:
+                    recv_ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            weight,
+                            group=send_group,
+                            group_peer=0,
+                        )
+                    )
+                weights.append((name, weight))
+            if recv_ops:
+                with self._relay_weight_dist_lock:
+                    _run_weight_sync_p2p_ops(recv_ops)
+                # The background loader runs in another Python thread with its
+                # own default stream. Make the P2P writes visible before handing
+                # the tensors to that thread.
+                torch.get_device_module(self.device).synchronize()
+
+            self._enqueue_relay_weight_update(weights, total_bytes)
+            reserved_pending_bytes = False
+            return True, "Succeeded to receive parameter online and queue relay load."
+        except Exception as e:
+            if reserved_pending_bytes:
+                self._release_relay_weight_memory(total_bytes)
             error_msg = (
                 f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "
@@ -3099,6 +3370,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
     def check_weights(self, action: str):
+        self._flush_pending_relay_weight_updates()
         self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
@@ -3146,6 +3418,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from sglang.srt.model_loader.loader import device_loading_context
 
+        self._flush_pending_relay_weight_updates()
         target_device = torch.device("cuda", torch.cuda.current_device())
 
         if recv_req.post_load_weights:

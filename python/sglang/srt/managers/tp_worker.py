@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
+    InitRelayWeightsUpdateGroupReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -32,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     PostProcessWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -101,15 +103,28 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
-    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
-        success, message = self.model_runner.init_weights_update_group(
-            recv_req.master_address,
-            recv_req.master_port,
-            recv_req.rank_offset,
-            recv_req.world_size,
-            recv_req.group_name,
-            recv_req.backend,
-        )
+    def init_weights_update_group(
+        self,
+        recv_req: InitWeightsUpdateGroupReqInput,
+    ):
+        if isinstance(recv_req, InitRelayWeightsUpdateGroupReqInput):
+            success, message = self.model_runner.init_relay_weights_update_group(
+                recv_req.master_address,
+                recv_req.master_port,
+                recv_req.rank_offset,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
+        else:
+            success, message = self.model_runner.init_weights_update_group(
+                recv_req.master_address,
+                recv_req.master_port,
+                recv_req.rank_offset,
+                recv_req.world_size,
+                recv_req.group_name,
+                recv_req.backend,
+            )
         return success, message
 
     def destroy_weights_update_group(self, recv_req: DestroyWeightsUpdateGroupReqInput):
@@ -144,15 +159,27 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_distributed(
-        self, recv_req: UpdateWeightsFromDistributedReqInput
+        self,
+        recv_req: (
+            UpdateWeightsFromDistributedReqInput
+            | UpdateRelayWeightsFromDistributedReqInput
+        ),
     ):
-        success, message = self.model_runner.update_weights_from_distributed(
-            recv_req.names,
-            recv_req.dtypes,
-            recv_req.shapes,
-            recv_req.group_name,
-            recv_req.load_format,
-        )
+        if isinstance(recv_req, UpdateRelayWeightsFromDistributedReqInput):
+            success, message = self.model_runner.update_relay_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+            )
+        else:
+            success, message = self.model_runner.update_weights_from_distributed(
+                recv_req.names,
+                recv_req.dtypes,
+                recv_req.shapes,
+                recv_req.group_name,
+                recv_req.load_format,
+            )
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
