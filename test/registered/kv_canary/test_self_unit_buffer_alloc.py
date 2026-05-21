@@ -17,7 +17,15 @@ register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-large")
 
 
 def _config(mode: RealKvHashMode) -> CanaryConfig:
-    return CanaryConfig(mode=CanaryMode.RAISE, real_kv_hash_mode=mode)
+    return CanaryConfig(
+        mode=CanaryMode.RAISE,
+        ring_capacity=1024,
+        sweep_interval=0,
+        real_kv_hash_mode=mode,
+        input_check_mode=False,
+        stats_print_every_n_steps=100,
+        allreduce_violation_signal=False,
+    )
 
 
 def test_resolve_read_bytes_off_returns_zero() -> None:
