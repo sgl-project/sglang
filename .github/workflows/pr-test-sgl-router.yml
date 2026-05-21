@@ -1,35 +1,101 @@
 name: PR Test (sgl-router)
 
+# Trigger contract — modeled on `pr-test.yml`:
+#
+#   * No `paths:` filter at the trigger level. The workflow ALWAYS
+#     fires on every PR synchronize / push, so the run record always
+#     appears as a check on the PR (no more "workflow silently didn't
+#     fire" mystery debugging). Path-based skip decisions are made
+#     inside the `sgl-router-gate` job below, where we can log the
+#     reason. Same for the `run-ci` label gate — moved off the
+#     workflow trigger and into the gate job so its outcome is
+#     observable.
+#
+#   * `push` on `main` keeps firing so post-merge runs still record
+#     against the default branch.
 on:
   push:
     branches: [main]
-    paths:
-      - "experimental/sgl-router/**"
-      - ".github/workflows/pr-test-sgl-router.yml"
-      - "scripts/ci/cuda/ci_install_dependency.sh"
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, labeled]
-    paths:
-      - "experimental/sgl-router/**"
-      - ".github/workflows/pr-test-sgl-router.yml"
-      - "scripts/ci/cuda/ci_install_dependency.sh"
   workflow_dispatch:
 
 concurrency:
-  group: sgl-router-${{ github.ref }}
+  group: sgl-router-${{ github.event_name }}-${{ github.head_ref || github.ref_name || 'default' }}
   cancel-in-progress: true
 
 env:
   SGLANG_IS_IN_CI: true
 
 jobs:
+  # Stage 0 — decide whether to run the heavy tiers. Always runs
+  # (cheap, ubuntu-latest), and emits a single `should_run` output
+  # consumed by every tier below. Reasons it might evict downstream
+  # work:
+  #   * `pull_request` event without the `run-ci` label (budget gate)
+  #   * No files matching the sgl-router paths changed in this PR
+  # Either outcome is logged on the gate job's page, so operators can
+  # see *why* the tiers were skipped instead of guessing.
+  sgl-router-gate:
+    name: gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.decide.outputs.should_run }}
+      paths_changed: ${{ steps.paths.outputs.sgl_router }}
+      has_run_ci_label: ${{ steps.label.outputs.has_run_ci }}
+    steps:
+      - uses: actions/checkout@v4
+      # `dorny/paths-filter` computes the diff against the PR base
+      # (for pull_request) or the push's `before` SHA (for push) and
+      # exposes `sgl_router=true|false` on whether any tracked path
+      # changed. Replaces the old workflow-level `paths:` filter so
+      # the gate is observable.
+      - name: Detect sgl-router path changes
+        id: paths
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            sgl_router:
+              - 'experimental/sgl-router/**'
+              - '.github/workflows/pr-test-sgl-router.yml'
+              - 'scripts/ci/cuda/ci_install_dependency.sh'
+      # `run-ci` label gate. Cheap workflow runs (e.g. docs-only PRs
+      # that happen to touch the sgl-router dir) still need the
+      # opt-in label before consuming the H100 / kind tiers below.
+      # `push` events on main and `workflow_dispatch` skip this gate.
+      - name: Check run-ci label
+        id: label
+        run: |
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "Non-PR event (${{ github.event_name }}); label gate bypassed."
+            exit 0
+          fi
+          if [[ "${{ contains(github.event.pull_request.labels.*.name, 'run-ci') }}" == "true" ]]; then
+            echo "has_run_ci=true" >> "$GITHUB_OUTPUT"
+            echo "PR has run-ci label; downstream tiers will run."
+          else
+            echo "has_run_ci=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::PR is missing the 'run-ci' label; skipping sgl-router tiers. Apply the label to opt in."
+          fi
+      - name: Decide
+        id: decide
+        run: |
+          paths='${{ steps.paths.outputs.sgl_router }}'
+          label='${{ steps.label.outputs.has_run_ci }}'
+          if [[ "$paths" == "true" && "$label" == "true" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Both path filter and run-ci label match; running tiers."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping tiers (paths_changed=$paths, has_run_ci=$label)."
+          fi
+
   sgl-router-lint:
     name: tier-1 — lint
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: sgl-router-gate
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
       # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage
@@ -120,11 +186,8 @@ jobs:
 
   sgl-router-build-and-test:
     name: tier-2 — build + test
-    needs: sgl-router-lint
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: [sgl-router-gate, sgl-router-lint]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: sccache
@@ -221,11 +284,8 @@ jobs:
 
   sgl-router-docker-build-test:
     name: tier-3 — docker (placeholder)
-    needs: sgl-router-build-and-test
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -234,13 +294,16 @@ jobs:
           echo "docker-build-test not implemented yet."
           exit 0
 
+  # tier-3 k8s integration is decoupled from tier-3 e2e: each runs on a
+  # different runner type (ubuntu kind cluster vs H100), each manages its
+  # own test scope (k8s_integration/ vs everything-else-in-e2e), and
+  # each is allowed to fail without blocking the other. They both still
+  # gate on tier-2's build+test passing — a Rust compile failure blocks
+  # the GPU/cluster runners from spinning up.
   sgl-router-k8s-integration:
     name: tier-3 — k8s integration
-    needs: sgl-router-build-and-test
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
@@ -286,11 +349,8 @@ jobs:
 
   sgl-router-e2e:
     name: tier-3 — e2e
-    needs: sgl-router-build-and-test
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    needs: [sgl-router-gate, sgl-router-build-and-test]
+    if: needs.sgl-router-gate.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
     steps:
@@ -350,23 +410,24 @@ jobs:
   sgl-router-finish:
     name: finish
     needs:
+      - sgl-router-gate
       - sgl-router-lint
       - sgl-router-build-and-test
       - sgl-router-docker-build-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
-    # Gate finish on the same label as upstream jobs to avoid false-green on
-    # unlabeled PRs (skipped needs => success), and fail when any upstream
-    # job actually failed or was cancelled.
+    # `always()` lets `finish` run after upstream `skipped` outcomes
+    # (when the gate decided to skip). The downstream-skipped path is
+    # an explicit success — the workflow was correctly bypassed for a
+    # PR that didn't need full CI. The downstream-failure /
+    # downstream-cancelled path is a real fail. We also accept the
+    # gate's `skipped` (impossible today, kept for symmetry) and
+    # require the gate itself to have succeeded.
     if: |
       always() &&
+      needs.sgl-router-gate.result == 'success' &&
       !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled') &&
-      (
-        github.event_name != 'pull_request' ||
-        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-      )
+      !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
       - name: All required checks completed
