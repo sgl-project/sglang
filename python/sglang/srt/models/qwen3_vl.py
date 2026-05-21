@@ -1256,7 +1256,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                 os.makedirs(_vit_profile_dir, exist_ok=True)
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                trace_path = os.path.join(_vit_profile_dir, f"vit_trace_{ts}.json")
+                tp_rank = get_tensor_model_parallel_world_size()
+                try:
+                    from sglang.srt.distributed.parallel_state import get_tp_group
+
+                    tp_rank = get_tp_group().rank_in_group
+                except Exception:
+                    tp_rank = 0
+                trace_path = os.path.join(
+                    _vit_profile_dir, f"vit_trace_tp{tp_rank}_{ts}.json"
+                )
                 with torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
