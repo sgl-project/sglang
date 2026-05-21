@@ -2897,13 +2897,9 @@ class Scheduler(
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-                    # None sentinel between iters; next iter's resolve_future
-                    # reassigns batch.seq_lens from new_seq_lens_buf. None is
-                    # used (rather than a sentinel tensor) so any accidental
-                    # value read between iters raises AttributeError fast
-                    # instead of silently picking up garbage. filter_batch and
-                    # merge_batch propagate None - see their None guards.
-                    batch.seq_lens = None
+                    # Schedule-stream sentinel between iters; next iter's
+                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
+                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):

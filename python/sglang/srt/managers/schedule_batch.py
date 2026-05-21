@@ -2488,10 +2488,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
-        if self.seq_lens is not None:
-            # None = spec v2 + overlap sentinel between iters; next iter's
-            # resolve_future will repopulate from the filtered req_pool_indices.
-            self.seq_lens = self.seq_lens[keep_indices_device]
+        self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
@@ -2543,13 +2540,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
-        if self.seq_lens is None or other.seq_lens is None:
-            # Either side is the spec v2 + overlap sentinel; propagate None.
-            # next iter's resolve_future repopulates from the merged
-            # req_pool_indices.
-            self.seq_lens = None
-        else:
-            self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
+        self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
