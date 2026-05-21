@@ -37,11 +37,6 @@ class PlanFuzzInputs:
     fb_prefix_lens: torch.Tensor
     fb_extend_seq_lens: torch.Tensor
     req_to_token: torch.Tensor
-    extras_slot_indices: torch.Tensor
-    extras_positions: torch.Tensor
-    extras_prev_slot_indices: torch.Tensor
-    extras_num_valid: torch.Tensor
-    extras_count: int
     swa_window_size: int
     full_to_swa_index_mapping: Optional[torch.Tensor]
     verify_capacity: int
@@ -64,7 +59,6 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         else None
     )
     rtt_kind = rng.choice(["linear", "sparse_permuted", "with_holes"])
-    extras_kind = rng.choice(["none", "few", "tile_boundary_64", "many_129"])
     padding_kind = rng.choice(["none", "trailing", "interleaved"])
     capacity_kind = rng.choice(["loose", "tight_match", "under_by_one"])
 
@@ -104,16 +98,10 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         else:
             total_verify += pfx
 
-    extras_capacity_pre = 256
-    extras_slots, extras_positions, extras_prevs, extras_num_valid = (
-        _make_extras_for_kind(kind=extras_kind, capacity=extras_capacity_pre, rng=rng)
-    )
-    extras_count = int(extras_num_valid[0].item())
-
     verify_capacity, write_req_capacity = derive_plan_capacity(
         kind=capacity_kind,
         total_verify=total_verify,
-        extras_count=extras_count,
+        extras_count=0,
         bs=bs,
     )
 
@@ -130,11 +118,6 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         fb_prefix_lens=fb_pfx,
         fb_extend_seq_lens=fb_ext,
         req_to_token=rtt,
-        extras_slot_indices=extras_slots,
-        extras_positions=extras_positions,
-        extras_prev_slot_indices=extras_prevs,
-        extras_num_valid=extras_num_valid,
-        extras_count=extras_count,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa,
         verify_capacity=verify_capacity,
@@ -142,47 +125,10 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
     )
 
 
-def _make_extras_for_kind(
-    *,
-    kind: str,
-    capacity: int,
-    rng: random.Random,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if kind == "none":
-        n_valid = 0
-    elif kind == "few":
-        n_valid = rng.randint(1, 6)
-    elif kind == "tile_boundary_64":
-        n_valid = 64
-    elif kind == "many_129":
-        n_valid = 129
-    else:
-        raise ValueError(f"unknown extras kind {kind}")
-    n_valid = min(n_valid, capacity)
-    slots = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    positions = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    if n_valid > 0:
-        slot_pool = rng.sample(range(500, 500 + max(1000, n_valid * 8)), k=n_valid)
-        slots[:n_valid] = torch.tensor(slot_pool, dtype=torch.int64, device=_DEVICE)
-        pos_list = [rng.randint(0, 0xFFFF) for _ in range(n_valid)]
-        positions[:n_valid] = torch.tensor(pos_list, dtype=torch.int64, device=_DEVICE)
-        prev_list = [-1] + slot_pool[: n_valid - 1]
-        prevs[:n_valid] = torch.tensor(prev_list, dtype=torch.int64, device=_DEVICE)
-    num_valid = torch.tensor([n_valid], dtype=torch.int32, device=_DEVICE)
-    return slots, positions, prevs, num_valid
-
-
 def _run_one(inputs: PlanFuzzInputs) -> tuple:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=inputs.verify_capacity,
         write_req_capacity=inputs.write_req_capacity,
-    )
-    extras_tuple = (
-        inputs.extras_slot_indices,
-        inputs.extras_positions,
-        inputs.extras_prev_slot_indices,
-        inputs.extras_num_valid,
     )
     _run_both_plan(
         triton_verify=triton_v,
@@ -193,7 +139,12 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         fb_prefix_lens=inputs.fb_prefix_lens,
         fb_extend_seq_lens=inputs.fb_extend_seq_lens,
         req_to_token=inputs.req_to_token,
-        extras=extras_tuple,
+        extras=(
+            torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            torch.zeros(1, dtype=torch.int32, device=_DEVICE),
+        ),
         swa_window_size=inputs.swa_window_size,
         full_to_swa_index_mapping=inputs.full_to_swa_index_mapping,
     )
@@ -204,10 +155,10 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         fb_prefix_lens=inputs.fb_prefix_lens,
         fb_extend_seq_lens=inputs.fb_extend_seq_lens,
         swa_window_size=inputs.swa_window_size,
-        extras_slot_indices=inputs.extras_slot_indices,
-        extras_positions=inputs.extras_positions,
-        extras_prev_slot_indices=inputs.extras_prev_slot_indices,
-        extras_count=inputs.extras_count,
+        extras_slot_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+        extras_positions=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+        extras_prev_slot_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+        extras_count=0,
     )
     return triton_v, triton_w
 
@@ -215,7 +166,7 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
 def _summarize(inputs: PlanFuzzInputs) -> str:
     return (
         f"bs={int(inputs.fb_req_pool_indices.shape[0])} "
-        f"swa={inputs.swa_window_size} extras={inputs.extras_count} "
+        f"swa={inputs.swa_window_size} "
         f"verify_cap={inputs.verify_capacity} write_cap={inputs.write_req_capacity} "
         f"has_lut={inputs.full_to_swa_index_mapping is not None}"
     )
@@ -223,7 +174,7 @@ def _summarize(inputs: PlanFuzzInputs) -> str:
 
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_plan_fuzz_full_combo(seed: int) -> None:
-    """Multi-dim plan fuzzer: random LUT/rtt/extras/padding/capacity/swa × N iters, byte-equal."""
+    """Multi-dim plan fuzzer: random LUT/rtt/padding/capacity/swa × N iters, byte-equal."""
     run_fuzz_combo(
         seed,
         draw_fn=_draw_random_plan_inputs,

@@ -30,7 +30,6 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _dummy_pseudo_tensors,
     _empty_extras,
-    make_extras_explicit,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -298,18 +297,8 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "extras_present,per_req_present",
-    [
-        (False, False),
-        (False, True),
-        (True, False),
-        (True, True),
-    ],
-)
-def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
-    extras_present: bool, per_req_present: bool
-) -> None:
+@pytest.mark.parametrize("per_req_present", [False, True])
+def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
     max_reqs = 4
     max_seq_len = 16
     rp_axis = torch.arange(max_reqs, device=_DEVICE, dtype=torch.int32).unsqueeze(1)
@@ -325,16 +314,6 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
         fb_prefix = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
         fb_extend = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
 
-    if extras_present:
-        extras = make_extras_explicit(
-            slot_indices=[10, 11],
-            positions=[0, 1],
-            prev_slot_indices=[-1, 10],
-            capacity=max(2, 1),
-        )
-    else:
-        extras = _empty_extras()
-
     triton_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE)
     triton_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE)
     ref_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE)
@@ -349,7 +328,7 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
         fb_prefix_lens=fb_prefix,
         fb_extend_seq_lens=fb_extend,
         req_to_token=req_to_token,
-        extras=extras,
+        extras=_empty_extras(),
         swa_window_size=0,
         full_to_swa_index_mapping=None,
     )
@@ -361,16 +340,10 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
         ref_write=ref_w,
     )
 
-    if not per_req_present and not extras_present:
+    if not per_req_present:
         assert int(triton_v.verify_num_valid[0].item()) == 0
         bs = int(fb_rpi.shape[0])
         assert int(triton_w.write_offsets[bs].item()) == 0
 
-    if not per_req_present and extras_present:
-        assert int(triton_v.verify_num_valid[0].item()) == 2
-
-    if per_req_present and not extras_present:
+    if per_req_present:
         assert int(triton_v.verify_num_valid[0].item()) == 8
-
-    if per_req_present and extras_present:
-        assert int(triton_v.verify_num_valid[0].item()) == 10

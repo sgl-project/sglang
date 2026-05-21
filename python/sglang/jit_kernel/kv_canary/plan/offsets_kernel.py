@@ -32,7 +32,6 @@ def launch_plan_offsets_kernel(
     fb_extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
-    extra_verify_num_valid: torch.Tensor,
     out_verify_offsets_scratch: torch.Tensor,
     out_write_offsets: torch.Tensor,
     out_write_seed_slot_indices: torch.Tensor,
@@ -56,7 +55,6 @@ def launch_plan_offsets_kernel(
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
         lut_tensor=lut_tensor,
-        extra_verify_num_valid=extra_verify_num_valid,
         out_verify_offsets_scratch=out_verify_offsets_scratch,
         out_write_offsets=out_write_offsets,
         out_write_seed_slot_indices=out_write_seed_slot_indices,
@@ -78,7 +76,6 @@ def launch_plan_offsets_kernel(
         fb_extend_seq_lens,
         req_to_token,
         lut_tensor,
-        extra_verify_num_valid,
         out_verify_offsets_scratch,
         out_write_offsets,
         out_write_seed_slot_indices,
@@ -104,7 +101,6 @@ def _validate_offsets_kernel_inputs(
     fb_extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     lut_tensor: torch.Tensor,
-    extra_verify_num_valid: torch.Tensor,
     out_verify_offsets_scratch: torch.Tensor,
     out_write_offsets: torch.Tensor,
     out_write_seed_slot_indices: torch.Tensor,
@@ -124,7 +120,6 @@ def _validate_offsets_kernel_inputs(
     _assert_contiguous(fb_extend_seq_lens, "fb_extend_seq_lens")
     _assert_contiguous(req_to_token, "req_to_token")
     _assert_contiguous(lut_tensor, "lut_tensor")
-    _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
     _assert_contiguous(out_verify_offsets_scratch, "out_verify_offsets_scratch")
     _assert_contiguous(out_write_offsets, "out_write_offsets")
     _assert_contiguous(out_write_seed_slot_indices, "out_write_seed_slot_indices")
@@ -137,7 +132,6 @@ def _validate_offsets_kernel_inputs(
     _require_dtype(fb_extend_seq_lens, "fb_extend_seq_lens", torch.int64)
     _require_dtype(req_to_token, "req_to_token", torch.int32)
     _require_dtype(lut_tensor, "lut_tensor", torch.int64)
-    _require_dtype(extra_verify_num_valid, "extra_verify_num_valid", torch.int32)
     _require_dtype(
         out_verify_offsets_scratch, "out_verify_offsets_scratch", torch.int64
     )
@@ -185,7 +179,6 @@ def _validate_offsets_kernel_inputs(
     _require_len(fb_extend_seq_lens, "fb_extend_seq_lens", bs)
     _require_2d(req_to_token, "req_to_token")
     _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
-    _require_min_len(extra_verify_num_valid, "extra_verify_num_valid", 1)
     _require_min_len(
         out_verify_offsets_scratch,
         "out_verify_offsets_scratch",
@@ -226,7 +219,6 @@ def _validate_offsets_kernel_inputs(
             (fb_extend_seq_lens, "fb_extend_seq_lens"),
             (req_to_token, "req_to_token"),
             (lut_tensor, "lut_tensor"),
-            (extra_verify_num_valid, "extra_verify_num_valid"),
             (out_write_offsets, "out_write_offsets"),
             (out_write_seed_slot_indices, "out_write_seed_slot_indices"),
             (out_verify_num_valid, "out_verify_num_valid"),
@@ -244,7 +236,6 @@ def _plan_offsets_kernel(
     extend_seq_lens_ptr,
     req_to_token_ptr,
     full_to_swa_lut_ptr,
-    extra_verify_num_valid_ptr,
     # Output pointers.
     out_verify_offsets_ptr,
     out_write_offsets_ptr,
@@ -366,14 +357,11 @@ def _plan_offsets_kernel(
     )
 
     # Scalar writes: out_verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
-    # never indexes past the buffer; enable carries the overflow bit (0 when requested > capacity) so the
+    # never indexes past the buffer; enable carries the overflow bit (0 when total_verify > capacity) so the
     # verify kernel skips the whole launch and the host can warn-log this step.
-    extras_count = tl.load(extra_verify_num_valid_ptr)  # scalar
-    extras_count = tl.where(extras_count > 0, extras_count, 0)
-    requested = total_verify + extras_count  # scalar
-    overflow = requested > VERIFY_CAPACITY  # scalar bool
+    overflow = total_verify > VERIFY_CAPACITY  # scalar bool
     enable = tl.where(overflow, 0, 1)  # scalar
-    clamped = tl.where(overflow, VERIFY_CAPACITY, requested)  # scalar
+    clamped = tl.where(overflow, VERIFY_CAPACITY, total_verify)  # scalar
     tl.store(out_verify_num_valid_ptr, clamped.to(tl.int32))
     tl.store(out_verify_enable_ptr, tl.full((), enable, tl.int32))
     tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))

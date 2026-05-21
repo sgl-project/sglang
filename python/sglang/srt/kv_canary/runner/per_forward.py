@@ -85,7 +85,6 @@ class PerForwardOrchestrator:
 
         self._plan_input_per_forward = PlanInput.allocate(
             bs_capacity=write_req_capacity,
-            extra_verify_capacity=0,
             device=device,
         )
 

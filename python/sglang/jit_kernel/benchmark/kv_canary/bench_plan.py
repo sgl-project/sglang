@@ -115,16 +115,6 @@ def _build_plan_inputs(
         )
         req_to_token[1:] = (row_idx - 1) * max_seq_len + col_idx
 
-    extras_cap = 1
-    extra_verify_slot_indices = torch.zeros(
-        extras_cap, dtype=torch.int32, device=device
-    )
-    extra_verify_positions = torch.zeros(extras_cap, dtype=torch.int32, device=device)
-    extra_verify_prev_slot_indices = torch.zeros(
-        extras_cap, dtype=torch.int32, device=device
-    )
-    extra_verify_num_valid = torch.zeros(1, dtype=torch.int32, device=device)
-
     if swa_window_size > 0:
         full_pool_size = bs * max_seq_len + 1
         full_to_swa: Optional[torch.Tensor] = torch.arange(
@@ -141,10 +131,6 @@ def _build_plan_inputs(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_verify_slot_indices,
-        extra_verify_positions=extra_verify_positions,
-        extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
-        extra_verify_num_valid=extra_verify_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa,
         verify_capacity=int(verify_plan.verify_slot_indices.shape[0]),
@@ -160,10 +146,6 @@ def _make_plan_callable(inputs: dict):
             fb_prefix_lens=inputs["fb_prefix_lens"],
             fb_extend_seq_lens=inputs["fb_extend_seq_lens"],
             req_to_token=inputs["req_to_token"],
-            extra_verify_slot_indices=inputs["extra_verify_slot_indices"],
-            extra_verify_positions=inputs["extra_verify_positions"],
-            extra_verify_prev_slot_indices=inputs["extra_verify_prev_slot_indices"],
-            extra_verify_num_valid=inputs["extra_verify_num_valid"],
             swa_window_size=inputs["swa_window_size"],
             full_to_swa_index_mapping=inputs["full_to_swa_index_mapping"],
             verify_capacity=inputs["verify_capacity"],

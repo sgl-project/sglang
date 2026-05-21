@@ -50,7 +50,7 @@ def _run_both_plan(
     active_verify_entries: Optional[int] = None,
     active_write_reqs: Optional[int] = None,
 ) -> None:
-    extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
+    _ = extras
     verify_capacity = int(triton_verify.verify_slot_indices.shape[0])
     canary_plan_step(
         verify_plan_out=triton_verify,
@@ -59,10 +59,6 @@ def _run_both_plan(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
@@ -74,10 +70,6 @@ def _run_both_plan(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=int(ref_verify.verify_slot_indices.shape[0]),

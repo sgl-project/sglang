@@ -16,18 +16,11 @@ def canary_plan_step_torch_reference(
     fb_prefix_lens: torch.Tensor,
     fb_extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
-    extra_verify_slot_indices: torch.Tensor,
-    extra_verify_positions: torch.Tensor,
-    extra_verify_prev_slot_indices: torch.Tensor,
-    extra_verify_num_valid: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
 ) -> None:
-    """Python reference for :func:`canary_plan_step`. Same signature & byte-equal semantics.
-
-    Extras are appended after per-req-derived entries without further translation (caller pre-translates).
-    """
+    """Python reference for :func:`canary_plan_step`. Same signature & byte-equal semantics."""
     bs = int(fb_req_pool_indices.shape[0])
     work_device = torch.device("cpu")
 
@@ -38,28 +31,6 @@ def canary_plan_step_torch_reference(
             f"match verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
-
-    if bs == 0:
-        extras_count_only = int(extra_verify_num_valid.detach().to("cpu").item())
-        extras_count_only = max(0, extras_count_only)
-        _write_num_valid_and_enable(
-            verify_plan_out=verify_plan_out,
-            requested=extras_count_only,
-            verify_capacity=verify_capacity,
-        )
-        write_plan_out.write_num_valid_reqs.zero_()
-        write_plan_out.write_offsets.zero_()
-        _append_extras(
-            verify_plan_out=verify_plan_out,
-            base_idx=0,
-            extra_verify_slot_indices=extra_verify_slot_indices,
-            extra_verify_positions=extra_verify_positions,
-            extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
-            extra_verify_num_valid=extra_verify_num_valid,
-            verify_capacity=verify_capacity,
-            work_device=work_device,
-        )
-        return
 
     req_pool_indices_host = fb_req_pool_indices.detach().to(
         device=work_device, dtype=torch.int64
@@ -98,22 +69,9 @@ def canary_plan_step_torch_reference(
         bs=bs,
     )
 
-    _append_extras(
-        verify_plan_out=verify_plan_out,
-        base_idx=total_verify,
-        extra_verify_slot_indices=extra_verify_slot_indices,
-        extra_verify_positions=extra_verify_positions,
-        extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
-        extra_verify_num_valid=extra_verify_num_valid,
-        verify_capacity=verify_capacity,
-        work_device=work_device,
-    )
-
-    extras_count = int(extra_verify_num_valid.detach().to("cpu").item())
-    extras_count = max(0, extras_count)
     _write_num_valid_and_enable(
         verify_plan_out=verify_plan_out,
-        requested=total_verify + extras_count,
+        requested=total_verify,
         verify_capacity=verify_capacity,
     )
 
@@ -137,50 +95,6 @@ def _swa_translate_slot(*, slot: int, lut: torch.Tensor) -> int:
     lut_len = int(lut.shape[0])
     safe_idx = min(slot, lut_len - 1) if lut_len > 0 else slot
     return int(lut[safe_idx].item())
-
-
-def _append_extras(
-    *,
-    verify_plan_out: VerifyPlan,
-    base_idx: int,
-    extra_verify_slot_indices: torch.Tensor,
-    extra_verify_positions: torch.Tensor,
-    extra_verify_prev_slot_indices: torch.Tensor,
-    extra_verify_num_valid: torch.Tensor,
-    verify_capacity: int,
-    work_device: torch.device,
-) -> None:
-    extras_count = int(extra_verify_num_valid.detach().to("cpu").item())
-    if extras_count <= 0:
-        return
-    slots = extra_verify_slot_indices[:extras_count].to(
-        device=work_device, dtype=torch.int64
-    )
-    positions = extra_verify_positions[:extras_count].to(
-        device=work_device, dtype=torch.int64
-    )
-    prevs = extra_verify_prev_slot_indices[:extras_count].to(
-        device=work_device, dtype=torch.int64
-    )
-    end_idx = min(base_idx + extras_count, verify_capacity)
-    capped = max(0, end_idx - base_idx)
-    if capped <= 0:
-        return
-    verify_plan_out.verify_slot_indices[base_idx:end_idx].copy_(
-        slots[:capped]
-        .to(verify_plan_out.verify_slot_indices.dtype)
-        .to(verify_plan_out.verify_slot_indices.device)
-    )
-    verify_plan_out.verify_positions[base_idx:end_idx].copy_(
-        positions[:capped]
-        .to(verify_plan_out.verify_positions.dtype)
-        .to(verify_plan_out.verify_positions.device)
-    )
-    verify_plan_out.verify_prev_slot_indices[base_idx:end_idx].copy_(
-        prevs[:capped]
-        .to(verify_plan_out.verify_prev_slot_indices.dtype)
-        .to(verify_plan_out.verify_prev_slot_indices.device)
-    )
 
 
 def _materialize_verify_entries(

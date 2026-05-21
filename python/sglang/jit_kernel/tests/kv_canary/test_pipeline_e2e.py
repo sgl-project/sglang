@@ -67,7 +67,7 @@ def _run_pipeline(
     verify_capacity: int,
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
-    extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
+    _ = extras
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
 
@@ -78,10 +78,6 @@ def _run_pipeline(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
@@ -649,9 +645,6 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     ring_capacity = 4
     log_real = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
     log_ref = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
-    extras = _empty_extras()
-    extra_slots, extra_positions, extra_prev_slots, extra_num_valid = extras
-
     plan_v_real = VerifyPlan.allocate(verify_capacity=256, device=_DEVICE)
     plan_w_real = WritePlan.allocate(write_req_capacity=4, device=_DEVICE)
     plan_v_ref = VerifyPlan.allocate(verify_capacity=256, device=_DEVICE)
@@ -664,10 +657,6 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=0,
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
@@ -679,10 +668,6 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prev_slots,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=0,
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),

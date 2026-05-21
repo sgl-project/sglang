@@ -27,11 +27,6 @@ class PlanInput:
             [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
         fb_extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
-        extra_verify_slot_indices: Pre-walked flat verify slots, shape [extra_verify_capacity],
-            int64. The per-forward path does not emit extras, so this is allocated with capacity 0.
-        extra_verify_positions: Same shape, int64. Expected position per extra entry.
-        extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
-        extra_verify_num_valid: Active extra entry count, shape [1], int32. Always 0.
 
     Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as int32
     or int64 at the boundary; canary canonicalizes them to int64 internally.
@@ -48,26 +43,17 @@ class PlanInput:
     fb_req_pool_indices: torch.Tensor
     fb_prefix_lens: torch.Tensor
     fb_extend_seq_lens: torch.Tensor
-    extra_verify_slot_indices: torch.Tensor
-    extra_verify_positions: torch.Tensor
-    extra_verify_prev_slot_indices: torch.Tensor
-    extra_verify_num_valid: torch.Tensor
 
     def zero_(self) -> None:
         self.fb_req_pool_indices.zero_()
         self.fb_prefix_lens.zero_()
         self.fb_extend_seq_lens.zero_()
-        self.extra_verify_slot_indices.zero_()
-        self.extra_verify_positions.zero_()
-        self.extra_verify_prev_slot_indices.zero_()
-        self.extra_verify_num_valid.zero_()
 
     @classmethod
     def allocate(
         cls,
         *,
         bs_capacity: int,
-        extra_verify_capacity: int,
         device: torch.device,
     ) -> "PlanInput":
         return cls(
@@ -78,16 +64,6 @@ class PlanInput:
             fb_extend_seq_lens=torch.zeros(
                 bs_capacity, dtype=torch.int64, device=device
             ),
-            extra_verify_slot_indices=torch.zeros(
-                extra_verify_capacity, dtype=torch.int64, device=device
-            ),
-            extra_verify_positions=torch.zeros(
-                extra_verify_capacity, dtype=torch.int64, device=device
-            ),
-            extra_verify_prev_slot_indices=torch.zeros(
-                extra_verify_capacity, dtype=torch.int64, device=device
-            ),
-            extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
 
@@ -104,7 +80,6 @@ def fill_plan_input_per_forward(
     - plan_input_out.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
       forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
       via req_pool_indices sentinel; the lens value there is irrelevant).
-    - extra_verify_* zeroed — they stay all-zero / num_valid = 0 (allocated once with 0 capacity).
 
     Returns the current bs (valid prefix length of the per-forward buffers).
     """

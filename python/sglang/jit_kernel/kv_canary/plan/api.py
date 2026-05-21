@@ -7,9 +7,6 @@ import torch
 from sglang.jit_kernel.kv_canary.plan.entries_kernel import (
     launch_plan_entries_kernel,
 )
-from sglang.jit_kernel.kv_canary.plan.extras_kernel import (
-    launch_plan_extras_kernel,
-)
 from sglang.jit_kernel.kv_canary.plan.offsets_kernel import (
     _PLAN_BS_BLOCK_SIZE,
     launch_plan_offsets_kernel,
@@ -26,16 +23,11 @@ def canary_plan_step(
     fb_prefix_lens: torch.Tensor,
     fb_extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
-    extra_verify_slot_indices: torch.Tensor,
-    extra_verify_positions: torch.Tensor,
-    extra_verify_prev_slot_indices: torch.Tensor,
-    extra_verify_num_valid: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
 ) -> None:
-    """Fill verify_plan_out + write_plan_out from ForwardBatch primitives + optional pre-walked flat verify
-    entries. Single Triton launch.
+    """Fill verify_plan_out + write_plan_out from ForwardBatch primitives.
 
     For each req r with fb_req_pool_indices[r] != 0 (0 = padding sentinel):
 
@@ -51,10 +43,6 @@ def canary_plan_step(
       (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — canary_write_step reads it
       directly from ForwardBatch via write_offsets.
 
-    Extra flat verify entries (extra_verify_*[: extra_verify_num_valid[0]]) are appended to verify_plan_out
-    **after** the per-req-derived entries. Caller is responsible for SWA-translating these entries before
-    passing in (plan kernel does NOT translate the extras).
-
     Args:
         verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
         write_plan_out: Pre-allocated WritePlan; filled in-place.
@@ -66,11 +54,6 @@ def canary_plan_step(
             int64. 1 for pure decode.
         req_to_token: ReqToTokenPool.req_to_token; full-pool slot index table, shape [max_reqs, max_seq_len],
             int32.
-        extra_verify_slot_indices: Pre-walked extra verify slots, shape [extra_verify_capacity], int64.
-            Caller-translated to the target index space.
-        extra_verify_positions: Same shape, int64. Expected position per extra entry.
-        extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
-        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for the per-forward caller.
         swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
         full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. Required (non-None) iff
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
@@ -78,7 +61,7 @@ def canary_plan_step(
             kernel and stored in the int64 plan schema.
 
     Implementation:
-        - Three sub-kernels with action-named identifiers, launched in sequence:
+        - Two sub-kernels with action-named identifiers, launched in sequence:
           1. ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
              reads fb_req_pool_indices[r], fb_prefix_lens[r], fb_extend_seq_lens[r] for each r; computes
              verify_count = (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0
@@ -92,12 +75,7 @@ def canary_plan_step(
              window_start[r] + j] (SWA-translated), prev_slot = req_to_token[..., window_start[r] + j - 1]
              when (window_start[r] + j) > 0 (also translated) else -1, position = window_start[r] + j;
              scatter (slot, position, prev_slot) into verify_plan_out at flat index verify_offsets[r] + j.
-          3. ``_plan_extras_kernel`` (1-D grid ``(k_tiles,)``, only launched when extra_verify_num_valid > 0):
-             copy extra_verify_*[: num_valid] into verify_plan_out.verify_* starting at flat index
-             verify_offsets[bs]. Extras are caller-pre-translated, no LUT pass.
-        - All output tensors are addressed at addresses baked into the cuda-graph capture; the 2nd and 3rd
-          kernels are conditionally launched based on cached host-side scalars from the 1st (graph-safe
-          under stream-capture conditionals).
+        - All output tensors are addressed at addresses baked into the cuda-graph capture.
 
     Calling contract:
         - Pure side-effect; no host work, no D2H.
@@ -144,7 +122,6 @@ def canary_plan_step(
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
-        extra_verify_num_valid=extra_verify_num_valid,
         out_verify_offsets_scratch=verify_offsets_scratch,
         out_write_offsets=write_plan_out.write_offsets,
         out_write_seed_slot_indices=write_plan_out.write_seed_slot_indices,
@@ -168,17 +145,4 @@ def canary_plan_step(
         out_verify_positions=verify_plan_out.verify_positions,
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
         swa_window_size=int(swa_window_size),
-    )
-
-    # Extras kernel: append extras into the verify tail. The base index lives in verify_offsets_scratch[bs].
-    launch_plan_extras_kernel(
-        extra_verify_slot_indices=extra_verify_slot_indices,
-        extra_verify_positions=extra_verify_positions,
-        extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
-        extra_verify_num_valid=extra_verify_num_valid,
-        verify_offsets_scratch=verify_offsets_scratch,
-        out_verify_slot_indices=verify_plan_out.verify_slot_indices,
-        out_verify_positions=verify_plan_out.verify_positions,
-        out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
-        bs=bs,
     )

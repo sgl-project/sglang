@@ -14,7 +14,6 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     _allocate_plan_pair,
     _empty_extras,
     derive_plan_capacity,
-    make_extras_explicit,
     make_lut,
     make_req_to_token,
 )
@@ -80,12 +79,12 @@ def _run_label(
     verify_capacity: int,
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
+    _ = extras
     verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=_DEVICE
     )
     runner = canary_plan_step if label == "real" else canary_plan_step_torch_reference
-    extra_slots, extra_positions, extra_prevs, extra_num_valid = extras
     runner(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,
@@ -93,10 +92,6 @@ def _run_label(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        extra_verify_slot_indices=extra_slots,
-        extra_verify_positions=extra_positions,
-        extra_verify_prev_slot_indices=extra_prevs,
-        extra_verify_num_valid=extra_num_valid,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
@@ -577,17 +572,11 @@ class TestSwa:
         assert int(plans[0][0].verify_num_valid[0].item()) == expected_total
 
 
-class TestExtras:
-    def test_extra_verify_entries_appended_after_per_req(self) -> None:
-        """Extras land at ``verify_offsets[bs]`` (after the per-req-derived entries)."""
+class TestNoExtras:
+    def test_plan_num_valid_counts_only_per_req_entries(self) -> None:
+        """Plan no longer appends sweep extras; radix sweep writes VerifyPlan directly."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
-        )
-        extras = make_extras_explicit(
-            slot_indices=[77, 78],
-            positions=[5, 6],
-            prev_slot_indices=[-1, 77],
-            capacity=8,
         )
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
@@ -596,46 +585,29 @@ class TestExtras:
             fb_prefix_lens=_tensor([3]),
             fb_extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=extras,
+            extras=_empty_extras(),
         )
 
         triton_v = plans[0][0]
-        # verify_num_valid = per_req(3) + extras(2) = 5; extras land at indices 3, 4.
-        assert int(triton_v.verify_num_valid[0].item()) == 5
-        assert int(triton_v.verify_slot_indices[3].item()) == 77
-        assert int(triton_v.verify_slot_indices[4].item()) == 78
-        assert int(triton_v.verify_positions[3].item()) == 5
-        assert int(triton_v.verify_positions[4].item()) == 6
-        assert int(triton_v.verify_prev_slot_indices[3].item()) == -1
-        assert int(triton_v.verify_prev_slot_indices[4].item()) == 77
+        assert int(triton_v.verify_num_valid[0].item()) == 3
 
-    def test_extra_verify_num_valid_zero_no_op(self) -> None:
-        """``extra_verify_num_valid == 0`` → extras tail is untouched; only per-req entries materialize."""
+    def test_zero_prefix_has_no_verify_entries(self) -> None:
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
-        # Extras buffer is non-empty but extra_verify_num_valid = 0; kernel must not append anything.
-        extras = make_extras_explicit(
-            slot_indices=[999, 999],
-            positions=[999, 999],
-            prev_slot_indices=[999, 999],
-            capacity=8,
-        )
-        extras[3].zero_()
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
             fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            fb_prefix_lens=_tensor([0]),
+            fb_extend_seq_lens=_tensor([5]),
             req_to_token=req_to_token,
-            extras=extras,
+            extras=_empty_extras(),
         )
 
-        assert int(plans[0][0].verify_num_valid[0].item()) == 3
+        assert int(plans[0][0].verify_num_valid[0].item()) == 0
 
-    def test_extras_capacity_just_fits(self) -> None:
-        """tight_match capacity: all extras land at the tail with no drop."""
+    def test_verify_capacity_just_fits_per_req_entries(self) -> None:
         rp = 1
         prefix = 4
         fb_rpi = _tensor([rp])
@@ -645,22 +617,11 @@ class TestExtras:
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
 
-        extras_slot_list = [500, 501, 502]
-        extras_position_list = [10, 11, 12]
-        extras_prev_list = [-1, 500, 501]
-        extras_count = len(extras_slot_list)
-        extras = make_extras_explicit(
-            slot_indices=extras_slot_list,
-            positions=extras_position_list,
-            prev_slot_indices=extras_prev_list,
-            capacity=extras_count,
-        )
-
         total_verify = prefix
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="tight_match",
             total_verify=total_verify,
-            extras_count=extras_count,
+            extras_count=0,
             bs=1,
         )
 
@@ -671,24 +632,16 @@ class TestExtras:
                 fb_prefix_lens=fb_pfx,
                 fb_extend_seq_lens=fb_ext,
                 req_to_token=rtt,
-                extras=extras,
+                extras=_empty_extras(),
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
                 write_req_capacity=write_req_capacity,
             )
             n = int(v_plan.verify_num_valid[0].item())
-            assert n == total_verify + extras_count, f"[{label}] num_valid {n}"
-            tail = (
-                v_plan.verify_slot_indices[prefix : prefix + extras_count]
-                .detach()
-                .cpu()
-                .tolist()
-            )
-            assert tail == extras_slot_list, f"[{label}] extras tail {tail}"
+            assert n == total_verify, f"[{label}] num_valid {n}"
 
-    def test_extras_capacity_undershoot_by_one(self) -> None:
-        """under_by_one capacity: the last extra is capped/dropped consistently across real and ref."""
+    def test_verify_capacity_undershoot_by_one(self) -> None:
         rp = 1
         prefix = 3
         fb_rpi = _tensor([rp])
@@ -698,22 +651,11 @@ class TestExtras:
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
 
-        extras_slot_list = [600, 601, 602]
-        extras_position_list = [20, 21, 22]
-        extras_prev_list = [-1, 600, 601]
-        extras_count = len(extras_slot_list)
-        extras = make_extras_explicit(
-            slot_indices=extras_slot_list,
-            positions=extras_position_list,
-            prev_slot_indices=extras_prev_list,
-            capacity=extras_count,
-        )
-
         total_verify = prefix
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="under_by_one",
             total_verify=total_verify,
-            extras_count=extras_count,
+            extras_count=0,
             bs=1,
         )
 
@@ -723,7 +665,7 @@ class TestExtras:
             fb_prefix_lens=fb_pfx,
             fb_extend_seq_lens=fb_ext,
             req_to_token=rtt,
-            extras=extras,
+            extras=_empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
             verify_capacity=verify_capacity,
@@ -735,7 +677,7 @@ class TestExtras:
             fb_prefix_lens=fb_pfx,
             fb_extend_seq_lens=fb_ext,
             req_to_token=rtt,
-            extras=extras,
+            extras=_empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
             verify_capacity=verify_capacity,
@@ -752,8 +694,8 @@ class TestExtras:
 
 
 class TestMisc:
-    def test_sweep_caller_writes_dummy_write_plan(self) -> None:
-        """``extend_seq_lens`` all zero → ``write_num_valid_reqs == 0``; VerifyPlan still populated."""
+    def test_zero_extend_writes_empty_write_plan(self) -> None:
+        """``extend_seq_lens`` all zero → write offsets stay zero; VerifyPlan still populated."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -837,7 +779,6 @@ class TestMisc:
         rtt = make_req_to_token(
             kind="linear", max_reqs=16, max_seq_len=16, device=_DEVICE
         )
-        extras = _empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=80, extras_count=0, bs=8
         )
@@ -868,10 +809,6 @@ class TestMisc:
                 fb_prefix_lens=big_pfx,
                 fb_extend_seq_lens=big_ext,
                 req_to_token=rtt,
-                extra_verify_slot_indices=extras[0],
-                extra_verify_positions=extras[1],
-                extra_verify_prev_slot_indices=extras[2],
-                extra_verify_num_valid=extras[3],
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
@@ -884,10 +821,6 @@ class TestMisc:
                 fb_prefix_lens=small_pfx,
                 fb_extend_seq_lens=small_ext,
                 req_to_token=rtt,
-                extra_verify_slot_indices=extras[0],
-                extra_verify_positions=extras[1],
-                extra_verify_prev_slot_indices=extras[2],
-                extra_verify_num_valid=extras[3],
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
@@ -904,15 +837,9 @@ class TestMisc:
 
 class TestVerifyContent:
     def test_verify_num_valid_aggregate(self) -> None:
-        """``verify_num_valid == sum(per-req verify_count) + extra_num_valid``."""
+        """``verify_num_valid == sum(per-req verify_count)``."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
-        )
-        extras = make_extras_explicit(
-            slot_indices=[80, 81, 82],
-            positions=[10, 11, 12],
-            prev_slot_indices=[-1, 80, 81],
-            capacity=8,
         )
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
@@ -921,11 +848,10 @@ class TestVerifyContent:
             fb_prefix_lens=_tensor([2, 5, 4]),
             fb_extend_seq_lens=_tensor([1, 1, 1]),
             req_to_token=req_to_token,
-            extras=extras,
+            extras=_empty_extras(),
         )
 
-        # Aggregate = 2 + 5 + 4 + 3 = 14.
-        assert int(plans[0][0].verify_num_valid[0].item()) == 14
+        assert int(plans[0][0].verify_num_valid[0].item()) == 11
 
     def test_verify_covers_all_tokens_no_skip(self) -> None:
         """FULL group + bs=4 → verify_num_valid == Σ(prefix_lens) — every prefix token verified."""
@@ -998,12 +924,6 @@ class TestByteEqual:
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=32, device=_DEVICE
         )
-        extras = make_extras_explicit(
-            slot_indices=[50, 51],
-            positions=[100, 101],
-            prev_slot_indices=[-1, 50],
-            capacity=8,
-        )
         plans = _plan_pair(verify_capacity=128, write_req_capacity=8)
         run_plan_diff(
             plan_pair=plans,
@@ -1011,7 +931,7 @@ class TestByteEqual:
             fb_prefix_lens=_tensor([0, 3, 8, 15]),
             fb_extend_seq_lens=_tensor([4, 1, 1, 1]),
             req_to_token=req_to_token,
-            extras=extras,
+            extras=_empty_extras(),
         )
 
     def test_byte_equal_python_reference_hardcoded(self) -> None:
