@@ -1,5 +1,6 @@
 """Tracing a program."""
 
+import inspect
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -52,6 +53,17 @@ def extract_prefix_by_tracing(program, backend):
 
 
 def trace_program(program, arguments, backend):
+    """Synchronous tracing - only works with sync functions
+
+    Raises TypeError immediately if used with async functions.
+    """
+    # Fail fast: reject async functions immediately
+    if inspect.iscoroutinefunction(program.func):
+        raise TypeError(
+            f"Cannot use trace_program() with async function '{program.func.__name__}'. "
+            f"This function is wrapped in AsyncSglFunction. Use async_trace_program() instead."
+        )
+
     # Create dummy backend
     if backend is None:
         backend = BaseBackend()
@@ -69,6 +81,72 @@ def trace_program(program, arguments, backend):
     tracer = TracerProgramState(backend, arguments, only_trace_prefix=False)
     with TracingScope(tracer):
         tracer.ret_value = program.func(tracer, **arguments)
+    return tracer
+
+
+async def async_extract_prefix_by_tracing(program, backend):
+    """Async version of extract_prefix_by_tracing"""
+    # Create dummy arguments
+    dummy_arguments = {name: SglArgument(name, None) for name in program.arg_names}
+    arguments = dummy_arguments
+    arguments.update(program.bind_arguments)
+
+    # Trace
+    tracer = TracerProgramState(backend, arguments, only_trace_prefix=True)
+    try:
+        with TracingScope(tracer):
+            result = program.func(tracer, **arguments)
+            if inspect.iscoroutine(result):
+                tracer.ret_value = await result
+            else:
+                tracer.ret_value = result
+    except (StopTracing, TypeError, AttributeError):
+        pass
+
+    # Extract prefix
+    prefix = ""
+    for expr in tracer.flatten_nodes():
+        if isinstance(expr, SglConstantText):
+            prefix += expr.value
+        else:
+            break
+    return prefix
+
+
+async def async_trace_program(program, arguments, backend):
+    """Async tracing - only works with async functions
+
+    Raises TypeError immediately if used with sync functions.
+    """
+    # Fail fast: reject sync functions immediately
+    if not inspect.iscoroutinefunction(program.func):
+        raise TypeError(
+            f"Cannot use async_trace_program() with sync function '{program.func.__name__}'. "
+            f"Use trace_program() instead."
+        )
+
+    # Create dummy backend
+    from sglang.lang.backend.async_base_backend import AsyncBaseBackend
+
+    if backend is None:
+        backend = AsyncBaseBackend()
+
+    # Create dummy arguments
+    dummy_arguments = {
+        name: SglArgument(name, None)
+        for name in program.arg_names
+        if name not in arguments
+    }
+    arguments.update(dummy_arguments)
+    arguments.update(program.bind_arguments)
+
+    # Trace
+    tracer = TracerProgramState(backend, arguments, only_trace_prefix=False)
+    with TracingScope(tracer):
+        result = program.func(tracer, **arguments)
+        # result must be a coroutine since we checked iscoroutinefunction
+        tracer.ret_value = await result
+
     return tracer
 
 
