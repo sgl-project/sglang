@@ -223,10 +223,8 @@ append_lm_eval_summary() {
     # the eval was for (framework, precision, topology, conc, model, etc.).
     local meta_json="${out_dir}/meta_env.json"
     local model_name="${MODEL_NAME:-$MODEL}"
-    local is_multinode_json="false"
-    if [ "${IS_MULTINODE:-false}" = "true" ]; then
-        is_multinode_json="true"
-    fi
+    # sglang's GB200 nightly is exclusively multi-node.
+    local is_multinode_json="true"
     local prefill_tp="${PREFILL_TP:-${TP:-1}}"
     local prefill_ep="${PREFILL_EP:-${EP_SIZE:-1}}"
     local prefill_num_workers="${PREFILL_NUM_WORKERS:-1}"

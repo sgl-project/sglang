@@ -322,6 +322,7 @@ jobs:
       RUN_EVAL: ${{ (inputs.run_eval || inputs.eval_only) && 'true' || matrix.config.run_eval }}
       EVAL_ONLY: ${{ inputs.eval_only && 'true' || matrix.config.eval_only }}
       EVAL_CONC: ${{ matrix.config.eval_conc }}
+      MAX_MODEL_LEN: ${{ matrix.config.max_model_len }}
 
     steps:
       - name: Checkout code

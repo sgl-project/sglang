@@ -111,10 +111,11 @@ def main():
                         "isl": str(isl),
                         "osl": str(osl),
                         "config_file": config_file,
-                        # Eval flags — workflow forwards these as env vars
-                        # consumed by srt-slurm's do_sweep.py. Strings (not
-                        # bools) so the GH Actions env: block can copy them
-                        # verbatim without YAML-to-shell conversion surprises.
+                        # Caps eval request size to fit the server's context.
+                        "max_model_len": str(isl + osl + 256),
+                        # Eval flags forwarded as env vars to srt-slurm's
+                        # do_sweep.py. Strings so the GH Actions env: block
+                        # copies them verbatim.
                         "run_eval": "true" if is_eval_entry else "false",
                         "eval_only": "false",
                         "eval_conc": str(eval_conc) if is_eval_entry else "",

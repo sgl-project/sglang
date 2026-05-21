@@ -54,3 +54,11 @@ dsr1-fp4-gb200-dynamo-sglang:
         - conc-list: [2048]
           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/8k1k/max-tpt.yaml
           config_file: recipes/gb200-fp4/8k1k/max-tpt.yaml
+
+        # 5-node low-latency recipe — useful for fast eval validation via
+        # workflow_dispatch with `eval_only: true`. Concs [4, 8] are below
+        # MIN_EVAL_CONC=16 so the cron pipeline won't auto-mark it; max-tpt
+        # remains the eval-eligible entry.
+        - conc-list: [4, 8]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/8k1k/low-latency.yaml
+          config_file: recipes/gb200-fp4/8k1k/low-latency.yaml
