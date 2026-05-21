@@ -8,7 +8,7 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
 from sglang.jit_kernel.kv_canary.plan_ref import (
-    canary_plan_step_torch_reference,
+    launch_canary_plan_kernels_torch_reference,
 )
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
@@ -17,11 +17,11 @@ from sglang.jit_kernel.kv_canary.verify import (
     canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
-    canary_verify_step_torch_reference,
+    launch_canary_verify_kernel_torch_reference,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
 from sglang.jit_kernel.kv_canary.write_ref import (
-    canary_write_step_torch_reference,
+    launch_canary_write_kernel_torch_reference,
 )
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -63,7 +63,7 @@ def _run_both_plan(
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
     )
-    canary_plan_step_torch_reference(
+    launch_canary_plan_kernels_torch_reference(
         verify_plan_out=ref_verify,
         write_plan_out=ref_write,
         req_pool_indices=req_pool_indices,
@@ -169,7 +169,7 @@ def _run_both_verify(
         real_kv_sources=real_kv_sources_cuda,
         real_kv_hash_mode=real_kv_hash_mode,
     )
-    canary_verify_step_torch_reference(
+    launch_canary_verify_kernel_torch_reference(
         canary_buf=ref_canary_buf,
         plan=plan_ref,
         kernel_kind=kernel_kind,
@@ -223,7 +223,7 @@ def _run_both_write(
         real_kv_sources=real_kv_sources_cuda,
         real_kv_hash_mode=real_kv_hash_mode,
     )
-    canary_write_step_torch_reference(
+    launch_canary_write_kernel_torch_reference(
         canary_buf=ref_canary_buf,
         plan=plan_ref,
         input_ids=input_ids,

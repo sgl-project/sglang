@@ -9,7 +9,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def canary_plan_step_torch_reference(
+def launch_canary_plan_kernels_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
@@ -28,7 +28,7 @@ def canary_plan_step_torch_reference(
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     if verify_capacity != plan_verify_capacity:
         raise ValueError(
-            f"kv-canary: canary_plan_step_torch_reference verify_capacity={verify_capacity} does not "
+            f"kv-canary: launch_canary_plan_kernels_torch_reference verify_capacity={verify_capacity} does not "
             f"match verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])

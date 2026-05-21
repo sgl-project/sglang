@@ -16,7 +16,7 @@ from sglang.jit_kernel.kv_canary.verify_ref import (
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def canary_write_step_torch_reference(
+def launch_canary_write_kernel_torch_reference(
     *,
     canary_buf: torch.Tensor,
     plan: WritePlan,

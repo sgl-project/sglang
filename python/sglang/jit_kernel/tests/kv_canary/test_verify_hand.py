@@ -14,7 +14,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.write_ref import (
-    canary_write_step_torch_reference,
+    launch_canary_write_kernel_torch_reference,
 )
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -115,7 +115,7 @@ def _stamp_clean_kv_chain(
     pseudo_tokens = torch.zeros(n, dtype=torch.int64, device=_DEVICE)
     pseudo_positions = torch.zeros(n, dtype=torch.int64, device=_DEVICE)
     log = FakeViolationLog.allocate(device=_DEVICE)
-    canary_write_step_torch_reference(
+    launch_canary_write_kernel_torch_reference(
         canary_buf=cuda_buf,
         plan=write_plan,
         input_ids=input_ids,
