@@ -61,11 +61,20 @@ class InternS1_1ImageProcessor(QwenVLImageProcessor):
 
         video_metadata = None
         if base_output.videos:
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
+            first_video = base_output.videos[0]
+            is_precomputed = isinstance(first_video, dict) and first_video.get(
+                "format"
+            ) in [
+                "processor_output",
+                "precomputed_embedding",
             ]
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
+
+            if not is_precomputed:
+                videos_processed = [
+                    await preprocess_video(video, video_config=self.video_config)
+                    for video in base_output.videos
+                ]
+                base_output.videos, video_metadata = map(list, zip(*videos_processed))
 
         preprocess_time = time.perf_counter()
 
