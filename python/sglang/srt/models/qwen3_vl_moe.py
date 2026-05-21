@@ -122,9 +122,9 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 and a2a_backend.is_deepep()
                 and deepstack_embeds.shape[0] != residual.shape[0]
             ):
-                deepstack_embeds = deepstack_embeds.tensor_split(
-                    self.attn_tp_size
-                )[self.attn_tp_rank]
+                deepstack_embeds = deepstack_embeds.tensor_split(self.attn_tp_size)[
+                    self.attn_tp_rank
+                ]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
