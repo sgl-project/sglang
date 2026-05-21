@@ -24,7 +24,8 @@ class ContiguousMemoryAllocator:
         self.total_size = total_size_bytes
         # List of (offset, size) for free blocks
         self.free_blocks = [(0, total_size_bytes)]
-        self.allocated_map = {}  # {handle: (offset, size)}
+        self.allocated_map = {}  # {offset: size_bytes}
+        self.allocated_size = 0  # Running counter for O(1) get_allocated_size
         self.lock = threading.Lock()
 
     def allocate(self, size_bytes: int) -> Optional[int]:
@@ -38,11 +39,18 @@ class ContiguousMemoryAllocator:
                         self.free_blocks[i] = (offset + size_bytes, remaining_size)
                     else:
                         self.free_blocks.pop(i)
+                    self.allocated_map[offset] = size_bytes
+                    self.allocated_size += size_bytes
                     return offset
             return None
 
     def free(self, offset: int, size_bytes: int):
         with self.lock:
+            # Remove from allocated map and update counter
+            if offset in self.allocated_map:
+                self.allocated_size -= self.allocated_map[offset]
+                del self.allocated_map[offset]
+
             # Return block and merge adjacent free blocks
             self.free_blocks.append((offset, size_bytes))
             self.free_blocks.sort()
@@ -60,6 +68,16 @@ class ContiguousMemoryAllocator:
                     curr_offset, curr_size = next_offset, next_size
             merged.append((curr_offset, curr_size))
             self.free_blocks = merged
+
+    def get_allocated_size(self) -> int:
+        """Return total allocated bytes. O(1) operation."""
+        with self.lock:
+            return self.allocated_size
+
+    def get_free_size(self) -> int:
+        """Return total free bytes."""
+        with self.lock:
+            return sum(block_size for _, block_size in self.free_blocks)
 
 
 class EmbeddingPrefetchOperation:
@@ -98,12 +116,17 @@ class EmbeddingCacheController:
         hidden_dims: dict = None,
         tp_group=None,
         all_rank_get=False,
+        enable_eviction: bool = True,
+        max_eviction_batch: int = 10,
     ):
         self.tp_world_size = tp_size
         self.tp_group = tp_group
+        self.tp_rank = tp_rank
         self.all_rank_get = all_rank_get
         self.hidden_dims = hidden_dims or {}
         self.element_size = torch.float32.itemsize
+        self.enable_eviction = enable_eviction
+        self.max_eviction_batch = max_eviction_batch
 
         # 1. Mooncake Backend & Pinned Buffer
         self.mooncake_store = MooncakeEmbeddingStore()
@@ -115,10 +138,24 @@ class EmbeddingCacheController:
 
         # 2. Variable Size Memory Management
         self.allocator = ContiguousMemoryAllocator(self.total_pool_size_bytes)
-        # {hash: (offset, num_tokens, embedding_dim, size_bytes)}
+        # {hash: (offset, num_tokens, embedding_dim, size_bytes, last_access_time)}
         self.hash_to_metadata = {}
 
-        # 3. Task Tracking
+        # 3. LRU Tracking
+        # OrderedDict maintains insertion order, used as LRU cache
+        # hash -> access_time
+        self.access_order = {}
+        self.access_lock = threading.Lock()
+
+        # 4. Statistics
+        self.stats = {
+            "total_allocated": 0,
+            "total_evicted": 0,
+            "eviction_count": 0,
+            "allocation_failures": 0,
+        }
+
+        # 5. Task Tracking
         self.ongoing_prefetch = {}  # {req_id: EmbeddingPrefetchOperation}
         self.prefetch_queue = Queue()
         self.insert_queue = Queue()
@@ -142,6 +179,118 @@ class EmbeddingCacheController:
         else:
             self.prefetch_tp_group = None
 
+    def _update_access_time(self, image_hash: str):
+        """Update LRU access time for a hash."""
+        with self.access_lock:
+            # Move to end (most recently used)
+            if image_hash in self.access_order:
+                del self.access_order[image_hash]
+            self.access_order[image_hash] = time.time()
+
+    def _select_eviction_candidates(self, required_bytes: int) -> List[str]:
+        """Select LRU candidates to free up at least required_bytes."""
+        candidates = []
+        freed_bytes = 0
+
+        with self.access_lock:
+            # Sort by access time (oldest first)
+            # Python dicts are insertion-ordered; the first keys are the oldest.
+            sorted_hashes = self.access_order.items()
+
+        for image_hash, _ in sorted_hashes:
+        for image_hash, _ in sorted_hashes:
+            if image_hash not in self.hash_to_metadata:
+                with self.access_lock:
+                    self.access_order.pop(image_hash, None)
+                continue
+            metadata = self.hash_to_metadata[image_hash]
+            size_bytes = metadata[3] if len(metadata) > 3 else 0
+            candidates.append(image_hash)
+            freed_bytes += size_bytes
+
+            if freed_bytes >= required_bytes:
+                break
+
+            if len(candidates) >= self.max_eviction_batch:
+                break
+
+        return candidates
+
+    def _evict_hashes(self, hashes_to_evict: List[str]) -> int:
+        """Evict specified hashes and free their memory. Returns freed bytes.
+
+        NOTE: Caller must hold self.lock before calling this method.
+        """
+        total_freed = 0
+
+        # NOTE: self.lock should be held by the caller (e.g., insert_batch,
+        # prefetch). Do NOT acquire it here to avoid reentrant deadlock.
+        for image_hash in hashes_to_evict:
+            if image_hash not in self.hash_to_metadata:
+                continue
+
+            offset, num_tokens, dim, size_bytes = self.hash_to_metadata[image_hash][:4]
+
+            # Free memory in allocator
+            self.allocator.free(offset, size_bytes)
+
+            # Remove from metadata
+            del self.hash_to_metadata[image_hash]
+
+            # Remove from access order
+            with self.access_lock:
+                self.access_order.pop(image_hash, None)
+
+            total_freed += size_bytes
+            self.stats["total_evicted"] += size_bytes
+
+        if total_freed > 0:
+            self.stats["eviction_count"] += 1
+
+        if total_freed > 0:
+            logger.info(
+                f"[Rank {self.tp_rank}] Evicted {len(hashes_to_evict)} embeddings, "
+                f"freed {total_freed / 1024**2:.2f} MB"
+            )
+
+        return total_freed
+
+    def _allocate_with_eviction(self, size_bytes: int) -> Optional[int]:
+        """Try to allocate memory, evicting old entries if necessary."""
+        # First try direct allocation
+        offset = self.allocator.allocate(size_bytes)
+        if offset is not None:
+            self.stats["total_allocated"] += size_bytes
+            return offset
+
+        # If failed and eviction is enabled, try eviction
+        if not self.enable_eviction:
+            self.stats["allocation_failures"] += 1
+            return None
+
+        # Select candidates to evict
+        candidates = self._select_eviction_candidates(size_bytes)
+        if not candidates:
+            self.stats["allocation_failures"] += 1
+            return None
+
+        # Evict and try again
+        freed = self._evict_hashes(candidates)
+        if freed < size_bytes:
+            logger.warning(
+                f"[Rank {self.tp_rank}] Could not free enough memory: "
+                f"needed {size_bytes / 1024**2:.2f} MB, freed {freed / 1024**2:.2f} MB"
+            )
+
+        # Try allocation again after eviction
+        offset = self.allocator.allocate(size_bytes)
+        if offset is not None:
+            self.stats["total_allocated"] += size_bytes
+        else:
+            self.stats["allocation_failures"] += 1
+
+        return offset
+
     def prefetch(
         self,
         req_id: str,
@@ -161,17 +310,24 @@ class EmbeddingCacheController:
         with self.lock:
             for h, num_tokens in zip(image_hashes, expected_tokens):
                 if h in self.hash_to_metadata:
+                    # Update access time for LRU
+                    self._update_access_time(h)
                     logger.debug(
-                        f"Req {req_id}: Hash  already in local metadata, skipping prefetch."
+                        f"Req {req_id}: Hash already in local metadata, skipping prefetch."
                     )
                     continue
 
                 size_bytes = num_tokens * dim * self.element_size
-                offset = self.allocator.allocate(size_bytes)
+                offset = self._allocate_with_eviction(size_bytes)
                 if offset is None:
+                    logger.warning(
+                        f"Req {req_id}: Failed to allocate {size_bytes / 1024**2:.2f} MB "
+                        f"for prefetch, skipping this image."
+                    )
                     continue
 
                 self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
+                self._update_access_time(h)
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
                 sizes.append(size_bytes)
@@ -196,12 +352,18 @@ class EmbeddingCacheController:
         with self.lock:
             for h, tensor in zip(image_hashes, embedding_tensors):
                 if h in self.hash_to_metadata:
+                    # Update access time for existing entry
+                    self._update_access_time(h)
                     continue
 
                 num_tokens, dim = tensor.shape[0], tensor.shape[1]
                 size_bytes = num_tokens * dim * self.element_size
-                offset = self.allocator.allocate(size_bytes)
+                offset = self._allocate_with_eviction(size_bytes)
                 if offset is None:
+                    logger.warning(
+                        f"Failed to allocate {size_bytes / 1024**2:.2f} MB for insert, "
+                        f"skipping this embedding."
+                    )
                     continue
 
                 # Copy to pinned pool for RDMA
@@ -212,6 +374,7 @@ class EmbeddingCacheController:
                 )
                 target_view.copy_(tensor.cpu())
                 self.hash_to_metadata[h] = (offset, num_tokens, dim, size_bytes)
+                self._update_access_time(h)
 
                 keys.append(h)
                 ptrs.append(self.cpu_pool.data_ptr() + offset)
@@ -288,13 +451,30 @@ class EmbeddingCacheController:
         with self.lock:
             tensors = []
             for h in image_hashes:
-                offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h]
+                if h not in self.hash_to_metadata:
+                    logger.warning(f"Hash {h} not found in local cache")
+                    tensors.append(None)
+                    continue
+                # Update access time for LRU
+                self._update_access_time(h)
+                offset, num_tokens, dim, size_bytes = self.hash_to_metadata[h][:4]
                 tensors.append(
                     self.cpu_pool[offset : offset + size_bytes]
                     .view(torch.float32)
                     .view(num_tokens, dim)
                 )
             return tensors
+
+    def get_stats(self) -> dict:
+        """Return cache statistics."""
+        with self.lock:
+            return {
+                **self.stats,
+                "num_cached": len(self.hash_to_metadata),
+                "allocated_mb": self.allocator.get_allocated_size() / 1024**2,
+                "free_mb": self.allocator.get_free_size() / 1024**2,
+                "total_mb": self.total_pool_size_bytes / 1024**2,
+            }
 
     async def batch_is_exist(self, image_hashes: List[str]) -> List[bool]:
         with self.lock:
