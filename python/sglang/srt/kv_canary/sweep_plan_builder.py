@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -10,7 +9,8 @@ from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
 def fill_verify_plan_radix_sweep(
     *,
     radix_cache: "BasePrefixCache",
