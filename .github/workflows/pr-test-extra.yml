@@ -117,7 +117,7 @@ jobs:
     needs: [check-changes, call-gate]
     if: |
       needs.check-changes.result == 'success' &&
-      needs.call-gate.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') &&
       needs.check-changes.outputs.sgl_kernel == 'true'
     uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
     with:
@@ -130,7 +130,7 @@ jobs:
   # =============================================== extra-a (1-/2-gpu) ===============================================
   extra-a-test-1-gpu-small:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-1-gpu-small
@@ -143,7 +143,7 @@ jobs:
 
   extra-a-test-1-gpu-large:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-1-gpu-large
@@ -157,7 +157,7 @@ jobs:
 
   extra-a-test-2-gpu-large:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-a-test-2-gpu-large
@@ -171,7 +171,7 @@ jobs:
   # =============================================== extra-b (4-/8-gpu) ===============================================
   extra-b-test-4-gpu-h100:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-4-gpu-h100
@@ -184,7 +184,7 @@ jobs:
 
   extra-b-test-4-gpu-b200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-4-gpu-b200
@@ -198,7 +198,7 @@ jobs:
 
   extra-b-test-8-gpu-h200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-8-gpu-h200
@@ -211,7 +211,7 @@ jobs:
 
   extra-b-test-deepep-8-gpu-h200:
     needs: [check-changes, call-gate, sgl-kernel-build-wheels]
-    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && needs.call-gate.result == 'success' }}
+    if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: extra-b-test-deepep-8-gpu-h200
