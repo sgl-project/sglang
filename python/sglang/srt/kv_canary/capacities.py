@@ -41,9 +41,7 @@ class CanaryLaunchCapacities:
             ("sweep_verify_capacity", self.sweep_verify_capacity),
         ):
             if value <= 0:
-                raise ValueError(
-                    f"kv-canary: {name} must be positive, got {value}"
-                )
+                raise ValueError(f"kv-canary: {name} must be positive, got {value}")
 
     @classmethod
     def from_args(
