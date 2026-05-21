@@ -8,8 +8,8 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
+from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
