@@ -2848,6 +2848,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
+        self.dsa_indexers = []
         for layer in layer_model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -2900,6 +2901,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+            # NSA indexers (None for layers without NSA)
+            dsa_indexer = None
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
+                dsa_indexer = layer.self_attn.indexer
+            self.dsa_indexers.append(dsa_indexer)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA
