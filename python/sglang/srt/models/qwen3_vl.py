@@ -1248,50 +1248,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 rope_type="rope_3d",
             )
         else:
-            import os
-            import time
-
-            _vit_profile_dir = os.environ.get("VIT_PROFILE_DIR", "")
-            if _vit_profile_dir:
-                import datetime
-
-                os.makedirs(_vit_profile_dir, exist_ok=True)
-                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                tp_rank = get_tensor_model_parallel_world_size()
-                try:
-                    from sglang.srt.distributed.parallel_state import get_tp_group
-
-                    tp_rank = get_tp_group().rank_in_group
-                except Exception:
-                    tp_rank = 0
-                trace_path = os.path.join(
-                    _vit_profile_dir, f"vit_trace_tp{tp_rank}_{ts}.json"
-                )
-                with torch.profiler.profile(
-                    activities=[
-                        torch.profiler.ProfilerActivity.CPU,
-                        torch.profiler.ProfilerActivity.CUDA,
-                    ],
-                    record_shapes=True,
-                ) as prof:
-                    result = self.visual(pixel_values, grid_thw=image_grid_thw)
-                    torch.cuda.synchronize()
-                prof.export_chrome_trace(trace_path)
-                logger.info(
-                    f"[VIT] profile saved to {trace_path}, "
-                    f"images={len(items)} tokens={pixel_values.shape[0]}"
-                )
-                return result
-
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            result = self.visual(pixel_values, grid_thw=image_grid_thw)
-            torch.cuda.synchronize()
-            dt = (time.perf_counter() - t0) * 1000
-            logger.info(
-                f"[VIT] images={len(items)} tokens={pixel_values.shape[0]} time={dt:.2f}ms"
-            )
-            return result
+            return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
