@@ -20,6 +20,7 @@ from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
+    get_aiter_mla_head_padding,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
@@ -264,9 +265,9 @@ class AiterAttnBackend(AttentionBackend):
                 f"Provided {self.num_head} number of heads.\n"
                 "Try adjusting tensor_parallel_size value."
             )
-            self.num_head_padded = 16 if self.num_head < 16 else self.num_head
-            self.head_repeat_factor = 16 // self.num_head if self.num_head < 16 else 1
-
+            self.num_head_padded, self.head_repeat_factor = get_aiter_mla_head_padding(
+                self.num_head
+            )
             self.enable_dp_attention = is_dp_attention_enabled()
             self.qo_indptr_ = torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -287,7 +288,7 @@ class AiterAttnBackend(AttentionBackend):
             # for non-fp8 kv_cache on tp8, use non-persist kernel to avoid performance degradation
             # head_num=16 (tp8 perf issue), head_num=128 (unsupported, like tp1 or --enable-dp-attention with tp8-dp8)
             if (
-                self.num_head_padded == 16 or self.num_head_padded == 128
+                self.num_head_padded in (8, 16, 128)
             ) and self.kv_cache_dtype is not fp8_dtype:
                 _use_mla_ps_kernel = False
                 fast_mode = False

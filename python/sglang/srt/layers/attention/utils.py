@@ -59,6 +59,37 @@ def get_num_page_per_block_flashmla(page_size: int = 64) -> int:
     return num_page_per_block
 
 
+# AITER MLA decode ships dedicated kernels for these head counts. For everything
+# else we fall back to padding up to the qh16 kernel. The nhead=8 fp8/fp8 path
+# was added by ROCm/aiter#3014; on aiter builds without #3014, callers that need
+# nhead=8 must use a build that includes it (or pad to 16 via repeat_interleave).
+_AITER_MLA_NATIVE_HEADS = (8, 16, 32, 64, 128)
+
+
+def get_aiter_mla_head_padding(num_head: int) -> tuple[int, int]:
+    """Decide head-axis padding for the AITER MLA decode kernels.
+
+    Returns ``(num_head_padded, head_repeat_factor)`` where ``num_head_padded``
+    is the head count actually fed to the AITER kernel and
+    ``head_repeat_factor == num_head_padded // num_head`` is the multiplier
+    applied to ``q`` along the head axis (via ``repeat_interleave``) before the
+    kernel call.
+
+    Rules:
+        - ``num_head`` already supported natively by AITER → no padding,
+          ``head_repeat_factor = 1``.
+        - ``num_head < 8`` (in practice only ``4``) → pad to ``16`` and replicate
+          along the head axis so the qh16 kernel handles it.
+
+    This replaces the previous ``SGLANG_AITER_MLA_DISABLE_HEAD_PAD`` env-var
+    toggle, which was needed before ROCm/aiter#3014 added a native nhead=8 fp8
+    decode kernel.
+    """
+    if num_head in _AITER_MLA_NATIVE_HEADS or num_head >= 16:
+        return num_head, 1
+    return 16, 16 // num_head
+
+
 @triton.jit
 def create_flashmla_kv_indices_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
@@ -119,6 +150,7 @@ def concat_and_cast_mha_k_kernel(
     k_nope_ptr,
     k_rope_ptr,
     head_cnt: tl.constexpr,
+    head_cnt_pad: tl.constexpr,
     k_stride0: tl.constexpr,
     k_stride1: tl.constexpr,
     nope_stride0: tl.constexpr,
@@ -126,13 +158,20 @@ def concat_and_cast_mha_k_kernel(
     rope_stride0: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
 ):
+    # Many Triton builds require tl.arange(0, N) with N a power of 2. Pad
+    # heads / nope / rope ranges and mask so arbitrary model dims (e.g. 192)
+    # work on ROCm + triton-custom.
     pid_loc = tl.program_id(0)
-    head_range = tl.arange(0, head_cnt)
+    head_range = tl.arange(0, head_cnt_pad)
+    head_ok = head_range < head_cnt
 
     k_head_ptr = k_ptr + pid_loc * k_stride0 + head_range[:, None] * k_stride1
 
-    nope_offs = tl.arange(0, nope_dim)
+    nope_offs = tl.arange(0, BLOCK_NOPE)
+    nope_ok = nope_offs < nope_dim
 
     src_nope_ptr = (
         k_nope_ptr
@@ -142,14 +181,17 @@ def concat_and_cast_mha_k_kernel(
     )
     dst_nope_ptr = k_head_ptr + nope_offs[None, :]
 
-    src_nope = tl.load(src_nope_ptr)
-    tl.store(dst_nope_ptr, src_nope)
+    m_nope = head_ok[:, None] & nope_ok[None, :]
+    src_nope = tl.load(src_nope_ptr, mask=m_nope, other=0.0)
+    tl.store(dst_nope_ptr, src_nope, mask=m_nope)
 
-    rope_offs = tl.arange(0, rope_dim)
+    rope_offs = tl.arange(0, BLOCK_ROPE)
+    rope_ok = rope_offs < rope_dim
     src_rope_ptr = k_rope_ptr + pid_loc * rope_stride0 + rope_offs[None, :]
     dst_rope_ptr = k_head_ptr + nope_dim + rope_offs[None, :]
-    src_rope = tl.load(src_rope_ptr)
-    tl.store(dst_rope_ptr, src_rope)
+    src_rope = tl.load(src_rope_ptr, mask=rope_ok[None, :], other=0.0)
+    m_rope_dst = head_ok[:, None] & rope_ok[None, :]
+    tl.store(dst_rope_ptr, src_rope, mask=m_rope_dst)
 
 
 def concat_and_cast_mha_k_triton(
@@ -180,6 +222,7 @@ def concat_and_cast_mha_k_triton(
         k_nope,
         k_rope,
         k.shape[1],
+        triton.next_power_of_2(int(k.shape[1])),
         k.stride(0),
         k.stride(1),
         k_nope.stride(0),
@@ -187,6 +230,8 @@ def concat_and_cast_mha_k_triton(
         k_rope.stride(0),
         nope_dim,
         rope_dim,
+        triton.next_power_of_2(int(nope_dim)),
+        triton.next_power_of_2(int(rope_dim)),
     )
 
 
