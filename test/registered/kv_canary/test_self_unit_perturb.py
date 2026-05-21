@@ -10,6 +10,7 @@ from kv_canary_runner_unit_utils import make_forward_batch, make_pool
 from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb import (
+    real_kv_post_forward,
     real_kv_unused_cache as real_kv_unused_cache_module,
 )
 from sglang.srt.kv_canary.perturb.config import (
@@ -20,6 +21,7 @@ from sglang.srt.kv_canary.perturb.config import (
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
 from sglang.srt.kv_canary.perturb.utils import (
+    WarmupGate,
     flip_first_byte_in_source,
     pick_target_group,
 )
@@ -102,6 +104,111 @@ class TestPickTargetGroup(CustomTestCase):
         )
 
         self.assertIsNone(group)
+
+
+class TestPerturbManager(CustomTestCase):
+    def test_perturb_manager_end_of_forward_dispatches_real_kv_post_forward(
+        self,
+    ) -> None:
+        """Verify end_of_forward() routes only to perturb_real_kv_post_forward."""
+        device = DEFAULT_DEVICE
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=0.0,
+                real_kv_used_prob=0.0,
+                real_kv_unused_cache_prob=0.0,
+                real_kv_post_forward_prob=0.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=0,
+            ),
+            req_to_token_pool=make_pool(device),
+            buffer_groups=(),
+            step_counter_getter=lambda: 10,
+        )
+        forward_batch = make_forward_batch(device)
+        calls: list[str] = []
+
+        with patch.object(
+            manager,
+            "perturb_real_kv_post_forward",
+            lambda batch: calls.append("real_kv_post_forward"),
+        ), patch.object(
+            manager,
+            "perturb_req_to_token",
+            lambda batch: calls.append("req_to_token"),
+        ), patch.object(
+            manager,
+            "perturb_real_kv_used",
+            lambda batch: calls.append("real_kv_used"),
+        ), patch.object(
+            manager,
+            "perturb_real_kv_unused_cache",
+            lambda batch: calls.append("real_kv_unused_cache"),
+        ):
+            manager.end_of_forward(forward_batch)
+
+        self.assertEqual(calls, ["real_kv_post_forward"])
+
+
+class TestRealKvPostForwardPerturb(CustomTestCase):
+    def test_real_kv_post_forward_flips_a_byte_in_out_cache_loc_slot(self) -> None:
+        """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers
+        untouched."""
+        device = DEFAULT_DEVICE
+        source = RealKvSource(
+            tensor=torch.zeros(4, 16, dtype=torch.uint8, device=device),
+            page_size=1,
+            num_bytes_per_token=16,
+            read_bytes=16,
+        )
+        group = CanaryBufferGroup(
+            kind=PoolKind.FULL,
+            k_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
+            k_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
+            v_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
+            v_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
+            real_kv_sources_k=(source,),
+            real_kv_sources_v=(source,),
+            swa_index_lut=None,
+        )
+        config = PerturbConfig(
+            req_to_token_prob=0.0,
+            real_kv_used_prob=0.0,
+            real_kv_unused_cache_prob=0.0,
+            real_kv_post_forward_prob=1.0,
+            target_group_kind=TargetGroupKind.FULL,
+            warmup_steps=0,
+        )
+        warmup_gate = WarmupGate(config=config, step_counter_getter=lambda: 10)
+
+        forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
+        forward_batch.out_cache_loc = torch.tensor(
+            [2], dtype=torch.int32, device=device
+        )
+        forward_batch.num_token_non_padded_cpu = 1
+
+        head_snapshot = group.k_head.clone()
+        v_head_snapshot = group.v_head.clone()
+        k_tail_snapshot = group.k_tail.clone()
+        v_tail_snapshot = group.v_tail.clone()
+        source_snapshot = source.tensor.clone()
+
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
+            real_kv_post_forward.run(
+                forward_batch=forward_batch,
+                config=config,
+                buffer_groups=(group,),
+                warmup_gate=warmup_gate,
+            )
+
+        diff = source.tensor != source_snapshot
+        self.assertEqual(int(diff.sum().item()), 1)
+        self.assertTrue(bool(diff[2, 0].item()))
+        self.assertEqual(int(source.tensor[2, 0].item()), 0 ^ 0xFF)
+        self.assertTrue(torch.equal(group.k_head, head_snapshot))
+        self.assertTrue(torch.equal(group.v_head, v_head_snapshot))
+        self.assertTrue(torch.equal(group.k_tail, k_tail_snapshot))
+        self.assertTrue(torch.equal(group.v_tail, v_tail_snapshot))
 
 
 class TestReqToTokenPerturb(CustomTestCase):
