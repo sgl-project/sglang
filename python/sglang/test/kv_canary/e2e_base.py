@@ -103,6 +103,8 @@ class CanaryE2EBase(CustomTestCase):
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
         server_env.update(cls.extra_env)
+        if cls.model_mode == "swa":
+            server_env.setdefault("SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS", "1")
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
@@ -111,6 +113,8 @@ class CanaryE2EBase(CustomTestCase):
             "--kv-canary",
             cls.kv_canary_mode,
             "--context-length",
+            "8192",
+            "--max-total-tokens",
             "8192",
             *cls.extra_server_args,
         ]
@@ -142,10 +146,10 @@ class CanaryE2EBase(CustomTestCase):
 
     def send_parallel_requests(
         self,
-        n: int,
+        n: int = 8,
         *,
         assert_all_successs: bool = True,
-        max_new_tokens: int = 200,
+        max_new_tokens: int = 2048,
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""

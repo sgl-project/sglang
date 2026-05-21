@@ -26,8 +26,10 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
         """Verify req_to_token perturbation reports a chain hash violation."""
-        self.send_parallel_requests(n=4)
+        self.send_parallel_requests()
         self.assert_per_forward_violation_reported(fail_reason="chain_hash")
+        if self.model_mode == "swa":
+            self.assert_swa_divergence_observed()
 
 
 class TestPerturbReqToTokenMha(_PerturbReqToTokenBase, unittest.TestCase):
