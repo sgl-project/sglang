@@ -709,6 +709,7 @@ class MMReceiverBase(ABC):
                         revision=server_args.revision,
                         use_fast=not server_args.disable_fast_image_processor,
                         tokenizer_backend=server_args.tokenizer_backend,
+                        model_name=server_args.model_path,
                     )
                 except ValueError as e:
                     error_message = str(e)
@@ -723,6 +724,7 @@ class MMReceiverBase(ABC):
                             revision=server_args.revision,
                             use_fast=True,
                             tokenizer_backend=server_args.tokenizer_backend,
+                            model_name=server_args.model_path,
                         )
                     else:
                         raise e
