@@ -504,7 +504,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens_cpu = batch.seq_lens_cpu
 
         if batch.seq_lens_sum is None:
-            batch.refresh_seq_lens_cpu()
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         ret = cls(
             forward_mode=batch.forward_mode,

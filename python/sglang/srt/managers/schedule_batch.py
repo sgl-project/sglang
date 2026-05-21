@@ -2420,8 +2420,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
@@ -2446,11 +2445,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
-
-    def refresh_seq_lens_cpu(self):
-        # Recompute seq_lens_sum from the (eagerly maintained, or freshly
-        # synced via FutureMap.resolve_seq_lens_cpu) CPU mirror.
-        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
     def filter_batch(
         self,
@@ -2498,8 +2492,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
@@ -2551,8 +2544,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])

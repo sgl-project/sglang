@@ -68,7 +68,7 @@ class FutureMap:
             self._forward_buf_initialized = False
 
         # Fences the schedule-consumed buf fields.
-        self._post_verify_buf_ready: Optional[torch.cuda.Event] = None
+        self.publish_ready: Optional[torch.cuda.Event] = None
 
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
@@ -120,21 +120,14 @@ class FutureMap:
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         """Schedule-stream D2H from new_seq_lens_buf into batch.seq_lens_cpu,
-        gated on _post_verify_buf_ready. No-op when there's no future state yet."""
+        gated on publish_ready. No-op when there's no future state yet."""
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
-        if self._post_verify_buf_ready is not None:
-            self._post_verify_buf_ready.wait()
+        if self.publish_ready is not None:
+            self.publish_ready.wait()
         batch.seq_lens_cpu = self.new_seq_lens_buf[fi.indices].cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-
-    def _record_post_verify_buf_ready(self) -> None:
-        # Forward-stream only. record() repositions the event to the current
-        # stream point; FIFO covers all prior writes on this stream.
-        if self._post_verify_buf_ready is None:
-            self._post_verify_buf_ready = torch.get_device_module(self.device).Event()
-        self._post_verify_buf_ready.record()
 
     def publish(
         self,
@@ -152,7 +145,9 @@ class FutureMap:
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        self._record_post_verify_buf_ready()
+        if self.publish_ready is None:
+            self.publish_ready = torch.get_device_module(self.device).Event()
+        self.publish_ready.record()
 
     def stash(self, future_indices: FutureIndices, payload) -> None:
         """Forward stream. Writes forward-only buf fields. Next iter's

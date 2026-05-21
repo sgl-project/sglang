@@ -1098,8 +1098,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            new_seq_lens=new_seq_lens,
+            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
         )
 
         # verify_forward_batch transitively holds verify-time GPU tensors

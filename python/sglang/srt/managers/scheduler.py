@@ -2835,11 +2835,11 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 # Pre-isolation CPU mirror prep. resolve_seq_lens_cpu is the
-                # spec v2 buf-D2H counterpart of resolve_future (no-op for
-                # first iter / non-spec); cross-stream barrier on the future's
-                # `done` event is encapsulated inside.
+                # spec v2 buf-D2H counterpart of resolve_future (no-op when
+                # there's no future state); also sets batch.seq_lens_sum.
+                # For paths it skips, ForwardBatch.init_new lazily computes
+                # the sum from seq_lens_cpu.
                 self.future_map.resolve_seq_lens_cpu(batch)
-                batch.refresh_seq_lens_cpu()
 
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
