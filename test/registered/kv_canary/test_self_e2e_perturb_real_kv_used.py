@@ -19,7 +19,6 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
     """
 
     kv_canary_mode = "log"
-    sweep_interval = 0
 
     target_group: ClassVar[Literal["full", "swa"]]
 

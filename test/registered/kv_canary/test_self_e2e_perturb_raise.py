@@ -25,7 +25,6 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
         "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
-    sweep_interval = 0
 
     def test_server_aborts_on_violation(self) -> None:
         try:

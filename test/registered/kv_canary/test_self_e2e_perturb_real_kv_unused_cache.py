@@ -20,7 +20,6 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
     """
 
     kv_canary_mode = "log"
-    sweep_interval = 4
     use_unique_prompts = True
 
     target_group: ClassVar[Literal["full", "swa"]]
@@ -31,6 +30,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+            "SGLANG_KV_CANARY_SWEEP_INTERVAL": "4",
         }
         super().setUpClass()
 

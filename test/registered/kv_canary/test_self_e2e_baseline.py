@@ -14,7 +14,6 @@ class _BaselineBase(CanaryE2EBase):
 
     kv_canary_mode = "log"
     perturb_env = {}
-    sweep_interval = 0
 
     def test_no_violation(self) -> None:
         results = self.send_parallel_requests(n=4, max_new_tokens=200)

@@ -23,7 +23,6 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
-    sweep_interval = 0
 
     def test_chain_hash_violation_observed(self) -> None:
         self.send_parallel_requests(n=4, max_new_tokens=200)
