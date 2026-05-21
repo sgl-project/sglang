@@ -20,8 +20,16 @@ from typing import List, Optional
 import numpy as np
 import torch
 
-from sglang.srt.distributed.utils import divide
 from sglang.srt.environ import envs
+
+
+# Inlined from sglang.srt.distributed.utils.divide to avoid pulling in the whole
+# sglang.srt.distributed package (which transitively loads sglang.srt.utils,
+# ~4.4s) for a four-line helper. mamba_utils is on the engine actor startup path.
+def divide(numerator: int, denominator: int) -> int:
+    if numerator % denominator != 0:
+        raise ValueError(f"{numerator} is not divisible by {denominator}")
+    return numerator // denominator
 
 logger = logging.getLogger(__name__)
 
