@@ -221,36 +221,41 @@ class HostKVCache(abc.ABC):
     def __init__(
         self,
         device_pool: KVCache,
-        host_to_device_ratio: float,
+        host_to_device_ratio: Optional[float],
         host_size: int,
         page_size: int,
         layout: str,
         pin_memory: bool,
         device: str,
         allocator_type: str = "default",
+        host_memory_mode: str = "cache",
     ):
         self.device_pool = device_pool
         self.page_size = page_size
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
+        self.host_memory_mode = host_memory_mode
         self.allocator = get_allocator_from_storage(allocator_type)
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
-        else:
+        elif host_to_device_ratio is not None:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
-        self.size = self.page_num * self.page_size
+        else:
+            raise ValueError("Either --hicache-size or --hicache-ratio must be set")
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
+        # Align up the host memory pool size to the page size.
+        self.page_num = max(1, (self.size + self.page_size - 1) // self.page_size)
+        self.size = self.page_num * self.page_size
 
-        assert (
-            self.size > device_pool.size
-        ), "The host memory should be larger than the device memory with the current protocol"
+        if self.host_memory_mode == "cache":
+            assert (
+                self.size > device_pool.size
+            ), "The host memory should be larger than the device memory with the current protocol"
 
         # Verify there is enough available host memory.
         host_mem = psutil.virtual_memory()
@@ -365,6 +370,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        host_memory_mode: str = "cache",
     ):
         super().__init__(
             device_pool,
@@ -375,6 +381,7 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            host_memory_mode=host_memory_mode,
         )
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
@@ -863,6 +870,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device: str = "cpu",
         allocator_type: str = "default",
         override_kv_cache_dim: Optional[int] = None,
+        host_memory_mode: str = "cache",
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -874,6 +882,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             pin_memory,
             device,
             allocator_type,
+            host_memory_mode=host_memory_mode,
         )
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
@@ -2621,6 +2630,7 @@ class DSAIndexerPoolHost(HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
+        host_memory_mode: str = "cache",
     ):
         self.device_pool = device_pool
         self.page_size = anchor_host.page_size

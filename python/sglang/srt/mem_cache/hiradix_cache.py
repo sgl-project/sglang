@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import collections
 import heapq
 import json
 import logging
@@ -72,15 +73,36 @@ class HiRadixCache(RadixCache):
 
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
+        self.host_memory_mode = server_args.hicache_host_memory_mode
+
+        hicache_ratio = server_args.hicache_ratio
+        if (
+            server_args.hicache_host_memory_mode == "buffer_only"
+            and server_args.hicache_size <= 0
+            and hicache_ratio is None
+        ):
+            cps = server_args.chunked_prefill_size
+            if cps is None or cps <= 0:
+                cps = server_args.max_prefill_tokens
+            buffer_tokens = 4 * cps
+            hicache_ratio = min(1.0, buffer_tokens / self.kv_cache.size)
+            logger.info(
+                "buffer_only: auto-computed host buffer = %d tokens "
+                "(4 * prefill_budget=%d, effective ratio=%.4f)",
+                buffer_tokens,
+                cps,
+                hicache_ratio,
+            )
 
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                host_memory_mode=server_args.hicache_host_memory_mode,
             )
         elif isinstance(self.kv_cache, DSATokenToKVPool):
             # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
@@ -88,11 +110,12 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,
-                server_args.hicache_ratio,
+                hicache_ratio,
                 server_args.hicache_size,
                 self.page_size,
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
+                host_memory_mode=server_args.hicache_host_memory_mode,
             )
         else:
             raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
@@ -168,6 +191,9 @@ class HiRadixCache(RadixCache):
         # record the ongoing prefetch requests
         self.ongoing_prefetch = {}
         self.ongoing_backup = {}
+        # buffer_only: queue of nodes waiting for host buffer space
+        self.pending_write_queue: collections.deque = collections.deque()
+        self.pending_write_node_ids: set = set()
         # track per-request tokens loaded from storage (L3 hits)
         # key: request_id, value: number of tokens actually loaded from storage
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
@@ -442,6 +468,14 @@ class HiRadixCache(RadixCache):
                     )
 
                 try:
+                    if self.host_memory_mode == "buffer_only":
+                        self.dec_lock_ref(last_host_node)
+                except Exception:
+                    logger.exception(
+                        "Failed to dec_lock_ref for prefetch anchor %s", req_id
+                    )
+
+                try:
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
@@ -454,16 +488,27 @@ class HiRadixCache(RadixCache):
 
         # Force release leftover backup ops: drop host protection on nodes.
         try:
-            for ack_id, node in list(self.ongoing_backup.items()):
+            for ack_id, (node, host_indices) in list(self.ongoing_backup.items()):
                 try:
                     node.release_host()
                 except Exception:
                     logger.exception(
                         "Failed to release host protection for backup op %s", ack_id
                     )
+                try:
+                    if host_indices is not None:
+                        self.cache_controller.mem_pool_host.free(host_indices)
+                except Exception:
+                    logger.exception(
+                        "Failed to free host indices for backup op %s", ack_id
+                    )
                 self.ongoing_backup.pop(ack_id, None)
         except Exception:
             logger.exception("Force release pending backup ops failed.")
+
+        # Force release queued pending writes (not locked, just clear bookkeeping).
+        self.pending_write_queue.clear()
+        self.pending_write_node_ids.clear()
 
     def _drain_storage_control_queues_local(self):
         """Drain storage control queues without TP synchronization.
@@ -503,6 +548,8 @@ class HiRadixCache(RadixCache):
                 if info is not None:
                     last_host_node, token_ids, _, _ = info
                     last_host_node.release_host()
+                    if self.host_memory_mode == "buffer_only":
+                        self.dec_lock_ref(last_host_node)
                     cc.prefetch_tokens_occupied -= len(token_ids)
                     if cc.prefetch_tokens_occupied < 0:
                         cc.prefetch_tokens_occupied = 0
@@ -512,7 +559,10 @@ class HiRadixCache(RadixCache):
                 ack_id = operation.id
                 entry = self.ongoing_backup.pop(ack_id, None)
                 if entry is not None:
-                    entry.release_host()
+                    node, host_indices = entry
+                    node.release_host()
+                    if host_indices is not None:
+                        cc.mem_pool_host.free(host_indices)
                 if log_metrics and self.enable_storage_metrics:
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
@@ -629,6 +679,9 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
+        self.pending_write_queue.clear()
+        self.pending_write_node_ids.clear()
+        self.pinned_size_ = 0
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -688,48 +741,88 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
-        host_indices = self.cache_controller.write(
-            device_indices=node.value,
-            node_id=node.id,
-            **self._get_extra_pools(),
-        )
-        if host_indices is None:
-            self.evict_host(len(node.value))
+        if self.host_memory_mode == "buffer_only":
+            if (
+                self.enable_storage
+                and not write_back
+                and node.id not in self.ongoing_write_through
+                and node.id not in self.pending_write_node_ids
+            ):
+                self.pending_write_queue.append(node)
+                self.pending_write_node_ids.add(node.id)
+            return 0
+
+        written = 0
+        if node.id not in self.ongoing_write_through:
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
                 **self._get_extra_pools(),
             )
-        if host_indices is not None:
-            node.host_value = host_indices.clone()
-            assert len(node.host_value) > 0
-            self.ongoing_write_through[node.id] = node
-            if not write_back:
-                # no need to lock nodes if write back
-                self.inc_lock_ref(node)
-            # Note: store(CPU) event is deferred to writing_check() after the
-            # async DMA transfer is confirmed complete.
-        else:
-            return 0
+            if host_indices is None:
+                self.evict_host(len(node.value))
+                host_indices = self.cache_controller.write(
+                    device_indices=node.value,
+                    node_id=node.id,
+                    **self._get_extra_pools(),
+                )
+            if host_indices is not None:
+                node.host_value = host_indices.clone()
+                assert len(node.host_value) > 0
+                self.ongoing_write_through[node.id] = (node, None)
+                if not write_back:
+                    # no need to lock nodes if write back
+                    self.inc_lock_ref(node)
+                written = len(host_indices)
+        return written
 
-        return len(host_indices)
-
-    def write_backup_storage(self, node: TreeNode):
+    def write_backup_storage(
+        self, node: TreeNode, host_indices: Optional[torch.Tensor] = None
+    ):
         prefix_keys = (
             node.get_prefix_hash_values(node.parent)
             if self.hicache_storage_pass_prefix_keys
             else None
         )
+        # host_indices is non-None only in buffer_only mode where the buffer
+        # pages are separately allocated and must be freed after the write.
+        # In cache mode we read from node.host_value which belongs to the node.
+        free_indices = host_indices
+        if host_indices is None:
+            host_indices = node.host_value
 
         operation_id = self.cache_controller.write_storage(
-            node.host_value,
+            host_indices,
             node.key,
             node.hash_value,
             prefix_keys,
             **self._get_extra_pools(),
         )
-        self.ongoing_backup[operation_id] = node
+        self.ongoing_backup[operation_id] = (node, free_indices)
         node.protect_host()
+
+    def _flush_pending_writes(self):
+        """Flush queued buffer_only writes to host memory."""
+        while self.pending_write_queue:
+            node = self.pending_write_queue[0]
+            if (
+                node.value is None
+                or node.backuped
+                or node.id in self.ongoing_write_through
+            ):
+                self.pending_write_queue.popleft()
+                self.pending_write_node_ids.discard(node.id)
+                continue
+            host_indices = self.cache_controller.write(
+                device_indices=node.value,
+                node_id=node.id,
+            )
+            if host_indices is None:
+                break
+            self.pending_write_queue.popleft()
+            self.pending_write_node_ids.discard(node.id)
+            self.ongoing_write_through[node.id] = (node, host_indices)
+            self.inc_lock_ref(node)
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -749,13 +842,15 @@ class HiRadixCache(RadixCache):
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
                     finish_event.synchronize()
                     for ack_id in ack_list:
-                        backuped_node = self.ongoing_write_through.pop(ack_id)
+                        backuped_node, host_indices = self.ongoing_write_through.pop(
+                            ack_id
+                        )
                         # DMA confirmed -- block is now on host.
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
                         )
                         if self.enable_storage:
-                            self.write_backup_storage(backuped_node)
+                            self.write_backup_storage(backuped_node, host_indices)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -778,12 +873,12 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()
             for ack_id in ack_list:
-                backuped_node = self.ongoing_write_through.pop(ack_id)
+                backuped_node, host_indices = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                    self.write_backup_storage(backuped_node, host_indices)
             finish_count -= 1
 
     def loading_check(self):
@@ -929,8 +1024,9 @@ class HiRadixCache(RadixCache):
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
         self._record_remove_event(node)
-        self.cache_controller.mem_pool_device_allocator.free(node.value)
         num_evicted = len(node.value)
+        self.cache_controller.mem_pool_device_allocator.free(node.value)
+        node.value = None
         self._delete_leaf(node)
         return num_evicted
 
@@ -951,6 +1047,10 @@ class HiRadixCache(RadixCache):
                 continue
 
             if x.host_ref_counter > 0:
+                continue
+
+            # In buffer_only mode host_value is transient and may already be None
+            if x.host_value is None:
                 continue
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
@@ -1041,12 +1141,42 @@ class HiRadixCache(RadixCache):
 
         return device_indices
 
+    def _load_to_device(
+        self, host_indices: torch.Tensor, node_id: int
+    ) -> Optional[torch.Tensor]:
+        """Allocate device memory and synchronously copy host data into it."""
+        device_indices = self.cache_controller.load(
+            host_indices=host_indices, node_id=node_id
+        )
+        if device_indices is None:
+            self.evict(EvictParams(num_tokens=len(host_indices)))
+            device_indices = self.cache_controller.load(
+                host_indices=host_indices, node_id=node_id
+            )
+        if device_indices is None:
+            logger.warning(
+                "Could not allocate device memory for %d tokens", len(host_indices)
+            )
+            return None
+        self.cache_controller.start_loading()
+        _start_event, finish_event, _ack_ids = self.cache_controller.ack_load_queue.pop(
+            0
+        )
+        finish_event.synchronize()
+        return device_indices
+
     def init_load_back(
         self,
         params: InitLoadBackParams,
     ):
         last_node = params.best_match_node
         mem_quota = params.mem_quota
+        if self.host_memory_mode == "buffer_only":
+            # No persistent host tier to load back from; skip H2D transfer.
+            return (
+                torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_node,
+            )
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
@@ -1078,6 +1208,8 @@ class HiRadixCache(RadixCache):
         self.loading_check()
         if self.enable_storage:
             self.drain_storage_control_queues()
+        if self.pending_write_queue:
+            self._flush_pending_writes()
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
@@ -1181,18 +1313,33 @@ class HiRadixCache(RadixCache):
         min_completed_tokens = completed_tokens_tensor.item()
         fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
-        matched_length = self._insert_helper_host(
-            last_host_node,
-            fetched_key,
-            written_indices,
-            hash_value[: min_completed_tokens // self.page_size],
-        )
-
-        self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
-        self.cache_controller.append_host_mem_release(
-            host_indices[min_completed_tokens:completed_tokens]
-        )
+        matched_length = 0
+        if self.host_memory_mode == "buffer_only":
+            device_indices = self._load_to_device(written_indices, last_host_node.id)
+            if device_indices is not None:
+                matched_length = self._insert_helper_storage_device(
+                    last_host_node,
+                    fetched_key,
+                    device_indices,
+                    hash_value[: min_completed_tokens // self.page_size],
+                )
+                if matched_length > 0:
+                    self.cache_controller.evict_device(device_indices[:matched_length])
+            self.cache_controller.mem_pool_host.free(host_indices)
+        else:
+            matched_length = self._insert_helper_host(
+                last_host_node,
+                fetched_key,
+                written_indices,
+                hash_value[: min_completed_tokens // self.page_size],
+            )
+            self.cache_controller.mem_pool_host.free(host_indices[:matched_length])
+            self.cache_controller.append_host_mem_release(
+                host_indices[min_completed_tokens:completed_tokens]
+            )
         last_host_node.release_host()
+        if self.host_memory_mode == "buffer_only":
+            self.dec_lock_ref(last_host_node)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
@@ -1241,10 +1388,15 @@ class HiRadixCache(RadixCache):
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
+            if last_node.host_value is not None:
+                host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
-        while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+
+        if self.host_memory_mode == "cache":
+            while not last_host_node.backuped:
+                last_host_node = last_host_node.parent
+        else:
+            last_host_node = self.root_node
 
         return MatchResult(
             device_indices=value,
@@ -1279,6 +1431,10 @@ class HiRadixCache(RadixCache):
             return
 
         last_host_node.protect_host()
+        # In buffer_only mode the anchor is a device node; protect it (and
+        # all ancestors) from GPU eviction while the prefetch is in flight.
+        if self.host_memory_mode == "buffer_only":
+            self.inc_lock_ref(last_host_node)
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             self.evict_host(prefetch_length)
@@ -1292,6 +1448,8 @@ class HiRadixCache(RadixCache):
                     prefetch_length
                 )
             else:
+                if self.host_memory_mode == "buffer_only":
+                    self.dec_lock_ref(last_host_node)
                 last_host_node.release_host()
                 # no sufficient host memory for prefetch
                 return
@@ -1354,6 +1512,50 @@ class HiRadixCache(RadixCache):
 
         return matched_length
 
+    def _insert_helper_storage_device(
+        self, node: TreeNode, key: RadixKey, value, hash_value
+    ):
+        """Insert storage-prefetched data as device nodes from a subtree anchor.
+
+        Analogous to _insert_helper_host but targets the device tier. Skips
+        write_backup (data already in storage) and hash computation (hash
+        provided by storage backend).
+        """
+        if len(key) == 0:
+            return 0
+
+        node.last_access_time = time.monotonic()
+        child_key = key.child_key(self.page_size)
+        matched_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            prefix_len = node.key.match(key, page_size=self.page_size)
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+            hash_value = hash_value[prefix_len // self.page_size :]
+            matched_length += prefix_len
+
+            if prefix_len < len(node.key):
+                node = self._split_node(node.key, node, prefix_len)
+
+            if len(key):
+                child_key = key.child_key(self.page_size)
+
+        if len(key):
+            new_node = TreeNode(priority=node.priority)
+            new_node.parent = node
+            new_node.key = key
+            new_node.value = value.clone()
+            new_node.hash_value = hash_value
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(value)
+            self._update_leaf_status(node)
+            self._update_leaf_status(new_node)
+            self._record_store_event(new_node)
+
+        return matched_length
+
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
         child_key = key.child_key(self.page_size)
@@ -1395,7 +1597,7 @@ class HiRadixCache(RadixCache):
         else:
             new_node.value = child.value[:split_len].clone()
             child.value = child.value[split_len:].clone()
-        if child.backuped:
+        if child.host_value is not None:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
@@ -1508,6 +1710,8 @@ class HiRadixCache(RadixCache):
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
         self._barrier_attn_groups()
         last_host_node.release_host()
+        if self.host_memory_mode == "buffer_only":
+            self.dec_lock_ref(last_host_node)
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)

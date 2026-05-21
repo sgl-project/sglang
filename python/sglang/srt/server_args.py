@@ -639,7 +639,8 @@ class ServerArgs:
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
-    hicache_ratio: float = 2.0
+    hicache_host_memory_mode: str = "cache"
+    hicache_ratio: Optional[float] = None
     hicache_size: int = 0
     hicache_write_policy: str = "write_through"
     hicache_io_backend: str = "kernel"
@@ -3495,6 +3496,25 @@ class ServerArgs:
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
         """
+        if self.hicache_host_memory_mode not in ["cache", "buffer_only"]:
+            raise ValueError(
+                "hicache_host_memory_mode must be either 'cache' or 'buffer_only', "
+                f"got {self.hicache_host_memory_mode!r}"
+            )
+
+        if (
+            self.hicache_host_memory_mode == "buffer_only"
+            and self.hicache_write_policy != "write_through"
+        ):
+            raise ValueError(
+                "buffer_only host memory mode currently only supports "
+                "write_through policy, got hicache_write_policy="
+                f"{self.hicache_write_policy!r}"
+            )
+
+        if self.hicache_ratio is None and self.hicache_host_memory_mode == "cache":
+            self.hicache_ratio = 2.0
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -5930,16 +5950,23 @@ class ServerArgs:
             help="Enable hierarchical cache",
         )
         parser.add_argument(
+            "--hicache-host-memory-mode",
+            type=str,
+            choices=["cache", "buffer_only"],
+            default=ServerArgs.hicache_host_memory_mode,
+            help="Choose whether host memory is a persistent HiCache tier or a transient staging buffer only.",
+        )
+        parser.add_argument(
             "--hicache-ratio",
             type=float,
             default=ServerArgs.hicache_ratio,
-            help="The ratio of the size of host KV cache memory pool to the size of device pool.",
+            help="The ratio of the size of host KV cache memory pool to the size of device pool. Defaults to 2.0 in cache mode. In buffer_only mode defaults to a prefill-based sizing when not set.",
         )
         parser.add_argument(
             "--hicache-size",
             type=int,
             default=ServerArgs.hicache_size,
-            help="The size of host KV cache memory pool in gigabytes, which will override the hicache_ratio if set.",
+            help="The size of host KV cache memory pool in gigabytes. In cache mode it overrides --hicache-ratio; in buffer_only mode it overrides the default staging buffer size.",
         )
         parser.add_argument(
             "--hicache-write-policy",

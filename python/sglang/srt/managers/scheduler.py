@@ -1999,7 +1999,23 @@ class Scheduler(
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
-            if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+            # In buffer_only mode last_host_node is root, so we treat
+            # the deepest device node as the host node. This means a device
+            # node is passed where a host node is expected. It works because the
+            # only node-level operations downstream (protect_host/release_host)
+            # are generic eviction locks despite their host-specific naming.
+            # TODO: refactor prefetch path to treat the anchor node as tier-agnostic
+            if (
+                last_host_node is self.tree_cache.root_node
+                and req.last_node is not self.tree_cache.root_node
+            ):
+                last_host_node = req.last_node
+
+            if (
+                last_host_node.backuped
+                or last_host_node is self.tree_cache.root_node
+                or last_host_node.hash_value is not None
+            ):
                 last_hash = last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 new_input_tokens = req.fill_ids[matched_len:]
