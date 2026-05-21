@@ -264,6 +264,7 @@ export const Qwen3Deployment = () => {
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
 
+    // Build model name based on model category
     let modelName;
     if (config.hasThinkingVariants) {
       if (category === 'base') {
@@ -277,8 +278,7 @@ export const Qwen3Deployment = () => {
       modelName = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
     }
 
-    let cmd = 'python -m sglang.launch_server \
-';
+    let cmd = 'python -m sglang.launch_server \\\n';
     cmd += `  --model ${modelName}`;
 
     if (hardware === 'xeon') {
