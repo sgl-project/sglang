@@ -160,7 +160,9 @@ class WaveAttnBackend(AttentionBackend):
             # layer_id=0 may not be a full attention layer
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
+                -1
+            ]
 
         self.forward_metadata: ForwardMetadata = None
 
