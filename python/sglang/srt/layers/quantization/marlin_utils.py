@@ -35,10 +35,31 @@ if TYPE_CHECKING:
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 
-try:
-    from vllm import _custom_ops as ops
-except ImportError:
-    ops = None
+_ops = None
+
+
+def _get_ops():
+    """Lazily import vllm._custom_ops; saves ~7s of vllm.platforms detection at startup."""
+    global _ops
+    if _ops is None:
+        try:
+            from vllm import _custom_ops as ops_mod
+
+            _ops = ops_mod
+        except ImportError:
+            _ops = False
+    return _ops if _ops is not False else None
+
+
+class _OpsProxy:
+    def __getattr__(self, name):
+        ops_mod = _get_ops()
+        if ops_mod is None:
+            raise AttributeError(f"vllm._custom_ops unavailable; cannot access '{name}'")
+        return getattr(ops_mod, name)
+
+
+ops = _OpsProxy()
 
 
 _is_cuda = is_cuda()
@@ -94,12 +115,8 @@ def query_marlin_supported_quant_types(
     # - has_zp is False: return quant_types that has not zero points
     # - has_zp is None: both
     if has_zp is None:
-        types0 = query_marlin_supported_quant_types(
-            False, include_fp_type, device_capability
-        )
-        types1 = query_marlin_supported_quant_types(
-            True, include_fp_type, device_capability
-        )
+        types0 = query_marlin_supported_quant_types(False, include_fp_type, device_capability)
+        types1 = query_marlin_supported_quant_types(True, include_fp_type, device_capability)
         return types0 + types1
 
     if has_zp:
@@ -119,15 +136,12 @@ def _check_marlin_supported(
     has_zp: bool,
     device_capability: Optional[int] = None,
 ) -> tuple[bool, Optional[str]]:
-
     if device_capability is None:
         major, minor = get_device_capability()
         capability = major * 10 + minor
         device_capability = -1 if capability is None else capability
 
-    supported_types = query_marlin_supported_quant_types(
-        has_zp, True, device_capability
-    )
+    supported_types = query_marlin_supported_quant_types(has_zp, True, device_capability)
 
     if quant_type not in supported_types:
         return (
@@ -158,9 +172,7 @@ def check_marlin_supported(
     return cond
 
 
-def verify_marlin_supported(
-    quant_type: ScalarType, group_size: int, has_zp: bool = False
-) -> None:
+def verify_marlin_supported(quant_type: ScalarType, group_size: int, has_zp: bool = False) -> None:
     cond, err_msg = _check_marlin_supported(quant_type, group_size, has_zp)
     if not cond:
         assert err_msg is not None
@@ -173,7 +185,6 @@ def verify_marlin_supports_shape(
     input_size: int,
     group_size: int,
 ) -> None:
-
     # Validate output_size_per_partition
     if output_size_per_partition % GPTQ_MARLIN_MIN_THREAD_N != 0:
         raise ValueError(
@@ -222,9 +233,7 @@ def check_marlin_supports_layer(layer: LinearBase, group_size: int) -> bool:
     output_size_per_partition = (
         getattr(layer, "output_size_per_partition", None) or layer.output_size
     )
-    input_size_per_partition = (
-        getattr(layer, "input_size_per_partition", None) or layer.input_size
-    )
+    input_size_per_partition = getattr(layer, "input_size_per_partition", None) or layer.input_size
 
     return check_marlin_supports_shape(
         output_size_per_partition=output_size_per_partition,
@@ -246,27 +255,17 @@ def check_moe_marlin_supports_layer(layer: FusedMoE, group_size: int) -> bool:
     # down: (n, k) = (hidden_size, intermediate_size_per_partition)
     # moe marlin requires n % 128 == 0 and k % 64 == 0
     supports_shape = (
-        hidden_size % 128 == 0
-        and intermediate_size_per_partition % max(64, group_size) == 0
+        hidden_size % 128 == 0 and intermediate_size_per_partition % max(64, group_size) == 0
     )
     supports_group_size = group_size in [-1, 32, 64, 128]
-    return (
-        supports_shape
-        and supports_group_size
-        and supports_router_weight
-        and supports_activation
-    )
+    return supports_shape and supports_group_size and supports_router_weight and supports_activation
 
 
-def marlin_make_workspace(
-    device: torch.device, max_blocks_per_sm: int = 1
-) -> torch.Tensor:
+def marlin_make_workspace(device: torch.device, max_blocks_per_sm: int = 1) -> torch.Tensor:
     # In the new marlin kernel, we use the num of threadblocks as workspace
     # size. The num of threadblocks is sms_count * max_blocks_per_sm.
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    return torch.zeros(
-        sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False
-    )
+    return torch.zeros(sms * max_blocks_per_sm, dtype=torch.int, device=device, requires_grad=False)
 
 
 def marlin_is_k_full(act_order: bool, is_row_parallel: bool) -> bool:
@@ -283,15 +282,11 @@ def marlin_repeat_scales_on_all_ranks(
 
 
 def marlin_make_empty_g_idx(device: torch.device) -> torch.Tensor:
-    return torch.nn.Parameter(
-        torch.empty(0, dtype=torch.int, device=device), requires_grad=False
-    )
+    return torch.nn.Parameter(torch.empty(0, dtype=torch.int, device=device), requires_grad=False)
 
 
 def marlin_make_empty_zp(device: torch.device) -> torch.Tensor:
-    return torch.nn.Parameter(
-        torch.empty(0, dtype=torch.int, device=device), requires_grad=False
-    )
+    return torch.nn.Parameter(torch.empty(0, dtype=torch.int, device=device), requires_grad=False)
 
 
 def marlin_sort_g_idx(g_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -312,7 +307,6 @@ def get_scale_perms():
 def marlin_permute_scales(
     s: torch.Tensor, size_k: int, size_n: int, group_size: int
 ) -> torch.Tensor:
-
     scale_perm, scale_perm_single = get_scale_perms()
     if group_size < size_k and group_size != -1:
         s = s.reshape((-1, len(scale_perm)))[:, scale_perm]
@@ -348,9 +342,7 @@ def marlin_moe_permute_scales(
     return output
 
 
-def marlin_zero_points(
-    zp: torch.Tensor, size_k: int, size_n: int, num_bits: int
-) -> torch.Tensor:
+def marlin_zero_points(zp: torch.Tensor, size_k: int, size_n: int, num_bits: int) -> torch.Tensor:
     # Permute zero-points in a similar way to scales, but do not use the
     # "single" permutation, since zero-points are applied on every MMA
     scale_perm, _ = get_scale_perms()
@@ -440,7 +432,6 @@ def maybe_warn_marlin_atomic_add_env():
 def should_use_atomic_add_reduce(
     m: int, n: int, k: int, device: torch.device, dtype: torch.dtype
 ) -> bool:
-
     # the performance of atomicAdd is better than global reduce
     # only when m*n is small and k is large
     if n >= 2048 or k < 2048 or device.type != "cuda":
@@ -675,13 +666,11 @@ class MarlinConfig(QuantizationConfig):
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
         # compat: autogptq >=0.8.0 use checkpoint_format: str
         # compat: autogptq <=0.7.1 is_marlin_format: bool
-        is_marlin_format = hf_quant_cfg.get(
-            "checkpoint_format"
-        ) == "marlin" or hf_quant_cfg.get("is_marlin_format", False)
-
-        is_valid_user_quant = (
-            user_quant is None or user_quant == "gptq" or user_quant == "marlin"
+        is_marlin_format = hf_quant_cfg.get("checkpoint_format") == "marlin" or hf_quant_cfg.get(
+            "is_marlin_format", False
         )
+
+        is_valid_user_quant = user_quant is None or user_quant == "gptq" or user_quant == "marlin"
 
         if is_marlin_format and is_valid_user_quant:
             msg = "The model is serialized in {} format. Using {} kernel.".format(
@@ -692,9 +681,7 @@ class MarlinConfig(QuantizationConfig):
 
         return None
 
-    def get_quant_method(
-        self, layer: torch.nn.Module, prefix: str
-    ) -> Optional[MarlinLinearMethod]:
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str) -> Optional[MarlinLinearMethod]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
@@ -729,9 +716,7 @@ class MarlinLinearMethod(LinearMethodBase):
         weight_loader = extra_weight_attrs["weight_loader"]
 
         if params_dtype != torch.float16:
-            raise ValueError(
-                f"The params dtype must be float16, but got {params_dtype}"
-            )
+            raise ValueError(f"The params dtype must be float16, but got {params_dtype}")
 
         # Validate output_size_per_partition
         output_size_per_partition = sum(output_partition_sizes)
@@ -766,9 +751,7 @@ class MarlinLinearMethod(LinearMethodBase):
             )
 
         # Check that we have at least 4 tiles horizontally in the shard
-        num_tiles_per_perm = self.quant_config.perm_len // (
-            self.quant_config.tile_size**2
-        )
+        num_tiles_per_perm = self.quant_config.perm_len // (self.quant_config.tile_size**2)
         if output_size_per_partition % num_tiles_per_perm != 0:
             raise ValueError("Each permutation group must reside on the same gpu")
 
@@ -809,9 +792,7 @@ class MarlinLinearMethod(LinearMethodBase):
         if input_groups == 1:
             scales = ChannelQuantScaleParameter(output_dim=1, **weight_scale_args)
         else:
-            scales = GroupQuantScaleParameter(
-                output_dim=1, input_dim=0, **weight_scale_args
-            )
+            scales = GroupQuantScaleParameter(output_dim=1, input_dim=0, **weight_scale_args)
 
         # Allocate workspace (Used for internal locking mechanism)
         max_workspace_size = (
@@ -849,9 +830,7 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
-        output_2d = ops.marlin_gemm(
-            x_2d, qweight, scales, workspace, size_m, size_n, size_k
-        )
+        output_2d = ops.marlin_gemm(x_2d, qweight, scales, workspace, size_m, size_n, size_k)
 
         output = output_2d.view(x.shape[:-1] + (output_2d.shape[1],))
 
@@ -875,9 +854,7 @@ def fake_unified_apply_gptq_marlin_gemm(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ) -> torch.Tensor:
-    return input.new_empty(
-        (input.shape[0], output_size_per_partition), dtype=input.dtype
-    )
+    return input.new_empty((input.shape[0], output_size_per_partition), dtype=input.dtype)
 
 
 @register_custom_op(fake_impl=fake_unified_apply_gptq_marlin_gemm)
@@ -933,9 +910,7 @@ def fake_unified_apply_gptq_marlin_gemm_with_wtype(
     use_fp32_reduce: bool,
     is_zp_float: bool,
 ) -> torch.Tensor:
-    return input.new_empty(
-        (input.shape[0], output_size_per_partition), dtype=input.dtype
-    )
+    return input.new_empty((input.shape[0], output_size_per_partition), dtype=input.dtype)
 
 
 @register_custom_op(fake_impl=fake_unified_apply_gptq_marlin_gemm_with_wtype)
