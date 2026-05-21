@@ -6,7 +6,10 @@ from _pytest.logging import LogCaptureFixture
 
 from sglang.srt.kv_canary.perturb import real_kv_used
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.perturb.slot_picker import ActiveSlotTarget
+from sglang.srt.kv_canary.perturb.slot_picker import ReqToTokenEntry
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
@@ -25,7 +28,7 @@ def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
     monkeypatch.setattr(
         real_kv_used,
         "pick_active_slot",
-        lambda **_: ActiveSlotTarget(req_pool_idx=0, position=0, slot=7),
+        lambda **_: ReqToTokenEntry(req_pool_idx=0, position=0, value=7),
     )
 
     with caplog.at_level(logging.INFO, logger=real_kv_used.logger.name):

@@ -65,19 +65,19 @@ def run(
             "kv_canary perturb real_kv_used: skipped because no target group with real_kv_sources_k "
             "matched target_group_kind=%s slot=%d",
             config.target_group_kind,
-            target.slot,
+            target.value,
         )
         return
     source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
     source = group.real_kv_sources_k[source_pick]
     flip_result = flip_first_byte_in_source(
-        group=group, source=source, slot_idx=target.slot
+        group=group, source=source, slot_idx=target.value
     )
     if flip_result is None:
         logger.info(
             "kv_canary perturb real_kv_used: skipped because slot=%d could not be mapped into "
             "group=%s source_idx=%d",
-            target.slot,
+            target.value,
             group.kind.name,
             source_pick,
         )
@@ -88,7 +88,7 @@ def run(
         "original_byte=0x%02X new_byte=0x%02X",
         group.kind.name,
         source_pick,
-        target.slot,
+        target.value,
         row,
         col,
         original_byte,

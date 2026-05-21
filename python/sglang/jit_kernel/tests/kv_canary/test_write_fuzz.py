@@ -139,6 +139,17 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     )
     expected_input_tokens = fb_input_ids.clone()
     expected_input_positions = fb_positions.clone()
+    if enable_write_verify_inputs:
+        candidate_indices = [
+            idx for idx, slot in enumerate(out_cache_loc_list) if slot >= 0
+        ]
+        rng.shuffle(candidate_indices)
+        mismatch_count = rng.randint(0, len(candidate_indices))
+        for idx in candidate_indices[:mismatch_count]:
+            if rng.choice([False, True]):
+                expected_input_tokens[idx] = expected_input_tokens[idx] + 1
+            else:
+                expected_input_positions[idx] = expected_input_positions[idx] + 1
 
     return WriteFuzzInputs(
         cuda_canary_buf=cuda_buf,
@@ -214,7 +225,7 @@ def _summarize(inputs: WriteFuzzInputs) -> str:
     total = int(inputs.plan_cuda.write_offsets[n_active].item())
     return (
         f"n_reqs={n_active} total_tokens={total} kind={inputs.kernel_kind.name} "
-        f"pseudo={inputs.enable_write_verify_inputs.name} hash_mode={inputs.real_kv_hash_mode.name} "
+        f"pseudo={inputs.enable_write_verify_inputs} hash_mode={inputs.real_kv_hash_mode.name} "
         f"sources={len(inputs.real_kv_sources_cuda)}"
     )
 
