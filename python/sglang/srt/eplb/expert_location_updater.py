@@ -26,7 +26,9 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import get_bool_env_var, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -230,10 +232,19 @@ def update_expert_weights_single_layer(
         # List[Tuple[temp_buffers_expert_location, routed_experts_weights_expert_location]]
         buffer2weight_copy_infos: List[Tuple[int, int]] = []
 
-        _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
+        if _is_npu:
+            # torch_npu batch_isend_irecv requires tensor.storage_offset() == 0,
+            # so we use temporary tensors as recv buffers to avoid non-zero offset
+            recv_tmp_tensors_infos = []
+            _handle_recv(buffer2weight_copy_infos, p2p_op_infos, recv_tmp_tensors_infos)
+        else:
+            _handle_recv(buffer2weight_copy_infos, p2p_op_infos)
         _create_isend_ops(p2p_op_infos)
         _filter_p2p_ops(p2p_op_infos)
-        _execute_p2p_ops(p2p_op_infos)
+        if _is_npu:
+            _execute_p2p_ops(p2p_op_infos, recv_tmp_tensors_infos)
+        else:
+            _execute_p2p_ops(p2p_op_infos)
         _execute_buffer2weight_copies(buffer2weight_copy_infos)
 
         if log_metrics:
@@ -248,14 +259,22 @@ def update_expert_weights_single_layer(
             output_logs.append(f"{p2p_op_infos=}")
             output_logs.append(f"{buffer2weight_copy_infos=}")
 
-    def _handle_recv(buffer2weight_copy_infos, p2p_op_infos):
+    def _handle_recv(
+        buffer2weight_copy_infos, p2p_op_infos, recv_tmp_tensors_infos=None
+    ):
         for dst_expert_location in range(*local_expert_location_range):
             _handle_recv_of_dst_expert_location(
-                dst_expert_location, buffer2weight_copy_infos, p2p_op_infos
+                dst_expert_location,
+                buffer2weight_copy_infos,
+                p2p_op_infos,
+                recv_tmp_tensors_infos,
             )
 
     def _handle_recv_of_dst_expert_location(
-        dst_expert_location: int, buffer2weight_copy_infos, p2p_op_infos
+        dst_expert_location: int,
+        buffer2weight_copy_infos,
+        p2p_op_infos,
+        recv_tmp_tensors_infos=None,
     ):
         logical_expert_id = new_physical_to_logical_map[dst_expert_location]
 
@@ -312,6 +331,7 @@ def update_expert_weights_single_layer(
                 src_rank=chosen_src_rank,
                 logical_expert_id=logical_expert_id,
                 dst_expert_location=dst_expert_location,
+                recv_tmp_tensors_infos=recv_tmp_tensors_infos,
             )
             if debug:
                 output_logs.append(
@@ -330,6 +350,7 @@ def update_expert_weights_single_layer(
             src_rank=chosen_src_rank,
             logical_expert_id=logical_expert_id,
             dst_expert_location=dst_expert_location,
+            recv_tmp_tensors_infos=recv_tmp_tensors_infos,
         )
         if debug:
             output_logs.append(
@@ -344,20 +365,48 @@ def update_expert_weights_single_layer(
         logical_expert_id: int,
         src_rank: int,
         dst_expert_location: int,
+        recv_tmp_tensors_infos,
     ):
-        p2p_op_infos.append(
-            (
-                logical_expert_id,
-                [
+        if _is_npu:
+            # torch_npu batch_isend_irecv requires tensor.storage_offset() == 0.
+            # tensors obtained from slicing/view may have non-zero offset, which
+            # will cause runtime error during p2p recv.
+            # Here we:
+            # clone tensors to create contiguous buffers with offset=0 for recv,
+            # and store these temporary tensors, and copy them back later if needed
+            ops = []
+            tmp_tensors = []
+
+            for i in range(num_tensors):
+                tmp = _get_tensor(temp_buffers, i, dst_expert_location).clone()
+                tmp_tensors.append(tmp)
+
+                ops.append(
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=tmp,
                         peer=src_rank,
                     )
-                    for i in range(num_tensors)
-                ],
+                )
+
+            p2p_op_infos.append((logical_expert_id, ops))
+
+            recv_tmp_tensors_infos.append((dst_expert_location, tmp_tensors))
+        else:
+            p2p_op_infos.append(
+                (
+                    logical_expert_id,
+                    [
+                        P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                            peer=src_rank,
+                        )
+                        for i in range(num_tensors)
+                    ],
+                )
             )
-        )
+
         buffer2weight_copy_infos.append((dst_expert_location, dst_expert_location))
 
     def _create_isend_ops(p2p_op_infos):
@@ -393,22 +442,42 @@ def update_expert_weights_single_layer(
                 f"create_isend_ops_of_logical_expert_id {logical_expert_id=} {src_expert_location=} {same_node_dst_ranks=} {cross_node_dst_ranks=}"
             )
 
-        p2p_op_infos.append(
-            (
-                logical_expert_id,
-                [
-                    P2POp(
-                        op=torch.distributed.isend,
-                        tensor=_get_tensor(
-                            routed_experts_weights, i, src_expert_location
-                        ),
-                        peer=dst_rank,
-                    )
-                    for dst_rank in all_dst_ranks
-                    for i in range(num_tensors)
-                ],
+        if _is_npu:
+            # Here we clone tensors before send to ensure they have offset=0
+            # and are safe for NPU communication.
+            p2p_op_infos.append(
+                (
+                    logical_expert_id,
+                    [
+                        P2POp(
+                            op=torch.distributed.isend,
+                            tensor=_get_tensor(
+                                routed_experts_weights, i, src_expert_location
+                            ).clone(),
+                            peer=dst_rank,
+                        )
+                        for dst_rank in all_dst_ranks
+                        for i in range(num_tensors)
+                    ],
+                )
             )
-        )
+        else:
+            p2p_op_infos.append(
+                (
+                    logical_expert_id,
+                    [
+                        P2POp(
+                            op=torch.distributed.isend,
+                            tensor=_get_tensor(
+                                routed_experts_weights, i, src_expert_location
+                            ),
+                            peer=dst_rank,
+                        )
+                        for dst_rank in all_dst_ranks
+                        for i in range(num_tensors)
+                    ],
+                )
+            )
 
     def _compute_comm_info(logical_expert_id: int):
         all_src_ranks = _deduplicate_ordered(
@@ -477,7 +546,7 @@ def update_expert_weights_single_layer(
                         missing_logical_experts_info.append(logical_expert_id)
                         p2p_op_infos[i] = (logical_expert_id, [])
 
-    def _execute_p2p_ops(p2p_op_infos):
+    def _execute_p2p_ops(p2p_op_infos, recv_tmp_tensors_infos=None):
         sorted_infos = sorted(p2p_op_infos, key=lambda info: info[0])
         p2p_ops = [op for _, ops in sorted_infos for op in ops]
         if len(p2p_ops) == 0:
@@ -486,6 +555,16 @@ def update_expert_weights_single_layer(
         reqs = torch.distributed.batch_isend_irecv(p2p_ops)
         for req in reqs:
             req.wait()
+
+        if _is_npu:
+            # data was received into temporary tensors (with storage_offset == 0)
+            # to satisfy p2p communication constraints. Here we copy the received
+            # data back to the original buffers, which may have non-zero storage_offset.
+            for dst_export_location, tmp_tensors in recv_tmp_tensors_infos:
+                for i in range(num_tensors):
+                    _get_tensor(temp_buffers, i, dst_export_location).copy_(
+                        tmp_tensors[i]
+                    )
 
     def _execute_buffer2weight_copies(buffer2weight_copy_infos):
         for (
