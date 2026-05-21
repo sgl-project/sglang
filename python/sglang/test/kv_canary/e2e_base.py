@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import string
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ _CONTEXT_LENGTH = 8192
 # fixtures (gemma-3-1b sliding_window = 512); short prompts would never exercise
 # the SWA-windowed verify path. Token count is roughly 6k after BPE.
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
+_UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
 class CanaryE2EBase(CustomTestCase):
@@ -231,7 +233,17 @@ def _make_unique_prompts(n: int) -> list[str]:
     Used by perturb_real_kv_unused_cache tests so orphan slots actually stay orphan
     (no future request will hit the corrupted KV). The body is the shared
     _LONG_PROMPT_BODY so the prompt still exceeds the SWA sliding window."""
+    if n > len(_UNIQUE_PROMPT_FIRST_CHARS):
+        raise ValueError(
+            f"unique prompt count {n} exceeds supported count "
+            f"{len(_UNIQUE_PROMPT_FIRST_CHARS)}"
+        )
+
     return [
-        f"<{hex(i * 0x9E3779B1 & 0xFFFFFFFF)[2:]}> {_LONG_PROMPT_BODY}"
+        (
+            f"{_UNIQUE_PROMPT_FIRST_CHARS[i]}"
+            f"{hex(i * 0x9E3779B1 & 0xFFFFFFFF)[2:]} "
+            f"{_LONG_PROMPT_BODY}"
+        )
         for i in range(n)
     ]
