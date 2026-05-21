@@ -228,6 +228,46 @@ def _plan_entries_kernel(
     j_mask = j_offs < my_verify_len  # [INNER_BLOCK] bool
 
     positions = window_start + j_offs  # [INNER_BLOCK]
+    slot, prev_slot = _load_verify_entry_slots(
+        req_to_token_ptr,
+        full_to_swa_lut_ptr,
+        rpi,
+        positions,
+        j_mask,
+        req_to_token_stride0,
+        swa_lut_len,
+        INNER_BLOCK,
+        HAS_SWA_LUT,
+        TOKEN_TO_KV_SLOT_PADDING,
+    )
+
+    _store_verify_entries(
+        out_verify_slot_indices_ptr,
+        out_verify_positions_ptr,
+        out_verify_prev_slot_indices_ptr,
+        slot,
+        positions,
+        prev_slot,
+        verify_start,
+        j_offs,
+        j_mask,
+        verify_capacity,
+    )
+
+
+@triton.jit
+def _load_verify_entry_slots(
+    req_to_token_ptr,
+    full_to_swa_lut_ptr,
+    rpi,
+    positions,
+    j_mask,
+    req_to_token_stride0,
+    swa_lut_len,
+    INNER_BLOCK: tl.constexpr,
+    HAS_SWA_LUT: tl.constexpr,
+    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
+):
     rpi_i64 = rpi.to(tl.int64)  # scalar
     stride_i64 = req_to_token_stride0  # scalar
     positions_i64 = positions.to(tl.int64)  # [INNER_BLOCK]
@@ -267,7 +307,22 @@ def _plan_entries_kernel(
     prev_slot = tl.where(
         prev_pos_valid, prev_translated, chain_head_tile
     )  # [INNER_BLOCK]
+    return slot, prev_slot
 
+
+@triton.jit
+def _store_verify_entries(
+    out_verify_slot_indices_ptr,
+    out_verify_positions_ptr,
+    out_verify_prev_slot_indices_ptr,
+    slot,
+    positions,
+    prev_slot,
+    verify_start,
+    j_offs,
+    j_mask,
+    verify_capacity,
+):
     out_offs = verify_start + j_offs  # [INNER_BLOCK]
     cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
     write_mask = j_mask & cap_mask  # [INNER_BLOCK] bool
