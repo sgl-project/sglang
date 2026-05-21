@@ -10,8 +10,8 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryLaunchCapacities:
-    """Pre-allocation sizes for the per-forward and sweep tensors a CanaryRunner owns. Computed
-    once at install_canary from ServerArgs + ModelRunner metadata; all four fields are upper
+    """Pre-allocation sizes for the per-forward tensors a CanaryRunner owns. Computed
+    once at install_canary from ServerArgs + ModelRunner metadata; all fields are upper
     bounds - actual per-step usage may be smaller but never larger.
 
     Fields:
@@ -24,21 +24,17 @@ class CanaryLaunchCapacities:
             to size the static fb_* PlanInput buffers (= max batch size under cuda graph).
         per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,
             one entry per token written in a single forward.
-        sweep_verify_capacity: VerifyPlan row capacity for the radix sweep launch, sized to the
-            pool slot count.
     """
 
     per_forward_verify_capacity: int
     per_forward_write_req_capacity: int
     per_forward_write_entry_capacity: int
-    sweep_verify_capacity: int
 
     def __post_init__(self) -> None:
         for name, value in (
             ("per_forward_verify_capacity", self.per_forward_verify_capacity),
             ("per_forward_write_req_capacity", self.per_forward_write_req_capacity),
             ("per_forward_write_entry_capacity", self.per_forward_write_entry_capacity),
-            ("sweep_verify_capacity", self.sweep_verify_capacity),
         ):
             if value <= 0:
                 raise ValueError(f"kv-canary: {name} must be positive, got {value}")
@@ -116,5 +112,4 @@ class CanaryLaunchCapacities:
             per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=max_bs,
             per_forward_write_entry_capacity=write_entry_capacity,
-            sweep_verify_capacity=pool_slot_count,
         )

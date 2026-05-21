@@ -58,7 +58,6 @@ class TestComputeLaunchCapacities(CustomTestCase):
                 per_forward_verify_capacity=0,
                 per_forward_write_req_capacity=1,
                 per_forward_write_entry_capacity=1,
-                sweep_verify_capacity=1,
             )
 
     def test_from_args_rejects_empty_pool_capacity(self) -> None:

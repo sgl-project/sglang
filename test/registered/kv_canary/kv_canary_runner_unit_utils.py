@@ -133,7 +133,6 @@ def make_runner(
     group: CanaryBufferGroup | None = None,
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
-    sweep_verify_capacity: int = 8,
 ) -> CanaryRunner:
     if config is None:
         config = make_config()
@@ -150,7 +149,6 @@ def make_runner(
             per_forward_verify_capacity=per_forward_verify_capacity,
             per_forward_write_req_capacity=2,
             per_forward_write_entry_capacity=8,
-            sweep_verify_capacity=sweep_verify_capacity,
         ),
     )
 

@@ -7,9 +7,9 @@ import torch
 
 from sglang.srt.kv_canary.plan_input_builder import (
     PlanInput,
-    build_plan_input_radix_sweep,
     fill_plan_input_per_forward,
 )
+from sglang.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_sweep
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -27,10 +27,6 @@ def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
         fb_req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
         fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
         fb_extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-        extra_verify_slot_indices=torch.zeros(0, dtype=torch.int64, device=device),
-        extra_verify_positions=torch.zeros(0, dtype=torch.int64, device=device),
-        extra_verify_prev_slot_indices=torch.zeros(0, dtype=torch.int64, device=device),
-        extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
     )
 
 
@@ -119,33 +115,31 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_prefix_lens[:3].tolist(), [3, 6, 0])
         self.assertEqual(plan.fb_extend_seq_lens[:3].tolist(), [1, 1, 1])
 
-    def test_build_plan_input_radix_sweep(self):
-        """Verify radix sweep plan inputs include cached slot chains."""
+    def test_build_verify_plan_radix_sweep(self):
+        """Verify radix sweep verify plans include cached slot chains."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        empty_out = build_plan_input_radix_sweep(
+        empty_out = build_verify_plan_radix_sweep(
             radix_cache=empty_cache,
             swa_window_size=0,
             full_to_swa_index_mapping=None,
         )
-        self.assertEqual(int(empty_out.extra_verify_num_valid.item()), 0)
+        self.assertEqual(int(empty_out.verify_num_valid.item()), 0)
 
         cache = make_radix_cache([[], [100, 101, 102]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        out = build_plan_input_radix_sweep(
+        out = build_verify_plan_radix_sweep(
             radix_cache=cache,
             swa_window_size=0,
             full_to_swa_index_mapping=None,
         )
-        self.assertEqual(int(out.extra_verify_num_valid.item()), 3)
-        self.assertEqual(out.extra_verify_slot_indices.dtype, torch.int64)
-        self.assertEqual(out.extra_verify_positions.dtype, torch.int64)
-        self.assertEqual(out.extra_verify_prev_slot_indices.dtype, torch.int64)
-        self.assertEqual(out.extra_verify_slot_indices[:3].tolist(), [100, 101, 102])
-        self.assertEqual(out.extra_verify_positions[:3].tolist(), [0, 1, 2])
-        self.assertEqual(
-            out.extra_verify_prev_slot_indices[:3].tolist(), [-1, 100, 101]
-        )
+        self.assertEqual(int(out.verify_num_valid.item()), 3)
+        self.assertEqual(out.verify_slot_indices.dtype, torch.int64)
+        self.assertEqual(out.verify_positions.dtype, torch.int64)
+        self.assertEqual(out.verify_prev_slot_indices.dtype, torch.int64)
+        self.assertEqual(out.verify_slot_indices[:3].tolist(), [100, 101, 102])
+        self.assertEqual(out.verify_positions[:3].tolist(), [0, 1, 2])
+        self.assertEqual(out.verify_prev_slot_indices[:3].tolist(), [-1, 100, 101])
 
     def test_plan_input_padding_dummy_sentinel(self):
         """Verify padding sentinel rows remain valid plan input entries."""
@@ -166,25 +160,25 @@ class TestSelfUnitPlanInput(CustomTestCase):
         """Verify held radix slots are still included in sweep plans."""
         cache = make_radix_cache([[], [42, 43, 44]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        out = build_plan_input_radix_sweep(
+        out = build_verify_plan_radix_sweep(
             radix_cache=cache,
             swa_window_size=0,
             full_to_swa_index_mapping=None,
         )
-        n = int(out.extra_verify_num_valid.item())
+        n = int(out.verify_num_valid.item())
         self.assertEqual(n, 3)
-        self.assertEqual(set(out.extra_verify_slot_indices[:n].tolist()), {42, 43, 44})
+        self.assertEqual(set(out.verify_slot_indices[:n].tolist()), {42, 43, 44})
 
     def test_truly_free_slot_not_swept(self):
         """Verify free radix slots are excluded from sweep plans."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        out = build_plan_input_radix_sweep(
+        out = build_verify_plan_radix_sweep(
             radix_cache=empty_cache,
             swa_window_size=0,
             full_to_swa_index_mapping=None,
         )
-        self.assertEqual(int(out.extra_verify_num_valid.item()), 0)
+        self.assertEqual(int(out.verify_num_valid.item()), 0)
 
 
 if __name__ == "__main__":

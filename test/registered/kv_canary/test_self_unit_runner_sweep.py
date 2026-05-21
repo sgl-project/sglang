@@ -11,7 +11,7 @@ from kv_canary_runner_unit_utils import (
 )
 
 from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
+from sglang.srt.kv_canary.runner import sweep as sweep_module
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_radix_cache, make_req_to_token_pool
 
@@ -41,7 +41,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         self.assertEqual(sweep_calls, [0, 4, 8])
 
     def test_sweep_runs_radix_path(self) -> None:
-        """Verify sweep execution runs the radix planning path."""
+        """Verify sweep execution runs the radix plan builder path."""
         config = make_config(sweep_interval=1)
         runner = make_runner(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
@@ -52,14 +52,20 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         runner.attach_radix_cache(cache)
 
-        plan_calls: list[str] = []
+        builder_calls: list[str] = []
+        real_builder = sweep_module.build_verify_plan_radix_sweep
+
+        def _spy_builder(**kwargs):
+            builder_calls.append("build")
+            return real_builder(**kwargs)
+
         with patch.object(
-            kernel_launch_module,
-            "launch_canary_plan_kernels",
-            lambda **kwargs: plan_calls.append("plan"),
+            sweep_module,
+            "build_verify_plan_radix_sweep",
+            _spy_builder,
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
-        self.assertGreaterEqual(plan_calls.count("plan"), 1)
+        self.assertGreaterEqual(builder_calls.count("build"), 1)
 
     def test_sweep_path_launches_sweep_kernels(self) -> None:
         """Verify sweep paths launch sweep verify kernels."""
@@ -82,17 +88,23 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in kind for kind in sweep_kernel_kinds))
 
-    def test_sweep_throws_when_walker_output_exceeds_sweep_capacity(self) -> None:
-        """Verify sweep planning rejects walker output beyond capacity."""
-        runner = make_runner(device=self.device, sweep_verify_capacity=1)
+    def test_sweep_allocates_verify_plan_from_walker_output(self) -> None:
+        """Verify sweep planning sizes the verify plan from walker output."""
+        runner = make_runner(device=self.device)
         cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         runner.attach_radix_cache(cache)
 
-        with self.assertRaisesRegex(
-            RuntimeError, r"radix-walker emitted .* sweep verify entries"
+        valid_counts: list[int] = []
+        with patch.object(
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            lambda **kwargs: valid_counts.append(
+                int(kwargs["plan"].verify_num_valid.item())
+            ),
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
+        self.assertTrue(all(count == 5 for count in valid_counts))
 
 
 if __name__ == "__main__":
