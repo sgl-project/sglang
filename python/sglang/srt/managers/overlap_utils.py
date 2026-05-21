@@ -232,27 +232,32 @@ class FutureMap:
         # Slice assignment used to coerce src dtype to buf dtype implicitly;
         # advanced index requires an explicit cast. bonus_tokens / new_seq_lens
         # in particular differ across disagg (int64) and forward (int32) paths.
-        # Write all fields unconditionally — for decode-branch iters the
-        # new_seq_lens / bonus_tokens writes are redundant (post_verify already
-        # wrote them) but idempotent; for extend-branch iters they're the only
-        # writes and must happen to keep buf slots valid.
+        # topk_p / topk_index / hidden_states are forward-only buf fields
+        # (consumed by next iter's resolve_future on forward stream — FIFO
+        # ordering covers them, no fence needed).
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
-        )
-        self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
-            self.new_seq_lens_buf.dtype
-        )
-        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
-            self.bonus_tokens_buf.dtype
         )
         if spec_need_hidden_states():
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        # Fence: skip if post_verify already recorded (keeps fence at verify-end
-        # for overlap). Reset flag for next iter.
+        # new_seq_lens / bonus_tokens are schedule-consumed (resolve_seq_lens_cpu
+        # reads new_seq_lens_buf via cross-stream D2H). Two write sites:
+        #   - decode-branch iter: store_post_verify wrote them already; the
+        #     fence is already at verify-end. Skip here to avoid a redundant
+        #     write that would race with schedule-stream reads guarded only by
+        #     the verify-end fence.
+        #   - extend-branch iter (and disagg bootstrap): no post_verify ran,
+        #     so write them here and record the fence.
         if not self._fence_done_by_post_verify:
+            self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
+                self.new_seq_lens_buf.dtype
+            )
+            self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
+                self.bonus_tokens_buf.dtype
+            )
             self._record_store_done()
         self._fence_done_by_post_verify = False
 
