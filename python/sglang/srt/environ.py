@@ -735,10 +735,26 @@ class Envs:
     # garbage write can trip a CUDA error before the canary's deferred D2H
     # violation pump has a chance to log the canary_kind line.
     SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
-    # Real-KV-byte perturbation. When >0, the canary self-test hook flips one
-    # byte of the real KV pool at an alive-but-not-verified-this-step slot with
-    # this probability per forward, proving the periodic sweep's independent
-    # detection value. Requires --kv-canary-sweep-interval > 0.
+    # Real-KV-used perturbation. When >0, the canary self-test flips byte 0 of
+    # an active req's currently-used KV slot with this probability per forward.
+    # Detection routes through the per-forward HEAD/TAIL verify kernel
+    # (real_kv_hash violation). Simulates CUDA-graph-idle-class bugs where a
+    # live slot's KV byte is silently overwritten.
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    # Real-KV-unused-cache perturbation. When >0, the canary self-test flips
+    # byte 0 of a radix-cached but currently-unused (orphan) KV slot with this
+    # probability per forward. Detection routes through sweep verify only
+    # (per-forward HEAD/TAIL won't look at this slot). Requires
+    # --kv-canary-sweep-interval > 0.
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    # Which CanaryBufferGroup the real_kv_used / real_kv_unused_cache perturb
+    # targets: "full" / "swa" exact-match the PoolKind name, "any" picks at
+    # random among groups with non-empty real_kv_sources. Used by per-group
+    # e2e tests to drive detection deterministically.
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr("any")
+    # Real-KV-byte perturbation. DEPRECATED — retained for one commit so the
+    # old perturb_real_kv_hook keeps compiling; the follow-up commit splits
+    # this into the two used / unused_cache env vars above.
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
