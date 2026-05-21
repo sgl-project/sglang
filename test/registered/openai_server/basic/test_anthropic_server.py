@@ -298,6 +298,13 @@ class TestAnthropicServer(CustomTestCase):
         self.assertEqual(message_start["message"]["role"], "assistant")
         self.assertIn("usage", message_start["message"])
 
+        # Verify input_tokens is reported correctly (not always 0)
+        self.assertGreater(
+            message_start["message"]["usage"]["input_tokens"],
+            0,
+            "message_start should report non-zero input_tokens",
+        )
+
         # Verify we got content deltas
         content_deltas = [e for e in events if e["type"] == "content_block_delta"]
         self.assertTrue(
