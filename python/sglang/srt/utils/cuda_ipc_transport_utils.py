@@ -134,6 +134,7 @@ class MmItemMemoryPool:
         self.occupied_chunks = []
 
         self._lock = threading.Lock()
+        self._pool_full_warned = False
 
         self._recycle_interval = recycle_interval
         self._stop_recycler = False
@@ -229,7 +230,24 @@ class MmItemMemoryPool:
                     self.memory_pool[available_chunk.start : available_chunk.end],
                     available_chunk.start,
                 )
+        self._warn_pool_full_once(src_tensor)
         return None, None, None
+
+    def _warn_pool_full_once(self, src_tensor: torch.Tensor):
+        if self._pool_full_warned:
+            return
+        self._pool_full_warned = True
+        pool_mb = (
+            self.memory_pool.numel() * self.memory_pool.element_size() / (1024 * 1024)
+        )
+        need_mb = src_tensor.numel() * src_tensor.element_size() / (1024 * 1024)
+        logger.warning(
+            "MmItemMemoryPool has no free chunk large enough for a %.2f MiB tensor "
+            "(pool size: %.2f MiB); falling back to non-IPC transport. "
+            "Consider increasing SGLANG_MM_FEATURE_CACHE_MB.",
+            need_mb,
+            pool_mb,
+        )
 
     def recycle_chunks(self):
 
@@ -350,23 +368,25 @@ class CudaIpcTensorTransportProxy:
 
         return state
 
-    def _reconstruct_from_ipc_extra(self, ipc_extra, *, use_cache: bool):
+    def _reconstruct_from_ipc_extra(
+        self, ipc_extra, *, use_cache: bool, rebuild_device_idx: int
+    ):
         shape = ipc_extra["shape"]
         dtype = ipc_extra["dtype"]
         stride = ipc_extra["stride"]
-        target_device = torch.device(f"cuda:{ipc_extra['pool_device_index']}")
-        cache_key = _normalize_pool_cache_key(
-            ipc_extra["pool_handle"], ipc_extra["pool_device_index"]
-        )
+        # Redirect handle[0] to the consumer's device so _new_shared_cuda's
+        # CUDAGuard stays there; peer access handles the cross-GPU open.
+        pool_handle = ipc_extra["pool_handle"]
+        redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
+        target_device = torch.device(f"cuda:{rebuild_device_idx}")
+        cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
 
         with torch.cuda.device(target_device):
             if use_cache:
-                storage = _pool_handle_cache_get_or_open(
-                    cache_key, ipc_extra["pool_handle"]
-                )
+                storage = _pool_handle_cache_get_or_open(cache_key, redirected_handle)
                 storage_to_cache = None
             else:
-                storage = _open_pooled_storage_uncached(ipc_extra["pool_handle"])
+                storage = _open_pooled_storage_uncached(redirected_handle)
                 storage_to_cache = storage
             slice_storage = storage[
                 ipc_extra["pool_byte_offset"] : ipc_extra["pool_byte_offset"]
@@ -426,10 +446,14 @@ class CudaIpcTensorTransportProxy:
                         _target_device,
                         cache_key,
                         storage_to_cache,
-                    ) = self._reconstruct_from_ipc_extra(ipc_extra, use_cache=True)
+                    ) = self._reconstruct_from_ipc_extra(
+                        ipc_extra,
+                        use_cache=True,
+                        rebuild_device_idx=rebuild_device_idx,
+                    )
                 except Exception as e:
                     cache_key = _normalize_pool_cache_key(
-                        ipc_extra["pool_handle"], ipc_extra["pool_device_index"]
+                        ipc_extra["pool_handle"], rebuild_device_idx
                     )
                     logger.info(
                         "Failed to deserialize from cached pooled CUDA IPC handle (%s). "
@@ -442,17 +466,25 @@ class CudaIpcTensorTransportProxy:
                         _target_device,
                         _cache_key,
                         storage_to_cache,
-                    ) = self._reconstruct_from_ipc_extra(ipc_extra, use_cache=False)
+                    ) = self._reconstruct_from_ipc_extra(
+                        ipc_extra,
+                        use_cache=False,
+                        rebuild_device_idx=rebuild_device_idx,
+                    )
                     if storage_to_cache is not None:
                         _pool_handle_cache_set(cache_key, storage_to_cache)
             else:
-                # Non-pooled path: open handle directly (original behavior)
+                # Non-pooled path: redirect handle[0] the same way as the pooled path.
                 try:
-                    storage = torch.UntypedStorage._new_shared_cuda(
-                        *ipc_extra["handle"]
-                    )
-                    target_device = torch.device(f"cuda:{ipc_extra['device_index']}")
+                    original_handle = ipc_extra["handle"]
+                    redirected_handle = (rebuild_device_idx,) + tuple(original_handle)[
+                        1:
+                    ]
+                    target_device = torch.device(f"cuda:{rebuild_device_idx}")
                     with torch.cuda.device(target_device):
+                        storage = torch.UntypedStorage._new_shared_cuda(
+                            *redirected_handle
+                        )
                         slice_tensor = torch.empty(
                             0, dtype=ipc_extra["dtype"], device=target_device
                         ).set_(

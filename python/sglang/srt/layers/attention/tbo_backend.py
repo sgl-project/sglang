@@ -179,6 +179,9 @@ class TboAttnBackend(AttentionBackend):
             assert ans == child.get_cuda_graph_seq_len_fill_value()
         return ans
 
+    def forward(self, *args, **kwargs):
+        return self.primary.forward(*args, **kwargs)
+
     def forward_extend(self, *args, **kwargs):
         return self.primary.forward_extend(*args, **kwargs)
 

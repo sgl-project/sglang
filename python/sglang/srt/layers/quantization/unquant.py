@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -14,6 +18,8 @@ from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
     MoeRunnerConfig,
+    get_deepep_mode,
+    get_moe_a2a_backend,
     get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
@@ -49,8 +55,6 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
-    from aiter import ActivationType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
     from aiter.tuned_gemm import tgemm
 
@@ -161,13 +165,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     """MoE method without quantization."""
 
     def __init__(
-        self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
+        self,
+        use_triton_kernels: bool = False,
+        use_flashinfer_trtllm_moe: bool = False,
+        use_deep_gemm: bool = False,
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
+        self.use_deep_gemm = use_deep_gemm
         self._cache_permute_indices = dict({})
 
     def create_weights(
@@ -229,9 +237,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Skip aiter weight shuffle when using non-auto MoE backend (e.g., triton, triton_kernels)
-        # because aiter CK kernels don't support all GEMM dimensions
-        _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
+        _should_use_aiter_moe = _use_aiter and (
+            get_moe_runner_backend().is_auto() or get_moe_runner_backend().is_aiter()
+        )
         if _should_use_aiter_moe:
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
@@ -245,6 +253,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         # Pack weight for get better performance on CPU
         if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+
+        if (
+            self.use_deep_gemm
+            and layer.w13_weight.dtype == torch.bfloat16
+            and get_moe_a2a_backend().is_deepep()
+            and get_deepep_mode().enable_low_latency()
+            and not _is_npu
+            and not _is_hip
+            and hasattr(layer, "dispatcher")
+        ):
+            layer.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
 
         # Reorder rows of W1 for fused gated activation
         if self.use_flashinfer_trtllm_moe:
@@ -314,8 +333,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                weight.data = weight.data.transpose(1, 2)
-                weight.data = npu_format_cast(weight.data)
+                origin_weight = weight.data.transpose(1, 2)
+                new_weight = origin_weight.contiguous()
+                origin_weight.untyped_storage().resize_(0)
+                weight.data = npu_format_cast(new_weight)
 
         return
 
@@ -371,11 +392,25 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
                 else MoeRunnerBackend.FLASHINFER_TRTLLM
             )
+        elif self.use_deep_gemm:
+            backend = MoeRunnerBackend.DEEP_GEMM
         elif self.use_triton_kernels:
             backend = MoeRunnerBackend.TRITON_KERNELS
         else:
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)
+
+        # Separate runner so CK-shape errors fall back to self.runner on every call.
+        self._aiter_runner: Optional[MoeRunner] = None
+        if (
+            _use_aiter
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            and get_moe_a2a_backend().supports_aiter()
+        ):
+            self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
     @property
     def load_up_proj_weight_first(self) -> bool:
@@ -400,7 +435,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
 
         moe_runner_config = self.moe_runner_config
 
@@ -417,7 +451,22 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 w2_bias=getattr(layer, "w2_weight_bias", None),
             )
             return self.runner.run(dispatch_output, quant_info)
+        elif self.runner.runner_backend.is_deep_gemm():
+            w13_weight = layer.w13_weight
+            w2_weight = layer.w2_weight
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
+
+            # Only use_fp8=False when SGLANG_DEEPEP_BF16_DISPATCH is true,
+            # otherwise use_fp8=True for FP8 dispatch path
+            use_fp8 = not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=w13_weight,
+                w2_weight=w2_weight,
+                use_fp8=use_fp8,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         elif self.use_flashinfer_cutlass:
+            topk_output = dispatch_output.topk_output
             output = flashinfer_cutlass_fused_moe(
                 input=x,
                 token_selected_experts=topk_output.topk_ids,
@@ -451,46 +500,33 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return self.runner.run(dispatch_output, quant_info)
         else:
-            # Skip aiter fused_moe when using non-auto MoE backend (e.g., triton, triton_kernels)
-            # because aiter CK kernels don't support all GEMM dimensions
-            _should_use_aiter_moe = _use_aiter and get_moe_runner_backend().is_auto()
-            if _should_use_aiter_moe:
-                assert not moe_runner_config.no_combine, "unsupported"
-                topk_weights, topk_ids, _ = topk_output
-                if moe_runner_config.apply_router_weight_on_input:
-                    assert (
-                        topk_weights.dim() == 2
-                    ), "`topk_weights` should be in shape (num_tokens, topk)"
-                    _, topk = topk_weights.shape
-                    assert (
-                        topk == 1
-                    ), "Only support topk=1 when `apply_router_weight_on_input` is True"
-                    x = x * topk_weights.to(x.dtype)
-                    topk_weights = torch.ones_like(
-                        topk_weights, dtype=torch.float32
-                    )  # topk_weights must be FP32 (float32)
-                output = fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    activation=(
-                        ActivationType.Silu
-                        if moe_runner_config.activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.expert_mask_gpu,
+            if self._aiter_runner is not None:
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    AiterMoeQuantInfo,
                 )
-                return StandardCombineInput(hidden_states=output)
-            else:
-                quant_info = TritonMoeQuantInfo(
-                    w13_weight=layer.w13_weight,
-                    w2_weight=layer.w2_weight,
-                    b13=getattr(layer, "w13_weight_bias", None),
-                    b2=getattr(layer, "w2_weight_bias", None),
-                )
-                return self.runner.run(dispatch_output, quant_info)
+
+                try:
+                    quant_info = AiterMoeQuantInfo(
+                        w13_weight=layer.w13_weight,
+                        w2_weight=layer.w2_weight,
+                        expert_mask=layer.dispatcher.expert_mask_gpu,
+                    )
+                    return self._aiter_runner.run(dispatch_output, quant_info)
+                except RuntimeError as e:
+                    # AITER CK fused_moe may not support all GEMM dimensions
+                    # (e.g. Gemma4 MoE with 128 experts x 704 intermediate size)
+                    logger.warning_once(
+                        f"AITER CK fused_moe failed ({e}), "
+                        "falling back to Triton MoE runner."
+                    )
+
+            quant_info = TritonMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                b13=getattr(layer, "w13_weight_bias", None),
+                b2=getattr(layer, "w2_weight_bias", None),
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
     def forward_cpu(
         self,
@@ -542,6 +578,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             )
             return StandardCombineInput(hidden_states=output)
 
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            b13=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+        )
+
     def forward_xpu(
         self,
         layer: torch.nn.Module,
@@ -564,6 +608,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights)
             output = fused_experts(
                 x,
                 layer.w13_weight,
@@ -573,6 +620,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
                 activation=moe_runner_config.activation,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=output)
         else:
@@ -582,12 +631,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             ), f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
 
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                b13=getattr(layer, "w13_weight_bias", None),
-                b2=getattr(layer, "w2_weight_bias", None),
-            )
+            quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
 
     def forward_npu(
@@ -677,5 +721,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
+
+    def forward_musa(self, *args, **kwargs) -> CombineInput:
+        return self.forward_cuda(*args, **kwargs)
 
     forward_native = forward_cpu

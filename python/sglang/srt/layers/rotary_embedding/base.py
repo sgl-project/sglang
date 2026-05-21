@@ -99,12 +99,22 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
+        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 apply_rotary_emb
             )
         self.position_cos, self.position_sin = None, None
+
+    def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
+        # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
+        # is expensive, so avoid calling it if possible
+        if (
+            self.cos_sin_cache.device != query.device
+            or self.cos_sin_cache.dtype != query.dtype
+        ):
+            self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""

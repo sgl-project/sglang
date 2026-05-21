@@ -453,9 +453,7 @@ MarlinFuncPtr get_marlin_kernel(
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
 
-#ifdef SGL_MOE_MARLIN_FP4
   NVFP4_GET_IF(host::kFE2M1f)
-#endif
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
 
@@ -1006,6 +1004,16 @@ void moe_wna16_marlin_gemm(
         std::is_same<scalar_t, fp16_t>::value,
         "Computation type must be float16 (half) when using float zero "
         "points.");
+  }
+
+  if (b_q_type == kFE2M1f) {
+    RuntimeCheck(
+        group_size == 16 || group_size == 32,
+        "float4_e2m1f only supports group_size == 16 (NVFP4) or group_size == 32 (MXFP4). Got group_size = ",
+        group_size);
+    RuntimeCheck(
+        group_size != 32 || std::is_same<scalar_t, nv_bfloat16>::value,
+        "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 activations.");
   }
 
   // Verify b_zeros
