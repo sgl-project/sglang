@@ -308,7 +308,13 @@ def fused_experts(
 
 @torch.compile
 def moe_sum_reduce_torch_compile(x, out, routed_scaling_factor):
-    torch.sum(x, dim=1, out=out)
+    # Detach `out` before using it as the `out=` argument to torch.sum.
+    # When this function is traced by Dynamo (e.g. with piecewise_cuda_graph_compiler='inductor'),
+    # `out` may carry a grad_fn (e.g. AsStridedBackward0) because it is an as_strided view of
+    # a parent buffer.  torch.sum(out=...) rejects autograd-tracked tensors.
+    # detach() shares the same storage so the result is still written to the correct memory,
+    # and the following in-place mul_ on the original `out` reads those values correctly.
+    torch.sum(x, dim=1, out=out.detach())
     out.mul_(routed_scaling_factor)
 
 
