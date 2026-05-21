@@ -1498,25 +1498,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
-        # compressed-tensors W4A16 MoE checkpoints do not contain g_idx tensors
-        # when actorder is disabled; they are materialized in
-        # process_weights_after_loading().
-        qc = self.quant_config
-        if (
-            qc is not None
-            and qc.get_name() == "compressed_tensors"
-            and getattr(qc, "is_w4a16_config", lambda: False)()
-        ):
-            weight_quant = qc.target_scheme_map.get("Linear", {}).get("weights")
-            if getattr(weight_quant, "actorder", None) != "group":
-                skipped_checking_patterns.extend(
-                    [
-                        "mlp.experts.w13_weight_g_idx",
-                        "mlp.experts.w2_weight_g_idx",
-                        "mlp.experts.w13_g_idx_sort_indices",
-                        "mlp.experts.w2_g_idx_sort_indices",
-                    ]
-                )
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {
