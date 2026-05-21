@@ -154,6 +154,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.model_executor.pool_context import set_kv_pools
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -740,8 +741,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
-
-        from sglang.srt.model_executor.pool_context import set_kv_pools
 
         set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
 
@@ -3201,6 +3200,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Ensure the correct pools are active for this runner. Necessary when
+        # multiple ModelRunner instances exist (e.g. multi-layer Eagle draft +
+        # target) because each runner has its own token_to_kv_pool.
+        set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
+
         # Check whether can run cuda graph
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
