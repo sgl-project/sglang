@@ -418,8 +418,8 @@ class PiecewiseCudaGraphRunner:
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
 
-        # Attention backend
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Attention backend (eager warmup; no graph capture in progress)
+        self.model_runner.attn_backend.init_forward_data(forward_batch)
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
@@ -594,10 +594,19 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            # PCG capture aligns with full-graph contract: per-iter prep runs
+            # outside model.forward (which is the torch.compile-traced piece
+            # that becomes the captured graph), while the graph-recordable
+            # phase is invoked inside ``run_once`` so it gets traced too.
+            self.model_runner.attn_backend.init_forward_data_out_graph(forward_batch)
 
             # Run and capture
             def run_once():
+                # Graph-recordable metadata prep -- captured into the traced
+                # piecewise graph alongside the model forward. No-op for all
+                # backends in the initial migration.
+                self.model_runner.attn_backend.init_forward_data_in_graph(forward_batch)
+
                 # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
@@ -796,8 +805,14 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
             ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Due to the dispatch kernel for MLA model, we init the metadata
+                # with the original forward_batch. The graph-recordable
+                # ``init_forward_data_in_graph`` ops captured at compile time
+                # are auto-replayed by the traced piecewise graph, so only
+                # the out-graph phase runs here per replay.
+                self.model_runner.attn_backend.init_forward_data_out_graph(
+                    forward_batch
+                )
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
