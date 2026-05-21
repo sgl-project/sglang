@@ -28,8 +28,8 @@ class _ModeConfig:
 
     Fields:
         model_path: HF model id used by popen_launch_server.
-        json_model_override_args: JSON string passed to --json-model-override-args (typically
-            shrinks num_hidden_layers so the canary e2e fits a 1-gpu CI budget).
+        json_model_override_args: JSON string passed to --json-model-override-args, or
+            None to omit the flag entirely.
         cuda_graph_max_bs: --cuda-graph-max-bs value.
         max_running_requests: --max-running-requests value.
         context_length: --context-length value.
@@ -37,7 +37,7 @@ class _ModeConfig:
     """
 
     model_path: str
-    json_model_override_args: str
+    json_model_override_args: Optional[str] = None
     cuda_graph_max_bs: int
     max_running_requests: int
     context_length: int
@@ -47,7 +47,6 @@ class _ModeConfig:
 _MODE_CONFIGS: dict[str, _ModeConfig] = {
     "mha": _ModeConfig(
         model_path="Qwen/Qwen3-0.6B",
-        json_model_override_args=json.dumps({"num_hidden_layers": 1}),
         cuda_graph_max_bs=8,
         max_running_requests=32,
         context_length=8192,
@@ -128,8 +127,6 @@ class CanaryE2EBase(CustomTestCase):
         cls._stderr_buf = io.StringIO()
 
         server_args = [
-            "--json-model-override-args",
-            cls._cfg.json_model_override_args,
             "--kv-canary",
             cls.kv_canary_mode,
             "--cuda-graph-max-bs",
@@ -141,6 +138,13 @@ class CanaryE2EBase(CustomTestCase):
             "--max-total-tokens",
             str(cls._cfg.max_total_tokens),
         ]
+        if cls._cfg.json_model_override_args is not None:
+            server_args.extend(
+                [
+                    "--json-model-override-args",
+                    cls._cfg.json_model_override_args,
+                ]
+            )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
             cls.base_url,
