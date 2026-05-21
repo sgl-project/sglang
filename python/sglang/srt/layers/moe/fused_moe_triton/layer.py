@@ -638,13 +638,25 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if self._has_fused_shared and expert_id >= self._num_global_routed:
-            # This is a shared expert.
-            physical_expert_ids = [expert_id]
+        require_global_experts = getattr(param, "_sglang_require_global_experts", False)
+        shared_expert_id = (
+            expert_id - global_expert_location_metadata.num_logical_experts
+            if self._has_fused_shared and expert_id is not None
+            else -1
+        )
+        if 0 <= shared_expert_id < self.num_fused_shared_experts:
+            # Checkpoint shared experts start after logical routed experts, while
+            # local fused MoE weights store them after physical routed experts.
+            if require_global_experts and is_deepep_class_backend():
+                physical_expert_ids = [
+                    rank * self.num_local_experts
+                    + self._num_local_routed
+                    + shared_expert_id
+                    for rank in range(self.moe_ep_size)
+                ]
+            else:
+                physical_expert_ids = [self._num_global_routed + shared_expert_id]
         else:
-            require_global_experts = getattr(
-                param, "_sglang_require_global_experts", False
-            )
             physical_expert_ids = (
                 global_expert_location_metadata.logical_to_all_physical(
                     self.layer_id, expert_id, require_global_experts
