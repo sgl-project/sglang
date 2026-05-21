@@ -380,6 +380,7 @@ class ServerArgsAutoTuner:
         ]
         if self._should_auto_enable_dit_layerwise_offload():
             components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
+            self._set_default_wan_dit_offload_prefetch_size()
         return components
 
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
@@ -402,11 +403,20 @@ class ServerArgsAutoTuner:
             return True
         if args.performance_mode != "auto":
             return False
-        return self._is_large_wan_pipeline_config()
+        return self._is_wan2_2_a14b_pipeline_config()
 
-    def _is_large_wan_pipeline_config(self) -> bool:
+    def _is_wan2_2_a14b_pipeline_config(self) -> bool:
         config_name = self.server_args.pipeline_config.__class__.__name__
-        return any(token in config_name for token in ("14B", "720P", "I2V480P"))
+        return config_name.startswith("Wan2_2_") and "A14B" in config_name
+
+    def _set_default_wan_dit_offload_prefetch_size(self) -> None:
+        args = self.server_args
+        if (
+            args.performance_mode == "auto"
+            and self._is_wan2_2_a14b_pipeline_config()
+            and not args.is_arg_explicitly_set("dit_offload_prefetch_size")
+        ):
+            args.dit_offload_prefetch_size = 2
 
     def _is_wan_pipeline_config(self) -> bool:
         return any(
