@@ -20,6 +20,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
     pick_target_group,
+    should_run_perturbation,
 )
 
 if TYPE_CHECKING:
@@ -37,13 +38,12 @@ def run(
     buffer_groups: tuple[CanaryBufferGroup, ...],
     warmup_gate: WarmupGate,
 ) -> None:
-    if config.real_kv_used_prob <= 0.0:
-        return
-    if warmup_gate.is_in_warmup():
-        return
-    if forward_batch is None:
-        return
-    if torch.rand((), device="cpu").item() >= config.real_kv_used_prob:
+    if not should_run_perturbation(
+        perturb_name="real_kv_used",
+        probability=config.real_kv_used_prob,
+        warmup_gate=warmup_gate,
+        forward_batch=forward_batch,
+    ):
         return
 
     target = pick_active_slot(
@@ -52,12 +52,21 @@ def run(
         exclude_out_cache_loc=True,
     )
     if target is None:
+        logger.info(
+            "kv_canary perturb real_kv_used: skipped because no active slot was found"
+        )
         return
     group = pick_target_group(
         buffer_groups=buffer_groups,
         target_kind=config.target_group_kind,
     )
     if group is None or not group.real_kv_sources_k:
+        logger.info(
+            "kv_canary perturb real_kv_used: skipped because no target group with real_kv_sources_k "
+            "matched target_group_kind=%s slot=%d",
+            config.target_group_kind,
+            target.slot,
+        )
         return
     source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
     source = group.real_kv_sources_k[source_pick]
@@ -65,6 +74,13 @@ def run(
         group=group, source=source, slot_idx=target.slot
     )
     if flip_result is None:
+        logger.info(
+            "kv_canary perturb real_kv_used: skipped because slot=%d could not be mapped into "
+            "group=%s source_idx=%d",
+            target.slot,
+            group.kind.name,
+            source_pick,
+        )
         return
     row, col, original_byte = flip_result
     logger.info(

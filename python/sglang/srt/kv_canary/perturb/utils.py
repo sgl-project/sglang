@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -11,6 +11,9 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class WarmupGate:
@@ -34,21 +37,52 @@ class WarmupGate:
     def is_in_warmup(self) -> bool:
         step = self._pump_and_allreduce.step_counter
         warmup_steps = self._config.warmup_steps
+
         if step < warmup_steps:
-            if not self._warmup_disable_logged:
-                logger.info(
-                    "kv_canary perturb: disabled during warmup window "
-                    "(first %d forward steps)",
-                    warmup_steps,
-                )
-                self._warmup_disable_logged = True
+            self._log_warmup_disabled_once(warmup_steps)
             return True
-        if not self._warmup_enable_logged:
-            logger.info(
-                "kv_canary perturb: enabled after warmup window at step=%d", step
-            )
-            self._warmup_enable_logged = True
+
+        self._log_warmup_enabled_once(step)
         return False
+
+    def _log_warmup_disabled_once(self, warmup_steps: int) -> None:
+        if self._warmup_disable_logged:
+            return
+
+        logger.info(
+            "kv_canary perturb: disabled during warmup window "
+            "(first %d forward steps)",
+            warmup_steps,
+        )
+        self._warmup_disable_logged = True
+
+    def _log_warmup_enabled_once(self, step: int) -> None:
+        if self._warmup_enable_logged:
+            return
+
+        logger.info("kv_canary perturb: enabled after warmup window at step=%d", step)
+        self._warmup_enable_logged = True
+
+
+def should_run_perturbation(
+    *,
+    perturb_name: str,
+    probability: float,
+    warmup_gate: WarmupGate,
+    forward_batch: Optional["ForwardBatch"],
+    require_forward_batch: bool = True,
+) -> bool:
+    if probability <= 0.0:
+        return False
+    if warmup_gate.is_in_warmup():
+        return False
+    if require_forward_batch and forward_batch is None:
+        logger.info(
+            "kv_canary perturb %s: skipped because forward_batch is unavailable",
+            perturb_name,
+        )
+        return False
+    return torch.rand((), device="cpu").item() < probability
 
 
 def pick_target_group(

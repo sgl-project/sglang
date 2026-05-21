@@ -44,7 +44,6 @@ def install_canary(
         tp_group=get_tp_group(),
         pp_group=get_pp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
-        radix_cache=None,
         launch_capacities=CanaryLaunchCapacities.from_args(
             server_args=model_runner.server_args,
             req_to_token_pool_size=model_runner.req_to_token_pool.size,

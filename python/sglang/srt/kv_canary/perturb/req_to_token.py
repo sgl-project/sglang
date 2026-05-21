@@ -19,7 +19,7 @@ import torch
 
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
-from sglang.srt.kv_canary.perturb.utils import WarmupGate
+from sglang.srt.kv_canary.perturb.utils import WarmupGate, should_run_perturbation
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -35,23 +35,24 @@ def run(
     req_to_token_pool: "ReqToTokenPool",
     warmup_gate: WarmupGate,
 ) -> None:
-    if config.req_to_token_prob <= 0.0:
-        return
-    if warmup_gate.is_in_warmup():
-        return
-    if forward_batch is None:
-        return
-    if torch.rand((), device="cpu").item() >= config.req_to_token_prob:
+    if not should_run_perturbation(
+        perturb_name="req_to_token",
+        probability=config.req_to_token_prob,
+        warmup_gate=warmup_gate,
+        forward_batch=forward_batch,
+    ):
         return
 
     active_targets = collect_active_slots(
         forward_batch=forward_batch,
         req_to_token_pool=req_to_token_pool,
-        exclude_out_cache_loc=False,
+        exclude_out_cache_loc=True,
     )
-    # Old req_to_token hook required slot >= 1 (treating 0 as padding sentinel) — preserve.
     active_targets = [t for t in active_targets if t.slot >= 1]
     if not active_targets:
+        logger.info(
+            "kv_canary perturb req_to_token: skipped because no active nonzero slots were found"
+        )
         return
 
     pick = int(torch.randint(0, len(active_targets), (1,)).item())
@@ -60,6 +61,11 @@ def run(
         item.slot for item in active_targets if item.slot != target.slot
     ]
     if not replacement_slots:
+        logger.info(
+            "kv_canary perturb req_to_token: skipped because no replacement slot differs from "
+            "original_slot=%d",
+            target.slot,
+        )
         return
     replacement_pick = int(torch.randint(0, len(replacement_slots), (1,)).item())
     new_value = replacement_slots[replacement_pick]
