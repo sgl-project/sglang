@@ -176,3 +176,9 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
     def test_gsm8k(self):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507 reference accuracy: 0.94
         self._test_gsm8k(accuracy_threshold=0.89)
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()
