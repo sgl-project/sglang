@@ -68,7 +68,7 @@ def get_image_size(img: DeepseekOCRImage) -> Tuple[int, int]:
 def resize_image(img: DeepseekOCRImage, size: Tuple[int, int]) -> DeepseekOCRImage:
     """Resize image to (width, height) for both PIL and tensor."""
     if isinstance(img, Image.Image):
-        return img.resize(size)
+        return img.resize(size, Image.BICUBIC)
     return TF.resize(
         img,
         [size[1], size[0]],
