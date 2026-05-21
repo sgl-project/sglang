@@ -349,8 +349,7 @@ class WhisperEncoder(torch.nn.Module):
         inputs_embeds = torch.nn.functional.gelu(self.conv1(input_features))
         inputs_embeds = torch.nn.functional.gelu(self.conv2(inputs_embeds))
 
-        inputs_embeds = inputs_embeds.mT
-
+        inputs_embeds = inputs_embeds.mT.contiguous()
         hidden_states = inputs_embeds + self.embed_positions(position_ids)
 
         for encoder_layer in self.layers:
@@ -508,7 +507,7 @@ class WhisperForConditionalGeneration(torch.nn.Module):
 
             if features_to_encode:
                 # Batch all features and run encoder once instead of sequentially
-                features_batch = torch.cat(features_to_encode, dim=0)
+                features_batch = torch.cat(features_to_encode, dim=0).contiguous()
                 encoder_len = features_batch.shape[-1] // 2
                 encoder_position_ids = torch.arange(
                     encoder_len, device=features_batch.device
