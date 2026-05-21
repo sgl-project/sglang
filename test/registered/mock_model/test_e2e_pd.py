@@ -37,6 +37,8 @@ def _send_parallel_requests(
     timeout: float = 60.0,
     max_workers: int = 16,
 ) -> List[Dict[str, object]]:
+    """Fire N /generate requests concurrently; return raw response dicts."""
+
     def _one(i: int) -> Dict[str, object]:
         payload = {
             "input_ids": _make_input_ids(seed=i, length=_INPUT_LEN),
@@ -62,6 +64,7 @@ def _make_input_ids(*, seed: int, length: int) -> List[int]:
 
 
 def _tee_stream(src: object, sinks: List[object]) -> None:
+    """Read lines from src and write to all sinks (thread target)."""
     for line in iter(src.readline, ""):
         for sink in sinks:
             sink.write(line)
@@ -77,6 +80,7 @@ def _popen_pd_with_capture(
     stdout_buf: io.StringIO,
     stderr_buf: io.StringIO,
 ) -> subprocess.Popen:
+    """Launch a PD server process with tee'd stdout/stderr capture."""
     _, host, port = base_url.split(":")
     host = host[2:]
     command = [
@@ -115,6 +119,8 @@ def _popen_pd_with_capture(
 
 
 class _MockModelPDBase(PDDisaggregationServerBase):
+    """PD fixture for mock-model + canary e2e tests."""
+
     model: ClassVar[str] = MOCK_MODEL_PATH
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args()
     extra_decode_args: ClassVar[List[str]] = mock_model_server_args()
