@@ -1,0 +1,31 @@
+[package]
+name = "bench-vlm-preproc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+turbojpeg = { version = "1.3", features = ["pkg-config"] }  # libjpeg-turbo SIMD + fractional scaling M/8
+png = "0.18"                  # row-streamed PNG decode
+fast_image_resize = "5.1"
+rayon = "1.10"
+bytemuck = "1.21"
+clap = { version = "4.5", features = ["derive"] }
+
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
+[[bin]]
+name = "dump"
+path = "src/dump.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[profile.bench]
+inherits = "release"
+debug = true

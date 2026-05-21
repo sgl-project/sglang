@@ -1,0 +1,17 @@
+[package]
+name = "bench-smg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+llm-multimodal = { path = "/Users/alex.nails/workplace/smg/crates/multimodal" }
+image = "0.25"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[workspace]
+# Make this a standalone workspace, decoupled from smg's workspace,
+# so we can build without smg's workspace settings polluting us.

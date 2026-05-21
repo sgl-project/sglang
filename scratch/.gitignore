@@ -1,0 +1,4 @@
+target/
+.venv/
+fixtures/
+*.f32
