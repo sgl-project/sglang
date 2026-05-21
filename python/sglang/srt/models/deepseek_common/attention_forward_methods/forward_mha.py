@@ -10,7 +10,10 @@ from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
+from sglang.srt.model_executor.pool_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -39,7 +42,7 @@ if _use_aiter_gfx95:
 
 
 def _resolve_attn_backend(forward_batch: ForwardBatch):
-    backend = forward_batch.attn_backend
+    backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):
         backend = backend.primary
     return backend
@@ -335,8 +338,8 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.prepare_chunked_prefix_cache_info(q.device)
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
 
         forward_batch.mha_return_lse = has_extend_prefix
         # Do mha for extended part without prefix
@@ -381,8 +384,8 @@ class DeepseekMHAForwardMixin:
         # Only initialize the info once
         if has_extend_prefix and forward_batch.num_prefix_chunks is None:
             forward_batch.num_prefix_chunks = 0
-            if hasattr(forward_batch.attn_backend, "init_mha_chunk_metadata"):
-                forward_batch.attn_backend.init_mha_chunk_metadata(forward_batch)
+            if hasattr(get_attn_backend(), "init_mha_chunk_metadata"):
+                get_attn_backend().init_mha_chunk_metadata(forward_batch)
         forward_batch.mha_return_lse = False
         # Do mha for extended part without prefix
         forward_batch.set_attn_attend_prefix_cache(False)
@@ -499,7 +502,7 @@ class DeepseekMHAForwardMixin:
 
         Returns: (kv_a, k_pe) both in BF16
         """
-        backend = forward_batch.attn_backend
+        backend = get_attn_backend()
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
