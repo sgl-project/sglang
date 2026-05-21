@@ -4,7 +4,6 @@ import {
   type ConfigSparkline,
   type ConfigSummary,
   type LatestNightlySummary,
-  type RegressionSummary,
 } from "@/lib/api";
 import { formatRelative } from "@/lib/format";
 import { Card, CardContent } from "@/components/ui/card";
@@ -18,11 +17,10 @@ export const dynamic = "force-dynamic";
 
 async function loadHomeData() {
   try {
-    const [configs, health, latest, regressions] = await Promise.all([
+    const [configs, health, latest] = await Promise.all([
       api.listConfigs(),
       api.health(),
       api.latestNightly().catch(() => null),
-      api.listRegressions("active").catch(() => [] as RegressionSummary[]),
     ]);
     const sparklines = await Promise.all(
       configs.map((c) =>
@@ -33,13 +31,12 @@ async function loadHomeData() {
     );
     const sparklineByConfig: Record<string, ConfigSparkline | null> = {};
     configs.forEach((c, i) => (sparklineByConfig[c.config_name] = sparklines[i]));
-    return { configs, health, latest, regressions, sparklineByConfig, error: null };
+    return { configs, health, latest, sparklineByConfig, error: null };
   } catch (err) {
     return {
       configs: [],
       health: null,
       latest: null as LatestNightlySummary | null,
-      regressions: [] as RegressionSummary[],
       sparklineByConfig: {} as Record<string, ConfigSparkline | null>,
       error: err instanceof Error ? err.message : String(err),
     };
@@ -47,15 +44,7 @@ async function loadHomeData() {
 }
 
 export default async function HomePage() {
-  const { configs, health, latest, regressions, sparklineByConfig, error } =
-    await loadHomeData();
-
-  const failedConfigsLastNight =
-    latest?.configs.filter((c) => c.failed_concurrencies.length > 0).length ?? 0;
-  const partialConfigsLastNight =
-    latest?.configs.filter((c) => c.partial_concurrencies.length > 0).length ?? 0;
-  const needsAttentionCount =
-    regressions.length + failedConfigsLastNight + partialConfigsLastNight;
+  const { configs, health, latest, sparklineByConfig, error } = await loadHomeData();
 
   return (
     <div className="space-y-8 animate-fade-in-up">
@@ -117,14 +106,6 @@ export default async function HomePage() {
 
       {error && <ErrorBanner message={error} />}
 
-      {needsAttentionCount > 0 && (
-        <NeedsAttentionBanner
-          regressions={regressions.length}
-          failedConfigs={failedConfigsLastNight}
-          partialConfigs={partialConfigsLastNight}
-        />
-      )}
-
       {/* Configs grid with sparklines */}
       <section className="space-y-3">
         <SectionHeader title="Configs" hint={`${configs.length} tracked`} />
@@ -159,39 +140,6 @@ export default async function HomePage() {
         )}
       </section>
     </div>
-  );
-}
-
-function NeedsAttentionBanner({
-  regressions,
-  failedConfigs,
-  partialConfigs,
-}: {
-  regressions: number;
-  failedConfigs: number;
-  partialConfigs: number;
-}) {
-  const parts: string[] = [];
-  if (regressions > 0)
-    parts.push(`${regressions} unresolved regression${regressions === 1 ? "" : "s"}`);
-  if (failedConfigs > 0)
-    parts.push(`${failedConfigs} config${failedConfigs === 1 ? "" : "s"} failed last nightly`);
-  if (partialConfigs > 0)
-    parts.push(`${partialConfigs} config${partialConfigs === 1 ? "" : "s"} partial last nightly`);
-
-  const triageHref = regressions > 0 ? "/regressions" : "/runs?status=failed&trigger=cron";
-
-  return (
-    <Link
-      href={triageHref}
-      className="flex flex-wrap items-center gap-2 rounded-xl border border-warning/40 bg-warning/5 px-4 py-2.5 text-[13px] transition hover:border-warning/60"
-    >
-      <span className="text-warning">⚠</span>
-      <span className="font-medium text-foreground">{parts.join(" · ")}</span>
-      <span className="ml-auto text-[12px] text-muted-foreground transition group-hover:text-foreground">
-        triage →
-      </span>
-    </Link>
   );
 }
 

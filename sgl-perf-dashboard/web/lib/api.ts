@@ -89,6 +89,13 @@ export interface ConfigSparkline {
   series: SparklineSeries[];
 }
 
+export interface ConcurrencyMetric {
+  concurrency: number;
+  value: number;
+  unit: string | null;
+  delta_pct_7d: number | null;
+}
+
 export interface LatestNightlyConfigResult {
   config_name: string;
   expected_concurrencies: number[];
@@ -96,10 +103,8 @@ export interface LatestNightlyConfigResult {
   failed_concurrencies: number[];
   partial_concurrencies: number[];
   representative_run_id: number;
-  headline_metric: string | null;
-  headline_value: number | null;
-  headline_unit: string | null;
-  headline_delta_pct_7d: number | null;
+  metric_name: string | null;
+  per_concurrency: ConcurrencyMetric[];
 }
 
 export interface LatestNightlySummary {

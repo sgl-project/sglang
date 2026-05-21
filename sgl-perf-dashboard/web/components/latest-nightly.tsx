@@ -61,11 +61,14 @@ export function LatestNightlyCard({ summary }: { summary: LatestNightlySummary }
 }
 
 function ConfigRow({ cfg }: { cfg: import("@/lib/api").LatestNightlyConfigResult }) {
-  const expected = cfg.expected_concurrencies.length || (cfg.passed_concurrencies.length + cfg.failed_concurrencies.length + cfg.partial_concurrencies.length);
+  const expected =
+    cfg.expected_concurrencies.length ||
+    cfg.passed_concurrencies.length +
+      cfg.failed_concurrencies.length +
+      cfg.partial_concurrencies.length;
   const passed = cfg.passed_concurrencies.length;
   const allPassed = passed === expected && expected > 0;
   const noneRan = passed === 0;
-  const someFailed = cfg.failed_concurrencies.length > 0 || cfg.partial_concurrencies.length > 0;
   const variant = allPassed ? "success" : noneRan ? "destructive" : "warning";
 
   return (
@@ -78,25 +81,37 @@ function ConfigRow({ cfg }: { cfg: import("@/lib/api").LatestNightlyConfigResult
           {passed}/{expected || "?"} passed
         </Badge>
         <span className="font-mono text-[13px] text-foreground/90">{cfg.config_name}</span>
-        {cfg.headline_value !== null && (
-          <>
-            <span className="ml-auto font-mono tabular-numbers text-[13px] text-foreground/80">
-              {formatNumber(cfg.headline_value)}
-              {compactUnit(cfg.headline_unit) && (
-                <span className="ml-1 text-[11px] text-muted-foreground">
-                  {compactUnit(cfg.headline_unit)}
-                </span>
-              )}
-            </span>
-            {cfg.headline_delta_pct_7d !== null && (
-              <DeltaBadge delta={cfg.headline_delta_pct_7d} metric={cfg.headline_metric} />
-            )}
-          </>
-        )}
-        {someFailed && cfg.headline_value === null && (
+        {noneRan && (
           <span className="ml-auto text-[12px] text-destructive">workflow failed</span>
         )}
       </div>
+      {cfg.per_concurrency.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 pl-1 text-[11px] text-muted-foreground">
+          {cfg.per_concurrency.map((m, i) => (
+            <span key={m.concurrency} className="font-mono tabular-numbers">
+              <span className="text-muted-foreground/70">conc&nbsp;{m.concurrency}</span>
+              <span className="mx-1 text-muted-foreground/40">·</span>
+              <span className="text-foreground/80">
+                {formatNumber(m.value)}
+                {compactUnit(m.unit) && (
+                  <span className="ml-0.5 text-muted-foreground">
+                    {compactUnit(m.unit)}
+                  </span>
+                )}
+              </span>
+              {m.delta_pct_7d !== null && (
+                <>
+                  {" "}
+                  <DeltaBadge delta={m.delta_pct_7d} metric={cfg.metric_name} />
+                </>
+              )}
+              {i < cfg.per_concurrency.length - 1 && (
+                <span className="ml-1 text-muted-foreground/40">|</span>
+              )}
+            </span>
+          ))}
+        </div>
+      )}
     </Link>
   );
 }

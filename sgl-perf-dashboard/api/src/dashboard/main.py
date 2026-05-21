@@ -16,6 +16,7 @@ from dashboard.db import connect, init_db
 from dashboard.models import (
     CommitRunsResult,
     CompareResult,
+    ConcurrencyMetric,
     ConfigSparkline,
     ConfigSummary,
     HealthStatus,
@@ -568,63 +569,61 @@ def latest_nightly() -> LatestNightlySummary | None:
                 ),
             )[0]
 
-            # Headline metric: at the highest passed concurrency, if any.
-            headline_metric = headline_value = headline_unit = headline_delta = None
-            if passed:
-                top_conc = passed[-1]
+            # Per-concurrency metric values + 7-day deltas for every passed conc.
+            metric_name = "total_token_throughput"
+            per_concurrency: list[ConcurrencyMetric] = []
+            for conc in passed:
                 row_with_metric = conn.execute(
                     """
                     SELECT m.value, m.unit
                     FROM runs r JOIN metrics m ON m.run_id = r.id
                     WHERE r.github_run_id = ? AND r.github_run_attempt = ?
                       AND r.config_name = ? AND r.concurrency = ?
-                      AND m.name = 'total_token_throughput'
+                      AND m.name = ?
                     LIMIT 1
                     """,
-                    (run_id, attempt, cfg_name, top_conc),
+                    (run_id, attempt, cfg_name, conc, metric_name),
                 ).fetchone()
-                if row_with_metric:
-                    headline_metric = "total_token_throughput"
-                    headline_value = row_with_metric["value"]
-                    headline_unit = row_with_metric["unit"]
-                    baseline = conn.execute(
-                        """
-                        WITH window_vals AS (
-                            SELECT m.value
-                            FROM runs r JOIN metrics m ON m.run_id = r.id
-                            WHERE r.config_name = ?
-                              AND r.concurrency = ?
-                              AND m.name = 'total_token_throughput'
-                              AND r.status = 'passed'
-                              AND r.started_at > datetime('now', '-7 day')
-                              AND r.id != (
-                                  SELECT id FROM runs
-                                  WHERE github_run_id = ? AND github_run_attempt = ?
-                                    AND config_name = ? AND concurrency = ?
-                              )
-                        )
-                        SELECT AVG(value) AS median FROM (
-                            SELECT value FROM window_vals
-                            ORDER BY value
-                            LIMIT 2 - (SELECT COUNT(*) FROM window_vals) % 2
-                            OFFSET (SELECT (COUNT(*) - 1) / 2 FROM window_vals)
-                        )
-                        """,
-                        (
-                            cfg_name,
-                            top_conc,
-                            run_id,
-                            attempt,
-                            cfg_name,
-                            top_conc,
-                        ),
-                    ).fetchone()
-                    if baseline and baseline["median"]:
-                        headline_delta = (
-                            (headline_value - baseline["median"])
-                            / baseline["median"]
-                            * 100
-                        )
+                if not row_with_metric:
+                    continue
+                value = row_with_metric["value"]
+                unit = row_with_metric["unit"]
+                delta_pct = None
+                baseline = conn.execute(
+                    """
+                    WITH window_vals AS (
+                        SELECT m.value
+                        FROM runs r JOIN metrics m ON m.run_id = r.id
+                        WHERE r.config_name = ?
+                          AND r.concurrency = ?
+                          AND m.name = ?
+                          AND r.status = 'passed'
+                          AND r.started_at > datetime('now', '-7 day')
+                          AND r.id != (
+                              SELECT id FROM runs
+                              WHERE github_run_id = ? AND github_run_attempt = ?
+                                AND config_name = ? AND concurrency = ?
+                          )
+                    )
+                    SELECT AVG(value) AS median FROM (
+                        SELECT value FROM window_vals
+                        ORDER BY value
+                        LIMIT 2 - (SELECT COUNT(*) FROM window_vals) % 2
+                        OFFSET (SELECT (COUNT(*) - 1) / 2 FROM window_vals)
+                    )
+                    """,
+                    (cfg_name, conc, metric_name, run_id, attempt, cfg_name, conc),
+                ).fetchone()
+                if baseline and baseline["median"]:
+                    delta_pct = (value - baseline["median"]) / baseline["median"] * 100
+                per_concurrency.append(
+                    ConcurrencyMetric(
+                        concurrency=conc,
+                        value=value,
+                        unit=unit,
+                        delta_pct_7d=delta_pct,
+                    )
+                )
 
             configs.append(
                 LatestNightlyConfigResult(
@@ -634,10 +633,8 @@ def latest_nightly() -> LatestNightlySummary | None:
                     failed_concurrencies=failed,
                     partial_concurrencies=partial,
                     representative_run_id=representative["id"],
-                    headline_metric=headline_metric,
-                    headline_value=headline_value,
-                    headline_unit=headline_unit,
-                    headline_delta_pct_7d=headline_delta,
+                    metric_name=metric_name if per_concurrency else None,
+                    per_concurrency=per_concurrency,
                 )
             )
 

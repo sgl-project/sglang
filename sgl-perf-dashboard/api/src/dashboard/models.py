@@ -180,6 +180,15 @@ class ConfigSparkline(BaseModel):
     series: list[SparklineSeries]
 
 
+class ConcurrencyMetric(BaseModel):
+    """One concurrency's metric reading + 7-day delta, used in LatestNightlyConfigResult."""
+
+    concurrency: int
+    value: float
+    unit: str | None
+    delta_pct_7d: float | None  # vs 7-day median at same (config, concurrency)
+
+
 class LatestNightlyConfigResult(BaseModel):
     """One config's outcome within the latest cron workflow."""
 
@@ -189,10 +198,10 @@ class LatestNightlyConfigResult(BaseModel):
     failed_concurrencies: list[int]
     partial_concurrencies: list[int]
     representative_run_id: int
-    headline_metric: str | None
-    headline_value: float | None
-    headline_unit: str | None
-    headline_delta_pct_7d: float | None  # vs 7-day median at same (config, conc)
+    metric_name: (
+        str | None
+    )  # which metric `per_concurrency` reports (e.g. total_token_throughput)
+    per_concurrency: list[ConcurrencyMetric]
 
 
 class LatestNightlySummary(BaseModel):
