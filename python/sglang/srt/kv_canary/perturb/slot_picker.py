@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
+from sglang.srt.kv_canary.plan_input_builder import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache

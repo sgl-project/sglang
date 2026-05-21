@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
-from sglang.srt.kv_canary.plan_input import build_plan_input_radix_sweep
+from sglang.srt.kv_canary.plan_input_builder import build_plan_input_radix_sweep
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_sweep,

@@ -12,7 +12,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
+from sglang.srt.kv_canary.plan_input_builder import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.launch import (
     get_valid_num_tokens,
