@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -466,13 +467,17 @@ class EagleDraftWorker(BaseDraftWorker):
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # Run forward under a per-step ForwardContext so the model layer
+            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
+            # honors the outer context and does not override.
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
+            ):
+                logits_output = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)

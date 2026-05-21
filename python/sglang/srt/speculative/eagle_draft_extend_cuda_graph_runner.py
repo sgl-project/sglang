@@ -25,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -352,8 +353,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             num_accept_tokens=num_accept_tokens,
         )
 
-        self.deepep_adapter.capture(is_extend_in_batch=True)
-
         # Forward batch
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
@@ -365,8 +364,6 @@ class EAGLEDraftExtendCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -379,23 +376,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
         )
 
-        self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=spec_info,
-        )
-
-        # Run and capture
         def run_once():
-            # model.forward() bypasses _forward_raw(), so invalidate manually.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
@@ -424,11 +408,23 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        self._capture_init(run_once)
-
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+        with forward_context(
+            ForwardContext(attn_backend=self.draft_extend_attn_backend)
+        ):
+            self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=spec_info,
+            )
+            self.deepep_adapter.capture(is_extend_in_batch=True)
+            self._capture_init(run_once)
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out

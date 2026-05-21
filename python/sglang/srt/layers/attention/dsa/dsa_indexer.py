@@ -80,6 +80,11 @@ from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
+)
 from sglang.srt.server_args import get_global_server_args
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -449,9 +454,9 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
             if _use_aiter_preshuffle:
@@ -471,7 +476,7 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+        kv_cache_fp8 = get_token_to_kv_pool().get_index_k_with_scale_buffer(
             layer_id=layer_id
         )
 
@@ -624,11 +629,11 @@ class Indexer(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         if _is_hip:
             if _use_aiter_preshuffle:
                 assert (
@@ -675,7 +680,7 @@ class Indexer(MultiPlatformOp):
         indexer_seq_lens_cpu = metadata.get_indexer_seq_len_cpu()
         seq_len_sum = torch.sum(indexer_seq_lens_cpu).item()
         max_seq_len = torch.max(indexer_seq_lens_cpu).item()
-        k_fp8, k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+        k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             metadata.get_indexer_seq_len(),
             block_tables,
@@ -851,9 +856,9 @@ class Indexer(MultiPlatformOp):
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
@@ -882,12 +887,12 @@ class Indexer(MultiPlatformOp):
                 end_seq_position += pre_chunk_offset
                 if offset == 0 and batch_idx != 0:
                     offset += forward_batch.extend_seq_lens_cpu[batch_idx - 1]
-                k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+                k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
                     layer_id,
                     end_seq_position,
                     block_tables[batch_idx],
                 )
-                k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+                k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
                     layer_id,
                     end_seq_position,
                     block_tables[batch_idx],
@@ -943,12 +948,12 @@ class Indexer(MultiPlatformOp):
                 - forward_batch.extend_seq_lens_cpu[0]
                 + kv_len
             )
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+            k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
                 layer_id,
                 kv_len,
                 block_tables[0],
             )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
                 layer_id,
                 kv_len,
                 block_tables[0],
@@ -999,7 +1004,7 @@ class Indexer(MultiPlatformOp):
         if not _is_npu:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import fp8_index
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = get_token_to_kv_pool().page_size
         assert page_size == 64, "only support page size 64"
 
         assert len(weights.shape) == 3
@@ -1011,7 +1016,7 @@ class Indexer(MultiPlatformOp):
 
         topk_indices_list = []
 
-        block_tables = forward_batch.req_to_token_pool.req_to_token[
+        block_tables = get_req_to_token_pool().req_to_token[
             forward_batch.req_pool_indices, :
         ]
         strided_indices = torch.arange(
@@ -1036,12 +1041,12 @@ class Indexer(MultiPlatformOp):
             weights_partial = weights[q_len_start:q_len_end]
             weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
 
-            k_fp8 = forward_batch.token_to_kv_pool.get_index_k_continuous(
+            k_fp8 = get_token_to_kv_pool().get_index_k_continuous(
                 layer_id,
                 seq_len,
                 block_tables[i],
             )
-            k_scale = forward_batch.token_to_kv_pool.get_index_k_scale_continuous(
+            k_scale = get_token_to_kv_pool().get_index_k_scale_continuous(
                 layer_id,
                 seq_len,
                 block_tables[i],
@@ -1093,18 +1098,18 @@ class Indexer(MultiPlatformOp):
             and can_use_dsa_fused_store(
                 key.dtype,
                 forward_batch.out_cache_loc.dtype,
-                forward_batch.token_to_kv_pool.page_size,
+                get_token_to_kv_pool().page_size,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
             fused_store_index_k_cache(
                 key,
                 buf,
                 forward_batch.out_cache_loc,
-                forward_batch.token_to_kv_pool.page_size,
+                get_token_to_kv_pool().page_size,
             )
             return
 
@@ -1114,8 +1119,8 @@ class Indexer(MultiPlatformOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = forward_batch.token_to_kv_pool.page_size
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            page_size = get_token_to_kv_pool().page_size
+            buf = get_token_to_kv_pool().get_index_k_with_scale_buffer(
                 layer_id=layer_id
             )
             kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
@@ -1140,7 +1145,7 @@ class Indexer(MultiPlatformOp):
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
 
-        forward_batch.token_to_kv_pool.set_index_k_scale_buffer(
+        get_token_to_kv_pool().set_index_k_scale_buffer(
             layer_id=layer_id,
             loc=out_loc,
             index_k=k_fp8,
@@ -1175,15 +1180,13 @@ class Indexer(MultiPlatformOp):
             from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
+            assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         # When upstream uses fused FP8 RMSNorm+quant, activations may be passed as
         # a tuple like (x_fp8, x_scale[, y]). Use `x_meta` for shape/device queries.
         x_meta = x[0] if isinstance(x, tuple) else x
 
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         enable_dual_stream = (
             self.alt_stream is not None
@@ -1405,12 +1408,10 @@ class Indexer(MultiPlatformOp):
         layer_scatter_modes=None,
         dynamic_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        if forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = forward_batch.attn_backend.forward_metadata.seq_lens
+        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
         else:
-            actual_seq_lengths_kv = (
-                forward_batch.attn_backend.forward_metadata.seq_lens_cpu_int
-            )
+            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -1558,7 +1559,7 @@ class Indexer(MultiPlatformOp):
                 torch.npu.current_stream(),
             )
 
-        forward_batch.token_to_kv_pool.set_index_k_buffer(
+        get_token_to_kv_pool().set_index_k_buffer(
             layer_id, forward_batch.out_cache_loc, k
         )
         if is_prefill:
@@ -1566,7 +1567,7 @@ class Indexer(MultiPlatformOp):
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q = (
+                get_attn_backend().forward_metadata.actual_seq_lengths_q = (
                     forward_batch.attn_cp_metadata.actual_seq_q_prev_tensor,
                     forward_batch.attn_cp_metadata.actual_seq_q_next_tensor,
                 )
@@ -1579,34 +1580,32 @@ class Indexer(MultiPlatformOp):
                         forward_batch.attn_cp_metadata.kv_len_next_tensor
                         + forward_batch.extend_prefix_lens.squeeze()
                     )
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
+                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
                         total_kv_len_prev_tensor,
                         total_kv_len_next_tensor,
                     )
                 else:
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv = (
+                    get_attn_backend().forward_metadata.actual_seq_lengths_kv = (
                         forward_batch.attn_cp_metadata.kv_len_prev_tensor,
                         forward_batch.attn_cp_metadata.kv_len_next_tensor,
                     )
                 actual_seq_lengths_q = (
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
+                    get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
                 actual_seq_lengths_kv = (
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_kv
+                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q is None:
+            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
                     or forward_batch.forward_mode.is_draft_extend()
                 ):
-                    num_draft_tokens = (
-                        forward_batch.attn_backend.speculative_num_draft_tokens
-                    )
+                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
                         num_draft_tokens + bs,
@@ -1622,10 +1621,10 @@ class Indexer(MultiPlatformOp):
                     )
             else:
                 actual_seq_lengths_q = (
-                    forward_batch.attn_backend.forward_metadata.actual_seq_lengths_q
+                    get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = forward_batch.token_to_kv_pool.get_index_k_buffer(layer_id)
+        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
 
         if self.rotary_emb.is_neox_style and self.alt_stream is not None:
             torch.npu.current_stream().wait_event(q_rope_event)
@@ -1637,7 +1636,7 @@ class Indexer(MultiPlatformOp):
             and layer_scatter_modes.attn_mode == ScatterMode.TP_ATTN_FULL
         ):
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = forward_batch.attn_backend.forward_metadata.block_tables
+        block_table = get_attn_backend().forward_metadata.block_tables
         if (
             is_prefill
             and self.dsa_enable_prefill_cp

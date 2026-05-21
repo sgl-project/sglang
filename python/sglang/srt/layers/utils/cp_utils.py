@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     is_allocation_symmetric,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -342,7 +343,7 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    get_token_to_kv_pool().set_kv_buffer(
         layer,
         cache_loc,
         key_cache_full,

@@ -78,6 +78,10 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     get_is_capture_mode,
 )
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -398,7 +402,7 @@ class MQALayer(nn.Module):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
@@ -467,6 +471,7 @@ class MQALayer(nn.Module):
                     x=x,
                     q_lora=q_lora,
                     forward_batch=forward_batch,
+                    attn_backend=attn_backend,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
                 )
@@ -533,7 +538,12 @@ class MQALayer(nn.Module):
         del qkv_a
 
         if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -556,7 +566,7 @@ class MQALayer(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return x
 
-        attn_backend = forward_batch.attn_backend
+        attn_backend = get_attn_backend()
         if TYPE_CHECKING:
             assert isinstance(
                 attn_backend,
@@ -1130,7 +1140,7 @@ class DeepseekV4Model(nn.Module):
 
         # Upgrade lazy raw metadata on the main stream once before any layer
         # forks alt-streams; later per-layer calls become no-ops.
-        forward_batch.attn_backend._maybe_upgrade_forward_metadata()
+        get_attn_backend()._maybe_upgrade_forward_metadata()
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1278,15 +1288,14 @@ class DeepseekV4ForCausalLM(nn.Module):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
                 if is_dsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
                     core_meta.init_flashmla_related()
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
+                            attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):

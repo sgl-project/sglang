@@ -29,6 +29,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -135,7 +136,7 @@ class RadixAttention(nn.Module):
                 )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 q,
                 k,
                 v,
@@ -188,7 +189,7 @@ def unified_attention_with_output(
     # the FA kernel validates out.size(0) == q.size(0).
     forward_batch._attn_output = output[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
+    ret = get_attn_backend().forward(
         query,
         key,
         value,

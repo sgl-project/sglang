@@ -354,8 +354,15 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        # Keep a runner ref to read live state set after backend construction
+        # (e.g. hisparse_coordinator is built in model_runner *after*
+        # init_attention_backend()).
+        self.model_runner = model_runner
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -377,6 +384,12 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
+
+    @property
+    def hisparse_coordinator(self):
+        # Live read: model_runner builds the coordinator *after*
+        # init_attention_backend(), so we cannot capture at __init__ time.
+        return self.model_runner.hisparse_coordinator
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -667,7 +680,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
@@ -960,7 +973,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
