@@ -834,6 +834,7 @@ class CommonKVSender(BaseKVSender):
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.Bootstrapping",
         )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         return KVPoll.Failed
 
@@ -1061,6 +1062,7 @@ class CommonKVReceiver(BaseKVReceiver):
             f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
             f"in KVPoll.WaitingForInput",
         )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         return KVPoll.Failed
 
