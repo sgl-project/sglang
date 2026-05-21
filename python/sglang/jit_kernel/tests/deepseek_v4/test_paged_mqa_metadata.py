@@ -34,6 +34,7 @@ import itertools
 
 import pytest
 import torch
+
 from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -241,9 +242,7 @@ def _load_deep_gemm():
         pytest.skip(f"deep_gemm unavailable: {type(e).__name__}: {e}")
 
 
-@pytest.mark.parametrize(
-    "bs", [64, 128, 1025, 2048, 4096, 8192, 32768, 65536]
-)
+@pytest.mark.parametrize("bs", [64, 128, 1025, 2048, 4096, 8192, 32768, 65536])
 @pytest.mark.parametrize("max_ctx", [256, 32768])
 def test_matches_deep_gemm(bs: int, max_ctx: int):
     """Byte-equal against the production deep_gemm reference. Auto-skips

@@ -297,9 +297,7 @@ __global__ __launch_bounds__(kKernelBThreads, 1)  //
 }
 
 struct IndexerMetadataKernel {
-  static void run(tvm::ffi::TensorView seq_lens,
-                  tvm::ffi::TensorView metadata,
-                  tvm::ffi::TensorView workspace) {
+  static void run(tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView metadata, tvm::ffi::TensorView workspace) {
     using namespace host;
     auto N = SymbolicSize{"batch_size"};
     auto M = SymbolicSize{"num_sm"};
@@ -339,8 +337,7 @@ struct IndexerMetadataKernel {
     } else {
       const auto num_tiles = (batch_size + kMBTileSize - 1) / kMBTileSize;
       const auto required = static_cast<int64_t>(batch_size) + num_tiles;
-      RuntimeCheck(static_cast<int64_t>(W.unwrap()) >= required,
-                   "workspace too small for multi-block path");
+      RuntimeCheck(static_cast<int64_t>(W.unwrap()) >= required, "workspace too small for multi-block path");
       auto* scratch_prefix = static_cast<uint32_t*>(workspace.data_ptr());
       auto* tile_sums = scratch_prefix + batch_size;
 
