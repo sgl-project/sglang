@@ -1329,6 +1329,12 @@ class DummyModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
+            # NOTE(woosuk): For accurate performance evaluation, we assign
+            # random values to the weights.
+            initialize_dummy_weights(model)
+
+            _post_load_weights(model)
+
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
@@ -1339,12 +1345,6 @@ class DummyModelLoader(BaseModelLoader):
                     ):
                         continue
                     quant_method.process_weights_after_loading(module)
-
-            # NOTE(woosuk): For accurate performance evaluation, we assign
-            # random values to the weights.
-            initialize_dummy_weights(model)
-
-            _post_load_weights(model)
 
         return model.eval()
 
@@ -1445,10 +1445,6 @@ class ShardedStateLoader(BaseModelLoader):
         with set_default_torch_dtype(model_config.dtype):
             with torch.device(device_config.device):
                 model = _initialize_model(model_config, self.load_config, quant_config)
-                for _, module in model.named_modules():
-                    quant_method = getattr(module, "quant_method", None)
-                    if quant_method is not None:
-                        quant_method.process_weights_after_loading(module)
             rank = get_tensor_model_parallel_rank()
             pattern = os.path.join(
                 local_model_path,
@@ -1488,6 +1484,13 @@ class ShardedStateLoader(BaseModelLoader):
                 raise ValueError(f"Missing keys {tuple(state_dict)} in loaded state!")
 
             _post_load_weights(model)
+
+            target_device = torch.device(device_config.device)
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    with device_loading_context(module, target_device):
+                        quant_method.process_weights_after_loading(module)
 
         return model.eval()
 
