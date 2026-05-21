@@ -253,6 +253,7 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config = update_intermediate_size(
             model_config, moe_intermediate_attr, intermediate_padding_size
         )
+
     multimodal_config = [
         [
             model_config.hf_config,
@@ -282,6 +283,7 @@ def adjust_config_with_unaligned_cpu_tp(
                 "encoder_attention_heads",
             ]
         )
+
     for m_config, config_name, model_type, num_head_str in multimodal_config:
         if (
             hasattr(m_config, config_name)

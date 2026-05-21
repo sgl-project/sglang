@@ -387,6 +387,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             base=10000.0,
             is_neox_style=True,
         )
+
         workspace_buffer = None
         if get_global_server_args().mm_attention_backend == "flashinfer_cudnn":
             if torch.cuda.is_available() and (not _is_npu):
@@ -404,8 +405,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 Qwen3_VisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
-                    head_size=head_dim,
                     intermediate_dim=vision_config.intermediate_size,
+                    head_size=head_dim,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
                     quant_config=quant_config,
