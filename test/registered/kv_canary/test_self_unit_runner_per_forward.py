@@ -100,19 +100,19 @@ class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
         call = endpoint.calls[0]
         self.assertTrue(
             torch.equal(
-                call["fb_input_ids"],
+                call["input_ids"],
                 torch.tensor([101, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
-                call["fb_positions"],
+                call["positions"],
                 torch.tensor([10, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
-                call["fb_out_cache_loc"],
+                call["out_cache_loc"],
                 torch.tensor([7, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
@@ -146,9 +146,9 @@ class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
         )
 
         call = endpoint.calls[0]
-        self.assertEqual(call["fb_input_ids"].dtype, torch.int64)
-        self.assertEqual(call["fb_positions"].dtype, torch.int64)
-        self.assertEqual(call["fb_out_cache_loc"].dtype, torch.int64)
+        self.assertEqual(call["input_ids"].dtype, torch.int64)
+        self.assertEqual(call["positions"].dtype, torch.int64)
+        self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
 
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:
         """Verify oversized prefix sums are handled without host-side errors."""

@@ -39,9 +39,9 @@ class TestSelfUnitWrite(CustomTestCase):
             4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=self.device
         )
         plan = WritePlan.allocate(write_req_capacity=1, device=self.device)
-        fb_input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
-        fb_positions = torch.zeros(1, dtype=torch.int64, device=self.device)
-        fb_out_cache_loc = torch.zeros(1, dtype=torch.int64, device=self.device)
+        input_ids = torch.zeros(1, dtype=torch.int64, device=self.device)
+        positions = torch.zeros(1, dtype=torch.int64, device=self.device)
+        out_cache_loc = torch.zeros(1, dtype=torch.int64, device=self.device)
         violation_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
         slot_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
         kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
@@ -61,9 +61,9 @@ class TestSelfUnitWrite(CustomTestCase):
             launch_canary_write_kernel(
                 context=context,
                 plan=plan,
-                fb_input_ids=fb_input_ids,
-                fb_positions=fb_positions,
-                fb_out_cache_loc=fb_out_cache_loc,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
                 enable_assert_inputs=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,

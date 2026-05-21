@@ -33,9 +33,9 @@ _FUZZ_ITER_PER_SEED = 50
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlanFuzzInputs:
-    fb_req_pool_indices: torch.Tensor
-    fb_prefix_lens: torch.Tensor
-    fb_extend_seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    prefix_lens: torch.Tensor
+    extend_seq_lens: torch.Tensor
     req_to_token: torch.Tensor
     swa_window_size: int
     full_to_swa_index_mapping: Optional[torch.Tensor]
@@ -72,24 +72,24 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         rng=rng,
     )
     padding_mask = make_padding_mask(bs=bs, kind=padding_kind, rng=rng)
-    fb_rpi_list: list[int] = []
-    fb_pfx_list: list[int] = []
-    fb_ext_list: list[int] = []
+    req_pool_indices_list: list[int] = []
+    prefix_lens_list: list[int] = []
+    extend_seq_lens_list: list[int] = []
     for r in range(bs):
         if padding_mask[r]:
-            fb_rpi_list.append(0)
-            fb_pfx_list.append(0)
-            fb_ext_list.append(0)
+            req_pool_indices_list.append(0)
+            prefix_lens_list.append(0)
+            extend_seq_lens_list.append(0)
         else:
-            fb_rpi_list.append(rng.randint(1, max_reqs - 1))
-            fb_pfx_list.append(rng.randint(0, max_seq_len - 1))
-            fb_ext_list.append(rng.randint(1, max(1, max_seq_len // 4)))
-    fb_rpi = torch.tensor(fb_rpi_list, dtype=torch.int64, device=_DEVICE)
-    fb_pfx = torch.tensor(fb_pfx_list, dtype=torch.int64, device=_DEVICE)
-    fb_ext = torch.tensor(fb_ext_list, dtype=torch.int64, device=_DEVICE)
+            req_pool_indices_list.append(rng.randint(1, max_reqs - 1))
+            prefix_lens_list.append(rng.randint(0, max_seq_len - 1))
+            extend_seq_lens_list.append(rng.randint(1, max(1, max_seq_len // 4)))
+    req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=_DEVICE)
+    prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int64, device=_DEVICE)
+    extend_seq_lens = torch.tensor(extend_seq_lens_list, dtype=torch.int64, device=_DEVICE)
 
     total_verify = 0
-    for rpi, pfx in zip(fb_rpi_list, fb_pfx_list):
+    for rpi, pfx in zip(req_pool_indices_list, prefix_lens_list):
         if rpi == 0:
             continue
         if swa_window_size > 0:
@@ -114,9 +114,9 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         full_to_swa = None
 
     return PlanFuzzInputs(
-        fb_req_pool_indices=fb_rpi,
-        fb_prefix_lens=fb_pfx,
-        fb_extend_seq_lens=fb_ext,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
         req_to_token=rtt,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa,
@@ -135,9 +135,9 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
         triton_write=triton_w,
         ref_verify=ref_v,
         ref_write=ref_w,
-        fb_req_pool_indices=inputs.fb_req_pool_indices,
-        fb_prefix_lens=inputs.fb_prefix_lens,
-        fb_extend_seq_lens=inputs.fb_extend_seq_lens,
+        req_pool_indices=inputs.req_pool_indices,
+        prefix_lens=inputs.prefix_lens,
+        extend_seq_lens=inputs.extend_seq_lens,
         req_to_token=inputs.req_to_token,
         extras=(
             torch.empty(0, dtype=torch.int64, device=_DEVICE),
@@ -151,9 +151,9 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
     PlanInvariants.assert_all(
         verify_plan=triton_v,
         write_plan=triton_w,
-        fb_req_pool_indices=inputs.fb_req_pool_indices,
-        fb_prefix_lens=inputs.fb_prefix_lens,
-        fb_extend_seq_lens=inputs.fb_extend_seq_lens,
+        req_pool_indices=inputs.req_pool_indices,
+        prefix_lens=inputs.prefix_lens,
+        extend_seq_lens=inputs.extend_seq_lens,
         swa_window_size=inputs.swa_window_size,
         extras_slot_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
         extras_positions=torch.empty(0, dtype=torch.int64, device=_DEVICE),
@@ -165,7 +165,7 @@ def _run_one(inputs: PlanFuzzInputs) -> tuple:
 
 def _summarize(inputs: PlanFuzzInputs) -> str:
     return (
-        f"bs={int(inputs.fb_req_pool_indices.shape[0])} "
+        f"bs={int(inputs.req_pool_indices.shape[0])} "
         f"swa={inputs.swa_window_size} "
         f"verify_cap={inputs.verify_capacity} write_cap={inputs.write_req_capacity} "
         f"has_lut={inputs.full_to_swa_index_mapping is not None}"

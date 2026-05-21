@@ -45,9 +45,9 @@ class WriteFuzzInputs:
     ref_canary_buf: torch.Tensor
     plan_cuda: WritePlan
     plan_ref: WritePlan
-    fb_input_ids: torch.Tensor
-    fb_positions: torch.Tensor
-    fb_out_cache_loc: torch.Tensor
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    out_cache_loc: torch.Tensor
     kernel_kind: CanaryLaunchTag
     enable_write_verify_inputs: bool
     expected_input_tokens: torch.Tensor
@@ -124,21 +124,21 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         device=_DEVICE,
     )
 
-    fb_input_ids = torch.tensor(
+    input_ids = torch.tensor(
         [rng.randint(0, 0xFFFFFFFF) for _ in range(total_tokens)],
         dtype=torch.int64,
         device=_DEVICE,
     )
-    fb_positions = torch.tensor(
+    positions = torch.tensor(
         [rng.randint(0, 1024) for _ in range(total_tokens)],
         dtype=torch.int64,
         device=_DEVICE,
     )
-    fb_out_cache_loc = torch.tensor(
+    out_cache_loc = torch.tensor(
         out_cache_loc_list, dtype=torch.int64, device=_DEVICE
     )
-    expected_input_tokens = fb_input_ids.clone()
-    expected_input_positions = fb_positions.clone()
+    expected_input_tokens = input_ids.clone()
+    expected_input_positions = positions.clone()
     if enable_write_verify_inputs:
         candidate_indices = [
             idx for idx, slot in enumerate(out_cache_loc_list) if slot >= 0
@@ -156,9 +156,9 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         ref_canary_buf=ref_buf,
         plan_cuda=plan_cuda,
         plan_ref=plan_ref,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
         kernel_kind=kernel_kind,
         enable_write_verify_inputs=enable_write_verify_inputs,
         expected_input_tokens=expected_input_tokens,
@@ -181,9 +181,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         ref_canary_buf=inputs.ref_canary_buf,
         plan_cuda=inputs.plan_cuda,
         plan_ref=inputs.plan_ref,
-        fb_input_ids=inputs.fb_input_ids,
-        fb_positions=inputs.fb_positions,
-        fb_out_cache_loc=inputs.fb_out_cache_loc,
+        input_ids=inputs.input_ids,
+        positions=inputs.positions,
+        out_cache_loc=inputs.out_cache_loc,
         enable_write_verify_inputs=inputs.enable_write_verify_inputs,
         expected_input_tokens=inputs.expected_input_tokens,
         expected_input_positions=inputs.expected_input_positions,
@@ -209,9 +209,9 @@ def _run_one(inputs: WriteFuzzInputs) -> None:
         canary_buf_before=cuda_buf_before,
         canary_buf_after=inputs.cuda_canary_buf,
         plan=inputs.plan_cuda,
-        fb_input_ids=inputs.fb_input_ids,
-        fb_positions=inputs.fb_positions,
-        fb_out_cache_loc=inputs.fb_out_cache_loc,
+        input_ids=inputs.input_ids,
+        positions=inputs.positions,
+        out_cache_loc=inputs.out_cache_loc,
         enable_write_verify_inputs=inputs.enable_write_verify_inputs,
         expected_input_tokens=inputs.expected_input_tokens,
         expected_input_positions=inputs.expected_input_positions,

@@ -110,9 +110,9 @@ def _build_write_inputs(
         write_num_valid_reqs=write_num_valid_reqs,
     )
 
-    fb_input_ids = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
-    fb_positions = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
-    fb_out_cache_loc = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
+    input_ids = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
+    positions = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
+    out_cache_loc = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
     if total_entries > 0:
         flat_idx = torch.arange(total_entries, device=device, dtype=torch.int64)
         per_req_idx = flat_idx % max(case.extend_len, 1)
@@ -121,20 +121,20 @@ def _build_write_inputs(
         slots = (req_idx * per_req_stride + case.prefix_len + per_req_idx) % max(
             num_slots, 1
         )
-        fb_input_ids[:total_entries] = (flat_idx % 32768).to(torch.int32)
-        fb_positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int32)
-        fb_out_cache_loc[:total_entries] = slots.to(torch.int32)
+        input_ids[:total_entries] = (flat_idx % 32768).to(torch.int32)
+        positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int32)
+        out_cache_loc[:total_entries] = slots.to(torch.int32)
 
     # SWA endpoints would gather the LUT here; identity LUT keeps the bench self-consistent while still
     # exercising the host gather cost.
     if case.pool_kind == "swa_window_128":
         full_to_swa = torch.arange(num_slots + 1, dtype=torch.int32, device=device)
         full_to_swa[-1] = -1
-        fb_out_cache_loc = full_to_swa[fb_out_cache_loc.to(torch.int64)].to(torch.int32)
+        out_cache_loc = full_to_swa[out_cache_loc.to(torch.int64)].to(torch.int32)
 
     if mirror_expected_inputs:
-        expected_input_tokens = fb_input_ids.clone()
-        expected_input_positions = fb_positions.clone()
+        expected_input_tokens = input_ids.clone()
+        expected_input_positions = positions.clone()
     else:
         expected_input_tokens = torch.zeros(
             num_tokens_padded, dtype=torch.int32, device=device
@@ -157,9 +157,9 @@ def _build_write_inputs(
     return dict(
         canary_buf=canary_buf,
         plan=plan,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
         violation_ring=violation_ring,
@@ -214,9 +214,9 @@ def benchmark(
             canary_write_step(
                 canary_buf=inputs["canary_buf"],
                 plan=inputs["plan"],
-                fb_input_ids=inputs["fb_input_ids"],
-                fb_positions=inputs["fb_positions"],
-                fb_out_cache_loc=inputs["fb_out_cache_loc"],
+                input_ids=inputs["input_ids"],
+                positions=inputs["positions"],
+                out_cache_loc=inputs["out_cache_loc"],
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
                 enable_write_verify_inputs=False,
                 expected_input_tokens=inputs["expected_input_tokens"],
@@ -276,9 +276,9 @@ def benchmark_kernel_kind(
         canary_write_step(
             canary_buf=inputs["canary_buf"],
             plan=inputs["plan"],
-            fb_input_ids=inputs["fb_input_ids"],
-            fb_positions=inputs["fb_positions"],
-            fb_out_cache_loc=inputs["fb_out_cache_loc"],
+            input_ids=inputs["input_ids"],
+            positions=inputs["positions"],
+            out_cache_loc=inputs["out_cache_loc"],
             kernel_kind=kernel_kind,
             enable_write_verify_inputs=enable_write_verify_inputs,
             expected_input_tokens=inputs["expected_input_tokens"],

@@ -94,9 +94,9 @@ def launch_endpoints_per_forward(
         endpoint.launch_per_forward(
             verify_plan=verify_plan,
             write_plan=write_plan,
-            fb_input_ids=input_ids,
-            fb_positions=positions,
-            fb_out_cache_loc=out_cache_loc,
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
             input_check_mode=input_check_mode,
             expected_inputs=expected_inputs,
             violation_log=violation_log,

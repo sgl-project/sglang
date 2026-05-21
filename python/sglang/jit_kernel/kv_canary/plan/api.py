@@ -40,7 +40,7 @@ def launch_canary_plan_kernels(
     - **Write metadata** (when extend_seq_lens[r] > 0): contribute extend_seq_lens[r] to the per-req
       write count (for write_offsets cumsum). Per-req chain seed = req_to_token[req_pool_indices[r],
       prefix_lens[r]-1] (SWA-translated), or -1 if prefix_lens[r] == 0. Per-token write data
-      (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — launch_canary_write_kernel
+      (input_ids / positions / out_cache_loc) is NOT materialized here — launch_canary_write_kernel
       reads it directly from ForwardBatch via write_offsets.
 
     Args:

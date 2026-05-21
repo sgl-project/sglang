@@ -66,9 +66,9 @@ class CanaryEndpoint:
         *,
         verify_plan: VerifyPlan,
         write_plan: WritePlan,
-        fb_input_ids: torch.Tensor,
-        fb_positions: torch.Tensor,
-        fb_out_cache_loc: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         input_check_mode: bool,
         expected_inputs: ExpectedInputs,
         violation_log: ViolationLog,
@@ -90,11 +90,11 @@ class CanaryEndpoint:
 
         # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel.
         if self.full_to_swa_index_mapping is not None:
-            fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
-                fb_out_cache_loc
+            out_cache_loc_for_canary = self.full_to_swa_index_mapping[
+                out_cache_loc
             ]
         else:
-            fb_out_cache_loc_for_canary = fb_out_cache_loc
+            out_cache_loc_for_canary = out_cache_loc
         if input_check_mode:
             expected_input_tokens = expected_inputs.tokens
             expected_input_positions = expected_inputs.positions
@@ -105,9 +105,9 @@ class CanaryEndpoint:
         launch_canary_write_kernel(
             context=context,
             plan=write_plan,
-            fb_input_ids=fb_input_ids,
-            fb_positions=fb_positions,
-            fb_out_cache_loc=fb_out_cache_loc_for_canary,
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=out_cache_loc_for_canary,
             enable_assert_inputs=input_check_mode,
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,

@@ -23,9 +23,9 @@ class PlanInvariants:
         *,
         verify_plan: VerifyPlan,
         write_plan: WritePlan,
-        fb_req_pool_indices: torch.Tensor,
-        fb_prefix_lens: torch.Tensor,
-        fb_extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
         swa_window_size: int,
         extras_slot_indices: torch.Tensor,
         extras_positions: torch.Tensor,
@@ -35,13 +35,13 @@ class PlanInvariants:
         PlanInvariants._assert_write_offsets_monotone(write_plan)
         PlanInvariants._assert_write_offsets_total_matches_active_extend_sum(
             write_plan=write_plan,
-            fb_extend_seq_lens=fb_extend_seq_lens,
-            fb_req_pool_indices=fb_req_pool_indices,
+            extend_seq_lens=extend_seq_lens,
+            req_pool_indices=req_pool_indices,
         )
         derived = PlanInvariants._assert_verify_num_valid_equals_derived_plus_extras(
             verify_plan=verify_plan,
-            fb_prefix_lens=fb_prefix_lens,
-            fb_req_pool_indices=fb_req_pool_indices,
+            prefix_lens=prefix_lens,
+            req_pool_indices=req_pool_indices,
             swa_window_size=swa_window_size,
             extras_count=extras_count,
         )
@@ -55,7 +55,7 @@ class PlanInvariants:
         )
         PlanInvariants._assert_padding_row_seed_is_minus_one(
             write_plan=write_plan,
-            fb_req_pool_indices=fb_req_pool_indices,
+            req_pool_indices=req_pool_indices,
         )
         PlanInvariants._assert_prev_slot_minus_one_iff_chain_head(
             verify_plan=verify_plan,
@@ -78,13 +78,13 @@ class PlanInvariants:
     def _assert_write_offsets_total_matches_active_extend_sum(
         *,
         write_plan: WritePlan,
-        fb_extend_seq_lens: torch.Tensor,
-        fb_req_pool_indices: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
     ) -> None:
         n_active = int(write_plan.write_num_valid_reqs[0].item())
         total = int(write_plan.write_offsets[n_active].item())
-        rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
-        ext_cpu = fb_extend_seq_lens.detach().cpu().tolist()
+        rpi_cpu = req_pool_indices.detach().cpu().tolist()
+        ext_cpu = extend_seq_lens.detach().cpu().tolist()
         expected_total = sum(ext for rpi, ext in zip(rpi_cpu, ext_cpu) if rpi != 0)
         assert (
             total == expected_total
@@ -119,12 +119,12 @@ class PlanInvariants:
     def _assert_padding_row_seed_is_minus_one(
         *,
         write_plan: WritePlan,
-        fb_req_pool_indices: torch.Tensor,
+        req_pool_indices: torch.Tensor,
     ) -> None:
         n_active = int(write_plan.write_num_valid_reqs[0].item())
         if n_active == 0:
             return
-        rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
+        rpi_cpu = req_pool_indices.detach().cpu().tolist()
         seeds_cpu = (
             write_plan.write_seed_slot_indices[:n_active].detach().cpu().tolist()
         )
@@ -167,13 +167,13 @@ class PlanInvariants:
     def _assert_verify_num_valid_equals_derived_plus_extras(
         *,
         verify_plan: VerifyPlan,
-        fb_prefix_lens: torch.Tensor,
-        fb_req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
         swa_window_size: int,
         extras_count: int,
     ) -> int:
-        rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
-        pfx_cpu = fb_prefix_lens.detach().cpu().tolist()
+        rpi_cpu = req_pool_indices.detach().cpu().tolist()
+        pfx_cpu = prefix_lens.detach().cpu().tolist()
         derived = 0
         for rpi, pfx in zip(rpi_cpu, pfx_cpu):
             if rpi == 0:
@@ -310,9 +310,9 @@ class WriteInvariants:
         canary_buf_before: torch.Tensor,
         canary_buf_after: torch.Tensor,
         plan: WritePlan,
-        fb_input_ids: torch.Tensor,
-        fb_positions: torch.Tensor,
-        fb_out_cache_loc: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         enable_write_verify_inputs: bool,
         expected_input_tokens: Optional[torch.Tensor],
         expected_input_positions: Optional[torch.Tensor],
@@ -322,15 +322,15 @@ class WriteInvariants:
         WriteInvariants._assert_written_slots_token_position_match_input(
             canary_buf_after=canary_buf_after,
             plan=plan,
-            fb_input_ids=fb_input_ids,
-            fb_positions=fb_positions,
-            fb_out_cache_loc=fb_out_cache_loc,
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
         )
         WriteInvariants._assert_slot_minus_one_skipped(
             canary_buf_before=canary_buf_before,
             canary_buf_after=canary_buf_after,
             plan=plan,
-            fb_out_cache_loc=fb_out_cache_loc,
+            out_cache_loc=out_cache_loc,
         )
         if (
             enable_write_verify_inputs
@@ -343,9 +343,9 @@ class WriteInvariants:
                 log_after=log_after,
                 expected_input_tokens=expected_input_tokens,
                 expected_input_positions=expected_input_positions,
-                fb_input_ids=fb_input_ids,
-                fb_positions=fb_positions,
-                fb_out_cache_loc=fb_out_cache_loc,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
                 plan=plan,
             )
         elif not enable_write_verify_inputs:
@@ -353,18 +353,18 @@ class WriteInvariants:
                 enable_write_verify_inputs=enable_write_verify_inputs,
                 log_before=log_before,
                 log_after=log_after,
-                expected_input_tokens=fb_input_ids,
-                expected_input_positions=fb_positions,
-                fb_input_ids=fb_input_ids,
-                fb_positions=fb_positions,
-                fb_out_cache_loc=fb_out_cache_loc,
+                expected_input_tokens=input_ids,
+                expected_input_positions=positions,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
                 plan=plan,
             )
         WriteInvariants._assert_write_slot_run_counter_incremented(
             log_before=log_before,
             log_after=log_after,
             plan=plan,
-            fb_out_cache_loc=fb_out_cache_loc,
+            out_cache_loc=out_cache_loc,
         )
         WriteInvariants._assert_write_kernel_run_counter_incremented_by_one(
             log_before=log_before, log_after=log_after
@@ -375,18 +375,18 @@ class WriteInvariants:
         *,
         canary_buf_after: torch.Tensor,
         plan: WritePlan,
-        fb_input_ids: torch.Tensor,
-        fb_positions: torch.Tensor,
-        fb_out_cache_loc: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
     ) -> None:
         n_active = int(plan.write_num_valid_reqs[0].item())
         if n_active == 0:
             return
         offsets = plan.write_offsets[: n_active + 1].detach().cpu().tolist()
         total = offsets[n_active]
-        slots_cpu = fb_out_cache_loc[:total].detach().cpu().tolist()
-        tokens_cpu = fb_input_ids[:total].detach().cpu().tolist()
-        pos_cpu = fb_positions[:total].detach().cpu().tolist()
+        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
+        tokens_cpu = input_ids[:total].detach().cpu().tolist()
+        pos_cpu = positions[:total].detach().cpu().tolist()
         view = canary_buf_after.view(torch.int64)
         for i in range(total):
             slot = slots_cpu[i]
@@ -407,13 +407,13 @@ class WriteInvariants:
         canary_buf_before: torch.Tensor,
         canary_buf_after: torch.Tensor,
         plan: WritePlan,
-        fb_out_cache_loc: torch.Tensor,
+        out_cache_loc: torch.Tensor,
     ) -> None:
         n_active = int(plan.write_num_valid_reqs[0].item())
         if n_active == 0:
             return
         total = int(plan.write_offsets[n_active].item())
-        slots_cpu = fb_out_cache_loc[:total].detach().cpu().tolist()
+        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
         written_slots = {s for s in slots_cpu if s >= 0}
         view_before = canary_buf_before.view(torch.int64)
         view_after = canary_buf_after.view(torch.int64)
@@ -423,7 +423,7 @@ class WriteInvariants:
                 continue
             assert torch.equal(
                 view_before[slot], view_after[slot]
-            ), f"slot {slot} not in fb_out_cache_loc but canary_buf changed"
+            ), f"slot {slot} not in out_cache_loc but canary_buf changed"
 
     @staticmethod
     def _assert_pseudo_violation_only_on_mismatch(
@@ -433,9 +433,9 @@ class WriteInvariants:
         log_after: FakeViolationLog,
         expected_input_tokens: torch.Tensor,
         expected_input_positions: torch.Tensor,
-        fb_input_ids: torch.Tensor,
-        fb_positions: torch.Tensor,
-        fb_out_cache_loc: torch.Tensor,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        out_cache_loc: torch.Tensor,
         plan: WritePlan,
     ) -> None:
         delta = int(log_after.write_index[0].item()) - int(
@@ -451,11 +451,11 @@ class WriteInvariants:
             assert delta == 0, f"empty plan produced {delta} violations"
             return
         total = int(plan.write_offsets[n_active].item())
-        tok = fb_input_ids[:total].detach().cpu().tolist()
-        pos = fb_positions[:total].detach().cpu().tolist()
+        tok = input_ids[:total].detach().cpu().tolist()
+        pos = positions[:total].detach().cpu().tolist()
         exp_tok = expected_input_tokens[:total].detach().cpu().tolist()
         exp_pos = expected_input_positions[:total].detach().cpu().tolist()
-        slots_cpu = fb_out_cache_loc[:total].detach().cpu().tolist()
+        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
         mismatch_entries = sum(
             1
             for i in range(total)
@@ -477,7 +477,7 @@ class WriteInvariants:
         log_before: FakeViolationLog,
         log_after: FakeViolationLog,
         plan: WritePlan,
-        fb_out_cache_loc: torch.Tensor,
+        out_cache_loc: torch.Tensor,
     ) -> None:
         n_active = int(plan.write_num_valid_reqs[0].item())
         if n_active == 0:

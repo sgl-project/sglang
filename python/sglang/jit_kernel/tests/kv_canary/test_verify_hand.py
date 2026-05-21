@@ -94,9 +94,9 @@ def _stamp_clean_kv_chain(
     *,
     buf_pair: tuple[torch.Tensor, torch.Tensor],
     sources_cuda: tuple[RealKvSource, ...],
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
     real_kv_hash_mode: consts.RealKvHashMode,
     seed_offset: int = 0,
 ) -> None:
@@ -104,7 +104,7 @@ def _stamp_clean_kv_chain(
 
     Lets verify tests start from a known-good chain without re-implementing splitmix64 by hand.
     """
-    n = int(fb_input_ids.shape[0])
+    n = int(input_ids.shape[0])
     cuda_buf, ref_buf = buf_pair
     write_plan = make_write_plan(
         write_offsets=[0, n],
@@ -118,9 +118,9 @@ def _stamp_clean_kv_chain(
     canary_write_step_torch_reference(
         canary_buf=cuda_buf,
         plan=write_plan,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         enable_write_verify_inputs=False,
         expected_input_tokens=pseudo_tokens,
@@ -473,9 +473,9 @@ class TestViolationField:
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources_cuda,
-            fb_input_ids=torch.tensor([7, 8, 9], dtype=torch.int64, device=_DEVICE),
-            fb_positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
-            fb_out_cache_loc=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
+            input_ids=torch.tensor([7, 8, 9], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
@@ -534,9 +534,9 @@ class TestViolationField:
             _stamp_clean_kv_chain(
                 buf_pair=buf_pair,
                 sources_cuda=sources_cuda,
-                fb_input_ids=torch.tensor(tokens, dtype=torch.int64, device=_DEVICE),
-                fb_positions=torch.tensor(positions, dtype=torch.int64, device=_DEVICE),
-                fb_out_cache_loc=torch.tensor(
+                input_ids=torch.tensor(tokens, dtype=torch.int64, device=_DEVICE),
+                positions=torch.tensor(positions, dtype=torch.int64, device=_DEVICE),
+                out_cache_loc=torch.tensor(
                     slot_indices, dtype=torch.int64, device=_DEVICE
                 ),
                 real_kv_hash_mode=consts.RealKvHashMode.ALL,
@@ -741,9 +741,9 @@ class TestRealKvHash:
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources_cuda,
-            fb_input_ids=torch.tensor([10, 20, 30], dtype=torch.int64, device=_DEVICE),
-            fb_positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
-            fb_out_cache_loc=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
+            input_ids=torch.tensor([10, 20, 30], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1, 2], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2, 3], dtype=torch.int64, device=_DEVICE),
             real_kv_hash_mode=mode,
         )
 
@@ -774,9 +774,9 @@ class TestRealKvHash:
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources_cuda,
-            fb_input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
-            fb_positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
-            fb_out_cache_loc=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
+            input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
@@ -1132,9 +1132,9 @@ class TestRealKvSource:
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources,
-            fb_input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
-            fb_positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
-            fb_out_cache_loc=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
+            input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
@@ -1181,9 +1181,9 @@ class TestLayoutAndScheduling:
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources,
-            fb_input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
-            fb_positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
-            fb_out_cache_loc=torch.tensor([1, 5], dtype=torch.int64, device=_DEVICE),
+            input_ids=torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE),
+            positions=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
+            out_cache_loc=torch.tensor([1, 5], dtype=torch.int64, device=_DEVICE),
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 

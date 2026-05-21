@@ -42,16 +42,16 @@ def _plan_pair(
 
 def _alloc_for_inputs(
     *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     extras_count: int,
     swa_window_size: int,
 ) -> tuple[int, int]:
-    bs = int(fb_req_pool_indices.shape[0])
-    rpi_cpu = fb_req_pool_indices.detach().cpu().tolist()
-    pfx_cpu = fb_prefix_lens.detach().cpu().tolist()
-    ext_cpu = fb_extend_seq_lens.detach().cpu().tolist()
+    bs = int(req_pool_indices.shape[0])
+    rpi_cpu = req_pool_indices.detach().cpu().tolist()
+    pfx_cpu = prefix_lens.detach().cpu().tolist()
+    ext_cpu = extend_seq_lens.detach().cpu().tolist()
     total_verify = 0
     for rpi, pfx in zip(rpi_cpu, pfx_cpu):
         if rpi == 0:
@@ -69,9 +69,9 @@ def _alloc_for_inputs(
 def _run_label(
     *,
     label: str,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     swa_window_size: int,
@@ -88,9 +88,9 @@ def _run_label(
     runner(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
         req_to_token=req_to_token,
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
@@ -110,9 +110,9 @@ class TestBasicShape:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([3]),
-            fb_prefix_lens=_tensor([0]),
-            fb_extend_seq_lens=_tensor([5]),
+            req_pool_indices=_tensor([3]),
+            prefix_lens=_tensor([0]),
+            extend_seq_lens=_tensor([5]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -134,9 +134,9 @@ class TestBasicShape:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([2]),
-            fb_prefix_lens=_tensor([7]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([2]),
+            prefix_lens=_tensor([7]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -155,9 +155,9 @@ class TestBasicShape:
         # req0: prefill extend=8; req1: decode extend=1; req2: decode extend=1.
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 3]),
-            fb_prefix_lens=_tensor([0, 4, 10]),
-            fb_extend_seq_lens=_tensor([8, 1, 1]),
+            req_pool_indices=_tensor([1, 2, 3]),
+            prefix_lens=_tensor([0, 4, 10]),
+            extend_seq_lens=_tensor([8, 1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -180,9 +180,9 @@ class TestSeedSlot:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([0]),
-            fb_extend_seq_lens=_tensor([3]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([0]),
+            extend_seq_lens=_tensor([3]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -197,9 +197,9 @@ class TestSeedSlot:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -216,9 +216,9 @@ class TestSeedSlot:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([2]),
-            fb_prefix_lens=_tensor([4]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([2]),
+            prefix_lens=_tensor([4]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -242,27 +242,27 @@ class TestSeedSlot:
 
         rp = 2
         prefix = 5
-        fb_rpi = _tensor([rp])
-        fb_pfx = _tensor([prefix])
-        fb_ext = _tensor([1])
+        req_pool_indices = _tensor([rp])
+        prefix_lens = _tensor([prefix])
+        extend_seq_lens = _tensor([1])
 
         full_seed_slot = rp * max_seq_len + (prefix - 1)
         expected_seed = int(lut[full_seed_slot].item())
 
         extras = _empty_extras()
         verify_capacity, write_req_capacity = _alloc_for_inputs(
-            fb_req_pool_indices=fb_rpi,
-            fb_prefix_lens=fb_pfx,
-            fb_extend_seq_lens=fb_ext,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             extras_count=0,
             swa_window_size=max_seq_len,
         )
         for label in ("real", "ref"):
             _, w_plan = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=max_seq_len,
@@ -289,9 +289,9 @@ class TestSeedSlot:
             kind="linear", max_reqs=max_reqs, max_seq_len=max_seq_len, device=_DEVICE
         )
 
-        fb_rpi = _tensor([rp])
-        fb_pfx = _tensor([prefix])
-        fb_ext = _tensor([1])
+        req_pool_indices = _tensor([rp])
+        prefix_lens = _tensor([prefix])
+        extend_seq_lens = _tensor([1])
         extras = _empty_extras()
 
         window_start = prefix - swa_window_size
@@ -305,9 +305,9 @@ class TestSeedSlot:
         for label in ("real", "ref"):
             v_plan, _ = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=swa_window_size,
@@ -326,7 +326,7 @@ class TestSeedSlot:
 
 class TestPadding:
     def test_padding_rows_contribute_zero(self) -> None:
-        """``fb_req_pool_indices[r] == 0`` rows → no verify entry, no write entry, seed = -1."""
+        """``req_pool_indices[r] == 0`` rows → no verify entry, no write entry, seed = -1."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -334,9 +334,9 @@ class TestPadding:
         # Step: bs=3 with row 1 marked as padding (rpi=0).
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 0, 2]),
-            fb_prefix_lens=_tensor([5, 99, 3]),
-            fb_extend_seq_lens=_tensor([1, 99, 1]),
+            req_pool_indices=_tensor([1, 0, 2]),
+            prefix_lens=_tensor([5, 99, 3]),
+            extend_seq_lens=_tensor([1, 99, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -365,14 +365,14 @@ class TestPadding:
         )
         rp = 1
         prefix = 4
-        fb_rpi = _tensor([rp])
-        fb_pfx = _tensor([prefix])
-        fb_ext = _tensor([1])
+        req_pool_indices = _tensor([rp])
+        prefix_lens = _tensor([prefix])
+        extend_seq_lens = _tensor([1])
         extras = _empty_extras()
         verify_capacity, write_req_capacity = _alloc_for_inputs(
-            fb_req_pool_indices=fb_rpi,
-            fb_prefix_lens=fb_pfx,
-            fb_extend_seq_lens=fb_ext,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             extras_count=0,
             swa_window_size=0,
         )
@@ -382,9 +382,9 @@ class TestPadding:
         for label in ("real", "ref"):
             v_plan, _ = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=0,
@@ -399,9 +399,9 @@ class TestPadding:
 
     def test_padding_row_with_garbage_prefix_does_not_oob(self) -> None:
         """rpi==0 padding row with absurd prefix_lens must not OOB-read req_to_token (row is skipped)."""
-        fb_rpi = _tensor([1, 0, 2])
-        fb_pfx = _tensor([5, 99999, 3])
-        fb_ext = _tensor([1, 99999, 1])
+        req_pool_indices = _tensor([1, 0, 2])
+        prefix_lens = _tensor([5, 99999, 3])
+        extend_seq_lens = _tensor([1, 99999, 1])
         rtt = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -413,9 +413,9 @@ class TestPadding:
         for label in ("real", "ref"):
             v_plan, w_plan = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=0,
@@ -430,9 +430,9 @@ class TestPadding:
             PlanInvariants.assert_all(
                 verify_plan=v_plan,
                 write_plan=w_plan,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 swa_window_size=0,
                 extras_slot_indices=extras[0],
                 extras_positions=extras[1],
@@ -453,9 +453,9 @@ class TestSwa:
         plans = _plan_pair(verify_capacity=256, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
             swa_window_size=128,
@@ -474,9 +474,9 @@ class TestSwa:
         plans = _plan_pair(verify_capacity=512, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([200]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([200]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
             swa_window_size=128,
@@ -503,9 +503,9 @@ class TestSwa:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
             swa_window_size=128,
@@ -531,9 +531,9 @@ class TestSwa:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
             swa_window_size=128,
@@ -559,9 +559,9 @@ class TestSwa:
         plans = _plan_pair(verify_capacity=1024, write_req_capacity=8)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 3, 1]),
-            fb_prefix_lens=_tensor(prefix_values),
-            fb_extend_seq_lens=_tensor([1, 1, 1, 1]),
+            req_pool_indices=_tensor([1, 2, 3, 1]),
+            prefix_lens=_tensor(prefix_values),
+            extend_seq_lens=_tensor([1, 1, 1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
             swa_window_size=window,
@@ -581,9 +581,9 @@ class TestNoExtras:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([3]),
-            fb_extend_seq_lens=_tensor([1]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([3]),
+            extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -598,9 +598,9 @@ class TestNoExtras:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([0]),
-            fb_extend_seq_lens=_tensor([5]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([0]),
+            extend_seq_lens=_tensor([5]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -610,9 +610,9 @@ class TestNoExtras:
     def test_verify_capacity_just_fits_per_req_entries(self) -> None:
         rp = 1
         prefix = 4
-        fb_rpi = _tensor([rp])
-        fb_pfx = _tensor([prefix])
-        fb_ext = _tensor([1])
+        req_pool_indices = _tensor([rp])
+        prefix_lens = _tensor([prefix])
+        extend_seq_lens = _tensor([1])
         rtt = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -628,9 +628,9 @@ class TestNoExtras:
         for label in ("real", "ref"):
             v_plan, _ = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=_empty_extras(),
                 swa_window_size=0,
@@ -644,9 +644,9 @@ class TestNoExtras:
     def test_verify_capacity_undershoot_by_one(self) -> None:
         rp = 1
         prefix = 3
-        fb_rpi = _tensor([rp])
-        fb_pfx = _tensor([prefix])
-        fb_ext = _tensor([1])
+        req_pool_indices = _tensor([rp])
+        prefix_lens = _tensor([prefix])
+        extend_seq_lens = _tensor([1])
         rtt = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
@@ -661,9 +661,9 @@ class TestNoExtras:
 
         real_v, _ = _run_label(
             label="real",
-            fb_req_pool_indices=fb_rpi,
-            fb_prefix_lens=fb_pfx,
-            fb_extend_seq_lens=fb_ext,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             req_to_token=rtt,
             extras=_empty_extras(),
             swa_window_size=0,
@@ -673,9 +673,9 @@ class TestNoExtras:
         )
         ref_v, _ = _run_label(
             label="ref",
-            fb_req_pool_indices=fb_rpi,
-            fb_prefix_lens=fb_pfx,
-            fb_extend_seq_lens=fb_ext,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             req_to_token=rtt,
             extras=_empty_extras(),
             swa_window_size=0,
@@ -702,9 +702,9 @@ class TestMisc:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2]),
-            fb_prefix_lens=_tensor([4, 6]),
-            fb_extend_seq_lens=_tensor([0, 0]),
+            req_pool_indices=_tensor([1, 2]),
+            prefix_lens=_tensor([4, 6]),
+            extend_seq_lens=_tensor([0, 0]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -722,9 +722,9 @@ class TestMisc:
 
     def test_replay_same_inputs_yields_same_outputs(self) -> None:
         """Two consecutive runs on identical inputs produce byte-equal plans (kernel is pure)."""
-        fb_rpi = _tensor([1, 2, 3])
-        fb_pfx = _tensor([4, 7, 2])
-        fb_ext = _tensor([2, 1, 3])
+        req_pool_indices = _tensor([1, 2, 3])
+        prefix_lens = _tensor([4, 7, 2])
+        extend_seq_lens = _tensor([2, 1, 3])
         rtt = make_req_to_token(
             kind="linear", max_reqs=8, max_seq_len=16, device=_DEVICE
         )
@@ -736,9 +736,9 @@ class TestMisc:
         for label in ("real", "ref"):
             run1_v, run1_w = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=0,
@@ -748,9 +748,9 @@ class TestMisc:
             )
             run2_v, run2_w = _run_label(
                 label=label,
-                fb_req_pool_indices=fb_rpi,
-                fb_prefix_lens=fb_pfx,
-                fb_extend_seq_lens=fb_ext,
+                req_pool_indices=req_pool_indices,
+                prefix_lens=prefix_lens,
+                extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
                 extras=extras,
                 swa_window_size=0,
@@ -805,9 +805,9 @@ class TestMisc:
             runner(
                 verify_plan_out=verify_plan,
                 write_plan_out=write_plan,
-                fb_req_pool_indices=big_rpi,
-                fb_prefix_lens=big_pfx,
-                fb_extend_seq_lens=big_ext,
+                req_pool_indices=big_rpi,
+                prefix_lens=big_pfx,
+                extend_seq_lens=big_ext,
                 req_to_token=rtt,
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
@@ -817,9 +817,9 @@ class TestMisc:
             runner(
                 verify_plan_out=verify_plan,
                 write_plan_out=write_plan,
-                fb_req_pool_indices=small_rpi,
-                fb_prefix_lens=small_pfx,
-                fb_extend_seq_lens=small_ext,
+                req_pool_indices=small_rpi,
+                prefix_lens=small_pfx,
+                extend_seq_lens=small_ext,
                 req_to_token=rtt,
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
@@ -844,9 +844,9 @@ class TestVerifyContent:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 3]),
-            fb_prefix_lens=_tensor([2, 5, 4]),
-            fb_extend_seq_lens=_tensor([1, 1, 1]),
+            req_pool_indices=_tensor([1, 2, 3]),
+            prefix_lens=_tensor([2, 5, 4]),
+            extend_seq_lens=_tensor([1, 1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -864,9 +864,9 @@ class TestVerifyContent:
         plans = _plan_pair(verify_capacity=128, write_req_capacity=8)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 3, 1]),
-            fb_prefix_lens=_tensor(prefix_values),
-            fb_extend_seq_lens=_tensor(extend_values),
+            req_pool_indices=_tensor([1, 2, 3, 1]),
+            prefix_lens=_tensor(prefix_values),
+            extend_seq_lens=_tensor(extend_values),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -881,9 +881,9 @@ class TestVerifyContent:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2]),
-            fb_prefix_lens=_tensor([5, 8]),
-            fb_extend_seq_lens=_tensor([1, 1]),
+            req_pool_indices=_tensor([1, 2]),
+            prefix_lens=_tensor([5, 8]),
+            extend_seq_lens=_tensor([1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -904,9 +904,9 @@ class TestVerifyContent:
         # bs=4, last two rows are padding.
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 0, 0]),
-            fb_prefix_lens=_tensor([3, 5, 99, 99]),
-            fb_extend_seq_lens=_tensor([1, 1, 99, 99]),
+            req_pool_indices=_tensor([1, 2, 0, 0]),
+            prefix_lens=_tensor([3, 5, 99, 99]),
+            extend_seq_lens=_tensor([1, 1, 99, 99]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -927,9 +927,9 @@ class TestByteEqual:
         plans = _plan_pair(verify_capacity=128, write_req_capacity=8)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2, 3, 1]),
-            fb_prefix_lens=_tensor([0, 3, 8, 15]),
-            fb_extend_seq_lens=_tensor([4, 1, 1, 1]),
+            req_pool_indices=_tensor([1, 2, 3, 1]),
+            prefix_lens=_tensor([0, 3, 8, 15]),
+            extend_seq_lens=_tensor([4, 1, 1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -947,9 +947,9 @@ class TestByteEqual:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor(rps),
-            fb_prefix_lens=_tensor(prefixes),
-            fb_extend_seq_lens=_tensor(extends),
+            req_pool_indices=_tensor(rps),
+            prefix_lens=_tensor(prefixes),
+            extend_seq_lens=_tensor(extends),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -995,9 +995,9 @@ class TestBoundarySweep:
         )
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor(req_pool_indices),
-            fb_prefix_lens=_tensor(prefix_lens),
-            fb_extend_seq_lens=_tensor(extend_seq_lens),
+            req_pool_indices=_tensor(req_pool_indices),
+            prefix_lens=_tensor(prefix_lens),
+            extend_seq_lens=_tensor(extend_seq_lens),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -1015,9 +1015,9 @@ class TestBoundarySweep:
         )
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1, 2]),
-            fb_prefix_lens=_tensor([prefix_val, 10]),
-            fb_extend_seq_lens=_tensor([1, 1]),
+            req_pool_indices=_tensor([1, 2]),
+            prefix_lens=_tensor([prefix_val, 10]),
+            extend_seq_lens=_tensor([1, 1]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )
@@ -1032,9 +1032,9 @@ class TestBoundarySweep:
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
-            fb_req_pool_indices=_tensor([1]),
-            fb_prefix_lens=_tensor([0]),
-            fb_extend_seq_lens=_tensor([extend_val]),
+            req_pool_indices=_tensor([1]),
+            prefix_lens=_tensor([0]),
+            extend_seq_lens=_tensor([extend_val]),
             req_to_token=req_to_token,
             extras=_empty_extras(),
         )

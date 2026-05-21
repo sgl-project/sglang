@@ -61,9 +61,9 @@ def _make_kernel_args(device):
         verify_plan=verify_plan,
         write_plan=write_plan,
         violation_log=log,
-        fb_input_ids=torch.zeros(1, dtype=torch.int64, device=device),
-        fb_positions=torch.zeros(1, dtype=torch.int64, device=device),
-        fb_out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
+        input_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        positions=torch.zeros(1, dtype=torch.int64, device=device),
+        out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
         input_check_mode=False,
         expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
         real_kv_hash_mode=RealKvHashMode.OFF,
@@ -89,9 +89,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
             ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
@@ -121,9 +121,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
             ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
@@ -189,7 +189,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(captured_rings[0], captured_rings[1])
         self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())
 
-    def test_swa_endpoint_pre_translates_fb_out_cache_loc(self):
+    def test_swa_endpoint_pre_translates_out_cache_loc(self):
         """Verify SWA endpoints translate cache locations before write launch."""
         captured: List[torch.Tensor] = []
         with patch.object(
@@ -197,7 +197,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         ), patch.object(
             endpoint_module,
             "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
+            lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
         ):
             # LUT maps full slot i → swa slot (i + 100) so we can verify the gather happened.
             lut = torch.arange(8, dtype=torch.int64, device=self.device) + 100
@@ -216,9 +216,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
             swa_ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
@@ -227,19 +227,19 @@ class TestSelfUnitEndpoint(CustomTestCase):
             full_ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
-        # SWA call: fb_out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
-        expected_swa = lut[args.fb_out_cache_loc]
+        # SWA call: out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
+        expected_swa = lut[args.out_cache_loc]
         self.assertTrue(torch.equal(captured[0], expected_swa))
-        # FULL call: fb_out_cache_loc keeps the same values and dtype.
-        self.assertIs(captured[1], args.fb_out_cache_loc)
+        # FULL call: out_cache_loc keeps the same values and dtype.
+        self.assertIs(captured[1], args.out_cache_loc)
 
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
         """Verify SWA sentinel cache rows become write-skip markers."""
@@ -249,7 +249,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         ), patch.object(
             endpoint_module,
             "launch_canary_write_kernel",
-            lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
+            lambda **kwargs: captured.append(kwargs["out_cache_loc"]),
         ):
             # 8 in-window rows + 1 trailing sentinel row at index 8.
             lut = torch.arange(8, dtype=torch.int64, device=self.device)
@@ -260,17 +260,17 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 device=self.device, kernel_kind=CanaryLaunchTag.HEAD_K_SWA, swa_lut=lut
             )
             args = _make_kernel_args(self.device)
-            # Point fb_out_cache_loc at the trailing-sentinel-row index — this is how sglang signals
+            # Point out_cache_loc at the trailing-sentinel-row index — this is how sglang signals
             # "this token is out-of-window for the SWA group" pre-cleanup, and the new host gather must
             # produce -1 here.
-            args.fb_out_cache_loc.fill_(8)
+            args.out_cache_loc.fill_(8)
 
             swa_ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
@@ -299,18 +299,18 @@ class TestSelfUnitEndpoint(CustomTestCase):
             ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids,
-                fb_positions=args.fb_positions,
-                fb_out_cache_loc=args.fb_out_cache_loc,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
 
-        self.assertEqual(captured[0]["fb_input_ids"].dtype, torch.int64)
-        self.assertEqual(captured[0]["fb_positions"].dtype, torch.int64)
-        self.assertEqual(captured[0]["fb_out_cache_loc"].dtype, torch.int64)
+        self.assertEqual(captured[0]["input_ids"].dtype, torch.int64)
+        self.assertEqual(captured[0]["positions"].dtype, torch.int64)
+        self.assertEqual(captured[0]["out_cache_loc"].dtype, torch.int64)
         self.assertIsNone(captured[0]["expected_input_tokens"])
         self.assertIsNone(captured[0]["expected_input_positions"])
 

@@ -22,8 +22,8 @@ class WritePlan:
     """Write plan consumed by launch_canary_write_kernel: per-token slot indices + per-req metadata.
 
     Fully per-req — no per-token tile. launch_canary_write_kernel uses write_offsets to map each thread's
-    (req, j) into a flat index i, then reads token-level data from fb_input_ids / fb_positions /
-    fb_out_cache_loc[i] directly.
+    (req, j) into a flat index i, then reads token-level data from input_ids / positions /
+    out_cache_loc[i] directly.
     SWA translation of per-token slots is done **host-side by the caller** (typically the endpoint) before
     invoking launch_canary_write_kernel — the kernel is SWA-agnostic and only understands "slot ≥ 0 ⇒ write;
     slot < 0 ⇒ skip this entry". Only the chain-seed slot (a per-req gather from req_to_token at plan time)
@@ -73,9 +73,9 @@ def launch_canary_write_kernel(
     *,
     context: VerifyOrWriteContext,
     plan: WritePlan,
-    fb_input_ids: torch.Tensor,
-    fb_positions: torch.Tensor,
-    fb_out_cache_loc: torch.Tensor,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
     enable_assert_inputs: bool,
     expected_input_tokens: torch.Tensor | None,
     expected_input_positions: torch.Tensor | None,
@@ -85,8 +85,8 @@ def launch_canary_write_kernel(
     Grid: one CUDA block per active write req, single thread per block (chain is intrinsically serial).
     Block r walks entries ``[plan.write_offsets[r], plan.write_offsets[r+1])``. Per chain step ``i``:
 
-    - ``slot`` = ``fb_out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
-    - ``token / position`` = ``fb_input_ids[i] / fb_positions[i]``.
+    - ``slot`` = ``out_cache_loc[i]`` (caller-pre-translated for SWA groups; entries set to -1 are skipped).
+    - ``token / position`` = ``input_ids[i] / positions[i]``.
     - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
     - Advance ``running_prev_hash = splitmix64_mix4(prev, token, position, real_kv_hash)``, where
@@ -101,26 +101,26 @@ def launch_canary_write_kernel(
     SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (no runtime seed).
 
     Write-time input verification (caller-driven, kernel is oracle-agnostic): when
-    ``enable_assert_inputs`` is True the kernel additionally compares ``fb_input_ids[i]`` against
-    ``expected_input_tokens[i]`` and ``fb_positions[i]`` against ``expected_input_positions[i]``; mismatch
+    ``enable_assert_inputs`` is True the kernel additionally compares ``input_ids[i]`` against
+    ``expected_input_tokens[i]`` and ``positions[i]`` against ``expected_input_positions[i]``; mismatch
     on either field records a violation. The chain still advances on the actual values (not the expected
     ones) so a downstream verify won't cascade. Whoever produced the expected tensors is responsible for
     filling them; the kernel runs no oracle internally.
 
     Write only writes canary_buf (reads only at seed slots). Block uses no shared memory.
 
-    The ``fb_*`` arguments are passed through unchanged from the source ForwardBatch — canary does not transform
+    The ForwardBatch-derived arguments are passed through unchanged from the source ForwardBatch — canary does not transform
     them.
 
     Args:
         context: Shared verify/write launch context, including canary buffer, launch tag, violation sink,
             health counters, and real KV fingerprint sources.
         plan: Pre-allocated WritePlan.
-        fb_input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int64.
+        input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int64.
             Flattened across reqs in plan.write_offsets order; tail beyond
             plan.write_offsets[plan.write_num_valid_reqs[0]] is cuda-graph padding.
-        fb_positions: ForwardBatch.positions; sequence positions of fb_input_ids, shape [num_tokens_padded], int64.
-        fb_out_cache_loc: Per-token canary slot index, shape [num_tokens_padded], int64. The caller is
+        positions: ForwardBatch.positions; sequence positions of input_ids, shape [num_tokens_padded], int64.
+        out_cache_loc: Per-token canary slot index, shape [num_tokens_padded], int64. The caller is
             responsible for translating ForwardBatch.out_cache_loc into the canary's index space for SWA
             groups (typically a host-side LUT gather in the endpoint); FULL groups pass it through
             unchanged. A -1 entry signals skip-this-token (used for SWA out-of-window slots or padding).
@@ -129,7 +129,7 @@ def launch_canary_write_kernel(
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
         expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int64. Only read
             when enable_assert_inputs is True; must be None when enable_assert_inputs is False.
-            Layout mirrors fb_input_ids (flattened across reqs in plan.write_offsets order); padding tail
+            Layout mirrors input_ids (flattened across reqs in plan.write_offsets order); padding tail
             is ignored. Filled by the caller from whichever oracle produces expected inputs — the kernel
             knows no oracle.
         expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int64, or None.
@@ -147,9 +147,9 @@ def launch_canary_write_kernel(
           real_kv_hash); else running_prev_hash = splitmix64(kCanaryChainAnchor).
         - Serial chain loop `for j in range(entry_count)`:
               i = entry_start + j;
-              slot = fb_out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
+              slot = out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
               if (slot < 0) continue;       // -1 sentinel = skip (SWA out-of-window or padding)
-              token = fb_input_ids[i]; position = fb_positions[i];
+              token = input_ids[i]; position = positions[i];
               real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
               if enable_assert_inputs:
@@ -167,7 +167,7 @@ def launch_canary_write_kernel(
         - Pure side-effect; never raises.
         - Input-verification mismatch records violations but does NOT abort the chain.
         - kernel_run_counter is bumped every call.
-        - Safe in cuda-graph capture; caller refills fb_input_ids / fb_positions / fb_out_cache_loc / plan
+        - Safe in cuda-graph capture; caller refills input_ids / positions / out_cache_loc / plan
           in-place before replay.
 
     Pinned by torch reference
@@ -186,9 +186,9 @@ def launch_canary_write_kernel(
     _assert_contiguous(plan.write_offsets, "plan.write_offsets")
     _assert_contiguous(plan.write_seed_slot_indices, "plan.write_seed_slot_indices")
     _assert_contiguous(plan.write_num_valid_reqs, "plan.write_num_valid_reqs")
-    _assert_contiguous(fb_input_ids, "fb_input_ids")
-    _assert_contiguous(fb_positions, "fb_positions")
-    _assert_contiguous(fb_out_cache_loc, "fb_out_cache_loc")
+    _assert_contiguous(input_ids, "input_ids")
+    _assert_contiguous(positions, "positions")
+    _assert_contiguous(out_cache_loc, "out_cache_loc")
     if enable_assert_inputs:
         if expected_input_tokens is None or expected_input_positions is None:
             raise ValueError(
@@ -216,9 +216,9 @@ def launch_canary_write_kernel(
         plan.write_offsets,
         plan.write_seed_slot_indices,
         plan.write_num_valid_reqs,
-        fb_input_ids,
-        fb_positions,
-        fb_out_cache_loc,
+        input_ids,
+        positions,
+        out_cache_loc,
         int(context.kernel_kind),
         int(enable_assert_inputs),
         expected_input_tokens,
