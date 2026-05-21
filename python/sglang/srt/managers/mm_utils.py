@@ -910,19 +910,18 @@ def embed_mm_inputs(
                 device=input_ids.device,
             )
             # calculate per request items length offset
-            items_size = torch.zeros(len(mm_inputs_list) + 1, dtype=int)
+            items_size = [0]
             items_offsets = []
-            for i, mm_inputs in enumerate(mm_inputs_list):
+            for mm_inputs in mm_inputs_list:
                 mm_items = [
                     item
                     for item in mm_inputs.mm_items
                     if item.is_modality(modality=modality)
                 ]
-                items_size[i + 1] = len(mm_items)
+                items_size.append(items_size[-1] + len(mm_items))
                 items_offsets.append(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
-            items_size = torch.cumsum(items_size, dim=0).tolist()
 
             embedding, mask, input_ids, indices = get_embedding_and_mask(
                 data_embedding_func=embedder,
