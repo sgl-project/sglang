@@ -153,6 +153,19 @@ class BaseGrammarBackend:
         """Set or clear specific tokens in the vocab mask. No-op by default."""
         pass
 
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        raise NotImplementedError()
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        raise NotImplementedError()
+
     def init_strict_reasoning_grammar(self, reasoning: bool):
         """Create a grammar object for strict token filtering only. Returns None by default."""
         return None
