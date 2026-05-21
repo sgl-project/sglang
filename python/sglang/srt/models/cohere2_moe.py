@@ -239,6 +239,7 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
+        self.layer_id = layer_id
 
         if self.tp_size > config.num_experts:
             raise ValueError(
@@ -306,12 +307,20 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        # FusedMoE.experts can write back into the input buffer when the
+        # MoeRunner reuses the input as its dispatcher scratch (observed for
+        # the unquantized triton backend on BF16). Snapshot the post-norm
+        # input so the shared-expert branch sees the original layernorm
+        # output and not whatever the routed kernel left behind.
+        shared_input = hidden_states.clone() if self.shared_experts is not None else None
+        routed_out = self.experts(hidden_states, topk_output)
         if self.shared_experts is not None:
-            shared_output = self.shared_experts(hidden_states)
-            final_hidden_states = final_hidden_states + shared_output
+            shared_out = self.shared_experts(shared_input)
+            final_hidden_states = routed_out + shared_out
             if self.shared_expert_combination_strategy == "average":
                 final_hidden_states = final_hidden_states / 2
+        else:
+            final_hidden_states = routed_out
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(orig_shape)
