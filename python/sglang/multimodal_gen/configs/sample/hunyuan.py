@@ -38,7 +38,7 @@ class HunyuanSamplingParams(SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.15,
+            rel_l1_thresh=0.15,
             # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4HunyuanVideo/teacache_sample_video.py#L222
             coefficients=[
                 7.33226126e02,

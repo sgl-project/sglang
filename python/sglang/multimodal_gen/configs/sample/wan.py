@@ -66,7 +66,7 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.08,
+            rel_l1_thresh=0.08,
             use_ret_steps=True,
             coefficients_callback=_wan_1_3b_coefficients,
             start_skipping=5,
@@ -102,7 +102,7 @@ class WanT2V_14B_SamplingParams(SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.20,
+            rel_l1_thresh=0.20,
             use_ret_steps=False,
             coefficients_callback=_wan_14b_coefficients,
             start_skipping=1,
@@ -128,7 +128,7 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.26,
+            rel_l1_thresh=0.26,
             use_ret_steps=True,
             coefficients_callback=_wan_14b_coefficients,
             start_skipping=5,
@@ -156,7 +156,7 @@ class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
 
     teacache_params: TeaCacheParams = field(
         default_factory=lambda: TeaCacheParams(
-            teacache_thresh=0.3,
+            rel_l1_thresh=0.3,
             use_ret_steps=True,
             coefficients_callback=_wan_14b_coefficients,
             start_skipping=5,

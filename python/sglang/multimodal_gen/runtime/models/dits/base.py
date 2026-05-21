@@ -8,16 +8,13 @@ import torch
 from torch import nn
 
 from sglang.multimodal_gen.configs.models import DiTConfig
-
-# NOTE: TeaCacheContext and TeaCacheMixin have been moved to
-# sglang.multimodal_gen.runtime.cache.teacache
-# For backwards compatibility, re-export from the new location
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext  # noqa: F401
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheMixin
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheStrategy
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 
-# TODO
 class BaseDiT(nn.Module, ABC):
     _fsdp_shard_conditions: list = []
     _compile_conditions: list = []
@@ -87,11 +84,15 @@ class BaseDiT(nn.Module, ABC):
         return next(self.parameters()).device
 
 
-class CachableDiT(TeaCacheMixin, BaseDiT):
-    """
-    An intermediate base class that adds TeaCache optimization functionality to DiT models.
+_CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
 
-    Inherits TeaCacheMixin for cache logic and BaseDiT for core DiT functionality.
+
+class CachableDiT(BaseDiT):
+    """
+    An intermediate base class that adds timestep-caching support for DiT models
+    such as TeaCache.
+
+    Inherits `BaseDiT` for core DiT functionality and stores cache logic in `self.cache`.
     """
 
     # These are required class attributes that should be overridden by concrete implementations
@@ -109,8 +110,61 @@ class CachableDiT(TeaCacheMixin, BaseDiT):
     )
 
     def __init__(self, config: DiTConfig, **kwargs) -> None:
+        """Initialize cache state for a DiT model with caching support.
+
+        Args:
+            config: DiT model configuration.
+            **kwargs: Passed through to BaseDiT (e.g. hf_config).
+
+        Attributes:
+            cache: None when uninitialized or when no caching was requested; otherwise an active TeaCacheStrategy.
+            calibrate_cache: When True, runs every forward pass to gather calibration data.
+        """
         super().__init__(config, **kwargs)
-        self._init_teacache_state()
+        self.cache: TeaCacheStrategy | None = None
+        self.calibrate_cache: bool = False
+
+    def maybe_init_cache(self) -> None:
+        """Initialize the cache strategy at the start of each new generation
+        (when timestep == 0 and cfg is positive for cfg-supporting models).
+
+        Since the cache parameters are contained in the sampling parameters which is only
+        accessible during the first forward pass, we cannot initialize the cache in CachableDiT.__init__.
+        """
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_batch = get_forward_context().forward_batch
+        if forward_batch is None:
+            return
+
+        # caching strategies may handle pos/neg cfg separately
+        supports_cfg = self.config.prefix.lower() in _CFG_SUPPORTED_PREFIXES
+
+        # initialize cache at the start of each new generation (step index == 0 and cfg is positive for cfg-supporting models)
+        current_timestep = get_forward_context().current_timestep
+        if current_timestep == 0 and (
+            (supports_cfg and not forward_batch.is_cfg_negative) or not supports_cfg
+        ):
+            # select caching strategy
+            cache_params = getattr(
+                forward_batch.sampling_params, "teacache_params", None
+            )
+            if forward_batch.enable_teacache and cache_params is not None:
+                num_steps = int(forward_batch.num_inference_steps)
+                start_skipping, end_skipping = cache_params.get_skip_boundaries(
+                    num_steps
+                )
+                self.cache = TeaCacheStrategy(
+                    supports_cfg,
+                    cache_params.get_coefficients(),
+                    cache_params.rel_l1_thresh,
+                    start_skipping,
+                    end_skipping,
+                )
+            else:
+                self.cache = None
 
     @classmethod
     def get_nunchaku_quant_rules(cls) -> dict[str, dict[str, Any]]:

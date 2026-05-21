@@ -13,7 +13,19 @@ TeaCache works by:
 3. When accumulated distance is below a threshold, reusing the cached residual
 4. Supporting CFG (Classifier-Free Guidance) with separate positive/negative caches
 
-## How It Works
+## Implementation
+
+TeaCache is split into three classes:
+
+- **`TeaCacheParams`** — pure data class holding user-set parameters (`rel_l1_thresh`, `coefficients`, `start_skipping`, `end_skipping`). Set once per request, never mutated during inference.
+- **`TeaCacheState`** — dataclass holding runtime state for one CFG branch: `step`, `previous_modulated_input`, `previous_residual`, `accumulated_rel_l1_distance`.
+- **`TeaCacheStrategy`** — all the logic. Owns two `TeaCacheState` objects (positive + optional negative CFG branch). Constructed once per generation by `CachableDiT.maybe_init_cache()` with all parameters resolved upfront.
+
+At each denoising step, the model calls:
+1. `cache.step(modulated_input)` — advances the step counter, accumulates the rescaled L1 distance, returns `True` if the forward pass can be skipped
+2. `cache.read()` — if skipping, reads the cached residual and applies it to hidden states
+3. `cache.write()` — if computing, stores the new residual in the cache
+4. `cache.reset_states()` — resets `state` and optionally `state_neg`, discarding any stale tensors
 
 ### L1 Distance Tracking
 
@@ -36,9 +48,7 @@ accumulated += poly(coefficients)(rel_l1)
 
 ### CFG Support
 
-For models that support CFG cache separation (Wan, Hunyuan, Z-Image), TeaCache maintains separate caches for positive and negative branches:
-- `previous_modulated_input` / `previous_residual` for positive branch
-- `previous_modulated_input_negative` / `previous_residual_negative` for negative branch
+For models that support CFG separation (Wan, Hunyuan, Z-Image), `TeaCacheStrategy` maintains separate `TeaCacheState` objects for the positive and negative branches.
 
 For models that don't support CFG separation (Flux, Qwen), TeaCache is automatically disabled when CFG is enabled.
 
@@ -50,7 +60,7 @@ TeaCache is configured via `TeaCacheParams` in the sampling parameters:
 from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
 
 params = TeaCacheParams(
-    teacache_thresh=0.1,           # Threshold for accumulated L1 distance
+    rel_l1_thresh=0.1,           # Threshold for accumulated L1 distance
     coefficients=[1.0, 0.0, 0.0],  # Polynomial coefficients for L1 rescaling
 )
 ```
@@ -59,7 +69,7 @@ params = TeaCacheParams(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `teacache_thresh` | float | Threshold for accumulated L1 distance. Lower = more caching, faster but potentially lower quality |
+| `rel_l1_thresh` | float | Threshold for accumulated L1 distance. Lower = more caching, faster but potentially lower quality |
 | `coefficients` | list[float] | Polynomial coefficients for L1 rescaling. Model-specific tuning |
 
 ### Model-Specific Configurations

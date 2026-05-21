@@ -16,12 +16,12 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     enable_cache_on_transformer,
     get_scm_mask,
 )
-from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext, TeaCacheMixin
+from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheState, TeaCacheStrategy
 
 __all__ = [
     # TeaCache (always available)
-    "TeaCacheContext",
-    "TeaCacheMixin",
+    "TeaCacheState",
+    "TeaCacheStrategy",
     # cache-dit integration (lazy-loaded, requires cache-dit package)
     "CacheDitConfig",
     "enable_cache_on_transformer",

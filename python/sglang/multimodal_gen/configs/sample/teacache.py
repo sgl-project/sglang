@@ -17,7 +17,7 @@ class TeaCacheParams(CacheParams):
     Attributes:
         cache_type: (`str`, defaults to `teacache`):
             A string labeling these parameters as belonging to teacache.
-        teacache_thresh (`float`, defaults to `0.0`):
+        rel_l1_thresh (`float`, defaults to `0.0`):
             Threshold for accumulated relative L1 distance. When below this threshold, the
             forward pass is skipped. Recommended values: 0.25 for ~1.5x speedup, 0.4 for ~1.8x,
             0.6 for ~2.0x.
@@ -48,7 +48,7 @@ class TeaCacheParams(CacheParams):
     """
 
     cache_type: str = "teacache"
-    teacache_thresh: float = 0.0
+    rel_l1_thresh: float = 0.0
     start_skipping: int | float = 5
     end_skipping: int | float = -1
     coefficients: list[float] = field(default_factory=list)
@@ -62,9 +62,7 @@ class TeaCacheParams(CacheParams):
             return self.coefficients_callback(self)
         return self.coefficients
 
-    def get_skip_boundaries(
-        self, num_inference_steps: int, do_cfg: bool
-    ) -> tuple[int, int]:
+    def get_skip_boundaries(self, num_inference_steps: int) -> tuple[int, int]:
         def _resolve_boundary(value: int | float) -> int:
             if isinstance(value, float):
                 return int(num_inference_steps * value)
@@ -74,9 +72,4 @@ class TeaCacheParams(CacheParams):
 
         start_skipping = _resolve_boundary(self.start_skipping)
         end_skipping = _resolve_boundary(self.end_skipping)
-
-        if do_cfg:
-            start_skipping *= 2
-            end_skipping *= 2
-
         return start_skipping, end_skipping
