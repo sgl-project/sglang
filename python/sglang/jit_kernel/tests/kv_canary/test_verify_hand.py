@@ -13,6 +13,9 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
     canary_verify_step,
 )
+from sglang.jit_kernel.kv_canary.verify_ref import (
+    launch_canary_verify_kernel_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
@@ -1278,7 +1281,13 @@ class TestLayoutAndScheduling:
         assert int(log.slot_run_counter[0].item()) == 0
         assert int(log.kernel_run_counter[0].item()) == 1
 
-    def test_disabled_plan_skips_slots_but_counts_kernel(self) -> None:
+    @pytest.mark.parametrize(
+        "runner",
+        [canary_verify_step, launch_canary_verify_kernel_torch_reference],
+    )
+    def test_disabled_plan_skips_slots_but_counts_kernel(
+        self, runner: Callable[..., None]
+    ) -> None:
         """``VerifyPlan.enable = 0`` skips active entries while still marking the verify launch as run."""
         canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
         slot_idx = 5
@@ -1308,7 +1317,7 @@ class TestLayoutAndScheduling:
         slot_run_before = log.slot_run_counter.clone()
         kernel_run_before = log.kernel_run_counter.clone()
 
-        canary_verify_step(
+        runner(
             canary_buf=canary_buf,
             plan=plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1319,7 +1328,8 @@ class TestLayoutAndScheduling:
             real_kv_sources=(),
             real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
-        torch.cuda.synchronize()
+        if runner is canary_verify_step:
+            torch.cuda.synchronize()
 
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)

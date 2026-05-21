@@ -28,6 +28,7 @@ class TestInstallOracleSampler(CustomTestCase):
     def test_install_oracle_sampler_twice_returns_distinct_hooks_with_replaced_oracle(
         self,
     ) -> None:
+        """Verify reinstalling the oracle sampler replaces the registered factory."""
         oracle_a = HashOracle(vocab_size=100)
         oracle_b = HashOracle(vocab_size=100)
 
