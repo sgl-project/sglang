@@ -311,9 +311,9 @@ class DiffusionServerBase:
         generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
         client: openai.Client,
     ) -> tuple[str, bytes]:
-        result_queue: queue.Queue[
-            tuple[str, tuple[str, bytes] | BaseException]
-        ] = queue.Queue(maxsize=1)
+        result_queue: queue.Queue[tuple[str, tuple[str, bytes] | BaseException]] = (
+            queue.Queue(maxsize=1)
+        )
 
         def _target() -> None:
             try:
@@ -819,9 +819,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test 4: list_loras - API should return the expected list of LoRA adapters
         logger.info("[LoRA E2E] Testing list_loras for %s", case.id)
-        resp = requests.get(
-            f"{base_url}/list_loras", timeout=_CONTROL_API_TIMEOUT_SECS
-        )
+        resp = requests.get(f"{base_url}/list_loras", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"list_loras failed: {resp.text}"
         lora_info = resp.json()
         logger.info("[LoRA E2E] list_loras returned %s", lora_info)
@@ -1039,9 +1037,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         # Test GET /v1/models
         logger.info("[Models API] Testing GET /v1/models for %s", case.id)
-        resp = requests.get(
-            f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS
-        )
+        resp = requests.get(f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
 
         data = resp.json()
@@ -1131,9 +1127,7 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             return
 
         base_url = f"http://localhost:{ctx.port}"
-        resp = requests.get(
-            f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS
-        )
+        resp = requests.get(f"{base_url}/v1/models", timeout=_CONTROL_API_TIMEOUT_SECS)
         assert resp.status_code == 200, f"/v1/models failed: {resp.text}"
         data = resp.json().get("data", [])
         if not data:
