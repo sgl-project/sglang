@@ -27,9 +27,10 @@ def launch_plan_extras_kernel(
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
     bs: int,
-    verify_capacity: int,
-    extras_capacity: int,
 ) -> None:
+    verify_capacity = int(verify_slot_indices.shape[0])
+    extras_capacity = int(extra_verify_slot_indices.shape[0])
+
     _validate_extras_kernel_inputs(
         extra_verify_slot_indices=extra_verify_slot_indices,
         extra_verify_positions=extra_verify_positions,

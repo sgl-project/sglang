@@ -14,7 +14,6 @@ from sglang.jit_kernel.kv_canary.plan.offsets_kernel import (
     _PLAN_BS_BLOCK_SIZE,
     launch_plan_offsets_kernel,
 )
-from sglang.jit_kernel.kv_canary.plan.utils import _resolve_swa_lut
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
@@ -137,16 +136,6 @@ def canary_plan_step(
             f"kv-canary: canary_plan_step verify_capacity={verify_capacity} does not match "
             f"verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
-    write_req_capacity_plus_one = int(write_plan_out.write_offsets.shape[0])
-    write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
-    extras_capacity = int(extra_verify_slot_indices.shape[0])
-
-    lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
-        full_to_swa_index_mapping, device
-    )
-
-    req_to_token_stride0 = int(req_to_token.stride(0))
-
     # Match the ref's tail-reset semantics: write_offsets positions past index bs are zeroed so a smaller
     # batch never leaks stale prefix-sum entries from a larger previous call. In-place .zero_() is
     # cuda-graph-safe (no allocation) and avoids one Triton launch.
@@ -159,7 +148,7 @@ def canary_plan_step(
         fb_prefix_lens=fb_prefix_lens,
         fb_extend_seq_lens=fb_extend_seq_lens,
         req_to_token=req_to_token,
-        lut_tensor=lut_tensor,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
         extra_verify_num_valid=extra_verify_num_valid,
         verify_offsets_scratch=verify_offsets_scratch,
         write_offsets=write_plan_out.write_offsets,
@@ -167,13 +156,7 @@ def canary_plan_step(
         verify_num_valid=verify_plan_out.verify_num_valid,
         verify_enable=verify_plan_out.enable,
         write_num_valid_reqs=write_plan_out.write_num_valid_reqs,
-        bs=bs,
-        req_to_token_stride0=req_to_token_stride0,
-        lut_len=lut_len,
         swa_window_size=int(swa_window_size),
-        has_swa_lut=has_swa_lut,
-        write_offsets_len=write_req_capacity_plus_one,
-        write_req_capacity=write_req_capacity,
         verify_capacity=verify_capacity,
     )
 
@@ -184,17 +167,12 @@ def canary_plan_step(
         fb_req_pool_indices=fb_req_pool_indices,
         fb_prefix_lens=fb_prefix_lens,
         req_to_token=req_to_token,
-        lut_tensor=lut_tensor,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_offsets_scratch=verify_offsets_scratch,
         verify_slot_indices=verify_plan_out.verify_slot_indices,
         verify_positions=verify_plan_out.verify_positions,
         verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
-        bs=bs,
-        req_to_token_stride0=req_to_token_stride0,
-        lut_len=lut_len,
-        verify_capacity=verify_capacity,
         swa_window_size=int(swa_window_size),
-        has_swa_lut=has_swa_lut,
     )
 
     # Extras kernel: append extras into the verify tail. The base index lives in verify_offsets_scratch[bs].
@@ -208,6 +186,4 @@ def canary_plan_step(
         verify_positions=verify_plan_out.verify_positions,
         verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
         bs=bs,
-        verify_capacity=verify_capacity,
-        extras_capacity=extras_capacity,
     )

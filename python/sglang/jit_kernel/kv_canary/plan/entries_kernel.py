@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -11,6 +13,7 @@ from sglang.jit_kernel.kv_canary.plan.utils import (
     _require_len,
     _require_min_len,
     _require_same_device,
+    _resolve_swa_lut,
     _swa_translate_tile,
 )
 from sglang.jit_kernel.kv_canary.verify import _assert_contiguous
@@ -25,18 +28,20 @@ def launch_plan_entries_kernel(
     fb_req_pool_indices: torch.Tensor,
     fb_prefix_lens: torch.Tensor,
     req_to_token: torch.Tensor,
-    lut_tensor: torch.Tensor,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
     verify_slot_indices: torch.Tensor,
     verify_positions: torch.Tensor,
     verify_prev_slot_indices: torch.Tensor,
-    bs: int,
-    req_to_token_stride0: int,
-    lut_len: int,
-    verify_capacity: int,
     swa_window_size: int,
-    has_swa_lut: bool,
 ) -> None:
+    bs = int(fb_req_pool_indices.shape[0])
+    verify_capacity = int(verify_slot_indices.shape[0])
+    lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
+        full_to_swa_index_mapping, verify_offsets_scratch.device
+    )
+    req_to_token_stride0 = int(req_to_token.stride(0))
+
     _validate_entries_kernel_inputs(
         fb_req_pool_indices=fb_req_pool_indices,
         fb_prefix_lens=fb_prefix_lens,
