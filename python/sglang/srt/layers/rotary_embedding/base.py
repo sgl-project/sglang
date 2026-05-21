@@ -47,7 +47,7 @@ if _is_hip:
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope
+    from sgl_kernel import fused_qk_rope_with_cos_sin_cache
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -422,41 +422,33 @@ class RotaryEmbedding(MultiPlatformOp):
         ), "fused_set_kv_buffer_arg is not supported for xpu implementation"
         positions = torch.add(positions, offsets) if offsets is not None else positions
 
-        num_tokens = positions.shape[0]
-        query_shape = query.shape
-        key_shape = key.shape
-
-        # Flatten to 2D: [num_tokens, n_heads * head_dim]
-        q_2d = query.view(num_tokens, -1)
-        k_2d = key.view(num_tokens, -1)
-        num_heads_q = q_2d.shape[1] // self.head_size
-        num_heads_k = k_2d.shape[1] // self.head_size
-
-        q_weight = torch.ones(self.rotary_dim, device=query.device, dtype=query.dtype)
-        k_weight = torch.ones(self.rotary_dim, device=query.device, dtype=query.dtype)
-
-        # Fuse Q and K into one contiguous buffer; no V portion (num_heads_v=0)
-        qk = torch.cat([q_2d, k_2d], dim=1)
-        positions = positions.to(torch.int32)
-
-        fused_qk_rope(
-            qk,
-            num_heads_q,
-            num_heads_k,
-            0,
-            self.head_size,
-            q_weight,
-            k_weight,
-            float(self.base),
-            self.is_neox_style,
-            positions,
-            self.rotary_dim,
-        )
-
-        # Unpack back to original shapes
-        q_out = qk[:, : num_heads_q * self.head_size].view(query_shape)
-        k_out = qk[:, num_heads_q * self.head_size :].view(key_shape)
-        return q_out, k_out
+        # Fused_qk_rope only supports aligned head_size
+        if self.head_size in [64, 128, 256, 512]:
+            num_tokens = positions.size(0)
+            q_rope = query.view(num_tokens, -1, self.head_size)
+            k_rope = key.view(num_tokens, -1, self.head_size)
+            if self.head_size != self.rotary_dim:
+                q_rope = q_rope[..., : self.rotary_dim]
+                k_rope = k_rope[..., : self.rotary_dim]
+            fused_qk_rope_with_cos_sin_cache(
+                q_rope,
+                k_rope,
+                self.cos_sin_cache,
+                positions,
+                self.rotary_dim,
+                self.is_neox_style,
+            )
+            return query, key
+        else:
+            # Use fallback kernel of 'rotary_embedding'
+            return torch.ops.sgl_kernel.rotary_embedding(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
 
 
 class LinearScalingRotaryEmbedding(RotaryEmbedding):
