@@ -301,10 +301,22 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            # Check for usage info in final chunks. OpenAI-compatible
+                            # servers (sglang, vLLM with include_usage) may emit a
+                            # trailing usage-only chunk with choices=[] or an
+                            # empty-text choice; completion_tokens must still be
+                            # recorded. Keeping this outside the content guard
+                            # mirrors the chat-completions path.
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
+
+                            choices = data.get("choices") or []
+                            if not choices:
+                                continue
+
+                            text = choices[0].get("text") or ""
+                            if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -313,16 +325,11 @@ async def async_request_openai_completions(
 
                                 # Decoding phase
                                 else:
-                                    output.text_chunks.append(
-                                        data["choices"][0]["text"]
-                                    )
+                                    output.text_chunks.append(text)
                                     output.itl.append(timestamp - most_recent_timestamp)
 
                                 most_recent_timestamp = timestamp
-                                generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
+                                generated_text += text
 
                     output.generated_text = generated_text
                     output.success = True
