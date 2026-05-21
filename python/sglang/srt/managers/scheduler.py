@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -2841,18 +2842,36 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Refresh BEFORE _overlap_forward_isolation so snapshot
-                # captures fresh values and restore preserves them.
-                batch.refresh_seq_lens_cpu()
+                # Spec v2 pre-isolation CPU mirror prep: D2H new_seq_lens_buf
+                # into batch.seq_lens_cpu + set seq_lens_sum. For non-spec_v2,
+                # ForwardBatch.init_new lazily computes the sum.
+                if batch.is_spec_v2:
+                    # FIXME: make this optional to different backends.
+                    self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
+
+                    # Spec_v2 worker fires this between sample-end and
+                    # draft_extend; publish moves the fence to verify-end so
+                    # schedule prep can overlap with draft_extend.
+                    fwd_kwargs = (
+                        {
+                            "on_verify_complete": partial(
+                                self.future_map.publish, future_indices
+                            )
+                        }
+                        if batch.is_spec_v2
+                        else {}
+                    )
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **fwd_kwargs
+                        )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -2863,7 +2882,12 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
+                            stash_payload = (
+                                batch_result.next_draft_input
+                                if batch.is_spec_v2
+                                else batch_result.next_token_ids
+                            )
+                            self.future_map.stash(future_indices, stash_payload)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
@@ -2876,15 +2900,11 @@ class Scheduler(
                 batch.input_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # Schedule-stream sentinel between iters; next iter's
+                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
+                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -2968,7 +2988,10 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
+            self.future_map.stash(
+                batch_result.future_indices, batch_result.next_token_ids
+            )
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
