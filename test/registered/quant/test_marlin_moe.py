@@ -436,6 +436,56 @@ class TestFusedMarlinMoe(CustomTestCase):
                         marlin_output, torch_output, atol=5e-2, rtol=0
                     )
 
+    def test_gptq_marlin_moe_scale_dtype_matches_params(self):
+        """Regression test: GPTQMarlinMoEMethod must allocate scales in params_dtype.
+
+        Previously, scales were hardcoded as torch.half regardless of params_dtype,
+        causing AssertionError when running GPTQ MoE models with --dtype bfloat16.
+        See https://github.com/sgl-project/sglang/issues/20599
+        """
+        from sglang.srt.layers.quantization.gptq import (
+            GPTQMarlinConfig,
+            GPTQMarlinMoEMethod,
+        )
+
+        for params_dtype in [torch.float16, torch.bfloat16]:
+            with self.subTest(params_dtype=params_dtype):
+                config = GPTQMarlinConfig(
+                    weight_bits=4,
+                    group_size=128,
+                    desc_act=False,
+                    is_sym=True,
+                    lm_head_quantized=False,
+                    dynamic={},
+                    full_config={},
+                )
+                method = GPTQMarlinMoEMethod(config)
+
+                layer = torch.nn.Module()
+                layer.moe_tp_size = 1
+                layer.intermediate_size_per_partition = 128
+                layer.group_size_div_factor = 1
+
+                method.create_weights(
+                    layer=layer,
+                    num_experts=4,
+                    hidden_size=256,
+                    intermediate_size_per_partition=128,
+                    params_dtype=params_dtype,
+                    weight_loader=lambda *a, **kw: None,
+                )
+
+                self.assertEqual(
+                    layer.w13_scales.dtype,
+                    params_dtype,
+                    f"w13_scales should be {params_dtype} but got {layer.w13_scales.dtype}",
+                )
+                self.assertEqual(
+                    layer.w2_scales.dtype,
+                    params_dtype,
+                    f"w2_scales should be {params_dtype} but got {layer.w2_scales.dtype}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
