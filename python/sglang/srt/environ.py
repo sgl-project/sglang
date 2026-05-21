@@ -719,7 +719,6 @@ class Envs:
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
-    SGLANG_KV_CANARY_ALLREDUCE_VIOLATION_SIGNAL = EnvBool(False)
     # Input-id / position verification inside canary_write_step. Only useful
     # when a token_oracle is feeding expected_input_* tensors per forward;
     # production users never set this. Test harnesses flip it on via

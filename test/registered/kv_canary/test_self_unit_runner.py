@@ -77,7 +77,6 @@ def _make_config(
     real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF,
     input_check_mode: bool = False,
     stats_print_every_n_steps: int = 100,
-    allreduce_violation_signal: bool = False,
 ) -> CanaryConfig:
     return CanaryConfig(
         mode=mode,
@@ -86,7 +85,6 @@ def _make_config(
         real_kv_hash_mode=real_kv_hash_mode,
         input_check_mode=input_check_mode,
         stats_print_every_n_steps=stats_print_every_n_steps,
-        allreduce_violation_signal=allreduce_violation_signal,
     )
 
 
@@ -269,10 +267,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_every_n_cadence(self):
         """Verify sweep execution follows the configured step cadence."""
-        config = _make_config(
-            sweep_interval=4,
-            allreduce_violation_signal=False,
-        )
+        config = _make_config(sweep_interval=4)
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
 
@@ -293,10 +288,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_runs_radix_path(self):
         """Verify sweep execution runs the radix planning path."""
-        config = _make_config(
-            sweep_interval=1,
-            allreduce_violation_signal=False,
-        )
+        config = _make_config(sweep_interval=1)
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
         with runner.with_forward_pass(fb):
@@ -471,10 +463,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
         """Verify the watchdog ignores disabled sweep counters."""
-        config = _make_config(
-            sweep_interval=0,
-            allreduce_violation_signal=False,
-        )
+        config = _make_config(sweep_interval=0)
         runner = _make_runner(device=self.device, config=config)
         runner._device_state.kernel_run_counters.zero_()
         for tag in (
@@ -492,10 +481,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_periodic_stats_log_every_n_step(self):
         """Verify periodic stats are logged at the configured interval."""
-        config = _make_config(
-            stats_print_every_n_steps=5,
-            allreduce_violation_signal=False,
-        )
+        config = _make_config(stats_print_every_n_steps=5)
         runner = _make_runner(device=self.device, config=config)
         runner._device_state.slot_run_counters.fill_(7)
 
@@ -509,10 +495,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_path_launches_sweep_kernels(self):
         """Verify sweep paths launch sweep verify kernels."""
-        config = _make_config(
-            sweep_interval=1,
-            allreduce_violation_signal=False,
-        )
+        config = _make_config(sweep_interval=1)
         runner = _make_runner(device=self.device, config=config)
         fb = _make_forward_batch(self.device)
         with runner.with_forward_pass(fb):

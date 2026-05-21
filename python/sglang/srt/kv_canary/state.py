@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -78,14 +77,11 @@ class CanaryDeviceState:
         slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
             view-handed-to-kernel pattern as kernel_run_counters; each launch adds its active entry
             count to its slot. Used for periodic stats ("protected N tokens").
-        allreduce_buf: Device byte buffer used for cross-rank allreduce of is_errored, shape [1], uint8.
-            Only allocated when CanaryConfig.allreduce_violation_signal is True.
     """
 
     violation_log: ViolationLog
     kernel_run_counters: torch.Tensor
     slot_run_counters: torch.Tensor
-    allreduce_buf: Optional[torch.Tensor]
 
     @classmethod
     def allocate(
@@ -104,12 +100,8 @@ class CanaryDeviceState:
         )
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
-        allreduce_buf: Optional[torch.Tensor] = None
-        if config.allreduce_violation_signal:
-            allreduce_buf = torch.zeros(1, dtype=torch.uint8, device=device)
         return cls(
             violation_log=violation_log,
             kernel_run_counters=kernel_run_counters,
             slot_run_counters=slot_run_counters,
-            allreduce_buf=allreduce_buf,
         )
