@@ -161,12 +161,6 @@ class CanaryRunner:
     def _get_swa_allocator(self) -> Optional["SWATokenToKVPoolAllocator"]:
         return self._swa_allocator
 
-    def _get_swa_index_lut(self) -> Optional["torch.Tensor"]:
-        for group in self._buffer_groups:
-            if group.swa_index_lut is not None:
-                return group.swa_index_lut
-        return None
-
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)
