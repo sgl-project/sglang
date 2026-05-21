@@ -25,6 +25,8 @@ from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
+from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
+from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
@@ -1505,6 +1507,8 @@ class Scheduler(
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            if _VLM_PROFILE and recv_reqs:
+                _vlm_log("scheduler_recv", n_reqs=len(recv_reqs))
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue

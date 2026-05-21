@@ -129,6 +129,8 @@ from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
+from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
+from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.breakable_cuda_graph_runner import (
@@ -3048,6 +3050,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.device_timer
             else contextlib.nullcontext()
         )
+        if _VLM_PROFILE:
+            _vlm_log(
+                "forward_extend",
+                batch_size=forward_batch.batch_size,
+                total_tokens=sum(forward_batch.extend_seq_lens_cpu),
+                has_mm=forward_batch.contains_mm_inputs(),
+            )
         with ctx:
             ret = self.model.forward(
                 forward_batch.input_ids,
