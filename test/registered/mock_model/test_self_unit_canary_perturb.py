@@ -5,7 +5,6 @@ import pytest
 from _pytest.logging import LogCaptureFixture
 
 from sglang.srt.kv_canary.perturb import real_kv_used
-
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.perturb.slot_picker import ReqToTokenEntry
 from sglang.test.ci.ci_register import register_cpu_ci
