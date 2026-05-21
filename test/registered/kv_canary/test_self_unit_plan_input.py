@@ -39,6 +39,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.device = DEFAULT_DEVICE
 
     def test_fill_plan_input_per_forward_extend(self):
+        """Verify extend batches populate per-forward plan inputs."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(
@@ -60,6 +61,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [7, 7])
 
     def test_fill_plan_input_per_forward_target_verify(self):
+        """Verify target-verify batches derive draft verification spans."""
         # TARGET_VERIFY writes spec_info.draft_token_num positions per req starting at the
         # current (un-bumped) seq_lens; extend_prefix_lens / extend_seq_lens are deliberately
         # NOT supplied because init_new does not populate them for this mode.
@@ -80,6 +82,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_fill_plan_input_per_forward_draft_extend_v2(self):
+        """Verify draft-extend-v2 batches derive prefix lengths from sequence lengths."""
         # DRAFT_EXTEND_V2 has seq_lens already bumped by the per-req draft refill length;
         # extend_prefix_lens is intentionally absent (cuda-graph replay does not set it). The
         # builder must derive prefix as seq_lens - extend_seq_lens.
@@ -99,6 +102,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_fill_plan_input_per_forward_decode(self):
+        """Verify decode batches populate one-token verification spans."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(
@@ -114,6 +118,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_extend_seq_lens[:3].tolist(), [1, 1, 1])
 
     def test_build_plan_input_radix_sweep(self):
+        """Verify radix sweep plan inputs include cached slot chains."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         empty_out = build_plan_input_radix_sweep(
@@ -138,6 +143,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         )
 
     def test_plan_input_padding_dummy_sentinel(self):
+        """Verify padding sentinel rows remain valid plan input entries."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(
@@ -152,6 +158,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_req_pool_indices.dtype, torch.int64)
 
     def test_radix_held_slot_still_swept(self):
+        """Verify held radix slots are still included in sweep plans."""
         cache = make_radix_cache([[], [42, 43, 44]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_plan_input_radix_sweep(
@@ -164,6 +171,7 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(set(out.extra_verify_slot_indices[:n].tolist()), {42, 43, 44})
 
     def test_truly_free_slot_not_swept(self):
+        """Verify free radix slots are excluded from sweep plans."""
         empty_cache = make_radix_cache([[]], device=self.device)
         empty_cache.req_to_token_pool = make_req_to_token_pool(self.device)
         out = build_plan_input_radix_sweep(

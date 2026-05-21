@@ -149,6 +149,7 @@ class TestSelfUnitRunner(CustomTestCase):
             self.addCleanup(p.stop)
 
     def test_per_forward_orchestrates_plan_head_tail(self):
+        """Verify per-forward execution launches plan, head, and tail kernels."""
         calls: List = []
         with patch.object(
             launch_module,
@@ -186,6 +187,7 @@ class TestSelfUnitRunner(CustomTestCase):
         )
 
     def test_sweep_every_n_cadence(self):
+        """Verify sweep execution follows the configured step cadence."""
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
@@ -211,6 +213,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertEqual(sweep_calls, [0, 4, 8])
 
     def test_sweep_runs_radix_path(self):
+        """Verify sweep execution runs the radix planning path."""
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
@@ -236,6 +239,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertGreaterEqual(plan_calls.count("plan"), 1)
 
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self):
+        """Verify req_to_token perturbation replaces a slot with another live slot."""
         pool = _make_pool(self.device, max_reqs=4, max_seq=8)
         pool.req_to_token[1, :3] = torch.tensor(
             [11, 22, 33], dtype=torch.int32, device=self.device
@@ -267,6 +271,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertNotEqual(replacement, original)
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
+        """Verify the kernel watchdog raises when counters stop advancing."""
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
@@ -276,6 +281,7 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._health_and_stats.health_check_step()
 
     def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
+        """Verify the watchdog ignores disabled sweep counters."""
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
@@ -298,6 +304,7 @@ class TestSelfUnitRunner(CustomTestCase):
         runner._health_and_stats.health_check_step()
 
     def test_runner_disabled_short_circuits(self):
+        """Verify disabled canary runners skip all launches."""
         config = CanaryConfig(mode=CanaryMode.OFF)
         runner = _make_runner(device=self.device, config=config)
 
@@ -315,6 +322,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertEqual(plan_calls, [])
 
     def test_periodic_stats_log_every_n_step(self):
+        """Verify periodic stats are logged at the configured interval."""
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
@@ -333,6 +341,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertTrue("step=5" in log_text or "step=10" in log_text)
 
     def test_sweep_path_launches_sweep_kernels(self):
+        """Verify sweep paths launch sweep verify kernels."""
         config = CanaryConfig(
             mode=CanaryMode.RAISE,
             real_kv_hash_mode=RealKvHashMode.OFF,
@@ -358,6 +367,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertTrue(any("SWEEP" in k for k in sweep_kernel_kinds))
 
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self):
+        """Verify oversized prefix sums are handled without host-side errors."""
         # Overflow no longer raises host-side: the plan kernel sets VerifyPlan.enable=0 and the
         # verify kernel skips the step on-device; host logs a throttled warning instead.
         runner = _make_runner(device=self.device, per_forward_verify_capacity=4)
@@ -366,6 +376,7 @@ class TestSelfUnitRunner(CustomTestCase):
             pass
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self):
+        """Verify prefix sums within capacity pass before-forward handling."""
         # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
         runner = _make_runner(device=self.device, per_forward_verify_capacity=16)
         fb = _make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
@@ -373,6 +384,7 @@ class TestSelfUnitRunner(CustomTestCase):
             pass
 
     def test_sweep_throws_when_walker_output_exceeds_sweep_capacity(self):
+        """Verify sweep planning rejects walker output beyond capacity."""
         runner = _make_runner(device=self.device, sweep_verify_capacity=1)
         cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
@@ -406,6 +418,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
 
     def test_per_forward_verify_capacity_covers_multi_req_prefix_sum(self):
+        """Verify per-forward capacity accounts for multi-request prefix sums."""
         max_bs = 8
         max_seq_len = 64
         max_total_num_tokens = 1024
@@ -470,18 +483,21 @@ class TestPlanRefOverflowGate(CustomTestCase):
         return verify_plan
 
     def test_plan_ref_sets_enable_zero_and_clamps_when_overflow(self):
+        """Verify plan reference disables verification and clamps overflow output."""
         # requested = sum(prefix_lens) = 8 > capacity = 4.
         plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
         self.assertEqual(int(plan.enable[0].item()), 0)
         self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
 
     def test_plan_ref_sets_enable_one_when_within_capacity(self):
+        """Verify plan reference enables verification within capacity."""
         # requested = 4 <= capacity = 16.
         plan = self._run_plan_ref(verify_capacity=16, bs=2, prefix_lens=[2, 2])
         self.assertEqual(int(plan.enable[0].item()), 1)
         self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
 
     def test_verify_ref_skips_when_enable_zero(self):
+        """Verify verify reference skips work when the plan is disabled."""
         plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
         self.assertEqual(int(plan.enable[0].item()), 0)
 

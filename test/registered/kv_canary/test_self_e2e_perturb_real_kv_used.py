@@ -33,6 +33,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
         super().setUpClass()
 
     def test_real_kv_used_perturbation_reports_real_kv_hash_violation(self) -> None:
+        """Verify active real KV perturbation reports a real KV hash violation."""
         self.send_parallel_requests(n=4)
         self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",

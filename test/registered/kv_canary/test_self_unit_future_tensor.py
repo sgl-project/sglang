@@ -13,6 +13,7 @@ register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
 
 class TestFutureTensor(CustomTestCase):
     def test_cuda_stage_then_wait_returns_host_copy(self) -> None:
+        """Verify staged CUDA tensors are copied back on wait."""
         if not torch.cuda.is_available():
             self.skipTest("cuda required")
         device = torch.device("cuda")
@@ -31,6 +32,7 @@ class TestFutureTensor(CustomTestCase):
         self.assertEqual(int(result_second.item()), 97)
 
     def test_cuda_pinned_when_stream_is_provided(self) -> None:
+        """Verify CUDA staging uses pinned host memory with a stream."""
         if not torch.cuda.is_available():
             self.skipTest("cuda required")
         device = torch.device("cuda")
@@ -41,6 +43,7 @@ class TestFutureTensor(CustomTestCase):
         self.assertEqual(int(future.wait().item()), 5)
 
     def test_cuda_each_call_allocates_fresh_host(self) -> None:
+        """Verify each CUDA staging call owns a fresh host buffer."""
         if not torch.cuda.is_available():
             self.skipTest("cuda required")
         device = torch.device("cuda")

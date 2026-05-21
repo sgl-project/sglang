@@ -75,6 +75,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.device = DEFAULT_DEVICE
 
     def test_launch_per_forward_calls_verify_then_write(self):
+        """Verify per-forward launch invokes verify before write."""
         calls: List = []
         with patch.object(
             endpoint_module, "canary_verify_step", _record_call(calls, "verify")
@@ -100,6 +101,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertIs(calls[3]["plan"], args.write_plan)
 
     def test_launch_per_forward_passes_kernel_kind(self):
+        """Verify per-forward launch passes the endpoint kernel kind."""
         captured: List = []
         with patch.object(
             endpoint_module,
@@ -129,6 +131,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertIn(("write", CanaryLaunchTag.TAIL_V_SWA), captured)
 
     def test_launch_sweep_only_calls_verify(self):
+        """Verify sweep launch invokes only the verify kernel."""
         calls: List[str] = []
         with patch.object(
             endpoint_module,
@@ -151,6 +154,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(calls, ["verify"])
 
     def test_endpoint_shares_violation_log_across_launches(self):
+        """Verify endpoints can reuse the same violation log."""
         captured_rings: List[int] = []
         with patch.object(
             endpoint_module,
@@ -180,9 +184,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())
 
     def test_swa_endpoint_pre_translates_fb_out_cache_loc(self):
-        """SWA endpoint host-gathers ``lut[fb_out_cache_loc]`` before calling canary_write_step; FULL
-        endpoint passes fb_out_cache_loc through unchanged. The kernel never sees a LUT.
-        """
+        """Verify SWA endpoints translate cache locations before write launch."""
         captured: List[torch.Tensor] = []
         with patch.object(
             endpoint_module, "canary_verify_step", lambda **kwargs: None
@@ -234,10 +236,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertTrue(torch.equal(captured[1], args.fb_out_cache_loc.to(torch.int32)))
 
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
-        """LUT trailing-row sentinel (-1) propagates through the host gather to the kernel as a skip
-        signal. The endpoint must turn a pre-cleanup "kernel-side LUT[full_pool_size] = -1 → skip"
-        path into "host gather → -1 → skip" without losing the sentinel semantics.
-        """
+        """Verify SWA sentinel cache rows become write-skip markers."""
         captured: List[torch.Tensor] = []
         with patch.object(
             endpoint_module, "canary_verify_step", lambda **kwargs: None
@@ -280,6 +279,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
         )
 
     def test_launch_per_forward_casts_write_inputs_to_int32(self):
+        """Verify per-forward launch casts write inputs to int32."""
         captured: List[dict] = []
         with patch.object(
             endpoint_module, "canary_verify_step", lambda **kwargs: None
