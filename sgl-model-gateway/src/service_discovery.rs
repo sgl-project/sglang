@@ -116,8 +116,8 @@ impl PodInfo {
             if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
                 if !(config.igw_mode && !config.selector.is_empty()) {
                     warn!(
-                    "PD mode enabled but both prefill_selector and decode_selector are empty"
-                );
+                        "PD mode enabled but both prefill_selector and decode_selector are empty"
+                    );
                     return false;
                 }
             }
