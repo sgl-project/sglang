@@ -1564,6 +1564,41 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        import gc
+        import time as _gc_time
+
+        def _gc_callback(phase, info):
+            if phase == "start":
+                gc._debug_t0 = _gc_time.perf_counter()
+                gc._debug_gen = info.get("generation", -1)
+                gc._debug_count = gc.get_count()
+            elif phase == "stop":
+                dur = (
+                    _gc_time.perf_counter()
+                    - getattr(gc, "_debug_t0", _gc_time.perf_counter())
+                ) * 1000
+                gen = getattr(gc, "_debug_gen", -1)
+                collected = info.get("collected", 0)
+                uncollectable = info.get("uncollectable", 0)
+                count_before = getattr(gc, "_debug_count", (0, 0, 0))
+                logger.info(
+                    "[GC] gen=%d collected=%d uncollectable=%d dur=%.1fms "
+                    "count_before=%s ts=%.6f",
+                    gen,
+                    collected,
+                    uncollectable,
+                    dur,
+                    count_before,
+                    _gc_time.time(),
+                )
+
+        gc.callbacks.append(_gc_callback)
+        gc.set_debug(gc.DEBUG_STATS)
+        logger.info(
+            "[GC] debug+callback installed (overlap), thresholds=%s count=%s",
+            gc.get_threshold(),
+            gc.get_count(),
+        )
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
