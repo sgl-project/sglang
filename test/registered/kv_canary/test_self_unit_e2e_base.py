@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.kv_canary.runner.swa_divergence_stats import format_swa_divergence_line
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 from sglang.test.test_utils import CustomTestCase
@@ -10,13 +11,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, stage="extra-a", runner_config="cpu-small")
 
 
-_GOOD_LINE: str = (
-    "kv_canary swa_divergence: forward_ct=120 verify_full=10000 "
-    "verify_swa=4200 mapping_nonidentity=512 swa_pool_wrap=64"
+_GOOD_LINE: str = format_swa_divergence_line(
+    forward_ct=120,
+    verify_full=10000,
+    verify_swa=4200,
+    mapping_nonidentity=512,
+    swa_pool_wrap=64,
 )
-_LATER_LINE: str = (
-    "kv_canary swa_divergence: forward_ct=240 verify_full=20000 "
-    "verify_swa=8400 mapping_nonidentity=1024 swa_pool_wrap=128"
+_LATER_LINE: str = format_swa_divergence_line(
+    forward_ct=240,
+    verify_full=20000,
+    verify_swa=8400,
+    mapping_nonidentity=1024,
+    swa_pool_wrap=128,
 )
 
 
@@ -76,9 +83,12 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             )
 
     def test_assert_swa_divergence_observed_raises_when_below_threshold(self) -> None:
-        zero_mapping_line = (
-            "kv_canary swa_divergence: forward_ct=100 verify_full=5000 "
-            "verify_swa=2000 mapping_nonidentity=0 swa_pool_wrap=64"
+        zero_mapping_line = format_swa_divergence_line(
+            forward_ct=100,
+            verify_full=5000,
+            verify_swa=2000,
+            mapping_nonidentity=0,
+            swa_pool_wrap=64,
         )
         harness, patcher = self._make_harness(zero_mapping_line + "\n")
         with patcher:
@@ -92,9 +102,12 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                 )
 
     def test_assert_swa_divergence_observed_raises_when_no_verify_lag(self) -> None:
-        equal_verify_line = (
-            "kv_canary swa_divergence: forward_ct=100 verify_full=5000 "
-            "verify_swa=5000 mapping_nonidentity=200 swa_pool_wrap=64"
+        equal_verify_line = format_swa_divergence_line(
+            forward_ct=100,
+            verify_full=5000,
+            verify_swa=5000,
+            mapping_nonidentity=200,
+            swa_pool_wrap=64,
         )
         harness, patcher = self._make_harness(equal_verify_line + "\n")
         with patcher:
@@ -110,9 +123,12 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
     def test_assert_swa_divergence_observed_raises_when_below_pool_wrap_threshold(
         self,
     ) -> None:
-        low_wrap_line = (
-            "kv_canary swa_divergence: forward_ct=100 verify_full=5000 "
-            "verify_swa=2000 mapping_nonidentity=200 swa_pool_wrap=3"
+        low_wrap_line = format_swa_divergence_line(
+            forward_ct=100,
+            verify_full=5000,
+            verify_swa=2000,
+            mapping_nonidentity=200,
+            swa_pool_wrap=3,
         )
         harness, patcher = self._make_harness(low_wrap_line + "\n")
         with patcher:
@@ -150,9 +166,12 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                 )
 
     def test_assert_swa_divergence_observed_catches_identity_mapping(self) -> None:
-        identity_only_line = (
-            "kv_canary swa_divergence: forward_ct=200 verify_full=10000 "
-            "verify_swa=2000 mapping_nonidentity=0 swa_pool_wrap=64"
+        identity_only_line = format_swa_divergence_line(
+            forward_ct=200,
+            verify_full=10000,
+            verify_swa=2000,
+            mapping_nonidentity=0,
+            swa_pool_wrap=64,
         )
         harness, patcher = self._make_harness(identity_only_line + "\n")
         with patcher:
@@ -166,9 +185,12 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                 )
 
     def test_assert_swa_divergence_observed_catches_no_pool_wrap(self) -> None:
-        no_wrap_line = (
-            "kv_canary swa_divergence: forward_ct=200 verify_full=10000 "
-            "verify_swa=2000 mapping_nonidentity=512 swa_pool_wrap=0"
+        no_wrap_line = format_swa_divergence_line(
+            forward_ct=200,
+            verify_full=10000,
+            verify_swa=2000,
+            mapping_nonidentity=512,
+            swa_pool_wrap=0,
         )
         harness, patcher = self._make_harness(no_wrap_line + "\n")
         with patcher:

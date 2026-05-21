@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import unittest
 from dataclasses import dataclass
 from typing import Optional
@@ -17,6 +16,7 @@ from sglang.srt.kv_canary.runner import swa_divergence_stats as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence_stats import (
     SWA_DIVERGENCE_LOG_PREFIX,
     SwaDivergenceStats,
+    parse_swa_divergence_line,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -132,22 +132,16 @@ class _LogCapture:
 
 
 def _parse_swa_divergence_line(line: str) -> dict[str, int]:
-    pattern = (
-        re.escape(SWA_DIVERGENCE_LOG_PREFIX)
-        + r" forward_ct=(\d+) verify_full=(\d+) verify_swa=(\d+) "
-        r"mapping_nonidentity=(\d+) swa_pool_wrap=(\d+)"
-    )
-    match = re.search(pattern, line)
-    if match is None:
+    parsed = parse_swa_divergence_line(line)
+    if parsed is None:
         raise AssertionError(f"line does not match swa_divergence format: {line!r}")
-    keys = (
-        "forward_ct",
-        "verify_full",
-        "verify_swa",
-        "mapping_nonidentity",
-        "swa_pool_wrap",
-    )
-    return {key: int(match.group(idx + 1)) for idx, key in enumerate(keys)}
+    return {
+        "forward_ct": parsed.forward_ct,
+        "verify_full": parsed.verify_full,
+        "verify_swa": parsed.verify_swa,
+        "mapping_nonidentity": parsed.mapping_nonidentity,
+        "swa_pool_wrap": parsed.swa_pool_wrap,
+    }
 
 
 class TestSwaDivergenceStats(CustomTestCase):

@@ -13,6 +13,9 @@ from typing import ClassVar, Literal, Optional
 
 import requests
 
+from sglang.srt.kv_canary.runner.swa_divergence_stats import (
+    find_last_swa_divergence_line,
+)
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -72,16 +75,6 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
 # the SWA-windowed verify path. Token count is roughly 6k after BPE.
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
-
-_SWA_DIVERGENCE_LINE_RE = re.compile(
-    r"kv_canary swa_divergence: "
-    r"forward_ct=(\d+) "
-    r"verify_full=(\d+) "
-    r"verify_swa=(\d+) "
-    r"mapping_nonidentity=(\d+) "
-    r"swa_pool_wrap=(\d+)"
-)
-
 
 class CanaryE2EBase(CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
@@ -267,42 +260,38 @@ class CanaryE2EBase(CustomTestCase):
         server log. If no such line is present yet, sleeps flush_wait_seconds
         and retries up to max_retries times before raising AssertionError.
         """
-        last_match: Optional[re.Match] = None
+        last_parsed = None
+        last_line: str = ""
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
             log_text = self._captured_log_text()
-            matches = list(_SWA_DIVERGENCE_LINE_RE.finditer(log_text))
-            if matches:
-                last_match = matches[-1]
+            found = find_last_swa_divergence_line(log_text)
+            if found is not None:
+                last_parsed, last_line = found
                 break
 
-        if last_match is None:
+        if last_parsed is None:
             raise AssertionError(
                 "No kv_canary swa_divergence line found in server log after "
                 f"{max_retries} retries (wait={flush_wait_seconds}s each). "
                 f"Log tail:\n{self._captured_log_text()[-2000:]}"
             )
 
-        verify_full = int(last_match.group(2))
-        verify_swa = int(last_match.group(3))
-        mapping_nonidentity = int(last_match.group(4))
-        swa_pool_wrap = int(last_match.group(5))
-
-        if mapping_nonidentity < min_mapping_nonidentity:
+        if last_parsed.mapping_nonidentity < min_mapping_nonidentity:
             raise AssertionError(
-                f"SWA divergence not observed: mapping_nonidentity={mapping_nonidentity} "
-                f"< min={min_mapping_nonidentity}. Line: {last_match.group(0)}"
+                f"SWA divergence not observed: mapping_nonidentity={last_parsed.mapping_nonidentity} "
+                f"< min={min_mapping_nonidentity}. Line: {last_line}"
             )
-        if swa_pool_wrap < min_pool_wrap:
+        if last_parsed.swa_pool_wrap < min_pool_wrap:
             raise AssertionError(
-                f"SWA divergence not observed: swa_pool_wrap={swa_pool_wrap} "
-                f"< min={min_pool_wrap}. Line: {last_match.group(0)}"
+                f"SWA divergence not observed: swa_pool_wrap={last_parsed.swa_pool_wrap} "
+                f"< min={min_pool_wrap}. Line: {last_line}"
             )
-        if require_verify_lag and not (verify_swa < verify_full):
+        if require_verify_lag and not (last_parsed.verify_swa < last_parsed.verify_full):
             raise AssertionError(
-                f"SWA divergence not observed: verify_swa={verify_swa} "
-                f"not strictly less than verify_full={verify_full}. "
-                f"Line: {last_match.group(0)}"
+                f"SWA divergence not observed: verify_swa={last_parsed.verify_swa} "
+                f"not strictly less than verify_full={last_parsed.verify_full}. "
+                f"Line: {last_line}"
             )
 
     def assert_no_violation(self, *, wait_seconds: float = 2.0) -> None:
