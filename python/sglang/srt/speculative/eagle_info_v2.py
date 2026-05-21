@@ -96,9 +96,6 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
-
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
@@ -233,7 +230,7 @@ class EagleDraftInputV2Mixin:
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         # seq_lens_cpu was just CPU-updated in tandem — sync=False avoids
         # a redundant D2H on the draft hot path.
-        batch.refresh_seq_lens_cpu(sync=False)
+        batch.refresh_seq_lens_cpu()
         batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens

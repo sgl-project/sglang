@@ -118,6 +118,10 @@ class FutureMap:
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
+            # Resolve placeholder batch.seq_lens (set to -indices at end of
+            # previous run_batch) to post-verify GPU values from the buf.
+            # Mirrors the input_ids placeholder pattern.
+            batch.seq_lens = draft_input.new_seq_lens
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 

@@ -2834,9 +2834,11 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Refresh BEFORE _overlap_forward_isolation so snapshot
-                # captures fresh values and restore preserves them.
-                batch.refresh_seq_lens_cpu()
+                # Single pre-isolation sync site: refresh_seq_lens_cpu owns the
+                # D2H from new_seq_lens_buf (spec v2 placeholder path) AND the
+                # lazy sum recompute. .cpu() to host is itself the cross-stream
+                # sync; no explicit verify_done.wait() needed.
+                batch.refresh_seq_lens_cpu(self.future_map)
 
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
@@ -2861,6 +2863,16 @@ class Scheduler(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
                             )
+                            # Record verify_done AFTER store_to_map so the
+                            # event covers the buf write (next iter's
+                            # refresh_seq_lens_cpu waits on it).
+                            if (
+                                batch.is_spec_v2
+                                and batch_result.next_draft_input is not None
+                                and batch_result.next_draft_input.verify_done
+                                is not None
+                            ):
+                                batch_result.next_draft_input.verify_done.record()
                         else:
                             batch_result.future_indices = future_indices
 
@@ -2869,15 +2881,13 @@ class Scheduler(
                 batch.input_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    # Placeholder for next iter's resolve_future; mirrors the
+                    # input_ids handle-mode treatment one line above. Post-verify
+                    # seq_lens lives in future_map.new_seq_lens_buf and is
+                    # resolved back into batch.seq_lens inside isolation.
+                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -2966,6 +2976,13 @@ class Scheduler(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
+            # Record verify_done AFTER store_to_map for the delay-sample path
+            # too (see Scheduler.run_batch for the non-delay path).
+            if (
+                batch_result.next_draft_input is not None
+                and batch_result.next_draft_input.verify_done is not None
+            ):
+                batch_result.next_draft_input.verify_done.record()
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

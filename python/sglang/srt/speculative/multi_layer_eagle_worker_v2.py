@@ -775,8 +775,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_lens
+        # verify_done event is allocated here, recorded by Scheduler.run_batch
+        # AFTER store_to_map on the forward stream — so that next iter's
+        # refresh_seq_lens_cpu wait on it covers the buf write, not just verify.
         verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]

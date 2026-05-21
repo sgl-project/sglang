@@ -109,6 +109,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+    from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -2447,23 +2448,28 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-    def maybe_wait_verify_done(self):
-        # Use event.wait() (stream-level wait) instead of .synchronize()
-        # (CPU block). Schedule-stream prep ops following this call get
-        # ordered after the forward-stream verify via the wait; CPU is not
-        # blocked. Subsequent .cpu()/.item() naturally sync the stream.
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.wait()
-
-    def refresh_seq_lens_cpu(self, sync: bool = True):
-        # sync=True: D2H from seq_lens (needed when seq_lens_cpu is stale
-        # relative to seq_lens, i.e. spec v2's mid-forward GPU rebind).
-        # sync=False: caller asserts seq_lens_cpu already fresh — skip D2H,
-        # only recompute the cached sum.
-        if sync and self.is_spec_v2:
-            self.seq_lens_cpu = self.seq_lens.cpu()
+    def refresh_seq_lens_cpu(self, future_map: Optional["FutureMap"] = None):
+        # Standalone sync point for seq_lens_cpu / seq_lens_sum.
+        # When future_map is passed (spec v2, post-first-iter), D2H reads
+        # post-verify seq_lens from new_seq_lens_buf. The buf is written by the
+        # previous iter's forward stream (store_to_map), so we need an explicit
+        # cross-stream wait — .cpu() alone is NOT a cross-stream sync. The wait
+        # is encapsulated here: spec_info.verify_done is recorded by Scheduler
+        # AFTER store_to_map, so waiting on it covers the buf write.
+        # Otherwise (first iter / non-spec / lazy-fallback paths), the CPU mirror
+        # is already eagerly maintained — just recompute the cached sum.
+        # In handle mode batch.seq_lens is a placeholder between iters; never
+        # D2H from it directly here.
+        if (
+            future_map is not None
+            and self.is_spec_v2
+            and self.spec_info is not None
+            and self.spec_info.future_indices is not None
+        ):
+            if self.spec_info.verify_done is not None:
+                self.spec_info.verify_done.wait()
+            indices = self.spec_info.future_indices.indices
+            self.seq_lens_cpu = future_map.new_seq_lens_buf[indices].cpu()
         self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
     def filter_batch(
@@ -2473,10 +2479,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
-
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2553,15 +2555,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # In the regular scheduler path:
-        # 1) self is always prefill, whose seq_lens is not a future
-        # 2) other is always decode, which is finished in previous step
-        # so verify_done is already synced and this is a no-op.
-        # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
-        # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
