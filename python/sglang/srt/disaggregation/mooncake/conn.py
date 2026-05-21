@@ -842,6 +842,15 @@ class MooncakeKVManager(CommonKVManager):
         bytes_per_token_src = src_kv_item_len // page_size
         bytes_per_token_dst = dst_kv_item_len // page_size
 
+        # Sanity check: slice must fit in destination token slot
+        if heads_bytes_per_token > bytes_per_token_dst:
+            logger.error(
+                f"[{mooncake_session_id}] layer {layer_id}: slice size "
+                f"({heads_bytes_per_token}) exceeds target token slot size "
+                f"({bytes_per_token_dst})"
+            )
+            return -1
+
         # Vectorized address computation (same pattern as send_kvcache_slice)
         prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
         decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)

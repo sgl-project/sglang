@@ -3773,6 +3773,15 @@ def dispatch_event_loop(scheduler: Scheduler):
                 "Layer-pipelined KV transfer enabled "
                 "(dispatched per-batch in normal event loop)"
             )
+            # Pipelining uses its own compute/transfer overlap mechanism via
+            # per-layer-group CUDA events, which is incompatible with the
+            # overlap scheduler's batch-level overlap. Force the normal loop.
+            if scheduler.enable_overlap:
+                logger.info(
+                    "Disabling overlap schedule (incompatible with "
+                    "layer-pipelined transfer)"
+                )
+                scheduler.enable_overlap = False
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
         elif scheduler.enable_overlap:

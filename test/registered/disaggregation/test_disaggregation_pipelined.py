@@ -95,7 +95,9 @@ class TestDisaggregationPipelined(PDDisaggregationServerBase):
         """Verify pipelined transfer handles concurrent prefills correctly."""
         import concurrent.futures
 
-        prompts = [
+        # Each prompt must exceed SGLANG_PIPELINE_MIN_TOKENS (64) to actually
+        # exercise the pipelined path under concurrency.
+        base_prompts = [
             "What is 2 + 2?",
             "Explain gravity in one sentence.",
             "Write a haiku about coding.",
@@ -105,6 +107,9 @@ class TestDisaggregationPipelined(PDDisaggregationServerBase):
             "Define photosynthesis briefly.",
             "What is the capital of Japan?",
         ]
+        # Pad each prompt to ~100 tokens so they exceed the min_tokens threshold
+        padding = " ".join(["word"] * 80)
+        prompts = [f"{padding}\n{p}" for p in base_prompts]
 
         def send_request(prompt):
             resp = requests.post(
