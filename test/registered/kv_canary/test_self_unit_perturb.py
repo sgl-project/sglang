@@ -122,7 +122,9 @@ class TestPerturb(CustomTestCase):
         ):
             manager.perturb(forward_batch)
 
-        self.assertEqual(calls, ["req_to_token", "real_kv_used", "real_kv_unused_cache"])
+        self.assertEqual(
+            calls, ["req_to_token", "real_kv_used", "real_kv_unused_cache"]
+        )
 
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
         """Verify req_to_token perturbation replaces a slot with another live slot."""
@@ -171,7 +173,9 @@ class TestPerturb(CustomTestCase):
         """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE
         pool = make_pool(device, max_reqs=4, max_seq=8)
-        pool.req_to_token[1, :2] = torch.tensor([0, 7], dtype=torch.int32, device=device)
+        pool.req_to_token[1, :2] = torch.tensor(
+            [0, 7], dtype=torch.int32, device=device
+        )
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(2,))
         forward_batch.out_cache_loc = torch.tensor(
             [7, 0, 0], dtype=torch.int32, device=device

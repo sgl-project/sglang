@@ -36,7 +36,9 @@ class TestBufferAlloc(CustomTestCase):
 
     def test_resolve_real_kv_read_bytes_partial_returns_16(self) -> None:
         """Verify PARTIAL mode reads the fixed byte prefix."""
-        self.assertEqual(resolve_real_kv_read_bytes(_config(RealKvHashMode.PARTIAL)), 16)
+        self.assertEqual(
+            resolve_real_kv_read_bytes(_config(RealKvHashMode.PARTIAL)), 16
+        )
 
     def test_resolve_real_kv_read_bytes_all_returns_sentinel_so_full_stride_used(
         self,
