@@ -1470,7 +1470,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
-                for _ in range(obj.parallel_sample_num):
+                for sample_idx in range(obj.parallel_sample_num):
+                    expanded_index = sample_idx * batch_size + i
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     # Ensure independent mm_items so wrap_shm_features won't mutate the original
@@ -1480,6 +1481,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
                         ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    for attr in (
+                        "bootstrap_host",
+                        "bootstrap_port",
+                        "bootstrap_room",
+                        "bootstrap_pair_key",
+                    ):
+                        value = getattr(obj, attr)[expanded_index]
+                        setattr(tmp_obj, attr, value)
+                        setattr(tokenized_obj, attr, value)
                     self._init_req_state(tmp_obj)
                     tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                     self._send_one_request(tokenized_obj)
