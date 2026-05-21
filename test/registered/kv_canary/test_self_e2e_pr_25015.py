@@ -53,7 +53,7 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
             self.send_parallel_requests(
                 n=1,
                 assert_all_success=False,
-                max_new_tokens=4,
+                max_new_tokens=32,
                 timeout=60.0,
             )
             self.assert_violation_logged_any(
