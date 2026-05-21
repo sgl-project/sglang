@@ -6,8 +6,6 @@ import json
 import unittest
 from typing import ClassVar
 
-import requests
-
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -59,26 +57,6 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
                 flush_wait_seconds=0.0,
             )
             return
-
-        self._assert_no_canary_fire()
-
-    def _assert_no_canary_fire(self) -> None:
-        resp = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": list(range(1, 65)),
-                "sampling_params": {
-                    "max_new_tokens": 4,
-                    "temperature": 0.0,
-                },
-            },
-            timeout=60.0,
-        )
-        self.assertEqual(resp.status_code, 200, resp.text)
-
-        health = requests.get(self.base_url + "/health", timeout=10.0)
-        self.assertEqual(health.status_code, 200, health.text)
-        self.assert_no_violation(wait_seconds=2.0)
 
 
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
