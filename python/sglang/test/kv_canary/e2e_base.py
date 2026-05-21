@@ -30,27 +30,18 @@ class _ModeConfig:
         model_path: HF model id used by popen_launch_server.
         json_model_override_args: JSON string passed to --json-model-override-args, or
             None to omit the flag entirely.
-        cuda_graph_max_bs: --cuda-graph-max-bs value.
-        max_running_requests: --max-running-requests value.
         context_length: --context-length value.
-        max_total_tokens: --max-total-tokens value.
     """
 
     model_path: str
     json_model_override_args: Optional[str] = None
-    cuda_graph_max_bs: int
-    max_running_requests: int
     context_length: int
-    max_total_tokens: int
 
 
 _MODE_CONFIGS: dict[str, _ModeConfig] = {
     "mha": _ModeConfig(
         model_path="Qwen/Qwen3-0.6B",
-        cuda_graph_max_bs=8,
-        max_running_requests=32,
         context_length=8192,
-        max_total_tokens=65536,
     ),
     "swa": _ModeConfig(
         model_path="google/gemma-3-1b-it",
@@ -73,10 +64,7 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
                 },
             }
         ),
-        cuda_graph_max_bs=8,
-        max_running_requests=32,
         context_length=8192,
-        max_total_tokens=65536,
     ),
 }
 
@@ -129,14 +117,8 @@ class CanaryE2EBase(CustomTestCase):
         server_args = [
             "--kv-canary",
             cls.kv_canary_mode,
-            "--cuda-graph-max-bs",
-            str(cls._cfg.cuda_graph_max_bs),
-            "--max-running-requests",
-            str(cls._cfg.max_running_requests),
             "--context-length",
             str(cls._cfg.context_length),
-            "--max-total-tokens",
-            str(cls._cfg.max_total_tokens),
         ]
         if cls._cfg.json_model_override_args is not None:
             server_args.extend(
