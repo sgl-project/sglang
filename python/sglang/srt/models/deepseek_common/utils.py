@@ -57,10 +57,12 @@ NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
     "fa3",
-    "nsa",
+    "dsa",
+    "nsa",  # Deprecated alias for "dsa"
     "flashinfer",
     "cutlass_mla",
     "trtllm_mla",
+    "tokenspeed_mla",
     "ascend",
     "intel_xpu",
 ]
