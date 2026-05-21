@@ -47,18 +47,17 @@ def _wait_for_uds_health(uds_path: str, timeout: float) -> None:
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
+        conn = _UDSConnection(uds_path, timeout=5.0)
         try:
-            conn = _UDSConnection(uds_path, timeout=5.0)
             conn.request("GET", "/health")
             resp = conn.getresponse()
             resp.read()
-            conn.close()
             if resp.status == 200:
                 return
-        except (ConnectionRefusedError, FileNotFoundError, OSError) as e:
+        except OSError as e:
             last_err = e
-            time.sleep(1.0)
-            continue
+        finally:
+            conn.close()
         time.sleep(1.0)
     raise TimeoutError(
         f"Server did not become healthy on {uds_path} within {timeout}s: "
@@ -84,12 +83,42 @@ class TestUDSServer(CustomTestCase):
             "--uds",
             cls.uds_path,
         ]
+
+        # Mirror the offline-mode optimization that popen_launch_server applies:
+        # on CI runners with the model cache pre-populated, set HF_HUB_OFFLINE=1
+        # so the subprocess does not hit the HuggingFace Hub network. We mutate
+        # os.environ (which Popen inherits) and remember which keys to restore.
+        cls._restore_env: dict[str, str | None] = {}
+        try:
+            from sglang.utils import is_in_ci
+            if is_in_ci():
+                from sglang.test.test_utils import (
+                    _try_enable_offline_mode_if_cache_complete,
+                )
+                proxy_env: dict[str, str] = {}
+                _try_enable_offline_mode_if_cache_complete(
+                    cls.model, proxy_env, command[1:]
+                )
+                for key, value in proxy_env.items():
+                    cls._restore_env[key] = os.environ.get(key)
+                    os.environ[key] = value
+        except Exception as e:
+            # Non-fatal: live HF fetch will still work; we just lose the offline
+            # optimization for this test run.
+            print(f"UDS test CI cache validation failed (non-fatal): {e}")
+
         cls.process = popen_with_error_check(command)
         _wait_for_uds_health(cls.uds_path, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
 
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        # Restore environment variables we mutated in setUpClass.
+        for key, original in cls._restore_env.items():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
         try:
             os.unlink(cls.uds_path)
         except FileNotFoundError:
