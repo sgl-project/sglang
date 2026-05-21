@@ -196,11 +196,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 token_to_kv_pool=self.model_runner.token_to_kv_pool,
                 attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=buffers.out_cache_loc[:num_tokens],
-                out_cache_loc_swa=(
-                    buffers.out_cache_loc_swa[:num_tokens]
-                    if buffers.out_cache_loc_swa is not None
-                    else None
-                ),
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=(
                     buffers.mamba_track_indices[:bs]
@@ -362,23 +357,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         bs = forward_batch.batch_size
 
-        swa_translator = (
-            self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa
-            if buffers.out_cache_loc_swa is not None
-            else None
-        )
         buffers.populate_from_forward_batch(
             forward_batch=forward_batch,
             raw_num_tokens=num_tokens,
             static_num_tokens=static_num_tokens,
             is_multimodal=self.is_multimodal,
-            swa_translator=swa_translator,
-        )
-
-        out_cache_loc_swa = (
-            buffers.out_cache_loc_swa[:static_num_tokens]
-            if buffers.out_cache_loc_swa is not None
-            else None
         )
 
         mamba_track_indices = (
@@ -436,7 +419,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
             mamba_track_mask=mamba_track_mask,
@@ -476,9 +458,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 or forward_batch.return_pooled_hidden_states
             ),
         )
-
-        if out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(out_cache_loc_swa)
 
         # Backends that need stable addresses for captured segments
         # (Breakable) commit serving-time values into their static buffers.

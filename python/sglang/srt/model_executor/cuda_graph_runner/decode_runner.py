@@ -666,15 +666,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        # SWA: write before capture so set_kv_buffer's Python branch
-        # (if self.swa_loc is not None) takes the fast path, recording
-        # GPU ops that read this buffer instead of the slow per-layer
-        # translate_loc_from_full_to_swa fallback.
-        if self.buffers.out_cache_loc_swa is not None:
-            self.model_runner.token_to_kv_pool.set_swa_loc(
-                self.buffers.out_cache_loc_swa[:num_tokens]
-            )
-
         shape_key = self._make_graph_key(bs, stream_idx, variant_label)
         self.backend.capture_one(shape_key, run_once, dummies=None)
 

@@ -10,7 +10,7 @@ the same way as for non-cuda-graph forward paths.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -378,20 +378,13 @@ class PrefillInputBuffers(ForwardInputBuffers):
         raw_num_tokens: int,
         static_num_tokens: int,
         is_multimodal: bool,
-        swa_translator: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ) -> None:
         """Copy serving-batch values into static buffers and zero out
         the padding region between ``raw_num_tokens`` and
         ``static_num_tokens``.
-
-        ``swa_translator`` is required when ``out_cache_loc_swa`` is
-        present; it converts the full-cache loc tensor into SWA-cache
-        coordinates.
         """
         if static_num_tokens != raw_num_tokens:
             self.out_cache_loc.zero_()
-            if self.out_cache_loc_swa is not None:
-                self.out_cache_loc_swa.zero_()
             self.input_ids[raw_num_tokens:static_num_tokens].zero_()
             self.positions[raw_num_tokens:static_num_tokens].zero_()
             if is_multimodal:
@@ -404,11 +397,6 @@ class PrefillInputBuffers(ForwardInputBuffers):
         self.input_ids[:raw_num_tokens].copy_(forward_batch.input_ids)
         self.positions[:raw_num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:raw_num_tokens].copy_(forward_batch.out_cache_loc)
-        if self.out_cache_loc_swa is not None:
-            assert swa_translator is not None
-            self.out_cache_loc_swa[:raw_num_tokens].copy_(
-                swa_translator(forward_batch.out_cache_loc)
-            )
 
         if (
             self.mamba_track_indices is not None
