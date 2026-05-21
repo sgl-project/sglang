@@ -186,7 +186,9 @@ class Qwen2_5_VLAttention(nn.Module):
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        attn_output = self.attn(query_states, key_states, value_states)
+        attn_output = self.attn(
+            query_states, key_states, value_states, attn_mask=attention_mask
+        )
         #
         # attn_output, attn_weights = attention_interface(
         #     self,
@@ -344,6 +346,11 @@ class Qwen2_5_VLTextModel(nn.Module):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # Ensure _attn_implementation is set to a value recognized by create_causal_mask.
+        # If None or unset, create_causal_mask returns None (no mask), causing full attention
+        # without causal masking and corrupting text encoder outputs.
+        if not getattr(config, "_attn_implementation", None):
+            config._attn_implementation = "eager"
         self._attn_implementation = config._attn_implementation
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2_5_VLRotaryEmbedding(config=config)
@@ -983,11 +990,12 @@ class Qwen2_5_VLModel(nn.Module):
                         inputs_embeds.device
                     )
                 else:
-                    delta = torch.zeros(
-                        (batch_size, seq_length), device=inputs_embeds.device
-                    )
-                delta = delta.repeat_interleave(batch_size // delta.shape[0], dim=1)
-                position_ids += delta.to(position_ids.device)
+                    delta = torch.zeros(batch_size, 1, device=inputs_embeds.device)
+                position_ids = (
+                    (torch.arange(seq_length, device=inputs_embeds.device) + delta)
+                    .unsqueeze(0)
+                    .expand(3, -1, -1)
+                )
 
         outputs = self.language_model(
             input_ids=None,
