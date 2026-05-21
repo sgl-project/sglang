@@ -845,6 +845,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         timesteps_cpu: torch.Tensor,
     ) -> DenoisingStepState:
         """Build the per-step state shared by the loop and model-specific hooks."""
+        if server_args.parsed_hybrid_schedule is not None:
+            server_args.parsed_hybrid_schedule.update_current_backend(
+                step_index, len(timesteps_cpu)
+            )
+
         t_int = int(t_host.item())
         t_device = ctx.timesteps[step_index]
         current_model, current_guidance_scale = self._select_and_manage_model(
