@@ -255,6 +255,23 @@ class ViTCudaGraphRunner:
         # (tokens > max bucket) hits recompilation (~3 s per new shape).
         torch._dynamo.reset()
 
+        # Warm up the eager fallback path.
+        # CUDA graph capture under @torch._dynamo.disable runs kernels in
+        # eager Python mode.  The first post-capture eager call then triggers
+        # torch.compile + Triton JIT, causing a multi-second stall.
+        # Running one forward pass here absorbs that cost at init time.
+        self._warmup_eager_fallback()
+
+    def _warmup_eager_fallback(self) -> None:
+        """Run one eager forward to absorb first-call JIT costs."""
+        B = self.BUCKET_SIZES[-1]  # use largest bucket's buffers
+        input_buf = self.input_bufs[B]
+        fwd_metadata = self.forward_metadatas[B]
+        rotary_cos = self.rotary_cos_bufs[B]
+        rotary_sin = self.rotary_sin_bufs[B]
+        self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
+        torch.get_device_module(self.device).synchronize()
+
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
