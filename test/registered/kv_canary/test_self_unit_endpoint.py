@@ -78,7 +78,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
         """Verify per-forward launch invokes verify before write."""
         calls: List = []
         with patch.object(
-            endpoint_module, "launch_canary_verify_kernel", _record_call(calls, "verify")
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            _record_call(calls, "verify"),
         ), patch.object(
             endpoint_module, "launch_canary_write_kernel", _record_call(calls, "write")
         ):
@@ -160,7 +162,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
             endpoint_module,
             "launch_canary_verify_kernel",
             lambda **kwargs: captured_rings.append(kwargs["violation_ring"].data_ptr()),
-        ), patch.object(endpoint_module, "launch_canary_write_kernel", lambda **kwargs: None):
+        ), patch.object(
+            endpoint_module, "launch_canary_write_kernel", lambda **kwargs: None
+        ):
             shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
             ep_a = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
