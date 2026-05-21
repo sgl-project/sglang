@@ -421,9 +421,7 @@ class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
         self.clear()
 
     def clear(self):
-        self.free_slots = torch.arange(
-            1, self.size + 1, dtype=torch.int64, device="cpu"
-        )
+        self.free_slots = torch.arange(self.size, dtype=torch.int64, device="cpu")
 
     def init_kv_buffer(self):
         dims = (self.layer_num, self.size + self.page_size, self.kv_cache_total_dim)
