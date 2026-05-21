@@ -1729,10 +1729,19 @@ class Scheduler(
         return image_inputs
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
+        import time
+
+        t0 = time.time()
         if self.server_args.enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            result = self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            result = MultimodalInputs.from_processor_output(mm_inputs_dict)
+        logger.info(
+            "[IPC_RECONSTRUCT] ts=%.6f dur=%.1fms",
+            time.time(),
+            (time.time() - t0) * 1000,
+        )
+        return result
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
