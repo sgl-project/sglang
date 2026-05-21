@@ -6,8 +6,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_nsa_index_head_dim,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
@@ -20,17 +20,18 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
-    HiSparseNSATokenToKVPool,
+    HiSparseDSATokenToKVPool,
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
-    NSATokenToKVPool,
+    NoOpMHATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
@@ -136,36 +137,36 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
-        # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
-        if not is_nsa_model:
+        # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
+        if not is_dsa_model:
             return kv_cache_dim
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
-        # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
+        # Assuming dsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.nsa_prefill_backend == "trtllm"
-            or self.server_args.nsa_decode_backend == "trtllm"
+            self.server_args.dsa_prefill_backend == "trtllm"
+            or self.server_args.dsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
-            self.server_args.nsa_prefill_backend == "tilelang"
-            or self.server_args.nsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend == "tilelang"
+            or self.server_args.dsa_decode_backend == "tilelang"
         ):
             return kv_cache_dim
 
-        quant_block_size = NSATokenToKVPool.quant_block_size
-        rope_storage_dtype = NSATokenToKVPool.rope_storage_dtype
+        quant_block_size = DSATokenToKVPool.quant_block_size
+        rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
         # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout (excluding TRTLLM and HIP+TileLang).
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
@@ -196,6 +197,44 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _validate_prefill_only_disable_kv_cache_pool_family(
+        self: ModelRunner,
+        is_dsa_model: bool,
+        is_dsv4_model: bool,
+        current_platform,
+    ):
+        if not self.server_args.prefill_only_disable_kv_cache or self.is_draft_worker:
+            return
+
+        unsupported_pool_family = None
+        if is_dsv4_model:
+            unsupported_pool_family = "DeepSeekV4TokenToKVPool"
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
+            unsupported_pool_family = "out-of-tree platform KV pool"
+        elif (
+            self.server_args.attention_backend == "ascend" and not self.mambaish_config
+        ):
+            unsupported_pool_family = "NPU/Ascend KV pool"
+        elif self.use_mla_backend and is_dsa_model:
+            unsupported_pool_family = "DSA/MLA KV pool"
+        elif self.use_mla_backend and not self.mambaish_config:
+            unsupported_pool_family = "MLA KV pool"
+        elif self.is_hybrid_swa:
+            unsupported_pool_family = "SWA KV pool"
+        elif self.mambaish_config:
+            unsupported_pool_family = "hybrid linear/Mamba KV pool"
+        elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            unsupported_pool_family = "FP4 MHA KV pool"
+
+        if unsupported_pool_family is not None:
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache is not supported for "
+                f"{unsupported_pool_family}. Supported configurations today: plain MHA "
+                "models on CUDA with the FA (fa3/fa4) prefill backend, --is-embedding, "
+                "--chunked-prefill-size=-1, --disable-radix-cache, no context-parallel "
+                "attention, no HiSparse, and --kv-cache-dtype != fp4_e2m1."
+            )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
@@ -203,9 +242,12 @@ class ModelRunnerKVCacheMixin:
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
+            max_spec_draft_tokens = (
+                self.server_args.effective_max_speculative_num_draft_tokens()
+            )
             extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
-                extra_max_context_len += self.server_args.speculative_num_draft_tokens
+            if max_spec_draft_tokens is not None:
+                extra_max_context_len += max_spec_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
                 from sglang.srt.disaggregation.decode import (
@@ -235,7 +277,7 @@ class ModelRunnerKVCacheMixin:
                                 if self.start_layer <= i < self.end_layer
                             ]
                         ),
-                        speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                        speculative_num_draft_tokens=max_spec_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
                         enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
@@ -269,7 +311,7 @@ class ModelRunnerKVCacheMixin:
                         ]
                     ),
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-                    speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    speculative_num_draft_tokens=max_spec_draft_tokens,
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,
                 )
@@ -286,11 +328,15 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         is_dsv4_model = is_deepseek_v4(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
+
+        self._validate_prefill_only_disable_kv_cache_pool_family(
+            is_dsa_model, is_dsv4_model, current_platform
+        )
 
         if is_dsv4_model:
             swa_page_size = self.page_size
@@ -329,8 +375,8 @@ class ModelRunnerKVCacheMixin:
                 enable_hisparse=self.enable_hisparse,
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_nsa_model:
-                PoolCls = current_platform.get_nsa_kv_pool_cls()
+            if self.use_mla_backend and is_dsa_model:
+                PoolCls = current_platform.get_dsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -343,7 +389,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -354,7 +400,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -426,7 +472,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -453,9 +499,9 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_dsa_model:
             PoolCls = (
-                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
+                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
             )
             pool_kwargs = {}
             if self.enable_hisparse:
@@ -476,11 +522,11 @@ class ModelRunnerKVCacheMixin:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_nsa_model
+            assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
@@ -591,7 +637,12 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    pool_cls = (
+                        NoOpMHATokenToKVPool
+                        if self.server_args.prefill_only_disable_kv_cache
+                        else MHATokenToKVPool
+                    )
+                    self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
@@ -718,6 +769,24 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     swa_allocator.full_to_swa_index_mapping
                 )
+
+        # Defensive check: the explicit validation above should reject known
+        # unsupported pool families before allocation. Keep this guard here so
+        # future pool-selection refactors fail at boot instead of on first use.
+        if (
+            self.server_args.prefill_only_disable_kv_cache
+            and not self.is_draft_worker
+            and not isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool)
+        ):
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
+                f"runtime pool is {type(self.token_to_kv_pool).__name__}. This pool "
+                "family is not yet supported by --prefill-only-disable-kv-cache. "
+                "Supported configurations today: plain MHA models on CUDA with the FA "
+                "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
+                "--disable-radix-cache, no context-parallel attention, no HiSparse, "
+                "and --kv-cache-dtype != fp4_e2m1."
+            )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.

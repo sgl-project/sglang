@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +27,7 @@ from transformers import LlamaConfig
 
 from sglang.srt.distributed import (
     get_pp_group,
+    get_pp_indices,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -129,6 +132,7 @@ class LlamaAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         layer_id: int = 0,
+        start_layer: int = 0,
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         rope_is_neox_style: bool = True,
@@ -139,6 +143,7 @@ class LlamaAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
+        self.start_layer = start_layer
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
@@ -208,7 +213,7 @@ class LlamaAttention(nn.Module):
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        if self.attn.layer_id == forward_batch.token_to_kv_pool.start_layer:
+        if self.attn.layer_id == self.start_layer:
             self.rotary_emb.get_cos_sin_with_position(positions)
         q, k, v = split_qkv_rmsnorm_rope(
             qkv,
@@ -252,6 +257,7 @@ class LlamaDecoderLayer(nn.Module):
         self,
         config: LlamaConfig,
         layer_id: int = 0,
+        start_layer: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -283,6 +289,7 @@ class LlamaDecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
+            start_layer=start_layer,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             rope_is_neox_style=rope_is_neox_style,
@@ -350,10 +357,19 @@ class LlamaModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        pp_start_layer, _ = get_pp_indices(
+            config.num_hidden_layers,
+            self.pp_group.rank_in_group,
+            self.pp_group.world_size,
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
+                config=config,
+                quant_config=quant_config,
+                layer_id=idx,
+                start_layer=pp_start_layer,
+                prefix=prefix,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,

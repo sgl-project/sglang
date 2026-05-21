@@ -1724,9 +1724,9 @@ def main():
     )
     parser.add_argument(
         "--hours",
-        type=int,
+        type=float,
         default=24,
-        help="Time window in hours (default: 24)",
+        help="Time window in hours (fractional ok, default: 24)",
     )
     parser.add_argument(
         "--status",
