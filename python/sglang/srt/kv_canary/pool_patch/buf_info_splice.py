@@ -5,7 +5,6 @@ from typing import Any, Callable, List, Tuple
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
-
 from sglang.srt.kv_canary.pool_patch.utils import wrap_method
 
 BufInfoTriple = Tuple[List[int], List[int], List[int]]
