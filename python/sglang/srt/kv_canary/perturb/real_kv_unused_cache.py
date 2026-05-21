@@ -39,6 +39,7 @@ def run(
     warmup_gate: WarmupGate,
 ) -> None:
     if not should_run_perturbation(
+        perturb_name="real_kv_unused_cache",
         probability=config.real_kv_unused_cache_prob,
         warmup_gate=warmup_gate,
         forward_batch=forward_batch,
@@ -48,17 +49,34 @@ def run(
 
     slot = pick_orphan_slot(radix_cache=radix_cache)
     if slot is None:
+        logger.info(
+            "kv_canary perturb real_kv_unused_cache: skipped because no orphan radix-cache slot "
+            "was found"
+        )
         return
     group = pick_target_group(
         buffer_groups=buffer_groups,
         target_kind=config.target_group_kind,
     )
     if group is None or not group.real_kv_sources_k:
+        logger.info(
+            "kv_canary perturb real_kv_unused_cache: skipped because no target group with "
+            "real_kv_sources_k matched target_group_kind=%s slot=%d",
+            config.target_group_kind,
+            slot,
+        )
         return
     source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
     source = group.real_kv_sources_k[source_pick]
     flip_result = flip_first_byte_in_source(group=group, source=source, slot_idx=slot)
     if flip_result is None:
+        logger.info(
+            "kv_canary perturb real_kv_unused_cache: skipped because slot=%d could not be mapped "
+            "into group=%s source_idx=%d",
+            slot,
+            group.kind.name,
+            source_pick,
+        )
         return
     row, col, original_byte = flip_result
     logger.info(

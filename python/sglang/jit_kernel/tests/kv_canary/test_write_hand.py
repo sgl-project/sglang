@@ -690,8 +690,8 @@ class TestMockMode:
 class TestSlotHandling:
     def test_negative_slot_skips_entry(self) -> None:
         """``fb_out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
-        slot_run_counter bump. Covers both SWA out-of-window (after caller-side LUT gather) and
-        explicit padding intents.
+        canary slot mutation. It still counts as a processed write entry for health accounting.
+        Covers both SWA out-of-window (after caller-side LUT gather) and explicit padding intents.
         """
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
@@ -716,8 +716,7 @@ class TestSlotHandling:
 
         stored_token, _, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=4)
         assert stored_token == 42
-        # slot_run_counter counts only non-skipped entries (1, not 2).
-        assert int(cuda_log.slot_run_counter.item()) == 1
+        assert int(cuda_log.slot_run_counter.item()) == 2
 
     def test_pre_translated_slot_writes_normally(self) -> None:
         """``fb_out_cache_loc[i] >= 0`` → the kernel writes to exactly that slot, with no LUT applied. This
@@ -1109,6 +1108,14 @@ class TestRealKvHash:
             num_slots=16,
             device=_DEVICE,
         )
+        pattern_slot3 = bytes(range(1, 17))
+        pattern_slot7 = bytes(range(101, 117))
+        sources_cuda[0].tensor[0, 3 * 16 : 4 * 16] = torch.tensor(
+            list(pattern_slot3), dtype=torch.uint8, device=_DEVICE
+        )
+        sources_cuda[0].tensor[0, 7 * 16 : 8 * 16] = torch.tensor(
+            list(pattern_slot7), dtype=torch.uint8, device=_DEVICE
+        )
         sources_ref = clone_real_kv_sources(sources_cuda)
 
         plan_pair = make_write_plan_pair(
@@ -1132,9 +1139,9 @@ class TestRealKvHash:
 
         slot3 = read_slot_fields(canary_buf=buf_pair[0], slot_idx=3)
         slot7 = read_slot_fields(canary_buf=buf_pair[0], slot_idx=7)
-        assert (
-            slot3[3] != slot7[3] or slot3[3] == 0
-        ), "two distinct slots in the same page must compute their own real_kv_hash"
+        assert slot3[3] == to_signed_int64(_hand_fold_all(pattern_slot3))
+        assert slot7[3] == to_signed_int64(_hand_fold_all(pattern_slot7))
+        assert slot3[3] != slot7[3]
 
     def test_multi_source_real_kv_fold_order_matters(self) -> None:
         """Two sources folded in reverse order yields a different real_kv_hash (fold is ordered)."""

@@ -23,6 +23,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_canary_state_equal,
     make_canary_buf,
     make_real_kv_sources,
+    stamp_clean_chain,
     write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
@@ -143,6 +144,7 @@ def _run_both_and_assert_pipeline_equal(
     verify_capacity: int = 256,
     write_req_capacity: int = 16,
     assert_ring_equal: bool = True,
+    initial_canary_buf: Optional[torch.Tensor] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -163,8 +165,11 @@ def _run_both_and_assert_pipeline_equal(
             total_tokens, dtype=torch.int32, device=_DEVICE
         )
 
-    buf_real = make_canary_buf(num_slots=num_slots, device=_DEVICE)
-    buf_ref = make_canary_buf(num_slots=num_slots, device=_DEVICE)
+    if initial_canary_buf is None:
+        buf_real = make_canary_buf(num_slots=num_slots, device=_DEVICE)
+    else:
+        buf_real = initial_canary_buf.clone()
+    buf_ref = buf_real.clone()
     log_real = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
     log_ref = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
 
@@ -354,30 +359,54 @@ def test_pipeline_swa_window() -> None:
 def test_pipeline_sweep_no_write() -> None:
     """All extend_seq_lens=0: write_step is no-op, verify sweeps prefix, buf unchanged."""
     max_seq_len = 16
+    prefix_len = 4
     req_to_token = make_req_to_token(
         kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
     )
 
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_prefix_lens = torch.tensor([prefix_len], dtype=torch.int32, device=_DEVICE)
     fb_extend_seq_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
     fb_input_ids = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
     fb_positions = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
     fb_out_cache_loc = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
 
-    _run_both_and_assert_pipeline_equal(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        fb_input_ids=fb_input_ids,
-        fb_positions=fb_positions,
-        fb_out_cache_loc=fb_out_cache_loc,
-        req_to_token=req_to_token,
-        num_slots=64,
-        extras=_empty_extras(),
-        swa_window_size=0,
-        full_to_swa_index_mapping=None,
+    initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
+    initial_ref = initial_buf.clone()
+    prefix_slots = [1 * max_seq_len + pos for pos in range(prefix_len)]
+    stamp_clean_chain(
+        cuda_buf=initial_buf,
+        ref_buf=initial_ref,
+        slot_indices=prefix_slots,
+        tokens=[100 + pos for pos in range(prefix_len)],
+        positions=list(range(prefix_len)),
     )
+
+    buf_real, buf_ref, log_real, log_ref, plan_v_real, plan_w_real, _, _ = (
+        _run_both_and_assert_pipeline_equal(
+            fb_req_pool_indices=fb_req_pool_indices,
+            fb_prefix_lens=fb_prefix_lens,
+            fb_extend_seq_lens=fb_extend_seq_lens,
+            fb_input_ids=fb_input_ids,
+            fb_positions=fb_positions,
+            fb_out_cache_loc=fb_out_cache_loc,
+            req_to_token=req_to_token,
+            num_slots=64,
+            extras=_empty_extras(),
+            swa_window_size=0,
+            full_to_swa_index_mapping=None,
+            initial_canary_buf=initial_buf,
+        )
+    )
+
+    assert int(plan_v_real.verify_num_valid[0].item()) == prefix_len
+    assert int(plan_w_real.write_num_valid_reqs[0].item()) == 0
+    assert torch.equal(buf_real, initial_buf)
+    assert torch.equal(buf_ref, initial_buf)
+    assert int(log_real.write_index[0].item()) == 0
+    assert int(log_ref.write_index[0].item()) == 0
+    assert int(log_real.slot_run_counter[0].item()) == prefix_len
+    assert int(log_ref.slot_run_counter[0].item()) == prefix_len
 
 
 @pytest.mark.parametrize(

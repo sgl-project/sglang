@@ -37,25 +37,36 @@ class WarmupGate:
     def is_in_warmup(self) -> bool:
         step = self._pump_and_allreduce.step_counter
         warmup_steps = self._config.warmup_steps
+
         if step < warmup_steps:
-            if not self._warmup_disable_logged:
-                logger.info(
-                    "kv_canary perturb: disabled during warmup window "
-                    "(first %d forward steps)",
-                    warmup_steps,
-                )
-                self._warmup_disable_logged = True
+            self._log_warmup_disabled_once(warmup_steps)
             return True
-        if not self._warmup_enable_logged:
-            logger.info(
-                "kv_canary perturb: enabled after warmup window at step=%d", step
-            )
-            self._warmup_enable_logged = True
+
+        self._log_warmup_enabled_once(step)
         return False
+
+    def _log_warmup_disabled_once(self, warmup_steps: int) -> None:
+        if self._warmup_disable_logged:
+            return
+
+        logger.info(
+            "kv_canary perturb: disabled during warmup window "
+            "(first %d forward steps)",
+            warmup_steps,
+        )
+        self._warmup_disable_logged = True
+
+    def _log_warmup_enabled_once(self, step: int) -> None:
+        if self._warmup_enable_logged:
+            return
+
+        logger.info("kv_canary perturb: enabled after warmup window at step=%d", step)
+        self._warmup_enable_logged = True
 
 
 def should_run_perturbation(
     *,
+    perturb_name: str,
     probability: float,
     warmup_gate: WarmupGate,
     forward_batch: Optional["ForwardBatch"],
@@ -66,6 +77,10 @@ def should_run_perturbation(
     if warmup_gate.is_in_warmup():
         return False
     if require_forward_batch and forward_batch is None:
+        logger.info(
+            "kv_canary perturb %s: skipped because forward_batch is unavailable",
+            perturb_name,
+        )
         return False
     return torch.rand((), device="cpu").item() < probability
 

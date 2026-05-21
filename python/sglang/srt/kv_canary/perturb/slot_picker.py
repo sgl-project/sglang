@@ -26,10 +26,10 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class ActiveSlotTarget:
+class ReqToTokenEntry:
     req_pool_idx: int
     position: int
-    slot: int
+    value: int
 
 
 def collect_active_slots(
@@ -37,8 +37,8 @@ def collect_active_slots(
     forward_batch: "ForwardBatch",
     req_to_token_pool: "ReqToTokenPool",
     exclude_out_cache_loc: bool = True,
-) -> list[ActiveSlotTarget]:
-    """Collect every (req_pool_idx, position, slot) triple for currently-active reqs.
+) -> list[ReqToTokenEntry]:
+    """Collect every (req_pool_idx, position, value) triple for currently-active reqs.
 
     Excludes slots in ``forward_batch.out_cache_loc`` when ``exclude_out_cache_loc=True``
     so a slot the current forward is about to write isn't picked (write race).
@@ -68,7 +68,7 @@ def collect_active_slots(
     seq_lens_list = seq_lens.detach().to("cpu").tolist()
     rows, cols = int(table.shape[0]), int(table.shape[1])
 
-    candidates: list[ActiveSlotTarget] = []
+    candidates: list[ReqToTokenEntry] = []
     for req_pool_idx, seq_len in zip(req_pool_indices_list, seq_lens_list):
         req_pool_idx_int = int(req_pool_idx)
         seq_len_int = int(seq_len)
@@ -77,20 +77,16 @@ def collect_active_slots(
         upper = min(seq_len_int, cols)
         if upper <= 0:
             continue
-        row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
-        for pos, raw_slot in enumerate(row_slots):
-            slot = int(raw_slot)
-            if slot < 0:
-                continue
-            if slot in excluded:
-                continue
-            candidates.append(
-                ActiveSlotTarget(
-                    req_pool_idx=req_pool_idx_int,
-                    position=pos,
-                    slot=slot,
-                )
+        row_values = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+        candidates.extend(
+            ReqToTokenEntry(
+                req_pool_idx=req_pool_idx_int,
+                position=pos,
+                value=value,
             )
+            for pos, raw_value in enumerate(row_values)
+            if (value := int(raw_value)) >= 0 and value not in excluded
+        )
     return candidates
 
 
@@ -99,7 +95,7 @@ def pick_active_slot(
     forward_batch: "ForwardBatch",
     req_to_token_pool: "ReqToTokenPool",
     exclude_out_cache_loc: bool = True,
-) -> Optional[ActiveSlotTarget]:
+) -> Optional[ReqToTokenEntry]:
     """Random pick from ``collect_active_slots`` output. Returns None if no candidate."""
     candidates = collect_active_slots(
         forward_batch=forward_batch,
@@ -123,12 +119,9 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
     )
     if slot_tensor.numel() == 0:
         return None
-    valid: list[int] = []
-    for raw_slot in slot_tensor.tolist():
-        slot = int(raw_slot)
-        if slot < 0:
-            continue
-        valid.append(slot)
+    valid: list[int] = [
+        slot for raw_slot in slot_tensor.tolist() if (slot := int(raw_slot)) >= 0
+    ]
     if not valid:
         return None
     pick = int(torch.randint(0, len(valid), (1,)).item())
