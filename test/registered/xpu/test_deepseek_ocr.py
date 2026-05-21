@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers import get_tokenizer
@@ -22,6 +23,7 @@ from sglang.test.test_utils import (
 register_xpu_ci(est_time=360, suite="stage-b-test-1-gpu-xpu")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepSeekOCR(CustomTestCase):
     @classmethod
     def setUpClass(cls):
