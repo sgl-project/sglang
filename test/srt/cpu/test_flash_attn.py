@@ -1,11 +1,13 @@
 import unittest
 
+import sgl_kernel  # noqa: F401
 import torch
 import torch.nn.functional as F
 from utils import parametrize, precision
 
-from sglang.jit_kernel.flash_attention import flash_attn_varlen_func
 from sglang.test.test_utils import CustomTestCase
+
+flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
 torch.manual_seed(1234)
 
@@ -200,6 +202,40 @@ class TestFlashAttn(CustomTestCase):
 
         atol = rtol = precision[dtype]
         torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    def _test_flash_attn_large_seq_causal_mask_once(self, seqlens):
+        dtype = torch.bfloat16
+        num_heads = 8
+        num_heads_kv = 2
+        head_dim = 64
+
+        seqlens_t = torch.tensor(seqlens, dtype=torch.int32)
+        cu_seqlens = torch.zeros(len(seqlens) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(seqlens_t, 0)
+        total = cu_seqlens[-1].item()
+        max_seqlen = seqlens_t.max().item()
+
+        q = torch.randn(total, num_heads, head_dim, dtype=dtype)
+        k = torch.randn(total, num_heads_kv, head_dim, dtype=dtype)
+        v = torch.randn(total, num_heads_kv, head_dim, dtype=dtype)
+
+        out_ref = flash_attn_varlen_ref(
+            q, k, v, cu_seqlens, cu_seqlens, is_causal=True, enable_gqa=True
+        )
+        out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen, True
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(out_ref, out, atol=atol, rtol=rtol)
+
+    def test_flash_attn_large_seq_causal_mask(self):
+        # Non-varlen path: single sequence, has_varlen_sequences returns False
+        # → dispatches to flash_attn_kernel_impl.
+        self._test_flash_attn_large_seq_causal_mask_once([5000])
+        # Varlen path: sequences with different lengths, has_varlen_sequences
+        # returns True → dispatches to flash_attn_varlen_kernel_impl
+        self._test_flash_attn_large_seq_causal_mask_once([5000, 4999])
 
 
 if __name__ == "__main__":

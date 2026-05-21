@@ -1,0 +1,158 @@
+---
+title: "Ring SP Benchmark: Wan2.2-TI2V-5B (u1r2 vs Baseline)"
+metatags:
+    description: "Review Ring-SP benchmark results for Wan2.2-TI2V-5B-Diffusers in SGLang Diffusion."
+---
+
+This page reports Ring-SP performance for `Wan2.2-TI2V-5B-Diffusers` using:
+
+- Parallel config: `sp=2, ulysses=1, ring=2` (short: `u1r2`)
+- Baseline config: `sp=1, ulysses=1, ring=1` (short: `u1r1`)
+
+## Benchmark Setup
+
+- Model: `Wan2.2-TI2V-5B-Diffusers`
+- GPU: `48G RTX40 series * 2`
+
+## Online Serving
+
+### Ring SP (`u1r2`)
+
+```bash
+sglang serve \
+  --model-type diffusion \
+  --model-path /model/HuggingFace/Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 2 --sp-degree 2 --ulysses-degree 1 --ring-degree 2 \
+  --port 8898
+```
+
+### Baseline (`u1r1`)
+
+```bash
+sglang serve \
+  --model-type diffusion \
+  --model-path /model/HuggingFace/Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+  --num-gpus 1 --sp-degree 1 --ulysses-degree 1 --ring-degree 1 \
+  --port 8898
+```
+
+## Benchmarks
+
+### Benchmark Disclaimer
+
+These benchmarks are provided for reference under one specific setup and command configuration. Actual performance may vary with model settings, runtime environment, and request patterns.
+
+### Stage Time Breakdown
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Stage / Metric</th>
+      <th><code>u1r2</code> (s)</th>
+      <th><code>u1r1</code> baseline (s)</th>
+      <th>Speedup</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>InputValidation</td>
+      <td>0.1060</td>
+      <td>0.1029</td>
+      <td>0.97x</td>
+    </tr>
+    <tr>
+      <td>TextEncoding</td>
+      <td>1.3965</td>
+      <td>2.2261</td>
+      <td>1.59x</td>
+    </tr>
+    <tr>
+      <td>LatentPreparation</td>
+      <td>0.0002</td>
+      <td>0.0002</td>
+      <td>1.00x</td>
+    </tr>
+    <tr>
+      <td>TimestepPreparation</td>
+      <td>0.0003</td>
+      <td>0.0004</td>
+      <td>1.33x</td>
+    </tr>
+    <tr>
+      <td>Denoising</td>
+      <td>52.6358</td>
+      <td>71.6785</td>
+      <td>1.36x</td>
+    </tr>
+    <tr>
+      <td>Decoding</td>
+      <td>7.6708</td>
+      <td>13.4314</td>
+      <td>1.75x</td>
+    </tr>
+    <tr>
+      <td><strong>Total</strong></td>
+      <td><strong>63.74</strong></td>
+      <td><strong>90.63</strong></td>
+      <td><strong>1.42x</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+### Memory Usage
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+    <col style={{width: "25%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Memory Metric</th>
+      <th><code>u1r2</code> (GB)</th>
+      <th><code>u1r1</code> baseline (GB)</th>
+      <th>Delta</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Peak GPU Memory</td>
+      <td>20.07</td>
+      <td>27.40</td>
+      <td>-7.33</td>
+    </tr>
+    <tr>
+      <td>Peak Allocated</td>
+      <td>13.35</td>
+      <td>20.40</td>
+      <td>-7.05</td>
+    </tr>
+    <tr>
+      <td>Memory Overhead</td>
+      <td>6.72</td>
+      <td>7.00</td>
+      <td>-0.28</td>
+    </tr>
+    <tr>
+      <td>Overhead Ratio</td>
+      <td>33.5%</td>
+      <td>25.6%</td>
+      <td>+7.9pp</td>
+    </tr>
+  </tbody>
+</table>
+
+## Summary
+
+- End-to-end latency improves from `90.63s` to `63.74s` (`1.42x`).
+- Main gains come from `Denoising` (`1.36x`) and `Decoding` (`1.75x`).
+- Absolute memory usage drops noticeably on Ring-SP (`Peak GPU Memory -7.33GB`, `Peak Allocated -7.05GB`).
+- Overhead ratio rises (`+7.9pp`), so future tuning can focus on reducing communication/runtime overhead while preserving the latency gain.

@@ -38,6 +38,9 @@ class AttentionBackendEnum(enum.Enum):
     AITER_SAGE = enum.auto()
     SLA_ATTN = enum.auto()
     SAGE_SLA_ATTN = enum.auto()
+    LASER_ATTN = enum.auto()
+    BLOCK_SPARSE_ATTN = enum.auto()
+    RAIN_FUSION_ATTN = enum.auto()
     NO_ATTENTION = enum.auto()
 
     def __str__(self):
@@ -52,6 +55,9 @@ class AttentionBackendEnum(enum.Enum):
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SLA_ATTN,
             AttentionBackendEnum.SAGE_SLA_ATTN,
+            AttentionBackendEnum.LASER_ATTN,
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
         }
 
 
@@ -63,6 +69,7 @@ class PlatformEnum(enum.Enum):
     MPS = enum.auto()
     NPU = enum.auto()
     MUSA = enum.auto()
+    XPU = enum.auto()
     OOT = enum.auto()
     UNSPECIFIED = enum.auto()
 
@@ -283,6 +290,8 @@ class Platform:
             return torch.device("cuda", local_rank)
         elif self.is_npu():
             return torch.device("npu", local_rank)
+        elif self.is_xpu():
+            return torch.device("xpu", local_rank)
         elif self.is_musa():
             return torch.device("musa", local_rank)
         elif self.is_mps():
@@ -300,6 +309,10 @@ class Platform:
             return "mccl"
         elif self.is_mps():
             return "gloo"
+        elif self.is_cpu():
+            return "gloo"
+        elif self.is_xpu():
+            return "xccl"
         else:
             raise NotImplementedError(
                 "No Accelerators(AMD/NV/MTT GPU, AMD MI instinct accelerators) available"

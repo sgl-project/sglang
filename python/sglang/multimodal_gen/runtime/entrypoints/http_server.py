@@ -22,7 +22,10 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.realtime import (
     realtime_video_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
-from sglang.multimodal_gen.runtime.entrypoints.post_training import weights_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+    rollout_api,
+    weights_api,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -38,7 +41,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-DEFAULT_SEED = 1024
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 
 
@@ -165,6 +167,32 @@ async def health_generate():
     return {"status": "ok"}
 
 
+@health_router.get("/stats")
+async def stats_endpoint(request: Request):
+    """Get runtime statistics including disagg pipeline metrics.
+
+    Returns queue depth, request counts, latency, throughput, etc.
+    Sends a GetDisaggStatsReq to the scheduler via ZMQ and returns the result.
+    """
+    from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
+
+    server_args: ServerArgs = request.app.state.server_args
+    response: dict = {
+        "status": "ok",
+        "model_path": server_args.model_path,
+    }
+
+    # Query the scheduler for disagg metrics
+    try:
+        stats_response = await async_scheduler_client.forward(GetDisaggStatsReq())
+        if hasattr(stats_response, "output") and stats_response.output is not None:
+            response["disagg"] = stats_response.output
+    except Exception as e:
+        response["disagg"] = {"error": str(e)}
+
+    return response
+
+
 def make_serializable(obj):
     """Recursively converts Tensors to None for JSON serialization."""
     if isinstance(obj, torch.Tensor):
@@ -255,7 +283,6 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
             rid,
             prompt=inst.get("prompt") or inst.get("text"),
             image_path=inst.get("image") or inst.get("image_url"),
-            seed=params.get("seed", DEFAULT_SEED),
             num_frames=params.get("num_frames"),
             fps=params.get("fps"),
             width=params.get("width"),
@@ -289,6 +316,7 @@ def create_app(server_args: ServerArgs):
     app.include_router(realtime_video_api.router)
     app.include_router(mesh_api.router)
     app.include_router(weights_api.router)
+    app.include_router(rollout_api.router)
 
     app.state.server_args = server_args
     return app

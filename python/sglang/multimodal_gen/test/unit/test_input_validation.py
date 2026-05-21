@@ -3,13 +3,19 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import torch
+from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
 from PIL import Image
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanI2V480PConfig,
     WanI2V720PConfig,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.pipelines.flux_2 import Flux2Pipeline
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
@@ -38,6 +44,28 @@ def _make_server_args(pipeline_config):
     sa = MagicMock()
     sa.pipeline_config = pipeline_config
     return sa
+
+
+class _DummyTI2IConfig:
+    task_type = ModelTaskType.TI2I
+
+    def __init__(self):
+        self.vae_config = MagicMock()
+        self.vae_config.get_vae_scale_factor.return_value = 8
+
+    def preprocess_vae_image(self, batch, vae_image_processor):
+        return None
+
+    def calculate_condition_image_size(self, image, width, height):
+        return None
+
+    def preprocess_condition_image(
+        self, image, target_width, target_height, vae_image_processor
+    ):
+        return image, (target_width, target_height)
+
+    def prepare_calculated_size(self, image):
+        return image.size
 
 
 class TestCalculateDimensionsFromArea(unittest.TestCase):
@@ -158,6 +186,89 @@ class TestPreprocessConditionImageResolution(unittest.TestCase):
         self.stage.preprocess_condition_image(batch, server_args, 1920, 1080)
         self.assertIsInstance(batch.condition_image, Image.Image)
         self.assertEqual((batch.width, batch.height), (1280, 720))
+
+
+class TestFlux2ConditionImagePreprocess(unittest.TestCase):
+    def test_matches_official_flux2_image_processor(self):
+        config = Flux2PipelineConfig()
+        config.vae_config.arch_config.vae_scale_factor = 8
+        processor = Flux2ImageProcessor(vae_scale_factor=16)
+        image = Image.fromarray(
+            np.arange(1792 * 1216 * 3, dtype=np.uint8).reshape(1216, 1792, 3),
+            mode="RGB",
+        )
+
+        size = config.calculate_condition_image_size(image, image.width, image.height)
+        self.assertEqual(size, (1232, 832))
+
+        processed, processed_size = config.preprocess_condition_image(
+            image, size[0], size[1], processor
+        )
+
+        official_image = processor._resize_to_target_area(image, 1024 * 1024)
+        expected_width = (official_image.width // 16) * 16
+        expected_height = (official_image.height // 16) * 16
+        expected = processor.preprocess(
+            official_image,
+            height=expected_height,
+            width=expected_width,
+            resize_mode="crop",
+        )
+
+        self.assertEqual(processed_size, (expected_width, expected_height))
+        self.assertTrue(torch.equal(processed, expected))
+
+    @patch.object(Flux2Pipeline, "add_standard_ti2i_stages")
+    def test_runtime_pipeline_uses_flux2_image_processor(self, mock_add_stages):
+        pipeline = object.__new__(Flux2Pipeline)
+        server_args = MagicMock()
+        server_args.pipeline_config.vae_config.arch_config.vae_scale_factor = 8
+
+        Flux2Pipeline.create_pipeline_stages(pipeline, server_args)
+
+        processor = mock_add_stages.call_args.kwargs["vae_image_processor"]
+        self.assertIsInstance(processor, Flux2ImageProcessor)
+        self.assertIs(
+            processor,
+            mock_add_stages.call_args.kwargs["image_vae_stage_kwargs"][
+                "vae_image_processor"
+            ],
+        )
+
+
+class TestFlux2TI2ISizeResolution(unittest.TestCase):
+    def setUp(self):
+        with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+            self.stage = InputValidationStage()
+        self.config = _DummyTI2IConfig()
+
+    def test_uses_condition_image_size_when_width_height_not_explicit(self):
+        image = Image.new("RGB", (1255, 833), color="red")
+        batch = _make_batch(image)
+        batch.extra = {}
+
+        self.stage.preprocess_condition_image(
+            batch,
+            _make_server_args(self.config),
+            image.width,
+            image.height,
+        )
+
+        self.assertEqual((batch.width, batch.height), (1248, 832))
+
+    def test_preserves_explicit_width_height_for_ti2i(self):
+        image = Image.new("RGB", (1255, 833), color="red")
+        batch = _make_batch(image, width=768, height=512)
+        batch.extra = {"explicit_fields": ["width", "height"]}
+
+        self.stage.preprocess_condition_image(
+            batch,
+            _make_server_args(self.config),
+            image.width,
+            image.height,
+        )
+
+        self.assertEqual((batch.width, batch.height), (768, 512))
 
 
 if __name__ == "__main__":

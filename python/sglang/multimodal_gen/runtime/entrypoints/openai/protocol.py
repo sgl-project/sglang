@@ -4,7 +4,7 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # Image API protocol models
@@ -24,6 +24,8 @@ class ImageResponse(BaseModel):
 
 
 class ImageGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     prompt: str
     model: Optional[str] = None
     n: Optional[int] = 1
@@ -42,7 +44,7 @@ class ImageGenerationsRequest(BaseModel):
     true_cfg_scale: Optional[float] = (
         None  # for CFG vs guidance distillation (e.g., QwenImage)
     )
-    seed: Optional[int] = 1024
+    seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     negative_prompt: Optional[str] = None
     output_quality: Optional[str] = "default"
@@ -74,6 +76,8 @@ class VideoResponse(BaseModel):
     expires_at: Optional[int] = None
     error: Optional[Dict[str, Any]] = None
     file_path: Optional[str] = None
+    file_paths: Optional[List[str]] = None
+    num_outputs: Optional[int] = None
     peak_memory_mb: Optional[float] = None
     inference_time_s: Optional[float] = None
 
@@ -83,11 +87,13 @@ class VideoGenerationsRequest(BaseModel):
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
     model: Optional[str] = None
+    n: Optional[int] = 1
+    num_outputs_per_prompt: Optional[int] = None
     seconds: Optional[int] = 4
     size: Optional[str] = ""
     fps: Optional[int] = None
     num_frames: Optional[int] = None
-    seed: Optional[int] = 1024
+    seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     # SGLang extensions
     width: Optional[int] = None
@@ -129,6 +135,8 @@ class VideoRemixRequest(BaseModel):
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
     # WebSocket does not support multipart/form-data image uploads
     first_frame: Optional[bytes | str] = None
+    seed: Optional[int] = 42
+    guidance_scale: Optional[float] = 1.0
     size: Optional[str] = "832x480"
     profile: Optional[bool] = False
     num_profiled_timesteps: Optional[int] = None
@@ -136,10 +144,11 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
 
 
 class RealtimeAction(BaseModel):
-    type: Literal["prompt", "video"]
+    type: Literal["prompt", "video", "control"]
     action_content: Optional[str] = None
     video_frame: Optional[bytes] = None
     video_frames: Optional[List[bytes]] = None
+    control_chunk: Optional[List[List[str]]] = None
 
 
 # Mesh API protocol models
@@ -165,7 +174,7 @@ class MeshGenerationsRequest(BaseModel):
     prompt: str = "generate 3d mesh"
     input_image: Optional[str] = None
     model: Optional[str] = None
-    seed: Optional[int] = None
+    seed: Optional[Union[int, List[int]]] = None
     generator_device: Optional[str] = "cuda"
     num_inference_steps: Optional[int] = None
     guidance_scale: Optional[float] = None

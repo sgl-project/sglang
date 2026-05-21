@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from collections import deque
 from enum import Enum
 from uuid import uuid4
@@ -26,14 +28,18 @@ class GenerateSession:
     def __init__(self):
         self.id = uuid4().hex
         self.request_id = None
-        self.request = None
+        self.request: RealtimeVideoGenerationsRequest | None = None
         self.mode: RealtimeVideoMode | None = None
+        self.input_temp_dir: str | None = None
         self.action_queue = deque(maxlen=1)
+        self.control_queue = deque(maxlen=512)
         self.video_frame_queue = deque(maxlen=256)
         self.generate_chunk_cnt = 0
+        self.last_control_actions: list[str] = []
+        self.has_control_state = False
         self.realtime_session = RealtimeSession()
 
-    def setRequest(self, request: RealtimeVideoGenerationsRequest):
+    def set_request(self, request: RealtimeVideoGenerationsRequest):
         self.request = request
 
     def set_mode(self, mode: RealtimeVideoMode | None):
@@ -41,11 +47,15 @@ class GenerateSession:
 
     def dispose(self):
         self.action_queue.clear()
+        self.control_queue.clear()
         self.video_frame_queue.clear()
         self.mode = None
         self.request = None
         self.request_id = None
+        self.input_temp_dir = None
         self.generate_chunk_cnt = 0
+        self.last_control_actions = []
+        self.has_control_state = False
         self.realtime_session.dispose()
 
     def new_request(self):
@@ -56,6 +66,16 @@ class GenerateSession:
 
     def append_action(self, action: RealtimeAction):
         self.action_queue.append(action)
+
+    def _append_control_frame(self, actions: list[str]):
+        normalized = list(actions)
+        self.control_queue.append(normalized)
+        self.last_control_actions = normalized
+        self.has_control_state = True
+
+    def append_control_chunk(self, control_chunk: list[list[str]]):
+        for actions in control_chunk:
+            self._append_control_frame(actions)
 
     def append_video_frames(self, frames: list):
         if len(frames) > 0:
@@ -80,6 +100,24 @@ class GenerateSession:
 
     def sample_action(self) -> RealtimeAction:
         return self.action_queue.popleft()
+
+    def sample_control_chunk(self, chunk_size: int) -> list[list[str]] | None:
+        if chunk_size <= 0:
+            return None
+
+        chunk: list[list[str]] = []
+        while len(chunk) < chunk_size and len(self.control_queue) > 0:
+            chunk.append(list(self.control_queue.popleft()))
+
+        if len(chunk) == 0 and not self.has_control_state:
+            # Keep emitting an explicit no-op control chunk so LingBot-style
+            # camera conditioning stays active before any user control arrives.
+            return [[] for _ in range(chunk_size)]
+
+        pad_actions = list(self.last_control_actions)
+        while len(chunk) < chunk_size:
+            chunk.append(list(pad_actions))
+        return chunk
 
     def sample_video_frames(self):
         required = self.required_video_frames()
@@ -121,6 +159,7 @@ class GenerateSession:
             fps=self.request.fps,
             image_path=self.request.first_frame,
             output_file_name=self.request_id,
+            save_output=False,
             seed=self.request.seed,
             generator_device=self.request.generator_device,
             num_inference_steps=self.request.num_inference_steps,
@@ -128,6 +167,14 @@ class GenerateSession:
             guidance_scale_2=self.request.guidance_scale_2,
             negative_prompt=self.request.negative_prompt,
             enable_teacache=self.request.enable_teacache,
+            enable_frame_interpolation=self.request.enable_frame_interpolation,
+            frame_interpolation_exp=self.request.frame_interpolation_exp,
+            frame_interpolation_scale=self.request.frame_interpolation_scale,
+            frame_interpolation_model_path=self.request.frame_interpolation_model_path,
+            enable_upscaling=self.request.enable_upscaling,
+            upscaling_model_path=self.request.upscaling_model_path,
+            upscaling_scale=self.request.upscaling_scale,
+            diffusers_kwargs=self.request.diffusers_kwargs,
             profile=self.request.profile,
             num_profiled_timesteps=self.request.num_profiled_timesteps,
             profile_all_stages=self.request.profile_all_stages,

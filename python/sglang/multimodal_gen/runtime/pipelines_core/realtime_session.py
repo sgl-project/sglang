@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -6,6 +8,8 @@ from typing import Any
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+REALTIME_SESSION_ID_EXTRA_KEY = "realtime_session_id"
+RETURN_ENCODED_FRAMES_EXTRA_KEY = "return_encoded_frames"
 
 
 class BaseRealtimeState:
@@ -20,22 +24,20 @@ class BaseRealtimeState:
 
 class RealtimeSession:
     def __init__(self):
-        # Keep per-session state isolated by stage/type so multiple realtime
-        # pipeline components can share one session without clobbering each
-        # other's caches.
+        # Store independent per-session state objects by type.
         self._states: dict[type[BaseRealtimeState], BaseRealtimeState] = {}
 
     @staticmethod
     def resolve_session_id(req: Any) -> str | None:
         has_explicit_session_id = (
-            isinstance(req.extra, dict) and "realtime_session_id" in req.extra
+            isinstance(req.extra, dict) and REALTIME_SESSION_ID_EXTRA_KEY in req.extra
         )
         if not has_explicit_session_id and req.session is None:
             return None
 
         session_id = None
         if has_explicit_session_id:
-            session_id = req.extra.get("realtime_session_id")
+            session_id = req.extra.get(REALTIME_SESSION_ID_EXTRA_KEY)
         elif isinstance(req.request_id, str) and "_" in req.request_id:
             # Backward compatibility for callers that did not set realtime_session_id.
             session_id = req.request_id.split("_", 1)[0]

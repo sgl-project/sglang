@@ -48,6 +48,9 @@ from sglang.multimodal_gen.runtime.utils.model_overlay import (
     maybe_load_overlay_model_index,
     maybe_resolve_overlay_model_path,
 )
+from sglang.multimodal_gen.runtime.utils.quantization_utils import (
+    normalize_flat_modelopt_quant_config,
+)
 from sglang.srt.environ import envs
 from sglang.utils import is_in_ci
 
@@ -311,13 +314,50 @@ def load_dict(file_path):
         ) from e
 
 
+def prepare_diffusers_component_path_for_loading(component_path: str) -> str:
+    """Download component repos if needed and patch legacy flat ModelOpt configs."""
+    local_component_path = (
+        maybe_download_model(component_path)
+        if not os.path.exists(component_path)
+        else component_path
+    )
+    config_path = os.path.join(local_component_path, "config.json")
+    if not os.path.exists(config_path):
+        return local_component_path
+
+    with get_lock(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                config = cast(dict[str, Any], json.load(f))
+        except Exception as exc:
+            logger.warning("Failed to read component config %s: %s", config_path, exc)
+            return local_component_path
+
+        quant_config = config.get("quantization_config")
+        normalized_quant_config = normalize_flat_modelopt_quant_config(quant_config)
+        if normalized_quant_config == quant_config:
+            return local_component_path
+
+        config["quantization_config"] = normalized_quant_config
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, sort_keys=True)
+            f.write("\n")
+        logger.warning(
+            "Patched legacy flat ModelOpt quantization_config at %s with quant_type=%s "
+            "for diffusers compatibility.",
+            config_path,
+            normalized_quant_config.get("quant_type"),
+        )
+
+    return local_component_path
+
+
 def get_diffusers_component_config(
     component_path: str,
 ) -> dict[str, Any]:
     """Gets a configuration of a submodule for the given diffusers model."""
     # Download from HuggingFace Hub if path doesn't exist locally
-    if not os.path.exists(component_path):
-        component_path = maybe_download_model(component_path)
+    component_path = prepare_diffusers_component_path_for_loading(component_path)
 
     config_names = ["generation_config.json"]
     # By default, we load config.json, but scheduler_config.json for scheduler

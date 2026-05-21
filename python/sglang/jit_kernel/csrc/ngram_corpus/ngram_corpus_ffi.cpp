@@ -51,24 +51,6 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->asyncInsert(std::move(tokens));
   }
 
-  void batch_match(
-      const tvm::ffi::TensorView tokens_flat,
-      const tvm::ffi::TensorView offsets,
-      const tvm::ffi::TensorView out_tokens,
-      const tvm::ffi::TensorView out_mask) {
-    auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
-    auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
-    int64_t batch_size = offsets.size(0) - 1;
-
-    std::vector<std::vector<int32_t>> tokens(batch_size);
-    for (int64_t i = 0; i < batch_size; ++i) {
-      tokens[i].assign(data + offs[i], data + offs[i + 1]);
-    }
-
-    auto result = ngram_->batchMatch(tokens);
-    write_result_(result, out_tokens, out_mask);
-  }
-
   void batch_match_stateful(
       const tvm::ffi::TensorView state_ids_tv,
       const tvm::ffi::TensorView tokens_flat,
@@ -129,11 +111,11 @@ struct NgramCorpusObj : public tvm::ffi::Object {
   }
 
   std::string list_external_corpora() {
-    auto ids = ngram_->listExternalCorpora();
+    auto entries = ngram_->listExternalCorpora();
     std::string result;
-    for (size_t i = 0; i < ids.size(); ++i) {
+    for (size_t i = 0; i < entries.size(); ++i) {
       if (i > 0) result += "\n";
-      result += ids[i];
+      result += entries[i].first + "\t" + std::to_string(entries[i].second);
     }
     return result;
   }
@@ -173,7 +155,6 @@ void register_ngram_corpus() {
   refl::ObjectDef<NgramCorpusObj>()
       .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
-      .def("batch_match", &NgramCorpusObj::batch_match)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
