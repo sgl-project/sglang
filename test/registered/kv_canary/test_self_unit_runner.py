@@ -66,6 +66,27 @@ def _make_pool(device, max_reqs: int = 4, max_seq: int = 8):
     return SimpleNamespace(req_to_token=table, size=max_reqs)
 
 
+def _make_config(
+    *,
+    mode: CanaryMode = CanaryMode.RAISE,
+    ring_capacity: int = 1024,
+    sweep_interval: int = 0,
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF,
+    input_check_mode: bool = False,
+    stats_print_every_n_steps: int = 100,
+    allreduce_violation_signal: bool = False,
+) -> CanaryConfig:
+    return CanaryConfig(
+        mode=mode,
+        ring_capacity=ring_capacity,
+        sweep_interval=sweep_interval,
+        real_kv_hash_mode=real_kv_hash_mode,
+        input_check_mode=input_check_mode,
+        stats_print_every_n_steps=stats_print_every_n_steps,
+        allreduce_violation_signal=allreduce_violation_signal,
+    )
+
+
 class _FakeDecodeForwardMode:
     def is_extend(self) -> bool:
         return False
@@ -114,9 +135,7 @@ def _make_runner(
     sweep_verify_capacity: int = 8,
 ):
     if config is None:
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE, real_kv_hash_mode=RealKvHashMode.OFF
-        )
+        config = _make_config()
     if group is None:
         group = _make_group(device=device)
     if req_pool is None:
@@ -147,6 +166,16 @@ class TestSelfUnitRunner(CustomTestCase):
         for p in self._patchers:
             p.start()
             self.addCleanup(p.stop)
+
+    def test_canary_config_requires_explicit_from_env_fields(self):
+        """Verify production config fields stay explicit at construction."""
+        with self.assertRaises(TypeError):
+            CanaryConfig(mode=CanaryMode.RAISE)
+
+    def test_perturb_config_requires_explicit_from_env_fields(self):
+        """Verify perturb config fields stay explicit at construction."""
+        with self.assertRaises(TypeError):
+            PerturbConfig(req_to_token_prob=0.0)
 
     def test_per_forward_orchestrates_plan_head_tail(self):
         """Verify per-forward execution launches plan, head, and tail kernels."""
@@ -188,9 +217,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_every_n_cadence(self):
         """Verify sweep execution follows the configured step cadence."""
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+        config = _make_config(
             sweep_interval=4,
             allreduce_violation_signal=False,
         )
@@ -214,9 +241,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_runs_radix_path(self):
         """Verify sweep execution runs the radix planning path."""
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+        config = _make_config(
             sweep_interval=1,
             allreduce_violation_signal=False,
         )
@@ -248,7 +273,13 @@ class TestSelfUnitRunner(CustomTestCase):
             [44, 55, 66], dtype=torch.int32, device=self.device
         )
         manager = PerturbManager(
-            config=PerturbConfig(req_to_token_prob=1.0, warmup_steps=0),
+            config=PerturbConfig(
+                req_to_token_prob=1.0,
+                real_kv_used_prob=0.0,
+                real_kv_unused_cache_prob=0.0,
+                target_group_kind="any",
+                warmup_steps=0,
+            ),
             req_to_token_pool=pool,
             buffer_groups=(),
             pump_and_allreduce=SimpleNamespace(step_counter=10),
@@ -282,9 +313,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
         """Verify the watchdog ignores disabled sweep counters."""
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+        config = _make_config(
             sweep_interval=0,
             allreduce_violation_signal=False,
         )
@@ -305,9 +334,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_periodic_stats_log_every_n_step(self):
         """Verify periodic stats are logged at the configured interval."""
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+        config = _make_config(
             stats_print_every_n_steps=5,
             allreduce_violation_signal=False,
         )
@@ -324,9 +351,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
     def test_sweep_path_launches_sweep_kernels(self):
         """Verify sweep paths launch sweep verify kernels."""
-        config = CanaryConfig(
-            mode=CanaryMode.RAISE,
-            real_kv_hash_mode=RealKvHashMode.OFF,
+        config = _make_config(
             sweep_interval=1,
             allreduce_violation_signal=False,
         )

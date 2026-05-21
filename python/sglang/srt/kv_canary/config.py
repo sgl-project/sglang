@@ -30,13 +30,13 @@ class CanaryConfig:
         mode: "off" | "log" | "raise". off = no canary installed; log = canary runs, violations are logged
             but do NOT raise (used for production observability + canary self-test perturb); raise =
             violations propagate to host as RuntimeError after the next D2H pump.
-        ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously
-            (default 1024); overflow only drops detail beyond row N, the monotonic counter still grows.
+        ring_capacity: Violation ring capacity (rows in ViolationLog.violation_ring). Sized generously;
+            overflow only drops detail beyond row N, the monotonic counter still grows.
         sweep_interval: 0 disables sweep entirely; positive N means every N-th forward step the runner
             additionally walks all radix-tree-held slots (overlap with per-forward HEAD/TAIL is harmless
             redundancy) and verifies them.
         real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Uniform across head/tail/sweep launches;
-            PARTIAL (first 16B, hard cap) is cheap enough to be the default.
+            PARTIAL (first 16B, hard cap) is cheap enough for production defaults.
         input_check_mode: bool. True = canary_write_step additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
@@ -46,16 +46,16 @@ class CanaryConfig:
             "canary protected N tokens, ran M sweep passes, K violations so far" every N forward steps.
         allreduce_violation_signal: True = end-of-step pump performs TP- and PP-group allreduce on the local
             is_errored byte so all ranks raise in lockstep; False = each rank raises independently (faster
-            but produces partial-failure logs across TP/PP groups). Default False (allreduce is expensive).
+            but produces partial-failure logs across TP/PP groups).
     """
 
     mode: Literal["off", "log", "raise"]
-    ring_capacity: int = 1024
-    sweep_interval: int = 64
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.PARTIAL
-    input_check_mode: bool = False
-    stats_print_every_n_steps: int = 100
-    allreduce_violation_signal: bool = False
+    ring_capacity: int
+    sweep_interval: int
+    real_kv_hash_mode: RealKvHashMode
+    input_check_mode: bool
+    stats_print_every_n_steps: int
+    allreduce_violation_signal: bool
 
     @classmethod
     def from_env(cls, server_args: "ServerArgs") -> "CanaryConfig":
