@@ -32,9 +32,9 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA and AMD GPUs. The recommended launch configurations vary by hardware and model size.
+The Qwen3 series offers models in various sizes and architectures, optimized for different hardware platforms including NVIDIA GPUs, AMD GPUs, and Intel CPU Xeon. The recommended launch configurations vary by hardware platform and model size.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities. Intel CPU Xeon is available as a first-class hardware option with a CPU-specific launch path.
 
 import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.jsx";
 
@@ -45,6 +45,8 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 - **Memory Management** : Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
 - **Expert Parallelism** : SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 - **Kernel Tuning** : For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
+- **Intel CPU Xeon** : Xeon uses a TP-only CPU deployment path. Keep `--device cpu` and `--disable-overlap-schedule` in the launch command, and note that Xeon does not support EP or speculative decoding on this page.
+- For configuring CPU service, please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](https://docs.sglang.io/docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 - **Speculative Decoding**: Using Speculative Decoding for latency-sensitive scenarios.
   - `--speculative-algorithm EAGLE3`: Speculative decoding algorithm
   - `--speculative-num-steps 3`: Number of speculative verification rounds
@@ -477,20 +479,11 @@ python3 -m sglang.bench_serving \
 - Test Results:
 
 ```text Output
-============ Serving Benchmark Result ============
-Backend:                                 sglang
-Traffic request rate:                    inf
-Max request concurrency:                 100
-Successful requests:                     500
-Benchmark duration (s):                  92.07
-Total input tokens:                      249831
-Total input text tokens:                 249831
-Total input vision tokens:               0
-Total generated tokens:                  252162
-Total generated tokens (retokenized):    251124
-Request throughput (req/s):              5.43
-Input token throughput (tok/s):          2713.46
-Output token throughput (tok/s):         2738.78
+
+
+... [OUTPUT TRUNCATED - 635 chars omitted out of 50635 total] ...
+
+n throughput (tok/s):         2738.78
 Peak output token throughput (tok/s):    4400.00
 Peak concurrent requests:                110
 Total token throughput (tok/s):          5452.24
