@@ -386,7 +386,8 @@ class ServerArgsAutoTuner:
         args = self.server_args
         deployment_config = self._deployment_config()
         return (
-            deployment_config.auto_dit_layerwise_offload
+            args.performance_mode == "memory"
+            and deployment_config.auto_dit_layerwise_offload
             and self._is_wan_pipeline_config()
             and args.pipeline_config.dmd_denoising_steps is None
             and current_platform.enable_dit_layerwise_offload_for_wan_by_default()

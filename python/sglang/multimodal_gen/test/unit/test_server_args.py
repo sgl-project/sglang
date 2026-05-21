@@ -506,12 +506,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["dit", "text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder", "vae"],
         )
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
@@ -633,13 +633,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
-        self.assertFalse(args.dit_cpu_offload)
+        self.assertTrue(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["dit", "text_encoder", "image_encoder", "vae"],
+            ["text_encoder", "image_encoder", "vae"],
         )
 
     def test_explicit_multi_gpu_dit_layerwise_only_selects_dit_group(self):
