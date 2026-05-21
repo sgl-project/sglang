@@ -84,6 +84,7 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertIs(ret, processor_output)
         self.assertEqual(len(mm_items), 1)
         self.assertEqual(mm_items[0].offsets, [(1, 2)])
+        self.assertIsNotNone(mm_items[0].pad_value)
         self.assertTrue(
             torch.equal(mm_items[0].feature, processor_output["pixel_values"])
         )
@@ -112,6 +113,8 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertEqual(len(mm_items), 2)
         self.assertEqual(mm_items[0].offsets, [(1, 2)])
         self.assertEqual(mm_items[1].offsets, [(4, 6)])
+        self.assertIsNotNone(mm_items[0].pad_value)
+        self.assertIsNotNone(mm_items[1].pad_value)
         self.assertEqual(tuple(mm_items[0].feature.shape), (2, 4))
         self.assertEqual(tuple(mm_items[1].feature.shape), (3, 4))
         self.assertEqual(mm_items[0].image_grid_thw.tolist(), [[1, 1, 2]])
@@ -142,6 +145,7 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertIs(precomputed_input["feature"], feature)
         self.assertEqual(len(mm_items), 1)
         self.assertIs(mm_items[0].feature, feature)
+        self.assertIsNotNone(mm_items[0].pad_value)
 
     def test_qwen_mrope_collects_all_split_image_grids(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)

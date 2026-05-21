@@ -1269,6 +1269,13 @@ class BaseMultimodalProcessor(ABC):
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
+        for item in all_collected_items:
+            if item.format in (
+                MultimodalInputFormat.PROCESSOR_OUTPUT,
+                MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+            ):
+                item.set_pad_value()
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
