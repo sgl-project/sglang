@@ -777,7 +777,7 @@ class EAGLEWorker(TpModelWorker):
                 and self.speculative_num_steps > 1
             ):
                 # Skip attention backend init for idle mode or 1-step draft
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
+                self.draft_attn_backend.init_forward_data(forward_batch)
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
@@ -1210,7 +1210,7 @@ class EAGLEWorker(TpModelWorker):
                     self.draft_extend_attn_backend
                     or self.draft_model_runner.attn_backend
                 )
-                attn_backend.init_forward_metadata(forward_batch)
+                attn_backend.init_forward_data(forward_batch)
             # Publish the chosen backend via ForwardContext so model code
             # picks it up for this forward (no runner-attr mutation).
             if attn_backend is not None:
