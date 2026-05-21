@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, List, Optional
 import torch
 import torch_npu
 from sgl_kernel_npu.attention.sinks_attention import (
-    attention_sinks_prefill_triton,
     attention_sinks_triton,
 )
 
@@ -1099,20 +1098,47 @@ class AscendAttnBackend(AttentionBackend):
                 #     layer.tp_q_head_num,
                 #     layer.tp_k_head_num,
                 # )
-                k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim).contiguous()
-                v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim).contiguous()
-                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
+                k_cache = (
+                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                    .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                    .contiguous()
+                )
+                v_cache = (
+                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                    .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                    .contiguous()
+                )
+                query = q.reshape(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                ).contiguous()
+
+                num_token_padding = query.shape[0]
+                if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                    query = query[: forward_batch.num_token_non_padded_cpu]
+
                 if self.forward_metadata.seq_lens_cpu_int is None:
                     actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
                 else:
-                    actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    actual_seq_lengths_kv = (
+                        self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                    )
                 if self.forward_metadata.extend_seq_lens_cpu_int is None:
                     actual_seq_lengths = self.forward_metadata.seq_lens_list_cumsum
                 else:
-                    actual_seq_lengths = torch.cumsum(self.forward_metadata.extend_seq_lens_cpu_int, dim=0).int().tolist()
+                    actual_seq_lengths = (
+                        torch.cumsum(
+                            self.forward_metadata.extend_seq_lens_cpu_int, dim=0
+                        )
+                        .int()
+                        .tolist()
+                    )
 
                 is_swa_layer = layer.sliding_window_size != -1
-                num_heads = layer.tp_q_head_num if layer.tp_q_head_num != layer.tp_k_head_num else layer.tp_k_head_num
+                num_heads = (
+                    layer.tp_q_head_num
+                    if layer.tp_q_head_num != layer.tp_k_head_num
+                    else layer.tp_k_head_num
+                )
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
                     query,
                     k_cache,
@@ -1120,7 +1146,11 @@ class AscendAttnBackend(AttentionBackend):
                     num_query_heads=num_heads,
                     num_key_value_heads=layer.tp_k_head_num,
                     input_layout="TND",
-                    pre_tokens=layer.sliding_window_size if layer.sliding_window_size != -1 else 2147483647,
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if layer.sliding_window_size != -1
+                        else 2147483647
+                    ),
                     next_tokens=0,
                     atten_mask=self.fia_mask.to(torch.int8),
                     sparse_mode=4 if is_swa_layer else 3,
@@ -1131,7 +1161,20 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_kvlen=actual_seq_lengths_kv,
                     learnable_sink=sinks,
                 )
-                attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+                attn_output = attn_output.view(
+                    -1, layer.tp_q_head_num * layer.v_head_dim
+                )
+                if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                    attn_output = torch.cat(
+                        [
+                            attn_output,
+                            attn_output.new_zeros(
+                                num_token_padding - attn_output.shape[0],
+                                *attn_output.shape[1:],
+                            ),
+                        ],
+                        dim=0,
+                    )
                 return attn_output
 
             if is_cp_mode:
@@ -1267,6 +1310,10 @@ class AscendAttnBackend(AttentionBackend):
                             -1, layer.tp_q_head_num, layer.qk_head_dim
                         ).contiguous()
 
+                        num_token_padding = query.shape[0]
+                        if num_token_padding > forward_batch.num_token_non_padded_cpu:
+                            query = query[: forward_batch.num_token_non_padded_cpu]
+
                         if self.forward_metadata.seq_lens_cpu_int is None:
                             actual_seq_lengths_kv = (
                                 self.forward_metadata.seq_lens_cpu_list
@@ -1312,6 +1359,17 @@ class AscendAttnBackend(AttentionBackend):
                         attn_output = attn_output.view(
                             -1, layer.tp_q_head_num * layer.v_head_dim
                         )
+                        if num_token_padding != forward_batch.num_token_non_padded_cpu:
+                            attn_output = torch.cat(
+                                [
+                                    attn_output,
+                                    attn_output.new_zeros(
+                                        num_token_padding - attn_output.shape[0],
+                                        *attn_output.shape[1:],
+                                    ),
+                                ],
+                                dim=0,
+                            )
                     else:
                         # add forward_batch.encoder_lens and is_cross_attention arguments for cross attention scene
                         attn_output = self.native_attn.run_sdpa_forward_extend(
@@ -1924,16 +1982,34 @@ class AscendAttnBackend(AttentionBackend):
             #     layer.tp_k_head_num,
             # )
             # return attn_out
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim).contiguous()
-            v_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim).contiguous()
+            k_cache = (
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                .view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
+                .contiguous()
+            )
+            v_cache = (
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+                .view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+                .contiguous()
+            )
             query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim).contiguous()
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_list
             else:
-                actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-            seq_lens_list = self.forward_metadata.seq_lens_cpu_list if self.forward_metadata.seq_lens_cpu_int is None else self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
-            actual_seq_lengths = torch.tensor([1] * len(seq_lens_list), dtype=torch.int32).cumsum(dim=0).tolist()
+                actual_seq_lengths_kv = (
+                    self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+                )
+            seq_lens_list = (
+                self.forward_metadata.seq_lens_cpu_list
+                if self.forward_metadata.seq_lens_cpu_int is None
+                else self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
+            )
+            actual_seq_lengths = (
+                torch.tensor([1] * len(seq_lens_list), dtype=torch.int32)
+                .cumsum(dim=0)
+                .tolist()
+            )
             if layer.sliding_window_size != -1:
                 sparse_mode = 4
             else:
@@ -1946,7 +2022,11 @@ class AscendAttnBackend(AttentionBackend):
                 num_query_heads=layer.tp_q_head_num,
                 num_key_value_heads=layer.tp_k_head_num,
                 input_layout="TND",
-                pre_tokens=layer.sliding_window_size if layer.sliding_window_size != -1 else 2147483647,
+                pre_tokens=(
+                    layer.sliding_window_size
+                    if layer.sliding_window_size != -1
+                    else 2147483647
+                ),
                 next_tokens=0,
                 atten_mask=self.fia_mask.to(torch.int8),
                 sparse_mode=sparse_mode,
@@ -1974,15 +2054,15 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_len_kv = (
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
-            
-            if (layer.qk_head_dim != layer.v_head_dim) and (layer.sliding_window_size == -1) :
+
+            if (layer.qk_head_dim != layer.v_head_dim) and (
+                layer.sliding_window_size == -1
+            ):
                 query_v2 = q.reshape(
                     -1, layer.tp_q_head_num, layer.qk_head_dim
                 ).contiguous()
                 actual_seq_qlen = (
-                    torch.tensor(
-                        [1] * len(actual_seq_len_kv), dtype=torch.int32
-                    )
+                    torch.tensor([1] * len(actual_seq_len_kv), dtype=torch.int32)
                     .cumsum(dim=0)
                     .tolist()
                 )
@@ -2026,9 +2106,7 @@ class AscendAttnBackend(AttentionBackend):
                     workspace=workspace,
                     out=[attn_output, softmax_lse],
                 )
-                return attn_output.view(
-                    -1, layer.tp_q_head_num * layer.v_head_dim
-                )
+                return attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             num_tokens = query.shape[0]
             workspace = torch_npu._npu_fused_infer_attention_score_get_max_workspace(
