@@ -1048,67 +1048,72 @@ class CudaGraphRunner:
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
-        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
-
-        if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-
-        # Attention backend
-        attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
-
-        # Run and capture
-        def run_once():
-            # Without this, warmup-1 caches the translation; the capture run gets
-            # a hit, skips the gather, and replay reuses stale SWA locations.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-            )
-            set_is_extend_in_batch(False)
-
-            kwargs = {}
-            if (
-                self.pp_size > 1
-                and "pp_proxy_tensors" in inspect.signature(forward).parameters
-            ):
-                kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                )
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.is_draft_worker
-                and "input_embeds" in inspect.signature(forward).parameters
-            ):
-                kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
-
-            logits_output_or_pp_proxy_tensors = forward(
-                input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
-            return logits_output_or_pp_proxy_tensors
-
-        self.deepep_adapter.capture(is_extend_in_batch=False)
-
         # Publish the (possibly per-stream) attn_backend into the active
-        # ForwardContext so model code reads the right backend during warmup
-        # and capture.
+        # ForwardContext for the full capture lifecycle. Setup hooks that
+        # read get_attn_backend() — notably TboForwardBatchPreparer.prepare_raw
+        # invoked by self.tbo_plugin.capture_one_batch_size below, and the
+        # DeepEP adapter — must see the same backend that warmup/capture do.
+        # Restored on exit (incl. errors).
         with forward_context(ForwardContext(attn_backend=attn_backend)):
+            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
+            if lora_ids is not None:
+                self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+            # Attention backend
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
+
+            # Run and capture
+            def run_once():
+                # Without this, warmup-1 caches the translation; the capture run gets
+                # a hit, skips the gather, and replay reuses stale SWA locations.
+                if self.model_runner.is_hybrid_swa:
+                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                )
+                set_is_extend_in_batch(False)
+
+                kwargs = {}
+                if (
+                    self.pp_size > 1
+                    and "pp_proxy_tensors" in inspect.signature(forward).parameters
+                ):
+                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                    )
+                if (
+                    self.model_runner.spec_algorithm.is_dflash()
+                    and self.model_runner.is_draft_worker
+                    and "input_embeds" in inspect.signature(forward).parameters
+                ):
+                    kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
+
+                logits_output_or_pp_proxy_tensors = forward(
+                    input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
+                return logits_output_or_pp_proxy_tensors
+
+            self.deepep_adapter.capture(is_extend_in_batch=False)
+
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()

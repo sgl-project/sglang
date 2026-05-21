@@ -584,51 +584,58 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
-            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
-
-        if lora_ids is not None:
-            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
-
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-
-        # Run and capture
-        def run_once():
-            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
-            if self.model_runner.is_hybrid_swa:
-                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
-
-            # Clean intermediate result cache for DP attention
-            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
-            set_dp_buffer_len(
-                global_dp_buffer_len,
-                num_tokens,
-                forward_batch.dp_padding_mode.is_max_len(),
-            )
-            # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
-            # It is True in this context but we need to set it to use low latency deepep mode.
-            set_is_extend_in_batch(False)
-
-            kwargs = {}
-            with set_forward_context(
-                forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-            ):
-                self.model_runner.model.forward(
-                    forward_batch.input_ids,
-                    forward_batch.positions,
-                    forward_batch,
-                    **kwargs,
-                )
-            return
-
-        # run twice for warmup at the first time and cuda graph capture at the second time
-        # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
+        # Publish attn_backend into the ForwardContext for the full capture
+        # lifecycle. Setup hooks that read get_attn_backend() — notably
+        # TboForwardBatchPreparer.prepare_raw invoked by
+        # self.tbo_plugin.capture_one_batch_size below — must see the same
+        # backend that warmup/capture do. Restored on exit (incl. errors).
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
+            self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
+            if lora_ids is not None:
+                self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+
+            # Run and capture
+            def run_once():
+                # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
+                if self.model_runner.is_hybrid_swa:
+                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
+                # Clean intermediate result cache for DP attention
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                set_dp_buffer_len(
+                    global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                )
+                # FIXME: the implementation is hacky. `is_extend_in_batch`` is for determining the deepep mode.
+                # It is True in this context but we need to set it to use low latency deepep mode.
+                set_is_extend_in_batch(False)
+
+                kwargs = {}
+                with set_forward_context(
+                    forward_batch,
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                ):
+                    self.model_runner.model.forward(
+                        forward_batch.input_ids,
+                        forward_batch.positions,
+                        forward_batch,
+                        **kwargs,
+                    )
+                return
+
+            # run twice for warmup at the first time and cuda graph capture at the second time
+            # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
