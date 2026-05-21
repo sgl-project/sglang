@@ -40,6 +40,7 @@ class SchedulerOutputStreamer:
     ps: ParallelState
     server_args: ServerArgs
     is_generation: bool
+    is_multimodal_gen: bool
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
@@ -154,6 +155,8 @@ class SchedulerOutputStreamer:
             self._maybe_log_time_stats(req=req)
 
         # Send to detokenizer
+        if self.is_multimodal_gen:
+            return
         payload = acc.to_payload(
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
