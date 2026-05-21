@@ -28,14 +28,12 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_verify_plan,
     make_verify_plan_pair,
     make_write_plan,
-    make_write_plan_pair,
     read_slot_fields,
     splitmix64,
     splitmix64_mix4,
     stamp_clean_chain,
     stamp_pair,
     to_signed_int64,
-    write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_verify,
@@ -66,9 +64,7 @@ class _VerifySingleSlotInput:
 
 
 def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=1,
@@ -142,9 +138,7 @@ def _stamp_clean_kv_chain(
 def test_chain_head_anchor() -> None:
     """``prev_slot_idx == -1`` → kernel uses ``splitmix64(consts.CANARY_CHAIN_ANCHOR)`` as the expected prev_hash."""
     # Step 1: stamp slot 5 such that stored.prev_hash already equals splitmix64(consts.CANARY_CHAIN_ANCHOR).
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=5,
@@ -226,9 +220,7 @@ def test_violation_token_mismatch() -> None:
 def test_violation_position_mismatch() -> None:
     """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
     # Stamp slot 7 with a valid head chain but stored position = 0; ask verify to expect position 5.
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=7,
@@ -250,9 +242,7 @@ def test_violation_position_mismatch() -> None:
 def test_violation_position_diverges_from_plan() -> None:
     """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
     # Step: a clean chain head with stored position 0; plan claims position 99 — kernel must flag POSITION.
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=3,
@@ -306,9 +296,7 @@ def test_violation_prev_hash_mismatch() -> None:
 
 def test_violation_real_kv_hash_mismatch() -> None:
     """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=1, device=_DEVICE)
 
     # Step: write a chain with real_kv_hash mixin, then mutate one byte in the source tensors so the next
@@ -346,9 +334,7 @@ def test_violation_real_kv_hash_mismatch() -> None:
 
 def test_real_kv_mode_off_yields_zero() -> None:
     """OFF mode → stored real_kv_hash field stays zero post-write; verify with OFF agrees byte-equal."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
     plan_pair = make_verify_plan_pair(
@@ -380,9 +366,7 @@ def test_real_kv_mode_off_yields_zero() -> None:
 )
 def test_real_kv_mode_byte_equal(mode: consts.RealKvHashMode) -> None:
     """PARTIAL / ALL modes both produce CUDA-vs-ref byte-equal state on a clean 3-step chain."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -415,9 +399,7 @@ def test_real_kv_mode_byte_equal(mode: consts.RealKvHashMode) -> None:
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
 def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     """Fold ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -459,9 +441,7 @@ def test_real_kv_source_rejects_zero_read_bytes() -> None:
 
 def test_real_kv_source_padding_below_4() -> None:
     """Host wrapper pads to 4 slots when fewer sources are supplied; dummy slots are never dereferenced."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
     plan_pair = make_verify_plan_pair(
@@ -508,9 +488,7 @@ def test_real_kv_source_above_4_raises() -> None:
 
 def test_real_kv_source_holey_dim1() -> None:
     """``tensor.shape[1] > page_size * num_bytes_per_token`` → trailing bytes are skipped."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     holey_source = make_real_kv_source(
         num_slots=16,
         num_bytes_per_token=16,
@@ -551,9 +529,7 @@ def test_real_kv_source_holey_dim1() -> None:
 
 def test_page_size_gt_1_access_pattern() -> None:
     """``page_size > 1`` → byte access follows ``(row=slot//page, col=(slot%page)*bpt:)``."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=8, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
     src = make_real_kv_source(
         num_slots=8,
         num_bytes_per_token=16,
@@ -602,9 +578,7 @@ def test_swa_translated_slot_indices() -> None:
     # SWA verify plans carry pre-translated slot indices — the verify kernel never sees the FULL slot
     # index again. We pre-stamp the SWA-side slot and feed it directly into the verify plan to assert no
     # extra translation happens kernel-side.
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=2,
@@ -622,9 +596,7 @@ def test_swa_translated_slot_indices() -> None:
 
 def test_kernel_run_counter_per_call() -> None:
     """``kernel_run_counter`` increments by 1 per call, even when ``verify_num_valid == 0``."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
@@ -675,9 +647,7 @@ def test_slot_run_counter_per_entry() -> None:
 
 def test_violation_ring_fill_once_first_row() -> None:
     """First violation lands at ring[0]; subsequent violations advance ``violation_write_index``."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     # 3 chain-head entries with stored values that all yield POSITION mismatch (positions all 99).
     for slot_idx in (1, 2, 3):
         stamp_pair(
@@ -708,9 +678,7 @@ def test_violation_ring_fill_once_first_row() -> None:
 
 def test_violation_ring_overflow_counter_still_increments() -> None:
     """Ring capacity exceeded → rows beyond are dropped but ``write_index`` still grows."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     n_violations = 10
     slot_indices = list(range(1, n_violations + 1))
     for slot_idx in slot_indices:
@@ -751,9 +719,7 @@ def test_violation_ring_overflow_counter_still_increments() -> None:
 
 def test_kernel_kind_stamped_into_row() -> None:
     """Different ``CanaryLaunchTag`` values → violation row.kernel_kind reflects each."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     stamp_pair(
         buf_pair,
         slot_idx=1,
@@ -775,9 +741,7 @@ def test_kernel_kind_stamped_into_row() -> None:
 
 def test_empty_plan_no_op() -> None:
     """``verify_num_valid = 0`` → no ring write, no slot_run_counter bump, only kernel_run_counter += 1."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_verify_plan_pair(
         slot_indices=[], positions=[], prev_slot_indices=[], capacity=4, device=_DEVICE
     )
@@ -804,9 +768,7 @@ def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     expected_prev_hashes_signed = [to_signed_int64(h) for h in expected_prev_hashes_u64]
 
     # Step 2: stamp each slot manually with the hardcoded expected prev_hash.
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     cuda_buf, _ = buf_pair
     for slot_idx, token, position, prev_hash in zip(
         slot_indices, tokens, positions, expected_prev_hashes_signed
@@ -1042,9 +1004,7 @@ def test_real_kv_hash_fold_mode_hardcoded(
         ]
     )
 
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     source_cuda = make_real_kv_source(
         num_slots=16, num_bytes_per_token=16, page_size=1, read_bytes=16, device=_DEVICE
     )
@@ -1140,9 +1100,7 @@ def test_chain_advance_formula_matches_spec() -> None:
 def test_violation_ring_row_byte_layout_hardcoded() -> None:
     import struct
 
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     anchor_hash_signed = chain_anchor_signed()
     stamp_pair(
         buf_pair,
@@ -1287,9 +1245,7 @@ def test_real_kv_hash_boundary_byte_equal_sweep(stored_rkv_val: int) -> None:
 
 def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
     """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=32, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=32, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(
         count=2,
         num_bytes_per_token=128,
@@ -1353,9 +1309,7 @@ def test_real_kv_hash_all_mode_with_multiple_sources() -> None:
 
 def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
     """PARTIAL mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=1, num_bytes_per_token=16, device=_DEVICE)
     slot_idx = 3
     row_bytes = (
@@ -1400,9 +1354,7 @@ def test_real_kv_hash_partial_mode_detects_single_bit_flip() -> None:
 
 def test_paged_layout_page_size_16() -> None:
     """page_size=16: slot→page mapping doesn't change verify chain semantics on a clean chain."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=64, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=64, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(
         count=1,
         num_bytes_per_token=16,
@@ -1499,9 +1451,7 @@ def test_violation_ring_atomic_with_many_violations() -> None:
 
 def test_chain_head_anchored_on_constant() -> None:
     """prev_slot==-1 + stored prev_hash != splitmix64(ANCHOR) → CHAIN_HASH bit set."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     slot_idx = 5
     stamp_pair(
         buf_pair,
@@ -1525,9 +1475,7 @@ def test_chain_head_anchored_on_constant() -> None:
 
 def test_position_mismatch_sets_position_bit_only() -> None:
     """Plan.position != stored.position with chain hash correct → only POSITION bit set."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     slot_idx = 5
     stamp_pair(
         buf_pair,
@@ -1593,9 +1541,7 @@ def test_replay_does_not_double_count_run_counters() -> None:
 
 def test_violation_rows_have_valid_kernel_kind_and_slot() -> None:
     """Each violation row's kernel_kind matches the launch tag; slot_idx is one of the plan slots."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     slot_indices = [1, 2, 3, 4]
     positions = [0, 1, 2, 3]
     plan_pair = make_verify_plan_pair(
