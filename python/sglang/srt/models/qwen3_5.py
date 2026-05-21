@@ -106,6 +106,7 @@ _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _hip_use_alt_stream = get_bool_env_var("SGLANG_HIP_ALT_STREAM") and _is_hip
+_qknorm_use_alt_stream = get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "True")
 _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
