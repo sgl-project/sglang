@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -27,9 +26,6 @@ from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
-logger = logging.getLogger(__name__)
-
 
 class PerForwardOrchestrator:
     """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
