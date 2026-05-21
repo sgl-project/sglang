@@ -997,6 +997,9 @@ def general_mm_embed_routine(
     use_deepstack: Dict[Modality, bool] = {},
     **kwargs,
 ) -> torch.Tensor:
+    import time as _ts_time
+
+    _ts_routine_start = _ts_time.time()
     """
     Process multimodal inputs and forward through language model.
 
@@ -1103,12 +1106,37 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
+    _has_mm = (
+        forward_batch.contains_mm_inputs()
+        if hasattr(forward_batch, "contains_mm_inputs")
+        else False
+    )
+    if _has_mm:
+        torch.cuda.synchronize()
+        _ts_after_vit = _ts_time.time()
+        _vit_dur = (_ts_after_vit - _ts_routine_start) * 1000
+
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
+
+    if _has_mm:
+        torch.cuda.synchronize()
+        _ts_after_llm = _ts_time.time()
+        _llm_dur = (_ts_after_llm - _ts_after_vit) * 1000
+        import logging
+
+        logging.getLogger(__name__).info(
+            "[MM_FORWARD] vit=%.1fms llm=%.1fms total=%.1fms ts=%.6f",
+            _vit_dur,
+            _llm_dur,
+            _vit_dur + _llm_dur,
+            _ts_after_llm,
+        )
+
     return hidden_states
 
 
