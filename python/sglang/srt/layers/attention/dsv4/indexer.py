@@ -674,8 +674,10 @@ class C4Indexer(nn.Module):
             # with T=0 / kv_len=0 deadlocks async on an internal collective.
             # Return the sentinel topk so downstream _forward_compressed
             # sees a well-shaped tensor without entering the indexer kernel.
-            kv_lens = forward_batch.seq_lens
-            if bs == 0 or (kv_lens.numel() > 0 and int(kv_lens.sum().item()) == 0):
+            # Use forward_mode.is_idle() instead of kv_lens.sum().item() to
+            # stay graph-capture-safe (.item() forces a host sync that ACL
+            # graph capture rejects with error 107027).
+            if bs == 0 or forward_batch.forward_mode.is_idle():
                 return torch.full(
                     (bs, self.index_topk),
                     -1,
