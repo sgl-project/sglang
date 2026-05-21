@@ -45,6 +45,12 @@ _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
 _is_default_tensor_transport = None
+_SHM_TOP_LEVEL_TENSOR_MIN_BYTES = 4096
+_SHM_MM_INPUT_TENSOR_FIELDS = (
+    "mrope_positions",
+    "vision_position_ids",
+    "visible_frame_counts",
+)
 
 
 def init_feature_buffer(device):
@@ -1747,17 +1753,37 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
-def _wrap_tensor_or_list(value):
+def _should_wrap_tensor(value, min_nbytes: int) -> bool:
+    return (
+        isinstance(value, torch.Tensor)
+        and value.is_cpu
+        and value.numel() > 0
+        and value.numel() * value.element_size() >= min_nbytes
+    )
+
+
+def _wrap_tensor_or_list(value, min_nbytes: int = 0):
     """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
-    if isinstance(value, torch.Tensor) and value.is_cpu:
+    if _should_wrap_tensor(value, min_nbytes):
         return ShmPointerMMData(value)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (ShmPointerMMData(t) if _should_wrap_tensor(t, min_nbytes) else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
     return value
+
+
+def _wrap_mm_input_tensor_fields(mm_inputs) -> None:
+    for field in _SHM_MM_INPUT_TENSOR_FIELDS:
+        value = getattr(mm_inputs, field, None)
+        if value is not None:
+            setattr(
+                mm_inputs,
+                field,
+                _wrap_tensor_or_list(value, _SHM_TOP_LEVEL_TENSOR_MIN_BYTES),
+            )
 
 
 def wrap_shm_features(obj):
@@ -1778,6 +1804,7 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+        _wrap_mm_input_tensor_fields(obj.mm_inputs)
     return obj
 
 
@@ -1801,6 +1828,9 @@ def has_shm_features(recv_reqs):
                 if _feature_has_shm(item.feature):
                     return True
                 if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                    return True
+            for field in _SHM_MM_INPUT_TENSOR_FIELDS:
+                if _feature_has_shm(getattr(req.mm_inputs, field, None)):
                     return True
     return False
 
@@ -1841,4 +1871,8 @@ def unwrap_shm_features(obj):
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+        for field in _SHM_MM_INPUT_TENSOR_FIELDS:
+            value = getattr(obj.mm_inputs, field, None)
+            if value is not None:
+                setattr(obj.mm_inputs, field, _unwrap_tensor_or_list(value))
     return obj

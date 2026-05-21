@@ -1,14 +1,20 @@
 import asyncio
+import pickle
 import unittest
 from multiprocessing import shared_memory
 from types import SimpleNamespace
 
 import torch
 
+import sglang.srt.managers.mm_utils as mm_utils
+import sglang.srt.server_args as server_args_module
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     ShmPointerMMData,
     _get_multimodal_indices_from_offsets,
+    has_shm_features,
+    unwrap_shm_features,
+    wrap_shm_features,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -24,6 +30,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.srt.server_args import set_global_server_args_for_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -374,6 +381,47 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
                 shm.close()
             except FileNotFoundError:
                 pass
+
+    def test_shm_wraps_large_top_level_mm_tensors(self):
+        source = torch.arange(768, dtype=torch.long).reshape(3, 256)
+        delta = torch.tensor([[7]], dtype=torch.long)
+        tokenized_req = SimpleNamespace(
+            mm_inputs=SimpleNamespace(
+                mm_items=[],
+                mrope_positions=source,
+                mrope_position_delta=delta,
+            )
+        )
+        old_server_args = server_args_module._global_server_args
+        old_transport = mm_utils._is_default_tensor_transport
+        output = None
+
+        try:
+            set_global_server_args_for_tokenizer(
+                SimpleNamespace(skip_tokenizer_init=False, dist_init_addr=None)
+            )
+            mm_utils._is_default_tensor_transport = False
+
+            wrap_shm_features(tokenized_req)
+
+            self.assertIsInstance(
+                tokenized_req.mm_inputs.mrope_positions, ShmPointerMMData
+            )
+            self.assertIs(tokenized_req.mm_inputs.mrope_position_delta, delta)
+            self.assertTrue(has_shm_features([tokenized_req]))
+
+            receiver_req = pickle.loads(pickle.dumps(tokenized_req))
+            unwrap_shm_features(receiver_req)
+            output = receiver_req.mm_inputs.mrope_positions
+
+            self.assertTrue(torch.equal(output, source))
+            self.assertTrue(hasattr(output, "_sglang_shm_handle"))
+        finally:
+            shm_handle = getattr(output, "_sglang_shm_handle", None)
+            if shm_handle is not None:
+                shm_handle.close()
+            server_args_module._global_server_args = old_server_args
+            mm_utils._is_default_tensor_transport = old_transport
 
     def test_qwen_mrope_collects_all_split_image_grids(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
