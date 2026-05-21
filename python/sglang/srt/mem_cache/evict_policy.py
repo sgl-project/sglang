@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Tuple, Union
 
@@ -63,3 +64,20 @@ class SLRUStrategy(EvictionStrategy):
 
         is_protected = 1 if node.hit_count >= self.protected_threshold else 0
         return (is_protected, node.last_access_time)
+
+
+class WLFUStrategy(EvictionStrategy):
+    """LRU variant with a frequency age penalty.
+
+    priority = last_access_time - alpha * log(1 + hit_count)
+
+    RadixCache evicts the smallest priority first. Lowering priority for
+    higher-hit nodes can reduce cache residency for prefixes that have already
+    served many requests in finite shared-prefix workloads.
+    """
+
+    def __init__(self, alpha: float = 2.0):
+        self.alpha = alpha
+
+    def get_priority(self, node: "TreeNode") -> float:
+        return node.last_access_time - self.alpha * math.log1p(node.hit_count)

@@ -4,6 +4,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
+import math
 import unittest
 from unittest.mock import MagicMock
 
@@ -15,6 +16,7 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
     SLRUStrategy,
+    WLFUStrategy,
 )
 
 
@@ -179,6 +181,32 @@ class TestSLRUStrategy(unittest.TestCase):
     def test_default_threshold_is_2(self):
         default = SLRUStrategy()
         self.assertEqual(default.protected_threshold, 2)
+
+
+class TestWLFUStrategy(unittest.TestCase):
+    def setUp(self):
+        self.strategy = WLFUStrategy(alpha=2.0)
+
+    def test_priority_applies_frequency_age_penalty(self):
+        node = _make_node(hit_count=3, last_access_time=10.0)
+        expected = 10.0 - 2.0 * math.log1p(3)
+        self.assertAlmostEqual(self.strategy.get_priority(node), expected)
+
+    def test_higher_hit_count_evicted_first_for_same_access_time(self):
+        cold = _make_node(hit_count=0, last_access_time=10.0)
+        served_many = _make_node(hit_count=10, last_access_time=10.0)
+        self.assertLess(
+            self.strategy.get_priority(served_many), self.strategy.get_priority(cold)
+        )
+
+    def test_alpha_zero_matches_lru(self):
+        strategy = WLFUStrategy(alpha=0.0)
+        node = _make_node(hit_count=100, last_access_time=42.0)
+        self.assertEqual(strategy.get_priority(node), 42.0)
+
+    def test_default_alpha_is_2(self):
+        default = WLFUStrategy()
+        self.assertEqual(default.alpha, 2.0)
 
 
 class TestEvictionOrdering(unittest.TestCase):
