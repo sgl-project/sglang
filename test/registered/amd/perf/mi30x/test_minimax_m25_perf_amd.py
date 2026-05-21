@@ -14,6 +14,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -58,6 +60,7 @@ MINIMAX_M25_MODEL_PATH = os.environ.get(
 PROFILE_DIR = "performance_profiles_minimax_m25"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyMiniMaxM25Performance(unittest.TestCase):
     """Nightly performance benchmark for MiniMax-M2.5 on MI325/MI300X.
 
