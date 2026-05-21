@@ -1135,6 +1135,32 @@ class BaseMultimodalProcessor(ABC):
             return input_ids.flatten().to(dtype=torch.long)
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
+    def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
+        source_tensor = tensor
+        if not tensor.is_cuda:
+            tensor = tensor.to("cuda", non_blocking=True)
+
+        sync_flag, available_slice, byte_offset = (
+            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        )
+        if isinstance(available_slice, torch.Tensor):
+            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+            return CudaIpcTensorTransportProxy(
+                data=available_slice,
+                info_data=tensor,
+                sync_buffer_meta=sync_flag,
+                pool_ipc_handle=(
+                    self.cudaipc_mmfeature_pool._pool_ipc_handle
+                    if _IPC_POOL_HANDLE_CACHE
+                    else None
+                ),
+                pool_byte_offset=byte_offset,
+                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
+            )
+        if self.server_args.keep_mm_feature_on_device:
+            return tensor
+        return source_tensor if not source_tensor.is_cuda else source_tensor.cpu()
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1255,58 +1281,13 @@ class BaseMultimodalProcessor(ABC):
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice, byte_offset = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.feature
-                        )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.feature.view(torch.int8).view(-1), non_blocking=True
-                        )
-                        item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.feature,
-                            sync_buffer_meta=sync_flag,
-                            pool_ipc_handle=(
-                                self.cudaipc_mmfeature_pool._pool_ipc_handle
-                                if _IPC_POOL_HANDLE_CACHE
-                                else None
-                            ),
-                            pool_byte_offset=byte_offset,
-                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.feature = item.feature.cpu()
-                elif (
+                if isinstance(item.feature, torch.Tensor):
+                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                if (
                     isinstance(item.precomputed_embeddings, torch.Tensor)
-                    and item.precomputed_embeddings.is_cuda
                 ):
-
-                    sync_flag, available_slice, byte_offset = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.precomputed_embeddings
-                        )
+                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                        item.precomputed_embeddings
                     )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8).view(-1),
-                            non_blocking=True,
-                        )
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.precomputed_embeddings,
-                            sync_buffer_meta=sync_flag,
-                            pool_ipc_handle=(
-                                self.cudaipc_mmfeature_pool._pool_ipc_handle
-                                if _IPC_POOL_HANDLE_CACHE
-                                else None
-                            ),
-                            pool_byte_offset=byte_offset,
-                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
         return all_collected_items, input_ids, ret
