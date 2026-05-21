@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -16,6 +17,13 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ReqToTokenPerturbTarget:
+    req_pool_idx: int
+    position: int
+    slot: int
 
 
 class PerturbHook:
@@ -83,7 +91,7 @@ class PerturbHook:
         req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
         seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
         rows, cols = int(table.shape[0]), int(table.shape[1])
-        active_pairs: list[tuple[int, int]] = []
+        active_targets: list[_ReqToTokenPerturbTarget] = []
         for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
             req_pool_idx_int = int(req_pool_idx)
             seq_len_int = int(seq_len)
@@ -94,31 +102,38 @@ class PerturbHook:
             upper = min(seq_len_int, cols)
             row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
             for pos, raw_slot in enumerate(row_slots):
-                if int(raw_slot) < 1:
+                slot = int(raw_slot)
+                if slot < 1:
                     continue
-                active_pairs.append((req_pool_idx_int, pos))
-        if not active_pairs:
+                active_targets.append(
+                    _ReqToTokenPerturbTarget(
+                        req_pool_idx=req_pool_idx_int,
+                        position=pos,
+                        slot=slot,
+                    )
+                )
+        if not active_targets:
             return
 
-        pick = int(torch.randint(0, len(active_pairs), (1,)).item())
-        req_pool_idx, position = active_pairs[pick]
-
-        original = int(table[req_pool_idx, position].item())
-        slot_upper = rows * cols
-        if slot_upper <= 1:
+        pick = int(torch.randint(0, len(active_targets), (1,)).item())
+        target = active_targets[pick]
+        replacement_slots = [
+            item.slot for item in active_targets if item.slot != target.slot
+        ]
+        if not replacement_slots:
             return
-        new_value = int(torch.randint(0, slot_upper, (1,)).item())
-        if new_value == original:
-            new_value = (original + 1) % slot_upper
+        replacement_pick = int(torch.randint(0, len(replacement_slots), (1,)).item())
+        new_value = replacement_slots[replacement_pick]
+
         logger.info(
             "kv_canary perturb req_to_token: req_pool_idx=%d position=%d original_slot=%d new_slot=%d",
-            req_pool_idx,
-            position,
-            original,
+            target.req_pool_idx,
+            target.position,
+            target.slot,
             new_value,
         )
-        table[req_pool_idx, position] = new_value
-        self._perturb_undo = (req_pool_idx, position, original)
+        table[target.req_pool_idx, target.position] = new_value
+        self._perturb_undo = (target.req_pool_idx, target.position, target.slot)
 
     def perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.real_kv_prob <= 0.0:

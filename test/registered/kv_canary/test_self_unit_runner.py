@@ -27,6 +27,8 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.kv_canary.runner.perturb import PerturbHook
+from sglang.srt.kv_canary.runner.perturb_config import PerturbConfig
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -64,10 +66,31 @@ def _make_pool(device, max_reqs: int = 4, max_seq: int = 8):
     return SimpleNamespace(req_to_token=table, size=max_reqs)
 
 
+class _FakeDecodeForwardMode:
+    def is_extend(self) -> bool:
+        return False
+
+    def is_mixed(self) -> bool:
+        return False
+
+    def is_decode_or_idle(self) -> bool:
+        return True
+
+    def is_target_verify(self) -> bool:
+        return False
+
+    def is_draft_extend_v2(self) -> bool:
+        return False
+
+    def is_extend_or_draft_extend_or_mixed(self) -> bool:
+        return False
+
+
 def _make_forward_batch(device, bs: int = 2, seq_lens_list=(3, 4)):
     seq_lens_list = list(seq_lens_list[:bs])
     return SimpleNamespace(
-        forward_mode=SimpleNamespace(is_extend=lambda: False, is_mixed=lambda: False),
+        forward_mode=_FakeDecodeForwardMode(),
+        spec_info=None,
         batch_size=bs,
         req_pool_indices=torch.tensor([1, 2][:bs], dtype=torch.int64, device=device),
         seq_lens=torch.tensor(seq_lens_list, dtype=torch.int32, device=device),
@@ -212,6 +235,34 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._sweep_orchestrator.maybe_run_sweep()
         self.assertGreaterEqual(plan_calls.count("plan"), 1)
 
+    def test_req_to_token_perturb_uses_live_slot_as_replacement(self):
+        pool = _make_pool(self.device, max_reqs=4, max_seq=8)
+        pool.req_to_token[1, :3] = torch.tensor(
+            [11, 22, 33], dtype=torch.int32, device=self.device
+        )
+        pool.req_to_token[2, :3] = torch.tensor(
+            [44, 55, 66], dtype=torch.int32, device=self.device
+        )
+        hook = PerturbHook(
+            config=PerturbConfig(req_to_token_prob=1.0, warmup_steps=0),
+            req_to_token_pool=pool,
+            buffer_groups=(),
+            pump_and_allreduce=SimpleNamespace(step_counter=10),
+        )
+        forward_batch = _make_forward_batch(self.device, bs=2, seq_lens_list=(3, 3))
+
+        with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
+            hook.perturb_hook(forward_batch)
+
+        row, col, original = hook._perturb_undo
+        replacement = int(pool.req_to_token[row, col].item())
+        live_slots = {11, 22, 33, 44, 55, 66}
+        self.assertIn(replacement, live_slots)
+        self.assertNotEqual(replacement, original)
+
+        hook.undo_after_step()
+        self.assertEqual(int(pool.req_to_token[row, col].item()), original)
+
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
@@ -271,7 +322,7 @@ class TestSelfUnitRunner(CustomTestCase):
         runner._device_state.slot_run_counters.fill_(7)
 
         with self.assertLogs(runner_module.logger.name, level=logging.INFO) as cm:
-            for _ in range(10):
+            for _ in range(11):
                 runner._health_and_stats.print_periodic_stats()
                 runner._pump_and_allreduce._step_counter += 1
         log_text = "\n".join(cm.output)
