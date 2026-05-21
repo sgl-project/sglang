@@ -78,7 +78,9 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_runner import (
+    get_is_capture_mode,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import get_global_server_args
 
@@ -302,6 +304,9 @@ class Indexer(MultiPlatformOp):
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
         weights = self._weights_proj_bf16_in_fp32_out(x)
+        if (num_heads := weights.size(1)) < 32:
+            assert 32 % num_heads == 0
+            weights = weights.repeat_interleave(32 // num_heads, dim=1)
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
@@ -1197,6 +1202,9 @@ class Indexer(MultiPlatformOp):
             query, key = self._get_q_k_bf16(
                 q_lora, x, positions, enable_dual_stream, forward_batch=forward_batch
             )
+            if (num_heads := query.size(1)) < 32:
+                assert 32 % num_heads == 0
+                query = query.repeat_interleave(32 // num_heads, dim=1)
 
             if enable_dual_stream:
                 current_stream = torch.cuda.current_stream()

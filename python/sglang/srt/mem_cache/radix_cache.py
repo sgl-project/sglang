@@ -344,6 +344,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.root_node.hash_value = []
         self.evictable_size_ = 0
         self.protected_size_ = 0
+        self._digest_dirty = True
         self.evictable_leaves.clear()
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
@@ -435,6 +436,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
+        self._digest_dirty = True
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
@@ -584,6 +586,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
+        if num_evicted > 0:
+            self._digest_dirty = True
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
@@ -628,6 +632,92 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def protected_size(self):
         # protected size refers to the size of the cache that is locked
         return self.protected_size_
+
+    def _skip_node_in_digest(self, node: TreeNode) -> bool:
+        """Whether to skip *node* when building a cache digest.
+
+        RadixCache skips evicted nodes (GPU data gone, unrecoverable).
+        HiRadixCache overrides this to keep evicted nodes that still have
+        a host backup, since they can be recovered via load_back().
+        """
+        return node.evicted
+
+    def build_cache_digest(
+        self,
+        chunk_size: int = 256,
+        max_entries: int = 2048,
+        max_prefix_tokens: int = 8192,
+    ) -> dict:
+        """Build a compact digest of cached prefixes for cache-aware DP routing.
+
+        Traverses the radix tree and produces chunk-aligned prefix hashes.
+        Each entry maps hash(token_ids[:chunk_boundary]) -> cached_length,
+        allowing the DP controller to estimate prefix match length for incoming
+        requests without accessing the actual tree.
+
+        Uses a deterministic chained hash: SHA256 on repr-encoded token
+        bytes, matching the estimation function in the DP controller.
+
+        Returns a dict ready to populate a CacheDigest dataclass.
+        """
+        prefix_entries: dict = {}
+
+        stack: list = [(self.root_node, [], b"", 0)]
+        while stack:
+            node, parent_tokens, parent_chain_hash, parent_boundary = stack.pop()
+
+            for child in node.children.values():
+                if self._skip_node_in_digest(child):
+                    continue
+
+                path_tokens = parent_tokens + child.key.token_ids
+                if len(path_tokens) > max_prefix_tokens:
+                    path_tokens = path_tokens[:max_prefix_tokens]
+
+                chain_hash = parent_chain_hash
+                first_boundary = parent_boundary + chunk_size
+
+                last_boundary = parent_boundary
+                for boundary in range(first_boundary, len(path_tokens) + 1, chunk_size):
+                    h = hashlib.sha256()
+                    if chain_hash:
+                        h.update(chain_hash)
+                    chunk = path_tokens[boundary - chunk_size : boundary]
+                    h.update(repr(chunk).encode())
+                    chain_hash = h.digest()
+                    prefix_entries[chain_hash] = max(
+                        prefix_entries.get(chain_hash, 0), boundary
+                    )
+                    last_boundary = boundary
+
+                    if len(prefix_entries) >= max_entries:
+                        break
+
+                if len(prefix_entries) >= max_entries:
+                    break
+
+                if len(path_tokens) < max_prefix_tokens and child.children:
+                    stack.append(
+                        (child, path_tokens, chain_hash, last_boundary)
+                    )
+
+            if len(prefix_entries) >= max_entries:
+                break
+
+        total = self._total_size_helper()
+        self._digest_dirty = False
+        logger.debug(
+            "[CacheDigest] built digest: entries=%d total_cached=%d "
+            "evictable=%d protected=%d chunk_size=%d",
+            len(prefix_entries), total, self.evictable_size_, self.protected_size_,
+            chunk_size,
+        )
+        return {
+            "prefix_entries": prefix_entries,
+            "total_cached_tokens": total,
+            "evictable_tokens": self.evictable_size_,
+            "protected_tokens": self.protected_size_,
+        }
 
     def all_values_flatten(self):
         values = []

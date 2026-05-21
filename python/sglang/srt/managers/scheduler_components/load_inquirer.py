@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    CacheDigest,
     DisaggregationMetrics,
     GetLoadsReqInput,
     GetLoadsReqOutput,
@@ -51,6 +52,7 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    get_tree_cache: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -188,6 +190,29 @@ class SchedulerLoadInquirer:
                 retracted=self.get_stats().num_retracted_reqs,
             )
 
+        cache_digest = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.server_args.disaggregation_decode_enable_radix_cache
+        ):
+            tree_cache = self.get_tree_cache()
+            if hasattr(tree_cache, "build_cache_digest"):
+                dirty = getattr(tree_cache, "_digest_dirty", True)
+                if dirty or not hasattr(tree_cache, "_cached_cache_digest"):
+                    chunk_size = self.server_args.dp_routing_digest_chunk_size
+                    digest_data = tree_cache.build_cache_digest(
+                        chunk_size=chunk_size,
+                    )
+                    tree_cache._cached_cache_digest = CacheDigest(
+                        dp_rank=self.ps.dp_rank,
+                        prefix_entries=digest_data["prefix_entries"],
+                        total_cached_tokens=digest_data["total_cached_tokens"],
+                        evictable_tokens=digest_data["evictable_tokens"],
+                        protected_tokens=digest_data["protected_tokens"],
+                        timestamp=time.time(),
+                    )
+                cache_digest = tree_cache._cached_cache_digest
+
         return GetLoadsReqOutput(
             dp_rank=self.ps.dp_rank,
             timestamp=time.time(),
@@ -206,4 +231,5 @@ class SchedulerLoadInquirer:
             lora=lora,
             disaggregation=disaggregation,
             queues=queues,
+            cache_digest=cache_digest,
         )

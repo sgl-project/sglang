@@ -56,7 +56,7 @@ from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams, InitLoadBackParams
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -248,6 +248,8 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    waiting_for_prefetch: bool = False
+    prefetch_triggered_time: float = 0.0
 
     @property
     def seqlen(self) -> int:
@@ -258,10 +260,30 @@ class DecodeRequest:
         return self.req.priority
 
 
+@dataclass
+class _PlannedPrealloc:
+    decode_req: DecodeRequest
+    prefix_indices: Optional[torch.Tensor]
+    prefix_len: int
+    required_alloc_tokens: int
+    origin_input_len: int
+
+
+def _cleanup_hicache_aborted_request(
+    tree_cache: BasePrefixCache, enable_hicache: bool, req: Req
+) -> None:
+    """Clean up HiRadixCache state for an aborted request."""
+    if not enable_hicache:
+        return
+    tree_cache.release_aborted_request(req.rid)
+
+
 class DecodePreallocQueue:
     """
     Store the requests that are preallocating.
     """
+
+    _PREFETCH_WAIT_TIMEOUT: float = 5.0
 
     def __init__(
         self,
@@ -318,6 +340,7 @@ class DecodePreallocQueue:
                 "SGLANG_DISAGG_STAGING_BUFFER is designed for non-MLA models "
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
+        self.enable_hicache = hasattr(tree_cache, "ongoing_prefetch")
         self.kv_manager = self._init_kv_manager()
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
@@ -485,6 +508,134 @@ class DecodePreallocQueue:
 
         return prefix_indices, len(prefix_indices)
 
+    def _match_prefix(self, req: Req):
+        """Match prefix against radix cache (read-only, no GPU allocation, no lock)."""
+        return match_prefix_for_req(
+            self.tree_cache,
+            req,
+            req.origin_input_ids,
+            cow_mamba=self.tree_cache.supports_mamba(),
+            include_req=True,
+        )
+
+    def _load_back_and_lock(
+        self,
+        req: Req,
+        match_result,
+        extra_load_back_budget_consumed: int = 0,
+        skip_load_back: bool = False,
+    ) -> Tuple[torch.Tensor, int, int, int]:
+        """
+        Optionally load matched host-cache prefix to GPU, then lock the
+        matched prefix node.
+
+        When *skip_load_back* is True the L2->L1 transfer is skipped (e.g.
+        because a budget pre-check already determined the request cannot
+        fit), avoiding wasteful GPU-pool allocation and DMA.
+
+        Returns:
+            (prefix_indices, prefix_len, load_back_tokens, lock_delta)
+        """
+        prefix_indices = match_result.device_indices
+        last_device_node = match_result.last_device_node
+        last_host_node = match_result.last_host_node
+        host_hit_length = match_result.host_hit_length
+        load_back_tokens = 0
+
+        logger.debug(
+            "[HiCache][match_prefix] req=%s total_input=%d L1_gpu_hit=%d L2_host_hit=%d",
+            req.rid,
+            len(req.origin_input_ids),
+            len(prefix_indices),
+            host_hit_length,
+        )
+
+        if (
+            not skip_load_back
+            and host_hit_length > 0
+            and self.enable_hicache
+        ):
+            mem_quota = (
+                self._allocatable_token_budgets(count_retracted=False)
+                - extra_load_back_budget_consumed
+            )
+            load_result, new_last_node = self.tree_cache.init_load_back(
+                InitLoadBackParams(
+                    best_match_node=last_host_node,
+                    host_hit_length=host_hit_length,
+                    mem_quota=mem_quota,
+                )
+            )
+            if len(load_result) > 0:
+                load_back_tokens = len(load_result)
+                prefix_indices = torch.cat([prefix_indices, load_result])
+                last_device_node = new_last_node
+                req.last_node = new_last_node
+
+                self.tree_cache.ready_to_load_host_cache()
+
+        lock_delta = 0
+        if len(prefix_indices) > 0:
+            lock_result = self.tree_cache.inc_lock_ref(last_device_node)
+            lock_delta = lock_result.delta
+
+        return prefix_indices, len(prefix_indices), load_back_tokens, lock_delta
+
+    def _unlock_prefix(self, req: Req, prefix_len: int) -> None:
+        """Undo inc_lock_ref from _load_back_and_lock when aborting or deferring."""
+        if prefix_len > 0:
+            self.tree_cache.dec_lock_ref(req.last_node)
+
+    def _trigger_prefetch_if_needed(
+        self, req: Req, last_host_node, prefix_len: int = 0
+    ) -> None:
+        """Trigger prefetch from storage if HiRadixCache is enabled and storage backend is available."""
+        if not self.enable_hicache:
+            return
+        if not self.tree_cache.enable_storage:
+            return
+
+        matched_len = prefix_len
+        total_len = len(req.origin_input_ids)
+
+        if matched_len >= total_len:
+            return
+
+        suffix_tokens = req.origin_input_ids[matched_len:]
+
+        if len(suffix_tokens) < self.tree_cache.prefetch_threshold:
+            return
+
+        last_hash = None
+        prefix_keys = None
+        if last_host_node is not None:
+            last_hash = last_host_node.get_last_hash_value()
+            if self.tree_cache.hicache_storage_pass_prefix_keys:
+                prefix_keys = last_host_node.get_prefix_hash_values(
+                    last_host_node.parent
+                )
+
+        self.tree_cache.prefetch_from_storage(
+            req_id=req.rid,
+            last_host_node=last_host_node,
+            new_input_tokens=suffix_tokens,
+            last_hash=last_hash,
+            prefix_keys=prefix_keys,
+        )
+
+    def _check_prefetch_progress(
+        self, rids_to_check: Optional[List[str]] = None
+    ) -> None:
+        """Check prefetch progress for ongoing prefetches and complete them."""
+        if not self.enable_hicache:
+            return
+
+        ongoing_prefetch_rids = list(self.tree_cache.ongoing_prefetch.keys())
+        for rid in ongoing_prefetch_rids:
+            if rids_to_check is not None and rid not in rids_to_check:
+                continue
+            self.tree_cache.check_prefetch_progress(rid)
+
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
@@ -528,6 +679,7 @@ class DecodePreallocQueue:
             message = f"Request {req.rid} exceeds the maximum number of tokens: {len(req.origin_input_ids)} > {self.max_total_num_tokens}"
             logger.error(message)
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+            _cleanup_hicache_aborted_request(self.tree_cache, self.enable_hicache, req)
             self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         if self._uses_swa_tail_prealloc():
@@ -637,6 +789,7 @@ class DecodePreallocQueue:
                     error_message,
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
+                _cleanup_hicache_aborted_request(self.tree_cache, self.enable_hicache, decode_req.req)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
@@ -735,8 +888,16 @@ class DecodePreallocQueue:
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
+        # Check HiRadixCache events (write completion, load completion, prefetch progress)
+        if self.enable_hicache:
+            self.tree_cache.check_hicache_events()
+
+        # Check prefetch progress for ongoing prefetches
+        self._check_prefetch_progress(rids_to_check)
+
         failed_reqs = []
         preallocated_reqs = []
+        planned_preallocs: List[_PlannedPrealloc] = []
         indices_to_remove = set()
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
@@ -778,6 +939,7 @@ class DecodePreallocQueue:
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
             if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+                _cleanup_hicache_aborted_request(self.tree_cache, self.enable_hicache, decode_req.req)
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
                     decode_req.req.return_logprob,
@@ -801,6 +963,7 @@ class DecodePreallocQueue:
             )
 
         # Then, preallocate the remaining requests if possible
+        cumulative_load_back_tokens = 0
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -810,6 +973,19 @@ class DecodePreallocQueue:
 
             if not decode_req.waiting_for_input:
                 continue
+
+            # Two-phase prefetch: check if request is waiting for L3->L2 prefetch
+            if decode_req.waiting_for_prefetch:
+                rid = decode_req.req.rid
+                prefetch_done = rid not in self.tree_cache.ongoing_prefetch
+                timed_out = (
+                    time.monotonic() - decode_req.prefetch_triggered_time
+                    > self._PREFETCH_WAIT_TIMEOUT
+                )
+                if prefetch_done or timed_out:
+                    decode_req.waiting_for_prefetch = False
+                else:
+                    continue
 
             if self.req_to_token_pool.available_size() <= 0:
                 break
@@ -824,55 +1000,168 @@ class DecodePreallocQueue:
             # TODO: add new_token ratio
             origin_input_len = len(decode_req.req.origin_input_ids)
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
-                # Match prefix against decode's radix cache.
-                prefix_indices, prefix_len = self._match_prefix_and_lock(decode_req.req)
-                # Align prefix_len down to page boundary so both prefill and
-                # decode agree on the page-aligned split point for KV transfer.
                 page_size = self.token_to_kv_pool_allocator.page_size
-                if page_size > 1 and prefix_len % page_size != 0:
-                    prefix_len = page_align_floor(prefix_len, page_size)
-                    prefix_indices = prefix_indices[:prefix_len]
+                fill_len = origin_input_len + max(
+                    len(decode_req.req.output_ids) - 1, 0
+                )
 
-                fill_len = origin_input_len + max(len(decode_req.req.output_ids) - 1, 0)
-                required_alloc_tokens = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                )
-                # Matching may lock previously-evictable radix pages, so refresh
-                # the admission budget against the post-lock pool state before we
-                # decide whether this request still fits.
-                full_allocatable_tokens = self._allocatable_token_budgets(
-                    retractable_tokens=retractable_tokens,
-                    count_retracted=True,
-                    extra_reserved_reqs=len(preallocated_reqs),
-                )
+                if self.enable_hicache:
+                    # Phase 1: Match prefix (read-only, no GPU allocation)
+                    match_result = self._match_prefix(decode_req.req)
+
+                    # Pre-check: skip load_back if request can't fit with L1-only prefix
+                    skip_load_back = False
+                    if match_result.host_hit_length > 0:
+                        l1_prefix_len = len(match_result.device_indices)
+                        if page_size > 1 and l1_prefix_len % page_size != 0:
+                            l1_prefix_len = page_align_floor(l1_prefix_len, page_size)
+                        conservative_alloc = self._required_alloc_tokens(
+                            fill_len=fill_len, prefix_len=l1_prefix_len
+                        )
+                        conservative_required = (
+                            conservative_alloc + self.num_reserved_decode_tokens
+                        )
+                        conservative_projected = (
+                            origin_input_len
+                            - l1_prefix_len
+                            + min(
+                                decode_req.req.sampling_params.max_new_tokens,
+                                CLIP_MAX_NEW_TOKEN,
+                            )
+                            - retractable_tokens
+                        )
+                        if (
+                            max(conservative_required, conservative_projected)
+                            > full_allocatable_tokens
+                        ):
+                            skip_load_back = True
+
+                    # Phase 2: Load back (if not skipped) + lock
+                    prefix_indices, prefix_len, load_back_tokens, lock_delta = (
+                        self._load_back_and_lock(
+                            decode_req.req,
+                            match_result,
+                            extra_load_back_budget_consumed=cumulative_load_back_tokens,
+                            skip_load_back=skip_load_back,
+                        )
+                    )
+                    full_allocatable_tokens += lock_delta
+
+                    # Align prefix_len down to page boundary
+                    if page_size > 1 and prefix_len % page_size != 0:
+                        prefix_len = page_align_floor(prefix_len, page_size)
+                        prefix_indices = prefix_indices[:prefix_len]
+
+                    # Two-phase prefetch: trigger L3->L2 and defer prealloc if started
+                    if decode_req.prefetch_triggered_time == 0.0:
+                        self._trigger_prefetch_if_needed(
+                            decode_req.req, decode_req.req.last_host_node, prefix_len
+                        )
+                        if decode_req.req.rid in self.tree_cache.ongoing_prefetch:
+                            self._unlock_prefix(decode_req.req, prefix_len)
+                            full_allocatable_tokens -= lock_delta
+                            decode_req.waiting_for_prefetch = True
+                            decode_req.prefetch_triggered_time = time.monotonic()
+                            continue
+                        else:
+                            decode_req.prefetch_triggered_time = time.monotonic()
+
+                    required_alloc_tokens = self._required_alloc_tokens(
+                        fill_len=fill_len, prefix_len=prefix_len
+                    )
+                else:
+                    # Non-HiCache radix cache path: use simple match_prefix_and_lock
+                    prefix_indices, prefix_len = self._match_prefix_and_lock(
+                        decode_req.req
+                    )
+                    lock_delta = 0
+                    load_back_tokens = 0
+                    if page_size > 1 and prefix_len % page_size != 0:
+                        prefix_len = page_align_floor(prefix_len, page_size)
+                        prefix_indices = prefix_indices[:prefix_len]
+                    required_alloc_tokens = self._required_alloc_tokens(
+                        fill_len=fill_len, prefix_len=prefix_len
+                    )
+                    full_allocatable_tokens = self._allocatable_token_budgets(
+                        retractable_tokens=retractable_tokens,
+                        count_retracted=True,
+                        extra_reserved_reqs=len(preallocated_reqs),
+                    )
             else:
                 prefix_indices = None
                 prefix_len = 0
+                lock_delta = 0
+                load_back_tokens = 0
                 required_alloc_tokens = origin_input_len
 
             required_tokens_for_request = (
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+            projected_tokens = (
+                origin_input_len
+                - prefix_len
+                + min(
+                    decode_req.req.sampling_params.max_new_tokens,
+                    CLIP_MAX_NEW_TOKEN,
                 )
+                - retractable_tokens
+            )
+            if (
+                max(required_tokens_for_request, projected_tokens)
                 > full_allocatable_tokens
             ):
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                # Abort if permanently stuck
+                if (
+                    len(self.scheduler.running_batch.reqs) == 0
+                    and len(self.transfer_queue.queue) == 0
+                    and projected_tokens > full_allocatable_tokens
+                ):
+                    logger.warning(
+                        "[Decode] Request %s aborted: projected memory need "
+                        "%d tokens (input=%d, max_new=%d, prefix=%d) exceeds "
+                        "allocatable %d with no retractable requests.",
+                        decode_req.req.rid,
+                        projected_tokens,
+                        origin_input_len,
+                        min(
+                            decode_req.req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKEN,
+                        ),
+                        prefix_len,
+                        full_allocatable_tokens,
+                    )
+                    self._unlock_prefix(decode_req.req, prefix_len)
+                    full_allocatable_tokens -= lock_delta
+                    decode_req.req.finished_reason = FINISH_ABORT(
+                        f"Insufficient memory: projected need "
+                        f"~{projected_tokens} tokens but only "
+                        f"{full_allocatable_tokens} allocatable."
+                    )
+                    _cleanup_hicache_aborted_request(
+                        self.tree_cache, self.enable_hicache, decode_req.req
+                    )
+                    self.scheduler.output_streamer.stream_output(
+                        [decode_req.req], decode_req.req.return_logprob
+                    )
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                if self.enable_hicache:
+                    self._unlock_prefix(decode_req.req, prefix_len)
+                    full_allocatable_tokens -= lock_delta
+                else:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
             if required_tokens_for_request > full_allocatable_tokens:
-                if prefix_len > 0:
-                    self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                if self.enable_hicache:
+                    self._unlock_prefix(decode_req.req, prefix_len)
+                    full_allocatable_tokens -= lock_delta
+                else:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                 break
 
             if uses_swa_tail_prealloc:
@@ -889,22 +1178,53 @@ class DecodePreallocQueue:
                     )
                     > swa_allocatable_tokens
                 ):
-                    if prefix_len > 0:
-                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    if self.enable_hicache:
+                        self._unlock_prefix(decode_req.req, prefix_len)
+                        full_allocatable_tokens -= lock_delta
+                    else:
+                        if prefix_len > 0:
+                            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
-            dst_kv_indices = self._pre_alloc(decode_req.req, prefix_indices, prefix_len)
-            hisparse_req_budget -= 1
-            # Recompute from actual pool state for the next queue entry.
-            # This accounts for page rounding and newly locked evictable cache.
-            full_allocatable_tokens = self._allocatable_token_budgets(
-                retractable_tokens=retractable_tokens,
-                count_retracted=True,
-                extra_reserved_reqs=len(preallocated_reqs) + 1,
+            full_allocatable_tokens -= required_tokens_for_request
+            if load_back_tokens > 0:
+                cumulative_load_back_tokens += load_back_tokens
+            planned_preallocs.append(
+                _PlannedPrealloc(
+                    decode_req=decode_req,
+                    prefix_indices=prefix_indices,
+                    prefix_len=prefix_len,
+                    required_alloc_tokens=required_alloc_tokens,
+                    origin_input_len=origin_input_len,
+                )
             )
+            indices_to_remove.add(i)
+
+        # --- Batch eviction then allocate ---
+        self._batch_evict_for_prealloc(planned_preallocs)
+
+        for planned in planned_preallocs:
+            decode_req = planned.decode_req
+            prefix_indices = planned.prefix_indices
+            prefix_len = planned.prefix_len
+            origin_input_len = planned.origin_input_len
+
+            dst_kv_indices = self._pre_alloc(
+                decode_req.req,
+                prefix_indices=prefix_indices,
+                prefix_len=prefix_len,
+                allow_evict=not self.enable_hicache,
+            )
+            hisparse_req_budget -= 1
+
+            if not self.enable_hicache:
+                full_allocatable_tokens = self._allocatable_token_budgets(
+                    retractable_tokens=retractable_tokens,
+                    count_retracted=True,
+                    extra_reserved_reqs=len(preallocated_reqs) + 1,
+                )
             if uses_swa_tail_prealloc:
-                # SWA budget uses simple decrement (no radix cache eviction in
-                # the SWA pool, so page-rounding drift is negligible).
+                _, swa_required = self._prealloc_required_tokens(decode_req.req)
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = prefix_len
 
@@ -1192,11 +1512,76 @@ class DecodePreallocQueue:
         )
         return num_new_pages * page_size
 
+    def _evict_for_prealloc(
+        self,
+        required_alloc_tokens: int,
+        *,
+        req: Optional[Req] = None,
+        fill_len: Optional[int] = None,
+        prefix_len: Optional[int] = None,
+        delta_len: Optional[int] = None,
+    ) -> None:
+        if not self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+            return
+
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        if available_size >= required_alloc_tokens:
+            return
+
+        num_to_evict = required_alloc_tokens - available_size
+        result = self.tree_cache.evict(EvictParams(num_tokens=num_to_evict))
+        available_after = self.token_to_kv_pool_allocator.available_size()
+        if available_after >= required_alloc_tokens:
+            return
+
+        if req is None:
+            logger.warning(
+                "Batch eviction insufficient: needed %s tokens, available %s after "
+                "evicting %s/%s tokens. evictable_size=%s, protected_size=%s",
+                required_alloc_tokens,
+                available_after,
+                result.num_tokens_evicted,
+                num_to_evict,
+                self.tree_cache.evictable_size(),
+                self.tree_cache.protected_size(),
+            )
+            return
+
+        logger.warning(
+            "Eviction insufficient: needed %s tokens, available %s after "
+            "evicting %s/%s tokens. evictable_size=%s, protected_size=%s, "
+            "fill_len=%s, prefix_len=%s, delta_len=%s, page_size=%s, req=%s",
+            required_alloc_tokens,
+            available_after,
+            result.num_tokens_evicted,
+            num_to_evict,
+            self.tree_cache.evictable_size(),
+            self.tree_cache.protected_size(),
+            fill_len,
+            prefix_len,
+            delta_len,
+            self.token_to_kv_pool_allocator.page_size,
+            req.rid,
+        )
+
+    def _batch_evict_for_prealloc(
+        self, planned_preallocs: List[_PlannedPrealloc]
+    ) -> None:
+        if not planned_preallocs:
+            return
+
+        total_required_alloc_tokens = sum(
+            planned.required_alloc_tokens for planned in planned_preallocs
+        )
+        self._evict_for_prealloc(total_required_alloc_tokens)
+
     def _pre_alloc(
         self,
         req: Req,
         prefix_indices: Optional[torch.Tensor] = None,
         prefix_len: Optional[int] = None,
+        *,
+        allow_evict: bool = True,
     ) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
         if prefix_len is None:
@@ -1227,7 +1612,8 @@ class DecodePreallocQueue:
 
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
-            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            allow_evict
+            and self.scheduler.server_args.disaggregation_decode_enable_radix_cache
             and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
         ):
             num_to_evict = (

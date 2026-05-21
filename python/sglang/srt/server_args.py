@@ -770,10 +770,18 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
+    disaggregation_decode_enable_hicache: bool = False
+    disaggregation_decode_hicache_ratio: float = 1.0
+    disaggregation_decode_hicache_size: int = 0
+    disaggregation_decode_hicache_write_policy: str = "write_through"
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
+
+    # Cache-aware DP routing (decode multi-DP)
+    dp_routing_digest_chunk_size: int = 256
+    dp_routing_max_extra_reqs: int = 1
 
     # Encode prefill disaggregation
     encoder_only: bool = False
@@ -993,12 +1001,18 @@ class ServerArgs:
             # Default behavior:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
-            # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
-            )
+            # - PD decode + radix cache + dp > 1: cache_aware
+            # - PD decode (other): round_robin
+            if self.disaggregation_mode == "prefill":
+                self.load_balance_method = "follow_bootstrap_room"
+            elif (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_enable_radix_cache
+                and self.dp_size > 1
+            ):
+                self.load_balance_method = "cache_aware"
+            else:
+                self.load_balance_method = "round_robin"
             return
 
     def _handle_ssl_validation(self):
@@ -3668,12 +3682,6 @@ class ServerArgs:
                         "('nixl', 'mooncake'), but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
-                if self.speculative_algorithm is not None:
-                    raise ValueError(
-                        "--disaggregation-decode-enable-radix-cache is incompatible "
-                        "with speculative decoding "
-                        f"(--speculative-algorithm {self.speculative_algorithm})"
-                    )
                 if self.enable_dp_attention:
                     logger.warning(
                         "EXPERIMENTAL: Decode radix cache with DP attention. "
@@ -3681,6 +3689,21 @@ class ServerArgs:
                     )
                 self.disable_radix_cache = False
                 logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
+
+                if self.disaggregation_decode_enable_hicache:
+                    self.enable_hierarchical_cache = True
+                    if self.disaggregation_decode_hicache_size > 0:
+                        self.hicache_size = self.disaggregation_decode_hicache_size
+                    else:
+                        self.hicache_ratio = self.disaggregation_decode_hicache_ratio
+                    self.hicache_write_policy = (
+                        self.disaggregation_decode_hicache_write_policy
+                    )
+                    logger.warning(
+                        "EXPERIMENTAL: HiRadixCache is enabled for decode server "
+                        f"(ratio={self.hicache_ratio}, "
+                        f"write_policy={self.hicache_write_policy})"
+                    )
             else:
                 self.disable_radix_cache = True
                 logger.warning("KV cache is forced as chunk cache for decode server")
@@ -5160,6 +5183,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "cache_aware",
             ],
         )
         parser.add_argument(
@@ -6523,6 +6547,30 @@ class ServerArgs:
             help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
         )
         parser.add_argument(
+            "--disaggregation-decode-enable-hicache",
+            action="store_true",
+            help="Enable hierarchical cache (HiRadixCache) on decode server (PD mode). Requires --disaggregation-decode-enable-radix-cache. Adds host (L2) and optional storage (L3) cache layers.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-ratio",
+            type=float,
+            default=ServerArgs.disaggregation_decode_hicache_ratio,
+            help="The ratio of host KV cache memory pool to device pool for decode server HiRadixCache.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-size",
+            type=int,
+            default=ServerArgs.disaggregation_decode_hicache_size,
+            help="The size of host KV cache memory pool in GB for decode server HiRadixCache. Overrides --disaggregation-decode-hicache-ratio if set.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-hicache-write-policy",
+            type=str,
+            choices=["write_back", "write_through", "write_through_selective"],
+            default=ServerArgs.disaggregation_decode_hicache_write_policy,
+            help="The write policy for decode server HiRadixCache.",
+        )
+        parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
@@ -6538,6 +6586,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_polling_interval,
             help="The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
+        )
+
+        # Cache-aware DP routing
+        parser.add_argument(
+            "--dp-routing-digest-chunk-size",
+            type=int,
+            default=ServerArgs.dp_routing_digest_chunk_size,
+            help="Chunk size (in tokens) for CacheDigest prefix hashing. Default 256.",
+        )
+        parser.add_argument(
+            "--dp-routing-max-extra-reqs",
+            type=int,
+            default=ServerArgs.dp_routing_max_extra_reqs,
+            help="Max extra requests a cache-preferred rank can have over the least-loaded rank before falling back to load balance. Default 1.",
         )
 
         # Encode prefill disaggregation
