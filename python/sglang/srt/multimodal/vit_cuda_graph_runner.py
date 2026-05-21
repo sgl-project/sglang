@@ -111,10 +111,13 @@ class ViTCudaGraphRunner:
     # ------------------------------------------------------------------
 
     def find_bucket(self, total_tokens: int) -> Optional[int]:
-        """Return the smallest bucket size >= total_tokens, or None."""
+        """Return the smallest captured bucket size >= total_tokens, or None."""
         idx = bisect.bisect_left(self.BUCKET_SIZES, total_tokens)
-        if idx < len(self.BUCKET_SIZES):
-            return self.BUCKET_SIZES[idx]
+        while idx < len(self.BUCKET_SIZES):
+            b = self.BUCKET_SIZES[idx]
+            if b in self.graphs:
+                return b
+            idx += 1
         return None
 
     # ------------------------------------------------------------------
