@@ -3227,7 +3227,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # get_attn_backend() resolve to the right objects regardless of which
         # other ModelRunner instances have been initialized in this process.
         # Frozen-KV MTP swaps self.token_to_kv_pool itself before calling
-        # forward(), so this set picks up that override.
+        # forward(), so this set picks up that override. Spec workers that
+        # need a non-default per-call backend (e.g. topk>1 Eagle/Frozen-KV
+        # draft loop) override ``self.attn_backend`` on the draft runner
+        # themselves so this set picks it up.
         prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
         prev_backend = set_attn_backend(self.attn_backend)
         try:
