@@ -4,19 +4,32 @@ metatags:
   description: "Ascend NPU performance profiling guide: use SGLang's built-in PyTorch Profiler for operator-level performance analysis of Ascend NPU inference services."
 ---
 
-During inference serving, it is sometimes necessary to monitor the internal execution flow of the serving framework to identify performance issues. By collecting start/end timestamps of key flows, identifying critical functions or iterations, recording key events, and gathering relevant information, you can quickly locate performance bottlenecks.
+During inference serving, it is sometimes necessary to monitor the internal
+execution flow of the serving framework to identify performance issues. By
+collecting start/end timestamps of key flows, identifying critical functions or
+iterations, recording key events, and gathering relevant information, you can
+quickly locate performance bottlenecks.
 
-This guide walks you through the complete workflow of collecting performance data in an SGLang Ascend NPU inference service — from preparation, collection, and analysis to visualization — helping you get started with performance profiling quickly.
+This guide walks you through the complete workflow of collecting performance
+data in an SGLang Ascend NPU inference service — from preparation, collection,
+and analysis to visualization — helping you get started with performance
+profiling quickly.
 
-For more profiling scenarios (e.g., Nsight Systems, PD disaggregation, etc.), see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
+For more profiling scenarios (e.g., Nsight Systems, PD disaggregation, etc.),
+see [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling).
 
 ## Ascend PyTorch Profiler
 
-SGLang has built-in PyTorch Profiler support. Through the Ascend `torch_npu` backend, you can directly collect NPU operator-level performance data. No additional packages are required — profiling start/stop is controlled via API requests.
+SGLang has built-in PyTorch Profiler support. Through the Ascend `torch_npu`
+backend, you can directly collect NPU operator-level performance data. No
+additional packages are required — profiling start/stop is controlled via API
+requests.
 
 ### 1. Environment Setup
 
-Launch an SGLang online service and set the `SGLANG_TORCH_PROFILER_DIR` environment variable to control where performance files are saved. Once the service starts, profiling is ready on standby.
+Launch an SGLang online service and set the `SGLANG_TORCH_PROFILER_DIR`
+environment variable to control where performance files are saved. Once the
+service starts, profiling is ready on standby.
 
 ```shell Command
 # Set the performance data output directory
@@ -32,7 +45,9 @@ sglang serve \
 ```
 
 <Note>
-On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically redirect PyTorch Profiler's CUDA activity to NPU, so `activities: ["CPU", "GPU"]` actually captures NPU operator events.
+On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically
+redirect PyTorch Profiler's CUDA activity to NPU, so
+`activities: ["CPU", "GPU"]` actually captures NPU operator events.
 </Note>
 
 **Profiling-related environment variables:**
@@ -66,7 +81,9 @@ On Ascend NPU, SGLang uses `torch_npu._apply_patches()` to automatically redirec
 
 ### 2. Collection Methods
 
-SGLang provides four collection methods. The core differences are **whether you need to manually send `/start_profile` and `/stop_profile`**. All four methods produce identical results — choose the most convenient one.
+SGLang provides four collection methods. The core differences are **whether you
+need to manually send `/start_profile` and `/stop_profile`**. All four methods
+produce identical results — choose the most convenient one.
 
 **Method comparison:**
 
@@ -109,7 +126,9 @@ SGLang provides four collection methods. The core differences are **whether you 
 
 #### Method A: API Manual Start/Stop
 
-Send `/start_profile` to start → send workload requests → send `/stop_profile` to stop. After stopping, the server automatically parses the data — **no need to manually call `analyse()`**.
+Send `/start_profile` to start → send workload requests → send `/stop_profile`
+to stop. After stopping, the server automatically parses the data — **no need to
+manually call `analyse()`**.
 
 ```bash Command
 # Step 1: Start profiling (no num_steps, requires manual stop)
@@ -131,12 +150,16 @@ curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 <Note>
-`/stop_profile` returns `"Stop profiling. This will take some time."` — the server needs time to flush trace data to disk and parse it. Wait for the response to complete.
+`/stop_profile` returns `"Stop profiling. This will take some time."` — the
+server needs time to flush trace data to disk and parse it. Wait for the
+response to complete.
 </Note>
 
 #### Method B: API Auto-Stop
 
-Specify `num_steps` in the `/start_profile` request. Profiling stops automatically after N steps and generates output — **no need to manually send `/stop_profile`**.
+Specify `num_steps` in the `/start_profile` request. Profiling stops
+automatically after N steps and generates output — **no need to manually send
+`/stop_profile`**.
 
 ```bash Command
 # num_steps=10, wait 3 warmup steps, auto-stop after 10 steps
@@ -157,7 +180,9 @@ curl http://127.0.0.1:30000/generate \
 
 #### Method C: bench_serving --profile
 
-Use SGLang's built-in `bench_serving` with the `--profile` flag. **Automatically handles `/start_profile` and `/stop_profile`** — no manual API calls needed.
+Use SGLang's built-in `bench_serving` with the `--profile` flag.
+**Automatically handles `/start_profile` and `/stop_profile`** — no manual API
+calls needed.
 
 ```bash Command
 # With --profile-steps: auto-stops after N steps and generates output
@@ -189,11 +214,15 @@ python -m sglang.bench_serving \
 ```
 
 <Note>
-`--profile-steps N` sends `"num_steps": N` to the server's `/start_profile`, so the server auto-stops and parses data after N steps — bench_serving skips sending `/stop_profile`.
+`--profile-steps N` sends `"num_steps": N` to the server's `/start_profile`, so
+the server auto-stops and parses data after N steps — bench_serving skips
+sending `/stop_profile`.
 </Note>
 
 <Note>
-`bench_serving --profile` creates a timestamp subdirectory inside `--profile-output-dir` (e.g. `<output_dir>/<timestamp>/`). The output path is shown in the server log as `Profiling done. Traces are saved to: <path>`.
+`bench_serving --profile` creates a timestamp subdirectory inside
+`--profile-output-dir` (e.g. `<output_dir>/<timestamp>/`). The output path is
+shown in the server log as `Profiling done. Traces are saved to: <path>`.
 </Note>
 
 **`bench_serving --profile` parameters:**
@@ -211,7 +240,10 @@ python -m sglang.bench_serving \
 
 #### Method D: sglang.profiler CLI
 
-Use the `sglang.profiler` CLI module, which automatically sends `/start_profile` and waits for completion. **Start `sglang.profiler` first, then send inference requests** (otherwise there are no steps to capture and the profiler will wait indefinitely).
+Use the `sglang.profiler` CLI module, which automatically sends
+`/start_profile` and waits for completion. **Start `sglang.profiler` first,
+then send inference requests** (otherwise there are no steps to capture and the
+profiler will wait indefinitely).
 
 ```bash Command
 # Terminal 1: Start sglang.profiler first (sends /start_profile, then waits for completion)
@@ -229,7 +261,8 @@ for i in $(seq 1 10); do
 done
 ```
 
-A simpler and more reliable approach is to use `bench_serving --profile`, which handles both steps automatically:
+A simpler and more reliable approach is to use `bench_serving --profile`, which
+handles both steps automatically:
 
 ```bash Command
 python3 -m sglang.bench_serving \
@@ -247,7 +280,11 @@ python3 -m sglang.bench_serving \
 ```
 
 <Note>
-`sglang.profiler` is essentially a CLI wrapper around the `/start_profile` API. Advanced options like `--profile-by-stage` are also supported. On Ascend NPU, trace flushing is asynchronous and may take a while — the CLI may occasionally block waiting for flush. If it times out, use Method B (API auto-stop) or Method C (bench_serving --profile) instead.
+`sglang.profiler` is essentially a CLI wrapper around the `/start_profile` API.
+Advanced options like `--profile-by-stage` are also supported. On Ascend NPU,
+trace flushing is asynchronous and may take a while — the CLI may occasionally
+block waiting for flush. If it times out, use Method B (API auto-stop) or
+Method C (bench_serving --profile) instead.
 </Note>
 
 **`sglang.profiler` CLI parameters:**
@@ -258,17 +295,27 @@ python3 -m sglang.bench_serving \
   </thead>
   <tbody>
     <tr><td><code>--url</code></td><td>SGLang server address</td></tr>
-    <tr><td><code>--output-dir</code></td><td>Output directory (defaults to <code>SGLANG_TORCH_PROFILER_DIR</code>)</td></tr>
+    <tr>
+      <td><code>--output-dir</code></td>
+      <td>Output directory (defaults to <code>SGLANG_TORCH_PROFILER_DIR</code>)</td>
+    </tr>
     <tr><td><code>--num-steps</code></td><td>Number of steps to profile</td></tr>
-    <tr><td><code>--profile-by-stage</code></td><td>Profile prefill / decode stages separately</td></tr>
+    <tr>
+      <td><code>--profile-by-stage</code></td>
+      <td>Profile prefill / decode stages separately</td>
+    </tr>
     <tr><td><code>--profile-prefix</code></td><td>Trace filename prefix</td></tr>
-    <tr><td><code>--cpu</code> / <code>--gpu</code> / <code>--mem</code> / <code>--rpd</code></td><td>Activity types to collect</td></tr>
+    <tr>
+      <td><code>--cpu</code> / <code>--gpu</code> / <code>--mem</code> / <code>--rpd</code></td>
+      <td>Activity types to collect</td>
+    </tr>
   </tbody>
 </table>
 
 ### 3. Full Parameter Reference
 
-All methods ultimately send a `/start_profile` request to the server. The full set of supported parameters:
+All methods ultimately send a `/start_profile` request to the server. The full
+set of supported parameters:
 
 <table>
   <thead>
@@ -281,22 +328,31 @@ All methods ultimately send a `/start_profile` request to the server. The full s
   <tbody>
     <tr>
       <td><code>output_dir</code></td>
-      <td>Output directory. Falls back to <code>SGLANG_TORCH_PROFILER_DIR</code> or <code>/tmp</code></td>
+      <td>
+        Output directory. Falls back to
+        <code>SGLANG_TORCH_PROFILER_DIR</code> or <code>/tmp</code>
+      </td>
       <td><code>/tmp</code></td>
     </tr>
     <tr>
       <td><code>num_steps</code></td>
-      <td>Number of steps. If set, profiling auto-stops — no /stop_profile needed</td>
+      <td>
+        Number of steps. If set, profiling auto-stops — no /stop_profile needed
+      </td>
       <td>None</td>
     </tr>
     <tr>
       <td><code>start_step</code></td>
-      <td>Step index to start profiling (inclusive), for skipping warmup</td>
+      <td>
+        Step index to start profiling (inclusive), for skipping warmup
+      </td>
       <td>0</td>
     </tr>
     <tr>
       <td><code>activities</code></td>
-      <td>Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, primarily CPU and GPU</td>
+      <td>
+        Activity types: CPU, GPU, MEM, RPD. On Ascend NPU, primarily CPU and GPU
+      </td>
       <td><code>["CPU", "GPU"]</code></td>
     </tr>
     <tr>
@@ -306,12 +362,18 @@ All methods ultimately send a `/start_profile` request to the server. The full s
     </tr>
     <tr>
       <td><code>with_stack</code></td>
-      <td>Record Python call stack. Also controllable via <code>SGLANG_PROFILE_WITH_STACK</code></td>
+      <td>
+        Record Python call stack. Also controllable via
+        <code>SGLANG_PROFILE_WITH_STACK</code>
+      </td>
       <td><code>true</code></td>
     </tr>
     <tr>
       <td><code>record_shapes</code></td>
-      <td>Record operator input shapes. Also controllable via <code>SGLANG_PROFILE_RECORD_SHAPES</code></td>
+      <td>
+        Record operator input shapes. Also controllable via
+        <code>SGLANG_PROFILE_RECORD_SHAPES</code>
+      </td>
       <td><code>true</code></td>
     </tr>
     <tr>
@@ -321,7 +383,10 @@ All methods ultimately send a `/start_profile` request to the server. The full s
     </tr>
     <tr>
       <td><code>profile_stages</code></td>
-      <td>Stages to profile, e.g. <code>["prefill", "decode"]</code>. Requires <code>profile_by_stage</code></td>
+      <td>
+        Stages to profile, e.g. <code>["prefill", "decode"]</code>.
+        Requires <code>profile_by_stage</code>
+      </td>
       <td>None</td>
     </tr>
   </tbody>
@@ -329,16 +394,19 @@ All methods ultimately send a `/start_profile` request to the server. The full s
 
 ### 4. Finding Output Files
 
-**The server log explicitly indicates where traces are saved.** You can find them via:
+**The server log explicitly indicates where traces are saved.** You can find
+them via:
 
-- **When profiling starts**: server log outputs `Profiling starts. Traces will be saved to: <path> (with profile id: <id>)`
+- **When profiling starts**: server log outputs
+  `Profiling starts. Traces will be saved to: <path> (with profile id: <id>)`
 ```
 [2026-05-19 13:23:15] Profiling starts. Traces will be saved to: /tmp/1779196995.6948605 (with profile id: 1779196995.6979997)
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] [WARNING] [350443] profiler.py: Invalid parameter export_type: None, reset it to text.
 [2026-05-19 13:23:15] INFO:     127.0.0.1:40714 - "POST /start_profile HTTP/1.1" 200 OK
 ```
-- **When profiling stops**: server log outputs `Profiling done. Traces are saved to: <path>`
+- **When profiling stops**: server log outputs
+  `Profiling done. Traces are saved to: <path>`
 ```
 [2026-05-19 13:23:17] Stop profiling...
 [2026-05-19 13:23:17] [WARNING] [350443] profiler.py: Incorrect schedule: Stop profiler while current state is RECORD which may result in incomplete parsed data.
@@ -354,20 +422,36 @@ Dump profiling traces to /tmp/1779243331.3219
 Waiting for 10 steps and the trace to be flushed.... (profile_by_stage=False)
 ```
 
-The directory structure is `<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/`. When using Method C (`bench_serving --profile`), a timestamp subdirectory is added: `<output_dir>/<timestamp>/`. Always check the server log for the exact path: `Profiling done. Traces are saved to: <path>`.
+The directory structure is
+`<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/`. When using Method C
+(`bench_serving --profile`), a timestamp subdirectory is added:
+`<output_dir>/<timestamp>/`. Always check the server log for the exact path:
+`Profiling done. Traces are saved to: <path>`.
 
 ### 5. Viewing Results
 
-After profiling stops (either `/stop_profile` returns or `num_steps` auto-triggers), the server **automatically parses the raw data**. The `ASCEND_PROFILER_OUTPUT` directory directly contains the following visualization files — **no need to manually call `analyse()`**:
+After profiling stops (either `/stop_profile` returns or `num_steps`
+auto-triggers), the server **automatically parses the raw data**. The
+`ASCEND_PROFILER_OUTPUT` directory directly contains the following visualization
+files — **no need to manually call `analyse()`**:
 
 <table>
   <thead>
     <tr><th>File</th><th>Description</th></tr>
   </thead>
   <tbody>
-    <tr><td><code>trace_view.json</code></td><td>Chrome Tracing format. Open in <a href="https://www.hiascend.com/document/detail/zh/mindstudio/81RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html">MindStudio Insight</a></td></tr>
+    <tr>
+      <td><code>trace_view.json</code></td>
+      <td>
+        Chrome Tracing format. Open in
+        <a href="https://www.hiascend.com/document/detail/zh/mindstudio/81RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html">MindStudio Insight</a>
+      </td>
+    </tr>
     <tr><td><code>analysis.db</code></td><td>Database-format performance data</td></tr>
-    <tr><td><code>ascend_pytorch_profiler_0.db</code></td><td>Database-format performance data</td></tr>
+    <tr>
+      <td><code>ascend_pytorch_profiler_0.db</code></td>
+      <td>Database-format performance data</td>
+    </tr>
     <tr><td><code>kernel_details.csv</code></td><td>Kernel-level data</td></tr>
     <tr><td><code>operator_details.csv</code></td><td>Operator-level data</td></tr>
     <tr><td><code>step_trace_time.csv</code></td><td>Step trace timing data</td></tr>
@@ -375,16 +459,24 @@ After profiling stops (either `/stop_profile` returns or `num_steps` auto-trigge
 </table>
 
 <Note>
-`trace_view.json` can also be opened using Chrome's built-in `chrome://tracing` or [Perfetto UI](https://ui.perfetto.dev/).
+`trace_view.json` can also be opened using Chrome's built-in
+`chrome://tracing` or [Perfetto UI](https://ui.perfetto.dev/).
 </Note>
 
 <Note>
-If you need to merge distributed trace files in a multi-node deployment, set `"merge_profiles": true` in the `/start_profile` request. Note: on Ascend NPU, the merger has limited support for the `*_ascend_pt` format — check `trace_view.json` on each node individually. See [Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces) for details.
+If you need to merge distributed trace files in a multi-node deployment, set
+`"merge_profiles": true` in the `/start_profile` request. Note: on Ascend NPU,
+the merger has limited support for the `*_ascend_pt` format — check
+`trace_view.json` on each node individually. See
+[Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling#profiler-trace-merger-for-distributed-traces)
+for details.
 </Note>
 
 ### 6. Re-parsing Raw Data (Optional)
 
-If you need to **re-parse existing data** with different parameters, or if profiling was interrupted and `ASCEND_PROFILER_OUTPUT` was not auto-generated, use `torch_npu`'s `analyse()` tool:
+If you need to **re-parse existing data** with different parameters, or if
+profiling was interrupted and `ASCEND_PROFILER_OUTPUT` was not auto-generated,
+use `torch_npu`'s `analyse()` tool:
 
 ```python
 from torch_npu.profiler.profiler import analyse
@@ -392,23 +484,44 @@ analyse("./sglang_profile/<hostname>_*_ascend_pt/")
 ```
 
 <Note>
-Normally **no need** to manually run `analyse()` — the server already parses data automatically. Only use this for re-parsing or handling interrupted data.
+Normally **no need** to manually run `analyse()` — the server already parses
+data automatically. Only use this for re-parsing or handling interrupted data.
 </Note>
 
 ## Best Practices
 
 ### Common Notes
 
-- **Finding output**: Check the server log for `Profiling starts. Traces will be saved to: <path>` and `Profiling done. Traces are saved to: <path>`, or `sglang.profiler` output for `Dump profiling traces to <path>`.
-- **Control trace file size**: Reduce the number of requests and output length using `--num-prompts` and `--random-output-len` to avoid trace files too large for browsers.
-- **Warmup iterations**: Set `start_step` to skip the first few warmup steps and capture performance data under steady state.
-- **CUDA Graph impact**: To see the full Python call stack → operator mapping in traces, add `--disable-cuda-graph` when starting the server. Note that this reduces decode performance — only use during profiling. To analyze CUDA Graph capture specifically, use `--enable-profile-cuda-graph` — traces are saved to `SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`.
-- **Multi-node deployment**: In multi-node environments, performance data is distributed across nodes. On Ascend NPU, the `merge_profiles` feature has limited support — check `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json` on each node individually. In PD disaggregation mode, prefill and decode workers must be profiled separately — see [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
+- **Finding output**: Check the server log for
+  `Profiling starts. Traces will be saved to: <path>` and
+  `Profiling done. Traces are saved to: <path>`, or `sglang.profiler` output for
+  `Dump profiling traces to <path>`.
+- **Control trace file size**: Reduce the number of requests and output length
+  using `--num-prompts` and `--random-output-len` to avoid trace files too large
+  for browsers.
+- **Warmup iterations**: Set `start_step` to skip the first few warmup steps and
+  capture performance data under steady state.
+- **CUDA Graph impact**: To see the full Python call stack → operator mapping in
+  traces, add `--disable-cuda-graph` when starting the server. Note that this
+  reduces decode performance — only use during profiling. To analyze CUDA Graph
+  capture specifically, use `--enable-profile-cuda-graph` — traces are saved to
+  `SGLANG_TORCH_PROFILER_DIR/graph_capture_profile/`.
+- **Multi-node deployment**: In multi-node environments, performance data is
+  distributed across nodes. On Ascend NPU, the `merge_profiles` feature has
+  limited support — check `*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json`
+  on each node individually. In PD disaggregation mode, prefill and decode
+  workers must be profiled separately — see
+  [Profile In PD Disaggregation Mode](/docs/developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode).
 
 ## See Also
 
-- [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling) — General SGLang profiling guide
-- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start) — Ascend NPU environment setup
-- [Ascend NPU Optimization](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization) — Ascend NPU optimization parameters
-- [Ascend NPU Performance Testing](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing) — Ascend NPU performance benchmarking
-- [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables) — Environment variable reference
+- [SGLang Benchmark and Profiling](/docs/developer_guide/benchmark_and_profiling)
+  — General SGLang profiling guide
+- [Ascend NPU Quickstart](/docs/hardware-platforms/ascend-npus/ascend_npu_quick_start)
+  — Ascend NPU environment setup
+- [Ascend NPU Optimization](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization)
+  — Ascend NPU optimization parameters
+- [Ascend NPU Performance Testing](/docs/hardware-platforms/ascend-npus/ascend_npu_performance_testing)
+  — Ascend NPU performance benchmarking
+- [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables)
+  — Environment variable reference
