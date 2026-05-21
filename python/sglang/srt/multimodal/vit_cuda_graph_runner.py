@@ -12,377 +12,486 @@
 # limitations under the License.
 # ==============================================================================
 
-"""ViT CUDA Graph Runner class."""
+"""ViT CUDA Graph Runner with bucket-based capture and greedy bin-packing."""
 
 from __future__ import annotations
 
-import inspect
-from contextlib import nullcontext
-from typing import Dict, Hashable, List, Optional, Tuple
+import bisect
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Protocol, Tuple
 
+import numpy as np
 import torch
-import torch.nn as nn
 
-from sglang.srt.distributed.parallel_state import get_tp_group
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.attention.vision import VisionAttentionMetadata
+
+
+@dataclass
+class ViTGraphConfig:
+    """Model configuration needed for graph setup.
+
+    Provided by the model via get_graph_config().
+    """
+
+    hidden_dim: int
+    rotary_dim: int
+    spatial_merge_unit: int  # spatial_merge_size^2, e.g. 4
+    device: torch.device
+    dtype: torch.dtype
+    attn_backend: str  # "triton_attn", "fa3", "fa4", "flashinfer_cudnn", etc.
+    elem_per_token: int = 0  # for FlashInfer element indptr computation
+
+
+class ViTGraphCapturable(Protocol):
+    """Protocol for ViT models supporting CUDA graph capture.
+
+    Models implement these three methods. The runner calls them during
+    capture and replay -- it never accesses model internals directly.
+    """
+
+    def get_graph_config(self) -> ViTGraphConfig: ...
+
+    def run_blocks(
+        self,
+        x: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Run all transformer blocks.
+
+        Returns:
+            (block_output, deepstack_outputs)
+        """
+        ...
+
+    def run_merger(
+        self,
+        x: torch.Tensor,
+        deepstack_outs: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run merger + optional deepstack concatenation."""
+        ...
+
+
+@dataclass
+class _Bin:
+    """A single bin in the greedy bin-packing algorithm."""
+
+    bucket_size: int
+    remaining: int
+    image_indices: List[int] = field(default_factory=list)
 
 
 class ViTCudaGraphRunner:
-    """Generic ViT CUDA Graph Runner.
+    """Generic ViT CUDA Graph Runner with bucket-based capture and bin-packing replay.
 
-    This runner captures the "blocks + merger + deepstack merger (optional)" part
-    of a vision transformer into a CUDA graph and replays it for identical shapes.
-
-    Optional for Qwen2.5 windowed attention:
-      - vit.fullatt_block_indexes: Sequence[int]
-      - run() provides both cu_seqlens and cu_window_seqlens
-
-    Optional for Qwen3 deepstack:
-      - vit.deepstack_vision_indexes: Sequence[int]
-      - vit.deepstack_merger_list: nn.ModuleList (same length as deepstack_vision_indexes)
+    Eagerly captures CUDA graphs for a fixed set of bucket sizes at init.
+    At runtime, packs multiple images into bins via greedy first-fit-decreasing,
+    and replays the corresponding graph for each bin.
     """
+
+    BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384]
+    MAX_IMAGES_PER_BUCKET = 16
+
+    _graph_memory_pool = None
 
     def __init__(
         self,
-        vit: nn.Module,
+        vit: ViTGraphCapturable,
+        config: ViTGraphConfig,
     ) -> None:
         self.vit = vit
+        self.config = config
+        self.device = config.device
+        self.dtype = config.dtype
 
-        # graph_key -> buffers / graphs
-        self.block_input: Dict[Hashable, torch.Tensor] = {}
-        self.block_ws: Dict[Hashable, torch.Tensor] = {}
-        self.block_graphs: Dict[Hashable, torch.cuda.CUDAGraph] = {}
-        self.block_output: Dict[Hashable, torch.Tensor] = {}
+        M = self.MAX_IMAGES_PER_BUCKET
 
-        # captured seqlens buffers (addresses must be stable for cuda-graph replay)
-        self.cu_full_len: Dict[Hashable, torch.Tensor] = {}
-        self.cu_window_len: Dict[Hashable, torch.Tensor] = {}
-        self.cu_full_len_kk: Dict[Hashable, torch.Tensor] = {}
-        self.cu_window_len_kk: Dict[Hashable, torch.Tensor] = {}
+        # Per-bucket-size state
+        self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.input_bufs: Dict[int, torch.Tensor] = {}
+        self.output_bufs: Dict[int, torch.Tensor] = {}
+        self.forward_metadatas: Dict[int, VisionAttentionMetadata] = {}
+        self.rotary_cos_bufs: Dict[int, torch.Tensor] = {}
+        self.rotary_sin_bufs: Dict[int, torch.Tensor] = {}
 
-        # rotary position buffers shared across graphs
-        self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        self.max_context_len = getattr(vit, "max_context_len", None)
+    # ------------------------------------------------------------------
+    # Bucket helpers
+    # ------------------------------------------------------------------
 
-        # Qwen2.5-VL specific viarable.
-        self._fullatt_block_indexes = set(getattr(vit, "fullatt_block_indexes", ()))
+    def find_bucket(self, total_tokens: int) -> Optional[int]:
+        """Return the smallest bucket size >= total_tokens, or None."""
+        idx = bisect.bisect_left(self.BUCKET_SIZES, total_tokens)
+        if idx < len(self.BUCKET_SIZES):
+            return self.BUCKET_SIZES[idx]
+        return None
 
-        # Qwen3-VL specific variables.
-        self._deepstack_visual_indexes = list(
-            getattr(vit, "deepstack_visual_indexes", []) or []
+    # ------------------------------------------------------------------
+    # Bin-packing
+    # ------------------------------------------------------------------
+
+    def bin_pack(self, image_token_counts: List[int]) -> Tuple[List[_Bin], List[int]]:
+        """Greedy first-fit-decreasing bin-packing.
+
+        Args:
+            image_token_counts: token count per image.
+
+        Returns:
+            (bins, eager_indices): bins for graph replay, and indices of
+            images too large for any bucket (fall back to eager).
+        """
+        M = self.MAX_IMAGES_PER_BUCKET
+        sorted_indices = sorted(
+            range(len(image_token_counts)),
+            key=lambda i: -image_token_counts[i],
         )
-        self._deepstack_merger_list = getattr(vit, "deepstack_merger_list", None)
 
-        first_blk = vit.blocks[0]
-        self._blk_accepts_output_ws = (
-            "output_ws" in inspect.signature(first_blk.forward).parameters
-        )
+        bins: List[_Bin] = []
+        eager_indices: List[int] = []
 
-        self._attn: Optional[VisionAttention] = getattr(first_blk, "attn", None)
-        self._attn_backend = getattr(self._attn, "qkv_backend", None)
+        for idx in sorted_indices:
+            size = image_token_counts[idx]
+            bucket = self.find_bucket(size)
+            if bucket is None:
+                eager_indices.append(idx)
+                continue
 
-    @property
-    def device(self) -> torch.device:
-        return self.vit.device
+            # First-fit
+            placed = False
+            for b in bins:
+                if b.remaining >= size and len(b.image_indices) < M:
+                    b.remaining -= size
+                    b.image_indices.append(idx)
+                    placed = True
+                    break
 
-    @property
-    def dtype(self) -> torch.dtype:
-        return self.vit.dtype
-
-    def _ensure_sin_cos_ws(self, seq_len: int, head_dim: int):
-        if self.sin_cos_ws is None:
-            max_shape = self.max_context_len or seq_len
-            max_shape = max(max_shape, seq_len)
-            cos_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
-            )
-            sin_ws = torch.empty(
-                max_shape, head_dim, dtype=self.dtype, device=self.device
-            )
-            self.sin_cos_ws = (cos_ws, sin_ws)
-        else:
-            if self.sin_cos_ws[0].size(0) < seq_len:
-                max_shape = max(self.sin_cos_ws[0].size(0) * 2, seq_len)
-                cos_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                sin_ws = torch.empty(
-                    max_shape, head_dim, dtype=self.dtype, device=self.device
-                )
-                self.sin_cos_ws = (cos_ws, sin_ws)
-
-    def _get_graph_key(self, x_3d: torch.Tensor) -> int:
-        # x_3d: [S, B, H], B=1, S as graph_key
-        return x_3d.shape[0]
-
-    def _create_graph(
-        self,
-        graph_key: int,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ] = None,  # (cos, sin), [S, D]
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-    ):
-
-        graph = torch.cuda.CUDAGraph()
-        vit = self.vit
-
-        # Qwen2.5-VL
-        if self._fullatt_block_indexes:
-            cu_window = self.cu_window_len[graph_key]
-            cu_window_kk = self.cu_window_len_kk[graph_key]
-            max_window_len = int(cu_window_kk.max().item())
-
-        cu_full = self.cu_full_len[graph_key]
-        cu_full_kk = self.cu_full_len_kk[graph_key]
-        max_full_len = int(cu_full_kk.max().item())
-
-        override_backend = get_global_server_args().mm_attention_backend
-
-        tp_group = get_tp_group()
-        ca_comm = tp_group.ca_comm
-        capture_ctx = ca_comm.capture() if ca_comm is not None else nullcontext()
-
-        with capture_ctx, torch.cuda.graph(graph):
-            y = None
-            deepstack_outs: List[torch.Tensor] = []
-            deepstack_capture_idx = 0
-
-            for layer_num, blk in enumerate(vit.blocks):
-                if self._fullatt_block_indexes:
-                    if layer_num in vit.fullatt_block_indexes:
-                        cu_seqlens_now = cu_full
-                        cu_seqlens_kk_now = cu_full_kk
-                        max_len = max_full_len
-                    else:
-                        cu_seqlens_now = cu_window
-                        cu_seqlens_kk_now = cu_window_kk
-                        max_len = max_window_len
-                else:
-                    cu_seqlens_now = cu_full
-                    cu_seqlens_kk_now = cu_full_kk
-                    max_len = max_full_len
-
-                if override_backend == "triton_attn":
-                    cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif override_backend == "fa3":
-                    cu_seq_len_ws = [cu_seqlens_now, max_len]
-                else:
-                    raise RuntimeError("Not supported ViT attention backend")
-
-                if position_embeddings is not None:
-                    if layer_num == 0:
-                        y = blk(
-                            self.block_input[graph_key],
-                            cu_seqlens=cu_seq_len_ws,
-                            position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                    else:
-                        y = blk(
-                            y,
-                            cu_seqlens=cu_seq_len_ws,
-                            position_embeddings=position_embeddings,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-                    if layer_num == 0:
-                        y = blk(
-                            self.block_input[graph_key],
-                            cu_seqlens=cu_seq_len_ws,
-                            rotary_pos_emb_cos=rotary_pos_emb_cos,
-                            rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
-                        )
-                    else:
-                        y = blk(
-                            y,
-                            cu_seqlens=cu_seq_len_ws,
-                            rotary_pos_emb_cos=rotary_pos_emb_cos,
-                            rotary_pos_emb_sin=rotary_pos_emb_sin,
-                            output_ws=self.block_ws[graph_key],
-                        )
-
-                # Optional deepstack support (Qwen3-VL)
-                if (
-                    self._deepstack_visual_indexes
-                    and layer_num in self._deepstack_visual_indexes
-                ):
-                    if self._deepstack_merger_list is None:
-                        raise RuntimeError(
-                            "deepstack_visual_indexes exists but deepstack_merger_list is missing."
-                        )
-                    deepstack_out = self._deepstack_merger_list[deepstack_capture_idx](
-                        y
+            if not placed:
+                bins.append(
+                    _Bin(
+                        bucket_size=bucket,
+                        remaining=bucket - size,
+                        image_indices=[idx],
                     )
-                    deepstack_outs.append(deepstack_out)
-                    deepstack_capture_idx += 1
-
-            main_out = vit.merger(y)
-
-            if deepstack_outs:
-                self.block_output[graph_key] = torch.cat(
-                    [main_out] + deepstack_outs, dim=1
                 )
-            else:
-                self.block_output[graph_key] = main_out
 
-        self.block_graphs[graph_key] = graph
+        return bins, eager_indices
 
-    def create_graph(
+    # ------------------------------------------------------------------
+    # Buffer allocation
+    # ------------------------------------------------------------------
+
+    def _alloc_buffers(self, bucket_size: int) -> None:
+        """Allocate pre-capture buffers for a given bucket size."""
+        B = bucket_size
+        M = self.MAX_IMAGES_PER_BUCKET
+        cfg = self.config
+
+        # Input: [B, 1, hidden_dim]
+        self.input_bufs[B] = torch.zeros(
+            B, 1, cfg.hidden_dim, device=self.device, dtype=self.dtype
+        )
+
+        # Rotary embeddings: [B, rotary_dim]
+        self.rotary_cos_bufs[B] = torch.zeros(
+            B, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+        self.rotary_sin_bufs[B] = torch.zeros(
+            B, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+
+        # Token-based cu_seqlens [M+1] and seq_lens [M] (all backends need these)
+        cu_seqlens = torch.zeros(M + 1, device=self.device, dtype=torch.int32)
+        seq_lens = torch.zeros(M, device=self.device, dtype=torch.int32)
+
+        # FlashInfer-specific: separate packed_indptrs and sequence_lengths
+        packed_indptrs = None
+        sequence_lengths = None
+        if cfg.attn_backend == "flashinfer_cudnn":
+            packed_indptrs = torch.zeros(
+                3 * (M + 1), device=self.device, dtype=torch.int32
+            )
+            sequence_lengths = torch.zeros(
+                M, 1, 1, 1, device=self.device, dtype=torch.int32
+            )
+
+        # Fill dummy: single sequence of length B, rest zero-length
+        self._fill_single_seq(cu_seqlens, seq_lens, B, packed_indptrs, sequence_lengths)
+
+        self.forward_metadatas[B] = VisionAttentionMetadata(
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            max_seqlen=B,
+            packed_indptrs=packed_indptrs,
+            sequence_lengths=sequence_lengths,
+            flashinfer_max_seqlen=B if packed_indptrs is not None else None,
+        )
+
+    def _fill_single_seq(
         self,
-        x_3d: torch.Tensor,  # [S, 1, H]
         cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
-        position_embeddings: Optional[
-            Tuple[torch.Tensor, torch.Tensor]
-        ],  # (cos, sin), [S, D]
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-    ) -> int:
-        vit = self.vit
-        graph_key = self._get_graph_key(x_3d)
+        seq_lens: torch.Tensor,
+        total_tokens: int,
+        packed_indptrs: Optional[torch.Tensor],
+        sequence_lengths: Optional[torch.Tensor],
+    ) -> None:
+        """Fill buffers for a single sequence of `total_tokens`, rest zero-length."""
+        M = self.MAX_IMAGES_PER_BUCKET
+        cfg = self.config
 
-        if graph_key in self.block_graphs:
-            return graph_key
+        # Token cu_seqlens: [0, total_tokens, total_tokens, ...]
+        vals = np.zeros(M + 1, dtype=np.int32)
+        vals[1:] = total_tokens
+        cu_seqlens.copy_(torch.from_numpy(vals))
 
-        # pre-allocate workspace
-        attn_module: VisionAttention = vit.blocks[0].attn
-        num_heads = attn_module.num_attention_heads_per_partition
-        attn_head_dim = attn_module.head_size
+        # seq_lens: [total_tokens, 0, 0, ...]
+        sl = np.zeros(M, dtype=np.int32)
+        sl[0] = total_tokens
+        seq_lens.copy_(torch.from_numpy(sl))
 
-        if graph_key not in self.block_output:
-            self.block_output[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
-            self.block_input[graph_key] = torch.empty_like(
-                x_3d, device=self.device
-            ).contiguous()
-            self.block_ws[graph_key] = torch.empty(
-                graph_key,
-                num_heads,
-                attn_head_dim,
-                device=self.device,
-                dtype=self.dtype,
+        if packed_indptrs is not None:
+            elem = cfg.elem_per_token
+            indptr = np.zeros(M + 1, dtype=np.int32)
+            indptr[1:] = total_tokens * elem
+            packed = np.concatenate([indptr, indptr, indptr])
+            packed_indptrs.copy_(torch.from_numpy(packed))
+
+        if sequence_lengths is not None:
+            sl_4d = np.zeros(M, dtype=np.int32)
+            sl_4d[0] = total_tokens
+            sequence_lengths.copy_(torch.from_numpy(sl_4d).view(M, 1, 1, 1))
+
+    # ------------------------------------------------------------------
+    # Capture
+    # ------------------------------------------------------------------
+
+    def _capture(self, bucket_size: int) -> None:
+        """Capture a CUDA graph for a single bucket size."""
+        B = bucket_size
+        self._alloc_buffers(B)
+
+        input_buf = self.input_bufs[B]
+        fwd_metadata = self.forward_metadatas[B]
+        rotary_cos = self.rotary_cos_bufs[B]
+        rotary_sin = self.rotary_sin_bufs[B]
+
+        device_module = torch.get_device_module(self.device)
+
+        if ViTCudaGraphRunner._graph_memory_pool is None:
+            ViTCudaGraphRunner._graph_memory_pool = device_module.graph_pool_handle()
+
+        # Warmup (2 runs to stabilize kernels)
+        for _ in range(2):
+            block_out, ds_outs = self.vit.run_blocks(
+                input_buf, fwd_metadata, rotary_cos, rotary_sin
             )
+            output = self.vit.run_merger(block_out, ds_outs)
+        device_module.synchronize()
 
-        # Qwen2.5-VL
-        if self._fullatt_block_indexes:
-            if graph_key not in self.cu_window_len:
-                self.cu_window_len[graph_key] = cu_window_seqlens
-                self.cu_full_len[graph_key] = cu_seqlens
-                self.cu_window_len_kk[graph_key] = (
-                    cu_window_seqlens[1:] - cu_window_seqlens[:-1]
-                )
-                self.cu_full_len_kk[graph_key] = cu_seqlens[1:] - cu_seqlens[:-1]
-        else:
-            if graph_key not in self.cu_full_len:
-                self.cu_full_len[graph_key] = cu_seqlens
-                self.cu_full_len_kk[graph_key] = cu_seqlens[1:] - cu_seqlens[:-1]
-
-        if position_embeddings is not None:
-            # make sure rotary workspace
-            head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(position_embeddings[0])
-            used_sin_ws.copy_(position_embeddings[1])
-            persist_position_embeddings = (used_cos_ws, used_sin_ws)
-            self._create_graph(
-                graph_key=graph_key, position_embeddings=persist_position_embeddings
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
+            block_out, ds_outs = self.vit.run_blocks(
+                input_buf, fwd_metadata, rotary_cos, rotary_sin
             )
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # make sure rotary workspace
-            head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
+            output = self.vit.run_merger(block_out, ds_outs)
 
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(rotary_pos_emb_cos)
-            used_sin_ws.copy_(rotary_pos_emb_sin)
-            self._create_graph(
-                graph_key=graph_key,
-                position_embeddings=None,
-                rotary_pos_emb_cos=used_cos_ws,
-                rotary_pos_emb_sin=used_sin_ws,
-            )
+        self.graphs[B] = graph
+        self.output_bufs[B] = output
 
-        return graph_key
+    def capture_all(self) -> None:
+        """Eagerly capture graphs for all bucket sizes. Called at model init."""
+        for B in self.BUCKET_SIZES:
+            self._capture(B)
+
+    # ------------------------------------------------------------------
+    # Replay
+    # ------------------------------------------------------------------
+
+    def _prepare_metadata(
+        self,
+        bucket_size: int,
+        image_token_counts: List[int],
+    ) -> None:
+        """Fill all metadata buffers for a packed bin of images."""
+        B = bucket_size
+        M = self.MAX_IMAGES_PER_BUCKET
+        cfg = self.config
+        metadata = self.forward_metadatas[B]
+        N = len(image_token_counts)
+
+        # Cumulative token offsets
+        offsets = np.zeros(N + 1, dtype=np.int32)
+        for i, s in enumerate(image_token_counts):
+            offsets[i + 1] = offsets[i] + s
+        S_total = int(offsets[N])
+
+        # Token cu_seqlens: [0, s1, s1+s2, ..., S, S, ..., B]
+        cu_vals = np.full(M + 1, S_total, dtype=np.int32)
+        cu_vals[0] = 0
+        for i in range(N):
+            cu_vals[i + 1] = offsets[i + 1]
+        cu_vals[M] = B  # last sequence gets padding tokens
+        metadata.cu_seqlens.copy_(torch.from_numpy(cu_vals))
+
+        # seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        sl_vals = np.zeros(M, dtype=np.int32)
+        for i in range(N):
+            sl_vals[i] = image_token_counts[i]
+        padding = B - S_total
+        if padding > 0 and N < M:
+            sl_vals[N] = padding  # padding sequence
+        elif padding > 0:
+            sl_vals[M - 1] = padding  # overflow to last slot
+        metadata.seq_lens.copy_(torch.from_numpy(sl_vals))
+
+        metadata.max_seqlen = B
+
+        # FlashInfer packed_indptrs
+        if metadata.packed_indptrs is not None:
+            elem = cfg.elem_per_token
+            indptr = np.full(M + 1, S_total * elem, dtype=np.int32)
+            indptr[0] = 0
+            for i in range(N):
+                indptr[i + 1] = offsets[i + 1] * elem
+            indptr[M] = B * elem
+            packed = np.concatenate([indptr, indptr, indptr])
+            metadata.packed_indptrs.copy_(torch.from_numpy(packed))
+
+        if metadata.sequence_lengths is not None:
+            fi_sl = np.zeros(M, dtype=np.int32)
+            for i in range(N):
+                fi_sl[i] = image_token_counts[i]
+            if padding > 0 and N < M:
+                fi_sl[N] = padding
+            metadata.sequence_lengths.copy_(torch.from_numpy(fi_sl).view(M, 1, 1, 1))
+
+        if metadata.flashinfer_max_seqlen is not None:
+            metadata.flashinfer_max_seqlen = B
 
     def replay(
         self,
-        graph_key: int,
-        x_3d: torch.Tensor,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-        output_indices: Optional[torch.Tensor] = None,
+        bucket_size: int,
+        packed_tokens: torch.Tensor,
+        packed_rotary_cos: torch.Tensor,
+        packed_rotary_sin: torch.Tensor,
+        image_token_counts: List[int],
     ) -> torch.Tensor:
+        """Replay a captured graph for one bin of packed images.
 
-        if position_embeddings is not None:
-            # update rotary workspace content
-            head_dim = position_embeddings[0].shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(position_embeddings[0])
-            used_sin_ws.copy_(position_embeddings[1])
-        elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            # update rotary workspace content
-            head_dim = rotary_pos_emb_cos.shape[1]
-            self._ensure_sin_cos_ws(graph_key, head_dim)
-            used_cos_ws = self.sin_cos_ws[0][:graph_key, :]
-            used_sin_ws = self.sin_cos_ws[1][:graph_key, :]
-            used_cos_ws.copy_(rotary_pos_emb_cos)
-            used_sin_ws.copy_(rotary_pos_emb_sin)
+        Args:
+            bucket_size: the bucket to replay.
+            packed_tokens: [S, hidden_dim] concatenated image tokens.
+            packed_rotary_cos: [S, rotary_dim] concatenated rotary cos.
+            packed_rotary_sin: [S, rotary_dim] concatenated rotary sin.
+            image_token_counts: per-image token counts in this bin.
 
-        # copy input
-        self.block_input[graph_key].copy_(x_3d)
+        Returns:
+            [S_merged, out_dim] packed merged output (only valid portion).
+        """
+        B = bucket_size
+        S = packed_tokens.shape[0]
+        merge_unit = self.config.spatial_merge_unit
 
-        # replay
-        self.block_graphs[graph_key].replay()
+        # Prepare metadata buffers
+        self._prepare_metadata(B, image_token_counts)
 
-        out = self.block_output[graph_key]
+        # Copy input tokens into buffer (pad with zeros beyond S)
+        self.input_bufs[B][:S, 0, :].copy_(packed_tokens)
+        if S < B:
+            self.input_bufs[B][S:, 0, :].zero_()
 
-        # Optional output reordering (Qwen2.5-VL window permutation inverse)
-        if output_indices is not None:
-            out = out.index_select(0, output_indices)
+        # Copy rotary embeddings
+        self.rotary_cos_bufs[B][:S].copy_(packed_rotary_cos)
+        self.rotary_sin_bufs[B][:S].copy_(packed_rotary_sin)
+        if S < B:
+            self.rotary_cos_bufs[B][S:].zero_()
+            self.rotary_sin_bufs[B][S:].zero_()
 
-        return out
+        # Replay
+        self.graphs[B].replay()
+
+        # Extract valid output
+        S_merged = S // merge_unit
+        return self.output_bufs[B][:S_merged].clone()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def run(
         self,
-        x: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        cu_window_seqlens: torch.Tensor,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        rotary_pos_emb_cos: Optional[torch.Tensor] = None,
-        rotary_pos_emb_sin: Optional[torch.Tensor] = None,
-        output_indices: Optional[torch.Tensor] = None,
+        per_image_tokens: List[torch.Tensor],
+        per_image_rotary_cos: List[torch.Tensor],
+        per_image_rotary_sin: List[torch.Tensor],
     ) -> torch.Tensor:
-        # x: [seq_len, hidden] -> [S, B=1, H]
-        x_3d = x.unsqueeze(1)
-        graph_key = self._get_graph_key(x_3d)
+        """Run the full ViT graph pipeline with bin-packing.
 
-        if graph_key not in self.block_graphs:
-            self.create_graph(
-                x_3d=x_3d,
-                position_embeddings=position_embeddings,
-                cu_seqlens=cu_seqlens,
-                cu_window_seqlens=cu_window_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-            )
+        Args:
+            per_image_tokens: list of [si, hidden_dim] tensors.
+            per_image_rotary_cos: list of [si, rotary_dim] tensors.
+            per_image_rotary_sin: list of [si, rotary_dim] tensors.
 
-        return self.replay(
-            graph_key=graph_key,
-            x_3d=x_3d,
-            position_embeddings=position_embeddings,
-            rotary_pos_emb_cos=rotary_pos_emb_cos,
-            rotary_pos_emb_sin=rotary_pos_emb_sin,
-            output_indices=output_indices,
-        )
+        Returns:
+            [total_merged, out_dim] concatenated output in original image order.
+        """
+        merge_unit = self.config.spatial_merge_unit
+        N = len(per_image_tokens)
+        image_token_counts = [t.shape[0] for t in per_image_tokens]
+
+        # Bin-pack
+        bins, eager_indices = self.bin_pack(image_token_counts)
+
+        # Allocate output storage (in original image order)
+        outputs: List[Optional[torch.Tensor]] = [None] * N
+
+        # Process bins via graph replay
+        for b in bins:
+            B = b.bucket_size
+            indices = b.image_indices
+            counts = [image_token_counts[i] for i in indices]
+
+            # Pack tokens
+            packed_tokens = torch.cat([per_image_tokens[i] for i in indices], dim=0)
+            packed_cos = torch.cat([per_image_rotary_cos[i] for i in indices], dim=0)
+            packed_sin = torch.cat([per_image_rotary_sin[i] for i in indices], dim=0)
+
+            merged = self.replay(B, packed_tokens, packed_cos, packed_sin, counts)
+
+            # Split per-image
+            offset = 0
+            for i, cnt in zip(indices, counts):
+                merged_cnt = cnt // merge_unit
+                outputs[i] = merged[offset : offset + merged_cnt]
+                offset += merged_cnt
+
+        # Process oversized images eagerly
+        for idx in eager_indices:
+            tokens = per_image_tokens[idx].unsqueeze(1)  # [S, 1, H]
+            S = tokens.shape[0]
+
+            # Build metadata for eager run
+            if self.config.attn_backend == "flashinfer_cudnn":
+                # Minimal cu_seqlens for single image
+                elem = self.config.elem_per_token
+                indptr = np.array([0, S * elem, S * elem], dtype=np.int32)
+                packed = np.concatenate([indptr, indptr, indptr])
+                cu = torch.from_numpy(packed).to(self.device)
+                sl = torch.tensor([S], dtype=torch.int32, device=self.device).view(
+                    1, 1, 1, 1
+                )
+                metadata = VisionAttentionMetadata(
+                    cu_seqlens=cu, max_seqlen=S, sequence_lengths=sl
+                )
+            else:
+                cu = torch.tensor([0, S], dtype=torch.int32, device=self.device)
+                metadata = VisionAttentionMetadata(cu_seqlens=cu, max_seqlen=S)
+
+            cos = per_image_rotary_cos[idx]
+            sin = per_image_rotary_sin[idx]
+            block_out, ds_outs = self.vit.run_blocks(tokens, metadata, cos, sin)
+            merged = self.vit.run_merger(block_out, ds_outs)
+            outputs[idx] = merged
+
+        # Concatenate in original order
+        return torch.cat([o for o in outputs if o is not None], dim=0)

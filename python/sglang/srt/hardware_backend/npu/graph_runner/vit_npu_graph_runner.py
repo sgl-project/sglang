@@ -25,12 +25,12 @@ import torch_npu
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+from sglang.srt.layers.attention.vision import VisionAttention, VisionAttentionMetadata
+from sglang.srt.multimodal.vit_cuda_graph_runner_legacy import ViTCudaGraphRunnerLegacy
 from sglang.srt.server_args import get_global_server_args
 
 
-class ViTNpuGraphRunner(ViTCudaGraphRunner):
+class ViTNpuGraphRunner(ViTCudaGraphRunnerLegacy):
     """Generic ViT NPU Graph Runner.
 
     This runner captures the "blocks + merger + deepstack merger (optional)" part
@@ -82,21 +82,25 @@ class ViTNpuGraphRunner(ViTCudaGraphRunner):
                 else:
                     raise RuntimeError("Not supported ViT attention backend")
 
+                fwd_metadata = VisionAttentionMetadata(
+                    cu_seqlens=cu_seq_lens,
+                    seq_lens=cu_seq_lens,
+                    max_seqlen=graph_key,
+                )
+
                 if layer_num == 0:
                     y = blk(
                         self.block_input[graph_key],
-                        cu_seqlens=cu_seq_lens,
+                        forward_metadata=fwd_metadata,
                         rotary_pos_emb_cos=self.sin_cos_ws[graph_key][0],
                         rotary_pos_emb_sin=self.sin_cos_ws[graph_key][1],
-                        output_ws=self.block_ws[graph_key],
                     )
                 else:
                     y = blk(
                         y,
-                        cu_seqlens=cu_seq_lens,
+                        forward_metadata=fwd_metadata,
                         rotary_pos_emb_cos=self.sin_cos_ws[graph_key][0],
                         rotary_pos_emb_sin=self.sin_cos_ws[graph_key][1],
-                        output_ws=self.block_ws[graph_key],
                     )
 
                 # Optional deepstack support (Qwen3-VL)
