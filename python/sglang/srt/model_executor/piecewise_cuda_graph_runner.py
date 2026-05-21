@@ -32,7 +32,11 @@ from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
-    set_forward_context,
+)
+from sglang.srt.compilation.piecewise_context_manager import (
+    set_forward_context as set_piecewise_forward_context,
+)
+from sglang.srt.compilation.piecewise_context_manager import (
     set_pcg_capture_stream,
 )
 from sglang.srt.distributed import get_tensor_model_parallel_rank
@@ -58,8 +62,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_musa,
@@ -423,9 +430,10 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
-        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
-        try:
-            with set_forward_context(
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            with set_piecewise_forward_context(
                 forward_batch,
                 self.attention_layers,
                 self.quant_config,
@@ -437,8 +445,6 @@ class PiecewiseCudaGraphRunner:
                     forward_batch.positions,
                     forward_batch,
                 )
-        finally:
-            set_attn_backend(prev_attn_backend)
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -610,7 +616,7 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
-            with set_forward_context(
+            with set_piecewise_forward_context(
                 forward_batch,
                 self.attention_layers,
                 self.quant_config,
@@ -627,14 +633,13 @@ class PiecewiseCudaGraphRunner:
 
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
-        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
-        try:
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
                 run_once()
-        finally:
-            set_attn_backend(prev_attn_backend)
 
         return
 
@@ -787,7 +792,7 @@ class PiecewiseCudaGraphRunner:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
             # Replay
-            with set_forward_context(
+            with set_piecewise_forward_context(
                 static_forward_batch,
                 self.attention_layers,
                 self.quant_config,

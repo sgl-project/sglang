@@ -23,8 +23,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.pool_context import set_attn_backend, set_kv_pools
+from sglang.srt.model_executor.pool_context import set_kv_pools
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -305,22 +309,21 @@ class FrozenKVMTPCudaGraphRunner:
             return ret
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
-        # Frozen-KV MTP graph capture: publish target pool + draft backend
-        # into pool_context for the duration of the capture so model layer
-        # reads see the target view.
+        # Frozen-KV MTP graph capture: publish target pool into pool_context
+        # and draft backend into the forward context for the duration of the
+        # capture so model layer reads see the target view.
         prev_pools = set_kv_pools(
             self.model_runner.req_to_token_pool,
             self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool,
         )
-        prev_attn_backend = set_attn_backend(self.draft_attn_backend)
         try:
-            self._capture_init(run_once)
-            out = self._capture_graph(
-                graph, get_global_graph_memory_pool(), stream, run_once
-            )
+            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+                self._capture_init(run_once)
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once
+                )
         finally:
             set_kv_pools(*prev_pools)
-            set_attn_backend(prev_attn_backend)
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 

@@ -26,7 +26,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -146,6 +146,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_forward_context,
+)
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
     ModelRunnerKVCacheMixin,
@@ -154,7 +159,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.pool_context import set_attn_backend, set_kv_pools
+from sglang.srt.model_executor.pool_context import set_kv_pools
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -2701,12 +2706,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        prev_attn_backend = set_attn_backend(self.attn_backend)
-        try:
+        with forward_context(ForwardContext(attn_backend=self.attn_backend)):
             with torch.inference_mode(), run_ctx or empty_context():
                 run_once()
-        finally:
-            set_attn_backend(prev_attn_backend)
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding
@@ -2990,10 +2992,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
-                # PDmux selects a per-stream backend; publish it to model-layer
-                # readers via pool_context so RadixAttention etc. dispatch
-                # against the right backend for this forward.
-                set_attn_backend(self.decode_attn_backend)
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
@@ -3001,13 +2999,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
 
-        # Launch forward
+        # Launch forward. PDmux selects a per-stream backend; publish it to
+        # model-layer readers via the forward context so RadixAttention etc.
+        # dispatch against the right backend for this forward.
         ctx = (
             self.device_timer.wrap(metadata={"category": "decode"})
             if self.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
+        pdmux_ctx = (
+            forward_context(
+                replace(get_forward_context(), attn_backend=self.decode_attn_backend)
+            )
+            if self.server_args.enable_pdmux
+            else contextlib.nullcontext()
+        )
+        with ctx, pdmux_ctx:
             return self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -3223,28 +3230,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Activate this runner's pools + attn_backend for the duration of the
-        # forward so that get_token_to_kv_pool() / get_req_to_token_pool() /
-        # get_attn_backend() resolve to the right objects regardless of which
-        # other ModelRunner instances have been initialized in this process.
-        # Frozen-KV MTP swaps self.token_to_kv_pool itself before calling
-        # forward(), so this set picks up that override. Spec workers that
-        # need a non-default per-call backend (e.g. topk>1 Eagle/Frozen-KV
-        # draft loop) override ``self.attn_backend`` on the draft runner
-        # themselves so this set picks it up.
+        # Activate this runner's pools for the duration of the forward so that
+        # get_token_to_kv_pool() / get_req_to_token_pool() resolve to the right
+        # objects regardless of which other ModelRunner instances have been
+        # initialized in this process. Frozen-KV MTP swaps
+        # self.token_to_kv_pool itself before calling forward(), so this set
+        # picks up that override.
+        #
+        # Per-forward-call control configs (attn_backend) ride on a separate
+        # ForwardContext stack; PDmux / spec-decode override sites wrap the
+        # dispatch in their own ``forward_context(replace(..., attn_backend=
+        # ...))`` blocks layered on top of this one.
         prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
-        prev_backend = set_attn_backend(self.attn_backend)
         try:
-            return self._forward_raw_body(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-                reinit_attn_backend=reinit_attn_backend,
-                split_forward_count=split_forward_count,
-            )
+            with forward_context(ForwardContext(attn_backend=self.attn_backend)):
+                return self._forward_raw_body(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    reinit_attn_backend=reinit_attn_backend,
+                    split_forward_count=split_forward_count,
+                )
         finally:
             set_kv_pools(*prev_pools)
-            set_attn_backend(prev_backend)
 
     def _forward_raw_body(
         self,

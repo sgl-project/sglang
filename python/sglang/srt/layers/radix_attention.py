@@ -22,14 +22,16 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    get_forward_context as get_piecewise_forward_context,
+)
 from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
     eager_on_graph,
 )
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.pool_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -121,7 +123,10 @@ class RadixAttention(nn.Module):
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
 
-        if forward_batch.forward_mode.is_extend() and get_forward_context() is not None:
+        if (
+            forward_batch.forward_mode.is_extend()
+            and get_piecewise_forward_context() is not None
+        ):
             if self.qk_head_dim != self.v_head_dim:
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
@@ -161,7 +166,7 @@ def unified_attention_with_output(
     k_rope: Optional[torch.Tensor] = None,
     sinks: Optional[torch.Tensor] = None,
 ) -> None:
-    context = get_forward_context()
+    context = get_piecewise_forward_context()
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]

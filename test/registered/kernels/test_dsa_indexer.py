@@ -380,16 +380,19 @@ class TestDSAIndexer(CustomTestCase):
                 seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
             )
 
-        # Pool refs + attn_backend are now in pool_context, not on ForwardBatch.
-        from sglang.srt.model_executor.pool_context import (
-            set_attn_backend,
-            set_kv_pools,
+        # Pool refs live in pool_context; attn_backend lives in forward_context.
+        # Neither is a ForwardBatch field. Set both as process-wide globals for
+        # the rest of the test (tests don't need save/restore).
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            set_forward_context,
         )
+        from sglang.srt.model_executor.pool_context import set_kv_pools
 
         set_kv_pools(
             self.model_runner.req_to_token_pool, self.model_runner.token_to_kv_pool
         )
-        set_attn_backend(self.backend)
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
         # Mock write to req_to_token_pool
         page_size = self.model_runner.page_size

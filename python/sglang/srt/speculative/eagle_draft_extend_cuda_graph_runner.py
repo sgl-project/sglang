@@ -25,8 +25,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
 from sglang.srt.utils import (
@@ -422,17 +425,16 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        # Publish the draft-extend attn_backend into pool_context so model
-        # code reads the right backend during warmup and capture.
-        prev_attn_backend = set_attn_backend(self.draft_extend_attn_backend)
-        try:
+        # Publish the draft-extend attn_backend into the forward context so
+        # model code reads the right backend during warmup and capture.
+        with forward_context(
+            ForwardContext(attn_backend=self.draft_extend_attn_backend)
+        ):
             self._capture_init(run_once)
 
             out = self._capture_graph(
                 graph, get_global_graph_memory_pool(), stream, run_once
             )
-        finally:
-            set_attn_backend(prev_attn_backend)
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out

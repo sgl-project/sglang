@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
-from sglang.srt.model_executor.pool_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import BumpAllocator, empty_context, get_bool_env_var, is_hip
@@ -691,8 +691,6 @@ class TboForwardBatchPreparer:
             "is_extend_in_batch",
             "all_extend_in_batch",
             "return_logprob",
-            "req_to_token_pool",
-            "token_to_kv_pool",
             "can_run_dp_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
