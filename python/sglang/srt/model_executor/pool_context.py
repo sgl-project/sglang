@@ -4,7 +4,11 @@
 Provides set_kv_pools() / get_token_to_kv_pool() / get_req_to_token_pool()
 as module-level globals, following the same pattern as get_global_server_args().
 
-Call set_kv_pools() once in ModelRunner.__init__ after init_memory_pool().
+ModelRunner.__init__ calls set_kv_pools() once after init_memory_pool().
+Code that needs a temporary pool swap (e.g. frozen-KV MTP) does explicit
+save/restore around the affected forward call. No locking is required: all
+runners live in the same process and forward calls are synchronous, so the
+global is mutated and read serially.
 """
 
 from __future__ import annotations
