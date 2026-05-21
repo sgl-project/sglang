@@ -2141,6 +2141,24 @@ def _close_main_process_sockets():
         setattr(tm, attr, None)
 
 
+def _uvicorn_bind_kwargs(server_args: ServerArgs) -> dict:
+    """Return the bind kwargs for uvicorn.Config / uvicorn.run.
+
+    UDS and host/port are mutually exclusive (enforced in ServerArgs); we
+    only ever return one shape or the other.
+    """
+    if server_args.uds:
+        return {"uds": server_args.uds}
+    return {"host": server_args.host, "port": server_args.port}
+
+
+def _format_listen_addr(server_args: ServerArgs) -> str:
+    """Human-readable listener address for startup logs."""
+    if server_args.uds:
+        return f"unix:{server_args.uds}"
+    return f"{server_args.host}:{server_args.port}"
+
+
 def _run_granian_server(server_args: ServerArgs):
     """Launch Granian with HTTP/2 support"""
     from granian import Granian
