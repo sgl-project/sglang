@@ -124,21 +124,21 @@ def fill_plan_input_per_forward(
     plan_input_out.fb_prefix_lens.zero_()
     plan_input_out.fb_extend_seq_lens.zero_()
 
-    prefix_lens, extend_seq_lens = _get_prefix_lens_and_extend_seq_lens(
+    _fill_prefix_lens_and_extend_seq_lens(
         forward_batch=forward_batch,
+        plan_input_out=plan_input_out,
         bs=bs,
     )
-    plan_input_out.fb_prefix_lens[:bs].copy_(prefix_lens)
-    plan_input_out.fb_extend_seq_lens[:bs].copy_(extend_seq_lens)
 
     return bs
 
 
-def _get_prefix_lens_and_extend_seq_lens(
+def _fill_prefix_lens_and_extend_seq_lens(
     *,
     forward_batch: "ForwardBatch",
+    plan_input_out: PlanInput,
     bs: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> None:
     # Enumerate per forward_mode rather than trusting forward_batch.extend_prefix_lens /
     # extend_seq_lens for every mode — those two fields are unreliable for spec-decode paths:
     # TARGET_VERIFY skips populating them in ForwardBatch.init_new (the is_decode-or-target_verify
@@ -156,35 +156,37 @@ def _get_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode is None or forward_mode.is_decode_or_idle():
-        prefix_lens = (forward_batch.seq_lens[:bs] - 1).to(torch.int64)
-        extend_seq_lens = torch.ones(
-            bs, dtype=torch.int64, device=forward_batch.seq_lens.device
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            (forward_batch.seq_lens[:bs] - 1).to(torch.int64)
         )
+        plan_input_out.fb_extend_seq_lens[:bs].fill_(1)
     elif forward_mode.is_target_verify():
         # seq_lens has NOT been bumped at TARGET_VERIFY (prepare_for_v2_verify only flips the
         # forward_mode and assigns out_cache_loc for positions [seq_lens, seq_lens +
         # draft_token_num)). So prefix == current seq_lens, extend == uniform draft_token_num.
-        prefix_lens = forward_batch.seq_lens[:bs].to(torch.int64)
-        extend_seq_lens = torch.full(
-            (bs,),
-            int(spec_info.draft_token_num),
-            dtype=torch.int64,
-            device=forward_batch.seq_lens.device,
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            forward_batch.seq_lens[:bs].to(torch.int64)
         )
+        plan_input_out.fb_extend_seq_lens[:bs].fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
         # seq_lens HAS been bumped at DRAFT_EXTEND_V2 (prepare_for_extend_to_fill_draft_kvcache
         # adds num_draft_tokens). forward_batch.extend_seq_lens is populated in both eager (via
         # init_new) and cuda-graph (the synthetic ForwardBatch sets it explicitly); only
         # extend_prefix_lens is missing in cuda-graph, so derive it as seq_lens - extend_seq_lens.
         extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int64)
-        prefix_lens = forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
+        plan_input_out.fb_extend_seq_lens[:bs].copy_(extend_seq_lens)
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
+        )
     else:
         # EXTEND / MIXED / DRAFT_EXTEND / SPLIT_PREFILL / DLLM_EXTEND — extend_*_lens guaranteed
         # populated by init_new's else branch.
-        prefix_lens = forward_batch.extend_prefix_lens[:bs].to(torch.int64)
-        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int64)
-
-    return prefix_lens, extend_seq_lens
+        plan_input_out.fb_prefix_lens[:bs].copy_(
+            forward_batch.extend_prefix_lens.to(torch.int64)
+        )
+        plan_input_out.fb_extend_seq_lens[:bs].copy_(
+            forward_batch.extend_seq_lens.to(torch.int64)
+        )
 
 
 def build_plan_input_radix_sweep(
