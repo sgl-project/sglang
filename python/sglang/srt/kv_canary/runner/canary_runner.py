@@ -207,6 +207,7 @@ class CanaryRunner:
             return
 
         self._per_forward_orchestrator.end_of_step(forward_batch)
+        self._perturb_manager.perturb_real_kv_unused_cache(forward_batch=None)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()

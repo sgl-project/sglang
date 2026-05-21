@@ -119,7 +119,8 @@ class PerForwardOrchestrator:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._perturb_manager.perturb(forward_batch)
+        self._perturb_manager.perturb_req_to_token(forward_batch)
+        self._perturb_manager.perturb_real_kv_used(forward_batch)
 
         if self._config.input_check_mode:
             manager = self._token_oracle_manager
