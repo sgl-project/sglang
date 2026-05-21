@@ -145,6 +145,7 @@ _SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
 
 
 def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
     result = {}
     for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
         for backend, suites in suite_dict.items():
@@ -312,6 +313,7 @@ def run_a_suite(args):
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
+    # Add extra timeout when retry is enabled
     timeout = args.timeout_per_file
     if args.enable_retry:
         timeout += args.retry_timeout_increase
@@ -397,6 +399,7 @@ def main():
     )
     args = parser.parse_args()
 
+    # Validate auto-partition arguments
     if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
         parser.error(
             "--auto-partition-id and --auto-partition-size must be specified together."
