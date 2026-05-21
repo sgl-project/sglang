@@ -249,6 +249,12 @@ class ViTCudaGraphRunner:
         for B in self.BUCKET_SIZES:
             self._capture(B)
 
+        # Clear dynamo caches polluted by bucket-specific shapes.
+        # apply_rotary_pos_emb_native uses @torch.compile(dynamic=True) which
+        # creates shape guards during warmup.  Without reset, eager fallback
+        # (tokens > max bucket) hits recompilation (~3 s per new shape).
+        torch._dynamo.reset()
+
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
