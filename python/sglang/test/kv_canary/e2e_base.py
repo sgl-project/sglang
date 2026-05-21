@@ -11,6 +11,7 @@ from typing import ClassVar, Literal, Optional
 
 import requests
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.test_utils import (
@@ -140,10 +141,10 @@ class CanaryE2EBase(CustomTestCase):
         self,
         *,
         fail_reason: str,
-        target_group: Optional[Literal["full", "swa"]] = None,
+        target_group: Optional[TargetGroupKind] = None,
         flush_wait_seconds: float = 2.0,
     ) -> None:
-        suffix = "" if target_group is None else f"_{target_group.upper()}"
+        suffix = "" if target_group is None else f"_{target_group.name}"
         self.assert_violation_logged_any(
             launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
             fail_reason=fail_reason,
@@ -154,11 +155,11 @@ class CanaryE2EBase(CustomTestCase):
         self,
         *,
         fail_reason: str,
-        target_group: Literal["full", "swa"],
+        target_group: TargetGroupKind,
         flush_wait_seconds: float = 2.0,
     ) -> None:
         self.assert_violation_logged_any(
-            launch_tag_patterns=(f"SWEEP_*_{target_group.upper()}",),
+            launch_tag_patterns=(f"SWEEP_*_{target_group.name}",),
             fail_reason=fail_reason,
             flush_wait_seconds=flush_wait_seconds,
         )

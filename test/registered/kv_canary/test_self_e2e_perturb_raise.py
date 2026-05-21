@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -39,7 +40,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
             pass
         self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",
-            target_group="full",
+            target_group=TargetGroupKind.FULL,
             flush_wait_seconds=3.0,
         )
 

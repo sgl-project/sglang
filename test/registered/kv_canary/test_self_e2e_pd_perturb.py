@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from typing import ClassVar, Literal
+from typing import ClassVar
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.pd_fixture import CanaryPDFixture
 
@@ -34,13 +35,13 @@ class _PDPerturbBase(CanaryPDFixture):
     real_kv_hash mismatch shows up on the D-side log only.
     """
 
-    target_group: ClassVar[Literal["full", "swa"]]
+    target_group: ClassVar[TargetGroupKind]
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.extra_prefill_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "1.0",
-            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
+            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
         super().setUpClass()
@@ -57,17 +58,17 @@ class _PDPerturbBase(CanaryPDFixture):
 
 class TestPDPerturbMhaFull(_PDPerturbBase, unittest.TestCase):
     model_mode = "mha"
-    target_group = "full"
+    target_group = TargetGroupKind.FULL
 
 
 class TestPDPerturbSwaFull(_PDPerturbBase, unittest.TestCase):
     model_mode = "swa"
-    target_group = "full"
+    target_group = TargetGroupKind.FULL
 
 
 class TestPDPerturbSwaSwa(_PDPerturbBase, unittest.TestCase):
     model_mode = "swa"
-    target_group = "swa"
+    target_group = TargetGroupKind.SWA
 
 
 if __name__ == "__main__":

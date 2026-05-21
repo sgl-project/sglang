@@ -8,6 +8,7 @@ from typing import ClassVar, Literal, Optional
 
 import requests
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -98,13 +99,13 @@ class CanaryPDFixture(PDDisaggregationServerBase):
         self,
         *,
         fail_reason: str,
-        target_group: Literal["full", "swa"],
+        target_group: TargetGroupKind,
         flush_wait_seconds: float = 4.0,
     ) -> None:
         """Scan the decode-side log for a HEAD_*/TAIL_* canary violation matching the
         target group. The longer default flush_wait_seconds accounts for D-side D2H
         pump latency plus PD transfer overhead."""
-        suffix = f"_{target_group.upper()}"
+        suffix = f"_{target_group.name}"
         self._assert_violation_logged_any(
             side="decode",
             launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),

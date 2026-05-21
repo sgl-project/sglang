@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
-from typing import ClassVar, Literal
+from typing import ClassVar
 
+from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -28,13 +29,13 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
     )
     use_unique_prompts = True
 
-    target_group: ClassVar[Literal["full", "swa"]]
+    target_group: ClassVar[TargetGroupKind]
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.extra_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
-            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
+            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
         super().setUpClass()
@@ -59,21 +60,21 @@ class TestPerturbRealKvUnusedCacheMhaFull(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
     model_mode = "mha"
-    target_group = "full"
+    target_group = TargetGroupKind.FULL
 
 
 class TestPerturbRealKvUnusedCacheSwaFull(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
     model_mode = "swa"
-    target_group = "full"
+    target_group = TargetGroupKind.FULL
 
 
 class TestPerturbRealKvUnusedCacheSwaSwa(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
     model_mode = "swa"
-    target_group = "swa"
+    target_group = TargetGroupKind.SWA
 
 
 if __name__ == "__main__":
