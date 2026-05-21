@@ -296,6 +296,14 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
       S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
       S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
+      # Eval — passed through to srt-slurm's do_sweep.py. RUN_EVAL=true runs
+      # lm-eval after the perf sweep against the same server (single Slurm
+      # job). EVAL_CONC controls the eval-phase concurrency (median of
+      # conc-list keeps GPU memory comfortable). Both are sourced from
+      # matrix entries built by generate_matrix.py.
+      RUN_EVAL: ${{ matrix.config.run_eval }}
+      EVAL_ONLY: ${{ matrix.config.eval_only }}
+      EVAL_CONC: ${{ matrix.config.eval_conc }}
 
     steps:
       - name: Checkout code
@@ -346,6 +354,32 @@ jobs:
             ${{ github.workspace }}/multinode_server_logs.tar.gz
           retention-days: 30
           if-no-files-found: warn
+
+      - name: Upload eval results
+        if: always() && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: gb200-eval-${{ matrix.config.name }}-${{ github.run_id }}
+          path: |
+            ${{ github.workspace }}/meta_env.json
+            ${{ github.workspace }}/results*.json
+            ${{ github.workspace }}/sample*.jsonl
+          retention-days: 30
+          if-no-files-found: ${{ matrix.config.eval_only == 'true' && 'error' || 'ignore' }}
+
+      - name: Verify eval scores
+        # Eval scores must meet thresholds.json on cron runs. For workflow_dispatch
+        # we still report results but don't gate the workflow on them — accuracy
+        # below threshold is "info" for a dev-triggered run, "failure" for nightly.
+        if: ${{ (success() || failure()) && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true') }}
+        continue-on-error: ${{ github.event_name != 'schedule' }}
+        run: |
+          if ls ${{ github.workspace }}/results*.json 1>/dev/null 2>&1; then
+            cd ${{ github.workspace }}
+            python3 scripts/ci/slurm/eval-workspace/utils/evals/validate_scores.py
+          else
+            echo "no eval results found; skipping validation"
+          fi
 
       - name: Analyze logs with AI on failure
         if: failure()

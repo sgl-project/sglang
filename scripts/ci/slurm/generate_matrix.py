@@ -22,12 +22,42 @@ import sys
 
 import yaml
 
+# Concurrencies below this are skipped when picking the eval candidate — too
+# few in-flight requests to keep the model warm for a meaningful eval pass.
+# Matches InferenceX's mark_eval_entries policy.
+MIN_EVAL_CONC = 16
+
 
 def seq_len_str(isl, osl):
     def fmt(n):
         return f"{n // 1024}k" if n % 1024 == 0 else str(n)
 
     return f"{fmt(isl)}{fmt(osl)}"
+
+
+def _pick_eval_entry(search_space):
+    """Within a (precision, isl, osl) group, pick the entry with the highest
+    max-concurrency (eligible concs only) and compute its eval concurrency.
+
+    Returns (best_index, eval_conc) or (-1, None) if no entry is eligible.
+    eval_conc is the upper-median of the chosen entry's eligible conc list —
+    keeps eval-phase GPU memory comfortable without dropping concurrency so
+    low that the eval drags on.
+    """
+    best_idx = -1
+    best_max = -1
+    best_eligible: list[int] = []
+    for i, entry in enumerate(search_space):
+        eligible = sorted(c for c in entry.get("conc-list", []) if c >= MIN_EVAL_CONC)
+        if not eligible:
+            continue
+        if eligible[-1] > best_max:
+            best_max = eligible[-1]
+            best_idx = i
+            best_eligible = eligible
+    if best_idx < 0:
+        return -1, None
+    return best_idx, best_eligible[len(best_eligible) // 2]
 
 
 def main():
@@ -59,11 +89,18 @@ def main():
         for seq_cfg in exp["seq-len-configs"]:
             isl, osl = seq_cfg["isl"], seq_cfg["osl"]
             sl = seq_len_str(isl, osl)
+            search_space = seq_cfg["search-space"]
 
-            for entry in seq_cfg["search-space"]:
+            # Auto-select one entry per (exp, isl, osl) group to also run
+            # lm-eval after the perf sweep. Picks the recipe with the highest
+            # max-conc; lm-eval then runs at the upper-median of its concs.
+            eval_idx, eval_conc = _pick_eval_entry(search_space)
+
+            for i, entry in enumerate(search_space):
                 config_file = entry["config_file"]
                 topology = config_file.rsplit("/", 1)[-1].replace(".yaml", "")
 
+                is_eval_entry = i == eval_idx
                 matrix.append(
                     {
                         "name": f"{exp['model-prefix']}-{exp['precision']}-{sl}-{topology}",
@@ -74,6 +111,13 @@ def main():
                         "isl": str(isl),
                         "osl": str(osl),
                         "config_file": config_file,
+                        # Eval flags — workflow forwards these as env vars
+                        # consumed by srt-slurm's do_sweep.py. Strings (not
+                        # bools) so the GH Actions env: block can copy them
+                        # verbatim without YAML-to-shell conversion surprises.
+                        "run_eval": "true" if is_eval_entry else "false",
+                        "eval_only": "false",
+                        "eval_conc": str(eval_conc) if is_eval_entry else "",
                     }
                 )
 
