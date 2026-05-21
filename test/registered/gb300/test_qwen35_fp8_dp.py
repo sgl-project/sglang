@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.gb300_utils import GB300_NCCL_PORT
@@ -33,6 +35,7 @@ DP_MTP_ARGS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35Fp8Dp(CustomTestCase):
     """Qwen3.5-397B FP8 DP4+DPA+MTP on GB300 (4x GB300 NVL4)."""
 

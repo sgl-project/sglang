@@ -1,5 +1,5 @@
 import unittest
-
+import torch
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
@@ -17,6 +17,7 @@ _AMD_SKIP_BACKEND = "fa3 / flashinfer attention backends are CUDA-only (not in t
 
 
 @unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):
     attention_backend = "fa3"
     speculative_eagle_topk = 2
@@ -24,6 +25,7 @@ class TestStandaloneSpeculativeDecodingBase(StandaloneServerBase, CustomTestCase
     disable_overlap = True
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCase):
     attention_backend = "triton"
     speculative_eagle_topk = 2
@@ -33,6 +35,7 @@ class TestStandaloneSpeculativeDecodingTriton(StandaloneServerBase, CustomTestCa
 
 
 @unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneSpeculativeDecodingFlashinfer(StandaloneServerBase, CustomTestCase):
     attention_backend = "flashinfer"
     speculative_eagle_topk = 2
