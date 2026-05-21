@@ -22,20 +22,11 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
     def __call__(self, **kwargs):
         result = self._processor(**kwargs)
 
-        # Map HuggingFace output keys to sglang standard keys
-        key_mapping = {
-            "input_image_embeds": "pixel_values",
-            "input_audio_embeds": "audio_features",
-            "audio_embed_sizes": "audio_feature_lens",
-        }
-        for hf_key, sglang_key in key_mapping.items():
-            if hf_key in result:
-                result[sglang_key] = result[hf_key]
-                del result[hf_key]
-
         # Filter out None or empty tensors from the result.
         # This prevents the sglang function base_processor.collect_mm_items_from_processor_output()
         # from misclassifying audio content as image content, and vice versa.
+        # (HF Phi-4-native key names like input_image_embeds are translated to
+        # sglang-standard names by the base class via HF_KEY_RENAMES below.)
         filtered_result = {
             k: v
             for k, v in result.items()
@@ -46,6 +37,16 @@ class Phi4MMProcessorAdapter(ProcessorMixin):
 
 class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
     models = [Phi4MMForCausalLM]
+
+    # HF Phi-4-native processor keys → sglang-standard names. Applied by the
+    # base class in collect_mm_items_from_processor_output before the
+    # ATTR_NAME_TO_MODALITY lookup; without this, the IMAGE / AUDIO mm_items
+    # come out without `feature` set and the model crashes downstream.
+    HF_KEY_RENAMES = {
+        "input_image_embeds": "pixel_values",
+        "input_audio_embeds": "audio_features",
+        "audio_embed_sizes": "audio_feature_lens",
+    }
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.processor = Phi4MMProcessorAdapter(_processor)

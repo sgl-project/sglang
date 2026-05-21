@@ -1031,7 +1031,26 @@ class BaseMultimodalProcessor(ABC):
         these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be passed via offline engine api
+
+        Subclasses can declare a ``HF_KEY_RENAMES`` mapping to translate model-
+        specific HF processor output keys to sglang-standard names before the
+        ATTR_NAME_TO_MODALITY lookup. Example::
+
+            class Phi4MMMultimodalProcessor(BaseMultimodalProcessor):
+                HF_KEY_RENAMES = {
+                    "input_image_embeds": "pixel_values",
+                    "input_audio_embeds": "audio_features",
+                    "audio_embed_sizes": "audio_feature_lens",
+                }
+
+        Without the rename, HF-native keys outside ATTR_NAME_TO_MODALITY are
+        silently dropped — the per-modality mm_item is then created without
+        ``feature`` set, and the model's get_*_feature blows up downstream.
         """
+
+        renames = getattr(self, "HF_KEY_RENAMES", None)
+        if renames:
+            data_dict = {renames.get(k, k): v for k, v in data_dict.items()}
 
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
