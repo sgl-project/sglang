@@ -105,7 +105,7 @@ def _swa_alloc(allocator, need_size):
     full_indices = allocator.full_attn_allocator.alloc(need_size)
     swa_indices = allocator.swa_attn_allocator.alloc(need_size)
     assert full_indices is not None and swa_indices is not None
-    allocator.full_to_swa_index_mapping[full_indices] = swa_indices
+    allocator.set_full_to_swa_mapping(full_indices, swa_indices)
     return full_indices
 
 
