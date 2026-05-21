@@ -191,7 +191,8 @@ class EmbeddingCacheController:
 
         with self.access_lock:
             # Sort by access time (oldest first)
-            sorted_hashes = sorted(self.access_order.items(), key=lambda x: x[1])
+            # Python dicts are insertion-ordered; the first keys are the oldest.
+            sorted_hashes = self.access_order.items()
 
         for image_hash, _ in sorted_hashes:
             if image_hash not in self.hash_to_metadata:
