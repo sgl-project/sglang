@@ -2895,10 +2895,8 @@ class Scheduler(
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-                    # Placeholder for next iter's resolve_future; mirrors the
-                    # input_ids handle-mode treatment one line above. Post-verify
-                    # seq_lens lives in future_map.new_seq_lens_buf and is
-                    # resolved back into batch.seq_lens inside isolation.
+                    # Schedule-stream sentinel between iters; next iter's
+                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
                     batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
