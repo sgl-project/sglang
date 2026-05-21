@@ -12,13 +12,19 @@ logger = logging.getLogger(__name__)
 def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> None:
     """Apply NemotronH model-specific server arg defaults and constraints."""
     model_config = server_args.get_model_config()
+    # NemotronH-specific config fields live on the inner llm_config for the
+    # VL/Omni wrappers (NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3)
+    # and on hf_config directly for the standalone NemotronHForCausalLM.
+    nemotron_h_cfg = getattr(
+        model_config.hf_config, "llm_config", model_config.hf_config
+    )
     if model_config.quantization in [
         "modelopt",
         "modelopt_fp8",
         "modelopt_fp4",
         "modelopt_mixed",
     ]:
-        assert model_config.hf_config.mlp_hidden_act == "relu2"
+        assert nemotron_h_cfg.mlp_hidden_act == "relu2"
         if model_config.quantization == "modelopt":
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":
@@ -37,7 +43,13 @@ def apply_nemotron_h_defaults(server_args: "ServerArgs", model_arch: str) -> Non
                     f"{model_arch}"
                 )
             else:
+                # Blackwell consumer (sm_110 / sm_120 / sm_121): native
+                # cutlass_moe_fp4 kernel is sm_100-only; flashinfer_cutlass
+                # has SM110/120/121 JIT support and non-gated awareness.
                 server_args.moe_runner_backend = "flashinfer_cutlass"
+                logger.info(
+                    "Use flashinfer_cutlass as MoE runner backend for " f"{model_arch}"
+                )
 
     server_args._handle_mamba_radix_cache(
         model_arch=model_arch,
