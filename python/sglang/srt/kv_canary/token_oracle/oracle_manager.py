@@ -35,11 +35,11 @@ class TokenOracleManager:
         input_ids = forward_batch.input_ids
         num_tokens = int(input_ids.shape[0])
 
-        rids_hashed = forward_batch.rids_hashed
-        if rids_hashed is None:
+        rids_int = forward_batch.rids_int
+        if rids_int is None:
             raise RuntimeError(
-                "fill_expected_inputs: forward_batch.rids_hashed is None; "
-                "token oracle requires the per-forward rids_hashed tensor "
+                "fill_expected_inputs: forward_batch.rids_int is None; "
+                "token oracle requires the per-forward rids_int tensor "
                 "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
             )
 
@@ -49,7 +49,7 @@ class TokenOracleManager:
         req_ids = _build_req_id_per_token(
             forward_batch=forward_batch,
             num_tokens=num_tokens,
-            rids_per_row=rids_hashed,
+            rids_per_row=rids_int,
         )
         expected_tokens = self.oracle.expected_tokens(
             req_ids=req_ids, positions=positions.to(torch.int64)

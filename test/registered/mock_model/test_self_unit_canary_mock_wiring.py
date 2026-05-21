@@ -33,7 +33,7 @@ class _StubForwardBatch:
     req_pool_indices: torch.Tensor
     forward_mode: _StubForwardMode
     extend_seq_lens: object
-    rids_hashed: torch.Tensor
+    rids_int: torch.Tensor
 
 
 def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) -> int:
@@ -57,7 +57,7 @@ class TestFillExpectedInputs(CustomTestCase):
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=False),
             extend_seq_lens=None,
-            rids_hashed=torch.tensor(
+            rids_int=torch.tensor(
                 [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
                 dtype=torch.int64,
             ),
@@ -98,7 +98,7 @@ class TestFillExpectedInputs(CustomTestCase):
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=True),
             extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
-            rids_hashed=torch.tensor([hashed_a, hashed_b], dtype=torch.int64),
+            rids_int=torch.tensor([hashed_a, hashed_b], dtype=torch.int64),
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=8, device=torch.device("cpu")
@@ -133,7 +133,7 @@ class TestFillExpectedInputs(CustomTestCase):
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
             forward_mode=_StubForwardMode(extend=False),
             extend_seq_lens=None,
-            rids_hashed=torch.tensor(
+            rids_int=torch.tensor(
                 [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
                 dtype=torch.int64,
             ),

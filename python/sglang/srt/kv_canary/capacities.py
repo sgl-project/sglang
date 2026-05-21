@@ -47,7 +47,9 @@ class CanaryLaunchCapacities:
         num_tokens_per_bs = 1
         if spec_num_draft_tokens:
             num_tokens_per_bs = max(num_tokens_per_bs, spec_num_draft_tokens)
+
         max_bs = max(cuda_graph_max_bs, req_to_token_pool_size)
+
         chunked_prefill_size = server_args.chunked_prefill_size
         max_prefill_tokens = server_args.max_prefill_tokens
         chunked_limit = (
@@ -56,9 +58,11 @@ class CanaryLaunchCapacities:
             else math.inf
         )
         max_extend_tokens_per_forward = min(max_prefill_tokens, chunked_limit)
+
         write_entry_capacity = max(
             1, max(max_bs * num_tokens_per_bs, max_extend_tokens_per_forward)
         )
+
         # Per-forward verify entries = sum_r (prefix_lens[r] - SWA_window_start[r]); the FULL group
         # never clips with a window, so the upper bound is sum_r prefix_lens[r]. Under radix prefix
         # sharing, reqs can collectively reference more tokens than the pool holds, so the budget
