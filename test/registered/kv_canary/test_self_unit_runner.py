@@ -522,8 +522,28 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
         self.assertEqual(
             capacities.per_forward_verify_capacity,
-            max(1, int(max_total_num_tokens * 1.2)),
+            int(max_total_num_tokens * 1.2),
         )
+
+    def test_manual_capacities_reject_non_positive_fields(self):
+        """Verify manual launch capacities fail instead of being clamped."""
+        with self.assertRaisesRegex(ValueError, "per_forward_verify_capacity"):
+            CanaryLaunchCapacities(
+                per_forward_verify_capacity=0,
+                per_forward_write_req_capacity=1,
+                per_forward_write_entry_capacity=1,
+                sweep_verify_capacity=1,
+            )
+
+    def test_from_args_rejects_empty_pool_capacity(self):
+        """Verify derived launch capacities reject invalid pool sizing."""
+        with self.assertRaisesRegex(ValueError, "pool_slot_count"):
+            CanaryLaunchCapacities.from_args(
+                server_args=self._make_server_args(max_bs=1),
+                req_to_token_pool_size=1,
+                max_seq_len_per_req=1,
+                pool_slot_count=0,
+            )
 
 
 class TestPlanRefOverflowGate(CustomTestCase):

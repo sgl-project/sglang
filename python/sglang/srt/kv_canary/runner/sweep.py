@@ -56,7 +56,7 @@ class SweepOrchestrator:
         self._radix_cache: Optional["BasePrefixCache"] = None
 
         self._verify_plan_sweep_radix = VerifyPlan.allocate(
-            verify_capacity=max(1, sweep_verify_capacity), device=device
+            verify_capacity=sweep_verify_capacity, device=device
         )
         self._write_plan_sweep = WritePlan.allocate(write_req_capacity=1, device=device)
 
