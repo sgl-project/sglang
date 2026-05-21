@@ -8,7 +8,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def canary_plan_step_torch_reference(
+def run_canary_plan_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
@@ -20,14 +20,14 @@ def canary_plan_step_torch_reference(
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
 ) -> None:
-    """Python reference for :func:`canary_plan_step`. Same signature & byte-equal semantics."""
+    """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
     bs = int(fb_req_pool_indices.shape[0])
     work_device = torch.device("cpu")
 
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     if verify_capacity != plan_verify_capacity:
         raise ValueError(
-            f"kv-canary: canary_plan_step_torch_reference verify_capacity={verify_capacity} does not "
+            f"kv-canary: run_canary_plan_torch_reference verify_capacity={verify_capacity} does not "
             f"match verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])

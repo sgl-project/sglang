@@ -78,9 +78,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
         """Verify per-forward launch invokes verify before write."""
         calls: List = []
         with patch.object(
-            endpoint_module, "canary_verify_step", _record_call(calls, "verify")
+            endpoint_module, "launch_canary_verify_kernel", _record_call(calls, "verify")
         ), patch.object(
-            endpoint_module, "canary_write_step", _record_call(calls, "write")
+            endpoint_module, "launch_canary_write_kernel", _record_call(calls, "write")
         ):
             ep = _make_endpoint(device=self.device)
             args = _make_kernel_args(self.device)
@@ -105,11 +105,11 @@ class TestSelfUnitEndpoint(CustomTestCase):
         captured: List = []
         with patch.object(
             endpoint_module,
-            "canary_verify_step",
+            "launch_canary_verify_kernel",
             lambda **kwargs: captured.append(("verify", kwargs["kernel_kind"])),
         ), patch.object(
             endpoint_module,
-            "canary_write_step",
+            "launch_canary_write_kernel",
             lambda **kwargs: captured.append(("write", kwargs["kernel_kind"])),
         ):
             ep = _make_endpoint(
@@ -135,11 +135,11 @@ class TestSelfUnitEndpoint(CustomTestCase):
         calls: List[str] = []
         with patch.object(
             endpoint_module,
-            "canary_verify_step",
+            "launch_canary_verify_kernel",
             lambda **kwargs: calls.append("verify"),
         ), patch.object(
             endpoint_module,
-            "canary_write_step",
+            "launch_canary_write_kernel",
             lambda **kwargs: calls.append("write"),
         ):
             ep = _make_endpoint(
@@ -158,9 +158,9 @@ class TestSelfUnitEndpoint(CustomTestCase):
         captured_rings: List[int] = []
         with patch.object(
             endpoint_module,
-            "canary_verify_step",
+            "launch_canary_verify_kernel",
             lambda **kwargs: captured_rings.append(kwargs["violation_ring"].data_ptr()),
-        ), patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None):
+        ), patch.object(endpoint_module, "launch_canary_write_kernel", lambda **kwargs: None):
             shared_log = ViolationLog.allocate(ring_capacity=2, device=self.device)
             ep_a = _make_endpoint(
                 device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_K_FULL
@@ -187,10 +187,10 @@ class TestSelfUnitEndpoint(CustomTestCase):
         """Verify SWA endpoints translate cache locations before write launch."""
         captured: List[torch.Tensor] = []
         with patch.object(
-            endpoint_module, "canary_verify_step", lambda **kwargs: None
+            endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
         ), patch.object(
             endpoint_module,
-            "canary_write_step",
+            "launch_canary_write_kernel",
             lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
         ):
             # LUT maps full slot i → swa slot (i + 100) so we can verify the gather happened.
@@ -239,10 +239,10 @@ class TestSelfUnitEndpoint(CustomTestCase):
         """Verify SWA sentinel cache rows become write-skip markers."""
         captured: List[torch.Tensor] = []
         with patch.object(
-            endpoint_module, "canary_verify_step", lambda **kwargs: None
+            endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
         ), patch.object(
             endpoint_module,
-            "canary_write_step",
+            "launch_canary_write_kernel",
             lambda **kwargs: captured.append(kwargs["fb_out_cache_loc"]),
         ):
             # 8 in-window rows + 1 trailing sentinel row at index 8.
@@ -282,10 +282,10 @@ class TestSelfUnitEndpoint(CustomTestCase):
         """Verify endpoint launch preserves canonical int64 write inputs."""
         captured: List[dict] = []
         with patch.object(
-            endpoint_module, "canary_verify_step", lambda **kwargs: None
+            endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None
         ), patch.object(
             endpoint_module,
-            "canary_write_step",
+            "launch_canary_write_kernel",
             lambda **kwargs: captured.append(kwargs),
         ):
             ep = _make_endpoint(device=self.device)

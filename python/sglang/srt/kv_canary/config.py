@@ -37,7 +37,7 @@ class CanaryConfig:
             redundancy) and verifies them.
         real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Uniform across head/tail/sweep launches;
             PARTIAL (first 16B, hard cap) is cheap enough for production defaults.
-        input_check_mode: bool. True = canary_write_step additionally compares
+        input_check_mode: bool. True = launch_canary_write_kernel additionally compares
             forward_batch.input_ids[i] / positions[i] against caller-supplied expected_input_tokens[i] /
             expected_input_positions[i]; mismatch records a violation. Only useful when something else
             (e.g. token_oracle.oracle_manager.fill_expected_inputs) is feeding the expected_* placeholders

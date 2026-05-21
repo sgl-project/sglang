@@ -20,12 +20,13 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WritePlan:
-    """Write plan consumed by canary_write_step: per-token slot indices + per-req metadata.
+    """Write plan consumed by launch_canary_write_kernel: per-token slot indices + per-req metadata.
 
-    Fully per-req — no per-token tile. canary_write_step uses write_offsets to map each thread's (req, j) into a
-    flat index i, then reads token-level data from fb_input_ids / fb_positions / fb_out_cache_loc[i] directly.
+    Fully per-req — no per-token tile. launch_canary_write_kernel uses write_offsets to map each thread's
+    (req, j) into a flat index i, then reads token-level data from fb_input_ids / fb_positions /
+    fb_out_cache_loc[i] directly.
     SWA translation of per-token slots is done **host-side by the caller** (typically the endpoint) before
-    invoking canary_write_step — the kernel is SWA-agnostic and only understands "slot ≥ 0 ⇒ write;
+    invoking launch_canary_write_kernel — the kernel is SWA-agnostic and only understands "slot ≥ 0 ⇒ write;
     slot < 0 ⇒ skip this entry". Only the chain-seed slot (a per-req gather from req_to_token at plan time)
     is SWA-translated by the plan kernel and lives in write_seed_slot_indices.
 
@@ -38,8 +39,8 @@ class WritePlan:
             write_offsets[write_num_valid_reqs[0]] == total_write_entries.
         write_seed_slot_indices: Chain-seed slot per write req, shape [write_req_capacity], int64. Already
             SWA-translated. -1 = no prefix (chain anchors on CANARY_CHAIN_ANCHOR).
-        write_num_valid_reqs: Active write-req count, shape [1], int32. canary_write_step skips blocks with
-            block_id >= write_num_valid_reqs[0].
+        write_num_valid_reqs: Active write-req count, shape [1], int32. launch_canary_write_kernel skips blocks
+            with block_id >= write_num_valid_reqs[0].
     """
 
     write_offsets: torch.Tensor
@@ -69,7 +70,7 @@ class WritePlan:
         )
 
 
-def canary_write_step(
+def launch_canary_write_kernel(
     *,
     canary_buf: torch.Tensor,
     plan: WritePlan,
@@ -131,7 +132,7 @@ def canary_write_step(
             groups (typically a host-side LUT gather in the endpoint); FULL groups pass it through
             unchanged. A -1 entry signals skip-this-token (used for SWA out-of-window slots or padding).
             The kernel does not consult any LUT.
-        kernel_kind: CanaryLaunchTag stamped into violation rows (see canary_verify_step). Sweep callers do not
+        kernel_kind: CanaryLaunchTag stamped into violation rows (see launch_canary_verify_kernel). Sweep callers do not
             invoke this kernel.
         enable_write_verify_inputs: bool toggle. False = expected_input_* tensors ignored. True = compare
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
@@ -187,7 +188,7 @@ def canary_write_step(
           in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary.write_ref.canary_write_step_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.write_ref.run_canary_write_torch_reference`; CUDA must match
     byte-for-byte.
     """
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:

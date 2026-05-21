@@ -12,11 +12,11 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
-    canary_verify_step,
+    launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import (
     WritePlan,
-    canary_write_step,
+    launch_canary_write_kernel,
 )
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
@@ -78,7 +78,7 @@ class CanaryEndpoint:
                 f"kv-canary: launch_per_forward not supported on sweep endpoint {self.kernel_kind.name}"
             )
 
-        canary_verify_step(
+        launch_canary_verify_kernel(
             canary_buf=self.canary_buf,
             plan=verify_plan,
             kernel_kind=self.kernel_kind,
@@ -98,7 +98,7 @@ class CanaryEndpoint:
         else:
             fb_out_cache_loc_for_canary = fb_out_cache_loc
 
-        canary_write_step(
+        launch_canary_write_kernel(
             canary_buf=self.canary_buf,
             plan=write_plan,
             fb_input_ids=fb_input_ids,
@@ -128,7 +128,7 @@ class CanaryEndpoint:
                 f"kv-canary: launch_sweep not supported on non-sweep endpoint {self.kernel_kind.name}"
             )
 
-        canary_verify_step(
+        launch_canary_verify_kernel(
             canary_buf=self.canary_buf,
             plan=verify_plan,
             kernel_kind=self.kernel_kind,

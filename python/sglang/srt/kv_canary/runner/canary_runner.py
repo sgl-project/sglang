@@ -171,7 +171,7 @@ class CanaryRunner:
         self._per_forward_orchestrator.before_forward(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
-        """canary_plan_step + HEAD endpoint launches. Caller is the monkey-patched
+        """Plan sub-kernels + HEAD endpoint launches. Caller is the monkey-patched
         ``model.forward`` - kernels here are captured into the cuda graph.
         """
         self._per_forward_orchestrator.launch_head_kernels(forward_batch)

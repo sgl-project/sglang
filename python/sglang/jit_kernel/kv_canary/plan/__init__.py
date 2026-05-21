@@ -1,1 +1,1 @@
-from sglang.jit_kernel.kv_canary.plan.api import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan.api import launch_canary_plan_kernels

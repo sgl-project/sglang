@@ -61,7 +61,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         from sglang.jit_kernel.kv_canary.verify import (
             CanaryLaunchTag,
             VerifyPlan,
-            canary_verify_step,
+            launch_canary_verify_kernel,
         )
 
         tensor = torch.zeros(4, 16, dtype=torch.uint8, device=self.device)
@@ -81,7 +81,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
 
         with self.assertRaises(ValueError):
-            canary_verify_step(
+            launch_canary_verify_kernel(
                 canary_buf=canary_buf,
                 plan=plan,
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,

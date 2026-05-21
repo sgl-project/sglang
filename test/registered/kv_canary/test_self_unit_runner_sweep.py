@@ -55,7 +55,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         plan_calls: list[str] = []
         with patch.object(
             kernel_launch_module,
-            "canary_plan_step",
+            "launch_canary_plan_kernels",
             lambda **kwargs: plan_calls.append("plan"),
         ):
             runner._sweep_orchestrator.maybe_run_sweep()
@@ -76,7 +76,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         sweep_kernel_kinds: list[str] = []
         with patch.object(
             endpoint_module,
-            "canary_verify_step",
+            "launch_canary_verify_kernel",
             lambda **kwargs: sweep_kernel_kinds.append(kwargs["kernel_kind"].name),
         ):
             runner._sweep_orchestrator.maybe_run_sweep()

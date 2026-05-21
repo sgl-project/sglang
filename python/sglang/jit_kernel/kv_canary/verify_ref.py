@@ -14,7 +14,7 @@ _U64_MASK: int = (1 << 64) - 1
 _I64_SIGN_BIT: int = 1 << 63
 
 
-def canary_verify_step_torch_reference(
+def run_canary_verify_torch_reference(
     *,
     canary_buf: torch.Tensor,
     plan: VerifyPlan,

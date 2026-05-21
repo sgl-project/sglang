@@ -161,10 +161,10 @@ class CanaryRunnerTestCase(CustomTestCase):
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
             patch.object(
-                kernel_launch_module, "canary_plan_step", lambda **kwargs: None
+                kernel_launch_module, "launch_canary_plan_kernels", lambda **kwargs: None
             ),
-            patch.object(endpoint_module, "canary_verify_step", lambda **kwargs: None),
-            patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None),
+            patch.object(endpoint_module, "launch_canary_verify_kernel", lambda **kwargs: None),
+            patch.object(endpoint_module, "launch_canary_write_kernel", lambda **kwargs: None),
         ]
         for patcher in self._patchers:
             patcher.start()

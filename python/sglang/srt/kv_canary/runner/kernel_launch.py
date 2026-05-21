@@ -7,7 +7,7 @@ import torch
 from sglang.jit_kernel.kv_canary.consts import (
     RealKvHashMode,
 )
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     VerifyPlan,
@@ -39,7 +39,7 @@ def invoke_plan(
     swa_window_size: int,
 ) -> None:
     window = swa_window_size if group.kind is PoolKind.SWA else 0
-    canary_plan_step(
+    launch_canary_plan_kernels(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,
         fb_req_pool_indices=plan_input.fb_req_pool_indices,

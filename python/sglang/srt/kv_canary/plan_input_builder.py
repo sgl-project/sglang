@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlanInput:
-    """Pre-staged input to canary_plan_step for the per-forward path.
+    """Pre-staged input to launch_canary_plan_kernels for the per-forward path.
 
     All tensors live on device.
 

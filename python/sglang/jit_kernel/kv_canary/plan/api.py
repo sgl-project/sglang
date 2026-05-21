@@ -15,7 +15,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def canary_plan_step(
+def launch_canary_plan_kernels(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
@@ -40,8 +40,8 @@ def canary_plan_step(
     - **Write metadata** (when fb_extend_seq_lens[r] > 0): contribute fb_extend_seq_lens[r] to the per-req
       write count (for write_offsets cumsum). Per-req chain seed = req_to_token[fb_req_pool_indices[r],
       fb_prefix_lens[r]-1] (SWA-translated), or -1 if fb_prefix_lens[r] == 0. Per-token write data
-      (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — canary_write_step reads it
-      directly from ForwardBatch via write_offsets.
+      (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — launch_canary_write_kernel
+      reads it directly from ForwardBatch via write_offsets.
 
     Args:
         verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
@@ -80,22 +80,22 @@ def canary_plan_step(
     Calling contract:
         - Pure side-effect; no host work, no D2H.
         - Safe in cuda-graph capture; caller refills all input tensors in-place before replay.
-        - Single kernel launch fills both plans end-to-end.
+        - The wrapper launches the plan sub-kernels needed to fill both plans end-to-end.
         - Padding rows contribute zero entries.
 
     Pinned by Python reference
-    :func:`sglang.jit_kernel.kv_canary.plan_ref.canary_plan_step_torch_reference`; Triton must match
+    :func:`sglang.jit_kernel.kv_canary.plan_ref.run_canary_plan_torch_reference`; Triton must match
     byte-for-byte.
     """
     bs = int(fb_req_pool_indices.shape[0])
     if bs > _PLAN_BS_BLOCK_SIZE:
         raise ValueError(
-            f"kv-canary: canary_plan_step supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
+            f"kv-canary: launch_canary_plan_kernels supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
             f"got bs={bs}. Bump _PLAN_BS_BLOCK_SIZE if real workloads need this."
         )
     if swa_window_size > 0 and full_to_swa_index_mapping is None:
         raise ValueError(
-            "kv-canary: canary_plan_step requires full_to_swa_index_mapping when swa_window_size > 0"
+            "kv-canary: launch_canary_plan_kernels requires full_to_swa_index_mapping when swa_window_size > 0"
         )
 
     device = verify_plan_out.verify_slot_indices.device
@@ -106,7 +106,7 @@ def canary_plan_step(
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     if verify_capacity != plan_verify_capacity:
         raise ValueError(
-            f"kv-canary: canary_plan_step verify_capacity={verify_capacity} does not match "
+            f"kv-canary: launch_canary_plan_kernels verify_capacity={verify_capacity} does not match "
             f"verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     # Match the ref's tail-reset semantics: write_offsets positions past index bs are zeroed so a smaller

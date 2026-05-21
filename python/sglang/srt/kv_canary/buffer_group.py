@@ -44,8 +44,8 @@ class CanaryBufferGroup:
             real-KV mixin disabled for this half.
         real_kv_sources_v: Same for V-half. Empty tuple iff v_head is None or the mixin is disabled.
         swa_index_lut: SWA full-to-swa index mapping LUT, shape [full_pool_size + 1], int64, or None for FULL
-            groups. Used by canary_plan_step to translate verify/seed slot indices at plan time, and by
-            canary_write_step to translate write slots inline. None iff kind == PoolKind.FULL.
+            groups. Used by launch_canary_plan_kernels to translate verify/seed slot indices at plan time, and by
+            launch_canary_write_kernel to translate write slots inline. None iff kind == PoolKind.FULL.
     """
 
     kind: PoolKind

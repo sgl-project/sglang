@@ -138,7 +138,7 @@ class RealKvSource:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class VerifyPlan:
-    """Flat verify entries consumed by canary_verify_step.
+    """Flat verify entries consumed by launch_canary_verify_kernel.
 
     Each row is a self-contained (slot_idx, position, prev_slot_idx) triple, so the verify kernel makes no
     assumption about the entry's source — per-forward derivation, sweep over running reqs, and sweep over
@@ -191,7 +191,7 @@ class VerifyPlan:
         )
 
 
-def canary_verify_step(
+def launch_canary_verify_kernel(
     *,
     canary_buf: torch.Tensor,
     plan: VerifyPlan,
@@ -266,7 +266,7 @@ def canary_verify_step(
         - Safe in cuda-graph capture; caller refills plan in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary.verify_ref.canary_verify_step_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.verify_ref.run_canary_verify_torch_reference`; CUDA must match
     byte-for-byte.
     """
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:

@@ -36,8 +36,7 @@ class PerForwardOrchestrator:
       captured region): perturb hooks, fill the static expected_input buffers, fill the static
       per-forward PlanInput buffers.
     - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region (called by the
-      monkey-patched model.forward, before the original forward): canary_plan_step kernel +
-      HEAD endpoint launches.
+      monkey-patched model.forward, before the original forward): plan sub-kernels + HEAD endpoint launches.
     - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region (called by the
       monkey-patched model.forward, after the original forward): TAIL endpoint launches reusing
       the plan staged in launch_head_kernels.
