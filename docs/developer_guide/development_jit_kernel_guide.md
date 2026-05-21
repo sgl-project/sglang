@@ -33,6 +33,10 @@ The function can then be called in Python as `module.func`.
 For caching compiled modules, prefer `sglang.jit_kernel.utils.cache_once` over `functools.lru_cache`.
 `functools.lru_cache` is not compatible with `torch.compile`.
 
+The KV canary plan entry point is `sglang.jit_kernel.kv_canary.plan.canary_plan_step`. The `kv_canary.plan`
+package keeps each Triton sub-kernel beside its host launch wrapper, and each wrapper validates the tensor and
+scalar contract it receives before dispatching.
+
 ### C++ Utilities
 
 The following C++ utilities are available:
