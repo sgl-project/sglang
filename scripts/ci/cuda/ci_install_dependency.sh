@@ -36,9 +36,31 @@ configure_environment() {
 
     OPTIONAL_DEPS="${1:-}"
 
-    # Whether to create a uv venv (set USE_VENV=1). Default: 0.
-    USE_VENV="${USE_VENV:-0}"
+    # Set via job/workflow env in pr-test.yml; YAML booleans serialize as
+    # "true"/"false". Anything else is treated as off.
+    USE_VENV="${USE_VENV:-false}"
     echo "USE_VENV=${USE_VENV}"
+
+    # Repair dangling tvm_ffi/flashinfer symlinks in system site-packages
+    # (left by stabilize_flashinfer_jit_paths runs that escaped the venv).
+    # No-op when clean.
+    SYSTEM_SITE=$(/usr/bin/python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+    if [ -n "$SYSTEM_SITE" ]; then
+        for pair in "tvm_ffi/include apache-tvm-ffi" "flashinfer/data flashinfer-python"; do
+            # shellcheck disable=SC2086
+            set -- $pair
+            link="${SYSTEM_SITE}/$1"
+            pkg="$2"
+            if [ -L "$link" ] && [ ! -e "$link" ]; then
+                # Uninstall (not force-reinstall) so install_sglang restores
+                # via pyproject.toml — no version pin to maintain here. No
+                # `|| true`: a failed uninstall fails the install loudly.
+                echo "::warning::Self-heal: dangling symlink ${link} -> $(readlink "$link"). Uninstalling ${pkg}; install_sglang will restore it."
+                rm -f "$link"
+                /usr/bin/python3 -m pip uninstall -y "$pkg" --root-user-action=ignore
+            fi
+        done
+    fi
 
     python3 -m pip install --upgrade pip
     if ! command -v uv >/dev/null 2>&1; then
@@ -47,8 +69,16 @@ configure_environment() {
 
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-    if [ "$USE_VENV" = "1" ]; then
-        UV_VENV="/tmp/sglang-ci-${GITHUB_RUN_ID:-norun}-${GITHUB_JOB:-nojob}-$$"
+    if [ "$USE_VENV" = "true" ]; then
+        # Stable path: deep_gemm MD5s `-I<site-packages>/deep_gemm/include`
+        # into its JIT cache key, so a per-job path rotates the key every run
+        # and ~/.cache/deep_gemm fills with unreachable entries. Assumes one
+        # job per runner container; concurrent jobs would race the rm -rf.
+        UV_VENV="/tmp/sglang-ci-venv"
+        rm -rf "$UV_VENV"
+        # rm -rf can exit 0 with content still present (chattr +i, bind
+        # mounts); uv venv --seed would silently layer onto stale state.
+        [ ! -e "$UV_VENV" ] || { echo "FATAL: $UV_VENV still exists after rm -rf"; ls -la "$UV_VENV" || true; exit 1; }
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
         source "$UV_VENV/bin/activate"
@@ -65,7 +95,7 @@ configure_environment() {
             echo "$UV_VENV/bin" >> "$GITHUB_PATH"
         fi
     else
-        echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
+        echo "USE_VENV=${USE_VENV}: skipping uv venv creation, installing into system Python"
         UV_VENV=""
     fi
 
@@ -167,7 +197,7 @@ clean_site_packages() {
 setup_pip_toolchain() {
     python3 -m pip install --upgrade pip
 
-    if [ "$USE_VENV" != "1" ]; then
+    if [ "$USE_VENV" != "true" ]; then
         export UV_SYSTEM_PYTHON=1
     fi
 
@@ -339,7 +369,7 @@ stabilize_flashinfer_jit_paths() {
     # In venv mode, FlashInfer JIT writes build.ninja with hardcoded -isystem
     # paths. Per-job venvs get unique paths, but the JIT cache is shared on the
     # host mount. Fix by symlinking venv copies to a stable host-mounted path.
-    if [ "$USE_VENV" != "1" ]; then
+    if [ "$USE_VENV" != "true" ]; then
         return
     fi
 
@@ -363,6 +393,16 @@ stabilize_flashinfer_jit_paths() {
     # Copy source files to stable path and symlink venv copies there
     FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
     TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
+
+    # Guard against python3 resolving outside the venv (broken activation,
+    # --system-site-packages): rm -rf + ln -s below would clobber system
+    # headers and dangle on the next $STABLE_FI_DIR rebuild.
+    for p in "$FI_DATA" "$TVM_INC"; do
+        case "$p" in
+            "$UV_VENV"/*) ;;
+            *) echo "FATAL: refusing to symlink '$p' outside venv '$UV_VENV'"; exit 1 ;;
+        esac
+    done
 
     FI_VERSION="${FLASHINFER_PYTHON_REQUIRED}"
     if [ ! -d "$STABLE_FI_DIR/flashinfer-data" ] || [ "$(cat "$STABLE_FI_DIR/.version" 2>/dev/null)" != "$FI_VERSION" ]; then
@@ -411,7 +451,15 @@ install_extra_deps() {
     $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+        # Skip the clone if an existing checkout is already at the required tag
+        # (idempotent on local re-runs; real CI gets a fresh actions/checkout
+        # so this is a fast no-op when there's nothing reusable).
+        LMMS_EVAL_TAG="v0.5"
+        EXISTING_TAG=$(git -C lmms-eval describe --tags --exact-match 2>/dev/null || true)
+        if [ "$EXISTING_TAG" != "$LMMS_EVAL_TAG" ]; then
+            rm -rf lmms-eval
+            git clone --branch "$LMMS_EVAL_TAG" --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+        fi
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
@@ -453,7 +501,7 @@ setup_ld_library_path() {
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
+    if [ "$USE_VENV" = "true" ] && [ -n "$UV_VENV" ]; then
         echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
     fi
     if [ -n "${GITHUB_ENV:-}" ]; then

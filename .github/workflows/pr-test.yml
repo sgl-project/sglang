@@ -64,7 +64,7 @@ env:
   FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  USE_VENV: false
+  USE_VENV: true
 
 permissions:
   actions: write
