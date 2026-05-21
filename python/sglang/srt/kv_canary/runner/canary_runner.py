@@ -20,6 +20,7 @@ from sglang.srt.kv_canary.runner.health import (
     KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger,
 )
+from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
@@ -87,11 +88,16 @@ class CanaryRunner:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
-        self._swa_divergence_stats = SwaDivergenceStats(
-            device=device,
-            d2h_stream=self._d2h_stream,
-            swa_allocator_getter=self._get_swa_allocator,
-        )
+        if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
+            self._swa_divergence_stats: Optional[SwaDivergenceStats] = (
+                SwaDivergenceStats(
+                    device=device,
+                    d2h_stream=self._d2h_stream,
+                    swa_allocator_getter=self._get_swa_allocator,
+                )
+            )
+        else:
+            self._swa_divergence_stats = None
 
         self._violation_manager = ViolationManager(
             config=config,
@@ -208,7 +214,8 @@ class CanaryRunner:
         self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
-        self._swa_divergence_stats.emit_log_if_due(
-            step_counter=self._step_counter,
-            period=self.config.stats_print_every_n_steps,
-        )
+        if self._swa_divergence_stats is not None:
+            self._swa_divergence_stats.emit_log_if_due(
+                step_counter=self._step_counter,
+                period=self.config.stats_print_every_n_steps,
+            )

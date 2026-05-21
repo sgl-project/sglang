@@ -8,6 +8,7 @@ from typing import Optional
 from unittest.mock import patch
 
 import torch
+from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
@@ -180,34 +181,14 @@ class TestSwaDivergenceStats(CustomTestCase):
             swa_div_module, "FutureTensor", swa_div_module.FutureTensor
         )
 
-    def test_swa_divergence_log_silent_when_env_disabled(self) -> None:
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(False):
-            stats = SwaDivergenceStats(
-                device=_DEVICE,
-                d2h_stream=None,
-                swa_allocator_getter=lambda: _FakeAllocator(wrap_count=5),
-            )
-            self.assertFalse(stats.enabled)
-            stats.observe_after_invoke_plan(
-                group=_make_group(PoolKind.FULL),
-                verify_plan=_make_verify_plan(42),
-            )
-            stats.on_forward_completed()
-            with _LogCapture() as capture:
-                stats.emit_log_if_due(step_counter=10, period=10)
-            self.assertEqual(capture.lines(), [])
-
-    def test_swa_divergence_log_emitted_when_env_enabled(self) -> None:
+    def test_swa_divergence_log_emitted(self) -> None:
         allocator = _FakeAllocator(wrap_count=13, nonidentity_write_count=2)
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
-            True
-        ), _patch_future_tensor():
+        with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
                 swa_allocator_getter=lambda: allocator,
             )
-            self.assertTrue(stats.enabled)
             for _ in range(4):
                 stats.observe_after_invoke_plan(
                     group=_make_group(PoolKind.FULL),
@@ -236,9 +217,7 @@ class TestSwaDivergenceStats(CustomTestCase):
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         allocator = _FakeAllocator(wrap_count=0)
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
-            True
-        ), _patch_future_tensor():
+        with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
@@ -287,9 +266,7 @@ class TestSwaDivergenceStats(CustomTestCase):
 
     def test_nonidentity_write_count_emitted_from_allocator(self) -> None:
         allocator = _FakeAllocator(wrap_count=0, nonidentity_write_count=7)
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
-            True
-        ), _patch_future_tensor():
+        with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
@@ -335,6 +312,23 @@ class TestSwaPoolWrapCount(CustomTestCase):
         self.assertEqual(observer.wrap_count, 1)
         observer.observe_swa_alloc(torch.tensor([5], dtype=torch.int64))
         self.assertEqual(observer.wrap_count, 2)
+
+
+class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
+    def test_swa_divergence_stats_is_none_when_env_disabled(self) -> None:
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
+            False
+        ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
+            runner = make_runner(device=self.device)
+        self.assertIsNone(runner._swa_divergence_stats)
+
+    def test_swa_divergence_stats_present_when_env_enabled(self) -> None:
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
+            True
+        ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
+            runner = make_runner(device=self.device)
+        self.assertIsNotNone(runner._swa_divergence_stats)
+        self.assertIsInstance(runner._swa_divergence_stats, SwaDivergenceStats)
 
 
 class TestSwaPoolNonidentityWriteCount(CustomTestCase):
