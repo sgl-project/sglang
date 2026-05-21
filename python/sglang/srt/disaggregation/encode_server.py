@@ -507,6 +507,11 @@ class MMEncoder:
                 ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (feature_lens // 100) * 13
             )
             return output_lengths
+        elif self.model_type == "mimo_v2":
+            # MiMo-V2's preprocess_audio returns audio_token_len (already
+            # post-encoder/avg-pooler/group-size). Stored in audio_feature_lens_raw,
+            # so no further reduction here.
+            return feature_lens
         else:
             # fallback to original HF audio sample logic for other models
             logger.warning(
@@ -638,10 +643,18 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature: torch.Tensor, grid_thw: List, modality: Modality
+        self, mm_feature, grid_thw: List, modality: Modality
     ) -> List[str]:
         """CPU Task: Compute hashes based on processed feature patches."""
-        hashes, offset = [], 0
+        hashes = []
+        if modality == Modality.AUDIO and isinstance(mm_feature, list):
+            for feature in mm_feature:
+                tmp_item = MultimodalDataItem(modality=modality, feature=feature)
+                tmp_item.set_pad_value()
+                hashes.append(tmp_item.hash)
+            return hashes
+
+        offset = 0
         logger.info(f"{mm_feature.shape=} with {modality=}")
         for grid in grid_thw:
             num_patches = self.get_num_patches(grid, modality)
@@ -654,7 +667,7 @@ class MMEncoder:
 
     async def _encode_missing(
         self,
-        mm_feature: torch.Tensor,
+        mm_feature,
         mm_inputs: dict,
         indices: List[int],
         modality: Modality = Modality.IMAGE,
@@ -665,23 +678,34 @@ class MMEncoder:
         """
         grid_thw = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
 
-        # 1. Slice mm_feature to get only the patches for missing mm items
-        sub_feature_list = []
-        offsets = [0]
-        curr = 0
-        for g in grid_thw:
-            curr += self.get_num_patches(g, modality)
-            offsets.append(curr)
-
-        for idx in indices:
-            sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
-
-        sub_feature = torch.cat(sub_feature_list, dim=0)
+        # Audio features are per-item (list of mels for mimo_v2, or batched
+        # N x n_mels x T_max for qwen2_audio); slice by item index and keep
+        # per-item shape. Image/video features are concatenated along the
+        # patch dim; slice by cumulative patch offsets and cat.
+        if modality == Modality.AUDIO:
+            if isinstance(mm_feature, list):
+                sub_feature = [mm_feature[i] for i in indices]
+            else:
+                sub_feature = mm_feature[list(indices)]
+        else:
+            sub_feature_list = []
+            offsets = [0]
+            curr = 0
+            for g in grid_thw:
+                curr += self.get_num_patches(g, modality)
+                offsets.append(curr)
+            for idx in indices:
+                sub_feature_list.append(mm_feature[offsets[idx] : offsets[idx + 1]])
+            sub_feature = torch.cat(sub_feature_list, dim=0)
 
         mm_item = MultimodalDataItem.from_dict(
             {
                 "modality": modality,
-                "feature": _convert(sub_feature),
+                "feature": (
+                    sub_feature
+                    if isinstance(sub_feature, list)
+                    else _convert(sub_feature)
+                ),
             }
         )
 
