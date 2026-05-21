@@ -42,7 +42,9 @@ class GSM8KAscendMixin(ABC):
         "SGLANG_ENBLE_TORCH_COMILE": "1",
         "AUTO_USE_UC_MEMORY": "0",
         "P2P_HCCL_BUFFSIZE": "20",
-        "TRANSFORMERS_VERBOSITY": os.getenv("TRANSFORMERS_VERBOSITY", "error"),
+        "TRANSFORMERS_VERBOSITY": os.getenv(
+            "TRANSFORMERS_VERBOSITY", "error"
+        ),
     }
 
     @classmethod
