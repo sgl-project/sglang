@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import ctypes
+import functools
 import logging
 import multiprocessing as mp
 import os
@@ -243,6 +244,11 @@ class MMEncoder:
         self.context = zmq.asyncio.Context(2)
         self.sync_context = zmq.Context()  # Reuse sync context for thread pool
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
+        # Dedicated executor for image preprocessing (resize/normalize).
+        # Separate from self.executor (ZMQ sends) to avoid contention under high concurrency.
+        self.preproc_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SGLANG_ENCODER_PREPROC_WORKERS", 32))
+        )
 
         embedding_cache_size = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "4096"))
         self.mm_cache = MultiModalStaticCache(embedding_cache_size * 1024 * 1024)
@@ -252,6 +258,14 @@ class MMEncoder:
             max_workers=int(os.environ.get("SGLANG_ENCODER_MM_LOAD_WORKERS", 4))
         )
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+
+        # Cross-request ViT batching queue
+        self._vit_queue: Optional[asyncio.Queue] = None
+        self._vit_task: Optional[asyncio.Task] = None
+        self._vit_batch_size = int(os.environ.get("SGLANG_ENCODER_BATCH_SIZE", 8))
+        self._vit_batch_timeout_ms = float(
+            os.environ.get("SGLANG_ENCODER_BATCH_TIMEOUT_MS", 20)
+        )
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -978,7 +992,10 @@ class MMEncoder:
         image_config = self.vision_config.get("image", {})
         if self.model_type in ["kimi_k25", "kimi_vl"]:
             images = self._normalize_kimi_encoder_images(images)
-        return self.image_processor(images=images, **image_config)
+        return await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(self.image_processor, images=images, **image_config),
+        )
 
     async def _process_video_items(self, mm_items, model_preprocessor):
         if model_preprocessor:
@@ -987,7 +1004,12 @@ class MMEncoder:
             raise ValueError("No video processor available")
 
         videos, video_processor_kwargs = await self._flatten_and_load_videos(mm_items)
-        processor_input = self.video_processor(videos=videos, **video_processor_kwargs)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.video_processor, videos=videos, **video_processor_kwargs
+            ),
+        )
 
         # Get additional video metadata
         if (
@@ -1046,7 +1068,12 @@ class MMEncoder:
 
         audios = await self._flatten_and_load_audios(mm_items)
         audio_config = self.vision_config.get("audio", {})
-        processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
+        processor_input = await asyncio.get_running_loop().run_in_executor(
+            self.preproc_executor,
+            functools.partial(
+                self.audio_processor.feature_extractor, audios, **audio_config
+            ),
+        )
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
@@ -1058,6 +1085,84 @@ class MMEncoder:
         output_lengths = self._get_feat_extract_output_lengths(input_lengths)
         processor_input["audio_feature_lens"] = output_lengths
         return processor_input
+
+    def _ensure_vit_batch_loop(self):
+        """Lazily start the ViT batch loop task on first use."""
+        if self._vit_task is None or self._vit_task.done():
+            self._vit_queue = asyncio.Queue()
+            self._vit_task = asyncio.get_event_loop().create_task(
+                self._vit_batch_loop()
+            )
+
+    async def _vit_batch_loop(self):
+        """
+        Drain concurrent ViT requests from _vit_queue and run them as a single
+        batched forward pass.
+
+        Adaptive sleep: wait SGLANG_ENCODER_BATCH_TIMEOUT_MS only when the queue
+        was empty (accumulating a new batch). When items are already queued,
+        yield immediately so back-to-back batches run without added latency.
+        """
+        while True:
+            first = await self._vit_queue.get()
+            batch = [first]
+            if self._vit_queue.empty():
+                await asyncio.sleep(self._vit_batch_timeout_ms / 1000)
+            else:
+                await asyncio.sleep(0)
+            while len(batch) < self._vit_batch_size:
+                try:
+                    batch.append(self._vit_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            mm_items_batch = [item for item, _, _ in batch]
+            get_feature_fns = [fn for _, fn, _ in batch]
+            futures = [f for _, _, f in batch]
+
+            try:
+                with torch.inference_mode():
+                    # Group by function identity so each group is one batched ViT forward pass.
+                    # In the common case all items share the same get_feature_fn.
+                    fn_groups: dict = {}
+                    for mm_item, fn, fut in zip(
+                        mm_items_batch, get_feature_fns, futures
+                    ):
+                        gid = id(fn)
+                        if gid not in fn_groups:
+                            fn_groups[gid] = (fn, [], [])
+                        fn_groups[gid][1].append(mm_item)
+                        fn_groups[gid][2].append(fut)
+
+                    for fn, group_items, group_futures in fn_groups.values():
+                        combined = fn(group_items).cpu()
+                        if combined.ndim != 2:
+                            combined = combined.reshape(-1, combined.shape[-1])
+                        modality = group_items[0].modality
+                        offset = 0
+                        for mm_item, fut in zip(group_items, group_futures):
+                            grid = None
+                            for attr in _mm_grid_attrs[modality]:
+                                try:
+                                    grid = getattr(mm_item, attr)
+                                    break
+                                except AttributeError:
+                                    continue
+                            if grid is None:
+                                raise RuntimeError(
+                                    f"No grid dim found on mm_item for {modality}"
+                                )
+                            n_tokens = sum(
+                                self.get_num_tokens(g, modality) for g in grid
+                            )
+                            emb = combined[offset : offset + n_tokens]
+                            offset += n_tokens
+                            if not fut.done():
+                                fut.set_result(emb)
+            except Exception as e:
+                for future in futures:
+                    if not future.done():
+                        future.set_exception(e)
 
     async def _encode(self, mm_items, modality: Modality) -> torch.Tensor:
         try:
@@ -1091,11 +1196,10 @@ class MMEncoder:
                         mm_embedding = mm_cache.embedding
 
             if mm_embedding is None:
-                with torch.inference_mode():
-                    mm_embedding: torch.Tensor = get_feature_fn([mm_item])
-                    mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+                self._ensure_vit_batch_loop()
+                future = asyncio.get_running_loop().create_future()
+                await self._vit_queue.put((mm_item, get_feature_fn, future))
+                mm_embedding = await future
 
             if self.server_args.enable_prefix_mm_cache:
                 async with self.mm_cache_lock:
