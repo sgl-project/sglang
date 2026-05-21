@@ -49,6 +49,8 @@ class UnifiedRadixTreeTestMixin:
     prefill_cache_assert = None
     decode_cache_assert = None
     sampling_temperature: float = 1
+    decode_hit_request_batch_size: int | None = None
+    decode_hit_inter_batch_delay_s: float = 0
 
     gsm8k_threshold: float = 0.93
     mmlu_threshold: float = 0.8
@@ -163,6 +165,8 @@ class UnifiedRadixTreeTestMixin:
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
             sampling_temperature=self.sampling_temperature,
+            request_batch_size=self.decode_hit_request_batch_size,
+            inter_batch_delay_s=self.decode_hit_inter_batch_delay_s,
         )
 
 

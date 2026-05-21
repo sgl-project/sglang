@@ -505,6 +505,18 @@ class ServerArgs(DisaggArgsMixin):
             and self._is_ltx23_two_stage_pipeline()
         )
 
+    def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
+        if (
+            self.ltx2_two_stage_device_mode != "resident"
+            or not self._is_ltx23_two_stage_pipeline()
+            or not current_platform.is_cuda()
+        ):
+            return False
+        return (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        )
+
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -1292,8 +1304,9 @@ class ServerArgs(DisaggArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Applies to both pre-quantized checkpoints and online "
                 "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
-                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
