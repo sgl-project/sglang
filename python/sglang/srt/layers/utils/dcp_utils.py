@@ -10,6 +10,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
 )
@@ -418,3 +419,58 @@ def prepare_decode_context_parallel_metadata(
         dcp_extend_prefix_lens_sum=extend_prefix_lens_sum,
     )
     return attn_dcp_metadata
+
+
+def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
+    dcp_world_size = get_dcp_world_size()
+    # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
+    gathered_kv_a = kv_a.new_empty(
+        (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
+    )
+    get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
+    gathered_kv_a = (
+        gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
+        .transpose(0, 1)
+        .reshape(-1, *kv_a.shape[1:])
+    )
+    return gathered_kv_a
+
+
+def prepare_dcp_kv_cache(
+    token_to_kv_pool,
+    attn_mqa,
+    dcp_local_prefix_kv_indices,
+    seq_lens,
+    extend_prefix_lens,
+    extend_seq_lens,
+    kv_a: torch.Tensor,
+    k_pe: torch.Tensor,
+):
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
+        attn_mqa, dcp_local_prefix_kv_indices
+    )
+    prefix_kv_a = _all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
+    prefix_k_pe = _all_gather_dcp_kv_cache(prefix_k_pe)
+    # re-organize kv with query orders
+    prefix_lens_cu = torch.zeros(
+        len(seq_lens) + 1,
+        dtype=torch.int32,
+        device=kv_a.device,
+    )
+    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
+    prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
+    extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
+    kv_a_tuple = ()
+    k_pe_tuple = ()
+    for i in range(len(seq_lens)):
+        kv_a_tuple += (
+            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+        )
+        k_pe_tuple += (
+            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
+            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
+        )
+    kv_a = torch.cat(kv_a_tuple, dim=0)
+    k_pe = torch.cat(k_pe_tuple, dim=0)
+    return kv_a, k_pe

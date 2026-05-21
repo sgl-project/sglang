@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_group,
     get_dcp_rank,
     get_dcp_world_size,
 )
@@ -14,6 +13,7 @@ from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
+from sglang.srt.layers.utils.dcp_utils import prepare_dcp_kv_cache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -239,40 +239,16 @@ class DeepseekMHAForwardMixin:
             else:
                 # BF16/FP16 path: directly fetch from cache
                 if get_dcp_world_size() > 1:
-                    prefix_kv_a, prefix_k_pe = (
-                        forward_batch.token_to_kv_pool.get_mla_kv_buffer(
-                            self.attn_mqa,
-                            forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
-                        )
+                    kv_a, k_pe = prepare_dcp_kv_cache(
+                        forward_batch.token_to_kv_pool,
+                        self.attn_mha,
+                        forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
+                        forward_batch.seq_lens,
+                        forward_batch.extend_prefix_lens,
+                        forward_batch.extend_seq_lens,
+                        kv_a,
+                        k_pe,
                     )
-                    prefix_kv_a = self._all_gather_dcp_kv_cache(prefix_kv_a.squeeze(1))
-                    prefix_k_pe = self._all_gather_dcp_kv_cache(prefix_k_pe)
-                    # re-organize kv with query orders
-                    prefix_lens_cu = torch.zeros(
-                        len(forward_batch.seq_lens) + 1,
-                        dtype=torch.int32,
-                        device=kv_a.device,
-                    )
-                    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
-                    prefix_lens_cu[1:] = torch.cumsum(
-                        forward_batch.extend_prefix_lens, dim=0
-                    )
-                    extend_lens_cu[1:] = torch.cumsum(
-                        forward_batch.extend_seq_lens, dim=0
-                    )
-                    kv_a_tuple = ()
-                    k_pe_tuple = ()
-                    for i in range(len(forward_batch.seq_lens)):
-                        kv_a_tuple += (
-                            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-                            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-                        )
-                        k_pe_tuple += (
-                            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-                            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-                        )
-                    kv_a = torch.cat(kv_a_tuple, dim=0)
-                    k_pe = torch.cat(k_pe_tuple, dim=0)
                 else:
                     kv_a, k_pe = self._get_mla_kv_buffer(
                         forward_batch.fetch_mha_one_shot_kv_indices(),
@@ -449,20 +425,6 @@ class DeepseekMHAForwardMixin:
             del kv, k, v, output, lse, tmp_output, tmp_lse
 
         return accum_output
-
-    def _all_gather_dcp_kv_cache(self, kv_a):
-        dcp_world_size = get_dcp_world_size()
-        # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
-        gathered_kv_a = kv_a.new_empty(
-            (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
-        )
-        get_dcp_group().all_gather_into_tensor(gathered_kv_a, kv_a)
-        gathered_kv_a = (
-            gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
-            .transpose(0, 1)
-            .reshape(-1, *kv_a.shape[1:])
-        )
-        return gathered_kv_a
 
     def _set_mla_kv_buffer(
         self: DeepseekV2AttentionMLA,
