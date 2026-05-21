@@ -113,7 +113,7 @@ def generate_checksums(
             model_path=model_path, filenames=files, max_workers=max_workers
         )
     else:
-        manifest = Manifest(files=_load_file_infos_from_hf(repo_id=source))
+        manifest = Manifest(files=_load_file_infos(repo_id=source))
 
     Path(output_path).write_text(
         json.dumps(manifest.to_dict(), indent=2, sort_keys=True)
@@ -142,7 +142,43 @@ def _load_checksums(source: str) -> Manifest:
     if Path(source).is_file():
         data = json.loads(Path(source).read_text())
         return Manifest.from_dict(data)
-    return Manifest(files=_load_file_infos_from_hf(repo_id=source))
+    return Manifest(files=_load_file_infos(repo_id=source))
+
+
+def _load_file_infos(*, repo_id: str) -> Dict[str, FileInfo]:
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_USE_MODELSCOPE.get():
+        return _load_file_infos_from_modelscope(repo_id=repo_id)
+
+    return _load_file_infos_from_hf(repo_id=repo_id)
+
+
+def _load_file_infos_from_modelscope(*, repo_id: str) -> Dict[str, FileInfo]:
+    from modelscope.hub.api import HubApi
+
+    api = HubApi()
+    files_data = api.get_model_files(repo_id, recursive=False)
+
+    file_infos = {}
+    for file_data in files_data:
+        filename = file_data.get("Name") or file_data.get("Path", "")
+        if not filename:
+            continue
+
+        if any(fnmatch.fnmatch(filename, pat) for pat in IGNORE_PATTERNS):
+            continue
+
+        sha256 = file_data.get("Sha256")
+        size = file_data.get("Size", -1)
+
+        if sha256:
+            file_infos[filename] = FileInfo(sha256=sha256, size=size)
+
+    if not file_infos:
+        raise IntegrityError(f"No files found in ModelScope repo {repo_id}.")
+
+    return file_infos
 
 
 def _load_file_infos_from_hf(*, repo_id: str) -> Dict[str, FileInfo]:
