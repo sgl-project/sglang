@@ -252,8 +252,8 @@ class ViTCudaGraphRunner:
         import logging
 
         logger = logging.getLogger(__name__)
-        # DEBUG: capture subset to find threshold
-        debug_buckets = [32, 64, 128, 256, 512, 1024]
+        # DEBUG: capture single large bucket
+        debug_buckets = [1024]
         for B in debug_buckets:
             self._capture(B)
         logger.info("[VIT_GRAPH] capture_all done, buckets=%s", debug_buckets)
