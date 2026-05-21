@@ -45,4 +45,3 @@ class _CanaryEnableWarner:
                 self._overflow_count_total,
                 self._verify_capacity,
             )
-
