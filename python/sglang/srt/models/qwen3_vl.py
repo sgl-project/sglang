@@ -891,9 +891,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
     def _vision_token_counts(self, grid_thw) -> List[int]:
         grid = self._grid_to_tensor(grid_thw).tolist()
-        return [
-            int(t) * int(h) * int(w) // self.spatial_merge_unit for t, h, w in grid
-        ]
+        return [int(t) * int(h) * int(w) // self.spatial_merge_unit for t, h, w in grid]
 
     def _raw_token_counts(self, grid_thw) -> List[int]:
         grid = self._grid_to_tensor(grid_thw).tolist()
