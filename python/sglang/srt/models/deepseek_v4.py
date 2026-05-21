@@ -121,16 +121,8 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
     return x_quant, x_bf16
 
 
-# Threshold above which the unfused hc_post + hc_pre chain wins; matches
-# ATOM's empirical M-bucket for Triton mhc_post_pre vs the legacy chain.
-# Override via SGLANG_OPT_FUSED_HC_POST_PRE_M_THRESHOLD for sweep testing.
-_FUSED_HC_POST_PRE_M_THRESHOLD = envs.SGLANG_OPT_FUSED_HC_POST_PRE_M_THRESHOLD.get()
-
-# Persistent scratch/output buffers, keyed by
-# (M, hidden_size, hc_mult, dtype, device). Required so `acc_partial` /
-# `acc_sq_partial` keep stable data_ptrs across CUDAGraph capture+replay.
+_FUSED_HC_POST_PRE_M_THRESHOLD = 64
 _FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
-
 _TRITON_MHC_POST_PRE_OPS = None
 _TRITON_MHC_POST_PRE_RUNTIME_DISABLED = False
 
@@ -220,13 +212,12 @@ def _try_fused_hc_post_pre(
     hc_post_mult: float,
     sinkhorn_iters: int,
 ) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
-    """Returns (new_residual, layer_input, new_post, new_comb) or None to
-    indicate the caller should run the unfused hc_post + hc_pre chain."""
     global _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
 
     if (
         _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
         or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
+        or not _is_gfx95_supported
         or x.shape[0] == 0
         or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
         or x.dim() != 2
@@ -259,6 +250,7 @@ def _try_fused_hc_post_pre(
             hc_eps,
             hc_post_mult,
             sinkhorn_iters,
+            # Match sglang's exp-domain asymmetric Sinkhorn used in hc_pre.
             asymmetric_exp_domain=True,
             hc_sinkhorn_eps=hc_eps,
             residual_out=bufs["residual_out"],
