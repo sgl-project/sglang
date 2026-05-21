@@ -495,7 +495,7 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         finally:
             MultimodalProcessorOutput.build_padded_input_ids = original_build
 
-        self.assertEqual(output.padded_input_ids, padded_input_ids)
+        self.assertIs(output.padded_input_ids, padded_input_ids)
 
     def test_qwen_reuses_base_output_input_ids_list(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)

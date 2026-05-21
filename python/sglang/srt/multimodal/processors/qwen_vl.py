@@ -725,7 +725,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             )
         elif isinstance(padded_input_ids, torch.Tensor):
             padded_input_ids = padded_input_ids.flatten().tolist()
-        else:
+        elif not isinstance(padded_input_ids, list):
             padded_input_ids = list(padded_input_ids)
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
