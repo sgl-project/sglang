@@ -113,6 +113,17 @@ def _v4_rope_inplace_npu(
     accumulates in fp32; 43 layers × (Q + K) = 86 rope calls compound that
     drift enough to flip argmax on marginal prompts.
     """
+
+    # Diagnostic experiment: materialize q_rope / kv_rope to contiguous so the
+    # downstream rotary kernel and freqs_cis fancy indexing operate on
+    # contiguous source. Aliases the originals so we can copy results back
+    # and preserve the function's in-place contract.
+    _q_rope_view = q_rope
+    _kv_rope_view = kv_rope
+    q_rope = q_rope.contiguous()
+    if kv_rope is not None:
+        kv_rope = kv_rope.contiguous()
+
     if (
         _is_npu
         and hasattr(torch.ops, "custom")
@@ -154,6 +165,10 @@ def _v4_rope_inplace_npu(
                 rotary_mode="interleave",
                 partial_slice=[0, rope_dim],
             )
+        # Write the rotated values back into the caller's strided view.
+        _q_rope_view.copy_(q_rope)
+        if _kv_rope_view is not None:
+            _kv_rope_view.copy_(kv_rope)
         return
 
     # Torch fallback (CUDA tests, or NPU images without the custom op).
@@ -181,6 +196,11 @@ def _v4_rope_inplace_npu(
     _apply(q_rope)
     if kv_rope is not None:
         _apply(kv_rope)
+
+    # Write the rotated values back into the caller's strided view.
+    _q_rope_view.copy_(q_rope)
+    if _kv_rope_view is not None:
+        _kv_rope_view.copy_(kv_rope)
 
 
 if TYPE_CHECKING:
