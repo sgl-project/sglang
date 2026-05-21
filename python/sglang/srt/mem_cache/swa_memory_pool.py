@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -42,6 +43,7 @@ class SWAKVPool(BaseSWAKVPool):
         enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        enable_memory_saver: bool = False,
         **kwargs,
     ):
         self.size = size
@@ -56,10 +58,13 @@ class SWAKVPool(BaseSWAKVPool):
         self.start_layer = 0
         self.page_size = page_size
         self.swa_loc = None
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=enable_memory_saver
+        )
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        kwargs["enable_memory_saver"] = enable_memory_saver
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
