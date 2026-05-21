@@ -57,28 +57,30 @@ class FutureMap:
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
         if self.spec_algo.is_none():
-            self.buf_initialized = True
             self.token_ids_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         else:
-            self.buf_initialized = False
+            # Schedule-consumed bufs: eagerly allocated with fixed shape/dtype
+            # so store_post_verify can write unconditionally from iter 1.
+            self.new_seq_lens_buf = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
+            self.bonus_tokens_buf = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
+            # Forward-only bufs: lazy because per-req shape depends on worker
+            # (topk * num_steps for multi-layer EAGLE) and hidden dtype.
+            self._forward_buf_initialized = False
 
-        # Fences the buf fields that schedule stream reads (new_seq_lens_buf,
-        # bonus_tokens_buf). Recorded by store_post_verify at verify-end
-        # (both extend and decode branches fire it); store_to_map records it
-        # only on the first iter, where post_verify is a no-op pending lazy
-        # buf init.
+        # Fences the schedule-consumed buf fields.
         self._post_verify_buf_ready: Optional[torch.cuda.Event] = None
 
-    def _lazy_init_buf(self, draft_input: EagleDraftInput):
-        self.buf_initialized = True
+    def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
+        self._forward_buf_initialized = True
 
         topk_p0 = draft_input.topk_p[0]
         topk_index0 = draft_input.topk_index[0]
-        bonus_token0 = draft_input.bonus_tokens[0]
-        new_seq_lens0 = draft_input.new_seq_lens[0]
-
         self.topk_p_buf = torch.empty(
             (self.req_pool_size, *topk_p0.shape),
             dtype=topk_p0.dtype,
@@ -89,17 +91,6 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.bonus_tokens_buf = torch.empty(
-            (self.req_pool_size, *bonus_token0.shape),
-            dtype=bonus_token0.dtype,
-            device=self.device,
-        )
-        self.new_seq_lens_buf = torch.empty(
-            (self.req_pool_size, *new_seq_lens0.shape),
-            dtype=new_seq_lens0.dtype,
-            device=self.device,
-        )
-
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
@@ -155,12 +146,9 @@ class FutureMap:
         bonus_tokens: torch.Tensor,
     ) -> None:
         """Forward stream. Writes the schedule-consumed buf fields and records
-        the fence at verify-end so schedule consumers unblock before
-        draft_extend. Fired by both extend and decode branches.
-
-        No-op on the first iter (buf not yet allocated). The first iter's
-        store_to_map lazy-inits and catches up the fence."""
-        if self.spec_algo.is_none() or not self.buf_initialized:
+        the fence at verify-end. Fired by both extend and decode branches
+        between target/verify and draft_extend."""
+        if self.spec_algo.is_none():
             return
         indices = future_indices.indices
         if indices.shape[0] == 0:
@@ -173,9 +161,8 @@ class FutureMap:
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
         """Forward stream. Writes the forward-only buf fields (topk /
-        hidden_states; FIFO covers them, no fence needed). On the first iter
-        — where store_post_verify was a no-op pending lazy init — also writes
-        the schedule-consumed fields and records the fence."""
+        hidden_states). Next iter's resolve_future reads them on forward
+        stream — same-stream FIFO covers, no fence needed."""
         if self.spec_algo.is_none():
             indices = future_indices.indices
             if indices.shape[0] == 0:
@@ -183,19 +170,17 @@ class FutureMap:
             # next_token_ids is int32; buf is int64. Advanced indexing requires
             # an explicit cast.
             self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
-            self._record_post_verify_buf_ready()
             return
 
         draft_input: EagleDraftInput = batch_result.next_draft_input
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            # DP idle: draft_input fields are empty stubs; _lazy_init_buf's
+            # DP idle: draft_input fields are empty stubs; _lazy_init_forward_buf's
             # shape peek would IndexError. Defer init until a real batch.
             return
 
-        first_iter = not self.buf_initialized
-        if first_iter:
-            self._lazy_init_buf(draft_input)
+        if not self._forward_buf_initialized:
+            self._lazy_init_forward_buf(draft_input)
 
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
@@ -205,26 +190,17 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        if first_iter:
-            # Catch up for store_post_verify's no-op (buf wasn't allocated).
-            self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
-                self.new_seq_lens_buf.dtype
-            )
-            self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
-                self.bonus_tokens_buf.dtype
-            )
-            self._record_post_verify_buf_ready()
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ) -> None:
-        """Disagg-decode bootstrap: seed buf in one shot from a fully
-        populated draft_input + record the fence."""
+        """Disagg-decode bootstrap: seed buf from a fully populated draft_input
+        + record the fence."""
         indices = future_indices.indices
         if indices.shape[0] == 0:
             return
-        if not self.buf_initialized:
-            self._lazy_init_buf(draft_input)
+        if not self._forward_buf_initialized:
+            self._lazy_init_forward_buf(draft_input)
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
