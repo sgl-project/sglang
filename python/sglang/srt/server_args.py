@@ -447,6 +447,7 @@ class ServerArgs:
     log_requests: bool = False
     log_requests_level: int = 2
     log_requests_format: str = "text"
+    log_stats_format: str = "text"
     log_requests_target: Optional[List[str]] = None
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
@@ -4891,6 +4892,13 @@ class ServerArgs:
             default=ServerArgs.log_requests_format,
             choices=["text", "json"],
             help="Format for request logging: 'text' (human-readable) or 'json' (structured)",
+        )
+        parser.add_argument(
+            "--log-stats-format",
+            type=str,
+            default=ServerArgs.log_stats_format,
+            choices=["text", "json"],
+            help="Format for prefill/decode stats logging: 'text' (human-readable) or 'json' (structured)",
         )
         parser.add_argument(
             "--log-requests-target",

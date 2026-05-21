@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from typing import (
     TYPE_CHECKING,
     List,
@@ -485,23 +487,31 @@ class SchedulerMetricsReporter:
             if batch is not None and batch.forward_iter is not None
             else self.scheduler.forward_ct
         )
-        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
 
-        msg = (
-            f"Prefill batch{iter_msg}, "
-            f"#new-seq: {prefill_stats.num_new_seqs}, "
-            f"#new-token: {prefill_stats.log_input_tokens}, "
-            f"#cached-token: {prefill_stats.log_hit_tokens}, "
-            f"{token_usage_msg}"
-            f"#running-req: {prefill_stats.num_running_reqs.total}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}, "
-            f"#pending-token: {prefill_stats.num_pending_tokens}, "
-        )
+        # Build log data as a dict first (shared by both text and json formats)
+        prefill_log_data = {
+            "event": "prefill.batch",
+            "timestamp": datetime.now().isoformat(),
+            "new_seqs": prefill_stats.num_new_seqs,
+            "new_tokens": prefill_stats.log_input_tokens,
+            "cached_tokens": prefill_stats.log_hit_tokens,
+            "token_usage": pool_stats.get_prefill_usage_msg_parts(),
+            "running_reqs": prefill_stats.num_running_reqs.total,
+            "queue_reqs": len(self.scheduler.waiting_queue),
+            "pending_tokens": prefill_stats.num_pending_tokens,
+            "graph_backend": self._graph_backend_label,
+            "can_run_cuda_graph": can_run_cuda_graph,
+            "input_throughput_token_per_s": round(self.last_input_throughput, 2),
+        }
+        if LOG_FORWARD_ITERS:
+            prefill_log_data["iter"] = batch_iter
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
-            msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+            prefill_log_data["bootstrap_reqs"] = len(
+                self.scheduler.disagg_prefill_bootstrap_queue.queue
+            )
+            prefill_log_data["inflight_reqs"] = len(
+                self.scheduler.disagg_prefill_inflight_queue
             )
 
         if (
@@ -509,23 +519,52 @@ class SchedulerMetricsReporter:
             and self.scheduler.server_args.encoder_transfer_backend
             == "zmq_to_scheduler"
         ):
-            msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
+            prefill_log_data["waiting_image_reqs"] = len(
+                self.scheduler.mm_receiver.waiting_list
             )
-
-        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-        msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops, _, _ = self._estimate_prefill_perf(prefill_stats.log_input_tokens)
             tflops_per_s = flops / gap_latency / 1e12
-            msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
+            prefill_log_data["est_prefill_tflops_per_s_per_gpu"] = round(
+                tflops_per_s, 2
+            )
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            prefill_log_data["fwd_occupancy_pct"] = round(self.fwd_occupancy, 2)
 
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            if self.scheduler.server_args.log_stats_format == "json":
+                logger.info(json.dumps(prefill_log_data, ensure_ascii=False))
+            else:
+                iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+                token_usage_msg = ", ".join(prefill_log_data["token_usage"]) + ", "
+                msg = (
+                    f"Prefill batch{iter_msg}, "
+                    f"#new-seq: {prefill_log_data['new_seqs']}, "
+                    f"#new-token: {prefill_log_data['new_tokens']}, "
+                    f"#cached-token: {prefill_log_data['cached_tokens']}, "
+                    f"{token_usage_msg}"
+                    f"#running-req: {prefill_log_data['running_reqs']}, "
+                    f"#queue-req: {prefill_log_data['queue_reqs']}, "
+                    f"#pending-token: {prefill_log_data['pending_tokens']}, "
+                )
+                if "bootstrap_reqs" in prefill_log_data:
+                    msg += f"#bootstrap-req: {prefill_log_data['bootstrap_reqs']}, "
+                    msg += f"#inflight-req: {prefill_log_data['inflight_reqs']}, "
+                if "waiting_image_reqs" in prefill_log_data:
+                    msg += (
+                        f"waiting-image-req: {prefill_log_data['waiting_image_reqs']}, "
+                    )
+                msg += f"{prefill_log_data['graph_backend']}: {prefill_log_data['can_run_cuda_graph']}, "
+                msg += f"input throughput (token/s): {prefill_log_data['input_throughput_token_per_s']:.2f}"
+                if "est_prefill_tflops_per_s_per_gpu" in prefill_log_data:
+                    msg += f", est. prefill TFLOPS/s (per GPU): {prefill_log_data['est_prefill_tflops_per_s_per_gpu']:.2f}"
+                if "fwd_occupancy_pct" in prefill_log_data:
+                    msg += (
+                        f", fwd occupancy: {prefill_log_data['fwd_occupancy_pct']:.2f}%"
+                    )
+                logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -656,8 +695,20 @@ class SchedulerMetricsReporter:
             if batch is not None and batch.forward_iter is not None
             else self.scheduler.forward_ct
         )
-        iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
-        msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+
+        # Build log data as a dict first (shared by both text and json formats)
+        decode_log_data = {
+            "event": "decode.batch",
+            "timestamp": datetime.now().isoformat(),
+            "running_reqs": num_running_reqs,
+            "token_usage": pool_stats.get_decode_usage_msg_parts(),
+            "graph_backend": self._graph_backend_label,
+            "can_run_cuda_graph": can_run_cuda_graph,
+            "gen_throughput_token_per_s": round(self.last_gen_throughput, 2),
+            "queue_reqs": len(self.scheduler.waiting_queue),
+        }
+        if LOG_FORWARD_ITERS:
+            decode_log_data["iter"] = batch_iter
 
         if self.scheduler.spec_algorithm.is_none():
             spec_accept_length = 0
@@ -678,29 +729,34 @@ class SchedulerMetricsReporter:
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
-            msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            decode_log_data["spec_accept_length"] = round(spec_accept_length, 2)
+            decode_log_data["spec_accept_rate"] = round(spec_accept_rate, 2)
         cache_hit_rate = 0.0
 
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            msg += f"pre-allocated usage: {self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated / self.scheduler.max_total_num_tokens:.2f}, "
-            msg += f"#prealloc-req: {len(self.scheduler.disagg_decode_prealloc_queue.queue)}, "
-            msg += f"#transfer-req: {len(self.scheduler.disagg_decode_transfer_queue.queue)}, "
-            msg += f"#retracted-req: {len(self.scheduler.disagg_decode_prealloc_queue.retracted_queue)}, "
+            decode_log_data["preallocated_usage"] = round(
+                self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                / self.scheduler.max_total_num_tokens,
+                2,
+            )
+            decode_log_data["prealloc_reqs"] = len(
+                self.scheduler.disagg_decode_prealloc_queue.queue
+            )
+            decode_log_data["transfer_reqs"] = len(
+                self.scheduler.disagg_decode_transfer_queue.queue
+            )
+            decode_log_data["retracted_reqs"] = len(
+                self.scheduler.disagg_decode_prealloc_queue.retracted_queue
+            )
 
         if (
             self.scheduler.server_args.language_only
             and self.scheduler.server_args.encoder_transfer_backend
             == "zmq_to_scheduler"
         ):
-            msg += (
-                f"waiting-image-req: {len(self.scheduler.mm_receiver.waiting_list)}, "
+            decode_log_data["waiting_image_reqs"] = len(
+                self.scheduler.mm_receiver.waiting_list
             )
-
-        msg += (
-            f"{self._graph_backend_label}: {can_run_cuda_graph}, "
-            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.scheduler.waiting_queue)}"
-        )
 
         if self.enable_mfu_metrics and gap_latency > 0:
             flops_per_s = self._mfu_log_flops / gap_latency
@@ -709,20 +765,50 @@ class SchedulerMetricsReporter:
             tflops_per_s = flops_per_s / 1e12
             read_gb_per_s = read_bytes_per_s / 1e9
             write_gb_per_s = write_bytes_per_s / 1e9
-            msg += (
-                f", est. decode TFLOPS/s (per GPU): {tflops_per_s:.2f}, "
-                f"est. read BW (GB/s per GPU): {read_gb_per_s:.2f}, "
-                f"est. write BW (GB/s per GPU): {write_gb_per_s:.2f}"
-            )
+            decode_log_data["est_decode_tflops_per_s_per_gpu"] = round(tflops_per_s, 2)
+            decode_log_data["est_read_bw_gb_per_s_per_gpu"] = round(read_gb_per_s, 2)
+            decode_log_data["est_write_bw_gb_per_s_per_gpu"] = round(write_gb_per_s, 2)
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
+            decode_log_data["fwd_occupancy_pct"] = round(self.fwd_occupancy, 2)
 
         if self.is_stats_logging_rank:
-            logger.info(msg)
+            if self.scheduler.server_args.log_stats_format == "json":
+                logger.info(json.dumps(decode_log_data, ensure_ascii=False))
+            else:
+                iter_msg = f" [{batch_iter}]" if LOG_FORWARD_ITERS else ""
+                token_usage_msg = ", ".join(decode_log_data["token_usage"]) + ", "
+                msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
+                if "spec_accept_length" in decode_log_data:
+                    msg += f"accept len: {decode_log_data['spec_accept_length']:.2f}, accept rate: {decode_log_data['spec_accept_rate']:.2f}, "
+                if "preallocated_usage" in decode_log_data:
+                    msg += f"pre-allocated usage: {decode_log_data['preallocated_usage']:.2f}, "
+                    msg += f"#prealloc-req: {decode_log_data['prealloc_reqs']}, "
+                    msg += f"#transfer-req: {decode_log_data['transfer_reqs']}, "
+                    msg += f"#retracted-req: {decode_log_data['retracted_reqs']}, "
+                if "waiting_image_reqs" in decode_log_data:
+                    msg += (
+                        f"waiting-image-req: {decode_log_data['waiting_image_reqs']}, "
+                    )
+                msg += (
+                    f"{decode_log_data['graph_backend']}: {decode_log_data['can_run_cuda_graph']}, "
+                    f"gen throughput (token/s): {decode_log_data['gen_throughput_token_per_s']:.2f}, "
+                    f"#queue-req: {decode_log_data['queue_reqs']}"
+                )
+                if "est_decode_tflops_per_s_per_gpu" in decode_log_data:
+                    msg += (
+                        f", est. decode TFLOPS/s (per GPU): {decode_log_data['est_decode_tflops_per_s_per_gpu']:.2f}, "
+                        f"est. read BW (GB/s per GPU): {decode_log_data['est_read_bw_gb_per_s_per_gpu']:.2f}, "
+                        f"est. write BW (GB/s per GPU): {decode_log_data['est_write_bw_gb_per_s_per_gpu']:.2f}"
+                    )
+                if "fwd_occupancy_pct" in decode_log_data:
+                    msg += (
+                        f", fwd occupancy: {decode_log_data['fwd_occupancy_pct']:.2f}%"
+                    )
+                logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 

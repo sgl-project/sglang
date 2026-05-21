@@ -1092,6 +1092,105 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         else:
             return "Unknown Time Stats"
 
+    def convert_to_duration_dict(self) -> dict:
+        """Return time stats as a structured dict for JSON logging."""
+        if self.disagg_mode == DisaggregationMode.NULL:
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
+            return {
+                "queue_duration_ms": round(queue_duration * 1e3, 2),
+                "forward_duration_ms": round(forward_duration * 1e3, 2),
+                "entry_time": self.format_wallclock(self.wait_queue_entry_time),
+            }
+        elif self.disagg_mode == DisaggregationMode.PREFILL:
+            result = {}
+            bootstrap_queue_duration = self.duration_between(
+                self.prefill_bootstrap_queue_entry_time, self.wait_queue_entry_time
+            )
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time, self.forward_entry_time
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time, self.completion_time
+            )
+            if self.bootstrap_done_time > 0:
+                result["bootstrap_duration_ms"] = round(
+                    self.duration_between(
+                        self.prefill_bootstrap_queue_entry_time,
+                        self.bootstrap_done_time,
+                    )
+                    * 1e3,
+                    2,
+                )
+                result["alloc_wait_duration_ms"] = round(
+                    self.duration_between(
+                        self.bootstrap_done_time, self.wait_queue_entry_time
+                    )
+                    * 1e3,
+                    2,
+                )
+            else:
+                result["bootstrap_queue_duration_ms"] = round(
+                    bootstrap_queue_duration * 1e3, 2
+                )
+            result["queue_duration_ms"] = round(queue_duration * 1e3, 2)
+            result["forward_duration_ms"] = round(forward_duration * 1e3, 2)
+            result["entry_time"] = self.format_wallclock(
+                self.prefill_bootstrap_queue_entry_time
+            )
+            result["transfer_speed_gb_s"] = round(self.transfer_speed_gb_s, 2)
+            result["transfer_total_mb"] = round(self.transfer_total_mb, 2)
+            result["retries"] = self.prefill_retry_count
+            return result
+        elif self.disagg_mode == DisaggregationMode.DECODE:
+            result = {}
+            prealloc_duration = self.duration_between(
+                self.decode_prealloc_queue_entry_time,
+                self.decode_transfer_queue_entry_time,
+            )
+            transfer_duration = self.duration_between(
+                self.decode_transfer_queue_entry_time,
+                self.wait_queue_entry_time,
+            )
+            queue_duration = self.duration_between(
+                self.wait_queue_entry_time,
+                self.forward_entry_time,
+            )
+            forward_duration = self.duration_between(
+                self.forward_entry_time,
+                self.completion_time,
+            )
+            if self.bootstrap_done_time > 0:
+                result["bootstrap_duration_ms"] = round(
+                    self.duration_between(
+                        self.decode_prealloc_queue_entry_time, self.bootstrap_done_time
+                    )
+                    * 1e3,
+                    2,
+                )
+                result["alloc_wait_duration_ms"] = round(
+                    self.duration_between(
+                        self.bootstrap_done_time, self.decode_transfer_queue_entry_time
+                    )
+                    * 1e3,
+                    2,
+                )
+            else:
+                result["prealloc_queue_duration_ms"] = round(prealloc_duration * 1e3, 2)
+            result["transfer_duration_ms"] = round(transfer_duration * 1e3, 2)
+            result["queue_duration_ms"] = round(queue_duration * 1e3, 2)
+            result["forward_duration_ms"] = round(forward_duration * 1e3, 2)
+            result["entry_time"] = self.format_wallclock(
+                self.decode_prealloc_queue_entry_time
+            )
+            return result
+        else:
+            return {}
+
     def convert_to_output_meta_info(self):
         meta_data = {}
         if self.forward_entry_time > 0.0:
