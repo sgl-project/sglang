@@ -1057,9 +1057,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
         if self.rids_hashed is not None:
-            # rids_hashed was sized to len(batch.reqs) in init_new (before cuda-graph
-            # padding); re-mirror onto sampling_info so both consumers see the
-            # padded length.
             self.rids_hashed = self._pad_tensor_to_size(self.rids_hashed, bs)
             if self.sampling_info is not None:
                 self.sampling_info.rids_hashed = self.rids_hashed

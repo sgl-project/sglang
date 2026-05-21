@@ -24,7 +24,7 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
@@ -277,7 +277,7 @@ class TestSelfUnitRunner(CustomTestCase):
                 req_to_token_prob=1.0,
                 real_kv_used_prob=0.0,
                 real_kv_unused_cache_prob=0.0,
-                target_group_kind="any",
+                target_group_kind=TargetGroupKind.ANY,
                 warmup_steps=0,
             ),
             req_to_token_pool=pool,
