@@ -42,9 +42,7 @@ class TestUvicornBindKwargs(unittest.TestCase):
 class TestFormatListenAddr(unittest.TestCase):
     def test_formats_host_port(self):
         args = ServerArgs(model_path="dummy")
-        self.assertEqual(
-            _format_listen_addr(args), f"{args.host}:{args.port}"
-        )
+        self.assertEqual(_format_listen_addr(args), f"{args.host}:{args.port}")
 
     def test_formats_uds(self):
         args = ServerArgs(model_path="dummy", uds="/run/sglang.sock")

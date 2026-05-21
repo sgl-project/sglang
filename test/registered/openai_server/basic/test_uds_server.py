@@ -60,8 +60,7 @@ def _wait_for_uds_health(uds_path: str, timeout: float) -> None:
             conn.close()
         time.sleep(1.0)
     raise TimeoutError(
-        f"Server did not become healthy on {uds_path} within {timeout}s: "
-        f"{last_err}"
+        f"Server did not become healthy on {uds_path} within {timeout}s: " f"{last_err}"
     )
 
 
@@ -91,10 +90,12 @@ class TestUDSServer(CustomTestCase):
         cls._restore_env: dict[str, str | None] = {}
         try:
             from sglang.utils import is_in_ci
+
             if is_in_ci():
                 from sglang.test.test_utils import (
                     _try_enable_offline_mode_if_cache_complete,
                 )
+
                 proxy_env: dict[str, str] = {}
                 _try_enable_offline_mode_if_cache_complete(
                     cls.model, proxy_env, command[1:]
@@ -128,7 +129,9 @@ class TestUDSServer(CustomTestCase):
         except OSError:
             pass
 
-    def _request_json(self, method: str, path: str, payload: dict | None = None) -> dict:
+    def _request_json(
+        self, method: str, path: str, payload: dict | None = None
+    ) -> dict:
         conn = _UDSConnection(self.uds_path, timeout=120.0)
         headers = {"Content-Type": "application/json"}
         body = json.dumps(payload).encode("utf-8") if payload is not None else None
