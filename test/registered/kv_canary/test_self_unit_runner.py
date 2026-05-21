@@ -251,17 +251,20 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         forward_batch = _make_forward_batch(self.device, bs=2, seq_lens_list=(3, 3))
 
+        snapshot = pool.req_to_token.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
             hook.perturb_req_to_token_hook(forward_batch)
 
-        row, col, original = hook._perturb_undo
+        diff = pool.req_to_token != snapshot
+        self.assertEqual(int(diff.sum().item()), 1)
+        rows, cols = torch.nonzero(diff, as_tuple=True)
+        row, col = int(rows[0].item()), int(cols[0].item())
+        original = int(snapshot[row, col].item())
         replacement = int(pool.req_to_token[row, col].item())
         live_slots = {11, 22, 33, 44, 55, 66}
+        self.assertIn(original, live_slots)
         self.assertIn(replacement, live_slots)
         self.assertNotEqual(replacement, original)
-
-        hook.undo_after_step()
-        self.assertEqual(int(pool.req_to_token[row, col].item()), original)
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         runner = _make_runner(device=self.device)
