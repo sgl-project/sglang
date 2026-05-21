@@ -49,7 +49,6 @@ class CanaryRunner:
         tp_group: Optional["GroupCoordinator"] = None,
         pp_group: Optional["GroupCoordinator"] = None,
         req_to_token_pool: "ReqToTokenPool",
-        radix_cache: Optional["BasePrefixCache"] = None,
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         token_oracle_manager: Optional[TokenOracleManager] = None,
@@ -133,9 +132,6 @@ class CanaryRunner:
             sweep_orchestrator=self._sweep_orchestrator,
             d2h_stream=self._d2h_stream,
         )
-
-        if radix_cache is not None:
-            self.attach_radix_cache(radix_cache)
 
     @property
     def active_tag_count(self) -> int:

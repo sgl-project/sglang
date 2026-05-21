@@ -285,6 +285,9 @@ class TestSelfUnitRunner(CustomTestCase):
             pump_and_allreduce=SimpleNamespace(step_counter=10),
         )
         forward_batch = _make_forward_batch(self.device, bs=2, seq_lens_list=(3, 3))
+        forward_batch.out_cache_loc = torch.tensor(
+            [11], dtype=torch.int32, device=self.device
+        )
 
         snapshot = pool.req_to_token.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
@@ -300,6 +303,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertIn(original, live_slots)
         self.assertIn(replacement, live_slots)
         self.assertNotEqual(replacement, original)
+        self.assertFalse(bool(diff[1, 0].item()))
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         """Verify the kernel watchdog raises when counters stop advancing."""
