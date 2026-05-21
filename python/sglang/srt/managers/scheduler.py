@@ -2838,6 +2838,7 @@ class Scheduler(
                 # into batch.seq_lens_cpu + set seq_lens_sum. For non-spec_v2,
                 # ForwardBatch.init_new lazily computes the sum.
                 if batch.is_spec_v2:
+                    # FIXME: make this optional to different backends.
                     self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
