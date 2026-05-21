@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -17,6 +18,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -45,6 +48,7 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+    fp8_dtype as _dsv4_k_cache_fp8_dtype,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.dp_attention import (
@@ -84,6 +88,707 @@ def _create_flashmla_metadata():
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
+
+
+def _dsv4_use_bf16_sparse_prefill() -> bool:
+    return envs.SGLANG_DSV4_USE_BF16_SPARSE_PREFILL.get()
+
+
+_DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO: Dict[int, float] = {}
+
+
+def _dsv4_apply_topk_length(
+    indices: torch.Tensor, topk_length: Optional[torch.Tensor]
+) -> torch.Tensor:
+    if topk_length is None:
+        return indices
+
+    indices = indices.clone()
+    arange = torch.arange(indices.shape[-1], device=indices.device).view(
+        *([1] * (indices.ndim - 1)), indices.shape[-1]
+    )
+    length = topk_length
+    while length.ndim < indices.ndim:
+        length = length.unsqueeze(-1)
+    indices[arange >= length] = -1
+    return indices
+
+
+def _dsv4_shift_valid_indices(indices: torch.Tensor, offset: int) -> torch.Tensor:
+    return torch.where(indices >= 0, indices + offset, indices)
+
+
+def _dsv4_pad_indices_last_dim(
+    indices: torch.Tensor, multiple: int = 128
+) -> torch.Tensor:
+    pad = (-indices.shape[-1]) % multiple
+    if pad == 0:
+        return indices
+    return F.pad(indices, (0, pad), value=-1)
+
+
+def _dsv4_dequantize_model1_fp8_sparse_k_cache_torch_ref(
+    k_cache: torch.Tensor,
+) -> torch.Tensor:
+    num_blocks, block_size, h_k, _ = k_cache.shape
+    assert h_k == 1
+    d, d_nope, d_rope, tile_size, num_tiles = 512, 448, 64, 64, 7
+    k_cache = k_cache.view(num_blocks, -1)
+    nope_rope = k_cache[:, : block_size * (d_nope + 2 * d_rope)].view(
+        num_blocks, block_size, d_nope + 2 * d_rope
+    )
+    nope = nope_rope[:, :, :d_nope]
+    rope = nope_rope[:, :, d_nope:].view(torch.bfloat16)
+    scale = (
+        k_cache[:, block_size * (d_nope + 2 * d_rope) :]
+        .view(num_blocks, block_size, 8)[:, :, :num_tiles]
+        .view(torch.float8_e8m0fnu)
+    )
+
+    result = torch.empty(
+        (num_blocks, block_size, d), dtype=torch.bfloat16, device=k_cache.device
+    )
+    result[..., d_nope:] = rope
+    for tile_idx in range(num_tiles):
+        start = tile_idx * tile_size
+        end = start + tile_size
+        result[..., start:end] = (
+            nope[..., start:end].to(torch.bfloat16)
+            * scale[:, :, tile_idx].to(torch.bfloat16).unsqueeze(-1)
+        )
+    return result.view(num_blocks, block_size, 1, d)
+
+
+_dsv4_dequantize_model1_fp8_sparse_k_cache_torch = (
+    _dsv4_dequantize_model1_fp8_sparse_k_cache_torch_ref
+)
+
+
+@triton.jit
+def _dsv4_dequantize_model1_fp8_sparse_k_cache_kernel(
+    k_cache_fp8_ptr,
+    k_cache_bf16_ptr,
+    k_cache_u8_ptr,
+    out_ptr,
+    k_stride_0: tl.constexpr,
+    k_bf16_stride_0: tl.constexpr,
+    out_stride_0: tl.constexpr,
+    out_token_offset: tl.constexpr,
+    block_size: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    VALUE_BYTES_PER_TOKEN: tl.constexpr,
+    VALUE_BF16_PER_TOKEN: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    SCALE_BIAS: tl.constexpr,
+):
+    token_linear = tl.program_id(0)
+    block_id = token_linear // block_size
+    token_offset = token_linear - block_id * block_size
+    out_token_id = out_token_offset + token_linear
+
+    offsets = tl.arange(0, BLOCK_DIM)
+    nope_mask = offsets < DIM_NOPE
+    rope_mask = (offsets >= DIM_NOPE) & (offsets < DIM_NOPE + DIM_ROPE)
+
+    value_base = block_id * k_stride_0 + token_offset * VALUE_BYTES_PER_TOKEN
+    x_fp32 = tl.load(
+        k_cache_fp8_ptr + value_base + offsets,
+        mask=nope_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    scale_offsets = (
+        block_id * k_stride_0
+        + block_size * VALUE_BYTES_PER_TOKEN
+        + token_offset * SCALE_BYTES_PER_TOKEN
+        + offsets // 64
+    )
+    scale_u8 = tl.load(
+        k_cache_u8_ptr + scale_offsets,
+        mask=nope_mask,
+        other=127,
+    ).to(tl.float32)
+    y_nope = (x_fp32 * tl.exp2(scale_u8 - SCALE_BIAS)).to(out_ptr.dtype.element_ty)
+
+    rope_offsets = (
+        block_id * k_bf16_stride_0
+        + token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    y_rope = tl.load(k_cache_bf16_ptr + rope_offsets, mask=rope_mask, other=0.0)
+
+    y = tl.where(nope_mask, y_nope, y_rope)
+    tl.store(
+        out_ptr + out_token_id * out_stride_0 + offsets,
+        y,
+        mask=offsets < DIM_NOPE + DIM_ROPE,
+    )
+
+
+@triton.jit
+def _dsv4_dequantize_two_model1_fp8_sparse_k_caches_kernel(
+    swa_k_cache_fp8_ptr,
+    swa_k_cache_bf16_ptr,
+    swa_k_cache_u8_ptr,
+    extra_k_cache_fp8_ptr,
+    extra_k_cache_bf16_ptr,
+    extra_k_cache_u8_ptr,
+    out_ptr,
+    swa_num_tokens,
+    swa_k_stride_0: tl.constexpr,
+    swa_k_bf16_stride_0: tl.constexpr,
+    extra_k_stride_0: tl.constexpr,
+    extra_k_bf16_stride_0: tl.constexpr,
+    out_stride_0: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
+    EXTRA_BLOCK_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    VALUE_BYTES_PER_TOKEN: tl.constexpr,
+    VALUE_BF16_PER_TOKEN: tl.constexpr,
+    SCALE_BYTES_PER_TOKEN: tl.constexpr,
+    SCALE_BIAS: tl.constexpr,
+):
+    token_linear = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_DIM)
+    is_extra = token_linear >= swa_num_tokens
+    nope_mask = offsets < DIM_NOPE
+    rope_mask = (offsets >= DIM_NOPE) & (offsets < DIM_NOPE + DIM_ROPE)
+
+    swa_block_id = token_linear // SWA_BLOCK_SIZE
+    swa_token_offset = token_linear - swa_block_id * SWA_BLOCK_SIZE
+    extra_token_linear = token_linear - swa_num_tokens
+    extra_block_id = extra_token_linear // EXTRA_BLOCK_SIZE
+    extra_token_offset = extra_token_linear - extra_block_id * EXTRA_BLOCK_SIZE
+
+    swa_value_base = (
+        swa_block_id * swa_k_stride_0 + swa_token_offset * VALUE_BYTES_PER_TOKEN
+    )
+    extra_value_base = (
+        extra_block_id * extra_k_stride_0 + extra_token_offset * VALUE_BYTES_PER_TOKEN
+    )
+    x_swa = tl.load(
+        swa_k_cache_fp8_ptr + swa_value_base + offsets,
+        mask=(~is_extra) & nope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_extra = tl.load(
+        extra_k_cache_fp8_ptr + extra_value_base + offsets,
+        mask=is_extra & nope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_fp32 = tl.where(is_extra, x_extra, x_swa)
+
+    scale_offsets = offsets // 64
+    swa_scale_offsets = (
+        swa_block_id * swa_k_stride_0
+        + SWA_BLOCK_SIZE * VALUE_BYTES_PER_TOKEN
+        + swa_token_offset * SCALE_BYTES_PER_TOKEN
+        + scale_offsets
+    )
+    extra_scale_offsets = (
+        extra_block_id * extra_k_stride_0
+        + EXTRA_BLOCK_SIZE * VALUE_BYTES_PER_TOKEN
+        + extra_token_offset * SCALE_BYTES_PER_TOKEN
+        + scale_offsets
+    )
+    scale_swa = tl.load(
+        swa_k_cache_u8_ptr + swa_scale_offsets,
+        mask=(~is_extra) & nope_mask,
+        other=127,
+    ).to(tl.float32)
+    scale_extra = tl.load(
+        extra_k_cache_u8_ptr + extra_scale_offsets,
+        mask=is_extra & nope_mask,
+        other=127,
+    ).to(tl.float32)
+    scale_u8 = tl.where(is_extra, scale_extra, scale_swa)
+    y_nope = (x_fp32 * tl.exp2(scale_u8 - SCALE_BIAS)).to(out_ptr.dtype.element_ty)
+
+    swa_rope_offsets = (
+        swa_block_id * swa_k_bf16_stride_0
+        + swa_token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    extra_rope_offsets = (
+        extra_block_id * extra_k_bf16_stride_0
+        + extra_token_offset * VALUE_BF16_PER_TOKEN
+        + (DIM_NOPE // 2)
+        + (offsets - DIM_NOPE)
+    )
+    y_rope_swa = tl.load(
+        swa_k_cache_bf16_ptr + swa_rope_offsets,
+        mask=(~is_extra) & rope_mask,
+        other=0.0,
+    )
+    y_rope_extra = tl.load(
+        extra_k_cache_bf16_ptr + extra_rope_offsets,
+        mask=is_extra & rope_mask,
+        other=0.0,
+    )
+    y_rope = tl.where(is_extra, y_rope_extra, y_rope_swa)
+
+    y = tl.where(nope_mask, y_nope, y_rope)
+    tl.store(
+        out_ptr + token_linear * out_stride_0 + offsets,
+        y,
+        mask=offsets < DIM_NOPE + DIM_ROPE,
+    )
+
+
+def _dsv4_get_k_cache_fp8_view(k_cache: torch.Tensor) -> torch.Tensor:
+    if k_cache.dtype == torch.uint8:
+        return k_cache.view(_dsv4_k_cache_fp8_dtype)
+    return k_cache
+
+
+def _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
+    k_cache: torch.Tensor,
+    out: torch.Tensor,
+    out_token_offset: int,
+) -> None:
+    num_blocks, block_size, h_k, dim_quant = k_cache.shape
+    assert h_k == 1
+    assert dim_quant == 584
+    assert out.dtype == torch.bfloat16
+    assert out.shape[-1] == 512
+
+    num_tokens = num_blocks * block_size
+    if num_tokens == 0:
+        return
+
+    k_cache_fp8 = _dsv4_get_k_cache_fp8_view(k_cache)
+    k_cache_bf16 = k_cache_fp8.view(torch.bfloat16)
+    k_cache_u8 = k_cache_fp8.view(torch.uint8)
+
+    d_nope, d_rope, block_dim = 448, 64, 512
+    _dsv4_dequantize_model1_fp8_sparse_k_cache_kernel[(num_tokens,)](
+        k_cache_fp8,
+        k_cache_bf16,
+        k_cache_u8,
+        out,
+        k_cache_fp8.stride(0),
+        k_cache_bf16.stride(0),
+        out.stride(0),
+        out_token_offset,
+        block_size,
+        DIM_NOPE=d_nope,
+        DIM_ROPE=d_rope,
+        BLOCK_DIM=block_dim,
+        VALUE_BYTES_PER_TOKEN=d_nope + 2 * d_rope,
+        VALUE_BF16_PER_TOKEN=(d_nope + 2 * d_rope) // 2,
+        SCALE_BYTES_PER_TOKEN=8,
+        SCALE_BIAS=127.0,
+        num_warps=4,
+    )
+
+
+def _dsv4_dequantize_two_model1_fp8_sparse_k_caches_into(
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    swa_num_blocks, swa_block_size, swa_h_k, swa_dim_quant = swa_k_cache.shape
+    extra_num_blocks, extra_block_size, extra_h_k, extra_dim_quant = extra_k_cache.shape
+    assert swa_h_k == 1 and extra_h_k == 1
+    assert swa_dim_quant == 584 and extra_dim_quant == 584
+    assert out.dtype == torch.bfloat16
+    assert out.shape[-1] == 512
+
+    swa_num_tokens = swa_num_blocks * swa_block_size
+    extra_num_tokens = extra_num_blocks * extra_block_size
+    assert out.shape[0] >= swa_num_tokens + extra_num_tokens
+    if swa_num_tokens == 0:
+        _dsv4_dequantize_model1_fp8_sparse_k_cache_into(extra_k_cache, out, 0)
+        return
+    if extra_num_tokens == 0:
+        _dsv4_dequantize_model1_fp8_sparse_k_cache_into(swa_k_cache, out, 0)
+        return
+
+    swa_k_cache_fp8 = _dsv4_get_k_cache_fp8_view(swa_k_cache)
+    swa_k_cache_bf16 = swa_k_cache_fp8.view(torch.bfloat16)
+    swa_k_cache_u8 = swa_k_cache_fp8.view(torch.uint8)
+    extra_k_cache_fp8 = _dsv4_get_k_cache_fp8_view(extra_k_cache)
+    extra_k_cache_bf16 = extra_k_cache_fp8.view(torch.bfloat16)
+    extra_k_cache_u8 = extra_k_cache_fp8.view(torch.uint8)
+
+    d_nope, d_rope, block_dim = 448, 64, 512
+    _dsv4_dequantize_two_model1_fp8_sparse_k_caches_kernel[
+        (swa_num_tokens + extra_num_tokens,)
+    ](
+        swa_k_cache_fp8,
+        swa_k_cache_bf16,
+        swa_k_cache_u8,
+        extra_k_cache_fp8,
+        extra_k_cache_bf16,
+        extra_k_cache_u8,
+        out,
+        swa_num_tokens,
+        swa_k_cache_fp8.stride(0),
+        swa_k_cache_bf16.stride(0),
+        extra_k_cache_fp8.stride(0),
+        extra_k_cache_bf16.stride(0),
+        out.stride(0),
+        SWA_BLOCK_SIZE=swa_block_size,
+        EXTRA_BLOCK_SIZE=extra_block_size,
+        DIM_NOPE=d_nope,
+        DIM_ROPE=d_rope,
+        BLOCK_DIM=block_dim,
+        VALUE_BYTES_PER_TOKEN=d_nope + 2 * d_rope,
+        VALUE_BF16_PER_TOKEN=(d_nope + 2 * d_rope) // 2,
+        SCALE_BYTES_PER_TOKEN=8,
+        SCALE_BIAS=127.0,
+        num_warps=4,
+    )
+
+
+def _dsv4_dequantize_model1_fp8_sparse_k_cache(k_cache: torch.Tensor) -> torch.Tensor:
+    num_blocks, block_size, h_k, dim_quant = k_cache.shape
+    assert h_k == 1
+    assert dim_quant == 584
+    out = torch.empty(
+        (num_blocks * block_size, 1, 512),
+        dtype=torch.bfloat16,
+        device=k_cache.device,
+    )
+    _dsv4_dequantize_model1_fp8_sparse_k_cache_into(k_cache, out, 0)
+    return out.view(num_blocks, block_size, 1, 512)
+
+
+def _dsv4_topk_length_2d(topk_length: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if topk_length is None:
+        return None
+    if topk_length.ndim == 1:
+        return topk_length.unsqueeze(1)
+    if topk_length.ndim == 2:
+        return topk_length
+    if topk_length.ndim == 3 and topk_length.shape[-1] == 1:
+        return topk_length.squeeze(-1)
+    raise AssertionError(f"unsupported topk_length shape: {tuple(topk_length.shape)}")
+
+
+@triton.jit
+def _dsv4_build_unified_prefill_indices_kernel(
+    swa_indices_ptr,
+    extra_indices_ptr,
+    swa_lengths_ptr,
+    extra_lengths_ptr,
+    out_ptr,
+    swa_stride_0: tl.constexpr,
+    swa_stride_1: tl.constexpr,
+    swa_stride_2: tl.constexpr,
+    extra_stride_0: tl.constexpr,
+    extra_stride_1: tl.constexpr,
+    extra_stride_2: tl.constexpr,
+    swa_len_stride_0: tl.constexpr,
+    swa_len_stride_1: tl.constexpr,
+    extra_len_stride_0: tl.constexpr,
+    extra_len_stride_1: tl.constexpr,
+    out_stride_0: tl.constexpr,
+    out_stride_1: tl.constexpr,
+    out_stride_2: tl.constexpr,
+    H_KV: tl.constexpr,
+    SWA_TOPK: tl.constexpr,
+    EXTRA_TOPK: tl.constexpr,
+    OUT_TOPK: tl.constexpr,
+    SWA_LENGTH_H: tl.constexpr,
+    EXTRA_LENGTH_H: tl.constexpr,
+    EXTRA_OFFSET: tl.constexpr,
+    HAS_EXTRA: tl.constexpr,
+    HAS_SWA_LENGTH: tl.constexpr,
+    HAS_EXTRA_LENGTH: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+):
+    row_id = tl.program_id(0)
+    q_id = row_id // H_KV
+    h_id = row_id - q_id * H_KV
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
+
+    values = tl.full((BLOCK_TOPK,), -1, dtype=tl.int32)
+
+    swa_mask = offsets < SWA_TOPK
+    swa_raw = tl.load(
+        swa_indices_ptr
+        + q_id * swa_stride_0
+        + h_id * swa_stride_1
+        + offsets * swa_stride_2,
+        mask=swa_mask,
+        other=-1,
+    )
+    swa_length_valid = swa_mask
+    if HAS_SWA_LENGTH:
+        swa_len_h_id = tl.minimum(h_id, SWA_LENGTH_H - 1)
+        swa_len = tl.load(
+            swa_lengths_ptr + q_id * swa_len_stride_0 + swa_len_h_id * swa_len_stride_1
+        )
+        swa_length_valid = swa_mask & (offsets < swa_len)
+    values = tl.where(swa_length_valid, swa_raw, values)
+
+    if HAS_EXTRA:
+        extra_offsets = offsets - SWA_TOPK
+        extra_mask = (offsets >= SWA_TOPK) & (extra_offsets < EXTRA_TOPK)
+        extra_raw = tl.load(
+            extra_indices_ptr
+            + q_id * extra_stride_0
+            + h_id * extra_stride_1
+            + extra_offsets * extra_stride_2,
+            mask=extra_mask,
+            other=-1,
+        )
+        extra_length_valid = extra_mask
+        if HAS_EXTRA_LENGTH:
+            extra_len_h_id = tl.minimum(h_id, EXTRA_LENGTH_H - 1)
+            extra_len = tl.load(
+                extra_lengths_ptr
+                + q_id * extra_len_stride_0
+                + extra_len_h_id * extra_len_stride_1
+            )
+            extra_length_valid = extra_mask & (extra_offsets < extra_len)
+        extra_shifted = tl.where(extra_raw >= 0, extra_raw + EXTRA_OFFSET, extra_raw)
+        values = tl.where(extra_length_valid, extra_shifted, values)
+
+    out_mask = offsets < OUT_TOPK
+    tl.store(
+        out_ptr + q_id * out_stride_0 + h_id * out_stride_1 + offsets * out_stride_2,
+        values,
+        mask=out_mask,
+    )
+
+
+def _dsv4_build_unified_prefill_indices_triton(
+    *,
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+    extra_offset: int,
+) -> torch.Tensor:
+    assert swa_page_indices.ndim == 3
+    num_q, h_kv, swa_topk = swa_page_indices.shape
+    has_extra = extra_indices is not None
+    extra_topk = 0
+    if has_extra:
+        assert extra_indices is not None
+        assert extra_indices.ndim == 3
+        assert extra_indices.shape[:2] == (num_q, h_kv)
+        extra_topk = extra_indices.shape[-1]
+
+    out_topk = ceil_align(swa_topk + extra_topk, 128)
+    out = torch.empty(
+        (num_q, h_kv, out_topk),
+        dtype=swa_page_indices.dtype,
+        device=swa_page_indices.device,
+    )
+
+    swa_lengths_2d = _dsv4_topk_length_2d(swa_topk_lengths)
+    extra_lengths_2d = _dsv4_topk_length_2d(extra_topk_lengths)
+
+    empty_indices = swa_page_indices
+    empty_lengths = torch.empty((1, 1), dtype=torch.int32, device=swa_page_indices.device)
+    extra_indices_arg = extra_indices if extra_indices is not None else empty_indices
+    swa_lengths_arg = swa_lengths_2d if swa_lengths_2d is not None else empty_lengths
+    extra_lengths_arg = (
+        extra_lengths_2d if extra_lengths_2d is not None else empty_lengths
+    )
+
+    block_topk = 128
+    grid = (num_q * h_kv, triton.cdiv(out_topk, block_topk))
+    _dsv4_build_unified_prefill_indices_kernel[grid](
+        swa_page_indices,
+        extra_indices_arg,
+        swa_lengths_arg,
+        extra_lengths_arg,
+        out,
+        swa_page_indices.stride(0),
+        swa_page_indices.stride(1),
+        swa_page_indices.stride(2),
+        extra_indices_arg.stride(0),
+        extra_indices_arg.stride(1),
+        extra_indices_arg.stride(2),
+        swa_lengths_arg.stride(0),
+        swa_lengths_arg.stride(1),
+        extra_lengths_arg.stride(0),
+        extra_lengths_arg.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H_KV=h_kv,
+        SWA_TOPK=swa_topk,
+        EXTRA_TOPK=extra_topk,
+        OUT_TOPK=out_topk,
+        SWA_LENGTH_H=swa_lengths_arg.shape[1],
+        EXTRA_LENGTH_H=extra_lengths_arg.shape[1],
+        EXTRA_OFFSET=extra_offset,
+        HAS_EXTRA=has_extra,
+        HAS_SWA_LENGTH=swa_lengths_2d is not None,
+        HAS_EXTRA_LENGTH=extra_lengths_2d is not None,
+        BLOCK_TOPK=block_topk,
+    )
+    return out
+
+
+def _dsv4_build_unified_prefill_inputs_from_real_decode(
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    return _dsv4_build_unified_prefill_inputs_from_real_decode_triton(
+        q=q,
+        swa_k_cache=swa_k_cache,
+        extra_k_cache=extra_k_cache,
+        swa_page_indices=swa_page_indices,
+        extra_indices=extra_indices,
+        swa_topk_lengths=swa_topk_lengths,
+        extra_topk_lengths=extra_topk_lengths,
+    )
+
+
+def _dsv4_build_unified_prefill_inputs_from_real_decode_torch_ref(
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if q.ndim != 4 or q.shape[1] != 1:
+        return None
+    if q.shape[-1] != 512:
+        return None
+    if swa_k_cache.shape[-1] != 584:
+        return None
+
+    q_prefill = q.squeeze(1).contiguous()
+    swa_indices = _dsv4_apply_topk_length(swa_page_indices, swa_topk_lengths)
+    swa_k_dequant = _dsv4_dequantize_model1_fp8_sparse_k_cache_torch_ref(swa_k_cache)
+    kv_parts = [swa_k_dequant.reshape(-1, 1, q.shape[-1])]
+    index_parts = [swa_indices]
+
+    if extra_k_cache is not None:
+        if extra_indices is None:
+            return None
+        if extra_k_cache.shape[-1] != 584:
+            return None
+        extra_indices = _dsv4_apply_topk_length(extra_indices, extra_topk_lengths)
+        extra_k_dequant = _dsv4_dequantize_model1_fp8_sparse_k_cache_torch_ref(
+            extra_k_cache
+        )
+        extra_offset = kv_parts[0].shape[0]
+        kv_parts.append(extra_k_dequant.reshape(-1, 1, q.shape[-1]))
+        index_parts.append(_dsv4_shift_valid_indices(extra_indices, extra_offset))
+
+    kv_unified = torch.cat(kv_parts, dim=0).contiguous()
+    indices_unified = torch.cat(index_parts, dim=-1).contiguous()
+    indices_unified = _dsv4_pad_indices_last_dim(indices_unified)
+    return q_prefill, kv_unified, indices_unified
+
+
+def _dsv4_build_unified_prefill_inputs_from_real_decode_triton(
+    q: torch.Tensor,
+    swa_k_cache: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    swa_page_indices: torch.Tensor,
+    extra_indices: Optional[torch.Tensor],
+    swa_topk_lengths: Optional[torch.Tensor],
+    extra_topk_lengths: Optional[torch.Tensor],
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    if q.ndim != 4 or q.shape[1] != 1:
+        return None
+    if q.shape[-1] != 512:
+        return None
+    if swa_k_cache.shape[-1] != 584:
+        return None
+
+    q_prefill = q.squeeze(1).contiguous()
+    swa_num_tokens = swa_k_cache.shape[0] * swa_k_cache.shape[1]
+    extra_num_tokens = 0
+
+    if extra_k_cache is not None:
+        if extra_indices is None:
+            return None
+        if extra_k_cache.shape[-1] != 584:
+            return None
+        extra_num_tokens = extra_k_cache.shape[0] * extra_k_cache.shape[1]
+
+    kv_unified = torch.empty(
+        (swa_num_tokens + extra_num_tokens, 1, q.shape[-1]),
+        dtype=torch.bfloat16,
+        device=q.device,
+    )
+    if extra_k_cache is None:
+        _dsv4_dequantize_model1_fp8_sparse_k_cache_into(
+            swa_k_cache, kv_unified, out_token_offset=0
+        )
+    else:
+        _dsv4_dequantize_two_model1_fp8_sparse_k_caches_into(
+            swa_k_cache, extra_k_cache, kv_unified
+        )
+
+    indices_unified = _dsv4_build_unified_prefill_indices_triton(
+        swa_page_indices=swa_page_indices,
+        extra_indices=extra_indices,
+        swa_topk_lengths=swa_topk_lengths,
+        extra_topk_lengths=extra_topk_lengths,
+        extra_offset=swa_num_tokens,
+    )
+    return q_prefill, kv_unified, indices_unified
+
+
+def _dsv4_run_bf16_sparse_prefill_attention(
+    *,
+    q_prefill: torch.Tensor,
+    kv_unified: torch.Tensor,
+    indices_unified: torch.Tensor,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: Optional[torch.Tensor],
+    compress_ratio: Literal[0, 4, 128],
+) -> Optional[torch.Tensor]:
+    global _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO
+
+    import flash_mla
+
+    if q_prefill.ndim != 3 or kv_unified.ndim != 3:
+        return None
+    if q_prefill.shape[-1] != kv_unified.shape[-1]:
+        return None
+    topk_length_unified = None
+
+    now = time.monotonic()
+    last_log_time = _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO.get(
+        compress_ratio, 0.0
+    )
+    should_log_hit = q_prefill.shape[0] >= 512 and (now - last_log_time >= 0.2)
+    if should_log_hit:
+        _DSV4_BF16_SPARSE_PREFILL_LAST_LOG_TIME_BY_RATIO[compress_ratio] = now
+        logger.warning(
+            "DSV4 BF16 sparse prefill hit: source=fp8_dequant ratio=%s q=%s kv_unified=%s indices=%s",
+            compress_ratio,
+            tuple(q_prefill.shape),
+            tuple(kv_unified.shape),
+            tuple(indices_unified.shape),
+        )
+
+    return flash_mla.flash_mla_sparse_fwd(
+        q_prefill,
+        kv_unified,
+        indices_unified,
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=attn_sink,
+        topk_length=topk_length_unified,
+    )[0]
 
 
 def _create_dummy_paged_compress_data(compress_ratio: int):
@@ -1032,6 +1737,33 @@ class DeepseekV4AttnBackend(
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             import flash_mla
+
+            if (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and _dsv4_use_bf16_sparse_prefill()
+            ):
+                prefill_inputs = _dsv4_build_unified_prefill_inputs_from_real_decode(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    extra_k_cache=extra_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    extra_indices=extra_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_topk_lengths=extra_topk_lengths,
+                )
+                if prefill_inputs is not None:
+                    q_prefill, kv_unified, indices_unified = prefill_inputs
+                    o_sparse = _dsv4_run_bf16_sparse_prefill_attention(
+                        q_prefill=q_prefill,
+                        kv_unified=kv_unified,
+                        indices_unified=indices_unified,
+                        sm_scale=self.softmax_scale,
+                        d_v=self.head_dim_v,
+                        attn_sink=attn_sink,
+                        compress_ratio=compress_ratio,
+                    )
+                    if o_sparse is not None:
+                        return o_sparse
 
             o = flash_mla.flash_mla_with_kvcache(
                 q=q,
