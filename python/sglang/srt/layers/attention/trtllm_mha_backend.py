@@ -21,7 +21,7 @@ from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
 )
 from sglang.srt.layers.attention.utils import canonicalize_stride
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_flashinfer_available
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -33,7 +33,6 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 # Constants
 # Default workspace size in MB for TRTLLM MHA
@@ -303,17 +302,26 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 ),
             }
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Initialize metadata for CUDA graph capture."""
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths (unified).
+
+        Body merged from the old ``init_forward_metadata_capture_cuda_graph``
+        and ``init_forward_metadata_replay_cuda_graph`` variants -- both wrote
+        into the same ``self.decode_cuda_graph_metadata`` / target_verify /
+        draft_extend pre-allocated buffers. The merged path runs the full
+        capture-style rebuild on each iteration (including at replay), per
+        the initial stage choice to defer the replay-time fast-path
+        optimization to a follow-up PR.
+        """
+        bs = forward_batch.batch_size
+        num_tokens = (
+            forward_batch.positions.shape[0]
+            if forward_batch.positions is not None
+            else bs
+        )
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
         metadata = TRTLLMMHAMetadata()
         device = seq_lens.device
 
@@ -437,106 +445,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             self.draft_extend_metadata[bs] = metadata
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Replay CUDA graph with new inputs."""
-        seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
-        req_pool_indices = req_pool_indices[:bs]
-        metadata = None
-        if forward_mode.is_decode_or_idle():
-            if spec_info is not None:
-                # Draft Decode
-                # Here we only support topk = 1 for now.
-                metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                metadata.max_seq_len_k = max_len + self.speculative_step_id + 1
-
-                max_seq_pages = (
-                    metadata.max_seq_len_k + self.page_size - 1
-                ) // self.page_size
-
-                metadata.cache_seqlens_int32.copy_(
-                    seq_lens + self.speculative_step_id + 1
-                )
-            else:
-                # Normal Decode
-                metadata = self.decode_cuda_graph_metadata[bs]
-                max_len = seq_lens_cpu.max().item()
-                max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-                metadata.max_seq_len_k = max_len
-
-                metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
-                    None, :
-                ],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_target_verify():
-            # Here we only support topk = 1 for now.
-            metadata = self.target_verify_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens + metadata.max_seq_len_q)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item() + metadata.max_seq_len_q
-            max_len = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        elif forward_mode.is_draft_extend():
-            metadata = self.draft_extend_metadata[bs]
-            metadata.cache_seqlens_int32.copy_(seq_lens)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-            max_len = seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k[1:].copy_(
-                torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
-            )
-            extend_lens = spec_info.num_accept_tokens[:bs]
-            if spec_info.num_accept_tokens_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accept_tokens_cpu)
-            else:
-                metadata.max_seq_len_q = 1
-
-            metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
-            )
-
-            max_seq_pages = (
-                metadata.max_seq_len_k + self.page_size - 1
-            ) // self.page_size
-            page_indices = self.req_to_token[
-                req_pool_indices[:, None],
-                self.draft_extend_metadata["strided_indices"][:max_seq_pages],
-            ]
-            metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
-            self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
-        self.forward_metadata = metadata
-
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
@@ -571,7 +479,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             page_size=self.page_size,
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         """Initialize the metadata for a forward pass."""
 
         metadata = TRTLLMMHAMetadata()
@@ -891,47 +799,17 @@ class TRTLLMHAAttnMultiStepDraftBackend(FlashInferMultiStepDraftBackend):
                 speculative_step_id=i,
             )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            self.attn_backends[i].init_forward_data(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        forward_batch: ForwardBatch,
-    ):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
         for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        assert forward_batch.spec_info is not None
-        assert forward_batch.spec_info.is_draft_input()
-
-        for i in range(self.speculative_num_steps - 1):
-
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_sum,
-                encoder_lens=forward_batch.encoder_lens,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            self.attn_backends[i].init_forward_data_out_graph(forward_batch)
