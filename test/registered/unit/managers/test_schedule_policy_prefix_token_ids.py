@@ -1,12 +1,15 @@
 import unittest
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     CacheAwarePolicy,
     SchedulePolicy,
     _prefix_match_token_ids,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -65,14 +68,25 @@ class TestPrefixMatchTokenIds(CustomTestCase):
 
 class TestComputePrefixMatchesParity(CustomTestCase):
     """Confirm `_compute_prefix_matches` (LPM cache-aware policy) produces the
-    same priority order as the previous implementation, even when the waiting
-    queue mixes fresh requests (`output_ids == []`) and retracted requests
-    (`output_ids != []`). The helper-driven optimization must not change which
-    request lands first.
+    expected priority order across the helper's two branches:
+
+    - fresh requests (``output_ids == []``) take the no-copy branch and the
+      cache lookup uses ``origin_input_ids`` directly;
+    - retracted requests (``output_ids != []``) take the concat branch and
+      the cache lookup must include the generated tokens.
     """
 
     def setUp(self):
+        # Pre-populate the radix cache with [100, 200, 300, 400] so the three
+        # requests below land at distinct match lengths and the LPM order is
+        # determined by `len(prefix_indices)` rather than stable-sort fallback.
         self.tree_cache = RadixCache.create_simulated()
+        self.tree_cache.insert(
+            InsertParams(
+                key=RadixKey(token_ids=[100, 200, 300, 400]),
+                value=torch.arange(4, dtype=torch.int64),
+            )
+        )
 
     def _build_policy(self):
         return SchedulePolicy(
@@ -84,25 +98,33 @@ class TestComputePrefixMatchesParity(CustomTestCase):
         )
 
     def test_lpm_order_with_mixed_output_state(self):
-        # Three reqs with the same prompt prefix; one is "retracted" with
-        # generated tokens so its prefix-match key includes output_ids.
-        req_fresh = Req(1, "p", [10, 20, 30], SamplingParams())
-        req_retracted = Req(2, "p", [10, 20], SamplingParams())
-        req_retracted.output_ids = [30, 40]
-        req_short = Req(3, "p", [10], SamplingParams())
+        # rid=1 (req_long): no-copy branch; origin alone yields a 2-token match.
+        req_long = Req(1, "p", [100, 200, 999], SamplingParams())
+        # rid=2 (req_retracted): concat branch; the 4-token match only exists
+        # because output_ids contributes the trailing 400, proving output_ids
+        # really is included in the prefix-match key.
+        req_retracted = Req(2, "p", [100, 200, 300], SamplingParams())
+        req_retracted.output_ids = [400, 999]
+        # rid=3 (req_short): no-copy branch; matches a 1-token prefix only.
+        req_short = Req(3, "p", [100], SamplingParams())
 
-        waiting_queue = [req_fresh, req_retracted, req_short]
+        waiting_queue = [req_long, req_retracted, req_short]
         policy = self._build_policy()
         self.assertEqual(policy.policy, CacheAwarePolicy.LPM)
 
         policy.calc_priority(waiting_queue)
 
-        # The order must be deterministic under LPM regardless of the helper
-        # taking the no-copy branch for req_fresh / req_short and the copy
-        # branch for req_retracted.
-        rids_after = [r.rid for r in waiting_queue]
-        self.assertEqual(len(rids_after), 3)
-        self.assertEqual(set(rids_after), {1, 2, 3})
+        # Match lengths witnessed during _compute_prefix_matches.
+        self.assertEqual(req_retracted.prefix_indices.numel(), 4)
+        self.assertEqual(req_long.prefix_indices.numel(), 2)
+        self.assertEqual(req_short.prefix_indices.numel(), 1)
+
+        # LPM sorts by descending match length, so the queue order is the
+        # exact list below -- not just a set membership check.
+        self.assertEqual(
+            [r.rid for r in waiting_queue],
+            [req_retracted.rid, req_long.rid, req_short.rid],
+        )
 
 
 if __name__ == "__main__":
