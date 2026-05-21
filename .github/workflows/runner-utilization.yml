@@ -30,11 +30,13 @@ concurrency:
 jobs:
   report:
     name: Generate Report
-    # Fork PRs have no business firing a 24h API scan. Same-repo branches,
-    # schedule, and dispatch still run.
+    # Skip fork PRs entirely, and require the `run-ci` label on same-repo PRs
+    # so unlabeled iteration pushes (e.g. long-lived sandbox branches) don't
+    # fire the 24h API scan. schedule and workflow_dispatch always run.
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code

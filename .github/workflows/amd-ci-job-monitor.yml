@@ -28,10 +28,12 @@ concurrency:
 jobs:
   fetch-actions-data:
     name: Fetch Actions Snapshot
-    # Skip fork PRs entirely — only same-repo branches, schedule, dispatch run.
+    # Skip fork PRs entirely, and require the `run-ci` label on same-repo PRs.
+    # schedule and workflow_dispatch always run.
     if: >-
       github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
