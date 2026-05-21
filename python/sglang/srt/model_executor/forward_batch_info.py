@@ -432,6 +432,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
 
+    # Decode context parallel KV write mask.
+    dcp_kv_mask: Optional[torch.Tensor] = None
+
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
@@ -661,6 +664,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        if model_runner.dcp_size > 1 and ret.out_cache_loc is not None:
+            ret.dcp_kv_mask = (
+                ret.positions % model_runner.dcp_size == model_runner.dcp_rank
+            )
 
         return ret
 

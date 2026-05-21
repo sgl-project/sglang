@@ -844,9 +844,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         for attn_backend in self.attn_backend_list:
+            # Some sub-backends patch padding entries in-place while preparing
+            # graph replay metadata.  Keep the shared ForwardBatch input buffer
+            # immutable for the captured model graph.
             attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,
-                req_pool_indices,
+                req_pool_indices.clone(),
                 seq_lens,
                 seq_lens_sum,
                 encoder_lens,

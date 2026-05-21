@@ -147,6 +147,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    dcp_kv_mask: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -168,6 +169,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
+        is_hybrid_swa: bool = False,
+        dcp_size: int = 1,
         hc_hidden_size: Optional[int] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
@@ -226,6 +229,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
                 global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
+            dcp_kv_mask = (
+                torch.zeros((max_num_token,), dtype=torch.bool)
+                if dcp_size > 1
+                else None
+            )
+
             ngram_embedding_info = (
                 NgramEmbeddingInfo(
                     token_table=ne_token_table,
@@ -265,6 +274,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            dcp_kv_mask=dcp_kv_mask,
         )
 
     def populate_from_forward_batch(
@@ -288,6 +298,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            if self.dcp_kv_mask is not None:
+                self.dcp_kv_mask.zero_()
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -304,6 +316,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
             forward_batch.out_cache_loc,
             forward_batch.positions,
         ]
+
+        if self.dcp_kv_mask is not None and forward_batch.dcp_kv_mask is not None:
+            dsts.append(self.dcp_kv_mask[:raw_num_token])
+            srcs.append(forward_batch.dcp_kv_mask)
 
         if self.ngram_embedding_info is not None:
             ngram_embedding_info = forward_batch.ngram_embedding_info
@@ -560,6 +576,7 @@ class CudaGraphRunner:
             model_runner.server_args.enable_profile_cuda_graph
         )
         self.tp_size = model_runner.server_args.tp_size
+        self.dcp_size = model_runner.server_args.dcp_size
         self.dp_size = model_runner.server_args.dp_size
         self.pp_size = model_runner.server_args.pp_size
         self.enable_pdmux = model_runner.server_args.enable_pdmux
@@ -674,6 +691,8 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            is_hybrid_swa=model_runner.is_hybrid_swa,
+            dcp_size=self.dcp_size,
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
@@ -1033,6 +1052,11 @@ class CudaGraphRunner:
             global_dp_buffer_len=global_dp_buffer_len,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,
+            dcp_kv_mask=(
+                buffers.dcp_kv_mask[:num_tokens]
+                if buffers.dcp_kv_mask is not None
+                else None
+            ),
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
