@@ -151,8 +151,8 @@ def make_req_to_token_pool(
     max_reqs: int = 8,
     max_seq_len: int = 32,
 ) -> SimpleNamespace:
-    table = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
-    return SimpleNamespace(req_to_token=table, size=max_reqs)
+    req_to_token = torch.zeros(max_reqs, max_seq_len, dtype=torch.int32, device=device)
+    return SimpleNamespace(req_to_token=req_to_token, size=max_reqs)
 
 
 def make_forward_batch(

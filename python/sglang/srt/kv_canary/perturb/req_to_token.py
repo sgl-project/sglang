@@ -68,7 +68,7 @@ def run(
     replacement_pick = int(torch.randint(0, len(replacement_values), (1,)).item())
     new_value = replacement_values[replacement_pick]
 
-    table = req_to_token_pool.req_to_token
+    req_to_token = req_to_token_pool.req_to_token
     logger.info(
         "kv_canary perturb req_to_token: req_pool_idx=%d position=%d original_slot=%d new_slot=%d",
         target.req_pool_idx,
@@ -76,4 +76,4 @@ def run(
         target.value,
         new_value,
     )
-    table[target.req_pool_idx, target.position] = new_value
+    req_to_token[target.req_pool_idx, target.position] = new_value

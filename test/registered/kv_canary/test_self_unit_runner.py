@@ -65,8 +65,8 @@ def _make_group(*, device, has_v: bool = True, kind: PoolKind = PoolKind.FULL):
 
 
 def _make_pool(device, max_reqs: int = 4, max_seq: int = 8):
-    table = torch.zeros(max_reqs, max_seq, dtype=torch.int32, device=device)
-    return SimpleNamespace(req_to_token=table, size=max_reqs)
+    req_to_token = torch.zeros(max_reqs, max_seq, dtype=torch.int32, device=device)
+    return SimpleNamespace(req_to_token=req_to_token, size=max_reqs)
 
 
 def _make_config(
