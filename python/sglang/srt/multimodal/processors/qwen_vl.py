@@ -697,22 +697,27 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+                preserve_input_ids_list=True,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, preserve_input_ids_list=True
             )
 
         process_time = time.perf_counter()
 
-        input_ids = input_ids.flatten()
-        if (
-            isinstance(base_output.input_ids, list)
-            and len(base_output.input_ids) == input_ids.numel()
-        ):
-            input_ids_list = base_output.input_ids
+        input_ids_tensor = None
+        if isinstance(input_ids, list):
+            input_ids_list = input_ids
         else:
-            input_ids_list = input_ids.tolist()
+            input_ids_tensor = input_ids.flatten()
+            if (
+                isinstance(base_output.input_ids, list)
+                and len(base_output.input_ids) == input_ids_tensor.numel()
+            ):
+                input_ids_list = base_output.input_ids
+            else:
+                input_ids_list = input_ids_tensor.tolist()
         padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
         if padded_input_ids is None:
             padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
@@ -725,6 +730,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
         if mrope_result is None:
+            if input_ids_tensor is None:
+                input_ids_tensor = torch.tensor(input_ids_list, dtype=torch.long)
+
             audio_feature_lengths = None
             if self.model_type == "qwen3_omni_moe":
                 audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
@@ -759,8 +767,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 mrope_result = self._compute_image_only_mrope_positions_from_offsets(
                     input_len=len(input_ids_list),
                     mm_items=mm_items,
-                    dtype=input_ids.dtype,
-                    device=input_ids.device,
+                    dtype=input_ids_tensor.dtype,
+                    device=input_ids_tensor.device,
                 )
         if mrope_result is None:
             mrope_result = MRotaryEmbedding.get_rope_index(
@@ -773,7 +781,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     self.hf_config.vision_config, "tokens_per_second", None
                 ),
                 # use the expanded token ids
-                input_ids=input_ids.unsqueeze(0),
+                input_ids=input_ids_tensor.unsqueeze(0),
                 image_grid_thw=image_grid_thw,
                 video_grid_thw=video_grid_thw,
                 second_per_grid_ts=second_per_grid_ts,

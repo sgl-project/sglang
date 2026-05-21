@@ -1195,8 +1195,9 @@ class BaseMultimodalProcessor(ABC):
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
+        preserve_input_ids_list: bool = False,
         **kwargs,
-    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+    ) -> Tuple[List[MultimodalDataItem], Union[List[int], torch.Tensor], dict]:
         """
         Process multimodal data and return the combined multimodal items and input_ids.
         Supports mixed modalities (images and audio in the same request).
@@ -1269,12 +1270,20 @@ class BaseMultimodalProcessor(ABC):
         if ret is None and dict_ret is not None:
             ret = dict_ret
 
-        if input_ids is None:
+        if input_ids is None and preserve_input_ids_list and isinstance(
+            base_output.input_ids, list
+        ):
+            input_ids = base_output.input_ids
+        elif input_ids is None:
             input_ids = self._as_input_ids_tensor(base_output.input_ids)
 
         if input_ids is None:
             for _, dict_item in dict_items:
-                input_ids = self._as_input_ids_tensor(dict_item.get("input_ids"))
+                dict_input_ids = dict_item.get("input_ids")
+                if preserve_input_ids_list and isinstance(dict_input_ids, list):
+                    input_ids = dict_input_ids
+                else:
+                    input_ids = self._as_input_ids_tensor(dict_input_ids)
                 if input_ids is not None:
                     break
 
@@ -1289,6 +1298,8 @@ class BaseMultimodalProcessor(ABC):
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
                 continue
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = self._as_input_ids_tensor(input_ids)
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")

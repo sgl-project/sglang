@@ -41,20 +41,6 @@ class DummyProcessor(BaseMultimodalProcessor):
         raise NotImplementedError
 
 
-class NoToListInputIds:
-    def __init__(self, values):
-        self.values = values
-
-    def flatten(self):
-        return self
-
-    def numel(self):
-        return len(self.values)
-
-    def tolist(self):
-        raise AssertionError("input_ids.tolist should not run")
-
-
 class GuardedProcessorOutput(dict):
     blocked_keys = {
         "second_per_grid_ts",
@@ -180,6 +166,35 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         )
 
         self.assertEqual(mm_items[0].offsets, [(1, 2)])
+
+    def test_processor_output_can_preserve_input_ids_list(self):
+        processor = make_processor()
+        input_ids = [1, 42, 42, 2]
+        processor_output = {
+            "format": "processor_output",
+            "input_ids": torch.tensor([input_ids]),
+            "pixel_values": torch.arange(8).reshape(2, 4),
+            "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            "offsets": [(1, 2)],
+            "hash": 12345,
+        }
+        base_output = BaseMultiModalProcessorOutput(
+            input_text="",
+            input_ids=input_ids,
+            images=[processor_output],
+        )
+
+        def fail_input_ids_tensor(*args, **kwargs):
+            raise AssertionError("input_ids tensor should not be built")
+
+        processor._as_input_ids_tensor = fail_input_ids_tensor
+        _, output_ids, _ = processor.process_and_combine_mm_data(
+            base_output,
+            MultimodalSpecialTokens(image_token_id=42),
+            preserve_input_ids_list=True,
+        )
+
+        self.assertIs(output_ids, input_ids)
 
     def test_processor_output_multi_image_split_uses_grid_lengths(self):
         processor = make_processor()
@@ -497,11 +512,20 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         processor.vision_start_token_id = 11
         processor.vision_end_token_id = 12
         processor.audio_start_token_id = None
+        processor.ATTR_NAME_TO_MODALITY = {
+            "pixel_values": Modality.IMAGE,
+            "image_grid_thw": Modality.IMAGE,
+        }
+        processor.FEATURE_NAMES = ["pixel_values"]
 
         input_ids = [11, 42, 42, 12]
         padded_input_ids = [11, -1001, -1001, 12]
         processor_output = {
+            "format": "processor_output",
             "padded_input_ids": padded_input_ids,
+            "pixel_values": torch.arange(8).reshape(2, 4),
+            "offsets": [(1, 2)],
+            "hash": 12345,
             "mrope_positions": torch.arange(12, dtype=torch.long).reshape(3, 4),
             "mrope_position_delta": torch.tensor([[0]], dtype=torch.long),
         }
@@ -516,11 +540,11 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
             audio_data=None,
         )
         processor.load_mm_data = lambda **kwargs: base_output
-        processor.process_and_combine_mm_data = lambda *args, **kwargs: (
-            [],
-            NoToListInputIds(input_ids),
-            processor_output,
-        )
+
+        def fail_input_ids_tensor(*args, **kwargs):
+            raise AssertionError("input_ids tensor should not be built")
+
+        processor._as_input_ids_tensor = fail_input_ids_tensor
 
         output = asyncio.run(processor.process_mm_data_async([], "", request_obj))
 
