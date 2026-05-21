@@ -59,7 +59,7 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    if is_hip_runtime() and envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+    if is_hip_runtime():
         from sglang.jit_kernel.triton_store_cache import triton_fused_store_cache
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
