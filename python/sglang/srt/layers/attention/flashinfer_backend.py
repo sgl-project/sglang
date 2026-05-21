@@ -18,6 +18,7 @@ import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.dllm.attention import get_dllm_causal_attention
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -250,7 +251,9 @@ class FlashInferAttnBackend(AttentionBackend):
                     "due to TMA descriptor initialization issues on B200. "
                     "Using auto backend instead for stability."
                 )
-            else:
+            elif not self.is_dllm_model:
+                # DLLM uses whole-graph CUDA captures, which also exhibit TMA descriptor
+                # initialization issues (same root cause as piecewise). Keep "auto" for DLLM.
                 fmha_backend = "cutlass"
         self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
             self.workspace_buffer, "NHD", backend=fmha_backend
@@ -503,6 +506,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
+            # DLLM_EXTEND: disable KV splitting to match the CUDA graph path.
+            # With split_kv enabled, FlashInfer's LSE merge for bidirectional
+            # attention (causal=False) produces incorrect outputs.
+            # The CUDA graph capture always uses disable_split_kv=True; for
+            # consistency we apply the same flag in the eager path.
+            dllm_disable_split_kv = (
+                self.is_dllm_model and forward_batch.forward_mode.is_dllm_extend()
+            )
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -516,6 +527,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
                 cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+                disable_split_kv=dllm_disable_split_kv,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -567,6 +579,7 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        dllm_causal: bool = False,
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -694,19 +707,53 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
                     )
                 )
-            seq_lens_sum = seq_lens.sum().item()
+            # Capture with a moderate prefix_len that saturates grid_x (the CUDA
+            # kernel thread-block count) at the SM count. With prefix_lens=0 at
+            # capture, grid_x=1 is baked into the graph; replaying with large prefix
+            # skips most KV tiles → wrong outputs. grid_x saturates at the SM count
+            # for prefix_len >= ~8192 tokens. Using max_pool_len - block_size = 262112
+            # would also work but creates bs × 262112 KV index entries which can
+            # overflow the FlashInfer 384MB workspace buffer for bs >= 4 → "illegal
+            # instruction" crash. 8192 keeps KV index entries manageable (bs × 8192)
+            # while still ensuring full grid coverage at replay.
+            block_size = self.dllm_config.block_size
+            max_pool_len = self.indices_updater_prefill.req_to_token.shape[1]
+            _GRID_SATURATION_PREFIX = 8192
+            capture_prefix_len = min(_GRID_SATURATION_PREFIX, max_pool_len - block_size)
+            capture_seq_lens = torch.full(
+                seq_lens.shape,
+                capture_prefix_len + block_size,
+                dtype=seq_lens.dtype,
+                device=seq_lens.device,
+            )
+            capture_prefix_lens = torch.full(
+                seq_lens.shape,
+                capture_prefix_len,
+                dtype=seq_lens.dtype,
+                device=seq_lens.device,
+            )
+            seq_lens_sum = capture_seq_lens.sum().item()
             self.indices_updater_prefill.update(
                 req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
+                capture_seq_lens,
+                capture_seq_lens.cpu(),
                 seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefix_lens=capture_prefix_lens,
                 prefill_wrappers=prefill_wrappers,
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens,
                 spec_info=None,
+                # disable_split_kv=True ensures grid_z=1 (no KV split parallelism).
+                # With split-KV enabled, num_kv_splits is baked into the CUDA graph
+                # at capture time (large, because capture_prefix_len=8192). At replay,
+                # num_kv_splits is small (short actual prefix). The workspace entries
+                # for extra KV-split tiles are stale → kernel reads garbage KV indices
+                # → cudaErrorIllegalAddress. With disable_split_kv=True, num_kv_splits=1
+                # at both capture and replay → no workspace mismatch.
+                disable_split_kv=True,
             )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            metadata_key = f"causal_{bs}" if dllm_causal else bs
+            self.prefill_cuda_graph_metadata[metadata_key] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -721,6 +768,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
+        dllm_causal: bool = False,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -759,16 +807,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_dllm_extend():
+            metadata_key = f"causal_{bs}" if dllm_causal else bs
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
+                disable_split_kv=True,  # must match capture; see capture comment
             )
         else:
             raise ValueError("Invalid forward mode")
@@ -806,9 +856,11 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
-            causal = (
-                not layer.is_cross_attention
-                and layer.attn_type != AttentionType.ENCODER_ONLY
+            causal = get_dllm_causal_attention(
+                layer,
+                forward_batch,
+                self.dllm_config,
+                default_causal=not layer.is_cross_attention,
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -848,6 +900,12 @@ class FlashInferAttnBackend(AttentionBackend):
                 or layer.attn_type == AttentionType.ENCODER_ONLY
             ):
                 causal = False
+            causal = get_dllm_causal_attention(
+                layer,
+                forward_batch,
+                self.dllm_config,
+                default_causal=causal,
+            )
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
@@ -865,6 +923,26 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
+                if not self.is_dllm_model:
+                    # TODO: design a better interface
+                    # For other models, use causal attention for the ragged part as previously
+                    causal = True
+
+                # Disable PDL for DLLM_EXTEND to avoid cudaErrorIllegalInstruction
+                # during CUDA graph replay on B200/SM10.0 (Blackwell). PDL uses
+                # cudaLaunchKernelEx with cudaLaunchAttributeProgrammaticStreamSerialization
+                # which is incompatible with CUDA graph capture/replay on this hardware.
+                _pdl_kwargs = {}
+                if self.is_dllm_model:
+                    import inspect as _inspect
+
+                    if (
+                        "enable_pdl"
+                        in _inspect.signature(
+                            self.prefill_wrapper_ragged.forward_return_lse
+                        ).parameters
+                    ):
+                        _pdl_kwargs["enable_pdl"] = False
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
@@ -872,6 +950,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    **_pdl_kwargs,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -879,6 +958,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    **_pdl_kwargs,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
@@ -1249,6 +1329,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1267,6 +1348,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1292,6 +1374,7 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
+            disable_split_kv=disable_split_kv,
         )
 
     def update_sliding_window(
@@ -1408,6 +1491,7 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
         cross_attention_custom_mask: Optional[torch.Tensor] = None,
+        disable_split_kv: bool = False,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1498,6 +1582,7 @@ class FlashInferIndicesUpdaterPrefill:
             token_pos_in_items_ptr=token_pos_in_items_ptr,
             token_pos_in_items_len=token_pos_in_items_len,
             max_item_len_ptr=max_item_len_ptr,
+            disable_split_kv=disable_split_kv,
         )
 
 
