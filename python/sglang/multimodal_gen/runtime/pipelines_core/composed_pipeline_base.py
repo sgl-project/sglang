@@ -14,8 +14,24 @@ from typing import Any, Callable, Literal, cast
 import torch
 from tqdm import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import (
+    RoleType,
+    filter_modules_for_role,
+)
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_attn_backend_context_manager,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_loading_order import (
+    ComponentLoadSpec,
+    order_component_load_specs,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+    ComponentResidencyStrategy,
+    get_global_component_residency_manager,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -82,17 +98,34 @@ class ComposedPipelineBase(ABC):
         use. The pipeline should be stateless and not hold any batch state.
         """
         self.server_args = server_args
+        self._disagg_role = server_args.disagg_role
 
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
+        self.component_residency_manager: ComponentResidencyManager | None = None
 
         if required_config_modules is not None:
             self._required_config_modules = required_config_modules
 
         if self._required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+
+        # Filter modules based on disaggregation role
+        if self._disagg_role != RoleType.MONOLITHIC:
+            original_modules = list(self._required_config_modules)
+            self._required_config_modules = filter_modules_for_role(
+                self._required_config_modules, self._disagg_role
+            )
+            skipped = set(original_modules) - set(self._required_config_modules)
+            if skipped:
+                logger.info(
+                    "Disagg role=%s: skipping modules %s",
+                    self._disagg_role.value,
+                    sorted(skipped),
+                )
 
         # [module_name, gpu memory usage]
         self.memory_usages: dict[str, float] = {}
@@ -169,6 +202,70 @@ class ComposedPipelineBase(ABC):
         """
         return
 
+    # --- Config-name → pipeline_config attribute mapping ---
+    _CONFIG_ATTR_MAP: dict[str, str] = {
+        "vae": "vae_config",
+        "video_vae": "vae_config",
+        "audio_vae": "audio_vae_config",
+    }
+
+    def _init_skipped_component_configs(
+        self,
+        full_model_index: dict[str, Any],
+        server_args: ServerArgs,
+    ) -> None:
+        """Read HF JSON configs for skipped components and run
+        update_model_arch + post_init so pipeline_config is fully
+        initialized without loading weights.
+        """
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            get_diffusers_component_config,
+        )
+
+        required = set(self.required_config_modules)
+        for module_name in full_model_index:
+            if module_name in required:
+                continue  # will be loaded normally
+            cfg_attr = self._CONFIG_ATTR_MAP.get(module_name)
+            if cfg_attr is None:
+                continue  # not a config we need to patch
+
+            pipeline_cfg = getattr(server_args.pipeline_config, cfg_attr, None)
+            if pipeline_cfg is None:
+                continue
+
+            try:
+                component_path = self._resolve_component_path(
+                    server_args, module_name, module_name
+                )
+                hf_config = get_diffusers_component_config(
+                    component_path=component_path
+                )
+                hf_config.pop("_class_name", None)
+                hf_config.pop("_diffusers_version", None)
+                pipeline_cfg.update_model_arch(hf_config)
+                if hasattr(pipeline_cfg, "post_init"):
+                    pipeline_cfg.post_init()
+                logger.info(
+                    "Disagg role=%s: initialized %s config from HF JSON "
+                    "(spatial_compression_ratio=%s)",
+                    self._disagg_role.value,
+                    module_name,
+                    getattr(
+                        getattr(pipeline_cfg, "arch_config", None),
+                        "spatial_compression_ratio",
+                        "N/A",
+                    ),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Disagg role=%s: failed to read HF config for skipped "
+                    "component %s: %s",
+                    self._disagg_role.value,
+                    module_name,
+                    e,
+                )
+
     def _resolve_component_path(
         self, server_args: ServerArgs, module_name: str, load_module_name: str
     ) -> str:
@@ -214,7 +311,24 @@ class ComposedPipelineBase(ABC):
                     "MoE pipeline detected. Adding transformer_2 to self.required_config_modules..."
                 )
                 if "transformer_2" not in self.required_config_modules:
-                    self.required_config_modules.append("transformer_2")
+                    # Re-apply disagg role filter: only add transformer_2 if the
+                    # role actually needs denoising modules.
+                    from sglang.multimodal_gen.runtime.disaggregation.roles import (
+                        get_module_role,
+                    )
+
+                    module_role = get_module_role("transformer_2")
+                    if (
+                        self._disagg_role == RoleType.MONOLITHIC
+                        or module_role is None
+                        or module_role == self._disagg_role
+                    ):
+                        self.required_config_modules.append("transformer_2")
+                    else:
+                        logger.info(
+                            "Disagg role=%s: skipping dynamically added module transformer_2",
+                            self._disagg_role.value,
+                        )
             else:
                 logger.info(
                     "Boundary ratio found in model_index.json without transformers; "
@@ -236,6 +350,11 @@ class ComposedPipelineBase(ABC):
         assert (
             len(model_index) > 1
         ), "model_index.json must contain at least one pipeline module"
+
+        # In disagg mode, read HF config for skipped components (e.g., VAE)
+        # so that update_model_arch + post_init can derive pipeline_config.
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self._init_skipped_component_configs(model_index, server_args)
 
         model_index = {
             required_module: model_index[required_module]
@@ -270,10 +389,16 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading required components: %s", required_modules)
 
         loaded_components = {}
-        for module_name, (
-            transformers_or_diffusers,
-            architecture,
-        ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+        component_load_specs: list[ComponentLoadSpec] = []
+
+        # enqueue only real weight loads (e.g., scheduler, tokenizer is excluded); skipped/provided modules keep old handling
+        for index, (
+            module_name,
+            (
+                transformers_or_diffusers,
+                architecture,
+            ),
+        ) in enumerate(model_index.items()):
             if transformers_or_diffusers is None:
                 logger.warning(
                     "Module %s in model_index.json has null value, removing from required_config_modules",
@@ -290,21 +415,64 @@ class ComposedPipelineBase(ABC):
                 loaded_components[module_name] = loaded_modules[module_name]
                 continue
 
-            # we load the module from the extra config module map if it exists
             if module_name in self._extra_config_module_map:
                 load_module_name = self._extra_config_module_map[module_name]
             else:
                 load_module_name = module_name
-
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
-            module, memory_usage = PipelineComponentLoader.load_component(
-                component_name=load_module_name,
-                component_model_path=component_model_path,
-                transformers_or_diffusers=transformers_or_diffusers,
-                server_args=server_args,
+            # collect loading specs
+            component_load_specs.append(
+                ComponentLoadSpec(
+                    module_name=module_name,
+                    load_module_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    architecture=architecture,
+                    index=index,
+                )
             )
+
+        # reorder loading order to avoid OOM
+        component_load_specs: ComponentLoadSpec = order_component_load_specs(
+            component_load_specs
+        )
+        logger.info(
+            "Memory-aware component load order: %s",
+            [spec.module_name for spec in component_load_specs],
+        )
+
+        for spec in tqdm(
+            iterable=component_load_specs, desc="Loading required modules"
+        ):
+            module_name: str = spec.module_name
+            load_module_name: str = spec.load_module_name
+            transformers_or_diffusers: str = spec.transformers_or_diffusers
+            architecture: str = spec.architecture
+            component_model_path: str = spec.component_model_path
+
+            attn_backend, matched_backend_key = (
+                server_args.resolve_component_attention_backend(
+                    module_name, load_module_name
+                )
+            )
+            if attn_backend is not None:
+                logger.info(
+                    "Using %s backend for component: %s",
+                    attn_backend.name.lower(),
+                    matched_backend_key,
+                )
+            with component_attn_backend_context_manager(
+                attn_backend, component_name=matched_backend_key or module_name
+            ):
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                    component_architecture=architecture,
+                )
 
             self.memory_usages[load_module_name] = memory_usage
 
@@ -334,17 +502,38 @@ class ComposedPipelineBase(ABC):
     def _infer_stage_name(stage: PipelineStage) -> str:
         return stage.__class__.__name__
 
+    def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
+        class_name = stage.__class__.__name__
+        if any(existing.__class__.__name__ == class_name for existing in self._stages):
+            return stage_name
+        return class_name
+
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None
     ) -> "ComposedPipelineBase":
 
         assert self.modules is not None, "No modules are registered"
 
+        # Filter stages based on disaggregation role
+        if self._disagg_role != RoleType.MONOLITHIC:
+            if stage.role_affinity != self._disagg_role:
+                if stage_name is None:
+                    stage_name = self._infer_stage_name(stage)
+                logger.info(
+                    "Disagg role=%s: skipping stage %s (affinity=%s)",
+                    self._disagg_role.value,
+                    stage_name,
+                    stage.role_affinity.value,
+                )
+                return self
+
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        stage.set_registered_stage_name(stage_name)
+        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
@@ -619,4 +808,34 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
+
+    @torch.no_grad()
+    def forward_batch(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        if len(batches) == 1:
+            return [self.forward(batches[0], server_args)]
+
+        if self.is_lora_set() and not self.is_lora_effective():
+            logger.warning(
+                "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
+            )
+
+        if not batches[0].is_warmup and not batches[0].suppress_logs:
+            logger.info(
+                "Running grouped pipeline stages: %s",
+                list(self._stage_name_mapping.keys()),
+                main_process_only=True,
+            )
+
+        return self.executor.execute_group_with_profiling(
+            self.stages, batches, server_args
+        )

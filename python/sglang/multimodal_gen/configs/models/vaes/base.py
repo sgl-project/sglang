@@ -41,6 +41,8 @@ class VAEConfig(ModelConfig):
     use_temporal_tiling: bool = True
     use_parallel_tiling: bool = True
     use_temporal_scaling_frames: bool = True
+    use_parallel_decode: bool = False
+    parallel_decode_mode: str = "tiled"
 
     def __post_init__(self):
         self.blend_num_frames = (
@@ -136,6 +138,20 @@ class VAEConfig(ModelConfig):
             dest=f"{prefix.replace('-', '_')}.use_parallel_tiling",
             default=VAEConfig.use_parallel_tiling,
             help="Whether to use parallel tiling for VAE",
+        )
+        parser.add_argument(
+            f"--{prefix}.use-parallel-decode",
+            action=StoreBoolean,
+            dest=f"{prefix.replace('-', '_')}.use_parallel_decode",
+            default=VAEConfig.use_parallel_decode,
+            help="Whether to use parallel decode for VAE",
+        )
+        parser.add_argument(
+            f"--{prefix}.parallel-decode-mode",
+            choices=("tiled", "patch", "auto"),
+            dest=f"{prefix.replace('-', '_')}.parallel_decode_mode",
+            default=VAEConfig.parallel_decode_mode,
+            help="Parallel decode mode for VAE",
         )
 
         return parser

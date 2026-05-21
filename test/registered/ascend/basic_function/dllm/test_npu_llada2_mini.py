@@ -1,17 +1,13 @@
 import os
 import unittest
-from types import SimpleNamespace
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
+from sglang.test.ascend.test_ascend_utils import LLaDA2_0_MINI_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.send_one import BenchArgs, send_one_prompt
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     is_in_ci,
-    popen_launch_server,
     write_github_step_summary,
 )
 
@@ -19,59 +15,27 @@ register_npu_ci(est_time=400, suite="stage-b-test-4-npu-a3", nightly=False)
 register_npu_ci(est_time=400, suite="nightly-1-npu-a3", nightly=True)
 
 
-class TestLLaDA2Mini(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls._old_disable_acl = os.environ.get("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT")
-        os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = "1"
+class TestLLaDA2Mini(GSM8KAscendMixin, CustomTestCase):
+    model = LLaDA2_0_MINI_WEIGHTS_PATH
 
-        cls.model = "/root/.cache/modelscope/hub/models/inclusionAI/LLaDA2.0-mini"
-        cls.base_url = DEFAULT_URL_FOR_TEST
-
-        other_args = [
-            "--trust-remote-code",
-            "--disable-radix-cache",
-            "--mem-fraction-static",
-            "0.9",
-            "--max-running-requests",
-            "1",
-            "--attention-backend",
-            "ascend",
-            "--dllm-algorithm",
-            "LowConfidence",  # TODO: Add dLLM configurations
-        ]
-
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=other_args,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-
-        if cls._old_disable_acl is None:
-            os.environ.pop("SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", None)
-        else:
-            os.environ["SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT"] = cls._old_disable_acl
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            num_shots=5,
-            data_path=None,
-            num_questions=200,
-            max_new_tokens=512,
-            parallel=128,
-            host="http://127.0.0.1",
-            port=int(self.base_url.split(":")[-1]),
-        )
-        metrics = run_eval_few_shot_gsm8k(args)
-        print(f"{metrics=}")
-
-        self.assertGreater(metrics["accuracy"], 0.88)
-        self.assertGreater(metrics["output_throughput"], 70)
+    other_args = [
+        "--trust-remote-code",
+        "--disable-radix-cache",
+        "--mem-fraction-static",
+        "0.9",
+        "--max-running-requests",
+        "1",
+        "--attention-backend",
+        "ascend",
+        "--dllm-algorithm",
+        "LowConfidence",  # TODO: Add dLLM configurations
+    ]
+    env = {
+        **os.environ,
+        "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",  # Need to avoid OOM issue
+    }
+    accuracy = 0.88
+    output_throughput = 70
 
     def test_bs_1_speed(self):
         args = BenchArgs(port=int(self.base_url.split(":")[-1]), max_new_tokens=2048)
