@@ -6,8 +6,14 @@ import triton.language as tl
 
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
+    _require_2d,
+    _require_dtype,
+    _require_len,
+    _require_min_len,
+    _require_same_device,
     _swa_translate_tile,
 )
+from sglang.jit_kernel.kv_canary.verify import _assert_contiguous
 
 # Inner-tile width for _plan_entries_kernel. Each (req, j-tile) program owns this many entries along the
 # j-axis of the (bs, max_verify_per_req) logical grid.
@@ -31,27 +37,132 @@ def launch_plan_entries_kernel(
     swa_window_size: int,
     has_swa_lut: bool,
 ) -> None:
-    if bs > 0 and verify_capacity > 0:
-        max_j_tiles = (
-            verify_capacity + _PLAN_VERIFY_INNER_BLOCK - 1
-        ) // _PLAN_VERIFY_INNER_BLOCK
-        grid_entries = (bs, max_j_tiles)
-        _plan_entries_kernel[grid_entries](
-            fb_req_pool_indices,
-            fb_prefix_lens,
-            req_to_token,
-            lut_tensor,
-            verify_offsets_scratch,
-            verify_slot_indices,
-            verify_positions,
-            verify_prev_slot_indices,
-            req_to_token_stride0,
-            lut_len,
-            verify_capacity,
-            INNER_BLOCK=_PLAN_VERIFY_INNER_BLOCK,
-            SWA_WINDOW=int(swa_window_size),
-            HAS_SWA_LUT=has_swa_lut,
+    _validate_entries_kernel_inputs(
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        req_to_token=req_to_token,
+        lut_tensor=lut_tensor,
+        verify_offsets_scratch=verify_offsets_scratch,
+        verify_slot_indices=verify_slot_indices,
+        verify_positions=verify_positions,
+        verify_prev_slot_indices=verify_prev_slot_indices,
+        bs=bs,
+        req_to_token_stride0=req_to_token_stride0,
+        lut_len=lut_len,
+        verify_capacity=verify_capacity,
+        has_swa_lut=has_swa_lut,
+    )
+
+    if bs == 0 or verify_capacity == 0:
+        return
+
+    max_j_tiles = (
+        verify_capacity + _PLAN_VERIFY_INNER_BLOCK - 1
+    ) // _PLAN_VERIFY_INNER_BLOCK
+    grid_entries = (bs, max_j_tiles)
+    _plan_entries_kernel[grid_entries](
+        fb_req_pool_indices,
+        fb_prefix_lens,
+        req_to_token,
+        lut_tensor,
+        verify_offsets_scratch,
+        verify_slot_indices,
+        verify_positions,
+        verify_prev_slot_indices,
+        req_to_token_stride0,
+        lut_len,
+        verify_capacity,
+        INNER_BLOCK=_PLAN_VERIFY_INNER_BLOCK,
+        SWA_WINDOW=int(swa_window_size),
+        HAS_SWA_LUT=has_swa_lut,
+    )
+
+
+def _validate_entries_kernel_inputs(
+    *,
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    lut_tensor: torch.Tensor,
+    verify_offsets_scratch: torch.Tensor,
+    verify_slot_indices: torch.Tensor,
+    verify_positions: torch.Tensor,
+    verify_prev_slot_indices: torch.Tensor,
+    bs: int,
+    req_to_token_stride0: int,
+    lut_len: int,
+    verify_capacity: int,
+    has_swa_lut: bool,
+) -> None:
+    _assert_contiguous(fb_req_pool_indices, "fb_req_pool_indices")
+    _assert_contiguous(fb_prefix_lens, "fb_prefix_lens")
+    _assert_contiguous(req_to_token, "req_to_token")
+    _assert_contiguous(lut_tensor, "lut_tensor")
+    _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
+    _assert_contiguous(verify_slot_indices, "verify_slot_indices")
+    _assert_contiguous(verify_positions, "verify_positions")
+    _assert_contiguous(verify_prev_slot_indices, "verify_prev_slot_indices")
+
+    _require_dtype(fb_req_pool_indices, "fb_req_pool_indices", torch.int64)
+    _require_dtype(fb_prefix_lens, "fb_prefix_lens", torch.int64)
+    _require_dtype(req_to_token, "req_to_token", torch.int32)
+    _require_dtype(lut_tensor, "lut_tensor", torch.int64)
+    _require_dtype(verify_offsets_scratch, "verify_offsets_scratch", torch.int64)
+    _require_dtype(verify_slot_indices, "verify_slot_indices", torch.int64)
+    _require_dtype(verify_positions, "verify_positions", torch.int64)
+    _require_dtype(verify_prev_slot_indices, "verify_prev_slot_indices", torch.int64)
+
+    if bs < 0:
+        raise ValueError(f"kv-canary: entries kernel bs must be non-negative, got {bs}")
+    if verify_capacity < 0:
+        raise ValueError(
+            f"kv-canary: verify_capacity must be non-negative, got {verify_capacity}"
         )
+    if req_to_token_stride0 <= 0:
+        raise ValueError(
+            f"kv-canary: req_to_token_stride0 must be positive, got {req_to_token_stride0}"
+        )
+    if lut_len < 0:
+        raise ValueError(f"kv-canary: lut_len must be non-negative, got {lut_len}")
+    if not isinstance(has_swa_lut, bool):
+        raise ValueError(
+            f"kv-canary: has_swa_lut must be bool, got {type(has_swa_lut).__name__}"
+        )
+    if has_swa_lut and lut_len <= 0:
+        raise ValueError("kv-canary: lut_len must be positive when has_swa_lut is True")
+    if not has_swa_lut and lut_len != 0:
+        raise ValueError("kv-canary: lut_len must be 0 when has_swa_lut is False")
+
+    _require_len(fb_req_pool_indices, "fb_req_pool_indices", bs)
+    _require_len(fb_prefix_lens, "fb_prefix_lens", bs)
+    _require_2d(req_to_token, "req_to_token")
+    _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
+    _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
+    _require_len(verify_slot_indices, "verify_slot_indices", verify_capacity)
+    _require_len(verify_positions, "verify_positions", verify_capacity)
+    _require_len(
+        verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity
+    )
+
+    if req_to_token_stride0 != int(req_to_token.stride(0)):
+        raise ValueError(
+            f"kv-canary: req_to_token_stride0={req_to_token_stride0} does not match "
+            f"req_to_token.stride(0)={int(req_to_token.stride(0))}"
+        )
+
+    _require_same_device(
+        verify_offsets_scratch,
+        "verify_offsets_scratch",
+        (
+            (fb_req_pool_indices, "fb_req_pool_indices"),
+            (fb_prefix_lens, "fb_prefix_lens"),
+            (req_to_token, "req_to_token"),
+            (lut_tensor, "lut_tensor"),
+            (verify_slot_indices, "verify_slot_indices"),
+            (verify_positions, "verify_positions"),
+            (verify_prev_slot_indices, "verify_prev_slot_indices"),
+        ),
+    )
 
 
 @triton.jit

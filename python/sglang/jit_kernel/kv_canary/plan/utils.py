@@ -22,6 +22,54 @@ def _resolve_swa_lut(
     return torch.zeros(1, dtype=torch.int64, device=device), 0, False
 
 
+def _require_dtype(tensor: torch.Tensor, name: str, dtype: torch.dtype) -> None:
+    if tensor.dtype != dtype:
+        raise ValueError(f"kv-canary: {name} must have dtype {dtype}, got {tensor.dtype}")
+
+
+def _require_1d(tensor: torch.Tensor, name: str) -> None:
+    if tensor.ndim != 1:
+        raise ValueError(
+            f"kv-canary: {name} must be 1-D, got shape {tuple(tensor.shape)}"
+        )
+
+
+def _require_2d(tensor: torch.Tensor, name: str) -> None:
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"kv-canary: {name} must be 2-D, got shape {tuple(tensor.shape)}"
+        )
+
+
+def _require_len(tensor: torch.Tensor, name: str, expected: int) -> None:
+    _require_1d(tensor=tensor, name=name)
+    actual = int(tensor.shape[0])
+    if actual != expected:
+        raise ValueError(
+            f"kv-canary: {name} length must be {expected}, got {actual}"
+        )
+
+
+def _require_min_len(tensor: torch.Tensor, name: str, minimum: int) -> None:
+    _require_1d(tensor=tensor, name=name)
+    actual = int(tensor.shape[0])
+    if actual < minimum:
+        raise ValueError(
+            f"kv-canary: {name} length must be >= {minimum}, got {actual}"
+        )
+
+
+def _require_same_device(
+    reference: torch.Tensor, reference_name: str, tensors: tuple[tuple[torch.Tensor, str], ...]
+) -> None:
+    for tensor, name in tensors:
+        if tensor.device != reference.device:
+            raise ValueError(
+                f"kv-canary: {name} must be on {reference_name}'s device "
+                f"{reference.device}, got {tensor.device}"
+            )
+
+
 @triton.jit
 def _compute_window_start(prefix_lens, SWA_WINDOW: tl.constexpr):
     """Per-req window start: max(prefix_lens - SWA_WINDOW, 0) when SWA, else 0.
