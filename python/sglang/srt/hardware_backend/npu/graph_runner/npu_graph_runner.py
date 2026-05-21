@@ -129,7 +129,11 @@ class NPUGraphRunner(CudaGraphRunner):
     def _update_inputs(self, seq_lens):
         if isinstance(self.update_attr_type, torch.Tensor):
             seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
-
+        
+        if self.model_runner.kv_cache_pruning_config is not None:
+            max_len  = self.model_runner.kv_cache_pruning_config["kv_cache_size"]
+            seq_lens = np.minimum(seq_lens, [max_len])
+            
         self.graphs[self.bs].update(
             cpu_update_input=[{self.update_attr_name: seq_lens}]
         )

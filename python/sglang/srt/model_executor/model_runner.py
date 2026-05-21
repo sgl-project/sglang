@@ -81,7 +81,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state, get_tensor_model_parallel_world_size
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -184,6 +184,7 @@ from sglang.srt.state_capturer.routed_experts import (
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     broadcast_pyobj,
+    get_bool_env_var,
     cpu_has_amx_support,
     dynamic_import,
     empty_context,
@@ -738,6 +739,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()
 
+        self.kv_cache_pruning_config = None
+        if server_args.kv_cache_pruning_config is not None:
+            if server_args.kv_cache_pruning_config <=0:
+                logging.warning("please specify positive number for per-layer cache size for K in tokens(same value will be used for V)")
+            elif not get_bool_env_var("ASCEND_USE_FIA", "False"):  # initial impl is only for FIA
+                logging.warning("KV-CACHE PRUNING is currently implemented  only for Ascend's FIA")
+            elif server_args.chunked_prefill_size != -1  :  # initial impl doen't support chunked prefill yet
+                logging.warning("KV-CACHE PRUNING is currently NOT implemented for chunked prefill (WIP), disabling the pruning ")
+            else:                
+                # pad 
+                kv_cache_size_in_pages = (int(server_args.kv_cache_pruning_config-1) // self.page_size) + 1
+                kv_cache_size = kv_cache_size_in_pages*self.page_size                
+                head_split_list = [self.model_config.get_num_kv_heads(get_tensor_model_parallel_world_size())]
+                head_size_list = [kv_cache_size]
+                logging.info("KV-CACHE PRUNING ENABLED")
+
+                self.kv_cache_pruning_config = {
+                    "kv_cache_prune_size_young_guard": 408,  # fine-tuned over LongBench
+                    "kv_cache_prune_size_old_guard": 16,     # fine-tuned over LongBench
+                    "prefill_stat_size" : 32,                # fine-tuned over LongBench
+                    "kv_cache_size": kv_cache_size,
+                    "head_split_list" : head_split_list,
+                    "head_size_list" : head_size_list
+                } 
+        
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
