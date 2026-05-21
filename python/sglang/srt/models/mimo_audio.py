@@ -8,7 +8,7 @@ import os
 import typing as tp
 from dataclasses import dataclass
 from functools import wraps
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -1222,9 +1222,7 @@ class AudioEncoderMixin:
                 self.audio_out_hidden_size,
             )
         else:
-            raise ValueError(
-                f"Invalid projection layers: {config.projection_layers}"
-            )
+            raise ValueError(f"Invalid projection layers: {config.projection_layers}")
 
         # Precedence: --audio-tokenizer-path CLI flag > config.audio_tokenizer_path
         # > <model_path>/audio_tokenizer fallback. The CLI flag lets users point at
@@ -1251,7 +1249,9 @@ class AudioEncoderMixin:
         )
 
     @staticmethod
-    def _load_mimo_audio_tokenizer(path: str, device: torch.device) -> MiMoAudioTokenizer:
+    def _load_mimo_audio_tokenizer(
+        path: str, device: torch.device
+    ) -> MiMoAudioTokenizer:
         """Load MiMoAudioTokenizer manually to avoid new-transformers compat issues."""
         import json
 
@@ -1281,7 +1281,9 @@ class AudioEncoderMixin:
         model.requires_grad_(False)
         return model
 
-    def apply_input_local_transformer(self, speech_embeddings: torch.Tensor) -> torch.Tensor:
+    def apply_input_local_transformer(
+        self, speech_embeddings: torch.Tensor
+    ) -> torch.Tensor:
         return self.input_local_transformer(
             inputs_embeds=speech_embeddings,
             return_dict=True,
@@ -1351,9 +1353,7 @@ class AudioEncoderMixin:
             segment_size=self.audio_segment_size,
             device=device,
         )
-        audio_codes = torch.cat(
-            [self.pad_audio_codes(c) for c in code_list], dim=0
-        )
+        audio_codes = torch.cat([self.pad_audio_codes(c) for c in code_list], dim=0)
         embeds = self.apply_input_local_transformer(
             self.apply_speech_embeddings(audio_codes)
         )

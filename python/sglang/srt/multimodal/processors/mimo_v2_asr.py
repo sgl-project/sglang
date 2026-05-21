@@ -7,7 +7,7 @@ processor only handles the special-token contract and content interleaving.
 import asyncio
 import re
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Union
 
 import numpy as np
 import torch

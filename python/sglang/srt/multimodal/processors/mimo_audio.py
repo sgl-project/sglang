@@ -164,9 +164,9 @@ class MiMoAudioPipeline:
         Output: (mel-spectrogram tensor [T, n_mels], audio_token_len int).
         """
         self._ensure_audio_dependencies()
-        assert isinstance(audio, (str, bytes, tuple)), (
-            f"audio must be a str, bytes or tuple, but got {type(audio)}"
-        )
+        assert isinstance(
+            audio, (str, bytes, tuple)
+        ), f"audio must be a str, bytes or tuple, but got {type(audio)}"
         if isinstance(audio, tuple):
             waveform, original_sr = audio
         else:
@@ -251,9 +251,9 @@ class MiMoAudioPipeline:
         if isinstance(audio, (str, bytes, tuple)):
             return self.preprocess_audio(audio)
 
-        assert audio.shape[1] >= self.audio_channels, (
-            f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
-        )
+        assert (
+            audio.shape[1] >= self.audio_channels
+        ), f"audio must have at least {self.audio_channels} channels, but got {audio.shape[1]}"
         T = audio.shape[0]
         audio = audio[:, : self.audio_channels].to(torch.long)
         padded_T = (
