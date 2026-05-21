@@ -16,7 +16,10 @@ from sglang.srt.kv_canary.endpoint import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.runner.health import HealthAndStats
+from sglang.srt.kv_canary.runner.health import (
+    KernelRunCounterHealthChecker,
+    PeriodicCanaryStatsLogger,
+)
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
@@ -37,7 +40,8 @@ class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
     until server shutdown. The runner itself is a thin facade; per-concern state and behavior
     live on the component classes (PumpAndAllreduce, SweepOrchestrator, ViolationReporter,
-    PerturbManager, PerForwardOrchestrator, HealthAndStats).
+    PerturbManager, PerForwardOrchestrator, KernelRunCounterHealthChecker,
+    PeriodicCanaryStatsLogger).
     """
 
     def __init__(
@@ -123,9 +127,15 @@ class CanaryRunner:
             d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
         )
-        self._health_and_stats = HealthAndStats(
+        self._health_checker = KernelRunCounterHealthChecker(
             config=config,
-            device=device,
+            device_state=self._device_state,
+            active_tags=self._active_tags,
+            pump_and_allreduce=self._pump_and_allreduce,
+            d2h_stream=self._d2h_stream,
+        )
+        self._stats_logger = PeriodicCanaryStatsLogger(
+            config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
             pump_and_allreduce=self._pump_and_allreduce,
@@ -181,8 +191,8 @@ class CanaryRunner:
         self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
         any_rank_errored = self._pump_and_allreduce.pump_and_drain()
-        self._health_and_stats.health_check_step()
-        self._health_and_stats.print_periodic_stats()
+        self._health_checker.step()
+        self._stats_logger.step()
 
         if any_rank_errored and not self._violation_reporter.is_raised:
             self._violation_reporter.log_or_raise_violation()
