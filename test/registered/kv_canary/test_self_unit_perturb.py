@@ -28,6 +28,7 @@ class TestParseTargetGroupKind(CustomTestCase):
     def test_parse_target_group_kind_accepts_valid_values_case_insensitively(
         self,
     ) -> None:
+        """Verify target group kind parsing accepts valid names case-insensitively."""
         cases = [
             ("full", TargetGroupKind.FULL),
             ("FULL", TargetGroupKind.FULL),
@@ -39,10 +40,12 @@ class TestParseTargetGroupKind(CustomTestCase):
                 self.assertEqual(_parse_target_group_kind(raw), expected)
 
     def test_parse_target_group_kind_rejects_invalid_value(self) -> None:
+        """Verify target group kind parsing rejects unknown names."""
         with self.assertRaisesRegex(ValueError, "must be one of"):
             _parse_target_group_kind("prefix")
 
     def test_parse_target_group_kind_rejects_missing_or_any(self) -> None:
+        """Verify target group kind parsing requires an explicit concrete group."""
         for raw in [None, "", "any", " Any "]:
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(
@@ -53,6 +56,7 @@ class TestParseTargetGroupKind(CustomTestCase):
 
 class TestPickTargetGroup(CustomTestCase):
     def test_pick_target_group_filters_exact_kind(self) -> None:
+        """Verify target group selection returns only the requested pool kind."""
         cases = [
             (TargetGroupKind.FULL, PoolKind.FULL),
             (TargetGroupKind.SWA, PoolKind.SWA),
@@ -72,6 +76,7 @@ class TestPickTargetGroup(CustomTestCase):
                 self.assertEqual(group.kind, expected_kind)
 
     def test_pick_target_group_rejects_unsupported_kind(self) -> None:
+        """Verify target group selection rejects unsupported enum values."""
         full_group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
 
         with self.assertRaisesRegex(ValueError, "Unsupported target_group_kind"):
@@ -81,6 +86,7 @@ class TestPickTargetGroup(CustomTestCase):
             )
 
     def test_pick_target_group_ignores_groups_without_real_kv_sources(self) -> None:
+        """Verify target group selection skips groups without real KV sources."""
         full_group = _make_group(kind=PoolKind.FULL, has_real_kv=False)
         swa_group = _make_group(kind=PoolKind.SWA, has_real_kv=True)
 
