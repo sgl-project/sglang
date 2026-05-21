@@ -11,11 +11,15 @@
 
 namespace {
 
-constexpr uint32_t kTopK = 1024;
-constexpr uint32_t kTopKBlockSize = 1024;
+#ifndef SGL_TOPK
+#define SGL_TOPK 512
+#endif
+
+constexpr uint32_t kTopK = SGL_TOPK;
+constexpr uint32_t kTopKBlockSize = SGL_TOPK;
 constexpr uint32_t kSMEM = 16 * 1024 * sizeof(uint32_t);  // 64KB (bytes)
 
-struct TopK1024Params {
+struct TopKParams {
   const float* __restrict__ scores;
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
@@ -224,7 +228,7 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
 }
 
 template <bool kUsePDL>
-__global__ void topk_1024_transform(const __grid_constant__ TopK1024Params params) {
+__global__ void topk_transform_kernel(const __grid_constant__ TopKParams params) {
   const auto &[
     scores, seq_lens, page_table, page_indices, raw_indices, // pointers
     score_stride, page_table_stride, page_bits // sizes
@@ -269,8 +273,8 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
 }
 
 template <bool kUsePDL>
-struct TopK1024Kernel {
-  static constexpr auto kernel = topk_1024_transform<kUsePDL>;
+struct TopKKernel {
+  static constexpr auto kernel = topk_transform_kernel<kUsePDL>;
 
   static void transform(
       const tvm::ffi::TensorView scores,
@@ -300,14 +304,14 @@ struct TopK1024Kernel {
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(page_table);
-    TensorMatcher({B, 1024})  // output, must be contiguous
+    TensorMatcher({B, kTopK})  // output, must be contiguous
         .with_dtype<int32_t>()
         .with_device(device)
         .verify(page_indices);
 
     int32_t* raw_indices_ptr = nullptr;
     if (raw_indices.has_value()) {
-      TensorMatcher({B, 1024})  // optional raw indices output, must be contiguous
+      TensorMatcher({B, kTopK})  // optional raw indices output, must be contiguous
           .with_dtype<int32_t>()
           .with_device(device)
           .verify(raw_indices.value());
@@ -317,7 +321,7 @@ struct TopK1024Kernel {
     RuntimeCheck(std::has_single_bit(page_size), "page_size must be power of 2");
     const auto page_bits = static_cast<uint32_t>(std::countr_zero(page_size));
     const auto batch_size = static_cast<uint32_t>(B.unwrap());
-    const auto params = TopK1024Params{
+    const auto params = TopKParams{
         .scores = static_cast<float*>(scores.data_ptr()),
         .seq_lens = static_cast<int32_t*>(seq_lens.data_ptr()),
         .page_table = static_cast<int32_t*>(page_table.data_ptr()),
