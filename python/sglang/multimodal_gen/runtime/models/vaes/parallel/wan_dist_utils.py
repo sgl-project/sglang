@@ -18,11 +18,13 @@ from sglang.multimodal_gen.runtime.models.vaes.parallel.wan_common_utils import 
     WanRMS_norm,
     WanUpsample,
     attention_block_forward,
+    match_conv3d_input_format,
     mid_block_forward,
     resample_forward,
     residual_block_forward,
     residual_down_block_forward,
     residual_up_block_forward,
+    restore_conv3d_output_format,
     up_block_forward,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -323,7 +325,9 @@ class WanDistCausalConv3d(nn.Conv3d):
                 x_padded = x_padded[..., shift:, :]
                 global_start += shift
 
+        x_padded = match_conv3d_input_format(x_padded, self.weight)
         out = super().forward(x_padded)
+        out = restore_conv3d_output_format(out, self.weight)
 
         if self.height_halo_size == 0:
             return out
