@@ -194,6 +194,7 @@ class ReqState:
     output_top_logprobs: List[Any] = dataclasses.field(default_factory=list)
     input_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
     output_token_ids_logprobs: List[Any] = dataclasses.field(default_factory=list)
+    prompt_token_ids: Optional[List[int]] = None
 
 
 def _slice_streaming_output_meta_info(
@@ -554,6 +555,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
                 self._send_one_request(tokenized_obj)
+                if getattr(obj, "return_prompt_token_ids", False):
+                    self.rid_to_state[obj.rid].prompt_token_ids = list(
+                        tokenized_obj.input_ids
+                    )
                 async for response in self._wait_one_response(obj, request):
                     yield response
             else:
@@ -1405,6 +1410,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Set up generators for each request in the batch
                 for i in range(batch_size):
                     tmp_obj = obj[i]
+                    if getattr(tmp_obj, "return_prompt_token_ids", False):
+                        self.rid_to_state[tmp_obj.rid].prompt_token_ids = list(
+                            tokenized_objs[i].input_ids
+                        )
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
@@ -1418,6 +1427,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         self._send_one_request(tokenized_obj)
+                        if getattr(tmp_obj, "return_prompt_token_ids", False):
+                            self.rid_to_state[tmp_obj.rid].prompt_token_ids = list(
+                                tokenized_obj.input_ids
+                            )
                         generators.append(self._wait_one_response(tmp_obj, request))
                         rids.append(tmp_obj.rid)
         else:
@@ -1456,6 +1469,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_req_state(tmp_obj)
                     tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
                     self._send_one_request(tokenized_obj)
+                    if getattr(tmp_obj, "return_prompt_token_ids", False):
+                        self.rid_to_state[tmp_obj.rid].prompt_token_ids = list(
+                            tokenized_objs[i].input_ids
+                        )
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
@@ -1835,6 +1852,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     and recv_obj.pooled_hidden_states[i] is not None
                 ):
                     out_dict["pooled_hidden_state"] = recv_obj.pooled_hidden_states[i]
+
+            if out_dict is not None and state.prompt_token_ids is not None:
+                out_dict["prompt_token_ids"] = state.prompt_token_ids
 
             # Set first_token_time on the first output batch.
             # This is the single write point for first_token_time.
