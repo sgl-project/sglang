@@ -64,6 +64,7 @@ from sglang.srt.configs.model_config import (
     get_num_indexer_layers,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
+from sglang.srt.connector.utils import COMMON_REMOTE_MODEL_FILES
 from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
@@ -3379,7 +3380,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 hf_folder = snapshot_download(
                     self.model_config.model_path,
                     revision=self.model_config.revision,
-                    allow_patterns="*.json",
+                    allow_patterns=["*.json", "*.py", *COMMON_REMOTE_MODEL_FILES],
                     cache_dir=self.load_config.download_dir,
                     local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )

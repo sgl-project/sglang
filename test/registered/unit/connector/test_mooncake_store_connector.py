@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
@@ -5,11 +6,16 @@ from unittest import mock
 
 import torch
 
+os.environ.setdefault("SGLANG_ENABLE_JIT_DEEPGEMM", "0")
+sys.modules.setdefault("deep_gemm", ModuleType("deep_gemm"))
+
 from sglang.srt.connector.mooncake_store import (
     DEFAULT_LOCAL_BUFFER_SIZE,
     MooncakeStoreConnector,
-    STANDALONE_CHUNK_SIZE,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class FakeStore:
@@ -78,6 +84,7 @@ class TestMooncakeStoreConnector(unittest.TestCase):
         fake_store_module = ModuleType("mooncake.store")
         fake_store_module.MooncakeDistributedStore = FakeInitStore
         fake_store_module.ReplicateConfig = type("ReplicateConfig", (), {})
+
         fake_config = SimpleNamespace(
             local_hostname="127.0.0.1",
             metadata_server="http://127.0.0.1:18080/metadata",
@@ -88,13 +95,30 @@ class TestMooncakeStoreConnector(unittest.TestCase):
             standalone_storage=True,
             client_server_address="127.0.0.1:50052",
         )
+        fake_config_module = ModuleType(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store"
+        )
+        fake_config_module.MooncakeStoreConfig = SimpleNamespace(
+            load_from_env=mock.Mock(return_value=fake_config)
+        )
 
-        with mock.patch.dict(sys.modules, {"mooncake.store": fake_store_module}):
-            with mock.patch(
-                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store.MooncakeStoreConfig.load_from_env",
-                return_value=fake_config,
-            ):
-                connector = MooncakeStoreConnector("mooncake:///model")
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "mooncake.store": fake_store_module,
+                "sglang.srt.mem_cache": ModuleType("sglang.srt.mem_cache"),
+                "sglang.srt.mem_cache.storage": ModuleType(
+                    "sglang.srt.mem_cache.storage"
+                ),
+                "sglang.srt.mem_cache.storage.mooncake_store": ModuleType(
+                    "sglang.srt.mem_cache.storage.mooncake_store"
+                ),
+                "sglang.srt.mem_cache.storage.mooncake_store.mooncake_store": (
+                    fake_config_module
+                ),
+            },
+        ):
+            connector = MooncakeStoreConnector("mooncake:///model")
 
         self.assertIsNone(connector.store.setup_args)
         self.assertEqual(
@@ -106,9 +130,7 @@ class TestMooncakeStoreConnector(unittest.TestCase):
         self.connector.config = SimpleNamespace(standalone_storage=True)
         tensor = torch.arange(8, dtype=torch.float32)
 
-        with mock.patch(
-            "sglang.srt.connector.mooncake_store.STANDALONE_CHUNK_SIZE", 8
-        ):
+        with mock.patch("sglang.srt.connector.mooncake_store.STANDALONE_CHUNK_SIZE", 8):
             self.connector.batch_put_from(["model/keys/rank_0/test.weight"], [tensor])
 
             loaded = torch.empty_like(tensor)

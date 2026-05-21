@@ -85,9 +85,9 @@ def run_save_remote(server_args: ServerArgs, save_args: SaveRemoteArgs):
     with Engine(server_args=server_args) as engine:
         print("Engine initialized successfully. Starting remote model save...\n")
 
-        rpc_kwargs = {"params": {"url": save_args.url}}
+        rpc_kwargs = {"url": save_args.url}
         if save_args.draft_url is not None:
-            rpc_kwargs["params"]["draft_url"] = save_args.draft_url
+            rpc_kwargs["draft_url"] = save_args.draft_url
 
         engine.save_remote_model(**rpc_kwargs)
 

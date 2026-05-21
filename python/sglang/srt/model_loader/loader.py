@@ -67,7 +67,7 @@ from sglang.srt.connector import (
     create_remote_connector,
     get_connector_type,
 )
-from sglang.srt.connector.utils import parse_model_name
+from sglang.srt.connector.utils import COMMON_REMOTE_MODEL_FILES, parse_model_name
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -2392,7 +2392,10 @@ class RemoteModelLoader(BaseModelLoader):
                     # ignore hidden files
                     if file_name.startswith("."):
                         continue
-                    if os.path.splitext(file_name)[1] in (".json", ".py"):
+                    if (
+                        os.path.splitext(file_name)[1] in (".json", ".py")
+                        or file_name in COMMON_REMOTE_MODEL_FILES
+                    ):
                         file_path = os.path.join(root, file_name)
                         with open(file_path, encoding="utf-8") as file:
                             file_content = file.read()
