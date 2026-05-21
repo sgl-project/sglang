@@ -38,6 +38,15 @@ class ParsedSwaDivergenceLine:
     swa_pool_wrap: int
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PendingSnapshot:
+    step_counter: int
+    verify_full: FutureTensor
+    verify_swa: FutureTensor
+    mapping_nonidentity: Optional[FutureTensor]
+    wrap_count: Optional[FutureTensor]
+
+
 def format_swa_divergence_line(
     *,
     forward_ct: int,
@@ -109,11 +118,7 @@ class SwaDivergenceStats:
             1, dtype=torch.int32, device=device
         )
 
-        self._pending_verify_full_future: Optional[FutureTensor] = None
-        self._pending_verify_swa_future: Optional[FutureTensor] = None
-        self._pending_mapping_nonidentity_future: Optional[FutureTensor] = None
-        self._pending_wrap_count_future: Optional[FutureTensor] = None
-        self._pending_step: Optional[int] = None
+        self._pending: Optional[_PendingSnapshot] = None
 
         self._latest_verify_full: int = 0
         self._latest_verify_swa: int = 0
@@ -149,22 +154,22 @@ class SwaDivergenceStats:
         self._stage_async_snapshots(step_counter=step_counter)
 
     def _drain_pending_futures(self) -> None:
-        if self._pending_step is None:
+        pending = self._pending
+        if pending is None:
             return
 
-        verify_full_future = self._pending_verify_full_future
-        verify_swa_future = self._pending_verify_swa_future
-        mapping_future = self._pending_mapping_nonidentity_future
-        wrap_future = self._pending_wrap_count_future
-        assert verify_full_future is not None
-        assert verify_swa_future is not None
-
-        verify_full = int(verify_full_future.wait().item())
-        verify_swa = int(verify_swa_future.wait().item())
+        verify_full = int(pending.verify_full.wait().item())
+        verify_swa = int(pending.verify_swa.wait().item())
         mapping_nonidentity = (
-            int(mapping_future.wait().item()) if mapping_future is not None else 0
+            int(pending.mapping_nonidentity.wait().item())
+            if pending.mapping_nonidentity is not None
+            else 0
         )
-        wrap_count = int(wrap_future.wait().item()) if wrap_future is not None else 0
+        wrap_count = (
+            int(pending.wrap_count.wait().item())
+            if pending.wrap_count is not None
+            else 0
+        )
 
         self._latest_verify_full = verify_full
         self._latest_verify_swa = verify_swa
@@ -179,18 +184,14 @@ class SwaDivergenceStats:
         )
         logger.info(line)
 
-        self._pending_verify_full_future = None
-        self._pending_verify_swa_future = None
-        self._pending_mapping_nonidentity_future = None
-        self._pending_wrap_count_future = None
-        self._pending_step = None
+        self._pending = None
 
     def _stage_async_snapshots(self, *, step_counter: int) -> None:
-        self._pending_verify_full_future = FutureTensor.device_to_host(
+        verify_full_future = FutureTensor.device_to_host(
             src_device=self._verify_full_total_device,
             stream=self._d2h_stream,
         )
-        self._pending_verify_swa_future = FutureTensor.device_to_host(
+        verify_swa_future = FutureTensor.device_to_host(
             src_device=self._verify_swa_total_device,
             stream=self._d2h_stream,
         )
@@ -206,16 +207,22 @@ class SwaDivergenceStats:
             else None
         )
         if counters is not None and counters.nonidentity_write_count is not None:
-            self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
+            mapping_future: Optional[FutureTensor] = FutureTensor.device_to_host(
                 src_device=counters.nonidentity_write_count,
                 stream=self._d2h_stream,
             )
-            self._pending_wrap_count_future = FutureTensor.device_to_host(
+            wrap_future: Optional[FutureTensor] = FutureTensor.device_to_host(
                 src_device=counters.wrap_count,
                 stream=self._d2h_stream,
             )
         else:
-            self._pending_mapping_nonidentity_future = None
-            self._pending_wrap_count_future = None
+            mapping_future = None
+            wrap_future = None
 
-        self._pending_step = step_counter
+        self._pending = _PendingSnapshot(
+            step_counter=step_counter,
+            verify_full=verify_full_future,
+            verify_swa=verify_swa_future,
+            mapping_nonidentity=mapping_future,
+            wrap_count=wrap_future,
+        )
