@@ -1,13 +1,13 @@
 # Operator Performance Optimizing Guidance
 
-# performance_benchmark
+# Performance_benchmark
 
 ## Obtaining Performance Data
 
 Before optimizing the performance, you need to obtain accurate performance data, understand the current performance status, and analyze the next optimization direction based on the performance status. MindStudio provides multiple methods for testing the performance of Triton operators, including profiling on the board and single-operator performance simulation pipeline.
 
 ### Network
-'''
+'''python
 
     import torch
     import torch_npu
@@ -54,19 +54,135 @@ Before optimizing the performance, you need to obtain accurate performance data,
 '''
 
 
-Refer to the function event_loop_overlap of this document https://github.com/sgl-project/sglang/blob/ifmn/eagle-dp-attn/python/sglang/srt/managers/scheduler.py to revise the same function in scheduler.py
+Refer to the function event_loop_overlap below to revise the same function in scheduler.py
 
+'''python
+    
+    def event_loop_overlap(self):
+            """A scheduler loop that overlaps the CPU processing and GPU computation."""
+            self.result_queue: Deque[
+                Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
+            ] = deque()
+
+        def pop_and_process():
+            # Process the results of the last batch
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        
+        enable_profiling = 1 and self.tp_rank == 0
+        prof_bs = 1 
+        prof_step = 10
+        profiling_stage: str = "prefill"
+        if enable_profiling:
+            prof_cnt = 0
+            import torch_npu
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level2,
+                l2_cache=False,
+                data_simplification=False,
+            )
+            profiling_path = "profiling/"
+            prof = torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                ],
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    profiling_path
+                ),
+                schedule=torch_npu.profiler.schedule(
+                    wait=1, warmup=1, active=10, repeat=1, skip_first=1
+                ),
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+                with_flops=False,
+                with_modules=False,
+                experimental_config=experimental_config,
+            )
+        while True:
+            # Receive requests
+            recv_reqs = self.recv_requests()
+            self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
+
+            # Get the next batch to run
+            batch = self.get_next_batch_to_run()
+            self.cur_batch = batch
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
+
+            # If we do not need to overlap the current batch with the last batch,
+            # we can process the last batch immediately.
+            if disable_overlap_for_batch:
+                pop_and_process()
+
+            # Launch the current batch
+            if batch:
+                if enable_profiling:
+                    is_prof_stage = False
+                    if (
+                        profiling_stage == "decode" and batch.forward_mode.is_decode()
+                    ) or (
+                        profiling_stage == "prefill" and batch.forward_mode.is_extend()
+                    ):
+                        is_prof_stage = True
+
+                    if len(batch.reqs) >= prof_bs and prof_cnt == 0 and is_prof_stage:
+                        prof.start()
+                        prof_cnt += 1
+                    if prof_cnt > 0 and is_prof_stage:
+                        prof_cnt += 1
+                    if prof_cnt == prof_step and is_prof_stage:
+                        torch.npu.synchronize()
+                        prof.stop()
+
+                batch_result = self.run_batch(batch)
+                self.result_queue.append((batch.copy(), batch_result))
+
+                if (
+                    enable_profiling
+                    and prof_cnt > 0
+                    and prof_cnt < prof_step
+                    and is_prof_stage
+                ):
+                    prof.step()
+            else:
+                batch_result = None
+                self.cancel_bubble_timer()
+
+            # Process the last batch
+            if self.last_batch:
+                if not disable_overlap_for_batch:
+                    pop_and_process()
+            elif batch is None:
+                # When the server is idle, do self-check and re-init some states
+                self.self_check_during_idle()
+
+            # Run sample of the current batch
+            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            if self.is_generation:
+                self.launch_batch_sample_if_needed(batch_result)
+
+            # Update last_batch
+            self.last_batch = batch
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.self_check_during_busy()
+
+'''
 
 ### Device-end
 The msProf tool is used to collect and analyze key performance indicators of operators running on the Ascend AI Processor. You can use the output performance data to quickly locate the software and hardware performance bottlenecks of operators and improve the efficiency of operator performance analysis.
 
-'''
+'''bash
 
     msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 
 '''
 
-'''
+'''text
 
     |------|------|
     | Name | DequantSwigluQuant_int32_high_performance_100000000 |
@@ -125,7 +241,7 @@ Time required for running a task, including the time for scheduling a task to th
 Task Wait Time (us)
 Interval between the end time of the previous task and the start time of the current task. The unit is μs.
 Block Dim
-Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is l0, this field is not collected and is displayed as 0.
+Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
 
 
 # Optimization
@@ -150,7 +266,7 @@ Must be vectorized.
 
 ## Tips
 1.  Ascend 910 series usually has only 40 or 48 vector cores. If the number of grids exceeds 40 or 48 vector cores, the grids will be delivered in a queue, resulting in a long waiting time. Therefore, the number of cores for high-performance implementation does not exceed the number of vector cores.
-2. Try to use up all the UB as much as possible. Move a large block size at a time to ensure that the bound is in the MTE. No Redundant Copy。
+2. Try to use up all the UB as much as possible. Move a large block size at a time to ensure that the bound is in the MTE. No Redundant Copy.
 3. If the offset is a negative number, the current triton-ascend considers it as a discrete memory access scenario. As a result, the performance severely deteriorates, and the data is read from the entire DMA block instead of being read in scalar mode.
 4. The UB of the Ascend hardware requires that the size of the tail axis of the tensor can be exactly divided by 32 bytes. If the length of the tail axis is insufficient, the length of the tail axis is automatically supplemented. For example, the performance deteriorates exponentially due to automatic supplementation for the Tensor whose shape is (2048, 3). In this situation, you can perform the transposition operation to change the alignment axis to a lower dimension. In addition, the transposition operation is affected by the automatic supplement rule. Therefore, special skills are also required to avoid supplementation.
 5. Use Double Buffer, parallelizes computation and data transfer. While computing one block of data, another block of data is being transferred to L1.
