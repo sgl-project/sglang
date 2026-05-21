@@ -1211,7 +1211,10 @@ class Req(ReqDllmMixin):
         start = len(self.output_ids) - tail_len
         token_window = self.output_ids[start:]
 
-        for token_count in range(1, len(token_window)):
+        # Old prefixes were checked in the previous step.
+        for token_count in range(
+            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+        ):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count
 
