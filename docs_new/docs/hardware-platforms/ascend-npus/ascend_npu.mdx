@@ -51,15 +51,30 @@ You can install SGLang using any of the methods below. Please go through `System
   </tbody>
 </table>
 
-<a id="obtain-cann-image"></a>
 ### Obtain CANN Image
+
+<Warning>
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30 GB** of free space.
+</Warning>
+
 You can obtain the dependency of a specified version of CANN through an image.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
-# for Atlas 800I A3 and Ubuntu OS
 docker pull quay.io/ascend/cann:8.5.0-a3-ubuntu22.04-py3.11
-# for Atlas 800I A2 and Ubuntu OS
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
 docker pull quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11
 ```
+
+  </Tab>
+</Tabs>
 
 ## Preparing the Running Environment
 
@@ -137,14 +152,42 @@ pip install -e python[all_npu]
 ### Method 2: Using Docker Image
 #### Obtain Image
 You can download the SGLang image or build an image based on Dockerfile to obtain the Ascend NPU image.
+
+<Warning>
+Ensure sufficient disk space before pulling images. Each Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 1. Download SGLang image
-```angular2html
-dockerhub: docker.io/lmsysorg/sglang:$tag
-# Main-based tag, change main to specific version like v0.5.6,
-# you can get image for specific version
-Atlas 800I A3 : {main}-cann8.5.0-a3
-Atlas 800I A2: {main}-cann8.5.0-910b
+
+<Tip>
+We publish both **stable releases** and **daily builds**. Choose a stable release tag (e.g., `v0.5.10-npu.rc1-a3`) if you prefer a validated version, or a daily build tag (e.g., `main-cann8.5.0-a3`) if you need the latest development changes.
+</Tip>
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Stable release
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+# Daily build
+docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
+```
+
+  </Tab>
+</Tabs>
+
 2. Build an image based on Dockerfile
 ```bash Command
 # Clone the SGLang repository
@@ -160,10 +203,10 @@ docker build --build-arg TARGETARCH=<arch_tag> -t <image_name> -f npu.Dockerfile
 #### Create Docker
 __Notice:__ `--privileged` and `--network=host` are required by RDMA, which is typically needed by Ascend NPU clusters.
 
-__Notice:__ The following docker command is based on Atlas 800I A3 machines. If you are using Atlas 800I A2, make sure only `davinci[0-7]` are mapped into container.
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
 ```bash Command
-
 alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
     --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
@@ -180,6 +223,32 @@ drun --env "HF_TOKEN=<secret>" \
     <image_name> \
     python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+alias drun='docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci_manager --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule --volume ~/.cache/:/root/.cache/'
+
+# Add HF_TOKEN env for download model by SGLang.
+drun --env "HF_TOKEN=<secret>" \
+    <image_name> \
+    python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+```
+
+  </Tab>
+</Tabs>
+
+<Tip>
+SGLang will serve on `http://127.0.0.1:30000` by default. You can change the host and port by `--host` and `--port` parameters.
+</Tip>
 
 ## System Settings
 
@@ -217,20 +286,51 @@ cat /proc/sys/vm/swappiness # shows 10
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
-python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --attention-backend ascend
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-3.1-8B-Instruct \
+  --attention-backend ascend \
+  --host 127.0.0.1 \
+  --port 8000
 ```
 
 #### PD Disaggregation Scene
 1. Launch Prefill Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
 # Enabling CPU Affinity
 export SGLANG_SET_CPU_AFFINITY=1
 
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend ascend \
+    --disaggregation-bootstrap-port 8995 \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 0 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8000
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# Enabling CPU Affinity
+export SGLANG_SET_CPU_AFFINITY=1
+
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -245,13 +345,39 @@ python3 -m sglang.launch_server \
     --port 8000
 ```
 
+  </Tab>
+</Tabs>
+
 2. Launch Decode Server
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```bash Command
-# PIP: recommended to config first Prefill Server IP
-# PORT: one free port
-# all sglang servers need to be config the same PIP and PORT,
-export ASCEND_MF_STORE_URL="tcp://PIP:PORT"
-# if you are Atlas 800I A2 hardware and use rdma for kv cache transfer, add this parameter
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
+python3 -m sglang.launch_server \
+    --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --disaggregation-mode decode \
+    --disaggregation-transfer-backend ascend \
+    --attention-backend ascend \
+    --device npu \
+    --base-gpu-id 1 \
+    --tp-size 1 \
+    --host 127.0.0.1 \
+    --port 8001
+```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+# PREFILL_IP: IP address of the first Prefill Server
+# FREE_PORT: any available port
+# all SGLang servers need to be configured with the same PREFILL_IP and FREE_PORT
+export ASCEND_MF_STORE_URL="tcp://PREFILL_IP:FREE_PORT"
 export ASCEND_MF_TRANSFER_PROTOCOL="device_rdma"
 python3 -m sglang.launch_server \
     --model-path meta-llama/Llama-3.1-8B-Instruct \
@@ -264,6 +390,9 @@ python3 -m sglang.launch_server \
     --host 127.0.0.1 \
     --port 8001
 ```
+
+  </Tab>
+</Tabs>
 
 3. Launch Router
 ```bash Command
@@ -291,4 +420,79 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --enable-multimodal \
     --sampling-backend ascend
+```
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests.
+
+### Which port to send requests to
+
+The port you use depends on your deployment mode:
+
+| Scenario | Where to send requests |
+|---|---|
+| Non-PD (single server) | The server's `--port` (e.g., `8000` in the examples above) |
+| Non-PD (multi-node) | The primary node's (`--node-rank 0`) `--port`; do **not** send requests to worker nodes |
+| PD disaggregation | The router's `--port` (e.g., `6688` in the examples above); do **not** send requests directly to prefill or decode servers |
+
+<Tip>
+SGLang serves on port `30000` by default if `--port` is not specified. The examples in this guide use explicit ports for clarity.
+
+If you are using PD disaggregation, replace `8000` with your router's port (e.g., `6688`) in the following examples.
+</Tip>
+
+### Health Check
+
+```bash Command
+curl http://127.0.0.1:8000/health
+```
+
+A successful response returns HTTP 200 with an empty body.
+
+### Generate (Native Endpoint)
+
+```bash Command
+curl http://127.0.0.1:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "What is the capital of France?",
+    "sampling_params": {"temperature": 0, "max_new_tokens": 128}
+  }'
+```
+
+The expected output should contain "Paris".
+
+### Chat Completions (OpenAI-Compatible)
+
+```bash Command
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}]
+  }'
+```
+
+The expected output should contain "Paris".
+
+### Multimodal Chat Completions
+
+<Note>
+The image URL in the example below references an external resource (`raw.githubusercontent.com`). Make sure the server has internet access so the image can be downloaded at inference time. Alternatively, you can use a locally accessible URL or base64-encoded image data.
+</Note>
+
+```bash Command
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-VL-30B-A3B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"}},
+        {"type": "text", "text": "Describe this image."}
+      ]
+    }]
+  }'
 ```

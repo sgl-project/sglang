@@ -99,7 +99,7 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
-def is_deepseek_nsa(config) -> bool:
+def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
         in (
@@ -121,31 +121,31 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
-def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config) or is_deepseek_v4(config)
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
     return config.index_head_dim
 
 
-def get_nsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_topk
 
 
-def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_n_heads
 
 
 def get_num_indexer_layers(config) -> int:
     """Layer count for the global indexer-topk capturer's host buffer.
 
-    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    DSA models (V3.2) instantiate an Indexer on every transformer layer.
     With index_topk_freq > 1 some layers reuse prev layer's topk; those still
     get a slot (mirrored at the MLA call site). DSv4 has C4 indexers only on
     layers whose compress_ratio == 4. Other architectures: set
     num_indexer_layers on hf_text_config; 0 disables the capturer.
     """
-    if is_deepseek_nsa(config):
+    if is_deepseek_dsa(config):
         return config.num_hidden_layers
     if is_deepseek_v4(config):
         compress_ratios = getattr(config, "compress_ratios", None) or []
@@ -174,6 +174,7 @@ class ModelConfig:
         encoder_only: bool = False,
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
+        model_config_parser: str = "auto",
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -185,6 +186,7 @@ class ModelConfig:
         self.quantize_and_serve = quantize_and_serve
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
+        self.model_config_parser = model_config_parser
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -201,6 +203,7 @@ class ModelConfig:
             trust_remote_code=trust_remote_code,
             revision=revision,
             model_override_args=self.model_override_args,
+            model_config_parser=model_config_parser,
             **kwargs,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
@@ -326,7 +329,7 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or is_deepseek_nsa(self.hf_text_config)
+            or is_deepseek_dsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -403,6 +406,7 @@ class ModelConfig:
             encoder_only=server_args.encoder_only,
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
+            model_config_parser=server_args.model_config_parser,
             **kwargs,
         )
 
@@ -618,8 +622,8 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
+                get_dsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
             # Handle rope scaling
@@ -762,6 +766,9 @@ class ModelConfig:
         self.spec_hidden_size = (
             self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
+        # mHC-flattened hidden size; None when not running an mHC model
+        # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
+        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:

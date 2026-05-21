@@ -170,8 +170,8 @@ class LoRAPipeline(ComposedPipelineBase):
         Yields:
             List of modules that had offload disabled.
         """
-        from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
-            OffloadableDiTMixin,
+        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+            is_layerwise_offloaded_module,
         )
 
         module_names = []
@@ -204,10 +204,9 @@ class LoRAPipeline(ComposedPipelineBase):
         offload_disabled_modules = []
         for module_name in module_names:
             module = self.modules.get(module_name)
-            if module is not None and isinstance(module, OffloadableDiTMixin):
-                if module.layerwise_offload_managers is not None:
-                    module.disable_offload()
-                    offload_disabled_modules.append(module)
+            if module is not None and is_layerwise_offloaded_module(module):
+                module.disable_offload()
+                offload_disabled_modules.append(module)
 
         try:
             yield offload_disabled_modules

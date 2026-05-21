@@ -7,15 +7,18 @@ metatags:
 
 ### Installation
 
-The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the quay.io platform. You can directly pull it.
+<Warning>
+Ensure sufficient disk space before pulling images. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
+The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the online platform. You can directly pull it.
+
+<Tabs>
+  <Tab title="Atlas 800I A3">
 
 ```bash Command
-#Atlas 800 A3
-docker pull quay.io/ascend/sglang:main-cann8.5.0-a3
-#Atlas 800 A2
-docker pull quay.io/ascend/sglang:main-cann8.5.0-910b
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
-#start container
 docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --privileged=true --net=host \
 -v /var/queue_schedule:/var/queue_schedule \
@@ -42,8 +45,38 @@ docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:${tag}
+quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 ```
+
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```bash Command
+docker pull quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -itd --shm-size=16g --privileged=true --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+```
+
+  </Tab>
+</Tabs>
 
 ## Deployment
 
@@ -52,6 +85,10 @@ quay.io/ascend/sglang:${tag}
 Run the following script to execute online inference.
 
 #### Qwen3.5 397B
+
+<Tip>
+Recommended model: [`Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp`](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-397B-A17B-w8a8-mtp)
+</Tip>
 
 ```bash Command
 # high performance cpu
@@ -89,13 +126,16 @@ python3 -m sglang.launch_server \
         --mem-fraction-static 0.7 \
         --port 8000 \
         --cuda-graph-bs 16 \
-        --quantization modelslim \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --dtype bfloat16
 ```
 
 #### Qwen3.5 122B
+
+<Tip>
+Recommended model: [`Eco-Tech/Qwen3.5-122B-A10B-w8a8-mtp`](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-122B-A10B-w8a8-mtp)
+</Tip>
 
 ```bash Command
 # high performance cpu
@@ -133,13 +173,16 @@ python3 -m sglang.launch_server \
         --mem-fraction-static 0.7 \
         --port 8000 \
         --cuda-graph-bs 16 \
-        --quantization modelslim \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --dtype bfloat16
 ```
 
 #### Qwen3.5 35B
+
+<Tip>
+Recommended model: [`Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp`](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp)
+</Tip>
 
 ```bash Command
 # high performance cpu
@@ -177,13 +220,16 @@ python3 -m sglang.launch_server \
         --mem-fraction-static 0.7 \
         --port 8000 \
         --cuda-graph-bs 16 \
-        --quantization modelslim \
         --enable-multimodal \
         --mm-attention-backend ascend_attn \
         --dtype bfloat16
 ```
 
 #### Qwen3.5 27B
+
+<Tip>
+Recommended model: [`Eco-Tech/Qwen3.5-27B-w8a8-mtp`](https://www.modelscope.cn/models/Eco-Tech/Qwen3.5-27B-w8a8-mtp)
+</Tip>
 
 ```bash Command
 # high performance cpu
@@ -227,7 +273,11 @@ python3 -m sglang.launch_server \
 
 ### Prefill-Decode Disaggregation
 
-Not test yet.
+Not tested yet.
+
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, Multimodal Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
 
 ### Using Benchmark
 

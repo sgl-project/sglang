@@ -8,8 +8,10 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -121,15 +123,29 @@ def retrieve_timesteps(
 
 class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
-        self, vae, tokenizer, processor, transformer, scheduler, model_path
+        self,
+        vae,
+        tokenizer,
+        processor,
+        transformer,
+        scheduler,
+        model_path,
+        vae_dtype: torch.dtype,
+        text_encoder_dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        self.vae = vae.to(torch.bfloat16)
+        self.vae = vae.to(dtype=vae_dtype)
+        self.vae_dtype = vae_dtype
+        self.text_encoder_dtype = text_encoder_dtype
         from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_path, subfolder="text_encoder"
-        ).to(torch.bfloat16)
+        self.text_encoder = (
+            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                model_path, subfolder="text_encoder"
+            )
+            .to(get_local_torch_device())
+            .to(dtype=self.text_encoder_dtype)
+        )
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -462,7 +478,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             image, calculated_height, calculated_width
         )
         image = image.unsqueeze(2)
-        image = image.to(dtype=torch.bfloat16)
+        image = image.to(dtype=self.vae_dtype)
 
         prompt = batch.prompt
         with self.use_declared_component(
