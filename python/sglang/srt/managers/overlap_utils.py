@@ -64,11 +64,7 @@ class FutureMap:
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-            # Forward-only buf, eager fixed dtype.
-            self.bonus_tokens_buf = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, device=self.device
-            )
-            # Remaining forward-only bufs are lazy (worker-dependent shape).
+            # Forward-only bufs are lazy (worker-dependent shape).
             self._forward_buf_initialized = False
 
         # Fences the schedule-consumed buf fields.
@@ -88,6 +84,9 @@ class FutureMap:
             (self.req_pool_size, *topk_index0.shape),
             dtype=topk_index0.dtype,
             device=self.device,
+        )
+        self.bonus_tokens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
