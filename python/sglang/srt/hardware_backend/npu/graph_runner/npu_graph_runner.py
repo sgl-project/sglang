@@ -82,21 +82,26 @@ class NPUGraphRunner(CudaGraphRunner):
         self.model_runner = model_runner
         self._init_arch_map()
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        self.forward_mode = None
+        self.if_use_v2 = model_runner.model_config.hf_config.architectures[0] in ["MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"]
 
     def _init_arch_map(self):
         if self.is_dllm:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "actual_seq_lengths_kv",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         else:
             self.attr_name: Dict[str, str] = {
                 AttentionArch.MLA: "actual_seq_lengths_kv",
                 AttentionArch.MHA: "context_lens",
+                "TARGET_VERIFY": "actual_seq_kvlen",
             }
         self.attr_type: Dict[str, Union[list, torch.Tensor]] = {
             AttentionArch.MLA: [],
             AttentionArch.MHA: torch.Tensor(),
+            "TARGET_VERIFY": [],
         }
 
     def _create_device_graph(self):
@@ -121,9 +126,13 @@ class NPUGraphRunner(CudaGraphRunner):
         return out
 
     def _get_update_attr_name(self):
+        if self.if_use_v2:
+            return self.attr_name["TARGET_VERIFY"]
         return self.attr_name[AttentionArch.MLA]
 
     def _get_update_attr_type(self):
+        if self.if_use_v2:
+            return self.attr_type["TARGET_VERIFY"]
         return self.attr_type[AttentionArch.MLA]
 
     def _update_inputs(self, seq_lens):
@@ -185,6 +194,7 @@ class NPUGraphRunner(CudaGraphRunner):
                     forward_batch.mrope_positions
                 )
 
+        self.forward_mode = forward_batch.forward_mode
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         # Replay

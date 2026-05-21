@@ -505,11 +505,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
+
+            if self.debug_mode:
+                all_pages = (
+                    torch.cat([self.free_pages, self.release_pages])
+                    if len(self.release_pages) > 0
+                    else self.free_pages
+                )
+                assert len(torch.unique(all_pages)) == len(all_pages), (
+                    f"[DOUBLE-FREE] free_pages_len={len(self.free_pages)} "
+                    f"release_pages_len={len(self.release_pages)} "
+                    f"unique_len={len(torch.unique(all_pages))} "
+                    f"need_sort={self.need_sort} "
+                    f"new_pages={free_page_indices.tolist()[:50]}"
+                )
         else:
             self.free_group.append(free_index)
-
-        if self.debug_mode:
-            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
