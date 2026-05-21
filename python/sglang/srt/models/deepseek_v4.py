@@ -1067,8 +1067,15 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
+        use_stream_pool = _is_cuda or (
+            _is_hip
+            and (
+                envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+                or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            )
+        )
         self.alt_streams = (
-            [torch.cuda.Stream() for _ in range(5)] if _is_cuda or _is_hip else None
+            [torch.cuda.Stream() for _ in range(5)] if use_stream_pool else None
         )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
