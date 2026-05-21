@@ -15,10 +15,10 @@ import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.slot_picker import pick_orphan_slot
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
-    pick_orphan_slot,
     pick_target_group,
 )
 

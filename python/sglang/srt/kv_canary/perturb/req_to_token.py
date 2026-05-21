@@ -18,10 +18,8 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.perturb.utils import (
-    WarmupGate,
-    collect_active_slots,
-)
+from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
+from sglang.srt.kv_canary.perturb.utils import WarmupGate
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
