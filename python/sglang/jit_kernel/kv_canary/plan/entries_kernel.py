@@ -140,9 +140,7 @@ def _validate_entries_kernel_inputs(
     _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
     _require_len(verify_slot_indices, "verify_slot_indices", verify_capacity)
     _require_len(verify_positions, "verify_positions", verify_capacity)
-    _require_len(
-        verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity
-    )
+    _require_len(verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity)
 
     if req_to_token_stride0 != int(req_to_token.stride(0)):
         raise ValueError(

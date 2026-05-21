@@ -24,7 +24,9 @@ def _resolve_swa_lut(
 
 def _require_dtype(tensor: torch.Tensor, name: str, dtype: torch.dtype) -> None:
     if tensor.dtype != dtype:
-        raise ValueError(f"kv-canary: {name} must have dtype {dtype}, got {tensor.dtype}")
+        raise ValueError(
+            f"kv-canary: {name} must have dtype {dtype}, got {tensor.dtype}"
+        )
 
 
 def _require_1d(tensor: torch.Tensor, name: str) -> None:
@@ -45,22 +47,20 @@ def _require_len(tensor: torch.Tensor, name: str, expected: int) -> None:
     _require_1d(tensor=tensor, name=name)
     actual = int(tensor.shape[0])
     if actual != expected:
-        raise ValueError(
-            f"kv-canary: {name} length must be {expected}, got {actual}"
-        )
+        raise ValueError(f"kv-canary: {name} length must be {expected}, got {actual}")
 
 
 def _require_min_len(tensor: torch.Tensor, name: str, minimum: int) -> None:
     _require_1d(tensor=tensor, name=name)
     actual = int(tensor.shape[0])
     if actual < minimum:
-        raise ValueError(
-            f"kv-canary: {name} length must be >= {minimum}, got {actual}"
-        )
+        raise ValueError(f"kv-canary: {name} length must be >= {minimum}, got {actual}")
 
 
 def _require_same_device(
-    reference: torch.Tensor, reference_name: str, tensors: tuple[tuple[torch.Tensor, str], ...]
+    reference: torch.Tensor,
+    reference_name: str,
+    tensors: tuple[tuple[torch.Tensor, str], ...],
 ) -> None:
     for tensor, name in tensors:
         if tensor.device != reference.device:

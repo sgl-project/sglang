@@ -82,9 +82,7 @@ def _validate_extras_kernel_inputs(
 ) -> None:
     _assert_contiguous(extra_verify_slot_indices, "extra_verify_slot_indices")
     _assert_contiguous(extra_verify_positions, "extra_verify_positions")
-    _assert_contiguous(
-        extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices"
-    )
+    _assert_contiguous(extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices")
     _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
     _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
     _assert_contiguous(verify_slot_indices, "verify_slot_indices")
@@ -113,7 +111,9 @@ def _validate_extras_kernel_inputs(
             f"kv-canary: extras_capacity must be non-negative, got {extras_capacity}"
         )
 
-    _require_len(extra_verify_slot_indices, "extra_verify_slot_indices", extras_capacity)
+    _require_len(
+        extra_verify_slot_indices, "extra_verify_slot_indices", extras_capacity
+    )
     _require_len(extra_verify_positions, "extra_verify_positions", extras_capacity)
     _require_len(
         extra_verify_prev_slot_indices,
@@ -124,9 +124,7 @@ def _validate_extras_kernel_inputs(
     _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
     _require_len(verify_slot_indices, "verify_slot_indices", verify_capacity)
     _require_len(verify_positions, "verify_positions", verify_capacity)
-    _require_len(
-        verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity
-    )
+    _require_len(verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity)
 
     _require_same_device(
         verify_offsets_scratch,
