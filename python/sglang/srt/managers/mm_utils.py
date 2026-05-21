@@ -1177,8 +1177,13 @@ def general_mm_embed_routine(
         # Save profile only for spikes
         if _prof is not None and _llm_dur > 200:
             _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            try:
+                _tp_rank = torch.distributed.get_rank()
+            except Exception:
+                _tp_rank = 0
             _trace_path = os.path.join(
-                _spike_profile_dir, f"spike_llm_{_llm_dur:.0f}ms_{_ts_str}.json"
+                _spike_profile_dir,
+                f"spike_llm_{_llm_dur:.0f}ms_tp{_tp_rank}_{_ts_str}.json",
             )
             _prof.export_chrome_trace(_trace_path)
             logging.getLogger(__name__).info(
