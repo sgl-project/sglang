@@ -249,18 +249,10 @@ class ViTCudaGraphRunner:
         import logging
 
         logger = logging.getLogger(__name__)
-        mem_before = torch.cuda.memory_allocated(self.device) / 1024**2
-        for B in self.BUCKET_SIZES:
+        # DEBUG: only capture smallest bucket to test if issue is binary
+        for B in self.BUCKET_SIZES[:1]:
             self._capture(B)
-        mem_after = torch.cuda.memory_allocated(self.device) / 1024**2
-        mem_reserved = torch.cuda.memory_reserved(self.device) / 1024**2
-        logger.info(
-            "[VIT_GRAPH] capture_all done: mem_alloc %.0fMB -> %.0fMB (delta=%.0fMB), reserved=%.0fMB",
-            mem_before,
-            mem_after,
-            mem_after - mem_before,
-            mem_reserved,
-        )
+        logger.info("[VIT_GRAPH] capture_all done (debug: only bucket=%d)", B)
 
     # ------------------------------------------------------------------
     # Replay
