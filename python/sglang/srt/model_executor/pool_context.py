@@ -16,8 +16,8 @@ synchronous, so the global is mutated and read serially.
 ``attn_backend`` follows the same model: ``_forward_raw`` publishes the active
 runner's ``attn_backend`` for the duration of the forward; PDmux per-stream
 swap and frozen-KV MTP draft swap can override via ``set_attn_backend()`` with
-save/restore. Model-layer code that previously read ``forward_batch.attn_backend``
-now reads ``get_attn_backend()``.
+save/restore. Model-layer code that previously read the (now-removed)
+ForwardBatch ``attn_backend`` field now reads ``get_attn_backend()``.
 """
 
 from __future__ import annotations
