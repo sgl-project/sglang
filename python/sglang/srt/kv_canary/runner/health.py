@@ -64,7 +64,7 @@ class KernelRunCounterHealthChecker:
                     f"at step={step_counter}; canary path is not executing"
                 )
 
-        self._previous_health_future = FutureTensor.create(
+        self._previous_health_future = FutureTensor.device_to_host(
             src_device=device_state.kernel_run_counters, stream=self._d2h_stream
         )
 
@@ -121,10 +121,10 @@ class PeriodicCanaryStatsLogger:
             )
 
         slot_sum_device = device_state.slot_run_counters.sum().view(1)
-        self._previous_slot_sum_future = FutureTensor.create(
+        self._previous_slot_sum_future = FutureTensor.device_to_host(
             src_device=slot_sum_device, stream=self._d2h_stream
         )
-        self._previous_write_index_future = FutureTensor.create(
+        self._previous_write_index_future = FutureTensor.device_to_host(
             src_device=device_state.violation_log.violation_write_index,
             stream=self._d2h_stream,
         )

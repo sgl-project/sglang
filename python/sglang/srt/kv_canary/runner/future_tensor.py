@@ -11,7 +11,7 @@ class FutureTensor:
     _event: torch.cuda.Event | None
 
     @classmethod
-    def create(
+    def device_to_host(
         cls, *, src_device: torch.Tensor, stream: torch.cuda.Stream
     ) -> "FutureTensor":
         host = torch.empty(
