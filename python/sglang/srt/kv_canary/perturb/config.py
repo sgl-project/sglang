@@ -12,6 +12,9 @@ class TargetGroupKind(IntEnum):
     SWA = PoolKind.SWA.value
     ANY = 2
 
+    def __str__(self) -> str:
+        return self.name.lower()
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PerturbConfig:

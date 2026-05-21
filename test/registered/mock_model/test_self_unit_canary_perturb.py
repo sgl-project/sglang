@@ -5,8 +5,11 @@ import pytest
 from _pytest.logging import LogCaptureFixture
 
 from sglang.srt.kv_canary.perturb import real_kv_used
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.perturb.slot_picker import ActiveSlotTarget
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-large")
 
 
 def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
@@ -16,7 +19,7 @@ def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
         req_to_token_prob=0.0,
         real_kv_used_prob=1.0,
         real_kv_unused_cache_prob=0.0,
-        target_group_kind="full",
+        target_group_kind=TargetGroupKind.FULL,
         warmup_steps=0,
     )
     warmup_gate = Mock()
