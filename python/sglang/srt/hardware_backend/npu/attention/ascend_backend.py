@@ -24,7 +24,7 @@ from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_bool_env_var, get_current_device_stream_fast
 
@@ -351,8 +351,8 @@ class AscendAttnBackend(AttentionBackend):
     ):
         pass
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
+        """Init the metadata for a forward pass (eager path)."""
         self.forward_metadata = ForwardMetadata()
         seq_lens_max = forward_batch.seq_lens.max()
         if forward_batch.forward_mode.is_target_verify():
@@ -458,22 +458,56 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
+
+        Body merged from old ``init_forward_metadata_capture_cuda_graph``
+        (initial setup: allocate ForwardMetadata, bind block_tables /
+        block_tables_swa views into ``self.graph_metadata`` buffers,
+        fill ``actual_seq_lengths_q`` and FIA head-pad tensors) and
+        ``init_forward_metadata_replay_cuda_graph`` (per-iter refresh:
+        copy block_tables / block_tables_swa from ``req_to_token``,
+        apply spec offsets to ``seq_lens``). Capture and replay run the
+        same body each iteration; per the initial-stage choice,
+        ``init_forward_data_in_graph`` is left as a no-op and any
+        future graph-recording optimization is deferred to a follow-up
+        per-backend PR.
+        """
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
         metadata = ForwardMetadata()
 
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        if self.is_dllm_model:
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+
+        # Compute max_len (replay-style) for per-iter block_tables refresh.
+        if seq_lens_cpu is not None:
+            max_len = int(seq_lens_cpu[:bs].max().item())
+        else:
             max_len = int(seq_lens[:bs].max().item())
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+        if forward_mode.is_target_verify():
+            max_len += self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            max_len += self.speculative_step_id + 1
+        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
+                self.full_to_swa_index_mapping[
+                    self.req_to_token[req_pool_indices[:bs], :max_len]
+                ][:, :: self.page_size]
+                // self.page_size
+            )
+            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables_swa[bs:, :].fill_(0)
+
+        if self.is_dllm_model:
             metadata.block_tables[:bs, :max_seq_pages].copy_(
                 (
                     self.req_to_token[req_pool_indices[:bs], :max_len][
@@ -482,13 +516,16 @@ class AscendAttnBackend(AttentionBackend):
                     // self.page_size
                 ).to(torch.int32)
             )
-            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables[bs:, :].fill_(0)
+        else:
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
+                // self.page_size
+            )
+        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+        metadata.block_tables[bs:, :].fill_(0)
 
-        if self.is_hybrid_swa:
-            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
         metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = seq_lens
+
         if (
             forward_mode.is_target_verify()
             or forward_mode.is_draft_extend_v2()
@@ -549,53 +586,19 @@ class AscendAttnBackend(AttentionBackend):
                 device=seq_lens.device,
             )
 
+        # seq_lens with spec offsets — bind to persistent fb buffer, then
+        # write adjusted values back in place (was replay variant body).
+        metadata.seq_lens = seq_lens
+        if forward_mode.is_target_verify():
+            adjusted_seq_lens = seq_lens + self.speculative_num_draft_tokens
+        elif forward_mode.is_decode_or_idle() and spec_info is not None:
+            adjusted_seq_lens = seq_lens + self.speculative_step_offset_npu
+        else:
+            adjusted_seq_lens = seq_lens
+        if adjusted_seq_lens is not seq_lens:
+            metadata.seq_lens[:bs].copy_(adjusted_seq_lens[:bs])
+
         self.graph_metadata[bs] = metadata
-        self.forward_metadata = metadata
-
-        self.graph_mode = True
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        metadata = self.graph_metadata[bs]
-        max_len = seq_lens_cpu[:bs].max().item()
-        if forward_mode.is_target_verify():
-            max_len += self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            max_len += self.speculative_step_id + 1
-        max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-
-        if self.is_hybrid_swa:
-            metadata.block_tables_swa[:bs, :max_seq_pages].copy_(
-                self.full_to_swa_index_mapping[
-                    self.req_to_token[req_pool_indices[:bs], :max_len]
-                ][:, :: self.page_size]
-                // self.page_size
-            )
-            metadata.block_tables_swa[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables_swa[bs:, :].fill_(0)
-        metadata.block_tables[:bs, :max_seq_pages].copy_(
-            self.req_to_token[req_pool_indices[:bs], :max_len][:, :: self.page_size]
-            // self.page_size
-        )
-
-        metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-        metadata.block_tables[bs:, :].fill_(0)
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.speculative_num_draft_tokens
-        elif forward_mode.is_decode_or_idle() and spec_info is not None:
-            seq_lens = seq_lens + self.speculative_step_offset_npu
-        metadata.seq_lens[:bs].copy_(seq_lens[:bs])
-
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -2282,10 +2285,10 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            self.attn_backends[i].init_forward_data(forward_batch)
 
         self.common_template(forward_batch, call_fn)
 
@@ -2293,33 +2296,14 @@ class AscendAttnMultiStepDraftBackend:
         for i in range(self.speculative_num_steps):
             self.attn_backends[i].init_cuda_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Capture + replay path -- dispatches per-step underlying-backend
+        init via ``common_template``. Capture and replay run the same body
+        each iteration; per the initial-stage choice, ``init_forward_data_in_graph``
+        is left as a no-op.
+        """
 
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
         def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            self.attn_backends[i].init_forward_data_out_graph(forward_batch)
 
         self.common_template(forward_batch, call_fn)
