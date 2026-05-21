@@ -384,6 +384,12 @@ class EagleDraftWorker(BaseDraftWorker):
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
 
+        # Lazy: under SGLANG_SPEC_V2_NO_VERIFY_SYNC the schedule path skips
+        # the CPU mirror, so seq_lens_sum can still be None here. The kernel
+        # only consults seq_lens_sum when there is no preallocated mask buffer.
+        if batch.seq_lens_sum is None and tree_mask_buf is None:
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
+
         (
             tree_mask,
             position,
@@ -397,7 +403,7 @@ class EagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            batch.seq_lens_sum or 0,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,

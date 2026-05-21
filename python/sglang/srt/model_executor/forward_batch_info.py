@@ -501,8 +501,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         else:
             seq_lens_cpu = batch.seq_lens_cpu
 
-        if batch.seq_lens_sum is None:
-            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+        # Under SGLANG_SPEC_V2_NO_VERIFY_SYNC seq_lens_cpu is None; leave
+        # seq_lens_sum as None so downstream (build_tree_kernel etc.) lazily
+        # computes from the GPU seq_lens when needed.
+        if batch.seq_lens_sum is None and seq_lens_cpu is not None:
+            batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         ret = cls(
             forward_mode=batch.forward_mode,
@@ -620,14 +623,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            assert isinstance(extend_seq_lens, list)
-            assert isinstance(extend_prefix_lens, list)
-            ret.extend_seq_lens = torch.tensor(extend_seq_lens, dtype=torch.int32).to(
-                device, non_blocking=True
-            )
-            ret.extend_prefix_lens = torch.tensor(
-                extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            # gpu_only path (prepare_for_extend_to_fill_draft_kvcache under
+            # SGLANG_SPEC_V2_NO_VERIFY_SYNC) hands these in as device tensors
+            # directly; skip H2D and leave *_cpu mirrors unset.
+            if isinstance(extend_seq_lens, torch.Tensor):
+                ret.extend_seq_lens = extend_seq_lens
+                ret.extend_prefix_lens = extend_prefix_lens
+            else:
+                assert isinstance(extend_seq_lens, list)
+                assert isinstance(extend_prefix_lens, list)
+                ret.extend_seq_lens = torch.tensor(
+                    extend_seq_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
+                ret.extend_prefix_lens = torch.tensor(
+                    extend_prefix_lens, dtype=torch.int32
+                ).to(device, non_blocking=True)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -637,8 +647,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
-            ret.extend_prefix_lens_cpu = extend_prefix_lens
-            ret.extend_seq_lens_cpu = extend_seq_lens
+            if isinstance(extend_prefix_lens, list):
+                ret.extend_prefix_lens_cpu = extend_prefix_lens
+                ret.extend_seq_lens_cpu = extend_seq_lens
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:

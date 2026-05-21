@@ -221,16 +221,32 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: Any,
         cuda_graph_runner: Any,
     ):
-        seq_lens_cpu_ = batch.seq_lens_cpu
-        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
+        bs = len(batch.seq_lens)
+        extend_num_tokens = bs * num_draft_tokens
+        # Under SGLANG_SPEC_V2_NO_VERIFY_SYNC the scheduler skipped
+        # resolve_seq_lens_cpu so seq_lens_cpu is None; stay on the GPU-only
+        # path (extend_lens / prefix_lens as device tensors, no .tolist()/.cpu()).
+        gpu_only = batch.seq_lens_cpu is None
 
         batch.spec_info = self
         batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
-        batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
-        batch.prefix_lens = seq_lens_cpu_.tolist()
+        if gpu_only:
+            prefix_lens_gpu = batch.seq_lens.to(torch.int32)
+            batch.seq_lens = batch.seq_lens + num_draft_tokens
+            batch.extend_lens = torch.full(
+                (bs,),
+                num_draft_tokens,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
+            )
+            batch.prefix_lens = prefix_lens_gpu
+        else:
+            seq_lens_cpu_ = batch.seq_lens_cpu
+            batch.seq_lens = batch.seq_lens + num_draft_tokens
+            batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.extend_lens = [num_draft_tokens for _ in range(bs)]
+            batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
             CaptureHiddenMode.NULL

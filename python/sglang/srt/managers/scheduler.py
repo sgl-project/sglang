@@ -2838,7 +2838,9 @@ class Scheduler(
                 # Spec v2 pre-isolation CPU mirror prep: D2H new_seq_lens_buf
                 # into batch.seq_lens_cpu + set seq_lens_sum. For non-spec_v2,
                 # ForwardBatch.init_new lazily computes the sum.
-                if batch.is_spec_v2:
+                # SGLANG_SPEC_V2_NO_VERIFY_SYNC skips this D2H entirely; downstream
+                # uses the gpu_only path in prepare_for_extend_to_fill_draft_kvcache.
+                if batch.is_spec_v2 and not envs.SGLANG_SPEC_V2_NO_VERIFY_SYNC.get():
                     # FIXME: make this optional to different backends.
                     self.future_map.resolve_seq_lens_cpu(batch)
 
