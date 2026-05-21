@@ -68,10 +68,10 @@ ${UV_PIP_INSTALL} triton-ascend
 
 
 ### Install sgl-kernel-npu
-SGLANG_KERNEL_NPU_TAG="2026.03.10.rc1"
+SGLANG_KERNEL_NPU_TAG="2026.05.01"
 mkdir sgl-kernel-npu
-(cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip" \
-&& unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch2.8.0-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \
+(cd sgl-kernel-npu && wget "${GITHUB_PROXY_URL:=""}https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip" \
+&& unzip ./sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py311-cann8.5.0-${DEVICE_TYPE}-$(arch).zip \
 && ${UV_PIP_INSTALL} ./deep_ep*.whl ./sgl_kernel_npu*.whl \
 && (cd "$(python3 -m pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so))
 

@@ -39,9 +39,14 @@ on:
         default: ''
         type: string
       official_source_group:
-        description: 'Official GT source group filter: all, diffusers, wan21, or ltx23. Used only when run_official_cases is true.'
+        description: 'Official GT source group filter: all, diffusers, wan21, ltx, or ltx23. Used only when run_official_cases is true.'
         required: false
         default: ''
+        type: string
+      ci_data_ref:
+        description: 'ci-data ref to use for repro scripts when running official GT cases.'
+        required: false
+        default: 'main'
         type: string
 
 concurrency:
@@ -90,6 +95,13 @@ jobs:
                   "zimage_image_t2i",
               ],
               "wan21": ["wan2_1_t2v_1.3b"],
+              "ltx": [
+                  "ltx_2_two_stage_t2v",
+                  "ltx_2.3_two_stage_t2v_2gpus",
+                  "ltx_2_3_two_stage_ti2v_2gpus",
+                  "ltx_2.3_one_stage_ti2v",
+                  "ltx_2_3_hq_pipeline",
+              ],
               "ltx23": [
                   "ltx_2.3_two_stage_t2v_2gpus",
                   "ltx_2.3_one_stage_ti2v",
@@ -97,7 +109,7 @@ jobs:
           }
           source_group = os.environ["OFFICIAL_SOURCE_GROUP"].strip() or "all"
           if source_group == "all":
-              selected_groups = list(groups)
+              selected_groups = ["diffusers", "wan21", "ltx"]
           elif source_group in groups:
               selected_groups = [source_group]
           else:
@@ -109,7 +121,6 @@ jobs:
               "flux_2_image_t2i",
               "flux_2_klein_image_t2i",
               "flux_2_ti2i",
-              "ltx_2.3_two_stage_t2v_2gpus",
           }
           include = []
           for group in selected_groups:
@@ -154,9 +165,13 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: sgl-project/ci-data
-          ref: main
+          ref: ${{ inputs.ci_data_ref || 'main' }}
           path: ci-data
           token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          sparse-checkout: |
+            diffusion-ci/repro_scripts
+            diffusion-ci/consistency_gt/official_generated/case_map.json
+          sparse-checkout-cone-mode: false
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -179,8 +194,8 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL="${{ inputs.kernel_artifact_run_id != '' && 'true' || 'false' }}" \
             bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Install official LTX-2.3 repro dependencies
-        if: matrix.source_group == 'ltx23'
+      - name: Install official LTX repro dependencies
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
         run: |
           UV_SYSTEM_PYTHON=1 uv pip install \
             "transformers==4.52.4" \
@@ -201,7 +216,7 @@ jobs:
           git -C /tmp/mmgen-official-code/Wan2.1 rev-parse HEAD
 
       - name: Checkout official LTX-2 repo
-        if: matrix.source_group == 'ltx23'
+        if: matrix.source_group == 'ltx' || matrix.source_group == 'ltx23'
         run: |
           mkdir -p /tmp/mmgen-official-code
           if [ ! -d /tmp/mmgen-official-code/LTX-2/.git ]; then
@@ -210,65 +225,6 @@ jobs:
           git -C /tmp/mmgen-official-code/LTX-2 fetch --depth 1 origin 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
           git -C /tmp/mmgen-official-code/LTX-2 checkout 41d924371612b692c0fd1e4d9d94c3dfb3c02cb3
           git -C /tmp/mmgen-official-code/LTX-2 rev-parse HEAD
-
-      - name: Prepare official LTX-2.3 assets
-        if: matrix.source_group == 'ltx23'
-        env:
-          HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
-        run: |
-          python - <<'PY'
-          import os
-          from pathlib import Path
-
-          from huggingface_hub import hf_hub_download, snapshot_download
-
-          root = Path.home() / ".cache/sgl_diffusion/materialized_models/Lightricks__LTX-2.3-official-assets"
-          root.mkdir(parents=True, exist_ok=True)
-          text_encoder = root / "text_encoder"
-          tokenizer = root / "tokenizer"
-          text_encoder.mkdir(exist_ok=True)
-          tokenizer.mkdir(exist_ok=True)
-
-          gemma_root = Path(
-              snapshot_download(
-                  repo_id="google/gemma-3-12b-it-qat-q4_0-unquantized",
-                  ignore_patterns=["*.onnx", "*.msgpack"],
-                  max_workers=8,
-              )
-          )
-          tokenizer_names = {
-              "tokenizer.json",
-              "tokenizer.model",
-              "tokenizer_config.json",
-              "special_tokens_map.json",
-          }
-
-          def link(src: Path, dst: Path) -> None:
-              if dst.exists() or dst.is_symlink():
-                  return
-              try:
-                  dst.symlink_to(src)
-              except OSError:
-                  os.link(src, dst)
-
-          for src in gemma_root.iterdir():
-              if not src.is_file():
-                  continue
-              link(src, text_encoder / src.name)
-              if src.name in tokenizer_names:
-                  link(src, tokenizer / src.name)
-
-          for filename in (
-              "ltx-2.3-22b-distilled-lora-384.safetensors",
-              "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
-          ):
-              src = Path(hf_hub_download("Lightricks/LTX-2.3", filename))
-              link(src, root / filename)
-
-          print(root)
-          print(sorted(p.name for p in root.iterdir()))
-          PY
 
       - name: Generate official output
         env:
@@ -301,17 +257,22 @@ jobs:
               --dtype bf16 \
               --device-map none \
               --generator-device cuda
-          elif [ "$SOURCE_GROUP" = "ltx23" ]; then
+          elif [ "$SOURCE_GROUP" = "ltx" ] || [ "$SOURCE_GROUP" = "ltx23" ]; then
             cd python
+            extra_ltx_args=()
+            if [ "$CASE_ID" = "ltx_2_3_hq_pipeline" ]; then
+              extra_ltx_args+=(--num-frames 24)
+            fi
             set +e
             PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
               python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
                 --out-dir ./${{ env.OUTPUT_NAME }} \
-                --case-ids "$CASE_ID"
+                --case-ids "$CASE_ID" \
+                "${extra_ltx_args[@]}"
             status=$?
             set -e
             if [ "$status" -ne 0 ]; then
-              find ./${{ env.OUTPUT_NAME }} -name 'official_ltx23_manifest.json' -print -exec cat {} \;
+              find ./${{ env.OUTPUT_NAME }} \( -name 'official_ltx_manifest.json' -o -name 'official_ltx23_manifest.json' \) -print -exec cat {} \;
               exit "$status"
             fi
           else
@@ -327,6 +288,7 @@ jobs:
             python/${{ env.OUTPUT_NAME }}/*.jpg
             python/${{ env.OUTPUT_NAME }}/*.png
             python/${{ env.OUTPUT_NAME }}/official_gt_manifest_*.json
+            python/${{ env.OUTPUT_NAME }}/official_ltx_manifest.json
             python/${{ env.OUTPUT_NAME }}/official_ltx23_manifest.json
           retention-days: 7
 

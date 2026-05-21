@@ -104,7 +104,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v1.1.1"
+ARG MORI_COMMIT="96ffa169710f214e76e07abe5008d686fe54522b"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -199,11 +199,14 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
+
+# cherry pick b639cb6 commit for aiter_mhc_pre fix, may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
+ && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 

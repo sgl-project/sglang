@@ -20,6 +20,7 @@ from sglang.srt.utils.common import (
     crash_on_warnings,
     get_bool_env_var,
     is_cuda,
+    is_musa,
     is_npu,
 )
 
@@ -32,6 +33,15 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
+if is_musa():
+    from sgl_kernel import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+    )
+
 
 if is_npu():
     import torch_npu
