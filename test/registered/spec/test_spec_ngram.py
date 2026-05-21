@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
@@ -10,6 +12,7 @@ from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 register_cuda_ci(est_time=254, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNgramSpeculativeDecodingPaged(NgramServerBase, GSM8KMixin):
     attention_backend = "flashinfer"
     extra_args = ["--page-size", "64"]
