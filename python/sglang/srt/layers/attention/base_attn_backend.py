@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+import warnings
+from abc import ABC
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -11,47 +12,141 @@ from sglang.srt.utils.common import is_npu
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.speculative.spec_info import SpecInput
 
 
 class AttentionBackend(ABC):
-    """The base class of attention backends"""
+    """The base class of attention backends.
 
-    @abstractmethod
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
-        """Init the metadata for a forward pass."""
-        raise NotImplementedError()
+    Per-forward init three-method contract (initial stage of step 03):
+
+        init_forward_data(fb)            -- eager wrapper = out_graph + in_graph
+        init_forward_data_out_graph(fb)  -- per-iter metadata prep run OUTSIDE
+                                            any cuda graph capture/replay scope.
+                                            All three paths (eager / capture /
+                                            replay) call this; capture and
+                                            replay run the same body.
+        init_forward_data_in_graph(fb)   -- graph-recordable metadata prep run
+                                            INSIDE `with graph.capture():`.
+                                            Recorded ops auto-execute at
+                                            replay via `graph.replay()`.
+                                            Default no-op; most backends do
+                                            NOT override this in the initial
+                                            stage (deferred optimization slot).
+
+    The five backend init paths (eager / full-graph capture / full-graph
+    replay / PCG capture / PCG replay) all flow through these methods. Only
+    the caller varies which subset it invokes:
+
+        eager        : init_forward_data(fb)         == out_graph + in_graph
+        full capture : out_graph(fb) outside; in_graph(fb) inside graph.
+        full replay  : out_graph(fb_view) outside; graph.replay() auto-runs
+                       recorded in_graph ops.
+        PCG capture  : out_graph(fb) outside; in_graph(fb) inside.
+        PCG replay   : out_graph(fb) outside; graph.replay() auto-runs.
+
+    Initial stage: backends override only ``init_forward_data_out_graph``
+    with the merged body of the old ``init_forward_metadata`` (eager) +
+    ``init_forward_metadata_capture_cuda_graph`` (capture) +
+    ``init_forward_metadata_replay_cuda_graph`` (replay) variants. The
+    ``_in_graph`` slot is reserved for a follow-up per-backend optimization
+    PR that moves graph-safe static-shape ops into the captured graph for
+    Python-dispatch savings at replay.
+    """
+
+    # -----------------------------------------------------------------
+    # Forward-data init -- three-method contract
+    # -----------------------------------------------------------------
+
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep run OUTSIDE any cuda graph capture/replay scope.
+
+        Called at eager (via the wrapper), capture (before the graph capture
+        context), and replay (before ``graph.replay()``). All three paths run
+        the same body; this is where the unified body lives in the initial
+        stage of step 03.
+
+        Default: no-op. Override this with the backend's per-iter prep.
+        """
+
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Graph-recordable metadata prep run INSIDE ``with graph.capture():``.
+
+        Recorded ops auto-execute at replay via ``graph.replay()`` -- no
+        Python dispatch at replay time.
+
+        Default: no-op. Most backends do NOT override this in the initial
+        stage; all prep stays in ``_out_graph``. A follow-up per-backend PR
+        moves graph-safe static-shape ops here for replay-time speedup.
+
+        Override contract: body must NOT call ``.item()`` / ``.cpu()`` /
+        ``.tolist()`` / dynamic-shape ``torch.empty()`` -- those are not
+        recordable and belong in ``_out_graph``.
+        """
+
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
+        """Eager-path wrapper -- runs both phases in order."""
+        self.init_forward_data_out_graph(forward_batch)
+        self.init_forward_data_in_graph(forward_batch)
+
+    # -----------------------------------------------------------------
+    # Deprecation shims for out-of-tree backends (one release window)
+    # -----------------------------------------------------------------
+    #
+    # Out-of-tree subclasses that still override the old method names continue
+    # to work via the forwarders below -- at the cost of a DeprecationWarning
+    # per call site. The capture/replay variants had positional-arg signatures
+    # incompatible with fb-only, so they raise NotImplementedError instead:
+    # out-of-tree code that uses them must migrate to ``_out_graph``.
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
+        """[DEPRECATED] Old eager init entry point.
+
+        Default forwards to the new three-method contract. Subclasses should
+        override ``init_forward_data_out_graph`` (and optionally
+        ``init_forward_data_in_graph``) instead of this method.
+        """
+        warnings.warn(
+            "AttentionBackend.init_forward_metadata is deprecated; "
+            "override init_forward_data_out_graph instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.init_forward_data(forward_batch)
+
+    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
+        """[DEPRECATED] Old capture-time init entry point -- not auto-forwarded.
+
+        Signature differed from the eager method, so callers must migrate to
+        ``init_forward_data_out_graph(fb)`` explicitly. Out-of-tree backends
+        overriding this method must move the body into
+        ``init_forward_data_out_graph``.
+        """
+        raise NotImplementedError(
+            "init_forward_metadata_capture_cuda_graph is deprecated; "
+            "override init_forward_data_out_graph instead."
+        )
+
+    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
+        """[DEPRECATED] Old replay-time init entry point -- not auto-forwarded.
+
+        Signature differed from the eager method, so callers must migrate to
+        ``init_forward_data_out_graph(fb_view)`` explicitly. Out-of-tree
+        backends overriding this method must move the body into
+        ``init_forward_data_out_graph``.
+        """
+        raise NotImplementedError(
+            "init_forward_metadata_replay_cuda_graph is deprecated; "
+            "override init_forward_data_out_graph instead."
+        )
+
+    # -----------------------------------------------------------------
+    # Cuda-graph buffer alloc + warmup hook (unchanged by step 03)
+    # -----------------------------------------------------------------
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         """Init the global shared states for cuda graph."""
-        raise NotImplementedError()
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
-        """Init the metadata for a forward pass for capturing a cuda graph."""
-        raise NotImplementedError()
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
         raise NotImplementedError()
 
     def get_cuda_graph_seq_len_fill_value(self):
