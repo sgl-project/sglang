@@ -89,7 +89,7 @@ jobs:
           fi
 
           if [ -z "${{ inputs.test_scope }}" ]; then
-            echo "test_scope=poc1" >> $GITHUB_OUTPUT
+            echo "test_scope=poc" >> $GITHUB_OUTPUT
           else
             echo "test_scope=${{ inputs.test_scope }}" >> $GITHUB_OUTPUT
           fi
@@ -713,19 +713,526 @@ jobs:
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     needs: [ set-image-config, nightly-poc-single-node-tests ]
-    if: ${{ !cancelled() && (needs.set-image-config.outputs.test_scope == 'all' || needs.set-image-config.outputs.test_scope == 'poc1') }}
+    if: ${{ !cancelled() && (needs.set-image-config.outputs.test_scope == 'all' || needs.set-image-config.outputs.test_scope == 'poc') }}
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-#          # Kimi 2p1d_32p accuracy
-          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa
+          - name: test_ascend_qwen3_235b_w8a8_1p1d_24p_accuracy
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_ascend_qwen3_235b_w8a8_1p1d_24p_accuracy.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          # GLM5 1p1d_32p (P: tp=16 + D: tp=16, total 32 cards)
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_gpqa
             prefill_size: 2
             decode_size: 2
             router_size: 1
-            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa.py
+            test_case: test/registered/ascend/accuracy/test_npu_glm5_1_w4a8_1p1d_32p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_aime2025
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_glm5_1_w4a8_1p1d_32p_aime2025.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in65k_out1k5_prefix90_25ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_48p_in65k_out1k5_prefix100_33ms
+            prefill_size: 2
+            decode_size: 4
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_48p_in65k_out1k5_prefix100_33ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_48p_in64k_out1k_prefix90_50ms
+            prefill_size: 4
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_48p_in64k_out1k_prefix90_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_glm5_1_w4a8_1p1d_48p_in128k_out1k_prefix90_50ms
+            prefill_size: 4
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_48p_in128k_out1k_prefix90_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
 
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in3k5_out1k5_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in3k5_out1k5_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in16k_out1k_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in196k_out1k
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in196k_out1k.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_20ms_90.py
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in64k_out1k_20ms_90.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms_90.py
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms_90.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms_90_1.py
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_32p_in128k_out1k_20ms_90_1.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_glm5_1_w4a8_1p1d_48p_in64k_out1k_33ms_90.py
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_glm5_1_w4a8_1p1d_48p_in64k_out1k_33ms_90.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          # Kimi 1p1d_16p PD separation (Issue #1: P:tp=8 + D:tp=8 = 16 cards total)
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in254k_out1k
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in254k_out1k.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in16k_out1k_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in16k_out1k_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in16k_out1k_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in16k_out1k_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in1080p_30_out256_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in1080p_30_out256_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in1024x1024_30_out1024_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in1024x1024_30_out1024_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k_prefix90_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k_prefix90_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k_prefix90_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k_prefix90_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_prefix90_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_prefix90_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_prefix90_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_in3k5_out1k5_20ms
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_2p1d_32p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_in3k5_out1k5_50ms
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_2p1d_32p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_in1080p_30_out256_50ms
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_2p1d_32p_in1080p_30_out256_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          # Kimi 1p1d_16p accuracy
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_gpqa
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_16p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_aime2025
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_16p_aime2025.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          # Kimi 2p1d_32p accuracy
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_aime2025
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_2p1d_32p_aime2025.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_in128k_out1k_prefix90_50ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_2p1d_32p_in128k_out1k_prefix90_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          # Kimi 1p1d_16p accuracy
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_gpqa
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_16p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_aime2025
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_16p_aime2025.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+            # Kimi 1p1d_24p accuracy
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_24p_aime2025
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_24p_aime2025.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_24p_gpqa
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_1p1d_24p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+#          # Kimi 2p1d_32p accuracy
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_2p1d_32p_gpqa.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_2p1d_32p_aime2025
+#            prefill_size: 2
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_kimi_k2_5_w4a8_2p1d_32p_aime2025.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_minimax_m2_5_w8a8_1p1d_24p_in3k5_out1k5_20ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_minimax_m2_5_w8a8_1p1d_24p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_minimax_m2_5_w8a8_1p1d_24p_in3k5_out1k5_50ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_minimax_m2_5_w8a8_1p1d_24p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          - name: test_npu_minimax_m2_5_w8a8_1p1d_16p_aime2025
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_minimax_m2_5_w8a8_1p1d_16p_aime2025.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_minimax_m2_5_w8a8_1p1d_16p_gpqa
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_minimax_m2_5_w8a8_1p1d_16p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_minimax_m2_5_w8a8_1p1d_16p_in128k_out1k_prefix90_50ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_minimax_m2_5_w8a8_1p1d_16p_in128k_out1k_prefix90_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_minimax_m2_5_w8a8_1p1d_16p_in64k_out1k_prefix90_50ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_minimax_m2_5_w8a8_1p1d_16p_in64k_out1k_prefix90_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_ascend_qwen3_235b_w8a8_1p1d_24p_accuracy
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_ascend_qwen3_235b_w8a8_1p1d_24p_accuracy.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+          - name: test_ascend_deepseek_r1_w8a8_1p1d_24p_in2k_out2k_50ms
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_ascend_deepseek_r1_w8a8_1p1d_24p_in2k_out2k_50ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k5_100ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in64k_out1k5_100ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_100ms
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_16p_in128k_out1k_100ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_24p_in64k_out1k5_prefix90_100ms
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_24p_in64k_out1k5_prefix90_100ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          - name: test_npu_kimi_k2_5_w4a8_1p1d_24p_in128k_out1k_prefix90_100ms
+            prefill_size: 1
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/ascend/performance/test_npu_kimi_k2_5_w4a8_1p1d_24p_in128k_out1k_prefix90_100ms.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
+          # Qwen3.5-397B W8A8 1P1D 32-card accuracy tests (P:16 + D:16)
+          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_gpqa
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/ascend/accuracy/test_npu_qwen3_5_397b_gpqa_1p1d_16p.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_aime2025
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/accuracy/test_npu_qwen3_5_397b_aime2025_1p1d_16p.py
+#            test_type: 'accuracy'
+#            prefill_decode_deployment: 'separation'
+          # ===== Qwen3.5-397B w8a8 PD separation tests =====
+#          - name: test_npu_qwen3_5_397b_w8a8_1p2d_24p_in3k5_out1k5_50ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p2d_24p_in3k5_out1k5_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p2d_24p_in3k5_out1k5_20ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p2d_24p_in3k5_out1k5_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in16k_out1k_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in16k_out1k_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in16k_out1k_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in16k_out1k_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_20ms_prefix
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_20ms_prefix.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_50ms_prefix
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_50ms_prefix.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in64k_out1k_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_20ms_prefix
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_20ms_prefix.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_50ms_prefix
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_50ms_prefix.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_20ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_in128k_out1k_20ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p1d_16p_1080p_256_50ms
+#            prefill_size: 1
+#            decode_size: 1
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p1d_16p_1080p_256_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
+#          - name: test_npu_qwen3_5_397b_w8a8_1p2d_24p_1024_1024_50ms
+#            prefill_size: 1
+#            decode_size: 2
+#            router_size: 1
+#            test_case: test/registered/ascend/performance/test_npu_qwen3_5_397b_w8a8_1p2d_24p_1024_1024_50ms.py
+#            test_type: 'perf'
+#            prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-aarch64-a3-0
