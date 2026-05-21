@@ -59,6 +59,7 @@ from sglang.srt.debug_utils.comparator.utils import Pair
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu", nightly=True)
+register_cpu_ci(est_time=1, suite="base-b-test-cpu")
 
 _DEFAULT_PERCENTILE_LINES: list[str] = [
     "      [blue]p1        [/]    -1.8000      -1.8000   [dim]+0.00e+00[/]",
