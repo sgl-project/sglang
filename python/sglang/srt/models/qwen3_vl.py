@@ -78,6 +78,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_npu,
     round_up,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -95,6 +96,10 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -134,8 +139,25 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        if (
+            self.linear_fc2.tp_size == 1
+            and use_intel_amx_backend(self.linear_fc1)
+            and use_intel_amx_backend(self.linear_fc2)
+        ):
+            x_shape = x.shape
+            out = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                x.view(-1, x.shape[-1]),
+                self.linear_fc1.weight,
+                self.linear_fc2.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.bias,
+                True,
+                True,
+            )
+            mlp_output = out.view(x_shape[0], x_shape[1], -1)
+        else:
+            x_fc1, _ = self.linear_fc1(x)
+            mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
 
@@ -348,8 +370,13 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        if is_cpu() and hasattr(vision_config, "original_num_heads"):
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
             head_dim = self.hidden_size // vision_config.original_num_heads
         else:
             head_dim = self.hidden_size // self.num_heads
