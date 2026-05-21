@@ -29,7 +29,7 @@ GB = 1024 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _DivergenceCounterTensors:
+class DivergenceCounterTensors:
     wrap_count: Optional[torch.Tensor]
     nonidentity_write_count: Optional[torch.Tensor]
 
@@ -422,8 +422,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return 0
         return int(self._nonidentity_write_count_device.item())
 
-    def divergence_stats_device_tensors(self) -> _DivergenceCounterTensors:
-        return _DivergenceCounterTensors(
+    def divergence_stats_device_tensors(self) -> DivergenceCounterTensors:
+        return DivergenceCounterTensors(
             wrap_count=self._wrap_count_device,
             nonidentity_write_count=self._nonidentity_write_count_device,
         )

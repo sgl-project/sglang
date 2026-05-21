@@ -18,7 +18,10 @@ from sglang.srt.kv_canary.runner.swa_divergence_stats import (
     SwaDivergenceStats,
     parse_swa_divergence_line,
 )
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import (
+    DivergenceCounterTensors,
+    SWATokenToKVPoolAllocator,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,21 +38,10 @@ class _RecordingFuture:
         return self.value
 
 
+@dataclass(slots=True, kw_only=True)
 class _FakeAllocator:
-    __slots__ = ("_wrap_count_device", "_nonidentity_write_count_device")
-
-    def __init__(
-        self,
-        *,
-        wrap_count: int = 0,
-        nonidentity_write_count: int = 0,
-    ) -> None:
-        self._wrap_count_device = torch.tensor(
-            [wrap_count], dtype=torch.int64, device=_DEVICE
-        )
-        self._nonidentity_write_count_device = torch.tensor(
-            [nonidentity_write_count], dtype=torch.int64, device=_DEVICE
-        )
+    _wrap_count_device: torch.Tensor
+    _nonidentity_write_count_device: torch.Tensor
 
     @property
     def wrap_count(self) -> int:
@@ -58,6 +50,25 @@ class _FakeAllocator:
     @property
     def nonidentity_write_count(self) -> int:
         return int(self._nonidentity_write_count_device.item())
+
+    def divergence_stats_device_tensors(self) -> DivergenceCounterTensors:
+        return DivergenceCounterTensors(
+            wrap_count=self._wrap_count_device,
+            nonidentity_write_count=self._nonidentity_write_count_device,
+        )
+
+
+def _fake_allocator(
+    *, wrap_count: int = 0, nonidentity_write_count: int = 0
+) -> _FakeAllocator:
+    return _FakeAllocator(
+        _wrap_count_device=torch.tensor(
+            [wrap_count], dtype=torch.int64, device=_DEVICE
+        ),
+        _nonidentity_write_count_device=torch.tensor(
+            [nonidentity_write_count], dtype=torch.int64, device=_DEVICE
+        ),
+    )
 
 
 def _make_env_on_allocator_stub() -> SWATokenToKVPoolAllocator:
@@ -120,7 +131,7 @@ def _parse_swa_divergence_line(line: str) -> dict[str, int]:
 
 class TestSwaDivergenceStats(CustomTestCase):
     def test_swa_divergence_log_emitted(self) -> None:
-        allocator = _FakeAllocator(wrap_count=13, nonidentity_write_count=2)
+        allocator = _fake_allocator(wrap_count=13, nonidentity_write_count=2)
         with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
@@ -156,7 +167,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             self.assertEqual(fields["swa_pool_wrap"], 13)
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
-        allocator = _FakeAllocator(wrap_count=0)
+        allocator = _fake_allocator(wrap_count=0)
         with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
@@ -207,7 +218,7 @@ class TestSwaDivergenceStats(CustomTestCase):
                 )
 
     def test_nonidentity_write_count_emitted_from_allocator(self) -> None:
-        allocator = _FakeAllocator(wrap_count=0, nonidentity_write_count=7)
+        allocator = _fake_allocator(wrap_count=0, nonidentity_write_count=7)
         with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
