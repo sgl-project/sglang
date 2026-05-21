@@ -17,12 +17,14 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     Indexer,
     rotate_activation,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
     DSAIndexerMetadata,
     DSAMetadata,
-    DSATopKBackend,
-    TopkTransformMethod,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
@@ -593,7 +595,8 @@ class TestDSAIndexer(CustomTestCase):
             )
 
         topk_indices_offset = (
-            torch.arange(num_rows, dtype=torch.int32, device=self.device) * 1024
+            torch.arange(num_rows, dtype=torch.int32, device=self.device)
+            * max_score_len
         )
         if query_lens is None:
             cu_seqlens_q = torch.arange(

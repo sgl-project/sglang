@@ -7,6 +7,12 @@ import torch
 
 from sglang.srt.environ import envs
 
+_FLASHINFER_TIE_BREAK_VALUES = {
+    "none": 0,
+    "small": 1,
+    "large": 2,
+}
+
 
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
@@ -60,7 +66,9 @@ class DSATopKBackend(Enum):
                 topk_op=flashinfer.top_k,
                 topk_op_kwargs={
                     "sorted": False,
-                    **_flashinfer_topk_kwargs(),
+                    "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    "tie_break": _flashinfer_tie_break_value(),
+                    "dsa_graph_safe": True,
                 },
             )
         raise RuntimeError(f"Unsupported {self = }.")
@@ -134,7 +142,9 @@ class DSATopKBackend(Enum):
                     lengths.contiguous(),
                     topk,
                     row_to_batch=row_to_batch,
-                    **_flashinfer_topk_kwargs(),
+                    deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    tie_break=_flashinfer_tie_break_value(),
+                    dsa_graph_safe=True,
                     row_starts=local_row_starts,
                 )
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -148,7 +158,9 @@ class DSATopKBackend(Enum):
                     topk_indices_offset.contiguous(),
                     lengths.contiguous(),
                     topk,
-                    **_flashinfer_topk_kwargs(),
+                    deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
+                    tie_break=_flashinfer_tie_break_value(),
+                    dsa_graph_safe=True,
                     row_starts=row_starts,
                 )
             raise RuntimeError(f"Unsupported {topk_transform_method = }.")
@@ -223,7 +235,9 @@ def _build_flashinfer_paged_args(
         # Decode-like case (one query row per batch) does not need an explicit mapping.
         # Avoid dynamic tensor construction in this branch to keep CUDA graph capture safe.
         num_batches = cu_seqlens_q_topk.shape[0] - 1
-        if not (row_starts is None and num_rows is not None and num_rows == num_batches):
+        if not (
+            row_starts is None and num_rows is not None and num_rows == num_batches
+        ):
             q_lens = torch.diff(cu_seqlens_q_topk).to(dtype=torch.int32, device=device)
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
@@ -237,31 +251,18 @@ def _build_flashinfer_paged_args(
 
     local_row_starts = row_starts
     if local_row_starts is not None and row_to_batch is not None:
-        local_row_starts = local_row_starts - attn_metadata.cu_seqlens_k[:-1][
-            row_to_batch
-        ]
+        local_row_starts = (
+            local_row_starts - attn_metadata.cu_seqlens_k[:-1][row_to_batch]
+        )
 
     return row_to_batch, local_row_starts
 
 
-def _flashinfer_topk_kwargs() -> Dict[str, object]:
-    return {
-        "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
-        "tie_break": _flashinfer_tie_break_value(),
-        "dsa_graph_safe": True,
-    }
-
-
 def _flashinfer_tie_break_value() -> int:
     mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get().lower()
-    tie_break_values = {
-        "none": 0,
-        "small": 1,
-        "large": 2,
-    }
-    if mode not in tie_break_values:
+    if mode not in _FLASHINFER_TIE_BREAK_VALUES:
         raise RuntimeError(
             "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK must be one of "
-            f"{tuple(tie_break_values)}, got {mode!r}."
+            f"{tuple(_FLASHINFER_TIE_BREAK_VALUES)}, got {mode!r}."
         )
-    return tie_break_values[mode]
+    return _FLASHINFER_TIE_BREAK_VALUES[mode]

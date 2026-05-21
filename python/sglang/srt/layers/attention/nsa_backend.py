@@ -15,4 +15,9 @@ from sglang.srt.layers.attention.dsa_backend import (  # noqa: F401
     DSAFlashMLAMetadata,
     DSAIndexerMetadata,
     DSAMetadata,
+    NativeSparseAttnBackend,
+    NativeSparseAttnMultiStepBackend,
+    NSAFlashMLAMetadata,
+    NSAIndexerMetadata,
+    NSAMetadata,
 )
