@@ -233,9 +233,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
         logits: torch.Tensor,
         topk: int,
         ks: Optional[torch.Tensor] = None,
-        cu_seqlens_q: torch.Tensor = None,
-        ke_offset: torch.Tensor = None,
-        batch_idx_list: List[int] = None,
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        ke_offset: Optional[torch.Tensor] = None,
+        batch_idx_list: Optional[List[int]] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if topk_indices_offset_override is not None:
