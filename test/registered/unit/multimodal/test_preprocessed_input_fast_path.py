@@ -446,9 +446,7 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
 
         try:
             MultimodalProcessorOutput.build_padded_input_ids = staticmethod(fail_build)
-            output = asyncio.run(
-                processor.process_mm_data_async([], "", request_obj)
-            )
+            output = asyncio.run(processor.process_mm_data_async([], "", request_obj))
         finally:
             MultimodalProcessorOutput.build_padded_input_ids = original_build
 
