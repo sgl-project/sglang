@@ -7,12 +7,14 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.multimodal_gen.runtime.utils.auth import auth_level, AuthLevel
 from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter()
 
 
 @router.post("/update_weights_from_disk")
+@auth_level(AuthLevel.ADMIN_FORCE)
 async def update_weights_from_disk(request: Request):
     """Update model weights from disk inplace without restarting the server."""
     body = await request.json()
@@ -47,6 +49,7 @@ async def update_weights_from_disk(request: Request):
 
 
 @router.post("/get_weights_checksum")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def get_weights_checksum(request: Request):
     """Return SHA-256 checksum of each requested module's weights."""
     body = await request.json()
