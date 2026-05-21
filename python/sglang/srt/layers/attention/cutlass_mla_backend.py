@@ -14,13 +14,12 @@ import triton
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -79,7 +78,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         self.q_data_type = model_runner.dtype
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
 
         bs = forward_batch.batch_size
         spec_info = forward_batch.spec_info
@@ -115,9 +114,9 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     block_kv_indices,
                 )
             else:
-                super().init_forward_metadata(forward_batch)
+                super().init_forward_data(forward_batch)
         else:
-            super().init_forward_metadata(forward_batch)
+            super().init_forward_data(forward_batch)
 
     def init_cuda_graph_state(
         self,
@@ -143,16 +142,12 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         )
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
                 max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
@@ -172,53 +167,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
                     self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
                 )
         else:
-            super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-
-        if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            seq_lens = seq_lens[:bs]
-
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-                PAGED_SIZE=PAGE_SIZE,
-            )
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
+            super().init_forward_data_out_graph(forward_batch)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
