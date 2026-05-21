@@ -3,8 +3,10 @@
 import io
 import logging
 import os
+import unittest
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.test.server.test_server_common import (  # noqa: F401
     DiffusionServerBase,
@@ -103,6 +105,7 @@ def _compute_clip_score(image_bytes: bytes, prompt: str) -> float | None:
         return None
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestZImageTurboAMD(DiffusionServerBase):
     """AMD nightly test for Z-Image-Turbo text-to-image generation."""
 

@@ -14,6 +14,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -63,6 +65,7 @@ DEEPSEEK_V32_MODEL_PATH = os.environ.get(
 PROFILE_DIR = "performance_profiles_deepseek_v32_basic_mi325"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyDeepseekV32BasicPerformance(unittest.TestCase):
     """AMD Nightly performance benchmark for DeepSeek-V3.2 model (basic variant).
 

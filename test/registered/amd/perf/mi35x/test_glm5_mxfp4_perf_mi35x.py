@@ -16,6 +16,8 @@ os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -77,6 +79,7 @@ def get_model_path() -> str:
     return GLM5_MXFP4_HF_MODEL_ID
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGLM5MXFP4PerfMI35x(unittest.TestCase):
     """MI35x Nightly performance benchmark for GLM-5-MXFP4 model."""
 

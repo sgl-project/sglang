@@ -14,6 +14,8 @@ import os
 import unittest
 from typing import List
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import BenchmarkResult
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -62,6 +64,7 @@ GROK2_TOKENIZER_PATH = os.environ.get(
 PROFILE_DIR = "performance_profiles_grok2"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyGrok2Performance(unittest.TestCase):
     """Nightly performance benchmark for Grok-2.
 
