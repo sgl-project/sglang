@@ -327,8 +327,11 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        self._run_forward(forward_batch, num_tokens)
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -460,6 +463,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
+                # forward_context is already active here — set by the outer
+                # ModelRunner._forward_raw whose body called replay. Don't
+                # re-wrap; doing so would clobber PDmux per-stream overrides.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,
