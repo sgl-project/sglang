@@ -246,15 +246,10 @@ class HiSparseCoordinator:
           buffer.  In the staging path this is correct (prefill filled the buffer),
           but here the buffer is empty.
         """
-        if self.is_dsv4_hisparse:
-            # TODO(dsv4): wire PD direct-to-host. Needs (a) load_to_device_per_layer
-            raise NotImplementedError(
-                "PD direct-to-host admission is not supported for dsv4 hisparse yet."
-            )
-
         self.alloc_device_buffer(req)
 
-        if req.kv_allocated_len <= self.device_buffer_size:
+        host_len = self._host_token_len(req.kv_allocated_len)
+        if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
             # must preload all tokens from host pool into the device buffer
@@ -271,9 +266,14 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
+    def _host_token_len(self, kv_allocated_len: int) -> int:
+        if self.is_dsv4_hisparse:
+            return kv_allocated_len // self.compress_ratio
+        return kv_allocated_len
+
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""
-        n = req.kv_allocated_len
+        n = self._host_token_len(req.kv_allocated_len)
         host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
         device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
 

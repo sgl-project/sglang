@@ -388,6 +388,17 @@ class DecodePreallocQueue:
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
         )
+        if self.scheduler.enable_hisparse and isinstance(
+            self.token_to_kv_pool, DeepSeekV4TokenToKVPool
+        ):
+            # DSV4 HiSparse writes C4 KV to host. c4_indexer/c128 stay on device.
+            device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
+                self.token_to_kv_pool.get_contiguous_buf_infos()
+            )
+            c4_layer_num = transfer_kv_pool.layer_num
+            kv_data_ptrs += device_kv_data_ptrs[c4_layer_num:]
+            kv_data_lens += device_kv_data_lens[c4_layer_num:]
+            kv_item_lens += device_kv_item_lens[c4_layer_num:]
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -909,6 +920,7 @@ class DecodePreallocQueue:
             decode_req.req.cache_protected_len = prefix_len
 
             page_size = self.token_to_kv_pool_allocator.page_size
+            device_kv_page_indices = None
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
@@ -917,6 +929,14 @@ class DecodePreallocQueue:
                     .numpy()
                     .astype(np.int32)
                 )
+                if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+                    kv_indices_full = self.req_to_token_pool.req_to_token[
+                        decode_req.req.req_pool_idx, prefix_len:origin_input_len
+                    ]
+                    device_kv_page_indices = kv_to_page_indices(
+                        kv_indices_full.cpu().numpy(),
+                        self.token_to_kv_pool.page_size,
+                    ).astype(np.int32)
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -940,8 +960,13 @@ class DecodePreallocQueue:
 
             def _swa_payload():
                 window_size = self.scheduler.sliding_window_size
+                state_page_size = (
+                    self.token_to_kv_pool.swa_page_size
+                    if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+                    else page_size
+                )
                 window_start = max(0, seq_len - window_size)
-                window_start = page_align_floor(window_start, page_size)
+                window_start = page_align_floor(window_start, state_page_size)
                 window_kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, window_start:seq_len
                 ]
@@ -951,7 +976,7 @@ class DecodePreallocQueue:
                     )
                 )
                 return kv_to_page_indices(
-                    window_kv_indices_swa.cpu().numpy(), page_size
+                    window_kv_indices_swa.cpu().numpy(), state_page_size
                 )
 
             def _dsa_payload():
@@ -981,11 +1006,22 @@ class DecodePreallocQueue:
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, page_size)
+            metadata_kwargs = {}
+            if device_kv_page_indices is not None and not _is_fake_transfer(
+                decode_req.req, self.scheduler.server_args
+            ):
+                if self.transfer_backend != TransferBackend.MOONCAKE:
+                    raise NotImplementedError(
+                        "DeepSeek V4 HiSparse PD direct-to-host currently "
+                        "requires the Mooncake transfer backend."
+                    )
+                metadata_kwargs["device_kv_indices"] = device_kv_page_indices
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=prefix_len,
+                **metadata_kwargs,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1263,13 +1299,12 @@ class DecodePreallocQueue:
                 last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
                 extend_num_tokens=fill_len,
             )
-            # Allocate host indices for the RDMA transfer target.
             host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                 coordinator.req_to_host_pool,
                 coordinator.req_to_host_pool_allocated_len,
                 req.req_pool_idx,
                 0,
-                fill_len,
+                coordinator._host_token_len(fill_len),
             )
         elif self.token_to_kv_pool_allocator.page_size == 1:
             kv_loc = self.token_to_kv_pool_allocator.alloc(delta_len)
