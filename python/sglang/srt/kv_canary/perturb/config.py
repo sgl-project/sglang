@@ -10,7 +10,6 @@ from sglang.srt.kv_canary.buffer_group import PoolKind
 class TargetGroupKind(IntEnum):
     FULL = PoolKind.FULL.value
     SWA = PoolKind.SWA.value
-    ANY = 2
 
     def __str__(self) -> str:
         return self.name.lower()
@@ -31,8 +30,7 @@ class PerturbConfig:
             cached but currently-unused (orphan) KV slot. Detection routes through sweep verify
             (per-forward never looks at this slot). 0 = disabled.
         target_group_kind: which CanaryBufferGroup to target with real_kv_used / real_kv_unused
-            perturb. FULL / SWA exact-match the PoolKind name; ANY picks at random among
-            groups with non-empty real_kv_sources.
+            perturb. FULL / SWA exact-match the PoolKind name.
         warmup_steps: number of initial forward steps to gate off all perturb hooks. Prevents
             perturb from firing during sglang warmup, where a garbage write can trip a CUDA error
             before the canary's deferred D2H violation pump has a chance to log the canary_kind
@@ -59,11 +57,17 @@ class PerturbConfig:
 
 
 def _parse_target_group_kind(raw: str | None) -> TargetGroupKind:
-    value = (raw or "any").strip().lower()
+    if raw is None or not raw.strip():
+        raise ValueError(
+            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP must be explicitly set to "
+            "'full' or 'swa'"
+        )
+
+    value = raw.strip().lower()
     try:
         return TargetGroupKind[value.upper()]
     except KeyError:
         raise ValueError(
-            f"SGLANG_KV_CANARY_PERTURB_TARGET_GROUP must be one of 'full' / 'swa' / 'any', "
-            f"got {raw!r}"
+            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP must be one of 'full' / "
+            f"'swa', got {raw!r}"
         ) from None

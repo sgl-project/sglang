@@ -748,10 +748,9 @@ class Envs:
     # --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
     # Which CanaryBufferGroup the real_kv_used / real_kv_unused_cache perturb
-    # targets: "full" / "swa" exact-match the PoolKind name, "any" picks at
-    # random among groups with non-empty real_kv_sources. Used by per-group
+    # targets: "full" / "swa" exact-match the PoolKind name. Used by per-group
     # e2e tests to drive detection deterministically.
-    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr("any")
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
