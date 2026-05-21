@@ -22,17 +22,12 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
-from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.multimodal.evs import EVSEmbeddingResult
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
 from sglang.utils import logger
-
-if _VLM_PROFILE:
-    import time as _time
 
 _is_npu = is_npu()
 
@@ -565,18 +560,7 @@ def _get_chunked_embedding_by_item(
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
         _move_items_to_device(miss_item_list, device)
-        if _VLM_PROFILE:
-            torch.cuda.synchronize()
-            _vit_t0 = _time.monotonic()
         all_miss_embedding = data_embedding_func(miss_item_list)
-        if _VLM_PROFILE:
-            torch.cuda.synchronize()
-            _vlm_log(
-                "vit_batch",
-                n_miss=len(miss_item_list),
-                n_cache_hits=len(cached_embeddings),
-                duration=_time.monotonic() - _vit_t0,
-            )
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
         )
@@ -1065,9 +1049,6 @@ def general_mm_embed_routine(
                     use_deepstack=use_deepstack,
                 )
             else:
-                if _VLM_PROFILE:
-                    torch.cuda.synchronize()
-                    _embed_t0 = _time.monotonic()
                 input_embeds, other_info = embed_mm_inputs(
                     mm_inputs_list=mm_inputs_list,
                     extend_prefix_lens=extend_prefix_lens,
@@ -1079,14 +1060,6 @@ def general_mm_embed_routine(
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
                 )
-                if _VLM_PROFILE:
-                    torch.cuda.synchronize()
-                    _vlm_log(
-                        "embed_mm",
-                        n_mm_reqs=len(mm_inputs_list),
-                        total_seq_lens=sum(extend_seq_lens),
-                        duration=_time.monotonic() - _embed_t0,
-                    )
 
             # add for qwen3_vl deepstack
             if use_deepstack:
@@ -1130,23 +1103,12 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    _has_mm = forward_batch.mm_input_embeds is not None
-    if _VLM_PROFILE and _has_mm:
-        torch.cuda.synchronize()
-        _llm_t0 = _time.monotonic()
     hidden_states = language_model(
         input_ids=None,
         forward_batch=forward_batch,
         input_embeds=input_embeds,
         **kwargs,
     )
-    if _VLM_PROFILE and _has_mm:
-        torch.cuda.synchronize()
-        _vlm_log(
-            "llm_forward",
-            batch_size=forward_batch.batch_size,
-            duration=_time.monotonic() - _llm_t0,
-        )
     return hidden_states
 
 

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time as _time
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -26,8 +25,6 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
-from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
-from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.utils import (
     broadcast_pyobj,
     point_to_point_pyobj,
@@ -74,8 +71,6 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
                 return []
 
-        if _VLM_PROFILE:
-            _pull_t0 = _time.monotonic()
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
@@ -86,13 +81,6 @@ class SchedulerRequestReceiver:
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
         self._finalize_shm_features(recv_reqs)
-
-        if _VLM_PROFILE and recv_reqs:
-            _vlm_log(
-                "recv_requests",
-                n_reqs=len(recv_reqs),
-                pull_dur=_time.monotonic() - _pull_t0,
-            )
 
         return recv_reqs
 
@@ -240,16 +228,8 @@ class SchedulerRequestReceiver:
                 and has_shm_features(recv_reqs)
             ):
                 barrier(group=self.tp_cpu_group)
-            if _VLM_PROFILE:
-                _unwrap_t0 = _time.monotonic()
             for req in recv_reqs:
                 unwrap_shm_features(req)
-            if _VLM_PROFILE:
-                _vlm_log(
-                    "unwrap_shm",
-                    n_reqs=len(recv_reqs),
-                    duration=_time.monotonic() - _unwrap_t0,
-                )
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

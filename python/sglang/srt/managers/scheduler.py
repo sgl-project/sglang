@@ -25,8 +25,6 @@ from contextlib import contextmanager, nullcontext
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
-from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
-from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.utils.common import suppress_noisy_warnings
 
 suppress_noisy_warnings()
@@ -1507,8 +1505,6 @@ class Scheduler(
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
-            if _VLM_PROFILE and recv_reqs:
-                _vlm_log("scheduler_recv", n_reqs=len(recv_reqs))
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1733,17 +1729,10 @@ class Scheduler(
         return image_inputs
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
-        if _VLM_PROFILE:
-            import time as _t
-
-            _t0 = _t.monotonic()
         if self.server_args.enable_broadcast_mm_inputs_process:
-            result = self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            result = MultimodalInputs.from_processor_output(mm_inputs_dict)
-        if _VLM_PROFILE:
-            _vlm_log("ipc_reconstruct", duration=_t.monotonic() - _t0)
-        return result
+            return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
