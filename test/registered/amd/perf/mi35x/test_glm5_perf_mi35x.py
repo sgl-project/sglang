@@ -1,6 +1,6 @@
 """MI35x Nightly performance benchmark for GLM-5.
 
-Tests GLM-5 with NSA attention backend using bench_one_batch on 8 GPUs.
+Tests GLM-5 with DSA attention backend using bench_one_batch on 8 GPUs.
 
 Registry: nightly-perf-8-gpu-mi35x-glm5 suite
 """
@@ -54,7 +54,7 @@ PROFILE_DIR = "performance_profiles_glm5_mi35x"
 class TestGLM5PerfMI35x(unittest.TestCase):
     """Nightly performance benchmark for GLM-5 on MI35x.
 
-    Tests GLM-5 with NSA attention backend on TP=8.
+    Tests GLM-5 with DSA attention backend on TP=8.
     """
 
     @classmethod
@@ -75,9 +75,9 @@ class TestGLM5PerfMI35x(unittest.TestCase):
                 "glm47",
                 "--tp",
                 "8",
-                "--nsa-prefill-backend",
+                "--dsa-prefill-backend",
                 "tilelang",
-                "--nsa-decode-backend",
+                "--dsa-decode-backend",
                 "tilelang",
                 "--kv-cache-dtype",
                 "fp8_e4m3",
