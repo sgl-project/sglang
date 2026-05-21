@@ -24,6 +24,7 @@ class KVCacheBuildResult:
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.model_config import ModelImpl
+from sglang.srt.distributed.parallel_state import get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -221,6 +222,9 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
     )
+
+    if get_dcp_world_size() > 1:
+        params.page_size = params.page_size * get_dcp_world_size()
 
     tree_cache = create_tree_cache(
         TreeCacheBuildContext(

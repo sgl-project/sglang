@@ -35,9 +35,12 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
+    use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    get_dcp_group,
+    get_dcp_world_size,
     graph_capture,
     set_pdmux_status,
 )
@@ -795,6 +798,18 @@ class CudaGraphRunner:
         )
         logger.info(log_message)
 
+    def _prealloc_symmetric_memory_pool(self):
+        if get_dcp_world_size() < 2:
+            return
+        with torch.get_device_module(self.device).stream(self.stream):
+            logger.info(f"Pre-allocating symmetric memory pool for dcp")
+            with use_symmetric_memory(get_dcp_group()):
+                [
+                    torch.empty(size, dtype=torch.uint8, device=self.device)
+                    for j in range(8)
+                    for size in [3 * 512 * 1024, 20 * 1024 * 1024]
+                ]
+
     def capture(self) -> None:
         profile_context = empty_context()
         if self.enable_profile_cuda_graph:
@@ -845,6 +860,7 @@ class CudaGraphRunner:
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
+                    self._prealloc_symmetric_memory_pool()
                     _capture_one_stream()
             else:
                 set_pdmux_status(False)

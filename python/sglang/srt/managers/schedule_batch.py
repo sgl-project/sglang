@@ -2185,7 +2185,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def new_tokens_required_next_decode(
         self, selected_indices: Optional[List[int]] = None
     ):
-        page_size = self.token_to_kv_pool_allocator.page_size
+        page_size = self.tree_cache.page_size
         requests = (
             self.reqs
             if selected_indices is None

@@ -81,7 +81,9 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.distributed.parallel_state import (
+    monkey_patch_vllm_parallel_state,
+)
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
@@ -126,6 +128,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils.dcp_utils import prepare_decode_context_parallel_metadata
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -3056,6 +3059,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Launch model forward
         if not skip_attn_backend_init:
+            # prepare kv cache buffer for dcp to gather kv cache
+            forward_batch.attn_dcp_metadata = prepare_decode_context_parallel_metadata(
+                forward_batch.seq_lens,
+                forward_batch.extend_prefix_lens,
+                forward_batch.extend_prefix_lens_cpu,
+                forward_batch.extend_seq_lens,
+                forward_batch.req_pool_indices,
+                forward_batch.req_to_token_pool.req_to_token,
+                forward_batch.seq_lens_sum,
+                forward_batch.token_to_kv_pool.get_key_buffer(0).shape,
+                self.kv_cache_dtype,
+                self.device,
+            )
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
