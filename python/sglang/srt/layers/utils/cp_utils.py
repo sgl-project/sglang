@@ -51,16 +51,14 @@ def is_prefill_cp_in_seq_split():
 
 
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
-    # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
-    # the seq data needs to be divided and recombined at twice the size of cp_size.
+    # CP metadata (zigzag split) only supports batch=1 for now.
     cur_cp_seq_len = seq_len // (cp_size * 2)
-    # print("DEBUG: can_cp_split", cur_cp_seq_len, cp_size, forward_batch.forward_mode.is_context_parallel_extend(), is_prefill_context_parallel_enabled(), flush=True)
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_prefill_context_parallel_enabled()
+        and forward_batch.seq_lens_cpu.shape[0] == 1
     ):
         return True
     else:
@@ -68,17 +66,17 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
@@ -90,18 +88,18 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
@@ -181,12 +179,15 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
         input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
 
     # Create output tensor with proper shape for all dimensions
-    input_tensor_full = torch.empty(
-        max_len * cp_size,
-        *input_tensor.shape[1:],
-        device=input_tensor.device,
-        dtype=input_tensor.dtype,
-    )
+    with use_symmetric_memory(
+        get_attention_cp_group(), disabled=not is_allocation_symmetric()
+    ):
+        input_tensor_full = torch.empty(
+            max_len * cp_size,
+            *input_tensor.shape[1:],
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
 
     get_attention_cp_group().cp_all_gather_into_tensor_async(
         input_tensor_full, input_tensor, stream
@@ -237,11 +238,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -394,11 +395,11 @@ def prepare_context_parallel_metadata(
     cp_size,
     seqs_len,
 ):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         return ContextParallelMetadata()
 
     """prepare_input_dp_with_cp_dsa-zigzag index
@@ -504,16 +505,16 @@ def prepare_context_parallel_metadata(
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
     # Prefix offset is critical when radix cache hits (prefix_len > 0).
-    # For non-NSA CP (e.g. qwen3-moe), consumers use these values directly as
+    # For non-DSA CP (e.g. qwen3-moe), consumers use these values directly as
     # FlashAttention cache_seqlens, so the prefix must be baked in here.
-    # For NSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
+    # For DSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
     # from (seq_lens_cpu - extend_seq_lens_cpu); baking prefix_len in here
     # would silently drop it whenever the scheduler packs multiple requests
     # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back
     # to 0), corrupting the indexer's ke_offset on prefix-cache hits.
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
-    if is_nsa_enable_prefill_cp():
+    if is_dsa_enable_prefill_cp():
         kv_len_prev = prefix_sum_list[cp_rank]
         kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     else:

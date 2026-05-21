@@ -1560,7 +1560,6 @@ class ShmPointerMMData:
         self.shm_name = state["shm_name"]
         self.shape = state["shape"]
         self.dtype = state["dtype"]
-        self.shm = None
         self._shm_handle = shared_memory.SharedMemory(name=self.shm_name)
         # Zero-copy view into shared memory (no clone, no unlink)
         self.tensor = torch.frombuffer(self._shm_handle.buf, dtype=self.dtype).reshape(
@@ -1599,6 +1598,19 @@ def _get_is_default_transport():
     return _is_default_tensor_transport
 
 
+def _wrap_tensor_or_list(value):
+    """Wrap a CPU tensor (or list of CPU tensors) in ShmPointerMMData."""
+    if isinstance(value, torch.Tensor) and value.is_cpu:
+        return ShmPointerMMData(value)
+    elif isinstance(value, (list, tuple)):
+        wrapped = [
+            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            for t in value
+        ]
+        return type(value)(wrapped) if isinstance(value, tuple) else wrapped
+    return value
+
+
 def wrap_shm_features(obj):
     """
     Scan the object for multimodal tensors and wrap them in SHM pointers.
@@ -1608,13 +1620,25 @@ def wrap_shm_features(obj):
 
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _wrap_tensor_or_list(item.feature)
             if (
-                hasattr(item, "feature")
-                and isinstance(item.feature, torch.Tensor)
-                and item.feature.is_cpu
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
             ):
-                item.feature = ShmPointerMMData(item.feature)
+                item.precomputed_embeddings = _wrap_tensor_or_list(
+                    item.precomputed_embeddings
+                )
     return obj
+
+
+def _feature_has_shm(feat) -> bool:
+    """Check whether a single feature (tensor, ShmPointer, or list) contains ShmPointerMMData."""
+    if isinstance(feat, ShmPointerMMData):
+        return True
+    if isinstance(feat, (list, tuple)):
+        return any(isinstance(t, ShmPointerMMData) for t in feat)
+    return False
 
 
 def has_shm_features(recv_reqs):
@@ -1625,9 +1649,23 @@ def has_shm_features(recv_reqs):
                 return True
         elif hasattr(req, "mm_inputs") and req.mm_inputs:
             for item in req.mm_inputs.mm_items:
-                if isinstance(item.feature, ShmPointerMMData):
+                if _feature_has_shm(item.feature):
+                    return True
+                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
                     return True
     return False
+
+
+def _unwrap_tensor_or_list(value):
+    """Restore ShmPointerMMData wrappers back into standard torch.Tensors."""
+    if isinstance(value, ShmPointerMMData):
+        return value.materialize()
+    elif isinstance(value, (list, tuple)):
+        unwrapped = [
+            t.materialize() if isinstance(t, ShmPointerMMData) else t for t in value
+        ]
+        return type(value)(unwrapped) if isinstance(value, tuple) else unwrapped
+    return value
 
 
 def unwrap_shm_features(obj):
@@ -1644,8 +1682,14 @@ def unwrap_shm_features(obj):
         return obj
     # Handle single requests
     if hasattr(obj, "mm_inputs") and obj.mm_inputs:
-        mm_items = obj.mm_inputs.mm_items
-        for item in mm_items:
-            if isinstance(item.feature, ShmPointerMMData):
-                item.feature = item.feature.materialize()
+        for item in obj.mm_inputs.mm_items:
+            if hasattr(item, "feature") and item.feature is not None:
+                item.feature = _unwrap_tensor_or_list(item.feature)
+            if (
+                hasattr(item, "precomputed_embeddings")
+                and item.precomputed_embeddings is not None
+            ):
+                item.precomputed_embeddings = _unwrap_tensor_or_list(
+                    item.precomputed_embeddings
+                )
     return obj

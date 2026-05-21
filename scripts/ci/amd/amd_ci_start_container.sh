@@ -6,8 +6,8 @@ SGLANG_VERSION="v0.5.5"   # Default version, will be overridden if git tags are 
 
 # Fetch tags from origin to ensure we have the latest
 if git fetch --tags origin; then
-  # Get the latest version tag sorted by version number (e.g., v0.5.7)
-  VERSION_FROM_TAG=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1)
+  # Use the shared helper so stable/post releases sort above rc tags.
+  VERSION_FROM_TAG=$(python3 python/tools/get_version_tag.py --tag-only || true)
   if [ -n "$VERSION_FROM_TAG" ]; then
     SGLANG_VERSION="$VERSION_FROM_TAG"
     echo "Using SGLang version from git tags: $SGLANG_VERSION"
@@ -23,7 +23,7 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="172.29.8.23:5000"
+LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -154,18 +154,15 @@ find_latest_image() {
     fi
   done
 
-  # Then try the local registry.
-  for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
-    echo "Checking for image: ${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >&2
-    if docker manifest inspect --insecure "${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
-      echo "Found available image: ${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}" >&2
-      echo "${LOCAL_DOCKER_REGISTRY}/rocm/sgl-dev:${image_tag}"
-      return 0
-    fi
-  done
-
-  # Finally, try the public registry.
+  # If not found locally, fall back to pulling from public registry.
+  # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
+  # `docker manifest inspect --insecure` because that command runs in the
+  # runner pod's network namespace, which on every observed AMD scale set
+  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
+  # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
+  # The actual local-registry pull still happens in the call site below via
+  # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
+  # docker daemon on the host and inherits its insecure-registries config.
   for days_back in {0..6}; do
     image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
@@ -260,14 +257,17 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  echo "Pulling Docker image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    # Local registry is on-LAN; no need to retry.
-    docker pull "${IMAGE}"
-    docker tag "${IMAGE}" "${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
-    IMAGE="${IMAGE#${LOCAL_DOCKER_REGISTRY}/}"
+  # Try the local docker registry first (avoids Docker Hub rate limits and is
+  # faster on the LAN); if that fails for any reason, fall back to the
+  # public registry with exponential-backoff retries. Capture stderr so the
+  # real failure reason (TLS handshake, 404, connection refused, etc.) is
+  # visible in the job log instead of being silently swallowed.
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
-    # Public registry pulls can hit rate limits; retry with backoff.
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     retry_with_backoff 6 docker pull "${IMAGE}"
   fi
 fi

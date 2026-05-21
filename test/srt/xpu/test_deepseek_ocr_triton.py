@@ -6,9 +6,9 @@ import os
 import unittest
 from pathlib import Path
 
-import test_deepseek_ocr as deepseek_ocr
-from transformers import AutoTokenizer
+from test_deepseek_ocr import TestDeepSeekOCR
 
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -16,14 +16,13 @@ from sglang.test.test_utils import (
 )
 
 
-class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
+# TODO: Temporarily disable this test and re-enable it after Triton-XPU is upgraded.
+@unittest.skip("Temporarily disabled until Triton-XPU upgrade")
+class TestDeepSeekOCRTriton(TestDeepSeekOCR):
     @classmethod
     def setUpClass(cls):
-        cls._cleanup_xpu_memory()
         cls.model = "deepseek-ai/DeepSeek-OCR"
-        cls.tokenizer = AutoTokenizer.from_pretrained(
-            cls.model, use_fast=False, trust_remote_code=True
-        )
+        cls.tokenizer = get_tokenizer(cls.model)
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.image_path = str(
             (Path(__file__).resolve().parents[3] / "examples/assets/example_image.png")
@@ -46,6 +45,9 @@ class TestDeepSeekOCRTriton(deepseek_ocr.TestDeepSeekOCR):
             ],
         )
 
+
+# Prevent pytest from collecting the imported base test class here.
+del TestDeepSeekOCR
 
 if __name__ == "__main__":
     unittest.main()
