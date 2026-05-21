@@ -13,7 +13,7 @@ class _BaselineBase(CanaryE2EBase):
     violations and every request must come back 200."""
 
     kv_canary_mode = "log"
-    perturb_env = {}
+    extra_env = {}
 
     def test_no_violation(self) -> None:
         results = self.send_parallel_requests(n=4, max_new_tokens=200)
@@ -23,11 +23,11 @@ class _BaselineBase(CanaryE2EBase):
 
 
 class TestBaselineMha(_BaselineBase, unittest.TestCase):
-    mode = "mha"
+    model_mode = "mha"
 
 
 class TestBaselineSwa(_BaselineBase, unittest.TestCase):
-    mode = "swa"
+    model_mode = "swa"
 
 
 if __name__ == "__main__":

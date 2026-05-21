@@ -28,7 +28,7 @@ class CanaryE2EBase(CustomTestCase):
     """Deprecated: superseded by ``sglang.test.kv_canary.e2e_base.CanaryE2EBase``.
 
     New canary e2e tests must use the e2e_base version, which drives server launch
-    from a ``mode = "mha" / "swa"`` class attribute plus declarative ``perturb_env``,
+    from a ``model_mode = "mha" / "swa"`` class attribute plus declarative ``extra_env``,
     ``sweep_interval`` and ``kv_canary_mode`` knobs. This older base is kept only as
     long as legacy callers (currently ``test_self_e2e_swa_gemma3.py``) still depend on
     it; once those migrate, delete this class.

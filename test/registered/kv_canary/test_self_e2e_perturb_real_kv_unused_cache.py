@@ -32,7 +32,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.perturb_env = {
+        cls.extra_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
@@ -56,21 +56,21 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
 class TestPerturbRealKvUnusedCacheMhaFull(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
-    mode = "mha"
+    model_mode = "mha"
     target_group = "full"
 
 
 class TestPerturbRealKvUnusedCacheSwaFull(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
-    mode = "swa"
+    model_mode = "swa"
     target_group = "full"
 
 
 class TestPerturbRealKvUnusedCacheSwaSwa(
     _PerturbRealKvUnusedCacheBase, unittest.TestCase
 ):
-    mode = "swa"
+    model_mode = "swa"
     target_group = "swa"
 
 

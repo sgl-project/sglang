@@ -19,7 +19,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
     """
 
     kv_canary_mode = "log"
-    perturb_env = {
+    extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
@@ -41,11 +41,11 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
 
 class TestPerturbReqToTokenMha(_PerturbReqToTokenBase, unittest.TestCase):
-    mode = "mha"
+    model_mode = "mha"
 
 
 class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase, unittest.TestCase):
-    mode = "swa"
+    model_mode = "swa"
 
 
 if __name__ == "__main__":

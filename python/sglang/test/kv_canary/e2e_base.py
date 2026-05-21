@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _ModeConfig:
     """Mode-specific server launch config so per-mode test classes only set
-    `mode = "mha"` / `"swa"`, not individual flags. All flags collected here.
+    `model_mode = "mha"` / `"swa"`, not individual flags. All flags collected here.
 
     Fields:
         model_path: HF model id used by popen_launch_server.
@@ -66,9 +66,6 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
 }
 
 
-_CONTEXT_LENGTH = 8192
-
-
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
 # fixtures (gemma-3-1b sliding_window = 512); short prompts would never exercise
@@ -78,20 +75,20 @@ _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
 class CanaryE2EBase(CustomTestCase):
-    """Base for canary e2e tests. Subclasses set ``mode`` and optionally
-    ``kv_canary_mode``, ``perturb_env``, ``extra_server_args``, ``use_unique_prompts``.
+    """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
+    ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
 
     ``setUpClass`` launches the server with mode-specific args + canary env;
-    ``tearDownClass`` kills the server and cleans env vars set in setUpClass.
+    ``tearDownClass`` kills the server.
 
     Violation log assertions parse the stable one-line summary emitted by
     ViolationReporter (see python/sglang/srt/kv_canary/runner/violation.py):
         ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
     """
 
-    mode: ClassVar[Literal["mha", "swa"]]
-    kv_canary_mode: ClassVar[Literal["log", "raise"]] = "log"
-    perturb_env: ClassVar[dict[str, str]] = {}
+    model_mode: ClassVar[Literal["mha", "swa"]]
+    kv_canary_mode: ClassVar[Literal["off", "log", "raise"]]
+    extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
 
@@ -99,16 +96,13 @@ class CanaryE2EBase(CustomTestCase):
     base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
     _stdout_buf: ClassVar[Optional[io.StringIO]] = None
     _stderr_buf: ClassVar[Optional[io.StringIO]] = None
-    _env_keys_set: ClassVar[list[str]] = []
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls._cfg = _MODE_CONFIGS[cls.mode]
-        cls._env_keys_set = []
-        for k, v in cls.perturb_env.items():
-            os.environ[k] = v
-            cls._env_keys_set.append(k)
+        cls._cfg = _MODE_CONFIGS[cls.model_mode]
+        server_env = os.environ.copy()
+        server_env.update(cls.extra_env)
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
@@ -117,7 +111,7 @@ class CanaryE2EBase(CustomTestCase):
             "--kv-canary",
             cls.kv_canary_mode,
             "--context-length",
-            str(_CONTEXT_LENGTH),
+            "8192",
             *cls.extra_server_args,
         ]
         if cls._cfg.json_model_override_args is not None:
@@ -132,7 +126,7 @@ class CanaryE2EBase(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=server_args,
-            env=os.environ.copy(),
+            env=server_env,
             return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
         )
 
@@ -140,8 +134,6 @@ class CanaryE2EBase(CustomTestCase):
     def tearDownClass(cls) -> None:
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
-        for k in cls._env_keys_set:
-            os.environ.pop(k, None)
 
     def make_prompts(self, n: int) -> list[str]:
         if self.use_unique_prompts:

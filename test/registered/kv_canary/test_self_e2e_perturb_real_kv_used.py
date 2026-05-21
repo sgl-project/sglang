@@ -14,7 +14,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
     With sweep OFF, the only way to surface this corruption is the per-forward
     HEAD/TAIL real_kv_hash check on the targeted group (FULL or SWA). Subclasses set
-    ``mode`` and ``target_group``; the FULL/SWA suffix in the violation launch_tag must
+    ``model_mode`` and ``target_group``; the FULL/SWA suffix in the violation launch_tag must
     match ``target_group``.
     """
 
@@ -25,7 +25,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.perturb_env = {
+        cls.extra_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
@@ -48,17 +48,17 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
 
 class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase, unittest.TestCase):
-    mode = "mha"
+    model_mode = "mha"
     target_group = "full"
 
 
 class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase, unittest.TestCase):
-    mode = "swa"
+    model_mode = "swa"
     target_group = "full"
 
 
 class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase, unittest.TestCase):
-    mode = "swa"
+    model_mode = "swa"
     target_group = "swa"
 
 

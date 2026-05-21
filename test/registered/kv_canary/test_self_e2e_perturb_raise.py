@@ -18,10 +18,10 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
     with a dropped connection, so the /generate call is wrapped in a best-effort try.
     """
 
-    mode = "mha"
+    model_mode = "mha"
     kv_canary_mode = "raise"
     extra_server_args = ("--kv-canary-real-data", "partial")
-    perturb_env = {
+    extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
