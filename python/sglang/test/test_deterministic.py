@@ -48,6 +48,7 @@ class BenchArgs:
     test_mode: str = "single"
     n_trials: int = 50
     n_start: int = 1
+    batch_sizes: Optional[List[int]] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -86,6 +87,13 @@ class BenchArgs:
             "--profile-steps", type=int, default=BenchArgs.profile_steps
         )
         parser.add_argument("--profile-by-stage", action="store_true")
+        parser.add_argument(
+            "--batch-sizes",
+            type=int,
+            nargs="+",
+            default=None,
+            help="Explicit batch sizes to test in p_vs_d mode (overrides --n-trials sweep)",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -718,9 +726,10 @@ def test_deterministic(args):
 
     elif args.test_mode == "p_vs_d":
         # TODO also extract other modes to functions
+        batch_sizes = args.batch_sizes or list(range(1, args.n_trials + 1))
         ans = []
-        for i in range(1, args.n_trials + 1):
-            ans += _test_mode_p_vs_d(args, batch_size=i)
+        for bs in batch_sizes:
+            ans += _test_mode_p_vs_d(args, batch_size=bs)
         return ans
 
     else:
