@@ -2895,7 +2895,7 @@ class Scheduler(
                     # used (rather than a sentinel tensor) so any accidental
                     # value read between iters raises AttributeError fast
                     # instead of silently picking up garbage. filter_batch and
-                    # merge_batch propagate None — see their None guards.
+                    # merge_batch propagate None - see their None guards.
                     batch.seq_lens = None
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
