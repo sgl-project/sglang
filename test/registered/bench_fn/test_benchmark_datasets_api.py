@@ -134,6 +134,8 @@ def make_args(**overrides):
         "gsp_ordered": False,
         "seed": 1,
         "mooncake_workload": "conversation",
+        "speed_bench_category": None,
+        "speed_bench_output_len": 512,
     }
     args.update(overrides)
     return SimpleNamespace(**args)
@@ -210,6 +212,39 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             },
         ]
         path = self.tmpdir_path / "openai.jsonl"
+        with open(path, "w") as f:
+            for row in rows:
+                f.write(json.dumps(row) + "\n")
+        return str(path)
+
+    def _write_speed_bench_jsonl(self):
+        rows = [
+            {
+                "question_id": "sb_001",
+                "category": "low_entropy",
+                "turns": ["Complete this Python function: def add(a, b):"],
+            },
+            {
+                "question_id": "sb_002",
+                "category": "mixed",
+                "turns": [
+                    "Explain the concept of attention mechanisms in transformers."
+                ],
+            },
+            {
+                "question_id": "sb_003",
+                "category": "high_entropy",
+                "turns": ["Write a short story about a robot discovering music."],
+            },
+            {
+                "question_id": "sb_004",
+                "category": "low_entropy",
+                "turns": [
+                    "Sort the following list in ascending order: [5, 2, 8, 1, 9]"
+                ],
+            },
+        ]
+        path = self.tmpdir_path / "speed_bench.jsonl"
         with open(path, "w") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
@@ -355,6 +390,78 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
+    def test_speed_bench_sampler(self):
+        dataset_path = self._write_speed_bench_jsonl()
+        args = make_args(
+            dataset_name="speed-bench",
+            dataset_path=dataset_path,
+            num_prompts=3,
+        )
+        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+
+        dataset = SpeedBenchDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        self.assertTrue(all(row.output_len == 512 for row in rows))
+        self.assertTrue(all(row.prompt_len > 0 for row in rows))
+
+    def test_speed_bench_category_filter(self):
+        dataset_path = self._write_speed_bench_jsonl()
+        args = make_args(
+            dataset_name="speed-bench",
+            dataset_path=dataset_path,
+            num_prompts=2,
+            speed_bench_category="low_entropy",
+        )
+        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+
+        dataset = SpeedBenchDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        # Only 2 low_entropy rows in the fixture, num_prompts=2
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+
+    def test_speed_bench_output_len_override(self):
+        dataset_path = self._write_speed_bench_jsonl()
+        args = make_args(
+            dataset_name="speed-bench",
+            dataset_path=dataset_path,
+            num_prompts=2,
+            speed_bench_output_len=128,
+        )
+        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+
+        dataset = SpeedBenchDataset.from_args(args)
+        rows = dataset.load(self.tokenizer)
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row.output_len == 128 for row in rows))
+
+    def test_speed_bench_empty_category_raises(self):
+        dataset_path = self._write_speed_bench_jsonl()
+        args = make_args(
+            dataset_name="speed-bench",
+            dataset_path=dataset_path,
+            num_prompts=1,
+            speed_bench_category="nonexistent_category",
+        )
+        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+
+        dataset = SpeedBenchDataset.from_args(args)
+        with self.assertRaises(ValueError):
+            dataset.load(self.tokenizer)
+
+    def test_speed_bench_no_path_raises(self):
+        args = make_args(
+            dataset_name="speed-bench",
+            dataset_path="",
+            num_prompts=1,
+        )
+        from sglang.benchmark.datasets.speed_bench import SpeedBenchDataset
+
+        with self.assertRaises(ValueError):
+            SpeedBenchDataset.from_args(args)
+
     def test_dataset_mapping_and_dispatch(self):
         expected = {
             "sharegpt",
@@ -366,6 +473,7 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
             "mmmu",
             "image",
             "mooncake",
+            "speed-bench",
         }
         self.assertTrue(expected.issubset(set(DATASET_MAPPING.keys())))
 
@@ -427,6 +535,18 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         gsp_rows = get_dataset(gsp_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(gsp_rows), 4)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in gsp_rows))
+
+        speed_bench_path = self._write_speed_bench_jsonl()
+        speed_bench_args = make_args(
+            dataset_name="speed-bench",
+            dataset_path=speed_bench_path,
+            num_prompts=2,
+        )
+        speed_bench_rows = get_dataset(
+            speed_bench_args, self.tokenizer, model_id="dummy-model"
+        )
+        self.assertEqual(len(speed_bench_rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in speed_bench_rows))
 
     def test_get_dataset_unknown_dataset(self):
         args = make_args(dataset_name="not-a-dataset")
