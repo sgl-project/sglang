@@ -25,6 +25,7 @@ import logging
 import os
 import random
 import socket
+import sys
 import tempfile
 import uuid
 from functools import cached_property
@@ -893,11 +894,10 @@ class ServerArgs:
         """
 
         if self.uds is not None:
-            import sys as _sys
-            if _sys.platform == "win32":
+            if sys.platform == "win32":
                 raise ValueError(
                     "--uds is only supported on Linux and macOS; "
-                    f"current platform: {_sys.platform}"
+                    f"current platform: {sys.platform}"
                 )
             # Compare against dataclass defaults to detect "user explicitly set
             # --host or --port alongside --uds".
