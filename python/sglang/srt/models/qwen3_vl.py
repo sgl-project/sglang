@@ -1250,7 +1250,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             import os
             import time
 
-            if os.environ.get("VIT_PROFILE", "") == "1":
+            _vit_profile_dir = os.environ.get("VIT_PROFILE_DIR", "")
+            if _vit_profile_dir:
+                import datetime
+
+                os.makedirs(_vit_profile_dir, exist_ok=True)
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                trace_path = os.path.join(_vit_profile_dir, f"vit_trace_{ts}.json")
                 with torch.profiler.profile(
                     activities=[
                         torch.profiler.ProfilerActivity.CPU,
@@ -1260,9 +1266,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 ) as prof:
                     result = self.visual(pixel_values, grid_thw=image_grid_thw)
                     torch.cuda.synchronize()
-                prof.export_chrome_trace("/tmp/vit_trace.json")
+                prof.export_chrome_trace(trace_path)
                 logger.info(
-                    f"[VIT] profile saved to /tmp/vit_trace.json, "
+                    f"[VIT] profile saved to {trace_path}, "
                     f"images={len(items)} tokens={pixel_values.shape[0]}"
                 )
                 return result
