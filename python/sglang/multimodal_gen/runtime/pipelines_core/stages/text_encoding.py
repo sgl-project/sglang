@@ -209,7 +209,9 @@ class TextEncodingStage(PipelineStage):
         prompt_seq_lens_list,
     ):
         prompt_embeds = [tensor[:prompt_count] for tensor in prompt_embeds_list]
-        negative_prompt_embeds = [tensor[prompt_count:] for tensor in prompt_embeds_list]
+        negative_prompt_embeds = [
+            tensor[prompt_count:] for tensor in prompt_embeds_list
+        ]
         prompt_masks = [tensor[:prompt_count] for tensor in prompt_masks_list]
         negative_masks = [tensor[prompt_count:] for tensor in prompt_masks_list]
         prompt_embeds_masks = [

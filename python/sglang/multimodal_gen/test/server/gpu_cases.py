@@ -388,7 +388,6 @@ if not current_platform.is_hip():
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
-                enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
             run_consistency_check=False,

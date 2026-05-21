@@ -111,9 +111,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.lora_path:
         extra_args += f" --lora-path {server_args.lora_path}"
 
-    if server_args.enable_warmup:
-        extra_args += " --warmup"
-
     # Strict ports: fail immediately if port is occupied instead of silently
     # picking another one (which causes the test client to connect to the wrong server).
     extra_args += " --strict-ports"
