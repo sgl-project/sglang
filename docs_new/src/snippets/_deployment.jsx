@@ -73,7 +73,7 @@
 //     import lives in an MDX file. So the per-model config is imported at
 //     MDX level and passed through here as the `config` prop.
 
-export const Deployment = ({ config }) => {
+export const Deployment = ({ config, benchmarks }) => {
   if (!config) {
     return <div style={{padding: 12, color: "#b91c1c"}}>Deployment: missing <code>config</code> prop</div>;
   }
@@ -105,43 +105,43 @@ export const Deployment = ({ config }) => {
   // 2. Style helper (dark-mode-aware)
   // ==========================================================================
   const makeStyles = (isDark) => ({
-    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "4px" },
+    container: { maxWidth: "900px", margin: "0 auto", display: "flex", flexDirection: "column", gap: "3px" },
     card: {
-      padding: "8px 12px",
+      padding: "5px 10px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
       borderRadius: "4px",
-      display: "flex", alignItems: "center", gap: "12px",
+      display: "flex", alignItems: "center", gap: "10px",
       background: isDark ? "#1f2937" : "#fff",
     },
     cardColumn: {
-      padding: "8px 12px",
+      padding: "5px 10px",
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
       borderRadius: "4px",
-      display: "flex", flexDirection: "column", gap: "6px",
+      display: "flex", flexDirection: "column", gap: "4px",
       background: isDark ? "#1f2937" : "#fff",
     },
-    title: { fontSize: "13px", fontWeight: "600", minWidth: "140px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
-    vendorRow: { display: "flex", alignItems: "center", gap: "8px" },
+    title: { fontSize: "12px", fontWeight: "600", minWidth: "108px", flexShrink: 0, color: isDark ? "#e5e7eb" : "inherit" },
+    vendorRow: { display: "flex", alignItems: "center", gap: "6px" },
     vendorLabel: {
-      fontSize: "11px", fontWeight: "600",
+      fontSize: "10px", fontWeight: "600",
       color: isDark ? "#9ca3af" : "#6b7280",
-      minWidth: "48px", textTransform: "uppercase", letterSpacing: "0.04em",
+      minWidth: "38px", textTransform: "uppercase", letterSpacing: "0.04em",
     },
     itemsGrid: (cols) => ({
       display: "grid", gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))`,
-      gap: "6px", flex: 1,
+      gap: "4px", flex: 1,
     }),
     labelBase: {
-      padding: "4px 10px",
+      padding: "2px 8px",
       border: `1px solid ${isDark ? "#9ca3af" : "#d1d5db"}`,
       borderRadius: "3px", cursor: "pointer",
       display: "inline-flex", flexDirection: "column",
       alignItems: "center", justifyContent: "center",
-      fontWeight: "500", fontSize: "13px",
+      fontWeight: "500", fontSize: "12px",
       transition: "all 0.2s", userSelect: "none",
-      minHeight: "32px", textAlign: "center",
+      minHeight: "26px", textAlign: "center",
       background: isDark ? "#374151" : "#fff",
       color: isDark ? "#e5e7eb" : "inherit",
     },
@@ -265,6 +265,83 @@ export const Deployment = ({ config }) => {
       border: "none", borderRadius: "4px", cursor: "pointer",
       fontSize: "13px", fontWeight: 500,
     },
+
+    // ---------- Benchmark card (rendered when the `benchmarks` prop is
+    // passed AND the current cell has a matching entry). Uses the same
+    // orange left-border family as the deploy panel so the two visually
+    // group together.
+    benchCard: {
+      padding: "8px 12px",
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      borderLeft: `3px solid ${isDark ? "#E85D4D" : "#D45D44"}`,
+      borderRadius: "4px",
+      background: isDark ? "#1f2937" : "#fff",
+      display: "flex", flexDirection: "column", gap: "8px",
+    },
+    benchHeader: {
+      display: "flex", alignItems: "baseline", justifyContent: "space-between",
+      gap: "12px",
+    },
+    benchTitle: {
+      fontSize: "13px", fontWeight: 600,
+      color: isDark ? "#e5e7eb" : "inherit",
+    },
+    benchVersion: {
+      fontSize: "11px",
+      color: isDark ? "#9ca3af" : "#6b7280",
+    },
+    benchGrid: {
+      display: "grid",
+      // Two equal columns when both blocks present, single column otherwise.
+      // Use auto-fit + minmax for graceful narrow-viewport collapse.
+      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+      gap: "12px",
+    },
+    benchBlock: {
+      border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
+      borderRadius: "4px",
+      padding: "8px 10px",
+      background: isDark ? "#111827" : "#fafafa",
+    },
+    benchBlockTitle: {
+      fontSize: "11px", fontWeight: 600, textTransform: "uppercase",
+      letterSpacing: "0.04em",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      marginBottom: "4px",
+    },
+    // Workload description (e.g. "ShareGPT, in/out=1024/1024, bs=1") that
+    // sits between the block title and the metric rows. Italic + slightly
+    // muted so it reads as context, not data.
+    benchWorkload: {
+      fontSize: "11px", fontStyle: "italic",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      marginBottom: "6px",
+      lineHeight: "1.3",
+    },
+    benchRow: {
+      display: "flex", justifyContent: "space-between",
+      fontSize: "12px", padding: "2px 0",
+    },
+    benchKey: { color: isDark ? "#9ca3af" : "#6b7280" },
+    benchVal: {
+      color: isDark ? "#e5e7eb" : "#111827",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+      fontWeight: 500,
+    },
+    benchAccuracyRow: {
+      fontSize: "12px",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      borderTop: `1px dashed ${isDark ? "#374151" : "#e5e7eb"}`,
+      paddingTop: "6px",
+    },
+    benchNotes: {
+      fontSize: "11px", fontStyle: "italic",
+      color: isDark ? "#9ca3af" : "#6b7280",
+    },
+    benchEmpty: {
+      fontSize: "12px", fontStyle: "italic",
+      color: isDark ? "#9ca3af" : "#6b7280",
+    },
   });
 
   // ==========================================================================
@@ -278,6 +355,31 @@ export const Deployment = ({ config }) => {
   const DIMENSIONS = ["hw", "variant", "quant", "strategy", "nodes"];
   const findCell = (cells, sel) =>
     cells.find((c) => DIMENSIONS.every((d) => c.match[d] === sel[d]));
+
+  // Mirror of findCell, but over the `benchmarks` array (per-cell results
+  // keyed by the same 5-dim match tuple). Returns the matching entry or
+  // null. The engine treats null and "no measured fields" the same way —
+  // both surface the empty-state card.
+  const findBenchmark = (list, sel) =>
+    (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
+
+  // True iff the entry has no numeric content worth rendering. Used to
+  // decide between rendering the metric blocks vs the empty-state line.
+  // An entry is "empty" if it has no sub-blocks OR every sub-block's
+  // fields are all null/undefined.
+  const benchmarkIsEmpty = (entry) => {
+    if (!entry) return true;
+    const blocks = ["latency", "throughput", "accuracy"];
+    for (const k of blocks) {
+      const block = entry[k];
+      if (block && typeof block === "object") {
+        for (const v of Object.values(block)) {
+          if (v !== null && v !== undefined) return false;
+        }
+      }
+    }
+    return true;
+  };
 
   // Grey-out predicate: a (dim, value) button is enabled iff there exists at
   // least one cell that matches every HIGHER-priority dimension in the current
@@ -380,7 +482,19 @@ export const Deployment = ({ config }) => {
     const cellEnv = cell.env || [];
     const flags = [...(cell.flags || [])];
     if (multinode) {
-      const i = flags.findIndex((f) => f.startsWith("--model-path"));
+      // Insert the multi-node trio after the LAST parallelism flag in the
+      // cell (--enable-dp-attention > --dp > --tp), falling back to right
+      // after --model-path. This matches the convention used by the
+      // legacy hand-coded generator on origin/main (which is what the
+      // live cookbook page renders today) — keeps cookbook commands
+      // byte-identical across the refactor.
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
+      let i = -1;
+      for (const anchor of PARALLELISM_ANCHORS) {
+        i = flags.findIndex((f) => f.split(/[\s=]/)[0] === anchor);
+        if (i !== -1) break;
+      }
+      if (i === -1) i = flags.findIndex((f) => f.startsWith("--model-path"));
       flags.splice(i + 1, 0,
         `--nnodes ${nnodes}`,
         `--node-rank {{NODE_RANK}}`,
@@ -428,6 +542,120 @@ export const Deployment = ({ config }) => {
       cmd = `${header}\n${cmd}`;
     }
     return cmd;
+  };
+
+  // Render the per-cell benchmark card. Inline function (not a sub-
+  // component) — capitalized React component names get rebound by
+  // Mintlify's _provideComponents, so we keep this as a lowercase-only
+  // JSX tree. Engine consumer renders <renderBenchmarkCall(...)>{}</>
+  // by inlining the return.
+  //
+  // Layout:
+  //   header   : "Benchmark"   "measured on sglang vX.Y.Z" (right-aligned)
+  //   grid     : latency block | throughput block (either collapses if absent)
+  //   accuracy : single row with present accuracy fields
+  //   notes    : optional italic line
+  //   empty    : when the entry has no measured numbers
+  //
+  // The version annotation lives at the header, NOT under accuracy, since
+  // every block in the entry is part of the same measurement run on the
+  // same sglang build.
+  const renderBenchmarkCard = (entry) => {
+    // Per-block label maps. Engine renders only the fields that have a
+    // non-null value, so partial measurements (e.g. TTFT but not TPOT)
+    // surface cleanly.
+    const LATENCY_LABELS = [
+      ["ttft_ms",     "TTFT",    "ms"],
+      ["tpot_ms",     "TPOT",    "ms"],
+      ["e2e_ms_p50",  "e2e p50", "ms"],
+    ];
+    const THROUGHPUT_LABELS = [
+      ["tokens_per_sec_per_gpu", "tokens/sec/GPU", ""],
+      ["p50_latency_ms",         "p50 latency",   "ms"],
+      ["max_concurrency",        "max concurrency", ""],
+    ];
+    const ACCURACY_LABELS = [
+      ["gsm8k_pct", "GSM8K", "%"],
+      ["mmlu_pct",  "MMLU",  "%"],
+    ];
+
+    const fmt = (val, unit) => {
+      if (val === null || val === undefined) return null;
+      return `${val}${unit ? " " + unit : ""}`;
+    };
+    const renderBlock = (title, block, labels) => {
+      if (!block) return null;
+      const rows = labels
+        .map(([key, label, unit]) => ({ label, value: fmt(block[key], unit) }))
+        .filter((r) => r.value !== null);
+      // Block renders if EITHER there's a workload description OR at least
+      // one measured metric. A workload-only block surfaces the "what was
+      // measured" intent before the numbers land — useful while filling in.
+      if (rows.length === 0 && !block.workload) return null;
+      return (
+        <div style={s.benchBlock}>
+          <div style={s.benchBlockTitle}>{title}</div>
+          {block.workload && (
+            <div style={s.benchWorkload}>{block.workload}</div>
+          )}
+          {rows.map((r) => (
+            <div key={r.label} style={s.benchRow}>
+              <span style={s.benchKey}>{r.label}</span>
+              <span style={s.benchVal}>{r.value}</span>
+            </div>
+          ))}
+        </div>
+      );
+    };
+
+    const isEmpty = benchmarkIsEmpty(entry);
+    const latencyBlock = !isEmpty && renderBlock("Latency",    entry.latency,    LATENCY_LABELS);
+    const throughputBlock = !isEmpty && renderBlock("Throughput", entry.throughput, THROUGHPUT_LABELS);
+
+    // Accuracy row: collapse the present fields into one line. If neither
+    // is present, the row is omitted.
+    const accuracyParts = !isEmpty && entry.accuracy
+      ? ACCURACY_LABELS
+          .map(([key, label, unit]) => {
+            const v = fmt(entry.accuracy[key], unit);
+            return v === null ? null : `${label} ${v}`;
+          })
+          .filter((s) => s !== null)
+      : [];
+
+    return (
+      <div style={s.benchCard}>
+        <div style={s.benchHeader}>
+          <div style={s.benchTitle}>Benchmark</div>
+          {!isEmpty && entry && entry.sglang_version && (
+            <div style={s.benchVersion}>measured on sglang <code>{entry.sglang_version}</code></div>
+          )}
+        </div>
+        {isEmpty ? (
+          <div style={s.benchEmpty}>
+            Benchmark data pending for this combination — submit yours via the Playground's Verified ↗ button.
+          </div>
+        ) : (
+          <>
+            {(latencyBlock || throughputBlock) && (
+              <div style={s.benchGrid}>
+                {latencyBlock}
+                {throughputBlock}
+              </div>
+            )}
+            {accuracyParts && accuracyParts.length > 0 && (
+              <div style={s.benchAccuracyRow}>
+                <span style={s.benchKey}>Accuracy: </span>
+                <span style={s.benchVal}>{accuracyParts.join(" · ")}</span>
+              </div>
+            )}
+            {entry && entry.notes && (
+              <div style={s.benchNotes}>{entry.notes}</div>
+            )}
+          </>
+        )}
+      </div>
+    );
   };
 
   const buildHardwareGroups = () => {
@@ -695,10 +923,17 @@ export const Deployment = ({ config }) => {
         </div>
       </div>
 
+      {/* Benchmark card. Renders only when the cookbook MDX passed a
+          `benchmarks` prop AND there is currently a matched cell. Inside
+          renderBenchmarkCard the empty-state path covers "match exists
+          but no measured numbers yet" — so cookbooks can ship the file
+          with placeholder entries and the card stays useful. */}
+      {benchmarks && cell && renderBenchmarkCard(findBenchmark(benchmarks, sel))}
+
       {/* Playground link. scrollIntoView (instead of an href anchor) so the
-          URL hash — which carries §3's selection — isn't overwritten. The
-          target id "3-3-playground" is auto-generated by Mintlify from the
-          "### 3.3 Playground" heading slug. */}
+          URL hash — which carries the Deploy panel's selection — isn't
+          overwritten. The target id "playground" is auto-generated by
+          Mintlify from the "## Playground" heading slug. */}
       <div
         style={{
           padding: "6px 12px",
@@ -713,7 +948,7 @@ export const Deployment = ({ config }) => {
         <button
           type="button"
           onClick={() => {
-            const el = document.getElementById("3-3-playground");
+            const el = document.getElementById("playground");
             if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
           }}
           style={{

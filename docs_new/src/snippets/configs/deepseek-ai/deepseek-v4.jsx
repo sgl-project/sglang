@@ -643,10 +643,10 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 4096",
+        "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
-        "--mem-fraction-static 0.88",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -772,10 +772,10 @@ export const config = {
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
         "--speculative-num-draft-tokens 4",
-        "--chunked-prefill-size 4096",
+        "--chunked-prefill-size 8192",
         "--disable-flashinfer-autotune",
         "--swa-full-tokens-ratio 0.1",
-        "--mem-fraction-static 0.88",
+        "--mem-fraction-static 0.90",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -891,12 +891,20 @@ export const config = {
     // H200 Pro FP8: low-latency exposes BOTH single-node (TP=8 Marlin) and
     // multi-2 (TP=16 DP-attn + DeepEP) — the old combined block, split.
     {
+      // h200 Pro FP8 SINGLE-NODE runs the FP4-native repo with Marlin's W4A16
+      // path (no FP8 conversion needed when sharded over only 8 GPUs). The
+      // sibling MULTI-2 cell below uses the sgl-project FP8 repackaging
+      // because Hopper TP=16 with DP-attn + DeepEP needs uniform FP8 weights.
+      // Because the two variants need DIFFERENT --model-path strings on the
+      // same (hw, variant, quant) tuple, this cell hard-codes the path
+      // verbatim instead of relying on {{MODEL_NAME}} (which would resolve
+      // to the FP8 repackaging via modelNames["h200|pro|fp8"]).
       match: { hw: "h200", variant: "pro", quant: "fp8", strategy: "low-latency", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DSV4_FP4_EXPERTS=0"],
+      env: [],
       flags: [
         "--trust-remote-code",
-        "--model-path {{MODEL_NAME}}",
+        "--model-path deepseek-ai/DeepSeek-V4-Pro",
         "--tp 8",
         "--moe-runner-backend marlin",
         "--speculative-algo EAGLE",

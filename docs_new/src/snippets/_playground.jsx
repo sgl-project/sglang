@@ -1073,8 +1073,18 @@ export const Playground = ({ config }) => {
     const multinode = nnodes > 1;
     let f = [...flags];
     if (multinode && !f.some((x) => x.startsWith("--nnodes"))) {
-      const at = f.findIndex((x) => x.startsWith("--model-path")) + 1;
-      f.splice(at, 0,
+      // Match _deployment.jsx: insert the multi-node trio after the last
+      // parallelism flag rather than after --model-path. Keeps the
+      // playground's untouched-base command byte-identical to the Deploy
+      // panel's command (and to the live website's IC generator).
+      const PARALLELISM_ANCHORS = ["--enable-dp-attention", "--dp", "--tp"];
+      let at = -1;
+      for (const anchor of PARALLELISM_ANCHORS) {
+        at = f.findIndex((x) => x.split(/[\s=]/)[0] === anchor);
+        if (at !== -1) break;
+      }
+      if (at === -1) at = f.findIndex((x) => x.startsWith("--model-path"));
+      f.splice(at + 1, 0,
         `--nnodes ${nnodes}`,
         `--node-rank {{NODE_RANK}}`,
         `--dist-init-addr {{NODE0_IP}}:20000`);
@@ -1846,12 +1856,12 @@ export const Playground = ({ config }) => {
         {/* Scroll back to §3.1 (the Interactive Command Generator). Use
             scrollIntoView so the URL hash — which carries the base cell
             selection — isn't overwritten. The target id is the auto-
-            generated Mintlify slug for "### 3.1 Basic Configuration". */}
+            generated Mintlify slug for "## Deploy". */}
         <button
           type="button"
           style={s.switchBaseBtn}
           onClick={() => {
-            const el = document.getElementById("3-1-basic-configuration");
+            const el = document.getElementById("deploy");
             if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
           }}
         >
