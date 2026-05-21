@@ -776,12 +776,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        moe_alt_stream = (
+            alt_streams[0]
+            if (
+                alt_streams is not None
+                and (_is_cuda or envs.SGLANG_ROCM_USE_MULTI_STREAM.get())
+            )
+            else None
+        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
             prefix=add_prefix("mlp", prefix),
             layer_id=self.layer_id,
-            alt_stream=alt_streams[0] if alt_streams is not None else None,
+            alt_stream=moe_alt_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
         )
