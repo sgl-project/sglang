@@ -112,14 +112,14 @@ class PerForwardOrchestrator:
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
-            verify_capacity=max(1, per_forward_verify_capacity), device=device
+            verify_capacity=per_forward_verify_capacity, device=device
         )
-        write_req_capacity = max(1, per_forward_write_req_capacity)
+        write_req_capacity = per_forward_write_req_capacity
         self._write_plan_per_forward = WritePlan.allocate(
             write_req_capacity=write_req_capacity, device=device
         )
 
-        write_entry_capacity = max(1, per_forward_write_entry_capacity)
+        write_entry_capacity = per_forward_write_entry_capacity
         self._expected_inputs = ExpectedInputs.allocate(
             capacity=write_entry_capacity, device=device
         )
@@ -132,7 +132,7 @@ class PerForwardOrchestrator:
 
         self._write_req_capacity = write_req_capacity
         self._write_entry_capacity = write_entry_capacity
-        self._verify_capacity = max(1, per_forward_verify_capacity)
+        self._verify_capacity = per_forward_verify_capacity
 
         self._enable_warner = _CanaryEnableWarner(
             verify_capacity=self._verify_capacity,
