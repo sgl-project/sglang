@@ -14,6 +14,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
+    _compute_pad_value,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -99,6 +100,30 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertTrue(
             torch.equal(mm_items[0].feature, processor_output["pixel_values"])
         )
+
+    def test_processor_output_preserves_precomputed_hash(self):
+        processor = make_processor()
+        input_ids = [1, 42, 42, 2]
+        processor_output = {
+            "format": "processor_output",
+            "input_ids": torch.tensor([input_ids]),
+            "pixel_values": torch.arange(8).reshape(2, 4),
+            "image_grid_thw": torch.tensor([[1, 1, 2]]),
+            "hash": 12345,
+        }
+        base_output = BaseMultiModalProcessorOutput(
+            input_text="",
+            input_ids=input_ids,
+            images=[processor_output],
+        )
+
+        mm_items, _, _ = processor.process_and_combine_mm_data(
+            base_output,
+            MultimodalSpecialTokens(image_token_id=42),
+        )
+
+        self.assertEqual(mm_items[0].hash, 12345)
+        self.assertEqual(mm_items[0].pad_value, _compute_pad_value(12345))
 
     def test_processor_output_multi_image_split_uses_grid_lengths(self):
         processor = make_processor()

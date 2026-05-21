@@ -985,9 +985,12 @@ class BaseMultimodalProcessor(ABC):
                     modality, raw_data, frame_limit = next(task_info_iter)
                     result = next(futures_iter).result()
 
-                    is_precomputed, new_imgs, new_vids, new_auds = (
-                        self._process_loaded_mm_data(modality, raw_data, result)
-                    )
+                    (
+                        is_precomputed,
+                        new_imgs,
+                        new_vids,
+                        new_auds,
+                    ) = self._process_loaded_mm_data(modality, raw_data, result)
 
                     has_precomputed_input |= is_precomputed
                     images.extend(new_imgs)
@@ -1080,7 +1083,7 @@ class BaseMultimodalProcessor(ABC):
 
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
-            if attr_name == "input_ids":
+            if attr_name in ("input_ids", "format", "modality", "hash", "pad_value"):
                 continue
 
             # Get modality for this attribute
@@ -1106,6 +1109,19 @@ class BaseMultimodalProcessor(ABC):
                     attr_name = "feature"
 
                 items[current_modality].set(attr_name, value)
+
+        if len(items) == 1:
+            item = next(iter(items.values()))
+            hash_value = data_dict.get("hash")
+            if hash_value is not None:
+                if isinstance(hash_value, torch.Tensor):
+                    hash_value = hash_value.item()
+                item.hash = int(hash_value)
+                pad_value = data_dict.get("pad_value")
+                if pad_value is not None:
+                    if isinstance(pad_value, torch.Tensor):
+                        pad_value = pad_value.item()
+                    item.pad_value = int(pad_value)
 
         return list(items.values())
 
@@ -1139,9 +1155,11 @@ class BaseMultimodalProcessor(ABC):
         if not tensor.is_cuda:
             return tensor
 
-        sync_flag, available_slice, byte_offset = (
-            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
-        )
+        (
+            sync_flag,
+            available_slice,
+            byte_offset,
+        ) = self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
         if isinstance(available_slice, torch.Tensor):
             available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
             return CudaIpcTensorTransportProxy(
