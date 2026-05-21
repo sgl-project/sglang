@@ -1591,6 +1591,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._handle_elastic_ep_result_boundary(result)
+                ):
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
@@ -1626,6 +1631,11 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._handle_elastic_ep_result_boundary(tmp_result)
+                ):
+                    continue
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()

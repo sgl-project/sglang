@@ -85,7 +85,7 @@ from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_sta
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     join_process_groups,
-    try_recover_ranks,
+    recover_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
@@ -1512,46 +1512,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     weight_name_filter=weight_name_filter,
                 )
 
-    def maybe_recover_ep_ranks(self):
-        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
-        # synchronization, and this function is on the forward-path.
-        # This check only runs when `--elastic-ep-backend` is enabled, so the
-        # synchronization overhead does not propagate to other configs.
-        # Leave for future optimization of the elastic EP path.
-        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
-            return
-
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
-        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
-        # tp-group index is the same as the global rank index.
-        ranks_to_recover = [
-            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
-        ]
-
-        # try_recover_ranks polls peer state via Mooncake EP backend.
-        # Mooncake's internal semantics guarantee that all ranks observe
-        # consistent peer readiness state, so collective operations below
-        # are safe even though polling appears local.
-        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
-            self.forward_pass_id = 0
+    def recover_ep_ranks_after_retract(self, ranks_to_recover: List[int]) -> None:
+        # `ranks_to_recover` uses global rank indices.
+        assert ranks_to_recover
+        recover_ranks(ranks_to_recover)
+        self.forward_pass_id = 0
+        if self.eplb_manager is not None:
             self.eplb_manager.reset_generator()
-            broadcast_global_expert_location_metadata(
-                src_rank=self._get_healthy_expert_location_src_rank(
-                    invoked_in_elastic_ep_rejoin_path=False
-                )
+        broadcast_global_expert_location_metadata(
+            src_rank=self._get_healthy_expert_location_src_rank(
+                invoked_in_elastic_ep_rejoin_path=False
             )
-            ElasticEPStateManager.instance().reset()
+        )
+        ElasticEPStateManager.instance().reset()
 
-            broadcast_pyobj(
-                [self.server_args.random_seed],
-                get_world_group().rank,
-                get_world_group().cpu_group,
-                src=get_world_group().ranks[0],
-            )
-            logger.info(f"recover ranks {ranks_to_recover} done")
+        broadcast_pyobj(
+            [self.server_args.random_seed],
+            get_world_group().rank,
+            get_world_group().cpu_group,
+            src=get_world_group().ranks[0],
+        )
+        logger.info(f"recover ranks {ranks_to_recover} done")
 
     def _get_healthy_expert_location_src_rank(
         self, invoked_in_elastic_ep_rejoin_path: bool
@@ -3137,6 +3118,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        elastic_ep_state = ElasticEPStateManager.instance()
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3165,15 +3147,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+        if self.enable_elastic_ep:
+            elastic_ep_state.submit_active_snapshot(
+                global_pg_active_ranks=self.tp_group.active_ranks,
+                non_blocking=not self.server_args.disable_overlap_schedule,
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
@@ -3202,9 +3180,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.msprobe_debugger is not None:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
-
-        if self.server_args.elastic_ep_backend is not None:
-            self.maybe_recover_ep_ranks()
 
         return output
 
@@ -3441,35 +3416,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype=torch.uint8,
                     device=self.device,
                 )
-
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
-        elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
-            elastic_ep_state.snapshot_active_to_last()
-            elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
-            gen = self.eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        return output
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):

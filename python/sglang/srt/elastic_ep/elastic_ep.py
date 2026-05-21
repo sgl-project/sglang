@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator, List, Optional
 
 import torch
@@ -16,26 +16,128 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ElasticEPState:
-    active_ranks: Optional[torch.Tensor]
-    last_active_ranks: Optional[torch.Tensor]
-    active_ranks_cpu: Optional[torch.Tensor]
+    """Elastic EP active-rank state.
 
-    def is_active_equal_last(self) -> bool:
-        return torch.equal(self.active_ranks, self.last_active_ranks)
+    Naming convention in this class:
+    - global: tensor indices are world ranks.
+    - pg: the mask originated from a process group, already mapped to global.
+    - _cpu: tensor storage is on CPU; it does not mean CPU process-group source.
+    """
+
+    active_ranks: torch.Tensor
+    committed_active_ranks_cpu: torch.Tensor
+    last_handled_committed_active_ranks_cpu: torch.Tensor
+    staging_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    staging_global_pg_active_ranks_cpu_slots: tuple[torch.Tensor, torch.Tensor]
+    next_staging_slot: int = 0
+    pending_staging_slots: list[int] = field(default_factory=list)
+
+    def submit_active_snapshot(
+        self,
+        global_pg_active_ranks: torch.Tensor,
+        non_blocking: bool = True,
+    ) -> None:
+        """Enqueue copies of world-size active-rank snapshots.
+
+        With non_blocking=True (overlap path) the scheduler relies on
+        copy_done.synchronize() (same forward_stream, recorded strictly later)
+        to act as the barrier before reading the staging buffers. Non-overlap
+        callers pass non_blocking=False so the staging buffers are valid as
+        soon as this call returns.
+        """
+        slot = self.next_staging_slot
+        self.next_staging_slot ^= 1
+        staging_active_ranks_cpu = self.staging_active_ranks_cpu_slots[slot]
+        staging_global_pg_active_ranks_cpu = (
+            self.staging_global_pg_active_ranks_cpu_slots[slot]
+        )
+        self.pending_staging_slots.append(slot)
+        assert len(self.pending_staging_slots) <= 2
+
+        if self.active_ranks.device.type == "cuda":
+            staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=non_blocking)
+        else:
+            # CPU backend: fully synchronous, no stream involved.
+            staging_active_ranks_cpu.copy_(self.active_ranks)
+
+        assert global_pg_active_ranks.numel() == self.committed_active_ranks_cpu.numel()
+        if global_pg_active_ranks.device.type == "cuda":
+            staging_global_pg_active_ranks_cpu.copy_(
+                global_pg_active_ranks, non_blocking=non_blocking
+            )
+        else:
+            staging_global_pg_active_ranks_cpu.copy_(global_pg_active_ranks)
+
+    def commit_active_snapshot(
+        self, global_pg_active_ranks_cpu: torch.Tensor, consensus_cpu_group
+    ) -> bool:
+        """Commit the oldest unconsumed world-size snapshot.
+
+        The committed mirror is a sticky fault latch: ranks return to active
+        only through explicit recover/reset. Caller must ensure the staging
+        buffers are ready, either by passing non_blocking=False to
+        submit_active_snapshot (non-overlap path) or by synchronizing the
+        stream after submit (e.g. via copy_done.synchronize, overlap path).
+        global_pg_active_ranks_cpu is a read-only process-group observation.
+        Returns True if a snapshot was committed.
+        """
+        if not self.pending_staging_slots:
+            return False
+        slot = self.pending_staging_slots.pop(0)
+        snapshot = self.staging_active_ranks_cpu_slots[slot]
+        global_pg_snapshot = self.staging_global_pg_active_ranks_cpu_slots[slot]
+
+        assert (
+            global_pg_active_ranks_cpu.numel()
+            == self.committed_active_ranks_cpu.numel()
+        )
+        self.committed_active_ranks_cpu.bitwise_and_(snapshot)
+        self.committed_active_ranks_cpu.bitwise_and_(global_pg_snapshot)
+        self.committed_active_ranks_cpu.bitwise_and_(global_pg_active_ranks_cpu)
+        torch.distributed.all_reduce(
+            self.committed_active_ranks_cpu,
+            op=torch.distributed.ReduceOp.MIN,
+            group=consensus_cpu_group,
+        )
+        return True
+
+    def is_stale_snapshot(self) -> bool:
+        """Return True iff a new fault has appeared since the last handled
+        snapshot. Call commit_active_snapshot() before this check."""
+        return not torch.equal(
+            self.committed_active_ranks_cpu,
+            self.last_handled_committed_active_ranks_cpu,
+        )
+
+    def mark_snapshot_handled(self) -> None:
+        """Snap last_handled to the current staging value so subsequent
+        is_stale_snapshot() calls only flag *new* faults."""
+        self.last_handled_committed_active_ranks_cpu.copy_(
+            self.committed_active_ranks_cpu
+        )
+
+    def clear_pending_snapshots(self) -> None:
+        self.pending_staging_slots.clear()
 
     def sync_active_to_cpu(self):
-        if self.active_ranks is not None:
-            self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
+        self.committed_active_ranks_cpu.copy_(self.active_ranks.detach().cpu())
 
     def snapshot_active_to_last(self):
-        if self.active_ranks is not None:
-            self.last_active_ranks = self.active_ranks.clone()
+        self.last_handled_committed_active_ranks_cpu.copy_(
+            self.active_ranks.detach().cpu()
+        )
 
     def reset(self):
-        if self.active_ranks is not None:
-            self.active_ranks.fill_(1)
-            self.snapshot_active_to_last()
-            self.sync_active_to_cpu()
+        self.active_ranks.fill_(1)
+        self.snapshot_active_to_last()
+        self.sync_active_to_cpu()
+        self.clear_pending_snapshots()
+        for staging_active_ranks_cpu in self.staging_active_ranks_cpu_slots:
+            staging_active_ranks_cpu.fill_(1)
+        for (
+            staging_global_pg_active_ranks_cpu
+        ) in self.staging_global_pg_active_ranks_cpu_slots:
+            staging_global_pg_active_ranks_cpu.fill_(1)
 
 
 class ElasticEPStateManager:
@@ -72,13 +174,43 @@ class ElasticEPStateManager:
 
     @classmethod
     def _build_state(
-        cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
+        cls,
+        *,
+        ep_size: Optional[int] = None,
+        device: Optional[torch.device] = None,
     ) -> ElasticEPState:
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
+        active_cpu = active.detach().cpu().clone()
+        # Initialize staging to the healthy initial state so is_stale_snapshot()
+        # before the first submit returns False (no false positive on startup).
+        if active.device.type == "cuda":
+            staging_active_ranks_cpu_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+        else:
+            staging_active_ranks_cpu_slots = (active_cpu.clone(), active_cpu.clone())
+
+        if active.device.type == "cuda":
+            staging_global_pg_active_ranks_cpu_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
+        else:
+            staging_global_pg_active_ranks_cpu_slots = (
+                active_cpu.clone(),
+                active_cpu.clone(),
+            )
+
         return ElasticEPState(
             active_ranks=active,
-            last_active_ranks=active.clone(),
-            active_ranks_cpu=active.detach().cpu().clone(),
+            committed_active_ranks_cpu=active_cpu.clone(),
+            last_handled_committed_active_ranks_cpu=active_cpu,
+            staging_active_ranks_cpu_slots=staging_active_ranks_cpu_slots,
+            staging_global_pg_active_ranks_cpu_slots=(
+                staging_global_pg_active_ranks_cpu_slots
+            ),
+            pending_staging_slots=[],
         )
 
     @classmethod
@@ -99,10 +231,6 @@ class ElasticEPStateManager:
 _PEER_STATE_POLL_INTERVAL_SEC = 0.01
 
 
-def _get_process_group_backend(process_group, device: str):
-    return process_group._get_backend(torch.device(device))
-
-
 def _iter_live_parallel_groups() -> Iterator[parallel_state.GroupCoordinator]:
     groups = []
     for group_ref in parallel_state._groups.values():
@@ -120,10 +248,10 @@ def _map_global_to_group_local_ranks(
     return [rank_to_local[rank] for rank in global_ranks if rank in rank_to_local]
 
 
-def _wait_for_peer_state(mooncake_ep, backend, ranks: List[int]) -> None:
+def _wait_for_peer_state(mooncake_ep, process_group, ranks: List[int]) -> None:
     # Relaunched ranks become recoverable asynchronously, so we poll until the
-    # target backend reports all requested peers as ready.
-    while not all(mooncake_ep.get_peer_state(backend, ranks)):
+    # target process group reports all requested peers as ready.
+    while not all(mooncake_ep.get_peer_state(process_group, ranks)):
         time.sleep(_PEER_STATE_POLL_INTERVAL_SEC)
 
 
@@ -144,59 +272,61 @@ def _refresh_ep_members() -> None:
     EPBuffer._buffer.update_ep_member()
 
 
-def try_recover_ranks(global_ranks: List[int]) -> bool:
+def can_recover_ranks(global_ranks: List[int]) -> bool:
     from mooncake import ep as mooncake_ep
 
-    world_backend = _get_process_group_backend(torch.distributed.group.WORLD, "cuda")
-    if not all(mooncake_ep.get_peer_state(world_backend, global_ranks)):
-        # The relaunched ranks have not finished initializing yet.
-        return False
+    world_group = torch.distributed.group.WORLD
+    return all(mooncake_ep.get_peer_state(world_group, global_ranks))
 
-    # Recover the world backend first, then recover each derived process group
+
+def recover_ranks(global_ranks: List[int]) -> None:
+    from mooncake import ep as mooncake_ep
+
+    # Recover the world process group first, then recover each derived process group
     # using ranks mapped into that group's local rank space.
-    mooncake_ep.recover_ranks(world_backend, global_ranks)
+    world_group = torch.distributed.group.WORLD
+    mooncake_ep.recover_ranks(world_group, global_ranks)
 
     for group in _iter_live_parallel_groups():
         group_local_ranks = _map_global_to_group_local_ranks(group.ranks, global_ranks)
         if not group_local_ranks:
             continue
 
-        device_backend = _get_process_group_backend(group.device_group, "cuda")
-        _wait_for_peer_state(mooncake_ep, device_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(device_backend, group_local_ranks)
+        device_group = group.device_group
+        _wait_for_peer_state(mooncake_ep, device_group, group_local_ranks)
+        mooncake_ep.recover_ranks(device_group, group_local_ranks)
 
-        cpu_backend = _get_process_group_backend(group.cpu_group, "cpu")
-        _wait_for_peer_state(mooncake_ep, cpu_backend, group_local_ranks)
-        mooncake_ep.recover_ranks(cpu_backend, group_local_ranks)
+        cpu_group = group.cpu_group
+        _wait_for_peer_state(mooncake_ep, cpu_group, group_local_ranks)
+        mooncake_ep.recover_ranks(cpu_group, group_local_ranks)
         _maybe_create_message_queue(group)
 
     _refresh_ep_members()
-    return True
 
 
 def join_process_groups():
     from mooncake import ep as mooncake_ep
 
-    def join_backend(label: str, backend) -> None:
-        logger.info("Recovered rank joining Mooncake backend %s", label)
-        mooncake_ep.join_group(backend)
+    def join_process_group(label: str, process_group) -> None:
+        logger.info("Recovered rank joining Mooncake process group %s", label)
+        mooncake_ep.join_group(process_group)
 
-    join_backend(
+    join_process_group(
         "default_world",
-        _get_process_group_backend(torch.distributed.group.WORLD, "cuda"),
+        torch.distributed.group.WORLD,
     )
 
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
             continue
 
-        join_backend(
+        join_process_group(
             f"{group.unique_name}:device",
-            _get_process_group_backend(group.device_group, "cuda"),
+            group.device_group,
         )
-        join_backend(
+        join_process_group(
             f"{group.unique_name}:cpu",
-            _get_process_group_backend(group.cpu_group, "cpu"),
+            group.cpu_group,
         )
         _maybe_create_message_queue(group)
 
