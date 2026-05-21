@@ -68,6 +68,18 @@ SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
+# Largest ``b`` for FlashMLA's sparse_decode ``get_decoding_sched_meta``
+# kernel before its dynamic shared memory allocation exceeds the per-arch
+# opt-in cap. The kernel allocates ``sizeof(int) * (b * 5 + 1)`` bytes
+# (see ``csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu``).
+# Both SM 9.0 (Hopper: H100/H800/H20) and SM 10.0 (Blackwell datacenter:
+# B100/B200/GB200) have the same 228 KB opt-in cap per CUDA Programming
+# Guide Table 16 and the Blackwell whitepaper. flash_mla itself only
+# supports SM90a + SM100f (``csrc/api/sparse_fwd.h::sparse_attn_prefill_interface``
+# TORCH_CHECKs this), so we don't need to handle other arches.
+#   b_max = (228 * 1024 - sizeof(int)) // (5 * sizeof(int)) = 11673
+_FLASHMLA_SMEM_MAX_B = 11673
+
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
 
@@ -1033,27 +1045,191 @@ class DeepseekV4AttnBackend(
 
             import flash_mla
 
-            o = flash_mla.flash_mla_with_kvcache(
-                q=q,
-                k_cache=swa_k_cache,
-                head_dim_v=self.head_dim_v,
-                block_table=None,
-                cache_seqlens=None,
-                tile_scheduler_metadata=flashmla_metadata,
-                softmax_scale=self.softmax_scale,
-                is_fp8_kvcache=True,
-                indices=swa_page_indices,
-                topk_length=swa_topk_lengths,
-                attn_sink=attn_sink,
-                extra_k_cache=extra_k_cache,
-                extra_indices_in_kvcache=extra_indices,
-                extra_topk_length=extra_topk_lengths,
-            )[0]
+            # FlashMLA's sparse_decode ``get_decoding_sched_meta`` kernel
+            # allocates ``4 * (b*5 + 1)`` bytes of dynamic shared memory.
+            # ``cudaFuncSetAttribute(..., MaxDynamicSharedMemorySize, smem)``
+            # returns "invalid argument" when ``smem`` exceeds the SM90/SM100
+            # opt-in cap of 228 KB, i.e. when ``b > _FLASHMLA_SMEM_MAX_B``.
+            # For decode ``b`` is the number of active sequences (always
+            # small); for DSv4 prefill-extend SGLang reshapes q so
+            # ``b == num tokens in the chunk``, and any sufficiently large
+            # ``chunked_prefill_size`` crashes the decode path.
+            #
+            # Above the cap we route through the dedicated prefill kernel
+            # ``flash_mla.flash_mla_sparse_fwd``. flash_mla provides two
+            # distinct sparse attention paths and both are supported on SM90a
+            # and SM100f (see ``csrc/api/sparse_fwd.h::sparse_attn_prefill_interface``):
+            #
+            #   flash_mla_with_kvcache  -> sparse_decode kernel
+            #                              FP8 paged KV, smem-limited schedule
+            #                              kernel.
+            #   flash_mla_sparse_fwd    -> sparse_prefill kernel
+            #                              BF16 flat KV, no schedule kernel,
+            #                              tile shapes tuned for prefill.
+            #
+            # The two-path pattern mirrors SGLang's NSA backend for DSv3.2
+            # (``nsa_backend.py::NSAAttnBackend._forward_flashmla_sparse`` for
+            # prefill, ``_forward_flashmla_kv`` for decode).
+            if q.shape[0] <= _FLASHMLA_SMEM_MAX_B:
+                # Fast path: original decode kernel, smem fits, zero overhead.
+                o = flash_mla.flash_mla_with_kvcache(
+                    q=q,
+                    k_cache=swa_k_cache,
+                    head_dim_v=self.head_dim_v,
+                    block_table=None,
+                    cache_seqlens=None,
+                    tile_scheduler_metadata=flashmla_metadata,
+                    softmax_scale=self.softmax_scale,
+                    is_fp8_kvcache=True,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                )[0]
+            else:
+                # Stage 2: dedicated prefill kernel. Handles all
+                # compress_ratio values (0 / 4 / 128) by dequant + concat +
+                # index combine.
+                o = self._forward_prefill_sparse_fwd(
+                    q=q,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    attn_sink=attn_sink,
+                )
 
             o = o.squeeze(1)
             return o
 
         raise NotImplementedError("ragged attention")
+
+    def _forward_prefill_sparse_fwd(
+        self,
+        q: torch.Tensor,
+        swa_k_cache: torch.Tensor,
+        swa_page_indices: torch.Tensor,
+        swa_topk_lengths: Optional[torch.Tensor],
+        extra_k_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        extra_topk_lengths: Optional[torch.Tensor],
+        attn_sink: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stage 2 prefill path for all DSv4 layer types.
+
+        Routes prefill through ``flash_mla.flash_mla_sparse_fwd`` (the
+        dedicated prefill kernel) instead of ``flash_mla_with_kvcache``
+        (the decode kernel). The decode kernel has an SM90 smem cap on
+        ``b == q.shape[0]``; the prefill kernel does not.
+
+        For ``compress_ratio == 0`` the layer only has the SWA cache, so
+        we just dequantize it and call sparse_fwd directly. For
+        ``compress_ratio in {4, 128}`` the layer additionally has a
+        compressed ``extra_k_cache``; we dequantize both, concatenate them
+        along the kv-token axis (``kv = [swa_bf16; extra_bf16]``), and
+        merge the per-token swa/extra topk indices into one flat array via
+        :func:`combine_swa_extra_indices` (which shifts extra indices by
+        ``s_kv_swa`` so they point into the extra region of the
+        concatenated buffer).
+
+        Args:
+            q:                  ``[num_tokens, 1, h_q, d_qk]`` bf16.
+            swa_k_cache:        ``[num_blocks, block_size, 1,
+                                bytes_per_token]`` uint8 (DSv4-Flash
+                                layout, 584 bytes/token).
+            swa_page_indices:   ``[num_tokens, 1, topk_swa]`` int32. Global
+                                indices into the flattened swa view.
+            swa_topk_lengths:   ``[num_tokens]`` int32. Per-token valid
+                                count in ``swa_page_indices``.
+            extra_k_cache:      Same layout as ``swa_k_cache``, or ``None``
+                                for ``compress_ratio == 0``.
+            extra_indices:      ``[num_tokens, 1, topk_extra]`` int32 or
+                                ``None``. Global indices into the
+                                flattened extra view.
+            extra_topk_lengths: ``[num_tokens]`` int32 or ``None``.
+            attn_sink:          ``[h_q]`` float32.
+
+        Returns:
+            ``[num_tokens, 1, h_q, d_v]`` bf16. The ``s_q`` dim is kept so
+            the caller's ``o.squeeze(1)`` matches the decode path's output
+            shape.
+
+        Performance notes:
+        * Dequantizes the FULL ``swa_k_cache`` (and ``extra_k_cache`` when
+          present) to BF16 per call. With expandable_segments allocator
+          mode this is fine but allocates ~2x the FP8 cache size in
+          transient BF16 storage per call. A follow-up can replace this
+          with a fused gather+dequant kernel that only materializes the
+          tokens actually referenced by the topk indices.
+        """
+        import flash_mla
+
+        from sglang.srt.layers.attention.dsv4.dequant_k_cache import (
+            dequant_k_cache_dsv4_flash,
+        )
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            combine_swa_extra_indices,
+        )
+
+        # Dequantize SWA cache: uint8 page-SOA [num_blocks, block_size, 1, 584]
+        # -> BF16 [num_blocks, block_size, 1, 512] (448 nope dequant + 64 rope).
+        swa_kv_bf16 = dequant_k_cache_dsv4_flash(swa_k_cache)
+        num_swa_blocks, swa_block_size, h_kv, d_qk = swa_kv_bf16.shape
+        assert h_kv == 1, f"DSv4 expects h_kv=1, got {h_kv}"
+        s_kv_swa = num_swa_blocks * swa_block_size
+        swa_kv_flat = swa_kv_bf16.view(s_kv_swa, h_kv, d_qk)
+
+        if extra_k_cache is None:
+            # compress_ratio == 0: SWA only.
+            kv_flat = swa_kv_flat
+            indices = swa_page_indices
+            topk_lengths = swa_topk_lengths
+        else:
+            # compress_ratio in {4, 128}: dequantize the extra cache and
+            # concatenate. Indices into the concatenated buffer:
+            #   [0, s_kv_swa)         -> swa region
+            #   [s_kv_swa, s_kv_swa + s_kv_extra) -> extra region
+            assert extra_indices is not None and extra_topk_lengths is not None
+            assert (
+                swa_topk_lengths is not None
+            ), "swa_topk_lengths is required when combining with extra cache"
+
+            extra_kv_bf16 = dequant_k_cache_dsv4_flash(extra_k_cache)
+            num_extra_blocks, extra_block_size, _, _ = extra_kv_bf16.shape
+            s_kv_extra = num_extra_blocks * extra_block_size
+            extra_kv_flat = extra_kv_bf16.view(s_kv_extra, h_kv, d_qk)
+
+            kv_flat = torch.cat([swa_kv_flat, extra_kv_flat], dim=0)
+
+            indices, topk_lengths = combine_swa_extra_indices(
+                swa_indices=swa_page_indices,
+                swa_topk_lens=swa_topk_lengths,
+                extra_indices=extra_indices,
+                extra_topk_lens=extra_topk_lengths,
+                s_kv_swa=s_kv_swa,
+            )
+
+        # sparse_fwd takes q as [s_q, h_q, d_qk] (no batch dim). The
+        # caller earlier unsqueezed q to [num_tokens, 1, h_q, d_qk] for
+        # the decode-style API; undo that here.
+        q_flat = q.squeeze(1)
+
+        out, _, _ = flash_mla.flash_mla_sparse_fwd(
+            q=q_flat,
+            kv=kv_flat,
+            indices=indices,
+            sm_scale=self.softmax_scale,
+            d_v=self.head_dim_v,
+            attn_sink=attn_sink,
+            topk_length=topk_lengths,
+        )
+        # out: [num_tokens, h_q, d_v=512]. Restore the s_q dim so the
+        # caller's o.squeeze(1) gives the same shape as the decode path.
+        return out.unsqueeze(1)
 
     def expand_prefill_casually(
         self,
