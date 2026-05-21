@@ -645,6 +645,35 @@ def test_slot_run_counter_per_entry() -> None:
     assert int(cuda_log.slot_run_counter[0].item()) == 4
 
 
+def test_grid_stride_processes_entries_beyond_grid_size() -> None:
+    """``verify_num_valid`` exceeding the persistent grid thread count is fully processed via grid-stride."""
+    n_active = 10000
+    cuda_buf, ref_buf = make_canary_buf_pair(
+        num_slots=n_active + 1, slot_stride_bytes=32, device=_DEVICE
+    )
+    slot_indices = list(range(1, n_active + 1))
+    tokens = [i + 10 for i in range(n_active)]
+    positions = list(range(n_active))
+    stamp_clean_chain(
+        cuda_buf=cuda_buf,
+        ref_buf=ref_buf,
+        tokens=tokens,
+        positions=positions,
+        slot_indices=slot_indices,
+    )
+
+    plan_pair = make_verify_plan_pair(
+        slot_indices=slot_indices,
+        positions=positions,
+        prev_slot_indices=[-1] + slot_indices[:-1],
+        device=_DEVICE,
+    )
+    cuda_log, _ = run_verify_diff(buf_pair=(cuda_buf, ref_buf), plan_pair=plan_pair)
+
+    assert int(cuda_log.slot_run_counter[0].item()) == n_active
+    assert int(cuda_log.kernel_run_counter[0].item()) == 1
+
+
 def test_violation_ring_fill_once_first_row() -> None:
     """First violation lands at ring[0]; subsequent violations advance ``violation_write_index``."""
     buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
