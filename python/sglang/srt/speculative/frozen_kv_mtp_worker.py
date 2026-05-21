@@ -21,6 +21,7 @@ assistant-side KV extension.
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from typing import List, Optional, Tuple
 
 import torch
@@ -279,40 +280,64 @@ class FrozenKVMTPWorker(TpModelWorker):
         else:
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
+            self.draft_attn_backend.init_forward_data(forward_batch)
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
     ) -> None:
+        # Frozen-KV MTP draft drives the underlying backend in DECODE mode
+        # against the frozen target KV pool; override the relevant fb fields
+        # for that view rather than mutating the caller's batch in place.
+        fb_view = replace(
+            forward_batch,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+            encoder_lens=None,
+        )
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.positions.numel(),
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-            )
+            self.draft_attn_backend.init_forward_data_out_graph(fb_view)
+
+    def _init_frozen_kv_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """In-graph counterpart of ``_init_frozen_kv_metadata_capture_cuda_graph``.
+
+        Default no-op for all backends in the initial migration; provided so
+        the cuda graph runner can invoke the new contract inside the graph
+        capture scope and so future per-backend overrides can be added
+        without changing the runner side.
+        """
+        fb_view = replace(
+            forward_batch,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+            encoder_lens=None,
+        )
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_data_in_graph(fb_view)
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
+        # Build a lightweight ForwardBatch view onto the padded buffers in
+        # DECODE mode (the underlying backend runs the same body as at
+        # capture time). The in-graph ops captured then auto-replay via
+        # graph.replay(), so only the out-graph phase runs here per replay.
+        fb_view = replace(
+            forward_batch,
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            req_pool_indices=forward_batch.req_pool_indices[:bs],
+            seq_lens=forward_batch.seq_lens[:bs],
+            seq_lens_sum=seq_lens_sum,
+            seq_lens_cpu=(
+                forward_batch.seq_lens_cpu[:bs]
+                if forward_batch.seq_lens_cpu is not None
+                else None
+            ),
+            encoder_lens=None,
+            spec_info=None,
+        )
         with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=(
-                    forward_batch.seq_lens_cpu[:bs]
-                    if forward_batch.seq_lens_cpu is not None
-                    else None
-                ),
-            )
+            self.draft_attn_backend.init_forward_data_out_graph(fb_view)
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:

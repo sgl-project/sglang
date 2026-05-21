@@ -282,6 +282,11 @@ class FrozenKVMTPCudaGraphRunner:
         )
 
         def run_once():
+            # Graph-recordable metadata prep. Default no-op for all backends
+            # in the initial migration, but invoked under the graph capture
+            # context so any future per-backend overrides get recorded.
+            self.frozen_kv_mtp_worker._init_frozen_kv_metadata_in_graph(forward_batch)
+
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
