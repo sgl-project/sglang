@@ -1116,14 +1116,23 @@ class Engine(EngineScoreMixin, EngineBase):
         self,
         restore_weights_before_load: bool = False,
         post_process_quantization: bool = False,
+        post_load_weights: bool = False,
     ):
         """
         Optional post-processing for updated weights (e.g., Marlin conversion).
         Should be called after weight update is finished.
+
+        Args:
+            restore_weights_before_load: Restore weights to pre-quantization state.
+            post_process_quantization: Re-apply quantization post-processing.
+            post_load_weights: Call model.post_load_weights() for models that
+                need post-load decomposition (e.g., DeepSeek MLA kv_b_proj
+                decomposition into w_kc/w_vc tensors after RDMA weight transfer).
         """
         obj = PostProcessWeightsReqInput(
             restore_weights_before_load=restore_weights_before_load,
             post_process_quantization=post_process_quantization,
+            post_load_weights=post_load_weights,
         )
 
         return self.loop.run_until_complete(
