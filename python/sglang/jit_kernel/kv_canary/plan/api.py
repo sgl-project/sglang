@@ -52,30 +52,25 @@ def canary_plan_step(
       directly from ForwardBatch via write_offsets.
 
     Extra flat verify entries (extra_verify_*[: extra_verify_num_valid[0]]) are appended to verify_plan_out
-    **after** the per-req-derived entries. Used by radix-cache-orphan sweep; caller is responsible for
-    SWA-translating these entries before passing in (plan kernel does NOT translate the extras).
-
-    Sweep callers pass fb_extend_seq_lens = all-zero → write_plan_out is filled with write_num_valid_reqs = 0;
-    downstream skips canary_write_step.
+    **after** the per-req-derived entries. Caller is responsible for SWA-translating these entries before
+    passing in (plan kernel does NOT translate the extras).
 
     Args:
         verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
-        write_plan_out: Pre-allocated WritePlan; filled in-place. write_num_valid_reqs = 0 for sweep callers.
+        write_plan_out: Pre-allocated WritePlan; filled in-place.
         fb_req_pool_indices: ForwardBatch.req_pool_indices; per-row ReqToTokenPool row index, shape [bs],
             int64. 0 is the padding sentinel.
         fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int64. Caller
-            normalizes: extend → ForwardBatch.extend_prefix_lens, decode → ForwardBatch.seq_lens - 1, sweep
-            over running → seq_lens.
+            normalizes: extend → ForwardBatch.extend_prefix_lens, decode → ForwardBatch.seq_lens - 1.
         fb_extend_seq_lens: ForwardBatch.extend_seq_lens; per-req tokens being written this step, shape [bs],
-            int64. 1 for pure decode; 0 for sweep.
+            int64. 1 for pure decode.
         req_to_token: ReqToTokenPool.req_to_token; full-pool slot index table, shape [max_reqs, max_seq_len],
             int32.
         extra_verify_slot_indices: Pre-walked extra verify slots, shape [extra_verify_capacity], int64.
             Caller-translated to the target index space.
         extra_verify_positions: Same shape, int64. Expected position per extra entry.
         extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
-        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for per-forward and running-sweep
-            callers.
+        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for the per-forward caller.
         swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
         full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. Required (non-None) iff
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.

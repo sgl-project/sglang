@@ -7,20 +7,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
-from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
-from sglang.srt.kv_canary.plan_input_builder import build_plan_input_radix_sweep
-from sglang.srt.kv_canary.runner.kernel_launch import (
-    invoke_plan,
-    launch_endpoints_sweep,
+from sglang.srt.kv_canary.plan_input_builder import (
+    fill_verify_plan_radix_sweep,
 )
+from sglang.srt.kv_canary.runner.kernel_launch import launch_endpoints_sweep
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +38,6 @@ class SweepOrchestrator:
         device_state: CanaryDeviceState,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         endpoints: tuple[CanaryEndpoint, ...],
-        req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
         sweep_verify_capacity: int,
         step_counter_getter: Callable[[], int],
@@ -50,7 +46,6 @@ class SweepOrchestrator:
         self._device_state = device_state
         self._buffer_groups = buffer_groups
         self._endpoints = endpoints
-        self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._step_counter_getter = step_counter_getter
         self._radix_cache: Optional["BasePrefixCache"] = None
@@ -58,7 +53,6 @@ class SweepOrchestrator:
         self._verify_plan_sweep_radix = VerifyPlan.allocate(
             verify_capacity=sweep_verify_capacity, device=device
         )
-        self._write_plan_sweep = WritePlan.allocate(write_req_capacity=1, device=device)
 
         self._last_sweep_step: int = -1
         self._sweep_passes: int = 0
@@ -85,31 +79,13 @@ class SweepOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        sweep_capacity = int(self._verify_plan_sweep_radix.verify_slot_indices.shape[0])
         for group in self._buffer_groups:
             window = self._swa_window_size if group.kind is PoolKind.SWA else 0
-            radix_input = build_plan_input_radix_sweep(
+            fill_verify_plan_radix_sweep(
                 radix_cache=self._radix_cache,
+                verify_plan_out=self._verify_plan_sweep_radix,
                 swa_window_size=window,
                 full_to_swa_index_mapping=group.swa_index_lut,
-            )
-            walker_output_size = int(radix_input.extra_verify_slot_indices.shape[0])
-            if walker_output_size > sweep_capacity:
-                # canary_plan_step's cap_mask would otherwise silently drop entries past
-                # sweep_capacity while the verify kernel grid still launches against the larger
-                # extras_count, OOB-loading verify_slot_indices. Throw instead.
-                raise RuntimeError(
-                    f"kv-canary: radix-walker emitted {walker_output_size} sweep verify entries, "
-                    f"exceeding pre-allocated sweep_verify_capacity={sweep_capacity}; raise the "
-                    f"sweep capacity in CanaryLaunchCapacities.from_args"
-                )
-            invoke_plan(
-                plan_input=radix_input,
-                verify_plan=self._verify_plan_sweep_radix,
-                write_plan=self._write_plan_sweep,
-                group=group,
-                req_to_token=self._req_to_token_pool.req_to_token,
-                swa_window_size=self._swa_window_size,
             )
             launch_endpoints_sweep(
                 endpoints=self._endpoints,

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
@@ -14,43 +15,34 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PlanInput:
-    """Pre-staged input to canary_plan_step. Built by one of two builders (per-forward /
-    radix-sweep); fed straight into canary_plan_step alongside the pre-allocated VerifyPlan +
-    WritePlan out buffers.
+    """Pre-staged input to canary_plan_step for the per-forward path.
 
     All tensors live on device.
 
     Fields:
         fb_req_pool_indices: Per-row ReqToTokenPool row index, shape [bs_capacity], int64.
-            0 = padding sentinel. Per-forward path: pre-allocated static buffer that the runner
-            writes into each step (see Static-buffer contract below). Radix-sweep path: empty.
+            0 = padding sentinel. Pre-allocated static buffer that the runner writes into each
+            step (see Static-buffer contract below).
         fb_prefix_lens: Per-req prefix length already written before this step, shape
-            [bs_capacity], int64. Per-forward extend → extend_prefix_lens; per-forward decode →
-            seq_lens - 1; radix-sweep → empty.
+            [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
         fb_extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
-            Per-forward → extend or all-ones (decode); radix-sweep → empty.
+            Extend length or all-ones for decode.
         extra_verify_slot_indices: Pre-walked flat verify slots, shape [extra_verify_capacity],
-            int64. Caller-translated to the target index space (SWA-aware if running on the SWA
-            group).
+            int64. The per-forward path does not emit extras, so this is allocated with capacity 0.
         extra_verify_positions: Same shape, int64. Expected position per extra entry.
         extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
-        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for the per-forward
-            caller.
+        extra_verify_num_valid: Active extra entry count, shape [1], int32. Always 0.
 
-    extra_verify_capacity is per-runner: per-forward path uses 0 (path doesn't emit extras);
-    radix-sweep path uses total-pool-slots (worst case radix-orphan covers entire pool).
-    Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as
-    int32 or int64 at the boundary; canary canonicalizes them to int64 internally.
+    Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as int32
+    or int64 at the boundary; canary canonicalizes them to int64 internally.
 
-    **Static-buffer contract (cuda-graph correctness, per-forward path only)**: the per-forward
-    PlanInput's tensors are allocated once during CanaryRunner.__init__ (sized for the worst-case
-    per-forward batch). The per-forward builder MUTATES those tensors in place each step via
-    ``.copy_()`` / ``.fill_()`` / index-assign on the default stream. The captured cuda-graph reads
-    them by address; therefore: (a) never reallocate, (b) all writes complete on the default stream
-    before the captured region runs (i.e. the writes happen in ``CanaryRunner.before_forward``
-    which the caller invokes in ``ModelRunner.forward`` BEFORE ``graph_runner.replay()`` or
-    ``model.forward()``). The radix-sweep path does NOT use static buffers — its builder allocates
-    a fresh PlanInput each sweep step (radix-sweep never runs inside a cuda-graph capture).
+    **Static-buffer contract (cuda-graph correctness)**: the PlanInput's tensors are allocated once
+    during CanaryRunner.__init__ (sized for the worst-case per-forward batch). The per-forward
+    builder MUTATES those tensors in place each step via ``.copy_()`` / ``.fill_()`` / index-assign
+    on the default stream. The captured cuda-graph reads them by address; therefore: (a) never
+    reallocate, (b) all writes complete on the default stream before the captured region runs (i.e.
+    the writes happen in ``CanaryRunner.before_forward`` which the caller invokes in
+    ``ModelRunner.forward`` BEFORE ``graph_runner.replay()`` or ``model.forward()``).
     """
 
     fb_req_pool_indices: torch.Tensor
@@ -186,21 +178,20 @@ def _extract_prefix_lens_and_extend_seq_lens(
         )
 
 
-def build_plan_input_radix_sweep(
+def fill_verify_plan_radix_sweep(
     *,
     radix_cache: "BasePrefixCache",
+    verify_plan_out: VerifyPlan,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
-) -> PlanInput:
-    """Builder for the radix-sweep caller. Allocates a fresh PlanInput each sweep step (the
-    Static-buffer contract on the PlanInput class applies to the per-forward path only).
+) -> int:
+    """Fill the sweep VerifyPlan directly from the radix-cache walker.
 
-    - fb_req_pool_indices: empty (bs = 0); plan kernel skips the per-req path entirely.
-    - fb_prefix_lens / fb_extend_seq_lens: empty.
-    - extra_verify_* populated by walk_radix_cache_for_canary covering EVERY slot held by the
-      radix tree (no exclusion of running-req-owned slots — the overlap with per-forward
-      HEAD/TAIL coverage is harmless redundancy). The builder applies the SWA LUT before
-      stuffing into PlanInput (plan kernel does NOT translate extras).
+    The walker covers every slot held by the radix tree. There is no exclusion for slots also owned
+    by running requests because the overlap with per-forward HEAD/TAIL coverage is harmless
+    redundancy. The helper applies the SWA LUT before writing the plan.
+
+    Returns the number of active verify entries.
     """
     device = radix_cache.req_to_token_pool.req_to_token.device
 
@@ -225,21 +216,21 @@ def build_plan_input_radix_sweep(
         )
 
     num_valid = int(slot_indices.shape[0])
+    capacity = int(verify_plan_out.verify_slot_indices.shape[0])
+    if num_valid > capacity:
+        raise RuntimeError(
+            f"kv-canary: radix-walker emitted {num_valid} sweep verify entries, exceeding "
+            f"pre-allocated sweep_verify_capacity={capacity}; raise the sweep capacity in "
+            f"CanaryLaunchCapacities.from_args"
+        )
 
-    fb_req_pool_indices = torch.empty(0, dtype=torch.int64, device=device)
-    fb_prefix_lens = torch.empty(0, dtype=torch.int64, device=device)
-    fb_extend_seq_lens = torch.empty(0, dtype=torch.int64, device=device)
-    extra_num_valid = torch.tensor([num_valid], dtype=torch.int32, device=device)
+    verify_plan_out.verify_slot_indices[:num_valid].copy_(slot_indices)
+    verify_plan_out.verify_positions[:num_valid].copy_(positions)
+    verify_plan_out.verify_prev_slot_indices[:num_valid].copy_(prev_slot_indices)
+    verify_plan_out.verify_num_valid.fill_(num_valid)
+    verify_plan_out.enable.fill_(1)
 
-    return PlanInput(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
-        extra_verify_slot_indices=slot_indices,
-        extra_verify_positions=positions,
-        extra_verify_prev_slot_indices=prev_slot_indices,
-        extra_verify_num_valid=extra_num_valid,
-    )
+    return num_valid
 
 
 def _swa_translate(

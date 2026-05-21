@@ -95,7 +95,6 @@ class CanaryRunner:
             device_state=self._device_state,
             buffer_groups=self._buffer_groups,
             endpoints=self._endpoints,
-            req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
             sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
             step_counter_getter=self._get_step_counter,
