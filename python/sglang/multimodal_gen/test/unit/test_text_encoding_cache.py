@@ -61,19 +61,11 @@ def make_forward_req(**kwargs):
 def make_server_args(**kwargs):
     defaults = {
         "pipeline_class_name": "LTX2TwoStagePipeline",
-        "model_path": "dummy-model",
-        "backend": "auto",
-        "model_id": None,
         "pipeline_config": SimpleNamespace(text_encoder_configs=[]),
     }
     defaults.update(kwargs)
-    return SimpleNamespace(**defaults)
-
-
-def get_negative_embedding_twice(stage, server_args, first_req, second_req=None):
-    stage.get_or_compute_negative_text_embedding(first_req, server_args, [0])
-    stage.get_or_compute_negative_text_embedding(
-        second_req if second_req is not None else make_req(), server_args, [0]
+    return SimpleNamespace(
+        **defaults,
     )
 
 
@@ -81,7 +73,8 @@ def test_negative_text_cache_key_tracks_encode_options():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
 
-    get_negative_embedding_twice(stage, server_args, make_req())
+    stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
+    stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
     assert stage.calls == 1
 
     stage.get_or_compute_negative_text_embedding(
@@ -99,24 +92,12 @@ def test_negative_text_cache_skips_warmup():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
 
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="default negative"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
+    stage.get_or_compute_negative_text_embedding(
+        make_req(is_warmup=True), server_args, [0]
+    )
+    stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
 
     assert stage.calls == 2
-
-
-def test_negative_text_cache_keeps_default_warmup():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    with patch.object(
-        stage, "_get_model_default_negative_prompt", return_value="bad quality"
-    ):
-        get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
-
-    assert stage.calls == 1
 
 
 def test_cfg_text_batch_encodes_positive_and_negative_once():

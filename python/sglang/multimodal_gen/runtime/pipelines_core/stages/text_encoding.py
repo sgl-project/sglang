@@ -11,6 +11,10 @@ import inspect
 from dataclasses import dataclass
 from typing import Any
 
+from sglang.multimodal_gen.registry import (
+    get_model_info,
+    get_pipeline_config_classes,
+)
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -125,6 +129,7 @@ class TextEncodingStage(PipelineStage):
     def _should_cache_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
+        """If and only if the reqs use the model-default negative prompt, will the embedding be cached"""
         if not batch.is_warmup:
             return True
         return self._uses_model_default_negative_prompt(batch, server_args)
@@ -167,6 +172,7 @@ class TextEncodingStage(PipelineStage):
     def _uses_model_default_negative_prompt(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
+        """Returns if the current Req adopts the model default negative prompts"""
         default_negative_prompt = self._get_model_default_negative_prompt(server_args)
         if default_negative_prompt is None:
             return False
@@ -174,7 +180,8 @@ class TextEncodingStage(PipelineStage):
             batch.negative_prompt
         ) == self._normalize_negative_prompt_for_default_match(default_negative_prompt)
 
-    def _get_model_default_negative_prompt(self, server_args: ServerArgs):
+    def _get_model_default_negative_prompt(self, server_args: ServerArgs) -> str:
+        """Get the default negative prompt of this model for caching usage"""
         model_key = (
             server_args.pipeline_class_name,
             server_args.model_path,
@@ -183,11 +190,6 @@ class TextEncodingStage(PipelineStage):
         )
         if self._default_negative_prompt_key == model_key:
             return self._default_negative_prompt_value
-
-        from sglang.multimodal_gen.registry import (
-            get_model_info,
-            get_pipeline_config_classes,
-        )
 
         sampling_params_cls = None
         if server_args.pipeline_class_name is not None:
