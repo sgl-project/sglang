@@ -395,10 +395,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Invalidate SWA loc translation cache — same fix as in
-            # multi_layer_eagle_draft_extend_cuda_graph_runner. This runner
-            # calls model.forward() directly, bypassing _forward_raw(), so
-            # the per-batch invalidation in _forward_raw() never fires.
+            # model.forward() bypasses _forward_raw(), so invalidate manually.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 

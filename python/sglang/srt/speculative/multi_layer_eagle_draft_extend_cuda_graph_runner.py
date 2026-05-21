@@ -424,13 +424,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Invalidate SWA loc translation cache so every model invocation
-            # (warmup 1, warmup 2, and capture run) starts clean. This runner
-            # calls model.forward() directly, bypassing _forward_raw(), so the
-            # per-batch invalidation in _forward_raw() never fires. Without this,
-            # warmup 1 caches the translation and the capture run gets a cache
-            # hit — no gather is recorded in the graph, and replay reuses stale
-            # warmup-1 translations, silently writing KV to wrong SWA locations.
+            # model.forward() bypasses _forward_raw(), so invalidate manually.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 

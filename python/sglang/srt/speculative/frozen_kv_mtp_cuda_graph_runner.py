@@ -288,8 +288,6 @@ class FrozenKVMTPCudaGraphRunner:
         )
 
         def run_once():
-            # Invalidate SWA loc translation cache — same fix as in
-            # cuda_graph_runner.run_once.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 

@@ -192,10 +192,9 @@ class SWAKVPool(BaseSWAKVPool):
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
-                logger.error(
-                    "translate_loc_from_full_to_swa: loc tensor changed within a "
-                    "forward pass without invalidate_loc_cache() — possible missing "
-                    "invalidation call site. Falling back to loc translation."
+                logger.warning(
+                    "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
+                    "without invalidate_loc_cache() — possible missing call site"
                 )
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
