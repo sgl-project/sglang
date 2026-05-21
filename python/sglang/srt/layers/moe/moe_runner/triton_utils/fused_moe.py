@@ -728,7 +728,10 @@ def _fused_moe_kernel_sequence(
             ).squeeze(dim=1)
         else:
             # According to micro benchmark results, torch.compile can get better performance for small token.
-            if num_tokens <= 32:
+            if (
+                not get_global_server_args().enable_deterministic_inference
+                and num_tokens <= 32
+            ):
                 moe_sum_reduce_torch_compile(
                     intermediate_cache3.view(*intermediate_cache3.shape),
                     out_hidden_states,
