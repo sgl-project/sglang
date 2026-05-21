@@ -260,19 +260,39 @@ class ViTCudaGraphRunner:
 
         import time as _time
 
-        B = self.BUCKET_SIZES[-1]
-        t0 = _time.monotonic()
-        self._eager_fallback(
-            self.input_bufs[B],
-            self.forward_metadatas[B],
-            self.rotary_cos_bufs[B],
-            self.rotary_sin_bufs[B],
+        # Warmup with a large token count (larger than any typical image)
+        # to absorb first-call CUDA initialization for large problem sizes.
+        WARMUP_TOKENS = 34048  # > typical max ~33600
+        cfg = self.config
+        warmup_x = torch.zeros(
+            WARMUP_TOKENS, 1, cfg.hidden_dim, device=self.device, dtype=self.dtype
         )
+        warmup_cos = torch.zeros(
+            WARMUP_TOKENS, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+        warmup_sin = torch.zeros(
+            WARMUP_TOKENS, cfg.rotary_dim, device=self.device, dtype=self.dtype
+        )
+        warmup_cu = torch.tensor(
+            [0, WARMUP_TOKENS], device=self.device, dtype=torch.int32
+        )
+        warmup_sl = torch.tensor([WARMUP_TOKENS], device=self.device, dtype=torch.int32)
+        warmup_meta = VisionAttentionMetadata(
+            cu_seqlens=warmup_cu,
+            seq_lens=warmup_sl,
+            max_seqlen=WARMUP_TOKENS,
+        )
+
+        t0 = _time.monotonic()
+        self._eager_fallback(warmup_x, warmup_meta, warmup_cos, warmup_sin)
         torch.get_device_module(self.device).synchronize()
         t1 = _time.monotonic()
         logger.info(
-            "[VIT_GRAPH] eager warmup took %.1fms (tokens=%d)", (t1 - t0) * 1000, B
+            "[VIT_GRAPH] eager warmup took %.1fms (tokens=%d)",
+            (t1 - t0) * 1000,
+            WARMUP_TOKENS,
         )
+        del warmup_x, warmup_cos, warmup_sin, warmup_cu, warmup_sl, warmup_meta
 
     # ------------------------------------------------------------------
     # Replay
