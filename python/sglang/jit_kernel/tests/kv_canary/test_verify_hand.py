@@ -34,6 +34,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     stamp_clean_chain,
     stamp_pair,
     to_signed_int64,
+    write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_verify,
@@ -1239,6 +1240,57 @@ class TestLayoutAndScheduling:
         assert int(cuda_log.write_index[0].item()) == 0
         assert int(cuda_log.slot_run_counter[0].item()) == 0
         assert int(cuda_log.kernel_run_counter[0].item()) == 1
+
+    def test_disabled_plan_skips_slots_but_counts_kernel(self) -> None:
+        """``VerifyPlan.enable = 0`` skips active entries while still marking the verify launch as run."""
+        canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        slot_idx = 5
+        write_slot_fields(
+            canary_buf=canary_buf,
+            slot_idx=slot_idx,
+            token=42,
+            position=1,
+            prev_hash=to_signed_int64(0x1234),
+            real_kv_hash=0,
+        )
+        plan = make_verify_plan(
+            slot_indices=[slot_idx],
+            positions=[0],
+            prev_slot_indices=[-1],
+            device=_DEVICE,
+        )
+        plan.enable[0] = 0
+
+        log = FakeViolationLog.allocate(capacity=8, device=_DEVICE)
+        log.ring.fill_(-777)
+        log.write_index[0] = 3
+        log.slot_run_counter[0] = 11
+        log.kernel_run_counter[0] = 13
+        ring_before = log.ring.clone()
+        write_index_before = log.write_index.clone()
+        slot_run_before = log.slot_run_counter.clone()
+        kernel_run_before = log.kernel_run_counter.clone()
+
+        canary_verify_step(
+            canary_buf=canary_buf,
+            plan=plan,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=log.ring,
+            violation_write_index=log.write_index,
+            slot_run_counter=log.slot_run_counter,
+            kernel_run_counter=log.kernel_run_counter,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(log.ring, ring_before)
+        assert torch.equal(log.write_index, write_index_before)
+        assert torch.equal(log.slot_run_counter, slot_run_before)
+        assert (
+            int(log.kernel_run_counter[0].item())
+            == int(kernel_run_before[0].item()) + 1
+        )
 
     def test_paged_layout_page_size_16(self) -> None:
         """page_size=16: slot→page mapping doesn't change verify chain semantics on a clean chain."""
