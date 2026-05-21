@@ -218,20 +218,10 @@ class CanaryE2EBase(CustomTestCase):
             ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
         emitted by ViolationReporter. Raises AssertionError if no matching line found.
         """
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text()
-        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
-        for match in line_re.finditer(log_text):
-            tag = match.group(1)
-            reason_field = match.group(2)
-            if not fnmatch.fnmatchcase(tag, launch_tag_pattern):
-                continue
-            if fail_reason in reason_field.split("+"):
-                return
-        raise AssertionError(
-            f"No canary violation matching launch_tag={launch_tag_pattern!r} "
-            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
-            f"{log_text[-2000:]}"
+        self.assert_violation_logged_any(
+            launch_tag_patterns=(launch_tag_pattern,),
+            fail_reason=fail_reason,
+            flush_wait_seconds=flush_wait_seconds,
         )
 
     def assert_violation_logged_any(
