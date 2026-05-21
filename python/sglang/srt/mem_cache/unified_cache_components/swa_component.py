@@ -254,6 +254,9 @@ class SWAComponent(TreeComponent):
             ].clone()
         else:
             new_parent.component_data[self.component_type].value = None
+            full_value = new_parent.component_data[BASE_COMPONENT_TYPE].value
+            if full_value is not None:
+                self.cache.token_to_kv_pool_allocator.clear_swa_mapping(full_value)
 
         child_swa_host_value = child.component_data[self.component_type].host_value
         if child_swa_host_value is not None:
@@ -289,16 +292,18 @@ class SWAComponent(TreeComponent):
         host_freed = 0
 
         # Device layer
-        if EvictLayer.DEVICE in target and cd.value is not None:
-            # Pass full indices to free_swa so slots with no SWA pair are
-            # skipped. Freeing swa_value directly would double free those
-            # entries since they all map to the same sentinel slot.
-            self.cache.token_to_kv_pool_allocator.free_swa(
-                node.component_data[BASE_COMPONENT_TYPE].value
-            )
-            freed = len(cd.value)
-            self.cache.component_evictable_size_[ct] -= freed
-            cd.value = None
+        if EvictLayer.DEVICE in target:
+            full_value = node.component_data[BASE_COMPONENT_TYPE].value
+            if cd.value is not None:
+                # Pass full indices to free_swa so slots with no SWA pair are
+                # skipped. Freeing swa_value directly would double free those
+                # entries since they all map to the same sentinel slot.
+                self.cache.token_to_kv_pool_allocator.free_swa(full_value)
+                freed = len(cd.value)
+                self.cache.component_evictable_size_[ct] -= freed
+                cd.value = None
+            elif full_value is not None:
+                self.cache.token_to_kv_pool_allocator.clear_swa_mapping(full_value)
 
         # Host layer
         host_lru = self.cache.host_lru_lists[ct]
