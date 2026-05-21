@@ -25,7 +25,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -602,6 +605,92 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def _start_heartbeat_checker_thread(self):
+        """Start the heartbeat checker thread for Decode worker."""
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_info_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+                            self._on_heartbeat_success(bootstrap_addr)
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _on_heartbeat_success(self, bootstrap_addr: str):
+        """Hook called on successful heartbeat. Override for backend-specific cleanup."""
+        pass
+
+    def _handle_node_failure(self, failed_bootstrap_addr: str):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
+                self.record_failure(
+                    room,
+                    f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+                )
+                self.update_status(room, KVPoll.Failed)
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} transfers affected"
+        )
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -675,10 +764,10 @@ class CommonKVSender(BaseKVSender):
         )
 
     def pop_decode_prefix_len(self) -> int:
-        return 0
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
-        return num_pages > 0
+        return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
@@ -699,12 +788,58 @@ class CommonKVSender(BaseKVSender):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
 
+    def _prepare_send(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
+        """Common pre-processing for send(): index tracking and CP-rank handling.
+
+        Returns:
+            (kv_indices, index_slice, is_last_chunk, should_skip)
+            If should_skip is True, the caller should return immediately.
+        """
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        self.curr_idx += len(kv_indices)
+        is_last_chunk = self.curr_idx == self.num_kv_indices
+
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return kv_indices, index_slice, is_last_chunk, True
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return kv_indices, index_slice, is_last_chunk, True
+
+        return kv_indices, index_slice, is_last_chunk, False
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
         pass
+
+    def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
+        """Check if bootstrapping has timed out. Returns KVPoll.Failed if timed out, None otherwise."""
+        init_time = getattr(self, "init_time", None)
+        if init_time is None:
+            return None
+        elapsed = time.time() - init_time
+        if elapsed >= self.kv_mgr.bootstrap_timeout:
+            reason = (
+                f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+                "in KVPoll.Bootstrapping"
+            )
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.conclude_state = KVPoll.Failed
+            return KVPoll.Failed
+        return None
 
     def poll(self) -> KVPoll:
         pass
@@ -913,6 +1048,23 @@ class CommonKVReceiver(BaseKVReceiver):
         state_indices: Optional[List[int]] = None,
     ):
         raise NotImplementedError
+
+    def _check_waiting_timeout(self) -> Optional[KVPoll]:
+        """Check if waiting for KV transfer has timed out.
+        Returns KVPoll.Failed if timed out, None otherwise."""
+        init_time = getattr(self, "init_time", None)
+        if init_time is None:
+            return None
+        elapsed = time.time() - init_time
+        if elapsed >= self.kv_mgr.waiting_timeout:
+            reason = (
+                f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+                "in KVPoll.WaitingForInput"
+            )
+            self.kv_mgr.record_failure(self.bootstrap_room, reason)
+            self.conclude_state = KVPoll.Failed
+            return KVPoll.Failed
+        return None
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
