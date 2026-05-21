@@ -1503,9 +1503,32 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         import gc
+        import time as _gc_time
 
-        gc.disable()
-        logger.info("[GC] disabled for event_loop_normal")
+        def _gc_callback(phase, info):
+            if phase == "start":
+                gc._debug_t0 = _gc_time.monotonic()
+                gc._debug_gen = info.get("generation", -1)
+            elif phase == "stop":
+                dur = (
+                    _gc_time.monotonic()
+                    - getattr(gc, "_debug_t0", _gc_time.monotonic())
+                ) * 1000
+                gen = getattr(gc, "_debug_gen", -1)
+                collected = info.get("collected", 0)
+                uncollectable = info.get("uncollectable", 0)
+                if dur > 5:
+                    logger.info(
+                        "[GC] gen=%d collected=%d uncollectable=%d dur=%.1fms ts=%.6f",
+                        gen,
+                        collected,
+                        uncollectable,
+                        dur,
+                        _gc_time.time(),
+                    )
+
+        gc.callbacks.append(_gc_callback)
+        logger.info("[GC] callback installed, thresholds=%s", gc.get_threshold())
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1533,10 +1556,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        import gc
-
-        gc.disable()
-        logger.info("[GC] disabled for event_loop_overlap")
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
