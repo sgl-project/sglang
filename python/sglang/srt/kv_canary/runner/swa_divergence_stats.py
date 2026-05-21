@@ -34,10 +34,10 @@ class SwaDivergenceStats:
         self._forward_ct: int = 0
 
         self._verify_full_total_device: torch.Tensor = torch.zeros(
-            1, dtype=torch.int64, device=device
+            1, dtype=torch.int32, device=device
         )
         self._verify_swa_total_device: torch.Tensor = torch.zeros(
-            1, dtype=torch.int64, device=device
+            1, dtype=torch.int32, device=device
         )
 
         self._pending_verify_full_future: Optional[FutureTensor] = None
@@ -60,7 +60,7 @@ class SwaDivergenceStats:
             target = self._verify_full_total_device
         else:
             target = self._verify_swa_total_device
-        target.add_(verify_plan.verify_num_valid.to(torch.int64))
+        target.add_(verify_plan.verify_num_valid)
 
     def on_forward_completed(self) -> None:
         self._forward_ct += 1
