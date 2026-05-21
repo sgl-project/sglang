@@ -22,8 +22,8 @@ from sglang.jit_kernel.kv_canary.plan.utils import (
 )
 from sglang.jit_kernel.kv_canary.verify import _assert_contiguous
 
-# Inner-tile width for _plan_entries_kernel. Each (req, j-tile) program owns this many entries along the
-# j-axis of the (bs, max_verify_per_req) logical grid.
+# Inner-tile width for _plan_entries_kernel. Each (req, verify-entry tile) program owns this many entries along
+# the per-req verify-entry axis of the (bs, max_verify_per_req) logical grid.
 _PLAN_VERIFY_INNER_BLOCK: int = 64
 
 
@@ -65,10 +65,10 @@ def launch_plan_entries_kernel(
     if bs == 0 or verify_capacity == 0:
         return
 
-    max_j_tiles = (
+    max_verify_entry_tiles = (
         verify_capacity + _PLAN_VERIFY_INNER_BLOCK - 1
     ) // _PLAN_VERIFY_INNER_BLOCK
-    grid_entries = (bs, max_j_tiles)
+    grid_entries = (bs, max_verify_entry_tiles)
     _plan_entries_kernel[grid_entries](
         req_pool_indices,
         prefix_lens,
@@ -201,39 +201,40 @@ def _plan_entries_kernel(
     REQ_POOL_IDX_PADDING: tl.constexpr,
     TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
-    """Entries kernel: materialize per-req verify entries. Grid = (bs, j_tiles).
+    """Entries kernel: materialize per-req verify entries. Grid = (bs, verify_entry_tiles).
 
-    Each program owns one (req, j-tile) cell. Verify capacity is the upper bound on entries-per-req used to
-    pick the grid; per-req actual count comes from ``verify_offsets[r+1] - verify_offsets[r]``.
+    Each program owns one (request, verify-entry tile) cell. Verify capacity is the upper bound on entries per
+    request used to pick the grid; the actual per-request count comes from adjacent entries in
+    ``verify_offsets``.
     """
-    r = tl.program_id(0)  # scalar
-    tile_idx = tl.program_id(1)  # scalar
+    request_offset = tl.program_id(0)  # scalar
+    verify_tile_index = tl.program_id(1)  # scalar
 
-    rpi = tl.load(req_pool_indices_ptr + r)  # scalar
-    prefix_lens = tl.load(prefix_lens_ptr + r)  # scalar
+    request_pool_index = tl.load(req_pool_indices_ptr + request_offset)  # scalar
+    prefix_lens = tl.load(prefix_lens_ptr + request_offset)  # scalar
 
-    if rpi == REQ_POOL_IDX_PADDING:
+    if request_pool_index == REQ_POOL_IDX_PADDING:
         return
 
     window_start = _compute_window_start(prefix_lens, SWA_WINDOW)  # scalar
 
-    verify_start = tl.load(verify_offsets_ptr + r)  # scalar
-    verify_end = tl.load(verify_offsets_ptr + r + 1)  # scalar
-    my_verify_len = verify_end - verify_start  # scalar
+    verify_start = tl.load(verify_offsets_ptr + request_offset)  # scalar
+    verify_end = tl.load(verify_offsets_ptr + request_offset + 1)  # scalar
+    request_verify_len = verify_end - verify_start  # scalar
 
-    if my_verify_len <= 0:
+    if request_verify_len <= 0:
         return
 
-    j_offs = tile_idx * INNER_BLOCK + tl.arange(0, INNER_BLOCK)  # [INNER_BLOCK]
-    j_mask = j_offs < my_verify_len  # [INNER_BLOCK] bool
+    entry_offsets = verify_tile_index * INNER_BLOCK + tl.arange(0, INNER_BLOCK)
+    entry_mask = entry_offsets < request_verify_len  # [INNER_BLOCK] bool
 
-    positions = window_start + j_offs  # [INNER_BLOCK]
-    slot, prev_slot = _load_verify_entry_slots(
+    positions = window_start + entry_offsets  # [INNER_BLOCK]
+    slot, previous_slot = _load_verify_entry_slots(
         req_to_token_ptr,
         full_to_swa_lut_ptr,
-        rpi,
+        request_pool_index,
         positions,
-        j_mask,
+        entry_mask,
         req_to_token_stride0,
         swa_lut_len,
         INNER_BLOCK,
@@ -247,10 +248,10 @@ def _plan_entries_kernel(
         out_verify_prev_slot_indices_ptr,
         slot,
         positions,
-        prev_slot,
+        previous_slot,
         verify_start,
-        j_offs,
-        j_mask,
+        entry_offsets,
+        entry_mask,
         verify_capacity,
     )
 
@@ -259,55 +260,57 @@ def _plan_entries_kernel(
 def _load_verify_entry_slots(
     req_to_token_ptr,
     full_to_swa_lut_ptr,
-    rpi,
+    request_pool_index,
     positions,
-    j_mask,
+    entry_mask,
     req_to_token_stride0,
     swa_lut_len,
     INNER_BLOCK: tl.constexpr,
     HAS_SWA_LUT: tl.constexpr,
     TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
-    rpi_i64 = rpi.to(tl.int64)  # scalar
+    request_pool_index_i64 = request_pool_index.to(tl.int64)  # scalar
     stride_i64 = req_to_token_stride0  # scalar
     positions_i64 = positions.to(tl.int64)  # [INNER_BLOCK]
 
     slot_full = tl.load(  # [INNER_BLOCK]
-        req_to_token_ptr + rpi_i64 * stride_i64 + positions_i64,
-        mask=j_mask,
+        req_to_token_ptr + request_pool_index_i64 * stride_i64 + positions_i64,
+        mask=entry_mask,
         other=TOKEN_TO_KV_SLOT_PADDING,
     )
 
-    prev_pos_valid = (positions > 0) & j_mask  # [INNER_BLOCK] bool
-    prev_positions_i64 = (positions - 1).to(tl.int64)  # [INNER_BLOCK]
-    safe_prev_positions_i64 = tl.where(
-        prev_pos_valid, prev_positions_i64, 0
+    previous_position_valid = (positions > 0) & entry_mask  # [INNER_BLOCK] bool
+    previous_positions_i64 = (positions - 1).to(tl.int64)  # [INNER_BLOCK]
+    safe_previous_positions_i64 = tl.where(
+        previous_position_valid, previous_positions_i64, 0
     )  # [INNER_BLOCK]
-    prev_slot_full = tl.load(  # [INNER_BLOCK]
-        req_to_token_ptr + rpi_i64 * stride_i64 + safe_prev_positions_i64,
-        mask=prev_pos_valid,
+    previous_slot_full = tl.load(  # [INNER_BLOCK]
+        req_to_token_ptr
+        + request_pool_index_i64 * stride_i64
+        + safe_previous_positions_i64,
+        mask=previous_position_valid,
         other=TOKEN_TO_KV_SLOT_PADDING,
     )
 
     if HAS_SWA_LUT:
         slot = _swa_translate_tile(
-            slot_full, j_mask, full_to_swa_lut_ptr, swa_lut_len
+            slot_full, entry_mask, full_to_swa_lut_ptr, swa_lut_len
         )  # [INNER_BLOCK]
-        prev_translated = _swa_translate_tile(  # [INNER_BLOCK]
-            prev_slot_full,
-            prev_pos_valid,
+        previous_translated = _swa_translate_tile(  # [INNER_BLOCK]
+            previous_slot_full,
+            previous_position_valid,
             full_to_swa_lut_ptr,
             swa_lut_len,
         )
     else:
         slot = slot_full
-        prev_translated = prev_slot_full
+        previous_translated = previous_slot_full
 
     chain_head_tile = tl.full((INNER_BLOCK,), -1, dtype=slot.dtype)  # [INNER_BLOCK]
-    prev_slot = tl.where(
-        prev_pos_valid, prev_translated, chain_head_tile
+    previous_slot = tl.where(
+        previous_position_valid, previous_translated, chain_head_tile
     )  # [INNER_BLOCK]
-    return slot, prev_slot
+    return slot, previous_slot
 
 
 @triton.jit
@@ -317,28 +320,28 @@ def _store_verify_entries(
     out_verify_prev_slot_indices_ptr,
     slot,
     positions,
-    prev_slot,
+    previous_slot,
     verify_start,
-    j_offs,
-    j_mask,
+    entry_offsets,
+    entry_mask,
     verify_capacity,
 ):
-    out_offs = verify_start + j_offs  # [INNER_BLOCK]
-    cap_mask = out_offs < verify_capacity  # [INNER_BLOCK] bool
-    write_mask = j_mask & cap_mask  # [INNER_BLOCK] bool
+    out_offsets = verify_start + entry_offsets  # [INNER_BLOCK]
+    capacity_mask = out_offsets < verify_capacity  # [INNER_BLOCK] bool
+    write_mask = entry_mask & capacity_mask  # [INNER_BLOCK] bool
 
     tl.store(
-        out_verify_slot_indices_ptr + out_offs,
+        out_verify_slot_indices_ptr + out_offsets,
         slot.to(tl.int64),
         mask=write_mask,
     )
     tl.store(
-        out_verify_positions_ptr + out_offs,
+        out_verify_positions_ptr + out_offsets,
         positions.to(tl.int64),
         mask=write_mask,
     )
     tl.store(
-        out_verify_prev_slot_indices_ptr + out_offs,
-        prev_slot.to(tl.int64),
+        out_verify_prev_slot_indices_ptr + out_offsets,
+        previous_slot.to(tl.int64),
         mask=write_mask,
     )
