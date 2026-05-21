@@ -252,10 +252,11 @@ class ViTCudaGraphRunner:
         import logging
 
         logger = logging.getLogger(__name__)
-        # DEBUG: only capture smallest bucket to test if issue is binary
-        for B in self.BUCKET_SIZES[:1]:
+        # DEBUG: capture subset to find threshold
+        debug_buckets = [32, 64, 128, 256, 512, 1024]
+        for B in debug_buckets:
             self._capture(B)
-        logger.info("[VIT_GRAPH] capture_all done (debug: only bucket=%d)", B)
+        logger.info("[VIT_GRAPH] capture_all done, buckets=%s", debug_buckets)
 
     # ------------------------------------------------------------------
     # Replay
