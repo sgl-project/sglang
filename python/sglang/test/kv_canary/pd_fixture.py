@@ -61,7 +61,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
         n: int,
         *,
         assert_all_success: bool = True,
-        max_new_tokens: int = 4,
+        max_new_tokens: int = 1,
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests with short prompts so each request fits
