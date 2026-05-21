@@ -973,7 +973,7 @@ impl Router {
         })?;
 
         let service_discovery_config = if self.service_discovery {
-            Some(service_discovery::ServiceDiscoveryConfig {
+            let config = service_discovery::ServiceDiscoveryConfig {
                 enabled: true,
                 selector: self.selector.clone(),
                 check_interval: std::time::Duration::from_secs(60),
@@ -985,7 +985,10 @@ impl Router {
                 bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
                 router_selector: HashMap::new(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-            })
+                igw_mode: self.enable_igw,
+            };
+            config.warn_if_misconfigured();
+            Some(config)
         } else {
             None
         };
