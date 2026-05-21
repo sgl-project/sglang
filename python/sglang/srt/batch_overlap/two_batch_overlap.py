@@ -691,8 +691,6 @@ class TboForwardBatchPreparer:
             "is_extend_in_batch",
             "all_extend_in_batch",
             "return_logprob",
-            "req_to_token_pool",
-            "token_to_kv_pool",
             "can_run_dp_cuda_graph",
             "dp_padding_mode",
             "global_forward_mode",
