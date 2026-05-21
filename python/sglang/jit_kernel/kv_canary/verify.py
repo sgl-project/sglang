@@ -205,8 +205,9 @@ def canary_verify_step(
 ) -> None:
     """Verify one canary buffer against a VerifyPlan.
 
-    One CUDA thread per active verify entry. Each thread reads the slot's 4 stored int64 fields (token_id,
-    position, prev_hash, real_kv_hash), recomputes the expected prev_hash from the predecessor slot (or from
+    A fixed persistent grid of `kPersistentBlocks * kVerifyBlockSize` CUDA threads grid-strides over active
+    verify entries. Each thread reads the slot's 4 stored int64 fields (token_id, position, prev_hash,
+    real_kv_hash), recomputes the expected prev_hash from the predecessor slot (or from
     splitmix64(CANARY_CHAIN_ANCHOR) for chain heads, signaled by prev_slot_idx == -1), and atomically appends
     any mismatch (chain hash / position / real_kv_hash) to violation_ring. Read-only on canary_buf.
 
@@ -239,9 +240,10 @@ def canary_verify_step(
     ``memory_pool.py:152``. All canary-attached pools MUST reserve slot 0 (free_slots starts at 1).
 
     Implementation:
-        - CUDA __global__ `canary_verify_kernel`: 1-D grid `((verify_capacity + 127) / 128, 1, 1)` blocks ×
-          `(128, 1, 1)` threads; tid = blockIdx.x * 128 + threadIdx.x = one verify entry. Early-exit on
-          tid >= plan.verify_num_valid[0].
+        - CUDA __global__ `canary_verify_kernel`: fixed 1-D grid `(kPersistentBlocks=64, 1, 1)` blocks ×
+          `(kVerifyBlockSize=128, 1, 1)` threads (= 8192 threads total). Each thread grid-strides over
+          verify entries `entry_idx ∈ [tid, tid + grid_threads, ...)` until
+          `min(plan.verify_num_valid[0], verify_capacity)`.
         - Per thread, gather:
           (a) self_slot = canary_buf[plan.verify_slot_indices[tid]] (32 B uint8 load, vectorized as 4× int64).
           (b) prev_slot = canary_buf[plan.verify_prev_slot_indices[tid]] when prev >= 0 (same shape); else
