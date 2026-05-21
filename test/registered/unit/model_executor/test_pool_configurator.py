@@ -358,6 +358,10 @@ class TestDSAModelConfigurator(unittest.TestCase):
     def _align_up(value, page_size):
         return ((value + page_size - 1) // page_size) * page_size
 
+    @staticmethod
+    def _describe_bytes(num_bytes):
+        return f"{num_bytes / 1024**3:.2f} GiB ({num_bytes} bytes)"
+
     def _expected_hisparse_pool_size(self, buffer_size, batch_size):
         return self._align_up(buffer_size * batch_size, self.PAGE_SIZE)
 
@@ -388,7 +392,17 @@ class TestDSAModelConfigurator(unittest.TestCase):
 
                 actual_gpu_bytes = _actual_memory_used(mr, config)
 
-                self.assertLessEqual(actual_gpu_bytes, available_gpu)
+                self.assertLessEqual(
+                    actual_gpu_bytes,
+                    available_gpu,
+                    msg=(
+                        "GPU memory overflow for non-HiSparse DSA config: "
+                        f"actual_gpu={self._describe_bytes(actual_gpu_bytes)}, "
+                        f"available_gpu={self._describe_bytes(available_gpu)}, "
+                        f"available_gpu_gb={available_gpu_gb}, "
+                        f"max_total_num_tokens={config.max_total_num_tokens}"
+                    ),
+                )
                 self.assertEqual(config.max_total_num_tokens % self.PAGE_SIZE, 0)
 
     def test_hisparse_gpu_and_cpu_pool_fit_memory_budget(self):
@@ -448,12 +462,43 @@ class TestDSAModelConfigurator(unittest.TestCase):
                                 config,
                                 host_to_device_ratio,
                             )
+                            indexer_bytes = actual_gpu_bytes - hot_main_bytes
 
                             self.assertGreaterEqual(
                                 config.max_total_num_tokens, hot_tokens
                             )
-                            self.assertLessEqual(actual_gpu_bytes, available_gpu)
-                            self.assertLessEqual(actual_cpu_bytes, available_cpu)
+                            self.assertLessEqual(
+                                actual_gpu_bytes,
+                                available_gpu,
+                                msg=(
+                                    "GPU memory overflow for HiSparse DSA config: "
+                                    f"actual_gpu={self._describe_bytes(actual_gpu_bytes)}, "
+                                    f"available_gpu={self._describe_bytes(available_gpu)}, "
+                                    f"hot_main_kv={self._describe_bytes(hot_main_bytes)}, "
+                                    f"indexer={self._describe_bytes(indexer_bytes)}, "
+                                    f"available_gpu_gb={available_gpu_gb}, "
+                                    f"buffer_size={buffer_size}, "
+                                    f"batch_size={batch_size}, "
+                                    f"host_to_device_ratio={host_to_device_ratio}, "
+                                    f"hot_tokens={hot_tokens}, "
+                                    f"max_total_num_tokens={config.max_total_num_tokens}"
+                                ),
+                            )
+                            self.assertLessEqual(
+                                actual_cpu_bytes,
+                                available_cpu,
+                                msg=(
+                                    "CPU memory overflow for HiSparse DSA config: "
+                                    f"actual_cpu={self._describe_bytes(actual_cpu_bytes)}, "
+                                    f"available_cpu={self._describe_bytes(available_cpu)}, "
+                                    f"available_gpu_gb={available_gpu_gb}, "
+                                    f"buffer_size={buffer_size}, "
+                                    f"batch_size={batch_size}, "
+                                    f"host_to_device_ratio={host_to_device_ratio}, "
+                                    f"hot_tokens={hot_tokens}, "
+                                    f"max_total_num_tokens={config.max_total_num_tokens}"
+                                ),
+                            )
                             self.assertEqual(
                                 config.max_total_num_tokens % self.PAGE_SIZE, 0
                             )
