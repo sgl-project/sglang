@@ -7,10 +7,13 @@ This file is a platform abstraction for ROCm GPUs,
 adjusted to match the structure and interface of `cuda.py`.
 """
 
+import types
 from functools import lru_cache
 from typing import Any
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.platforms.interface import (
@@ -199,6 +202,7 @@ class RocmPlatform(Platform):
           is selected for each distinct input shape (benefits Conv3d-heavy VAE
           decode).
         - Replace nn.GroupNorm with AITer GroupNorm when available.
+        - Replace CausalConv3d (3x3x3) with temporal-unfolded batched Conv2D.
         """
         if envs.SGLANG_USE_ROCM_CUDNN_BENCHMARK and not torch.backends.cudnn.benchmark:
             torch.backends.cudnn.benchmark = True
@@ -206,22 +210,35 @@ class RocmPlatform(Platform):
                 "Enabled cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers"
             )
 
-        if not envs.SGLANG_USE_ROCM_VAE:
-            return vae
-        try:
-            from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
+        if envs.SGLANG_USE_ROCM_VAE:
+            try:
+                from aiter.ops.groupnorm import GroupNorm as AiterGroupNorm
 
-            count = cls._replace_groupnorm(vae, AiterGroupNorm)
-            if count > 0:
-                logger.info(
-                    "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
-                    count,
+                count = cls._replace_groupnorm(vae, AiterGroupNorm)
+                if count > 0:
+                    logger.info(
+                        "Replaced %d nn.GroupNorm modules with AITer GroupNorm in VAE",
+                        count,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to apply AITer GroupNorm to VAE.",
+                    exc_info=True,
                 )
-        except Exception:
-            logger.warning(
-                "Failed to apply AITer GroupNorm to VAE.",
-                exc_info=True,
-            )
+
+        use_bf16 = envs.SGLANG_USE_ROCM_VAE_CONV2D_BF16
+        use_conv2d = envs.SGLANG_USE_ROCM_VAE_CONV2D or use_bf16
+        if use_conv2d:
+            count = cls._replace_conv3d_with_conv2d(vae, use_bf16=use_bf16)
+            if count > 0:
+                mode = "BF16" if use_bf16 else "same dtype"
+                logger.info(
+                    "Replaced %d CausalConv3d modules with batched Conv2D "
+                    "(compute=%s) in VAE",
+                    count,
+                    mode,
+                )
+
         return vae
 
     @staticmethod
@@ -244,6 +261,137 @@ class RocmPlatform(Platform):
             else:
                 count += RocmPlatform._replace_groupnorm(child, aiter_gn_cls)
         return count
+
+    @staticmethod
+    def _conv3d_as_batched_conv2d(
+        x_padded: torch.Tensor,
+        weight_2d: torch.Tensor,
+        bias: torch.Tensor | None,
+        stride: tuple[int, ...],
+        kt: int,
+        compute_bf16: bool = False,
+    ) -> torch.Tensor:
+        """Replace F.conv3d with temporal-unfolded batched Conv2D.
+
+        ``x_padded`` must already be spatially/temporally padded so that
+        ``F.conv3d(x_padded, weight, bias, stride, padding=0)`` would produce
+        the correct output.  This routine unfolds along the temporal axis,
+        reshapes into a batch of 2-D frames, runs ``F.conv2d``, and folds the
+        result back.
+
+        *weight_2d* is the pre-transformed 2-D kernel
+        ``[C_out, Kt*C_in, Kh, Kw]``, cached at patch time to avoid
+        redundant permute/reshape on every forward call.
+
+        When *compute_bf16* is True the convolution is executed in BF16 and
+        the output is cast back to the original dtype.
+        """
+        orig_dtype = x_padded.dtype
+        N, C_in, T, H, W = x_padded.shape
+        C_out = weight_2d.shape[0]
+        stride_t, stride_h, stride_w = stride
+
+        T_out = (T - kt) // stride_t + 1
+
+        # (N, C_in, T, H, W) -> (N, T_out, Kt, C_in, H, W) -> (N*T_out, Kt*C_in, H, W)
+        unfolded = x_padded.unfold(2, kt, stride_t)
+        unfolded = unfolded.permute(0, 2, 5, 1, 3, 4).reshape(
+            N * T_out, kt * C_in, H, W
+        )
+
+        w = weight_2d
+        if compute_bf16 and orig_dtype != torch.bfloat16:
+            unfolded = unfolded.to(torch.bfloat16)
+            w = w.to(torch.bfloat16)
+            b = bias.to(torch.bfloat16) if bias is not None else None
+        else:
+            b = bias
+
+        out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
+
+        if compute_bf16 and orig_dtype != torch.bfloat16:
+            out = out.to(orig_dtype)
+
+        _, _, H_out, W_out = out.shape
+        return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
+
+    @staticmethod
+    def _replace_conv3d_with_conv2d(
+        module: torch.nn.Module, use_bf16: bool = False
+    ) -> int:
+        """Walk *module* and patch every CausalConv3d that has a 3-D kernel.
+
+        A ``CausalConv3d`` is identified as any ``nn.Conv3d`` subclass that
+        carries a ``_padding`` attribute (set by the Wan / diffusers causal
+        conv wrapper).  Only modules whose kernel is truly 3-D (Kt>1, Kh>1,
+        Kw>1) are replaced; pointwise or 1-D-temporal convolutions are left
+        untouched.  Modules with non-default ``groups`` or ``dilation`` are
+        skipped as the 2-D decomposition assumes groups=1 and dilation=1.
+        """
+        patched = 0
+        skipped = 0
+        for _name, child in module.named_modules():
+            if not isinstance(child, nn.Conv3d):
+                continue
+            if not hasattr(child, "_padding"):
+                continue
+            kt, kh, kw = child.kernel_size
+            if kt <= 1 or kh <= 1 or kw <= 1:
+                skipped += 1
+                continue
+            if child.groups != 1 or any(d != 1 for d in child.dilation):
+                skipped += 1
+                continue
+
+            padding = child._padding
+            stride = child.stride
+
+            # Pre-compute the 2-D weight: [C_out, C_in, Kt, Kh, Kw]
+            # -> [C_out, Kt*C_in, Kh, Kw]  (cached as a buffer)
+            weight_2d = (
+                child.weight.data.permute(0, 2, 1, 3, 4)
+                .reshape(child.out_channels, kt * child.in_channels, kh, kw)
+                .contiguous()
+            )
+            child.register_buffer("_weight_2d", weight_2d)
+
+            def _patched_forward(
+                self,
+                x,
+                cache_x=None,
+                *,
+                _padding=padding,
+                _stride=stride,
+                _kt=kt,
+                _bf16=use_bf16,
+            ):
+                pad = list(_padding)
+                if cache_x is not None and _padding[4] > 0:
+                    cache_x = cache_x.to(x.device)
+                    x = torch.cat([cache_x, x], dim=2)
+                    pad[4] -= cache_x.shape[2]
+                x = F.pad(x, pad)
+                x = x.to(self.weight.dtype)
+                return RocmPlatform._conv3d_as_batched_conv2d(
+                    x,
+                    self._weight_2d,
+                    self.bias,
+                    _stride,
+                    _kt,
+                    compute_bf16=_bf16,
+                )
+
+            child.forward = types.MethodType(_patched_forward, child)
+            patched += 1
+
+        logger.info(
+            "Conv3D→Conv2D: patched %d CausalConv3d (3D kernel, compute=%s), "
+            "skipped %d (1D/pointwise/grouped)",
+            patched,
+            "BF16" if use_bf16 else "same dtype",
+            skipped,
+        )
+        return patched
 
     @classmethod
     def enable_dit_layerwise_offload_for_wan_by_default(cls) -> bool:

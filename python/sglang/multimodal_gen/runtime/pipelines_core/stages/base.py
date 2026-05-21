@@ -9,12 +9,19 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from enum import Enum, auto
 
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -33,6 +40,8 @@ class StageParallelismType(Enum):
     MAIN_RANK_ONLY = auto()
     # this stage requires a cfg-parallel
     CFG_PARALLEL = auto()
+    # executed on main rank only and send result to other ranks
+    MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
 
 
 class StageVerificationError(Exception):
@@ -41,7 +50,7 @@ class StageVerificationError(Exception):
     pass
 
 
-class PipelineStage(ABC):
+class PipelineStage(StageDedupMixin, ABC):
     """
     Abstract base class for all pipeline stages.
 
@@ -52,6 +61,9 @@ class PipelineStage(ABC):
 
     def __init__(self):
         self.server_args = get_global_server_args()
+        self._component_residency_manager = None
+        self._registered_stage_name: str | None = None
+        self._profile_stage_name: str | None = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -103,6 +115,96 @@ class PipelineStage(ABC):
         Offload the model for the stage.
         """
         pass
+
+    def set_component_residency_manager(self, manager) -> None:
+        self._component_residency_manager = manager
+
+    def set_registered_stage_name(self, stage_name: str) -> None:
+        self._registered_stage_name = stage_name
+
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        self._profile_stage_name = stage_name
+
+    def _component_stage_name(self, stage_name: str | None = None) -> str:
+        return (
+            stage_name
+            or getattr(self, "_registered_stage_name", None)
+            or self.__class__.__name__
+        )
+
+    def _active_component_stage_name(self) -> str:
+        manager = getattr(self, "_component_residency_manager", None)
+        manager_state = getattr(manager, "state", None)
+        manager_stage_name = getattr(manager_state, "stage_name", None)
+        if manager_stage_name is not None:
+            return manager_stage_name
+        return self._component_stage_name()
+
+    def _active_profile_stage_name(self) -> str:
+        return getattr(self, "_profile_stage_name", None) or self.__class__.__name__
+
+    def _finish_active_component_use(self) -> None:
+        if self._component_residency_manager is not None:
+            self._component_residency_manager.finish_active_use()
+
+    @contextmanager
+    def _use_component(
+        self,
+        use: ComponentUse,
+        module=None,
+    ) -> Iterator[object | None]:
+        if self._component_residency_manager is None:
+            yield module
+            return
+        with self._component_residency_manager.use_component(use, module) as component:
+            yield component
+
+    def _declared_component_use(
+        self,
+        *,
+        component_name: str,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> ComponentUse:
+        manager = self._component_residency_manager
+        stage_name = self._active_component_stage_name()
+        server_args = manager.server_args if manager is not None else self.server_args
+        for use in self.component_uses(server_args, stage_name):
+            if use.component_name != component_name:
+                continue
+            if phase is not None and use.phase != phase:
+                continue
+            if target_dtype is not None:
+                return replace(use, target_dtype=target_dtype)
+            return use
+        raise ValueError(
+            f"{self.__class__.__name__} did not declare component use: "
+            f"{component_name}"
+        )
+
+    @contextmanager
+    def use_declared_component(
+        self,
+        *,
+        component_name: str,
+        module=None,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> Iterator[object | None]:
+        """reference a component already declared in `component_uses`"""
+        use = self._declared_component_use(
+            component_name=component_name,
+            phase=phase,
+            target_dtype=target_dtype,
+        )
+        with self._use_component(use, module) as component:
+            yield component
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        """Declares component uses of current stage for unified residency scheduling."""
+        return []
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
     @property
@@ -181,12 +283,10 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-
-
         Returns:
             The updated batch information after this stage's processing.
         """
-        stage_name = self.__class__.__name__
+        stage_name = self._active_profile_stage_name()
         # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification

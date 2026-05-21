@@ -20,6 +20,9 @@ def fuse_scale_shift_native(
 def apply_rotary_embedding_native(
     x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: bool = False
 ) -> torch.Tensor:
+    if interleaved and cos.shape[-1] == x.shape[-1]:
+        cos = cos[..., ::2]
+        sin = sin[..., ::2]
     cos = cos.unsqueeze(-2).to(x.dtype)
     sin = sin.unsqueeze(-2).to(x.dtype)
 
@@ -28,6 +31,7 @@ def apply_rotary_embedding_native(
         and x.dim() == 3
         and x.shape[1] < NPU_ROTARY_MUL_MAX_NUM_HEADS
         and x.shape[2] < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        and not interleaved
     ):
         if cos.size(-1) * 2 == x.size(-1):
             cos = torch.cat([cos, cos], dim=-1)

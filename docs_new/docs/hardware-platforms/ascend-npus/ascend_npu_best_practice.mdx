@@ -357,12 +357,12 @@ you encounter issues or have any questions, please [open an issue](https://githu
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-Next-A3B-Instruct</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3.5K+1.5K</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>20ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-3_5k-1_5k-20ms-on-a3-2-cards-mixed-mode">Optimal Configuration</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-next-3_5k-1_5k-20ms-on-a3-1-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-14B</td>
@@ -422,16 +422,6 @@ you encounter issues or have any questions, please [open an issue](https://githu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>50ms</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-235b-a22b-3_5k-1_5k-50ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-235B-A22B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Atlas 800I A3</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>PD Mixed</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>2K+2K</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>100ms</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>W8A8 INT8</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="#qwen3-235b-a22b-2k-2k-100ms-on-a3-8-cards-mixed-mode">Optimal Configuration</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3-235B-A22B</td>
@@ -622,7 +612,6 @@ do
         echo "${P_IP[$i]}"
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_BUFFSIZE=800
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_NPU_FUSED_MOE_MODE=2
         export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=131072
@@ -689,7 +678,7 @@ python -m sglang_router.launch_router \
 We tested it based on the `RANDOM` dataset.
 
 ```shell Command
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 768  --random-input-len 3500 --random-output-len 1500 --num-prompts 3072 --random-range-ratio 1 --request-rate 16
+python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 6688 --max-concurrency 1024 --random-input-len 3584 --random-output-len 1536 --num-prompts 7168 --random-range-ratio 1 --request-rate 40
 ```
 
 ### DeepSeek-R1 2K-2K 50ms on A3 24 Cards Disaggregation Mode
@@ -743,7 +732,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export SGLANG_USE_AG_AFTER_QLORA=1
         export HCCL_SOCKET_IFNAME=lo
@@ -870,7 +858,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -996,7 +983,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
@@ -1185,7 +1171,6 @@ export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
 
 MODEL_PATH=xxx
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -1276,7 +1261,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=2600
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -1383,7 +1367,6 @@ export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=56
 export HCCL_BUFFSIZE=1200
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=512
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_NPU_USE_MLAPO=1
 export SGLANG_ENABLE_SPEC_V2=1
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
@@ -1476,7 +1459,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=3500
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
@@ -1594,7 +1576,6 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1200
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=xxx
         export GLOO_SOCKET_IFNAME=xxx
@@ -1617,8 +1598,8 @@ do
         --nnodes 2 --node-rank $i \
         --disaggregation-bootstrap-port 8995 \
         --moe-dense-tp-size 1 \
-	    --enable-nsa-prefill-context-parallel \
-        --nsa-prefill-cp-mode in-seq-split \
+	    --enable-dsa-prefill-context-parallel \
+        --dsa-prefill-cp-mode in-seq-split \
         --attn-cp-size 32 \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2 \
         --dist-init-addr ${P_IP[0]}:10000
@@ -1761,7 +1742,6 @@ do
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         export STREAMS_PER_DEVICE=32
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         # P节点
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
@@ -1908,78 +1888,6 @@ We tested it based on the `RANDOM` dataset.
 
 ```shell Command
 python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 272 --random-input-len 3500 --random-output-len 1500 --num-prompts 1088 --random-range-ratio 1
-```
-
-### Qwen3-235B-A22B 2K-2K 100ms on A3 8 Cards Mixed Mode
-
-Model: Qwen3-235B-A22B-W8A8
-
-Hardware: Atlas 800I A3 8Card
-
-DeployMode: PD Mixed
-
-Dataset: random
-
-Input Output Length: 2K+2K
-
-TPOT: 100ms
-
-#### Model Deployment
-
-```bash Command
-echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-sysctl -w vm.swappiness=0
-sysctl -w kernel.numa_balancing=0
-sysctl -w kernel.sched_migration_cost_ns=50000
-
-unset https_proxy
-unset http_proxy
-unset HTTPS_PROXY
-unset HTTP_PROXY
-unset ASCEND_LAUNCH_BLOCKING
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /usr/local/Ascend/nnal/atb/set_env.sh
-source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
-export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
-
-export SGLANG_SET_CPU_AFFINITY=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
-
-MODEL_PATH=xxx
-
-LOCAL_HOST1=`hostname -I|awk -F " " '{print$1}'`
-LOCAL_HOST2=`hostname -I|awk -F " " '{print$2}'`
-
-echo "${LOCAL_HOST1}"
-echo "${LOCAL_HOST2}"
-
-export HCCL_BUFFSIZE=1200
-export HCCL_SOCKET_IFNAME=lo
-export GLOO_SOCKET_IFNAME=lo
-export HCCL_OP_EXPANSION_MODE="AIV"
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_SPEC_V2=1
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=144
-
-python -m sglang.launch_server --model-path $MODEL_PATH \
-    --host 127.0.0.1 --port 7439 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim  \
-    --max-running-requests 576 --context-length 8192 --dtype bfloat16 \
-    --chunked-prefill-size 32768 --max-prefill-tokens 458880  \
-    --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
-    --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
-    --disable-radix-cache --moe-a2a-backend deepep  --deepep-mode auto --speculative-draft-model-quantization unquant  \
-    --tp 16 --dp-size 16 --enable-dp-attention --enable-dp-lm-head --mem-fraction-static 0.84 --cuda-graph-bs 8 16 20 24 32 36
-
-```
-
-#### Benchmark
-
-We tested it based on the `RANDOM` dataset.
-
-```shell Command
-python -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7439 --max-concurrency 576 --random-input-len 2000 --random-output-len 2000 --num-prompts 576 --random-range-ratio 1
 ```
 
 ### Qwen3-235B-A22B 2K-2K 50ms on A3 8 Cards Mixed Mode
@@ -2697,7 +2605,6 @@ do
         export TASK_QUEUE_ENABLE=2
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode prefill \
         --host ${P_IP[$i]} --port 8000 --disaggregation-bootstrap-port 8995 --trust-remote-code \
@@ -2794,7 +2701,6 @@ source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=72
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600
 
 MODEL_PATH=xxx
@@ -3458,7 +3364,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 78 \
     --disable-radix-cache --speculative-draft-model-quantization unquant \
     --chunked-prefill-size -1 --max-prefill-tokens 65536  \
@@ -3527,7 +3433,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu  --quantization modelslim  \
+    --attention-backend ascend --device npu \
     --max-running-requests 120 \
     --disable-radix-cache \
     --speculative-algorithm EAGLE3 --speculative-draft-model-path xxx \
@@ -3590,7 +3496,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --max-running-requests 16 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
@@ -3654,7 +3560,7 @@ export SGLANG_ENABLE_SPEC_V2=1
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7339 --trust-remote-code --nnodes 1 --node-rank 0  \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --max-running-requests 8 \
     --disable-radix-cache \
     --speculative-draft-model-quantization unquant \
@@ -3708,7 +3614,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3755,7 +3660,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3803,7 +3707,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=330
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=5
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=3000
@@ -3850,7 +3753,6 @@ python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --mamba-ssm-dtype bfloat16 \
     --base-gpu-id 0 \
     --speculative-draft-model-path /home/weights/Qwen3-Next-80B-A3B-Instruct \
-    --quantization modelslim \
     --moe-a2a-backend deepep --deepep-mode auto \
 ```
 
@@ -3915,7 +3817,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.8 \
     --tp-size 1 --dp-size 1 \
     --sampling-backend ascend --max-running-requests 8 \
@@ -3992,7 +3894,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.89 \
     --tp-size 1 --dp-size 2 \
     --sampling-backend ascend --max-running-requests 144 \
@@ -4068,7 +3970,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.9 \
     --tp-size 1 \
     --max-running-requests 70 \
@@ -4141,7 +4043,7 @@ echo "${LOCAL_HOST2}"
 
 python -m sglang.launch_server --model-path $MODEL_PATH \
     --host 127.0.0.1 --port 7239 --trust-remote-code --nnodes 1 --node-rank 0 \
-    --attention-backend ascend --device npu --quantization modelslim \
+    --attention-backend ascend --device npu \
     --disable-radix-cache --mem-fraction-static 0.894 \
     --tp-size 2 \
     --max-running-requests 1 \
@@ -4163,11 +4065,11 @@ We tested it based on the `RANDOM` dataset.
 python3 -m sglang.bench_serving --dataset-name random --backend sglang --host 127.0.0.1 --port 7239 --max-concurrency 1 --random-output-len 1500 --random-input-len 3500 --num-prompts 4 --random-range-ratio 1
 ```
 
-### Qwen3-Next 3_5K-1_5K 20ms on A3 2 Cards Mixed Mode
+### Qwen3-Next 3_5K-1_5K 20ms on A3 1 Cards Mixed Mode
 
 Model: Qwen3-Next-80B-A3B-Instruct
 
-Hardware: Atlas 800I A3 2Card
+Hardware: Atlas 800I A3 1Card
 
 DeployMode: PD Mixed
 
@@ -4198,7 +4100,6 @@ export PATH=/usr/local/Ascend/8.5.0/compiler/bishengir/bin:$PATH
 export SGLANG_SET_CPU_AFFINITY=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=400
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=10
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
@@ -4231,19 +4132,17 @@ echo "${LOCAL_HOST2}"
 
 python3 -m sglang.launch_server --model-path ${MODEL_PATH} \
     --page-size 128 \
-    --tp-size 4 --dp-size 2 \
+    --tp-size 2 \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --watchdog-timeout 9000 \
     --host 127.0.0.1 --port 6699 \
     --mem-fraction-static 0.85 \
     --disable-radix-cache --max-prefill-tokens 28672 --context-length 26384 --max-total-tokens 122304 \
-    --enable-dp-attention --enable-dp-lm-head \
     --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --speculative-draft-model-quantization unquant \
-    --chunked-prefill-size -1 --max-running-requests 16 \
-    --cuda-graph-bs 2 4 8 \
+    --chunked-prefill-size -1 --max-running-requests 2 \
+    --cuda-graph-bs 2 \
     --mamba-ssm-dtype bfloat16 \
     --speculative-draft-model-path /path/to/Qwen3-Next-80B-A3B-Instruct
 ```

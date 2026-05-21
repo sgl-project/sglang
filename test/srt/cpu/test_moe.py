@@ -302,12 +302,12 @@ class TestFusedExperts(CustomTestCase):
         topk_weight, topk_ids = torch.topk(score, topk)
         awq_w13_weight_pack, awq_w13_zero_pack, awq_w13_scales_pack = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                awq_w13_weight, awq_w13_zero, awq_w13_scales
+                awq_w13_weight, awq_w13_zero, awq_w13_scales, 0
             )
         )
         awq_w2_weight_pack, awq_w2_zero_pack, awq_w2_scales_pack = (
             torch.ops.sgl_kernel.convert_weight_packed_scale_zp(
-                awq_w2_weight, awq_w2_zero, awq_w2_scales
+                awq_w2_weight, awq_w2_zero, awq_w2_scales, 0
             )
         )
 

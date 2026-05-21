@@ -34,17 +34,18 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PrefetchTimeoutConfig,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_nsa_pool_to_hiradix_cache,
+    attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -54,10 +55,11 @@ from sglang.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
     TreeNode,
+)
+from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -84,8 +86,8 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+        elif isinstance(self.kv_cache, DSATokenToKVPool):
+            # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -97,16 +99,14 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
-            )
+            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 
         self.tp_group = params.tp_cache_group
+        self.attn_cp_group = params.attn_cp_cache_group
+        self.attn_tp_group = params.attn_tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.attn_cp_rank = params.attn_cp_rank
-        self.attn_cp_size = params.attn_cp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -114,8 +114,7 @@ class HiRadixCache(RadixCache):
         (
             extra_config,
             prefetch_threshold,
-            prefetch_timeout_base,
-            prefetch_timeout_per_ki_token,
+            prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
@@ -125,8 +124,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            attach_hybrid_nsa_pool_to_hiradix_cache(
+        if isinstance(self.kv_cache, DSATokenToKVPool):
+            attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -134,6 +133,8 @@ class HiRadixCache(RadixCache):
                 prefetch_threshold=prefetch_threshold,
                 enable_storage_metrics=self.enable_storage_metrics,
                 load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
             )
         else:
             self.cache_controller = HiCacheController(
@@ -142,6 +143,8 @@ class HiRadixCache(RadixCache):
                 self.page_size,
                 self.tp_group,
                 load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
                 write_policy=server_args.hicache_write_policy,
                 io_backend=server_args.hicache_io_backend,
                 storage_backend=server_args.hicache_storage_backend,
@@ -150,15 +153,12 @@ class HiRadixCache(RadixCache):
                 storage_backend_extra_config=extra_config,
                 pp_rank=self.pp_rank,
                 pp_size=self.pp_size,
-                attn_cp_rank=self.attn_cp_rank,
-                attn_cp_size=self.attn_cp_size,
                 enable_storage_metrics=self.enable_storage_metrics,
             )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
             prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=self.enable_storage,
             enable_storage_metrics=self.enable_storage_metrics,
@@ -188,6 +188,24 @@ class HiRadixCache(RadixCache):
 
         super().__init__(params=params)
 
+    def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
+        reduced = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
+                reduced = True
+        if not reduced and self.tp_world_size > 1:
+            torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
+
+    def _barrier_attn_groups(self):
+        waited = False
+        for group in (self.attn_cp_group, self.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.barrier(group=group)
+                waited = True
+        if not waited and self.tp_world_size > 1:
+            torch.distributed.barrier(group=self.tp_group)
+
     def shutdown(self):
         """Best-effort auto-detach of storage backend on process shutdown.
 
@@ -205,33 +223,30 @@ class HiRadixCache(RadixCache):
         *,
         storage_backend: Optional[str],
         prefetch_threshold: int,
-        prefetch_timeout_base: float,
-        prefetch_timeout_per_ki_token: float,
+        prefetch_timeout_config: PrefetchTimeoutConfig,
         hicache_storage_pass_prefix_keys: bool,
         enable_storage: bool,
         enable_storage_metrics: bool,
         extra_metric_labels: Optional[Dict[str, str]],
     ) -> None:
-        prefetch_timeout_per_page = (
-            self.page_size / 1024 * prefetch_timeout_per_ki_token
-        )
-
         self.enable_storage = enable_storage
         self.prefetch_threshold = prefetch_threshold
-        self.prefetch_timeout_base = prefetch_timeout_base
-        self.prefetch_timeout_per_page = prefetch_timeout_per_page
+        self.prefetch_timeout_config = prefetch_timeout_config
         self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
         self.enable_storage_metrics = enable_storage_metrics
 
         if self.enable_storage_metrics:
+            attn_cp_rank, attn_cp_size = (
+                self.cache_controller.get_attn_cp_rank_and_size()
+            )
             labels = {
                 "storage_backend": storage_backend,
                 "tp_rank": self.cache_controller.tp_rank,
                 "dp_rank": self.cache_controller.dp_rank,
                 "pp_rank": self.cache_controller.pp_rank,
                 "pp_size": self.cache_controller.pp_size,
-                "attn_cp_rank": self.cache_controller.attn_cp_rank,
-                "attn_cp_size": self.cache_controller.attn_cp_size,
+                "attn_cp_rank": attn_cp_rank,
+                "attn_cp_size": attn_cp_size,
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)
@@ -329,8 +344,7 @@ class HiRadixCache(RadixCache):
             (
                 extra_config,
                 prefetch_threshold,
-                prefetch_timeout_base,
-                prefetch_timeout_per_ki_token,
+                prefetch_timeout_config,
                 hicache_storage_pass_prefix_keys,
             ) = self._parse_storage_backend_extra_config(
                 storage_backend_extra_config_json
@@ -359,8 +373,7 @@ class HiRadixCache(RadixCache):
         self._apply_storage_runtime_config(
             storage_backend=storage_backend,
             prefetch_threshold=prefetch_threshold,
-            prefetch_timeout_base=prefetch_timeout_base,
-            prefetch_timeout_per_ki_token=prefetch_timeout_per_ki_token,
+            prefetch_timeout_config=prefetch_timeout_config,
             hicache_storage_pass_prefix_keys=hicache_storage_pass_prefix_keys,
             enable_storage=True,
             enable_storage_metrics=self._enable_metrics_flag,
@@ -546,7 +559,7 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config: JSON string containing extra configuration
 
         Returns:
-            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_base, prefetch_timeout_per_ki_token, hicache_storage_pass_prefix_keys)
+            tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_config, hicache_storage_pass_prefix_keys)
         """
         # Parse extra config if provided. Extra config can be a JSON string or a json/toml/yaml file path prefixed with "@".
         extra_config = {}
@@ -578,11 +591,17 @@ class HiRadixCache(RadixCache):
                 logger.error(f"Invalid backend extra config JSON: {e}")
                 raise e
 
+        defaults = PrefetchTimeoutConfig()
         prefetch_threshold = extra_config.pop("prefetch_threshold", 256)  # tokens
-        prefetch_timeout_base = extra_config.pop("prefetch_timeout_base", 1)  # seconds
+        prefetch_timeout_base = extra_config.pop(
+            "prefetch_timeout_base", defaults.base
+        )  # seconds
         prefetch_timeout_per_ki_token = extra_config.pop(
-            "prefetch_timeout_per_ki_token", 0.25
+            "prefetch_timeout_per_ki_token", defaults.per_ki_token
         )  # seconds per 1024 tokens
+        prefetch_timeout_max = extra_config.pop(
+            "prefetch_timeout_max", defaults.max
+        )  # seconds, upper bound for the linear timeout
         hicache_storage_pass_prefix_keys = extra_config.pop(
             "hicache_storage_pass_prefix_keys", False
         )
@@ -599,17 +618,26 @@ class HiRadixCache(RadixCache):
             raise ValueError(
                 f"prefetch_timeout_per_ki_token must be number, got {type(prefetch_timeout_per_ki_token).__name__}"
             )
+        if not isinstance(prefetch_timeout_max, (int, float)):
+            raise ValueError(
+                f"prefetch_timeout_max must be number, got {type(prefetch_timeout_max).__name__}"
+            )
         if not isinstance(hicache_storage_pass_prefix_keys, bool):
             raise ValueError(
                 "hicache_storage_pass_prefix_keys must be bool, got "
                 f"{type(hicache_storage_pass_prefix_keys).__name__}"
             )
 
+        prefetch_timeout_config = PrefetchTimeoutConfig(
+            base=float(prefetch_timeout_base),
+            per_ki_token=float(prefetch_timeout_per_ki_token),
+            max=float(prefetch_timeout_max),
+        )
+
         return (
             extra_config,
             prefetch_threshold,
-            float(prefetch_timeout_base),
-            float(prefetch_timeout_per_ki_token),
+            prefetch_timeout_config,
             hicache_storage_pass_prefix_keys,
         )
 
@@ -632,10 +660,11 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
+                indices_from_pool=PoolName.KV,
             )
             return {"extra_pools": [pool]}
         else:
@@ -760,13 +789,8 @@ class HiRadixCache(RadixCache):
                 break
             finish_count += 1
         queue_size = torch.tensor(finish_count, dtype=torch.int, device="cpu")
-        if self.tp_world_size > 1:
-            # synchronize TP workers to make the same update to radix cache
-            torch.distributed.all_reduce(
-                queue_size,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
+        # Keep cache state transitions identical across CPxTP participants.
+        self._all_reduce_attn_groups(queue_size, torch.distributed.ReduceOp.MIN)
 
         finish_count = int(queue_size.item())
         while finish_count > 0:
@@ -948,22 +972,22 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.evicted:
+            if child.backuped:
                 blocked_id = child.id
                 reason = (
-                    f"blocked_by_evicted_child child_id={blocked_id} "
-                    f"(child backuped={child.backuped})"
+                    f"blocked_by_backuped_child child_id={blocked_id} "
+                    f"(child evicted={child.evicted})"
                 )
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                     mutation = (
-                        "removed_from_evictable_host_leaves_child_still_demoted_under_subtree"
+                        "removed_from_evictable_host_leaves_child_still_backuped_under_subtree"
                     )
                 else:
-                    mutation = "cannot_enter_while_demoted_children_remain"
+                    mutation = "cannot_enter_while_backuped_children_remain"
                 self._trace_host_leaf_node(
                     caller="_update_host_leaf_status",
-                    phase="withdraw_blocked_by_demoted_child",
+                    phase="withdraw_blocked_by_backuped_child",
                     node=node,
                     reason=reason,
                     mutation=mutation,
@@ -977,7 +1001,7 @@ class HiRadixCache(RadixCache):
         else:
             mutation = "unchanged_already_in_evictable_host_leaves"
         reason = (
-            "eligible_gpu_evicted_on_host subtree_has_no_demoted_children "
+            "eligible_gpu_evicted_on_host subtree_has_no_backuped_children "
             "and_no_lock_ref"
         )
         self._trace_host_leaf_node(
@@ -1081,7 +1105,7 @@ class HiRadixCache(RadixCache):
             caller="_evict_backuped",
             phase="will_update_gpu_leaf_parent",
             node=parent,
-            reason="parent_device_leaf bookkeeping_after_child_demoted",
+            reason="parent_device_leaf_bookkeeping_after_child_gpu_demoted",
             mutation="observe",
         )
         self._update_leaf_status(parent)
@@ -1202,7 +1226,9 @@ class HiRadixCache(RadixCache):
                 phase="after_parent_host_leaf_refresh",
                 node=x.parent,
                 mutation="observe",
-                reason="may_promote_parent_if_demoted_children_host_subtree_cleared",
+                reason=(
+                    "may_promote_parent_if_no_backuped_children_remain_in_subtree"
+                ),
             )
 
             if len(x.parent.children) == 0 and x.parent.evicted:
@@ -1307,7 +1333,7 @@ class HiRadixCache(RadixCache):
         self,
         params: InitLoadBackParams,
     ):
-        last_node = params.last_host_node
+        last_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
         rid = getattr(req, "rid", None) if req is not None else None
@@ -1351,7 +1377,7 @@ class HiRadixCache(RadixCache):
             )
 
         return (
-            torch.empty((0,), dtype=torch.int64, device=self.device),
+            self._empty_match_result.device_indices,
             last_node,
         )
 
@@ -1390,10 +1416,7 @@ class HiRadixCache(RadixCache):
             ],
             dtype=torch.int,
         )
-        if self.tp_world_size > 1:
-            torch.distributed.all_reduce(
-                qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
-            )
+        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
 
         n_revoke, n_backup, n_release = map(int, qsizes.tolist())
         self._drain_storage_control_queues_impl(
@@ -1405,12 +1428,10 @@ class HiRadixCache(RadixCache):
 
     # Timeout is linearly increasing with the number of pages
     def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation):
-        # If hash_value has not been computed in timeout_base seconds, terminate it.
-        return (
-            time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
-        )
+        cfg = self.prefetch_timeout_config
+        num_tokens = len(operation.hash_value) * self.page_size
+        timeout = min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024)
+        return time.monotonic() - operation.start_time > timeout
 
     def can_terminate_prefetch(self, operation: PrefetchOperation):
         can_terminate = True
@@ -1434,18 +1455,13 @@ class HiRadixCache(RadixCache):
             return True
 
         operation_terminated = operation.is_terminated()
-        if self.tp_world_size > 1:
-            states = torch.tensor(
-                [1 - int(can_terminate), int(operation_terminated)],
-                dtype=torch.int,
-            )
-            torch.distributed.all_reduce(
-                states,
-                op=torch.distributed.ReduceOp.MAX,
-                group=self.tp_group,
-            )
-            can_terminate = states[0].item() == 0
-            operation_terminated = states[1].item() == 1
+        states = torch.tensor(
+            [1 - int(can_terminate), int(operation_terminated)],
+            dtype=torch.int,
+        )
+        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        can_terminate = states[0].item() == 0
+        operation_terminated = states[1].item() == 1
         # the operation should be terminated if it is already terminated on any TP worker
         # or it meets the termination condition on all TP workers
         can_terminate = can_terminate or operation_terminated
@@ -1458,7 +1474,7 @@ class HiRadixCache(RadixCache):
 
         # todo: more policies for prefetch progress such as timeout
         # the current policy is to prefetch with best effort and terminate when queuing is over
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[
+        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
             req_id
         ]
 
@@ -1477,24 +1493,17 @@ class HiRadixCache(RadixCache):
         )
 
         min_completed_tokens = completed_tokens
-        if self.tp_world_size > 1:
-            # synchrnoize TP workers to make the same update to hiradix cache
-            completed_tokens_tensor = torch.tensor(
-                min_completed_tokens, dtype=torch.int
-            )
-            torch.distributed.all_reduce(
-                completed_tokens_tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=self.tp_group,
-            )
-            min_completed_tokens = completed_tokens_tensor.item()
-        fetched_token_ids = token_ids[:min_completed_tokens]
+        # Synchronize workers before mutating host cache tree state.
+        completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
+        self._all_reduce_attn_groups(
+            completed_tokens_tensor, torch.distributed.ReduceOp.MIN
+        )
+        min_completed_tokens = completed_tokens_tensor.item()
+        fetched_key = prefetch_key[:min_completed_tokens]
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
+            fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -1505,7 +1514,7 @@ class HiRadixCache(RadixCache):
         )
         last_host_node.release_host()
         del self.ongoing_prefetch[req_id]
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         # Track tokens actually loaded from storage for this request (L3 hits)
         loaded_from_storage = min_completed_tokens - matched_length
@@ -1534,25 +1543,20 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
-        key = params.key
-        empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        if self.disable or len(key) == 0:
-            return MatchResult(
-                device_indices=empty_value,
-                last_device_node=self.root_node,
-                last_host_node=self.root_node,
-                host_hit_length=0,
-            )
+        if self.disable:
+            return self._empty_match_result
 
+        key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
         key = key.page_aligned(self.page_size)
-        page_aligned_len = len(key)
+        if len(key) == 0:
+            return self._empty_match_result
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
-            value = empty_value
+            value = self._empty_match_result.device_indices
 
         host_hit_length = 0
         last_host_node = last_node
@@ -1566,6 +1570,8 @@ class HiRadixCache(RadixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
+            # TODO(ispobock): use best_match_node as start node for load_back
+            best_match_node=last_host_node,
             host_hit_length=host_hit_length,
         )
 
@@ -1577,16 +1583,14 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
-        new_input_tokens = (
-            convert_to_bigram_key(new_input_tokens)
-            if self.is_eagle
-            else new_input_tokens
+        prefetch_key = RadixKey(
+            new_input_tokens,
+            extra_key=last_host_node.key.extra_key,
+            is_bigram=self.is_eagle,
         )
         # align the number of fetching tokens to the page size
-        prefetch_length = len(new_input_tokens) - (
-            len(new_input_tokens) % self.page_size
-        )
-        new_input_tokens = new_input_tokens[:prefetch_length]
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
+        prefetch_length = len(prefetch_key)
         if not self.enable_storage:
             logger.debug(
                 "[prefetch_from_storage] skip rid=%s prefetch_length=%d reason=storage_disabled",
@@ -1640,33 +1644,51 @@ class HiRadixCache(RadixCache):
             )
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
-            self._log_prefetch_from_storage_abort_root_diag(
-                phase="prefetch_from_storage_abort_before",
-                req_id=req_id,
-
-
-                evict_host_attempted=evict_host_for_prefetch,
+            available_size = self.cache_controller.mem_pool_host.available_size()
+            reduced_prefetch_length = available_size - (
+                available_size % self.page_size
             )
-            last_host_node.release_host()
-            logger.debug(
-                "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
-                "reason=host_mem_unavailable",
-                req_id,
-                prefetch_length,
-            )
-            logger.debug(
-                "[HiCachePrefetchHostMem] prefetch_from_storage_abort req_id=%s reason=host_mem_unavailable evict_host_attempted=%s pool_size=%s available_size=%s",
-                req_id,
-                evict_host_for_prefetch,
-                mp.size,
-                mp.available_size(),
-            )
-            self._log_prefetch_from_storage_abort_root_diag(
-                phase="prefetch_from_storage_abort_after",
-                req_id=req_id,
-                evict_host_attempted=evict_host_for_prefetch,
-            )
-            return
+            if reduced_prefetch_length >= self.prefetch_threshold:
+                logger.debug(
+                    "[HiCachePrefetchHostMem] prefetch_retry_with_reduced_length req_id=%s "
+                    "reduced_prefetch_length=%s pool_size=%s available_size=%s",
+                    req_id,
+                    reduced_prefetch_length,
+                    mp.size,
+                    mp.available_size(),
+                )
+                prefetch_length = reduced_prefetch_length
+                prefetch_key = prefetch_key[:prefetch_length]
+                host_indices = self.cache_controller.mem_pool_host.alloc(
+                    prefetch_length
+                )
+            if host_indices is None:
+                self._log_prefetch_from_storage_abort_root_diag(
+                    phase="prefetch_from_storage_abort_before",
+                    req_id=req_id,
+                    evict_host_attempted=evict_host_for_prefetch,
+                )
+                last_host_node.release_host()
+                logger.debug(
+                    "[prefetch_from_storage] skip rid=%s prefetch_length=%d "
+                    "reason=host_mem_unavailable",
+                    req_id,
+                    prefetch_length,
+                )
+                logger.debug(
+                    "[HiCachePrefetchHostMem] prefetch_from_storage_abort req_id=%s "
+                    "reason=host_mem_unavailable evict_host_attempted=%s pool_size=%s available_size=%s",
+                    req_id,
+                    evict_host_for_prefetch,
+                    mp.size,
+                    mp.available_size(),
+                )
+                self._log_prefetch_from_storage_abort_root_diag(
+                    phase="prefetch_from_storage_abort_after",
+                    req_id=req_id,
+                    evict_host_attempted=evict_host_for_prefetch,
+                )
+                return
         logger.debug(
             "[HiCachePrefetchHostMem] prefetch_from_storage_alloc_ok req_id=%s prefetch_length=%s evict_host_attempted=%s pool_size=%s available_size=%s",
             req_id,
@@ -1679,25 +1701,26 @@ class HiRadixCache(RadixCache):
             "[prefetch_from_storage] started rid=%s tokens=%d prefetch_length=%d "
             "last_host_node_id=%s",
             req_id,
-            len(new_input_tokens),
+            len(prefetch_key),
             prefetch_length,
             last_host_node.id,
         )
+
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            new_input_tokens,
+            prefetch_key,
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
-            new_input_tokens,
+            prefetch_key,
             host_indices,
             operation,
         )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
@@ -1887,14 +1910,15 @@ class HiRadixCache(RadixCache):
         if rid not in self.ongoing_prefetch:
             return
 
-        last_host_node, token_ids, host_indices, operation = self.ongoing_prefetch[rid]
+        last_host_node, prefetch_key, host_indices, operation = self.ongoing_prefetch[
+            rid
+        ]
         if operation.host_indices is None:
             return
 
         completed_tokens, _ = self.cache_controller.terminate_prefetch(operation)
-        if self.tp_world_size > 1:
-            torch.distributed.barrier(group=self.tp_group)
+        self._barrier_attn_groups()
         last_host_node.release_host()
         del self.ongoing_prefetch[rid]
         self.cache_controller.append_host_mem_release(host_indices[:completed_tokens])
-        self.cache_controller.prefetch_tokens_occupied -= len(token_ids)
+        self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)

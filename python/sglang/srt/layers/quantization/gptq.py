@@ -129,6 +129,8 @@ class GPTQConfig(QuantizationConfig):
         lm_head_quantized: bool,
         dynamic: Dict[str, Dict[str, Union[int, bool]]],
         checkpoint_format: str = "",
+        true_sequential: bool = False,
+        static_groups: bool = False,
     ) -> None:
         # GPTQModel use `dynamic` config property to allow per module
         # quantization config so each module can be individually optimized.
@@ -165,6 +167,8 @@ class GPTQConfig(QuantizationConfig):
         # Currently GPTQModel stores v1 format checkpoints by default,
         # but provides the option to set `format="gptq_v2"` in `QuantizeConfig`.
         self.checkpoint_format = checkpoint_format
+        self.true_sequential = true_sequential
+        self.static_groups = static_groups
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
@@ -222,6 +226,10 @@ class GPTQConfig(QuantizationConfig):
         checkpoint_format = cls.get_from_keys_or(
             config, ["checkpoint_format"], default=""
         )
+        true_sequential = cls.get_from_keys_or(
+            config, ["true_sequential"], default=False
+        )
+        static_groups = cls.get_from_keys_or(config, ["static_groups"], default=False)
         return cls(
             weight_bits,
             group_size,
@@ -229,6 +237,8 @@ class GPTQConfig(QuantizationConfig):
             lm_head_quantized,
             dynamic,
             checkpoint_format,
+            true_sequential,
+            static_groups,
         )
 
     def get_quant_method(
@@ -477,7 +487,6 @@ class GPTQLinearMethod(LinearMethodBase):
             group_size = self.quant_config.group_size
         else:
             group_size = input_size
-
         self.use_shuffle = True
         scale_and_zero_size = input_size // group_size
         scale_and_zero_input_dim = None

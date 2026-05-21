@@ -4,50 +4,60 @@ run-name: ${{ inputs.pr_head_sha && format('[rerun-test] {0} {1}', inputs.test_c
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Dispatch mode: cuda | multimodal_gen | cpu"
+        required: true
+        type: choice
+        options:
+          - cuda
+          - multimodal_gen
+          - cpu
       test_command:
         description: "Test command(s) to run, one per line (e.g. 'registered/core/test_srt_endpoint.py TestSRTEndpoint.test_simple_decode')"
         required: true
         type: string
-      runner_label:
-        description: "Runner label"
-        required: true
-        type: choice
-        options:
-          - 1-gpu-h100
-          - 1-gpu-5090
-          - 2-gpu-h100
-          - 4-gpu-h100
-          - 4-gpu-a10
-          - 4-gpu-b200
-          - 8-gpu-h200
-          - 8-gpu-h20
-          - 8-gpu-b200
-          - ubuntu-latest
+      runs_on:
+        description: "GHA runner label (cuda/multimodal_gen only; ignored for cpu)"
+        required: false
+        type: string
+        default: ""
+      install_script:
+        description: "Install script path (cuda only). E.g. scripts/ci/cuda/ci_install_dependency.sh"
+        required: false
+        type: string
+        default: ""
+      install_timeout:
+        description: "Install-step timeout minutes (cuda only)"
+        required: false
+        type: string
+        default: "20"
+      rdma_devices:
+        description: "SGLANG_CI_RDMA_ALL_DEVICES csv (cuda only; empty = unset)"
+        required: false
+        type: string
+        default: ""
       pr_head_sha:
         description: "PR head SHA to checkout (for /rerun-test on fork PRs)"
         required: false
         type: string
         default: ""
-      use_deepep:
-        description: "Use ci_install_deepep.sh instead of ci_install_dependency.sh"
+      reply_comment_id:
+        description: "Reply comment ID to write back result to"
         required: false
         type: string
-        default: "false"
-      is_cpu:
-        description: "Run as CPU-only test (uses ubuntu-latest with uv pip install)"
+        default: ""
+      reply_marker:
+        description: "Per-batch marker for locating the line in reply comment"
         required: false
         type: string
-        default: "false"
-      install_diffusion:
-        description: "Install diffusion dependencies (for multimodal gen tests)"
-        required: false
-        type: string
-        default: "false"
+        default: ""
 
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write
@@ -56,41 +66,52 @@ permissions:
 
 jobs:
   rerun-test-cuda:
-    if: inputs.is_cpu != 'true'
-    runs-on: ${{ inputs.runner_label }}
+    if: inputs.mode == 'cuda'
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
     env:
-      RUNNER_LABELS: ${{ inputs.runner_label }}
-      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.runner_label == '8-gpu-h20' && 'mlx5_1,mlx5_2,mlx5_3,mlx5_4' || '' }}
+      RUNNER_LABELS: ${{ inputs.runs_on }}
+      SGLANG_CI_RDMA_ALL_DEVICES: ${{ inputs.rdma_devices }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
 
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
+            source /etc/profile.d/sglang-ci.sh
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
       - uses: ./.github/actions/check-maintenance
 
       - name: Install dependencies
-        timeout-minutes: 20
+        timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
         run: |
-          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
-          if [[ "${{ inputs.use_deepep }}" == "true" ]]; then
-            bash scripts/ci/cuda/ci_install_deepep.sh
-          elif [[ "${{ inputs.install_diffusion }}" == "true" ]]; then
-            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-          else
-            bash scripts/ci/cuda/ci_install_dependency.sh
-          fi
+          bash ${{ inputs.install_script }}
 
       - name: Run test
         timeout-minutes: 60
         run: |
-          if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
+          if [[ "${{ inputs.runs_on }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
-          # Collect non-empty commands into an array for counting.
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
@@ -103,17 +124,74 @@ jobs:
             cmd="${cmds[$idx]}"
             echo ""
             echo "."
-            if [[ "${{ inputs.install_diffusion }}" == "true" ]]; then
-              echo "Begin ($i/$total): python3 -m pytest $cmd -x"
-              echo "."
-              file_start=$SECONDS
-              python3 -m pytest $cmd -x || exit 1
-            else
-              echo "Begin ($i/$total): python3 $cmd"
-              echo "."
-              file_start=$SECONDS
-              (cd test/ && python3 $cmd -f) || exit 1
-            fi
+            echo "Begin ($i/$total): python3 $cmd"
+            echo "."
+            file_start=$SECONDS
+            (cd test/ && python3 $cmd -f) || exit 1
+            elapsed=$(( SECONDS - file_start ))
+            echo "."
+            echo "End ($i/$total): elapsed=${elapsed}s"
+            echo "."
+            echo ""
+          done
+          total_elapsed=$(( SECONDS - suite_start ))
+          echo "All $total test(s) passed in ${total_elapsed}s"
+
+      - uses: ./.github/actions/upload-cuda-coredumps
+        if: failure()
+
+  rerun-test-multimodal-gen:
+    if: inputs.mode == 'multimodal_gen'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    env:
+      RUNNER_LABELS: ${{ inputs.runs_on }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies (diffusion)
+        timeout-minutes: 20
+        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run test
+        timeout-minutes: 60
+        run: |
+          cmds=()
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            cmds+=("$cmd")
+          done <<< "${{ inputs.test_command }}"
+          total=${#cmds[@]}
+          suite_start=$SECONDS
+          for idx in "${!cmds[@]}"; do
+            i=$((idx + 1))
+            cmd="${cmds[$idx]}"
+            echo ""
+            echo "."
+            echo "Begin ($i/$total): python3 -m pytest $cmd -x"
+            echo "."
+            file_start=$SECONDS
+            python3 -m pytest $cmd -x || exit 1
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -127,9 +205,12 @@ jobs:
         if: failure()
 
   rerun-test-cpu:
-    if: inputs.is_cpu == 'true'
+    if: inputs.mode == 'cpu'
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
     steps:
       - name: Free disk space
         run: |
@@ -140,6 +221,18 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || github.sha }}
+
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
 
       - uses: ./.github/actions/check-maintenance
 
@@ -153,11 +246,9 @@ jobs:
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
-
-      - name: Install Rust toolchain
-        run: bash scripts/ci/utils/install_rustup.sh
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -170,7 +261,6 @@ jobs:
         timeout-minutes: 60
         run: |
           cd test/
-          # Collect non-empty commands into an array for counting.
           cmds=()
           while IFS= read -r cmd; do
             [ -z "$cmd" ] && continue
@@ -195,3 +285,39 @@ jobs:
           done
           total_elapsed=$(( SECONDS - suite_start ))
           echo "All $total test(s) passed in ${total_elapsed}s"
+
+  write-back-result:
+    needs: [rerun-test-cuda, rerun-test-multimodal-gen, rerun-test-cpu]
+    if: always() && inputs.reply_comment_id != '' && inputs.reply_marker != ''
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: rerun-test-writeback-${{ inputs.reply_comment_id }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Write back result to reply comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ needs.rerun-test-cuda.result }}" == "success" \
+             || "${{ needs.rerun-test-multimodal-gen.result }}" == "success" \
+             || "${{ needs.rerun-test-cpu.result }}" == "success" ]]; then
+            STATUS=success
+          else
+            STATUS=failure
+          fi
+          python3 scripts/ci/utils/update_rerun_test_status.py \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status "$STATUS" \
+            --repo "${{ github.repository }}"
