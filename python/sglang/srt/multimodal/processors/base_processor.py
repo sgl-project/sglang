@@ -1136,9 +1136,8 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
-        source_tensor = tensor
         if not tensor.is_cuda:
-            tensor = tensor.to("cuda", non_blocking=True)
+            return tensor
 
         sync_flag, available_slice, byte_offset = (
             self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
@@ -1159,7 +1158,7 @@ class BaseMultimodalProcessor(ABC):
             )
         if self.server_args.keep_mm_feature_on_device:
             return tensor
-        return source_tensor if not source_tensor.is_cuda else source_tensor.cpu()
+        return tensor.cpu()
 
     def process_and_combine_mm_data(
         self,
