@@ -938,6 +938,11 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos: [total_tokens, rotary_dim]
             rotary_pos_emb_sin: [total_tokens, rotary_dim]
         """
+        import time
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
         # Split per-image
         num_images = len(token_cu_seqlens) - 1
         per_image_tokens = []
@@ -950,9 +955,17 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             per_image_cos.append(rotary_pos_emb_cos[start:end])
             per_image_sin.append(rotary_pos_emb_sin[start:end])
 
-        return self.cuda_graph_runner.run(
+        result = self.cuda_graph_runner.run(
             per_image_tokens, per_image_cos, per_image_sin
         )
+
+        torch.cuda.synchronize()
+        dt = (time.perf_counter() - t0) * 1000
+        total_tokens = int(token_cu_seqlens[-1])
+        logger.info(
+            f"[VIT CG] images={num_images} tokens={total_tokens} time={dt:.2f}ms"
+        )
+        return result
 
     def forward_with_npu_graph(
         self,
