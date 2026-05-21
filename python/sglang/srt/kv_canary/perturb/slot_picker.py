@@ -12,6 +12,7 @@ Two picking modes:
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -127,3 +128,23 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
         return None
     pick = int(torch.randint(0, len(valid), (1,)).item())
     return valid[pick]
+
+
+def pick_out_cache_loc_slot(*, forward_batch: "ForwardBatch") -> Optional[int]:
+    out_cache_loc = forward_batch.out_cache_loc
+    if out_cache_loc is None:
+        return None
+    total = int(out_cache_loc.shape[0])
+    if total <= 0:
+        return None
+    valid_num_tokens = forward_batch.num_token_non_padded_cpu
+    if valid_num_tokens is None:
+        valid_num_tokens = total
+    valid_num_tokens = int(valid_num_tokens)
+    if valid_num_tokens <= 0:
+        return None
+    pick = random.randrange(valid_num_tokens)
+    slot = int(out_cache_loc[pick].item())
+    if slot < 0:
+        return None
+    return slot

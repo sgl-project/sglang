@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.slot_picker import pick_out_cache_loc_slot
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
@@ -42,7 +43,7 @@ def run(
     ):
         return
 
-    slot = _pick_out_cache_slot(forward_batch=forward_batch)
+    slot = pick_out_cache_loc_slot(forward_batch=forward_batch)
     if slot is None:
         logger.info(
             "kv_canary perturb real_kv_post_forward: skipped because forward_batch.out_cache_loc "
@@ -86,23 +87,3 @@ def run(
         original_byte,
         original_byte ^ 0xFF,
     )
-
-
-def _pick_out_cache_slot(*, forward_batch: "ForwardBatch") -> Optional[int]:
-    out_cache_loc = forward_batch.out_cache_loc
-    if out_cache_loc is None:
-        return None
-    total = int(out_cache_loc.shape[0])
-    if total <= 0:
-        return None
-    valid_num_tokens = forward_batch.num_token_non_padded_cpu
-    if valid_num_tokens is None:
-        valid_num_tokens = total
-    valid_num_tokens = int(valid_num_tokens)
-    if valid_num_tokens <= 0:
-        return None
-    pick = random.randrange(valid_num_tokens)
-    slot = int(out_cache_loc[pick].item())
-    if slot < 0:
-        return None
-    return slot
