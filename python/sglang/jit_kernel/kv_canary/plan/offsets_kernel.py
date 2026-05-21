@@ -6,7 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kv_canary.consts import CANARY_RESERVED_SLOT
+from sglang.jit_kernel.kv_canary.consts import (
+    REQ_POOL_IDX_PADDING,
+    TOKEN_TO_KV_SLOT_PADDING,
+)
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
     _require_1d,
@@ -92,7 +95,8 @@ def launch_plan_offsets_kernel(
         WRITE_OFFSETS_LEN=write_offsets_len,
         WRITE_REQ_CAPACITY=write_req_capacity,
         VERIFY_CAPACITY=verify_capacity,
-        RESERVED_SLOT=CANARY_RESERVED_SLOT,
+        REQ_POOL_IDX_PADDING=REQ_POOL_IDX_PADDING,
+        TOKEN_TO_KV_SLOT_PADDING=TOKEN_TO_KV_SLOT_PADDING,
     )
 
 
@@ -256,7 +260,8 @@ def _plan_offsets_kernel(
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
     VERIFY_CAPACITY: tl.constexpr,
-    RESERVED_SLOT: tl.constexpr,
+    REQ_POOL_IDX_PADDING: tl.constexpr,
+    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
     """Offsets kernel: per-req counts, seeds, exclusive-prefix-sum offsets, scalar totals.
 
@@ -268,7 +273,7 @@ def _plan_offsets_kernel(
 
     # Per-req inputs (int64 for canary-owned metadata; req_to_token keeps its pool dtype).
     rpi = tl.load(
-        req_pool_indices_ptr + bs_offs, mask=bs_mask, other=RESERVED_SLOT
+        req_pool_indices_ptr + bs_offs, mask=bs_mask, other=REQ_POOL_IDX_PADDING
     )  # [BS_BLOCK]
     prefix_lens = tl.load(
         prefix_lens_ptr + bs_offs, mask=bs_mask, other=0
@@ -277,8 +282,7 @@ def _plan_offsets_kernel(
         extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0
     )  # [BS_BLOCK]
 
-    # SGLang's ReqToTokenPool reserves req_pool_idx 0 as the CUDA-graph padding row.
-    is_active = (rpi != RESERVED_SLOT) & bs_mask  # [BS_BLOCK] bool
+    is_active = (rpi != REQ_POOL_IDX_PADDING) & bs_mask  # [BS_BLOCK] bool
     has_prefix = is_active & (prefix_lens > 0)  # [BS_BLOCK] bool
 
     window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)  # [BS_BLOCK]
@@ -398,7 +402,7 @@ def _plan_write_offsets(
     seed_full = tl.load(  # [BS_BLOCK]
         req_to_token_ptr + rpi.to(tl.int64) * stride_i64 + safe_prefix_pos.to(tl.int64),
         mask=has_prefix,
-        other=0,
+        other=TOKEN_TO_KV_SLOT_PADDING,
     )
 
     if HAS_SWA_LUT:

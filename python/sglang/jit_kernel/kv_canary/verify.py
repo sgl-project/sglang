@@ -248,8 +248,9 @@ def launch_canary_verify_kernel(
             health counters, and real KV fingerprint sources.
         plan: Pre-allocated VerifyPlan; addresses baked into cuda-graph capture.
 
-    Slot 0 is unconditionally skipped by the verify kernel — it is sglang's reserved padding sink per
-    ``memory_pool.py:152``. All canary-attached pools MUST reserve slot 0 (free_slots starts at 1).
+    Token-to-KV slot 0 is unconditionally skipped by the verify kernel: SGLang's TokenToKVPoolAllocator
+    reserves it for padded-token dummy writes, and zero-initialized req_to_token entries therefore point to
+    a non-real KV slot. Canary-attached pools mirror that contract by reserving canary slot 0.
 
     Implementation:
         - CUDA __global__ `canary_verify_kernel`: fixed 1-D grid `(kPersistentBlocks=64, 1, 1)` blocks ×

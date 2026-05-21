@@ -6,7 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kv_canary.consts import CANARY_RESERVED_SLOT
+from sglang.jit_kernel.kv_canary.consts import (
+    REQ_POOL_IDX_PADDING,
+    TOKEN_TO_KV_SLOT_PADDING,
+)
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
     _require_2d,
@@ -81,7 +84,8 @@ def launch_plan_entries_kernel(
         INNER_BLOCK=_PLAN_VERIFY_INNER_BLOCK,
         SWA_WINDOW=int(swa_window_size),
         HAS_SWA_LUT=has_swa_lut,
-        RESERVED_SLOT=CANARY_RESERVED_SLOT,
+        REQ_POOL_IDX_PADDING=REQ_POOL_IDX_PADDING,
+        TOKEN_TO_KV_SLOT_PADDING=TOKEN_TO_KV_SLOT_PADDING,
     )
 
 
@@ -194,7 +198,8 @@ def _plan_entries_kernel(
     INNER_BLOCK: tl.constexpr,
     SWA_WINDOW: tl.constexpr,
     HAS_SWA_LUT: tl.constexpr,
-    RESERVED_SLOT: tl.constexpr,
+    REQ_POOL_IDX_PADDING: tl.constexpr,
+    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
     """Entries kernel: materialize per-req verify entries. Grid = (bs, j_tiles).
 
@@ -207,8 +212,7 @@ def _plan_entries_kernel(
     rpi = tl.load(req_pool_indices_ptr + r)  # scalar
     prefix_lens = tl.load(prefix_lens_ptr + r)  # scalar
 
-    # SGLang's ReqToTokenPool reserves req_pool_idx 0 as the CUDA-graph padding row.
-    if rpi == RESERVED_SLOT:
+    if rpi == REQ_POOL_IDX_PADDING:
         return
 
     window_start = _compute_window_start(prefix_lens, SWA_WINDOW)  # scalar
@@ -231,7 +235,7 @@ def _plan_entries_kernel(
     slot_full = tl.load(  # [INNER_BLOCK]
         req_to_token_ptr + rpi_i64 * stride_i64 + positions_i64,
         mask=j_mask,
-        other=0,
+        other=TOKEN_TO_KV_SLOT_PADDING,
     )
 
     prev_pos_valid = (positions > 0) & j_mask  # [INNER_BLOCK] bool
@@ -242,7 +246,7 @@ def _plan_entries_kernel(
     prev_slot_full = tl.load(  # [INNER_BLOCK]
         req_to_token_ptr + rpi_i64 * stride_i64 + safe_prev_positions_i64,
         mask=prev_pos_valid,
-        other=0,
+        other=TOKEN_TO_KV_SLOT_PADDING,
     )
 
     if HAS_SWA_LUT:

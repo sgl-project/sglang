@@ -5,10 +5,14 @@ from typing import Final
 
 CANARY_CHAIN_ANCHOR: Final[int] = 0xC0FFEE1234567890
 
-# Mirrors SGLang's ReqToTokenPool contract: row 0 is reserved as the CUDA-graph padding row and real
-# req_pool_idx values start at 1. Canary-attached pools reserve the same slot so zero-initialized
-# req_to_token entries translate to a skipped padding sentinel instead of spurious violations.
-CANARY_RESERVED_SLOT: Final[int] = 0
+# Mirrors SGLang's ReqToTokenPool contract: req_pool_idx 0 is the CUDA-graph padding row, while real
+# request rows start at 1.
+REQ_POOL_IDX_PADDING: Final[int] = 0
+
+# Mirrors SGLang's TokenToKVPoolAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
+# writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
+# instead of treating unfilled entries as real KV slots.
+TOKEN_TO_KV_SLOT_PADDING: Final[int] = 0
 
 CANARY_FIELDS_PER_SLOT: Final[int] = 4
 CANARY_FIELD_TOKEN: Final[int] = 0
