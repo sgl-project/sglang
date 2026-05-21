@@ -47,6 +47,9 @@ class GenerationBatchResult:
     # sync path: forward stream -> output processor
     accept_lens: Optional[torch.Tensor] = None
 
+    # Post-verify seq_lens for the next iter; published via on_verify_complete.
+    new_seq_lens: Optional[torch.Tensor] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 
