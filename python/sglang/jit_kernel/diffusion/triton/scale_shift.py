@@ -343,6 +343,8 @@ def fuse_scale_shift_kernel(
 
     B, L, C = x.shape
     output = torch.empty_like(x)
+    if x.numel() == 0:
+        return output
 
     if scale.dim() == 4:
         # scale/shift: [B, F, 1, C]

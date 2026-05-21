@@ -16,11 +16,17 @@ This document describes how to perform accuracy evaluation for SGLang models run
 
 ## Environment Setup
 
+<Warning>
+Ensure sufficient disk space before proceeding. The Docker image requires at least **30 GB** of free space. If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 First, launch the SGLang environment using the provided container image:
 
+<Tabs>
+  <Tab title="Atlas 800I A3">
+
 ```shell Command
-# Atlas 800I A3 environment
-export IMAGE=quay.io/ascend/sglang:main-cann8.5.0-a3
+export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-a3
 
 docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
@@ -39,7 +45,29 @@ docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
     $IMAGE
 ```
 
-**For Atlas 800I A2 users**: Replace the image tag with `main-cann8.5.0-910b` and adjust device mappings from `/dev/davinci[8-15]` to `/dev/davinci[0-7]`.
+  </Tab>
+  <Tab title="Atlas 800I A2">
+
+```shell Command
+export IMAGE=quay.io/ascend/sglang:v0.5.10-npu.rc1-910b
+
+docker run -it --rm --privileged --network=host --ipc=host --shm-size=16g \
+    --device=/dev/davinci0 --device=/dev/davinci1 --device=/dev/davinci2 --device=/dev/davinci3 \
+    --device=/dev/davinci4 --device=/dev/davinci5 --device=/dev/davinci6 --device=/dev/davinci7 \
+    --device=/dev/davinci_manager \
+    --device=/dev/hisi_hdc \
+    --volume /usr/local/sbin:/usr/local/sbin \
+    --volume /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+    --volume /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+    --volume /etc/ascend_install.info:/etc/ascend_install.info \
+    --volume /var/queue_schedule:/var/queue_schedule \
+    --volume ~/.cache/:/root/.cache/ \
+    --entrypoint=bash \
+    $IMAGE
+```
+
+  </Tab>
+</Tabs>
 
 ---
 
