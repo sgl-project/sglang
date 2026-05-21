@@ -382,7 +382,7 @@ force_reinstall_cutlass_dsl_libs_cu13() {
         return
     fi
 
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
     if [ -z "$CUTLASS_DSL_VERSION" ]; then
         echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
         return
