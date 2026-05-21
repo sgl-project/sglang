@@ -124,5 +124,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_req_pool_indices[:3].tolist(), [0, 5, 0])
         self.assertEqual(plan.fb_req_pool_indices.dtype, torch.int64)
 
+
 if __name__ == "__main__":
     unittest.main()

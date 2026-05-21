@@ -57,7 +57,9 @@ class TestSelfUnitSweepPlanBuilder(CustomTestCase):
         )
         num_valid = int(out.verify_num_valid.item())
         self.assertEqual(num_valid, 3)
-        self.assertEqual(set(out.verify_slot_indices[:num_valid].tolist()), {42, 43, 44})
+        self.assertEqual(
+            set(out.verify_slot_indices[:num_valid].tolist()), {42, 43, 44}
+        )
 
     def test_truly_free_slot_not_swept(self) -> None:
         """Verify free radix slots are excluded from sweep plans."""
