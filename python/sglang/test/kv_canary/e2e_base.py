@@ -30,18 +30,15 @@ class _ModeConfig:
         model_path: HF model id used by popen_launch_server.
         json_model_override_args: JSON string passed to --json-model-override-args, or
             None to omit the flag entirely.
-        context_length: --context-length value.
     """
 
     model_path: str
     json_model_override_args: Optional[str] = None
-    context_length: int
 
 
 _MODE_CONFIGS: dict[str, _ModeConfig] = {
     "mha": _ModeConfig(
         model_path="Qwen/Qwen3-0.6B",
-        context_length=8192,
     ),
     "swa": _ModeConfig(
         model_path="google/gemma-3-1b-it",
@@ -64,9 +61,11 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
                 },
             }
         ),
-        context_length=8192,
     ),
 }
+
+
+_CONTEXT_LENGTH = 8192
 
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
@@ -78,7 +77,7 @@ _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).stri
 
 class CanaryE2EBase(CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``mode`` and optionally
-    ``kv_canary_mode``, ``perturb_env``, ``extra_server_args``, ``use_unique_prompts``.
+    ``kv_canary_mode``, ``perturb_env``, ``use_unique_prompts``.
 
     ``setUpClass`` launches the server with mode-specific args + canary env;
     ``tearDownClass`` kills the server and cleans env vars set in setUpClass.
@@ -91,7 +90,6 @@ class CanaryE2EBase(CustomTestCase):
     mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[Literal["log", "raise"]] = "log"
     perturb_env: ClassVar[dict[str, str]] = {}
-    extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
 
     process: ClassVar[Optional[object]] = None
@@ -116,8 +114,7 @@ class CanaryE2EBase(CustomTestCase):
             "--kv-canary",
             cls.kv_canary_mode,
             "--context-length",
-            str(cls._cfg.context_length),
-            *cls.extra_server_args,
+            str(_CONTEXT_LENGTH),
         ]
         if cls._cfg.json_model_override_args is not None:
             server_args.extend(
