@@ -43,7 +43,7 @@ class PumpAndAllreduce:
         local_errored = False
         if self._previous_pump_future is not None:
             local_errored = bool(int(self._previous_pump_future.wait().item()))
-        self._previous_pump_future = FutureTensor.create(
+        self._previous_pump_future = FutureTensor.device_to_host(
             src_device=signal.view(-1)[:1], stream=self._d2h_stream
         )
 
@@ -75,7 +75,7 @@ class PumpAndAllreduce:
                 )
             else:
                 any_rank_errored = local_errored
-            self._previous_allreduce_future = FutureTensor.create(
+            self._previous_allreduce_future = FutureTensor.device_to_host(
                 src_device=allreduce_buf, stream=self._d2h_stream
             )
 

@@ -49,7 +49,7 @@ class _CanaryEnableWarner:
 
     def tick(self, enable_device: torch.Tensor) -> None:
         self._drain_previous()
-        self._pending_future = FutureTensor.create(
+        self._pending_future = FutureTensor.device_to_host(
             src_device=enable_device,
             stream=self._d2h_stream,
         )

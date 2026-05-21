@@ -165,6 +165,4 @@ def _canonicalize_boundary_int64(tensor: torch.Tensor, name: str) -> torch.Tenso
         raise TypeError(
             f"kv-canary: {name} must have dtype torch.int32 or torch.int64, got {tensor.dtype}"
         )
-    if tensor.dtype == torch.int64:
-        return tensor
     return tensor.to(torch.int64)
