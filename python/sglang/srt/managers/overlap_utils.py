@@ -64,16 +64,11 @@ class FutureMap:
         else:
             self.buf_initialized = False
 
-        # Single cross-stream fence covering "all buf writes dispatched so far".
-        # Recorded on forward stream at the tail of every store_to_map; waited
-        # on by schedule-stream consumers (e.g. resolve_seq_lens_cpu) before
-        # reading the buf. Lives on FutureMap so callers can't forget to
-        # propagate it through filter/merge/etc.
+        # Forward-stream fence covering all buf writes dispatched so far.
+        # Waited on by schedule-stream consumers before reading the buf.
         self._last_store_done: Optional[torch.cuda.Event] = None
-        # Per-iter flag: did store_post_verify record the fence already? If so,
-        # store_to_map skips its own record so the fence stays at verify-end
-        # (preserving schedule prep / draft_extend overlap). Reset by every
-        # store_to_map call.
+        # Set by store_post_verify so store_to_map skips its own record and
+        # the fence stays at verify-end (for draft_extend overlap).
         self._fence_done_by_post_verify: bool = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
@@ -130,21 +125,14 @@ class FutureMap:
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            # Resolve placeholder batch.seq_lens (set to -indices at end of
-            # previous run_batch) to post-verify GPU values from the buf.
-            # Mirrors the input_ids placeholder pattern.
+            # Resolve seq_lens placeholder (-indices) to the post-verify view.
             batch.seq_lens = draft_input.new_seq_lens
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        """Schedule-stream counterpart of resolve_future for the CPU mirror.
-
-        Reads post-verify seq_lens from new_seq_lens_buf into batch.seq_lens_cpu
-        and recomputes batch.seq_lens_sum. Waits on _last_store_done so the
-        D2H sees all forward-stream buf writes dispatched so far. No-op for
-        paths without future state (first iter / no spec_info).
-        """
+        """Schedule-stream D2H from new_seq_lens_buf into batch.seq_lens_cpu,
+        gated on _last_store_done. No-op when there's no future state yet."""
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
@@ -154,11 +142,8 @@ class FutureMap:
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def _record_store_done(self) -> None:
-        # Must be called on forward stream right after a buf write that
-        # produces values consumed by schedule stream. Reuses one Event across
-        # iters; record() repositions it to the current forward-stream point.
-        # Forward-stream FIFO guarantees the new position is at-or-past every
-        # prior write recorded on this event.
+        # Forward-stream only. record() repositions the event to the current
+        # stream point; FIFO covers all prior writes on this stream.
         if self._last_store_done is None:
             self._last_store_done = torch.get_device_module(self.device).Event()
         self._last_store_done.record()
@@ -169,25 +154,15 @@ class FutureMap:
         new_seq_lens: torch.Tensor,
         bonus_tokens: torch.Tensor,
     ) -> None:
-        """Forward stream. Writes the buf fields produced at verify-end
-        (new_seq_lens, bonus_tokens) and records the cross-stream fence here.
-
-        The fence lands at verify-end rather than at store_to_map (which runs
-        after draft_extend), so schedule-stream consumers (resolve_seq_lens_cpu)
-        unblock as soon as verify is done — preserving the schedule prep /
-        draft_extend overlap window on forward stream.
-
-        First iter (buf not yet allocated): no-op. The subsequent store_to_map
-        will write these fields and record the fence.
-        """
+        """Forward stream. Writes verify-end buf fields and records the fence
+        here so schedule consumers unblock at verify-end (before draft_extend).
+        No-op on the first iter (buf not yet allocated); store_to_map handles
+        it then."""
         if self.spec_algo.is_none() or not self.buf_initialized:
             return
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            # DP idle: nothing to store for this rank.
-            return
-        # Advanced indexing requires explicit dtype cast (slice assignment
-        # used to coerce implicitly).
+            return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         self.bonus_tokens_buf[indices] = bonus_tokens.to(self.bonus_tokens_buf.dtype)
         self._record_store_done()
@@ -196,22 +171,15 @@ class FutureMap:
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        """Forward stream. Writes all buf fields. Records the cross-stream
-        fence only if store_post_verify did not already record it for this
-        iter (decode-branch). Extend-branch iters (prefill / mixed) never fire
-        the post_verify callback, so this method must write new_seq_lens /
-        bonus_tokens here too — otherwise their buf slots stay uninitialized
-        (`torch.empty` garbage) and a downstream `.cpu()` overflows int32.
-        """
+        """Forward stream. Writes the post-draft_extend buf fields (topk /
+        hidden), plus new_seq_lens / bonus_tokens when post_verify didn't run
+        (extend branch). Records the fence iff post_verify didn't."""
         if self.spec_algo.is_none():
             indices = future_indices.indices
             if indices.shape[0] == 0:
-                # DP attention idle rank: indices is empty but next_token_ids
-                # may carry padded values from sibling ranks. Nothing to store
-                # for this rank.
-                return
-            # next_token_ids is int32; buf is int64. Slice assignment used to
-            # cast implicitly, but advanced indexing requires an explicit match.
+                return  # DP idle: next_token_ids carries sibling-rank padding.
+            # next_token_ids is int32; buf is int64. Advanced indexing requires
+            # an explicit cast.
             self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
             if not self._fence_done_by_post_verify:
                 self._record_store_done()
@@ -221,20 +189,15 @@ class FutureMap:
         draft_input: EagleDraftInput = batch_result.next_draft_input
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            # DP idle rank: draft_input fields are empty stubs without a usable
-            # shape, so _lazy_init_buf's shape peek (draft_input.topk_p[0])
-            # would IndexError. Defer init until a real batch arrives.
+            # DP idle: draft_input fields are empty stubs; _lazy_init_buf's
+            # shape peek would IndexError. Defer init until a real batch.
             return
 
         if not self.buf_initialized:
             self._lazy_init_buf(draft_input)
 
-        # Slice assignment used to coerce src dtype to buf dtype implicitly;
-        # advanced index requires an explicit cast. bonus_tokens / new_seq_lens
-        # in particular differ across disagg (int64) and forward (int32) paths.
-        # topk_p / topk_index / hidden_states are forward-only buf fields
-        # (consumed by next iter's resolve_future on forward stream — FIFO
-        # ordering covers them, no fence needed).
+        # Forward-only fields (next iter's resolve_future reads them on
+        # forward stream — FIFO covers them, no fence needed).
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
@@ -243,14 +206,9 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        # new_seq_lens / bonus_tokens are schedule-consumed (resolve_seq_lens_cpu
-        # reads new_seq_lens_buf via cross-stream D2H). Two write sites:
-        #   - decode-branch iter: store_post_verify wrote them already; the
-        #     fence is already at verify-end. Skip here to avoid a redundant
-        #     write that would race with schedule-stream reads guarded only by
-        #     the verify-end fence.
-        #   - extend-branch iter (and disagg bootstrap): no post_verify ran,
-        #     so write them here and record the fence.
+        # Schedule-consumed fields: skip when post_verify already wrote them
+        # — a redundant write here would race the schedule-stream read gated
+        # on the verify-end fence.
         if not self._fence_done_by_post_verify:
             self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
                 self.new_seq_lens_buf.dtype
@@ -264,11 +222,8 @@ class FutureMap:
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ) -> None:
-        """Bootstrap helper for disagg-decode prebuilt batches. The caller
-        constructs a fully-populated EagleDraftInput (all post-verify and
-        post-draft_extend fields) and asks FutureMap to seed the buf in one
-        shot, recording the fence so subsequent resolve_seq_lens_cpu sees
-        valid data. Equivalent to the first-iter path in store_to_map."""
+        """Disagg-decode bootstrap: seed buf in one shot from a fully
+        populated draft_input + record the fence."""
         indices = future_indices.indices
         if indices.shape[0] == 0:
             return
