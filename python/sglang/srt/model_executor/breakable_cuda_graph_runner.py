@@ -179,11 +179,6 @@ class BreakableCudaGraphRunner:
                 (self.max_num_tokens,),
                 dtype=torch.int64 if not is_npu() else torch.int32,
             )
-            out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                if model_runner.is_hybrid_swa
-                else None
-            )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             if self.is_multimodal:
                 input_embeds = torch.zeros(
@@ -210,7 +205,6 @@ class BreakableCudaGraphRunner:
         self.buffers = PrefillInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             mamba_track_indices=None,
             mamba_track_mask=None,
             mamba_track_seqlens=None,
@@ -302,11 +296,6 @@ class BreakableCudaGraphRunner:
             token_to_kv_pool=self.model_runner.token_to_kv_pool,
             attn_backend=self.model_runner.attn_backend,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_swa=(
-                buffers.out_cache_loc_swa[:num_tokens]
-                if buffers.out_cache_loc_swa is not None
-                else None
-            ),
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
             mamba_track_mask=None,
@@ -400,6 +389,9 @@ class BreakableCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
+            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
         for _ in range(2):
