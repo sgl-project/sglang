@@ -539,6 +539,8 @@ class Qwen3HybridLinearDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
+                support_shared_expert_fusion=True,
+                enable_cuda_shared_expert_fusion=True,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -706,6 +708,8 @@ class Qwen3HybridAttentionDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
+                support_shared_expert_fusion=True,
+                enable_cuda_shared_expert_fusion=True,
             )
         else:
             self.mlp = Qwen2MoeMLP(
@@ -1018,6 +1022,9 @@ class Qwen3NextForCausalLM(nn.Module):
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
 
+        self.num_fused_shared_experts = self._get_num_fused_shared_experts()
+        self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: layer.mlp.get_moe_weights()
@@ -1029,6 +1036,15 @@ class Qwen3NextForCausalLM(nn.Module):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def _get_num_fused_shared_experts(self) -> int:
+        if not (
+            hasattr(self.model, "layers")
+            and len(self.model.layers) > 0
+            and hasattr(self.model.layers[0].mlp, "num_fused_shared_experts")
+        ):
+            return 0
+        return self.model.layers[0].mlp.num_fused_shared_experts
 
     @torch.no_grad()
     def forward(
@@ -1103,7 +1119,11 @@ class Qwen3NextForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=(
+                self.config.num_experts
+                if not self.enable_shared_expert_fusion
+                else self.config.num_experts + self.num_fused_shared_experts
+            ),
         )
 
         params_dict = dict(self.named_parameters())
@@ -1132,6 +1152,12 @@ class Qwen3NextForCausalLM(nn.Module):
 
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+
+            if self.enable_shared_expert_fusion and "mlp.shared_expert." in name:
+                name = name.replace(
+                    "mlp.shared_expert.",
+                    f"mlp.experts.{self.config.num_experts}.",
+                )
 
             # Remap modelopt FP8 KV cache scale names:
             # checkpoint: k_proj.k_scale / v_proj.v_scale
