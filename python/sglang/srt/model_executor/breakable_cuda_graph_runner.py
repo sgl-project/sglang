@@ -30,7 +30,9 @@ from typing import TYPE_CHECKING, Union
 import torch
 import tqdm
 
-from sglang.srt.compilation.piecewise_context_manager import set_forward_context
+from sglang.srt.compilation.piecewise_context_manager import (
+    set_forward_context as set_piecewise_forward_context,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
@@ -56,6 +58,10 @@ from sglang.srt.model_executor.cuda_graph_runner import (
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
+)
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
 )
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
@@ -233,7 +239,7 @@ class BreakableCudaGraphRunner:
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
 
-        with set_forward_context(
+        with set_piecewise_forward_context(
             forward_batch,
             self.attention_layers,
             self.quant_config,
@@ -292,9 +298,6 @@ class BreakableCudaGraphRunner:
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
@@ -394,14 +397,17 @@ class BreakableCudaGraphRunner:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
-        graph = BreakableCUDAGraph()
-        with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
-            output = run_once()
+            graph = BreakableCUDAGraph()
+            with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
+                output = run_once()
 
         return graph, output
 
@@ -460,7 +466,7 @@ class BreakableCudaGraphRunner:
             self.layer_model.forward = replay_layer_forward
             try:
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-                with set_forward_context(
+                with set_piecewise_forward_context(
                     static_forward_batch,
                     self.attention_layers,
                     self.quant_config,

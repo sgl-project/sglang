@@ -177,6 +177,10 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         self.draft_attn_backend = self._init_draft_attn_backend()
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        # Make the runner's attn_backend point at the draft backend so the
+        # global ``get_attn_backend()`` set by _forward_raw resolves to it
+        # during draft forward passes. For topk=1 this is already true.
+        self.draft_model_runner.attn_backend = self.draft_attn_backend
         self.cuda_graph_runner = None
 
         with (
@@ -251,7 +255,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         return frozen_kv_target_view(forward_batch, self.kv_context)
 
     def _target_kv_pool_view(self, forward_batch: ForwardBatch):
-        return target_kv_pool_view(forward_batch, self.kv_context)
+        return target_kv_pool_view(
+            forward_batch, self.kv_context, self.draft_model_runner
+        )
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
         set_frozen_kv_positions(forward_batch, self.topk)
@@ -275,7 +281,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-        forward_batch.attn_backend = self.draft_attn_backend
+        # draft_model_runner.attn_backend points at draft_attn_backend; the
+        # forward pass publishes it via pool_context.
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
@@ -290,7 +297,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_mode=ForwardMode.DECODE,
                 spec_info=None,
             )
-        forward_batch.attn_backend = self.draft_attn_backend
+        # draft_model_runner.attn_backend points at draft_attn_backend; the
+        # forward pass publishes it via pool_context.
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
@@ -310,7 +318,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                     else None
                 ),
             )
-        forward_batch.attn_backend = self.draft_attn_backend
+        # draft_model_runner.attn_backend points at draft_attn_backend; the
+        # forward pass publishes it via pool_context.
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
