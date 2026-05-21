@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
 from kv_canary_runner_unit_utils import make_forward_batch, make_pool
+
 from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import (
@@ -132,8 +132,12 @@ def test_req_to_token_perturb_uses_live_slot_as_replacement() -> None:
     """Verify req_to_token perturbation replaces a slot with another live slot."""
     device = DEFAULT_DEVICE
     pool = make_pool(device, max_reqs=4, max_seq=8)
-    pool.req_to_token[1, :3] = torch.tensor([11, 22, 33], dtype=torch.int32, device=device)
-    pool.req_to_token[2, :3] = torch.tensor([44, 55, 66], dtype=torch.int32, device=device)
+    pool.req_to_token[1, :3] = torch.tensor(
+        [11, 22, 33], dtype=torch.int32, device=device
+    )
+    pool.req_to_token[2, :3] = torch.tensor(
+        [44, 55, 66], dtype=torch.int32, device=device
+    )
     manager = PerturbManager(
         config=PerturbConfig(
             req_to_token_prob=1.0,
@@ -172,7 +176,9 @@ def test_collect_active_slots_ignores_padded_out_cache_loc() -> None:
     pool = make_pool(device, max_reqs=4, max_seq=8)
     pool.req_to_token[1, :2] = torch.tensor([0, 7], dtype=torch.int32, device=device)
     forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(2,))
-    forward_batch.out_cache_loc = torch.tensor([7, 0, 0], dtype=torch.int32, device=device)
+    forward_batch.out_cache_loc = torch.tensor(
+        [7, 0, 0], dtype=torch.int32, device=device
+    )
     forward_batch.num_token_non_padded_cpu = 1
 
     targets = collect_active_slots(

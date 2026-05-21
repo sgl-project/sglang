@@ -9,6 +9,7 @@ from kv_canary_runner_unit_utils import (
     make_forward_batch,
     make_runner,
 )
+
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.test.ci.ci_register import register_cuda_ci

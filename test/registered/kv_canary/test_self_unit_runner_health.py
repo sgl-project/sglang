@@ -4,6 +4,7 @@ import logging
 import unittest
 
 from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_config, make_runner
+
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.test.ci.ci_register import register_cuda_ci

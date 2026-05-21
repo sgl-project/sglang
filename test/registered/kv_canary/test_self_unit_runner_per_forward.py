@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 
 import torch
-
 from kv_canary_runner_unit_utils import (
     CanaryRunnerTestCase,
     RecordingEndpoint,
@@ -12,6 +11,7 @@ from kv_canary_runner_unit_utils import (
     make_group,
     make_runner,
 )
+
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
