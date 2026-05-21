@@ -340,6 +340,13 @@ class ViTCudaGraphRunner:
         self.rotary_cos_bufs[B][:S].copy_(rotary_pos_emb_cos)
         self.rotary_sin_bufs[B][:S].copy_(rotary_pos_emb_sin)
 
+        # DEBUG: sync all TP ranks before replay to avoid NCCL desync
+        torch.cuda.synchronize()
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.barrier()
+
         # Replay
         self.graphs[B].replay()
 
