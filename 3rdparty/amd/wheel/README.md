@@ -1,60 +1,59 @@
-# sglang-kernel (prior sgl-kernel)
+# Limitations
 
-Building and releasing `sglang-kernel` as a wheel is a part of the release workflow. Check [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml) for details.
+* Wheels built for ROCm 7.0.0 have [a known issue](https://github.com/sgl-project/sglang/issues/20188).
+* sglang-kernel wheels so far were built without multi-arch support and can only guarantee to work on gfx950.
+* We suggest using [docker images](https://hub.docker.com/r/rocm/sgl-dev) for a better experience.
+
+# sglang-kernel (formerly sgl-kernel)
+
+> **Note:** We generally don't recommend direct installation of sglang-kernel, as it may not match arbitrary sglang versions in your target environment.
+
+## Install Prebuilt Wheel
+
+For example, to install [version 0.4.2.post2](https://sgl-project.github.io/whl/rocm720/sglang-kernel/):
+
+```bash
+pip install https://github.com/sgl-project/whl/releases/download/v0.4.2.post2/sglang_kernel-0.4.2.post2+rocm720-cp310-abi3-manylinux2014_x86_64.whl#sha256=86ce4335c7e12fa75f8ce24311ab5c3d52ec8c73a90b407868d0e7142c3d6421
+```
+
+## Reference
+
+* [release-whl-kernel.yml](https://github.com/sgl-project/sglang/blob/main/.github/workflows/release-whl-kernel.yml)
 
 # sglang
 
-`3rdparty/amd/wheel/sglang/pyproject.toml` is the AMD-specific pyproject for building the `amd-sglang` wheel. It extends `python/pyproject_other.toml` with two ROCm-version extras (`rocm700`, `rocm720`) that pin the matching torch/triton/torchaudio/torchvision/`sglang-kernel` wheels, and renames the package to `amd-sglang`.
+Choose one of the following installation methods.
 
-## Operation to build sglang wheel
+## Build from Source
 
-```
-$ git clone https://github.com/sgl-project/sglang.git && cd sglang
-$ cp 3rdparty/amd/wheel/sglang/pyproject.toml python/pyproject.toml
-$ cd python && python -m build
-```
-
-## Installation
-
-### v0.5.9
-
-ROCm 7.0.0:
-```
-pip uninstall sglang-kernel sglang amd-sglang
-pip install "amd-sglang[all-hip,rocm700]" -i https://pypi.amd.com/rocm-7.0.0/simple --extra-index-url https://pypi.org/simple
+```bash
+cp python/pyproject_rocm.toml python/pyproject.toml
+cd python && python -m build
 ```
 
-ROCm 7.2.0:
-```
-pip uninstall sglang-kernel sglang amd-sglang
-pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
-```
+## Install Prebuilt Wheel
 
-Note: You must resolve the two dependencies, AITER and triton, below.  Others are optional depending on your applications.
+For example, to install for [ROCm 7.2.0](https://pypi.amd.com/sglang/rocm720/simple/sglang/):
+
+```bash
+pip install "sglang[all-hip,rocm720]" -i https://pypi.amd.com/sglang/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
+```
 
 ## Manual Dependency Resolution
 
-### Resolving AITER
+### Resolving Triton
 
-[AITER](https://github.com/ROCm/aiter) is a fundamental dependency. Wheel-izing it is ongoing.
-Until we can pin it reliably, install it manually (typically following the [ROCm docker recipe](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L106).
+To avoid known issues in Triton 3.5.1 (installed by default), we recommend upgrading Triton after installation:
 
-### Revolving triton
-
-To avoid known issues in triton 3.5.1 installed by default, we recommend upgrading triton after installation.  In ROCm 7.0.0 environment,
-```
-pip install triton==3.6.0
-```
-or ROCm 7.2.0,
-```
+```bash
 pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/triton-3.6.0%2Brocm7.2.0.gitba5c1517-cp310-cp310-linux_x86_64.whl
 ```
 
-#### `torch._inductor.exc.InductorError: AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'`
+#### Known Issue: `torch._inductor.exc.InductorError: AttributeError: 'KernelMetadata' object has no attribute 'cluster_dims'`
 
-After upgrading, you may hit this error during inference when PyTorch Inductor interacts with Triton metadata.
+After upgrading Triton, you may encounter this error during inference when PyTorch Inductor interacts with Triton metadata.
 
-A pragmatic workaround is to guard the metadata access in Inductor's Triton heuristics so it only reads `cluster_dims` when the attribute exists:
+**Workaround:** Guard the metadata access in Inductor's Triton heuristics to only read `cluster_dims` when the attribute exists:
 
 ```diff
 --- a/opt/venv/lib/python3.10/site-packages/torch/_inductor/runtime/triton_heuristics.py
@@ -76,19 +75,26 @@ A pragmatic workaround is to guard the metadata access in Inductor's Triton heur
 
 Install sgl-model-gateway as follows:
 
-```
-$ apt install openssl libssl-dev protobuf
-$ export PATH="/$HOME/.cargo/bin:${PATH}" \
+```bash
+# Install system dependencies
+apt install openssl libssl-dev protobuf-compiler
+
+# Install Rust toolchain
+export PATH="/$HOME/.cargo/bin:${PATH}" \
   && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-  && rustc --version && cargo --version # Prepare for a rust toolchain
-$ python3 -m pip install --no-cache-dir setuptools-rust \
+  && rustc --version && cargo --version
+
+# Build and install sgl-model-gateway
+python3 -m pip install --no-cache-dir setuptools-rust \
   && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
   && cargo build --release \
   && python3 -m pip install --no-cache-dir . \
-  && rm -rf /root/.cache # Build and install sgl-model-gateway
+  && rm -rf /root/.cache
 ```
 
-#### [Mori](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L381)
+#### Mori
+
+See the [Mori installation steps](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L381) in the ROCm Dockerfile.
 
 ### Resolving Dependencies for DeepSeek-V3.2
 
