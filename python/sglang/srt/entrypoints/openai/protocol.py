@@ -80,6 +80,90 @@ class ModelList(BaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+CODEX_BASE_INSTRUCTIONS = (
+    "You are a coding assistant running on SGLang. Be accurate, concrete, and "
+    "focus on actionable engineering help."
+)
+
+
+class CodexTruncationPolicy(BaseModel):
+    mode: Literal["bytes"] = "bytes"
+    limit: int = 10000
+
+
+class CodexModelInfo(BaseModel):
+    slug: str
+    display_name: str
+    description: Optional[str] = None
+    default_reasoning_level: Optional[str] = None
+    supported_reasoning_levels: List[str] = Field(default_factory=list)
+    shell_type: Literal["default"] = "default"
+    visibility: Literal["list"] = "list"
+    supported_in_api: bool = True
+    priority: int
+    additional_speed_tiers: List[str] = Field(default_factory=list)
+    availability_nux: Optional[Dict[str, Any]] = None
+    upgrade: Optional[Dict[str, Any]] = None
+    base_instructions: str = CODEX_BASE_INSTRUCTIONS
+    model_messages: Optional[List[Dict[str, Any]]] = None
+    supports_reasoning_summaries: bool = False
+    default_reasoning_summary: str = "auto"
+    support_verbosity: bool = False
+    default_verbosity: Optional[str] = None
+    apply_patch_tool_type: Optional[str] = None
+    web_search_tool_type: Literal["text"] = "text"
+    truncation_policy: CodexTruncationPolicy = Field(
+        default_factory=CodexTruncationPolicy
+    )
+    supports_parallel_tool_calls: bool = False
+    supports_image_detail_original: bool = False
+    context_window: int
+    max_context_window: int
+    auto_compact_token_limit: Optional[int] = None
+    effective_context_window_percent: int = 95
+    experimental_supported_tools: List[str] = Field(default_factory=list)
+    input_modalities: List[str] = Field(default_factory=lambda: ["text"])
+    supports_search_tool: bool = False
+
+
+class CodexModelsResponse(BaseModel):
+    models: List[CodexModelInfo] = Field(default_factory=list)
+
+
+def build_codex_model_info(
+    slug: str,
+    *,
+    context_window: int,
+    is_multimodal: bool,
+    priority: int,
+) -> CodexModelInfo:
+    input_modalities = ["text", "image"] if is_multimodal else ["text"]
+    return CodexModelInfo(
+        slug=slug,
+        display_name=slug,
+        priority=priority,
+        context_window=context_window,
+        max_context_window=context_window,
+        input_modalities=input_modalities,
+    )
+
+
+def build_codex_models_response(
+    model_slugs: List[str], *, context_window: int, is_multimodal: bool
+) -> CodexModelsResponse:
+    return CodexModelsResponse(
+        models=[
+            build_codex_model_info(
+                slug=slug,
+                context_window=context_window,
+                is_multimodal=is_multimodal,
+                priority=priority,
+            )
+            for priority, slug in enumerate(model_slugs)
+        ]
+    )
+
+
 class ErrorResponse(BaseModel):
     object: str = "error"
     message: str

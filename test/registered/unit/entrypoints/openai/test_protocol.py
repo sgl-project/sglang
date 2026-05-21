@@ -19,16 +19,19 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, ValidationError
 
 from sglang.srt.entrypoints.openai.protocol import (
+    CODEX_BASE_INSTRUCTIONS,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
+    CodexModelsResponse,
     CompletionRequest,
     Function,
     ModelCard,
     ModelList,
     Tool,
     UsageInfo,
+    build_codex_models_response,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -66,6 +69,38 @@ class TestModelList(unittest.TestCase):
         self.assertEqual(len(model_list.data), 2)
         self.assertEqual(model_list.data[0].id, "model-1")
         self.assertEqual(model_list.data[1].id, "model-2")
+
+
+class TestCodexModelsResponse(unittest.TestCase):
+    """Test Codex model list serialization helpers."""
+
+    def test_text_only_model_modalities(self):
+        response = build_codex_models_response(
+            ["test-model"], context_window=4096, is_multimodal=False
+        )
+        self.assertIsInstance(response, CodexModelsResponse)
+        self.assertEqual(response.models[0].input_modalities, ["text"])
+        self.assertEqual(response.models[0].base_instructions, CODEX_BASE_INSTRUCTIONS)
+
+    def test_multimodal_model_modalities(self):
+        response = build_codex_models_response(
+            ["vl-model"], context_window=8192, is_multimodal=True
+        )
+        self.assertEqual(response.models[0].input_modalities, ["text", "image"])
+        self.assertEqual(response.models[0].context_window, 8192)
+        self.assertEqual(response.models[0].max_context_window, 8192)
+
+    def test_adapter_priorities_increase_with_order(self):
+        response = build_codex_models_response(
+            ["base-model", "adapter-a", "adapter-b"],
+            context_window=16384,
+            is_multimodal=False,
+        )
+        self.assertEqual(
+            [model.slug for model in response.models],
+            ["base-model", "adapter-a", "adapter-b"],
+        )
+        self.assertEqual([model.priority for model in response.models], [0, 1, 2])
 
 
 class TestCompletionRequest(unittest.TestCase):

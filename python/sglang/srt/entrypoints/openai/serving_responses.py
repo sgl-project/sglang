@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import time
+from collections import defaultdict
 from contextlib import AsyncExitStack
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
@@ -17,7 +18,7 @@ import jinja2
 import openai.types.responses as openai_responses_types
 import orjson
 from fastapi import Request
-from fastapi.responses import ORJSONResponse
+from fastapi.responses import ORJSONResponse, StreamingResponse
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -69,6 +70,23 @@ logger = logging.getLogger(__name__)
 
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
+
+    _BRIDGE_TOP_LEVEL_FIELDS = {"text", "prompt_cache_key", "client_metadata"}
+    _BRIDGE_TOOL_TYPES = {
+        "function",
+        "namespace",
+        "tool_search",
+        "custom",
+        "local_shell",
+        "web_search",
+        "image_generation",
+    }
+    _BRIDGE_SKIPPED_TOOL_TYPES = {"web_search", "image_generation"}
+    _BRIDGE_REJECTED_TOOL_TYPES = {
+        "local_shell",
+        "web_search_preview",
+        "code_interpreter",
+    }
 
     def __init__(
         self,
@@ -158,6 +176,717 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     def _request_id_prefix(self) -> str:
         return "resp_"
+
+    async def handle_raw_request(
+        self,
+        raw_body: dict[str, Any],
+        raw_request: Optional[Request] = None,
+    ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        if self._should_bridge_raw_request(raw_body):
+            return await self._handle_bridged_request(raw_body, raw_request)
+
+        try:
+            request = ResponsesRequest.model_validate(raw_body)
+        except Exception as exc:
+            return self.create_error_response(str(exc))
+
+        return await self.create_responses(request, raw_request)
+
+    def _should_bridge_raw_request(self, raw_body: dict[str, Any]) -> bool:
+        if any(field in raw_body for field in self._BRIDGE_TOP_LEVEL_FIELDS):
+            return True
+
+        for tool in raw_body.get("tools") or []:
+            if tool.get("type") in self._BRIDGE_TOOL_TYPES:
+                return True
+
+        raw_input = raw_body.get("input")
+        if not isinstance(raw_input, list):
+            return False
+
+        for item in raw_input:
+            if not isinstance(item, dict):
+                continue
+
+            item_type = item.get("type")
+            if item_type in {
+                "function_call",
+                "function_call_output",
+                "custom_tool_call_output",
+            }:
+                return True
+
+            if item_type in (None, "message"):
+                content = item.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") in {
+                            "input_text",
+                            "input_image",
+                            "output_text",
+                        }:
+                            return True
+
+        return False
+
+    async def _handle_bridged_request(
+        self,
+        raw_body: dict[str, Any],
+        raw_request: Optional[Request],
+    ) -> Union[AsyncGenerator[str, None], ORJSONResponse]:
+        if raw_body.get("stream") is not True:
+            return self.create_error_response(
+                "This /v1/responses bridge currently supports only streaming POST /v1/responses requests.",
+                param="stream",
+            )
+
+        try:
+            chat_request, namespace_map, bridge_warnings = (
+                self._translate_bridged_request(raw_body)
+            )
+        except ValueError as exc:
+            return self.create_error_response(str(exc))
+
+        error_msg = OpenAIServingChat._validate_request(self, chat_request)
+        if error_msg:
+            return self.create_error_response(error_msg)
+
+        try:
+            adapted_request, processed_request = (
+                OpenAIServingChat._convert_to_internal_request(
+                    self, chat_request, raw_request
+                )
+            )
+        except Exception as exc:
+            return self.create_error_response(str(exc))
+
+        chat_result = await OpenAIServingChat._handle_streaming_request(
+            self, adapted_request, processed_request, raw_request
+        )
+        if not isinstance(chat_result, StreamingResponse):
+            return self._convert_chat_error_response(chat_result)
+
+        response_id = (
+            raw_body.get("request_id") or f"{self._request_id_prefix()}{random_uuid()}"
+        )
+        created_time = int(time.time())
+        return self._bridge_chat_stream(
+            chat_result.body_iterator,
+            raw_body,
+            chat_request,
+            response_id=response_id,
+            created_time=created_time,
+            namespace_map=namespace_map,
+            bridge_warnings=bridge_warnings,
+        )
+
+    def _translate_bridged_request(
+        self, raw_body: dict[str, Any]
+    ) -> tuple[ChatCompletionRequest, dict[str, dict[str, str]], list[str]]:
+        namespace_map: dict[str, dict[str, str]] = {}
+        tools, bridge_warnings = self._translate_bridged_tools(
+            raw_body.get("tools") or [], namespace_map
+        )
+
+        response_format = None
+        text_config = raw_body.get("text")
+        if isinstance(text_config, dict):
+            fmt = text_config.get("format")
+            if isinstance(fmt, dict) and fmt.get("type") == "json_schema":
+                response_format = fmt
+
+        reasoning = raw_body.get("reasoning")
+        reasoning_effort = None
+        if isinstance(reasoning, dict):
+            reasoning_effort = reasoning.get("effort")
+
+        request_data: dict[str, Any] = {
+            "model": raw_body.get("model"),
+            "messages": self._translate_bridged_messages(
+                raw_body.get("input"), raw_body.get("instructions")
+            ),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": raw_body.get("temperature"),
+            "top_p": raw_body.get("top_p"),
+            "presence_penalty": raw_body.get("presence_penalty", 0.0),
+            "frequency_penalty": raw_body.get("frequency_penalty", 0.0),
+            "stop": raw_body.get("stop"),
+            "parallel_tool_calls": raw_body.get("parallel_tool_calls", True),
+            "user": raw_body.get("user"),
+            "max_completion_tokens": raw_body.get("max_output_tokens"),
+            "reasoning_effort": reasoning_effort,
+            "response_format": response_format,
+            "tools": tools or None,
+            "tool_choice": self._translate_bridged_tool_choice(
+                raw_body.get("tool_choice"), namespace_map, tools
+            ),
+            "rid": raw_body.get("request_id")
+            or f"{self._request_id_prefix()}{random_uuid()}",
+            "priority": raw_body.get("priority"),
+            "extra_key": raw_body.get("extra_key"),
+            "cache_salt": raw_body.get("cache_salt"),
+        }
+        request_data = {k: v for k, v in request_data.items() if v is not None}
+        return (
+            ChatCompletionRequest.model_validate(request_data),
+            namespace_map,
+            bridge_warnings,
+        )
+
+    def _translate_bridged_messages(
+        self, raw_input: Any, instructions: Optional[str]
+    ) -> list[ChatCompletionMessageParam]:
+        messages: list[ChatCompletionMessageParam] = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+
+        if raw_input is None:
+            return messages
+
+        if isinstance(raw_input, str):
+            messages.append({"role": "user", "content": raw_input})
+            return messages
+        if not isinstance(raw_input, list):
+            raise ValueError(
+                "Bridged /v1/responses requests must use a string or list input."
+            )
+
+        for item in raw_input:
+            if not isinstance(item, dict):
+                raise ValueError("Unsupported response input item in bridge mode.")
+
+            item_type = item.get("type")
+            if item_type in (None, "message"):
+                role = item.get("role", "user")
+                messages.append(
+                    {
+                        "role": role,
+                        "content": self._translate_bridged_message_content(
+                            item.get("content", "")
+                        ),
+                    }
+                )
+                continue
+
+            if item_type == "function_call":
+                tool_name = item.get("name")
+                namespace = item.get("namespace")
+                if not tool_name:
+                    raise ValueError("function_call items must provide a name.")
+                if namespace:
+                    tool_name = self._flatten_namespace_tool_name(namespace, tool_name)
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id"),
+                                "type": "function",
+                                "function": {
+                                    "name": tool_name,
+                                    "arguments": self._stringify_tool_payload(
+                                        item.get("arguments", "")
+                                    ),
+                                },
+                            }
+                        ],
+                    }
+                )
+                continue
+
+            if item_type in {"function_call_output", "custom_tool_call_output"}:
+                output = item.get("output")
+                if output is None:
+                    output = item.get("content")
+                if output is None:
+                    output = item.get("input", "")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id") or item.get("tool_call_id"),
+                        "content": self._stringify_tool_payload(output),
+                    }
+                )
+                continue
+
+            raise ValueError(f"Unsupported response input item type '{item_type}'.")
+
+        return messages
+
+    def _translate_bridged_message_content(self, content: Any) -> Any:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return self._stringify_tool_payload(content)
+
+        text_parts: list[str] = []
+        multimodal_parts: list[dict[str, Any]] = []
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+
+            part_type = part.get("type")
+            if part_type in {"input_text", "output_text", "text"}:
+                text = part.get("text", "")
+                text_parts.append(text)
+                if multimodal_parts:
+                    multimodal_parts.append({"type": "text", "text": text})
+                continue
+
+            if part_type in {"input_image", "image_url"}:
+                image_payload = (
+                    part.get("image_url") or part.get("image") or part.get("url")
+                )
+                if isinstance(image_payload, dict):
+                    image_url = dict(image_payload)
+                else:
+                    image_url = {"url": image_payload}
+                if part.get("detail") is not None and "detail" not in image_url:
+                    image_url["detail"] = part["detail"]
+                if text_parts and not multimodal_parts:
+                    multimodal_parts.extend(
+                        {"type": "text", "text": text} for text in text_parts
+                    )
+                multimodal_parts.append({"type": "image_url", "image_url": image_url})
+                continue
+
+        if multimodal_parts:
+            return multimodal_parts
+        return "\n".join(text_parts)
+
+    def _translate_bridged_tools(
+        self,
+        raw_tools: list[dict[str, Any]],
+        namespace_map: dict[str, dict[str, str]],
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        translated_tools: list[dict[str, Any]] = []
+        bridge_warnings: list[str] = []
+        for tool in raw_tools:
+            if not isinstance(tool, dict):
+                raise ValueError("Unsupported tool definition in bridge mode.")
+
+            tool_type = tool.get("type")
+            if tool_type in self._BRIDGE_SKIPPED_TOOL_TYPES:
+                warning = (
+                    f"Skipping unsupported tool type '{tool_type}' in /v1/responses "
+                    "bridge mode."
+                )
+                logger.warning(warning)
+                bridge_warnings.append(warning)
+                continue
+            if tool_type in self._BRIDGE_REJECTED_TOOL_TYPES:
+                raise ValueError(
+                    f"Tool type '{tool_type}' is not supported by the /v1/responses bridge in this first pass."
+                )
+
+            if tool_type == "function":
+                translated_tools.append(self._build_function_chat_tool(tool))
+                continue
+
+            if tool_type == "namespace":
+                namespace = tool.get("namespace") or tool.get("name")
+                functions = tool.get("functions") or tool.get("tools") or []
+                if not namespace or not isinstance(functions, list):
+                    raise ValueError(
+                        "Namespace tools must provide a namespace and functions."
+                    )
+                for function_tool in functions:
+                    translated = self._build_function_chat_tool(function_tool)
+                    original_name = translated["function"]["name"]
+                    flattened_name = self._flatten_namespace_tool_name(
+                        namespace, original_name
+                    )
+                    translated["function"]["name"] = flattened_name
+                    namespace_map[flattened_name] = {
+                        "namespace": namespace,
+                        "name": original_name,
+                    }
+                    translated_tools.append(translated)
+                continue
+
+            if tool_type == "tool_search":
+                translated_tools.append(self._build_function_chat_tool(tool))
+                continue
+
+            if tool_type == "custom":
+                tool_name = tool.get("name")
+                if not tool_name:
+                    raise ValueError("Custom tools must provide a name.")
+                translated_tools.append(
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "description": tool.get("description"),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "input": {"type": "string"},
+                                },
+                                "required": ["input"],
+                            },
+                            "strict": bool(tool.get("strict", False)),
+                        },
+                    }
+                )
+                continue
+
+            raise ValueError(
+                f"Tool type '{tool_type}' is not supported by the /v1/responses bridge in this first pass."
+            )
+
+        return translated_tools, bridge_warnings
+
+    def _build_function_chat_tool(self, tool: dict[str, Any]) -> dict[str, Any]:
+        function = tool.get("function")
+        if not isinstance(function, dict):
+            function = tool
+        name = function.get("name") or tool.get("name")
+        if not name:
+            raise ValueError("Function tools must provide a name.")
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": function.get("description") or tool.get("description"),
+                "parameters": function.get("parameters") or tool.get("parameters"),
+                "strict": bool(function.get("strict", tool.get("strict", False))),
+            },
+        }
+
+    def _translate_bridged_tool_choice(
+        self,
+        tool_choice: Any,
+        namespace_map: dict[str, dict[str, str]],
+        tools: list[dict[str, Any]],
+    ) -> Any:
+        if tool_choice is None:
+            return "auto"
+        if isinstance(tool_choice, str):
+            return tool_choice
+        if not isinstance(tool_choice, dict):
+            return tool_choice
+
+        if tool_choice.get("type") in self._BRIDGE_SKIPPED_TOOL_TYPES:
+            raise ValueError(
+                f"tool_choice selects unsupported tool type '{tool_choice.get('type')}', "
+                "which is skipped in /v1/responses bridge mode."
+            )
+        if tool_choice.get("type") != "function":
+            return tool_choice
+
+        function_name = tool_choice.get("name")
+        namespace = tool_choice.get("namespace")
+        function = tool_choice.get("function")
+        if not function_name and isinstance(function, dict):
+            function_name = function.get("name")
+            namespace = namespace or function.get("namespace")
+
+        if namespace and function_name:
+            function_name = self._flatten_namespace_tool_name(namespace, function_name)
+        elif function_name in namespace_map:
+            function_name = function_name
+
+        available_tool_names = {
+            tool["function"]["name"]
+            for tool in tools
+            if isinstance(tool, dict)
+            and isinstance(tool.get("function"), dict)
+            and tool["function"].get("name")
+        }
+        if function_name and function_name not in available_tool_names:
+            raise ValueError(
+                f"tool_choice selects tool '{function_name}', but that tool is unavailable after bridge translation."
+            )
+
+        return {"type": "function", "function": {"name": function_name}}
+
+    def _flatten_namespace_tool_name(self, namespace: str, name: str) -> str:
+        return f"{namespace}.{name}"
+
+    def _stringify_tool_payload(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload)
+
+    def _convert_chat_error_response(
+        self, chat_error: ORJSONResponse
+    ) -> ORJSONResponse:
+        try:
+            payload = orjson.loads(chat_error.body)
+        except Exception:
+            return self.create_error_response("Internal server error", status_code=500)
+
+        if "error" in payload:
+            error = payload["error"]
+            return self.create_error_response(
+                error.get("message", "Internal server error"),
+                err_type=error.get("type", "invalid_request_error"),
+                status_code=error.get("code", chat_error.status_code),
+                param=error.get("param"),
+            )
+
+        return self.create_error_response(
+            payload.get("message", "Internal server error"),
+            err_type=payload.get("type", "invalid_request_error"),
+            status_code=payload.get("code", chat_error.status_code),
+            param=payload.get("param"),
+        )
+
+    async def _bridge_chat_stream(
+        self,
+        chat_stream: AsyncIterator[Any],
+        raw_body: dict[str, Any],
+        chat_request: ChatCompletionRequest,
+        *,
+        response_id: str,
+        created_time: int,
+        namespace_map: dict[str, dict[str, str]],
+        bridge_warnings: list[str],
+    ) -> AsyncGenerator[str, None]:
+        sequence_number = 0
+        message_item_id = f"msg_{random_uuid()}"
+        message_output_index = 0
+        message_added = False
+        content_index = 0
+        full_text = ""
+        saw_message_text = False
+        usage = None
+        tool_calls: dict[int, dict[str, Any]] = defaultdict(
+            lambda: {"id": None, "name": None, "arguments": []}
+        )
+
+        def send_event(event_type: str, payload: dict[str, Any]) -> str:
+            nonlocal sequence_number
+            event = {"type": event_type, "sequence_number": sequence_number, **payload}
+            sequence_number += 1
+            return f"event: {event_type}\ndata: {json.dumps(event)}\n\n"
+
+        yield send_event(
+            "response.created",
+            {
+                "response": self._make_bridged_response_payload(
+                    raw_body,
+                    response_id=response_id,
+                    model=chat_request.model,
+                    created_time=created_time,
+                    status="in_progress",
+                    output=[],
+                    usage=None,
+                    bridge_warnings=bridge_warnings,
+                )
+            },
+        )
+
+        async for raw_chunk in chat_stream:
+            event_payload = self._parse_chat_stream_chunk(raw_chunk)
+            if event_payload is None:
+                continue
+            if event_payload == "[DONE]":
+                continue
+
+            if "error" in event_payload:
+                yield f"data: {json.dumps({'error': event_payload['error']})}\n\n"
+                return
+
+            if event_payload.get("usage") is not None:
+                usage = self._translate_chat_usage(event_payload["usage"])
+                continue
+
+            choices = event_payload.get("choices") or []
+            if not choices:
+                continue
+
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+
+            text_delta = delta.get("content")
+            if text_delta:
+                if not message_added:
+                    message_added = True
+                    yield send_event(
+                        "response.output_item.added",
+                        {
+                            "output_index": message_output_index,
+                            "item": {
+                                "id": message_item_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "status": "in_progress",
+                            },
+                        },
+                    )
+                saw_message_text = True
+                full_text += text_delta
+                yield send_event(
+                    "response.output_text.delta",
+                    {
+                        "output_index": message_output_index,
+                        "item_id": message_item_id,
+                        "content_index": content_index,
+                        "delta": text_delta,
+                    },
+                )
+
+            for tool_call in delta.get("tool_calls") or []:
+                tool_index = tool_call.get("index", 0)
+                state = tool_calls[tool_index]
+                tool_id = tool_call.get("id")
+                if tool_id:
+                    state["id"] = tool_id
+                function = tool_call.get("function") or {}
+                if function.get("name"):
+                    state["name"] = function["name"]
+                if function.get("arguments"):
+                    state["arguments"].append(function["arguments"])
+
+        output_items = []
+        if saw_message_text:
+            message_item = {
+                "id": message_item_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": full_text,
+                        "annotations": [],
+                        "logprobs": None,
+                    }
+                ],
+                "status": "completed",
+            }
+            output_items.append(message_item)
+            yield send_event(
+                "response.output_item.done",
+                {
+                    "output_index": message_output_index,
+                    "item": message_item,
+                },
+            )
+
+        base_tool_output_index = 1 if saw_message_text else 0
+        for offset, tool_index in enumerate(sorted(tool_calls)):
+            tool_call = tool_calls[tool_index]
+            tool_name = tool_call["name"]
+            item = {
+                "id": f"fc_{random_uuid()}",
+                "type": "function_call",
+                "call_id": tool_call["id"] or f"call_{random_uuid()}",
+                "name": tool_name,
+                "arguments": "".join(tool_call["arguments"]),
+                "status": "completed",
+            }
+            if tool_name in namespace_map:
+                restored = namespace_map[tool_name]
+                item["name"] = restored["name"]
+                item["namespace"] = restored["namespace"]
+            output_items.append(item)
+            yield send_event(
+                "response.output_item.done",
+                {
+                    "output_index": base_tool_output_index + offset,
+                    "item": item,
+                },
+            )
+
+        yield send_event(
+            "response.completed",
+            {
+                "response": self._make_bridged_response_payload(
+                    raw_body,
+                    response_id=response_id,
+                    model=chat_request.model,
+                    created_time=created_time,
+                    status="completed",
+                    output=output_items,
+                    usage=usage,
+                    bridge_warnings=bridge_warnings,
+                )
+            },
+        )
+        yield "data: [DONE]\n\n"
+
+    def _make_bridged_response_payload(
+        self,
+        raw_body: dict[str, Any],
+        *,
+        response_id: str,
+        model: str,
+        created_time: int,
+        status: str,
+        output: list[dict[str, Any]],
+        usage: Optional[dict[str, Any]],
+        bridge_warnings: list[str],
+    ) -> dict[str, Any]:
+        metadata = dict(raw_body.get("metadata") or {})
+        if bridge_warnings:
+            metadata["bridge_warnings"] = bridge_warnings
+        response = {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_time,
+            "model": model,
+            "output": output,
+            "status": status,
+            "parallel_tool_calls": raw_body.get("parallel_tool_calls", True),
+            "tool_choice": raw_body.get("tool_choice", "auto"),
+            "tools": raw_body.get("tools") or [],
+            "instructions": raw_body.get("instructions"),
+            "max_output_tokens": raw_body.get("max_output_tokens"),
+            "previous_response_id": raw_body.get("previous_response_id"),
+            "store": raw_body.get("store"),
+            "temperature": raw_body.get("temperature"),
+            "text": raw_body.get("text"),
+            "top_p": raw_body.get("top_p"),
+            "truncation": raw_body.get("truncation"),
+            "user": raw_body.get("user"),
+            "metadata": metadata or None,
+            "usage": usage,
+        }
+        return {k: v for k, v in response.items() if v is not None}
+
+    def _translate_chat_usage(self, chat_usage: dict[str, Any]) -> dict[str, Any]:
+        prompt_details = chat_usage.get("prompt_tokens_details") or {}
+        return {
+            "input_tokens": chat_usage.get("prompt_tokens", 0),
+            "input_tokens_details": {
+                "cached_tokens": prompt_details.get("cached_tokens", 0)
+            },
+            "output_tokens": chat_usage.get("completion_tokens", 0),
+            "output_tokens_details": {
+                "reasoning_tokens": chat_usage.get("reasoning_tokens", 0)
+            },
+            "total_tokens": chat_usage.get("total_tokens", 0),
+        }
+
+    def _parse_chat_stream_chunk(
+        self, raw_chunk: Any
+    ) -> Optional[Union[str, dict[str, Any]]]:
+        if isinstance(raw_chunk, bytes):
+            raw_chunk = raw_chunk.decode("utf-8")
+        if not isinstance(raw_chunk, str):
+            return None
+
+        for block in raw_chunk.split("\n\n"):
+            if not block:
+                continue
+            data_lines = [
+                line[len("data: ") :]
+                for line in block.splitlines()
+                if line.startswith("data: ")
+            ]
+            if not data_lines:
+                continue
+            payload = "\n".join(data_lines)
+            if payload == "[DONE]":
+                return payload
+            return json.loads(payload)
+        return None
 
     async def create_responses(
         self,

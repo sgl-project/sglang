@@ -1532,6 +1532,21 @@ class TestLoRADynamicUpdate(CustomTestCase):
             adapter_names = {m["id"] for m in adapter_models}
             self.assertEqual(adapter_names, {"adapter1", "adapter2"})
 
+            response = requests.get(
+                DEFAULT_URL_FOR_TEST + "/v1/models",
+                params={"client_version": "0.124.0"},
+            )
+            self.assertTrue(response.ok, response.text)
+            codex_models = response.json()["models"]
+            self.assertEqual(
+                [model["slug"] for model in codex_models],
+                [
+                    "meta-llama/Llama-3.1-8B-Instruct",
+                    "adapter1",
+                    "adapter2",
+                ],
+            )
+
             # Unload one adapter
             session.unload_lora_adapter(lora_name="adapter1")
 

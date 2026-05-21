@@ -81,16 +81,17 @@ from sglang.srt.entrypoints.ollama.serving import OllamaServing
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ClassifyRequest,
+    CodexModelsResponse,
     CompletionRequest,
     DetokenizeRequest,
     EmbeddingRequest,
     ErrorResponse,
     ModelCard,
     ModelList,
-    ResponsesRequest,
     ScoringRequest,
     TokenizeRequest,
     V1RerankReqInput,
+    build_codex_models_response,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
@@ -1598,36 +1599,63 @@ async def openai_v1_audio_transcriptions(
     )
 
 
-@app.get("/v1/models", response_class=ORJSONResponse)
-async def available_models():
-    """Show available models. OpenAI-compatible endpoint."""
-    served_model_names = [_global_state.tokenizer_manager.served_model_name]
-    model_cards = []
+def _get_served_model_entries() -> List[Dict[str, Any]]:
+    tokenizer_manager = _global_state.tokenizer_manager
+    base_model_name = tokenizer_manager.served_model_name
+    model_entries = [
+        {
+            "id": base_model_name,
+            "root": base_model_name,
+            "parent": None,
+            "max_model_len": tokenizer_manager.model_config.context_len,
+        }
+    ]
 
-    # Add base model
-    for served_model_name in served_model_names:
-        model_cards.append(
+    if tokenizer_manager.server_args.enable_lora:
+        for _, lora_ref in tokenizer_manager.lora_registry.get_all_adapters().items():
+            model_entries.append(
+                {
+                    "id": lora_ref.lora_name,
+                    "root": lora_ref.lora_path,
+                    "parent": base_model_name,
+                    "max_model_len": None,
+                }
+            )
+
+    return model_entries
+
+
+def _build_openai_model_list(model_entries: List[Dict[str, Any]]) -> ModelList:
+    return ModelList(
+        data=[
             ModelCard(
-                id=served_model_name,
-                root=served_model_name,
-                max_model_len=_global_state.tokenizer_manager.model_config.context_len,
+                id=model_entry["id"],
+                root=model_entry["root"],
+                parent=model_entry["parent"],
+                max_model_len=model_entry["max_model_len"],
             )
-        )
+            for model_entry in model_entries
+        ]
+    )
 
-    # Add loaded LoRA adapters
-    if _global_state.tokenizer_manager.server_args.enable_lora:
-        lora_registry = _global_state.tokenizer_manager.lora_registry
-        for _, lora_ref in lora_registry.get_all_adapters().items():
-            model_cards.append(
-                ModelCard(
-                    id=lora_ref.lora_name,
-                    root=lora_ref.lora_path,
-                    parent=served_model_names[0],
-                    max_model_len=None,
-                )
-            )
 
-    return ModelList(data=model_cards)
+def _build_codex_model_list(model_entries: List[Dict[str, Any]]) -> CodexModelsResponse:
+    tokenizer_manager = _global_state.tokenizer_manager
+    return build_codex_models_response(
+        [model_entry["id"] for model_entry in model_entries],
+        context_window=tokenizer_manager.model_config.context_len,
+        is_multimodal=tokenizer_manager.model_config.is_multimodal,
+    )
+
+
+@app.get("/v1/models", response_class=ORJSONResponse)
+async def available_models(request: Request):
+    """Show available models. OpenAI-compatible endpoint."""
+    model_entries = _get_served_model_entries()
+    client_version = request.query_params.get("client_version")
+    if client_version:
+        return _build_codex_model_list(model_entries)
+    return _build_openai_model_list(model_entries)
 
 
 @app.get("/v1/models/{model:path}", response_class=ORJSONResponse)
@@ -1667,9 +1695,8 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
-    result = await raw_request.app.state.openai_serving_responses.create_responses(
-        request_obj, raw_request
+    result = await raw_request.app.state.openai_serving_responses.handle_raw_request(
+        request, raw_request
     )
 
     # Handle streaming responses
