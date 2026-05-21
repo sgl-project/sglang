@@ -108,13 +108,35 @@ class RequestStage:
 
     # Pre-scheduler sub-attribution (observed at scheduler receive time using
     # timestamps propagated from APIServerReqTimeStats).
+    #
+    # CHAT_TEMPLATE = received_time -> prompt_render_finish_time. For
+    # /v1/chat/completions this covers _convert_to_internal_request, which
+    # historically called apply_chat_template(tokenize=True). The two
+    # CHAT_TEMPLATE_RENDER / CHAT_TEMPLATE_ENCODE sub-stages split the heavy
+    # work; the remaining time inside CHAT_TEMPLATE (preamble + GenerateReqInput
+    # construction) is derivable as chat_template - render - encode.
     CHAT_TEMPLATE = RequestStageConfig(
         "chat_template",
         level=1,
         metrics_is_observed=True,
     )
-    HF_TOKENIZE = RequestStageConfig(
-        "hf_tokenize",
+    CHAT_TEMPLATE_RENDER = RequestStageConfig(
+        "chat_template_render",
+        level=1,
+        metrics_is_observed=True,
+    )
+    CHAT_TEMPLATE_ENCODE = RequestStageConfig(
+        "chat_template_encode",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Time spent in tokenizer_manager.generate_request preamble and
+    # _tokenize_one_request after _convert_to_internal_request returns. For the
+    # /v1/chat/completions path this is mostly bookkeeping (mm-processor checks,
+    # building TokenizedGenerateReqInput); for native /generate with text input
+    # this also includes the actual HF tokenize call.
+    TOKENIZE_MANAGER_PREP = RequestStageConfig(
+        "tokenize_manager_prep",
         level=1,
         metrics_is_observed=True,
     )
@@ -358,15 +380,24 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
 
+    # Sub-buckets of CHAT_TEMPLATE for /v1/chat/completions, in seconds.
+    # Stored as durations (not absolute times) so they bypass the cross-process
+    # clock-drift adjustment in __setstate__.
+    chat_template_render_duration: float = 0.0
+    chat_template_encode_duration: float = 0.0
+
     def __getstate__(self) -> object:
-        # send to DP controller or Scheduler. These timestamps are used by
-        # SchedulerReqTimeStats.set_scheduler_recv_time to emit per-stage
-        # histograms (chat_template / hf_tokenize / zmq_wire).
+        # send to DP controller or Scheduler. These timestamps + durations are
+        # used by SchedulerReqTimeStats.set_scheduler_recv_time to emit
+        # per-stage histograms (chat_template / chat_template_render /
+        # chat_template_encode / tokenize_manager_prep / zmq_wire).
         state = {
             "created_time": self.created_time,
             "prompt_render_finish_time": self.prompt_render_finish_time,
             "tokenize_finish_time": self.tokenize_finish_time,
             "api_server_dispatch_time": self.api_server_dispatch_time,
+            "chat_template_render_duration": self.chat_template_render_duration,
+            "chat_template_encode_duration": self.chat_template_encode_duration,
         }
         state.update(super().__getstate__())
         return state
@@ -560,13 +591,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     """
 
     # Propagated from tokenizer/grpc_server or dp controller, used to emit
-    # per-stage histograms (chat_template / hf_tokenize / zmq_wire) at
-    # scheduler receive time.
+    # per-stage histograms (chat_template / chat_template_render /
+    # chat_template_encode / tokenize_manager_prep / zmq_wire) at scheduler
+    # receive time.
     created_time: float = 0.0
     prompt_render_finish_time: float = 0.0
     tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     dpc_dispatch_time: float = 0.0
+    # Durations (seconds) for the two sub-buckets of chat_template; only set
+    # for /v1/chat/completions requests.
+    chat_template_render_duration: float = 0.0
+    chat_template_encode_duration: float = 0.0
 
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
@@ -635,9 +671,19 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
                 RequestStage.CHAT_TEMPLATE,
                 self.prompt_render_finish_time - self.created_time,
             )
+        if self.chat_template_render_duration > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE_RENDER,
+                self.chat_template_render_duration,
+            )
+        if self.chat_template_encode_duration > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE_ENCODE,
+                self.chat_template_encode_duration,
+            )
         if self.prompt_render_finish_time > 0.0 and self.tokenize_finish_time > 0.0:
             self.observe_per_stage_req_latency(
-                RequestStage.HF_TOKENIZE,
+                RequestStage.TOKENIZE_MANAGER_PREP,
                 self.tokenize_finish_time - self.prompt_render_finish_time,
             )
         if self.api_server_dispatch_time > 0.0:

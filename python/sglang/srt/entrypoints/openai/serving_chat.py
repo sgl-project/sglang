@@ -451,6 +451,12 @@ class OpenAIServingChat(OpenAIServingBase):
             use_audio_in_video=getattr(request, "use_audio_in_video", False),
         )
 
+        adapted_request.chat_template_render_duration = (
+            processed_messages.chat_template_render_duration
+        )
+        adapted_request.chat_template_encode_duration = (
+            processed_messages.chat_template_encode_duration
+        )
         return adapted_request, request
 
     def _process_messages(
@@ -655,15 +661,29 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
+            # Split apply_chat_template(tokenize=True) into render-only and
+            # encode-only so /metrics can attribute time to each. Mirrors what
+            # HF does internally: chat templates already include role/special
+            # tokens, so the follow-up encode uses add_special_tokens=False.
+            chat_template_render_duration: Optional[float] = None
+            chat_template_encode_duration: Optional[float] = None
             try:
-                prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+                _t0 = time.perf_counter()
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
                     tools=tools,
                     return_dict=False,
                     **extra_template_kwargs,
                 )
+                _t1 = time.perf_counter()
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                    rendered_prompt, add_special_tokens=False
+                )
+                _t2 = time.perf_counter()
+                chat_template_render_duration = _t1 - _t0
+                chat_template_encode_duration = _t2 - _t1
             except Exception as e:
                 # If the first attempt fails, try with flat function-only format.
                 # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
@@ -673,14 +693,24 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
-                        openai_compatible_messages,
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        tools=tools,
-                        return_dict=False,
-                        **extra_template_kwargs,
+                    _t0 = time.perf_counter()
+                    rendered_prompt = (
+                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            return_dict=False,
+                            **extra_template_kwargs,
+                        )
                     )
+                    _t1 = time.perf_counter()
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        rendered_prompt, add_special_tokens=False
+                    )
+                    _t2 = time.perf_counter()
+                    chat_template_render_duration = _t1 - _t0
+                    chat_template_encode_duration = _t2 - _t1
                 except jinja2.TemplateError as template_error:
                     # Template errors (e.g., from raise_exception in Jinja templates)
                     # should be treated as client errors (400 BadRequest)
@@ -708,6 +738,8 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            chat_template_render_duration=chat_template_render_duration,
+            chat_template_encode_duration=chat_template_encode_duration,
         )
 
     def _apply_conversation_template(

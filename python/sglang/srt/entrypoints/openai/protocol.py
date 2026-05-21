@@ -1518,6 +1518,10 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    # Sub-bucket durations (seconds) when chat template + HF tokenize were
+    # measured separately; None for paths that do not split them.
+    chat_template_render_duration: Optional[float] = None
+    chat_template_encode_duration: Optional[float] = None
 
 
 class ToolCallProcessingResult(NamedTuple):

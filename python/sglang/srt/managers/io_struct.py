@@ -246,6 +246,10 @@ class GenerateReqInput(BaseReq):
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
     prompt_render_finish_time: Optional[float] = None
+    # Durations (seconds) for chat_template sub-buckets; only set for OpenAI
+    # chat completions, propagated to time_stats in _init_req_state.
+    chat_template_render_duration: Optional[float] = None
+    chat_template_encode_duration: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
@@ -699,6 +703,8 @@ class GenerateReqInput(BaseReq):
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
             prompt_render_finish_time=self.prompt_render_finish_time,
+            chat_template_render_duration=self.chat_template_render_duration,
+            chat_template_encode_duration=self.chat_template_encode_duration,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None

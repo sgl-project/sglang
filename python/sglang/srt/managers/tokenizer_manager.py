@@ -2637,6 +2637,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             time_stats.set_created_time(created_time)
             if getattr(obj, "prompt_render_finish_time", None):
                 time_stats.set_prompt_render_finish_time(obj.prompt_render_finish_time)
+            if getattr(obj, "chat_template_render_duration", None):
+                time_stats.chat_template_render_duration = (
+                    obj.chat_template_render_duration
+                )
+            if getattr(obj, "chat_template_encode_duration", None):
+                time_stats.chat_template_encode_duration = (
+                    obj.chat_template_encode_duration
+                )
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]
