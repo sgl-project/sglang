@@ -64,6 +64,7 @@ runtime_common = [
   "uvloop",
   "xgrammar==0.2.0",
   "smg-grpc-servicer>=0.5.0",
+  "xxhash",
 ]
 
 diffusion_common = [

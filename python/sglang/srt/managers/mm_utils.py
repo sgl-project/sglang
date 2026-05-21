@@ -3,7 +3,6 @@ Multi-modality utils
 """
 
 import copy
-import hashlib
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -12,6 +11,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 import torch
+import xxhash
 from torch import nn
 
 from sglang.srt.environ import envs
@@ -1317,8 +1317,7 @@ def get_multimodal_data_bounds(
 
 
 def data_hash(data) -> int:
-    hash_bytes = hashlib.sha256(data).digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    return xxhash.xxh3_64_intdigest(data)
 
 
 def tensor_hash(tensor_list) -> int:
@@ -1336,21 +1335,17 @@ def tensor_hash(tensor_list) -> int:
             tensor = torch.concat(tensors)
             return gpu_tensor_hash(tensor.cuda())
         # CPU path: hash each tensor incrementally without concat
-        hasher = hashlib.sha256()
+        hasher = xxhash.xxh3_64()
         for t in tensors:
             t = t.detach().contiguous()
             hasher.update(memoryview(t.view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+        return hasher.intdigest()
 
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
     tensor = tensor.detach().contiguous()
-    hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    return xxhash.xxh3_64_intdigest(memoryview(tensor.view(torch.uint8).numpy()))
 
 
 def hash_feature(f):
@@ -1360,10 +1355,7 @@ def hash_feature(f):
         return data_hash(tuple(flatten_nested_list(f)))
     elif isinstance(f, np.ndarray):
         arr = np.ascontiguousarray(f)
-        hasher = hashlib.sha256()
-        hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+        return xxhash.xxh3_64_intdigest(memoryview(arr))
     elif isinstance(f, torch.Tensor):
         return tensor_hash([f])
     elif isinstance(f, CudaIpcTensorTransportProxy):
