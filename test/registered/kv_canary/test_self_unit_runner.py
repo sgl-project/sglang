@@ -172,7 +172,9 @@ class TestSelfUnitRunner(CustomTestCase):
         self.device = DEFAULT_DEVICE
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
-            patch.object(kernel_launch_module, "canary_plan_step", lambda **kwargs: None),
+            patch.object(
+                kernel_launch_module, "canary_plan_step", lambda **kwargs: None
+            ),
             patch.object(endpoint_module, "canary_verify_step", lambda **kwargs: None),
             patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None),
         ]
