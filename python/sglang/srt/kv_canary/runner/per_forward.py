@@ -116,8 +116,6 @@ class PerForwardOrchestrator:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._drain_pending_enable_mirror()
-
         self._perturb_hook.perturb_hook(forward_batch)
         self._perturb_hook.perturb_real_kv_hook(forward_batch)
 
@@ -192,25 +190,24 @@ class PerForwardOrchestrator:
     def end_of_step(self) -> None:
         if self._config.mode == "off":
             return
+        # Drain the previous step's enable mirror right before overwriting the slot, matching the
+        # double-buffer pattern PumpAndAllreduce uses for its violation signal: the wait stalls the
+        # host as late as possible so the d2h copy gets a full forward pass of headroom.
+        previous = self._pending_enable_future
+        if previous is not None:
+            enable_value = int(previous.wait().item())
+            if enable_value == 0:
+                self._overflow_count_total += 1
+                logger.warning(
+                    "kv-canary: per-forward verify skipped this step due to overflow "
+                    "(total=%d, capacity=%d); check ServerArgs / pool sizing",
+                    self._overflow_count_total,
+                    self._verify_capacity,
+                )
         self._pending_enable_future = FutureTensor.create(
             src_device=self._verify_plan_per_forward.enable,
             stream=self._d2h_stream,
         )
-
-    def _drain_pending_enable_mirror(self) -> None:
-        future = self._pending_enable_future
-        if future is None:
-            return
-        self._pending_enable_future = None
-        enable_value = int(future.wait().item())
-        if enable_value == 0:
-            self._overflow_count_total += 1
-            logger.warning(
-                "kv-canary: per-forward verify skipped this step due to overflow "
-                "(total=%d, capacity=%d); check ServerArgs / pool sizing",
-                self._overflow_count_total,
-                self._verify_capacity,
-            )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
