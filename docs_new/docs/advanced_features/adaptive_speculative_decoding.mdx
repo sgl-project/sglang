@@ -76,7 +76,7 @@ The adaptive update happens in two places:
 title: "EAGLEWorker.forward_batch_generation() — decode path"
 ---
 flowchart TD
-  Z["⓪ adaptive_controller.get_steps_for_batch(batch_size)<br/>query optimal step for current BS range, activate if different"]
+  Z["⓪ activate_step_by_batch(batch_size)<br/>query optimal step for current BS range, activate if different"]
   A["① draft(batch)<br/>draft model multi-step generation with current tier"]
   B["② verify(batch, spec_info)<br/>target model tree verification → produces num_correct_drafts_per_req"]
   C["③ forward_draft_extend_after_decode(batch)<br/>draft model KV-cache catch-up"]

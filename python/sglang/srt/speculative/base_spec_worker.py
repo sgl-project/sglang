@@ -42,3 +42,11 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        """Activate the optimal adaptive step for the current batch size.
+
+        Default no-op. Adaptive-aware workers override this to switch
+        the runtime state before each draft round.
+        """
+        pass

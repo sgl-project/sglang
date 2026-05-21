@@ -509,17 +509,10 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
-            # Each BS range maintains its own optimal step count. The previous
-            # round may have served a different BS range, so we must switch to
-            # this batch's step before drafting. on_verify_complete (after verify)
-            # updates EMA and may change the step for the *current* BS range;
-            # this check handles cross-range switches between rounds.
             if self.adaptive_controller is not None:
-                target_steps = self.adaptive_controller.get_steps_for_batch(
-                    batch.batch_size()
+                self.adaptive_controller.activate_step_by_batch(
+                    batch.batch_size(), self.speculative_num_steps
                 )
-                if target_steps != self.speculative_num_steps:
-                    self.adaptive_controller.activate(target_steps)
 
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 

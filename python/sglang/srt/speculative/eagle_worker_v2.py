@@ -785,17 +785,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
-            # In SpecV2 (overlap scheduler), the step count must be set before
-            # the draft model runs because draft and verify are pipelined.  The
-            # EMA update from the previous batch's on_verify_complete may have
-            # changed the optimal step for the current batch size, so we query
-            # and activate here before entering the draft→verify→extend loop.
-            if self.adaptive_controller is not None:
-                target_steps = self.adaptive_controller.get_steps_for_batch(
-                    batch.seq_lens.shape[0]
-                )
-                if target_steps != self.speculative_num_steps:
-                    self.adaptive_controller.activate(target_steps)
+            self.activate_step_by_batch(batch.seq_lens.shape[0])
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -845,6 +835,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
+            )
+
+    def activate_step_by_batch(self, batch_size: int) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.activate_step_by_batch(
+                batch_size, self.speculative_num_steps
             )
 
     # -- Adaptive speculative decoding protocol --
