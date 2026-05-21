@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
-import os
 import unittest
 
 import torch
@@ -12,7 +10,7 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.srt.model_executor.forward_batch_info import _stable_hash_rid_i64
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.mock_model_utils import mock_model_engine_kwargs
+from sglang.test.mock_model_utils import mock_model_server_args, mock_model_server_env
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
@@ -151,30 +149,29 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(expected_inputs.tokens.tolist(), initial_tokens.tolist())
 
 
-class TestMockModelEngineKwargs(CustomTestCase):
-    def setUp(self) -> None:
-        self._prior_input_check = os.environ.get("SGLANG_KV_CANARY_INPUT_CHECK")
+class TestMockModelServerLaunchHelpers(CustomTestCase):
+    def test_mock_model_server_args_adds_canary_defaults(self) -> None:
+        args = mock_model_server_args("--tp", "2")
 
-    def tearDown(self) -> None:
-        if self._prior_input_check is None:
-            os.environ.pop("SGLANG_KV_CANARY_INPUT_CHECK", None)
-        else:
-            os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = self._prior_input_check
+        self.assertIn("--load-format", args)
+        self.assertIn("dummy", args)
+        self.assertIn("--sampling-backend", args)
+        self.assertIn("token_oracle", args)
+        self.assertIn("--kv-canary", args)
+        self.assertIn("raise", args)
+        self.assertEqual(args[-2:], ["--tp", "2"])
 
-    def test_mock_model_engine_kwargs_merges_json_override(self) -> None:
-        kwargs = mock_model_engine_kwargs(
-            json_model_override_args='{"rope_theta": 1000.0}',
-        )
+    def test_mock_model_server_env_enables_input_check_by_default(self) -> None:
+        env = mock_model_server_env()
 
-        merged = json.loads(kwargs["json_model_override_args"])
-        self.assertEqual(merged["num_hidden_layers"], 1)
-        self.assertEqual(merged["rope_theta"], 1000.0)
+        self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "1")
+        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
-    def test_mock_model_engine_kwargs_speculative_disables_input_check(self) -> None:
-        os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
-        kwargs = mock_model_engine_kwargs(speculative_algorithm="EAGLE")
-        self.assertEqual(kwargs["speculative_algorithm"], "EAGLE")
-        self.assertEqual(os.environ["SGLANG_KV_CANARY_INPUT_CHECK"], "0")
+    def test_mock_model_server_env_can_disable_input_check(self) -> None:
+        env = mock_model_server_env(input_check_enabled=False)
+
+        self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "0")
+        self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
 
 if __name__ == "__main__":
