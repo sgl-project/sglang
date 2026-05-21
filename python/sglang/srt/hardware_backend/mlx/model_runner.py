@@ -15,6 +15,7 @@ state.
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -259,6 +260,17 @@ class MlxModelRunner:
 
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
+
+        # Optional: fuse SwitchGLU's up_proj + gate_proj into one gather_qmm
+        # dispatch per layer per token. Activated by SGLANG_MLX_FUSE_SWITCHGLU=1.
+        # See: python/sglang/srt/hardware_backend/mlx/moe/fused_switch_glu.py
+        if os.environ.get("SGLANG_MLX_FUSE_SWITCHGLU", "0") == "1":
+            from sglang.srt.hardware_backend.mlx.moe.fused_switch_glu import (
+                patch_switch_glu_with_fused_up_gate,
+            )
+
+            n_patched = patch_switch_glu_with_fused_up_gate(self.model)
+            logger.info(f"MLX SwitchGLU fusion enabled: patched {n_patched} blocks")
 
     def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
         """Return (n_kv_heads, head_dim, dtype) from the model."""
