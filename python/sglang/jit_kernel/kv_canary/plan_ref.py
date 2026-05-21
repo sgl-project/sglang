@@ -77,6 +77,31 @@ def run_canary_plan_torch_reference(
     )
 
 
+def canary_plan_step_torch_reference(
+    *,
+    verify_plan_out: VerifyPlan,
+    write_plan_out: WritePlan,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    verify_capacity: int,
+) -> None:
+    run_canary_plan_torch_reference(
+        verify_plan_out=verify_plan_out,
+        write_plan_out=write_plan_out,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
+        req_to_token=req_to_token,
+        swa_window_size=swa_window_size,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_capacity=verify_capacity,
+    )
+
+
 def _write_num_valid_and_enable(
     *,
     verify_plan_out: VerifyPlan,
@@ -94,8 +119,11 @@ def _swa_translate_slot(*, slot: int, lut: torch.Tensor) -> int:
     if slot < 0:
         return slot
     lut_len = int(lut.shape[0])
-    safe_idx = min(slot, lut_len - 1) if lut_len > 0 else slot
-    return int(lut[safe_idx].item())
+    if slot >= lut_len:
+        raise ValueError(
+            f"kv-canary: SWA slot {slot} is outside full_to_swa_index_mapping length {lut_len}"
+        )
+    return int(lut[slot].item())
 
 
 def _materialize_verify_entries(

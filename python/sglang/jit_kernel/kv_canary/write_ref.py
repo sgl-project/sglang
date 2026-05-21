@@ -180,3 +180,40 @@ def run_canary_write_torch_reference(
         violation_ring.copy_(ring_host.to(violation_ring.device))
 
     violation_write_index[0] = violation_write_index[0] + len(violation_rows)
+
+
+def canary_write_step_torch_reference(
+    *,
+    canary_buf: torch.Tensor,
+    plan: WritePlan,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    kernel_kind: CanaryLaunchTag,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor | None,
+    expected_input_positions: torch.Tensor | None,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    slot_run_counter: torch.Tensor,
+    kernel_run_counter: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+) -> None:
+    run_canary_write_torch_reference(
+        canary_buf=canary_buf,
+        plan=plan,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        kernel_kind=kernel_kind,
+        enable_assert_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        slot_run_counter=slot_run_counter,
+        kernel_run_counter=kernel_run_counter,
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+    )
