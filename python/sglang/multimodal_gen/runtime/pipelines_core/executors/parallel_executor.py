@@ -78,7 +78,9 @@ class ParallelExecutor(PipelineExecutor):
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
 
@@ -94,20 +96,26 @@ class ParallelExecutor(PipelineExecutor):
                     if rank != 0:
                         batch = broadcasted_list[0]
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
 
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
                 elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
 
