@@ -27,7 +27,10 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
+    make_log_pair,
 )
+
+_DEVICE = torch.device("cuda")
 
 
 def _run_both_plan(
@@ -370,3 +373,114 @@ def _yield_simpler(inputs: Any) -> Iterator[tuple[str, Any]]:
             current_value = fields[name]
             if current_value > 8:
                 yield from emit(f"shrink_{name}", **{name: max(8, current_value // 2)})
+
+
+def run_verify_diff(
+    *,
+    buf_pair: tuple[torch.Tensor, torch.Tensor],
+    plan_pair: tuple[VerifyPlan, VerifyPlan],
+    real_kv_sources_pair: tuple[
+        tuple[RealKvSource, ...], tuple[RealKvSource, ...]
+    ] = ((), ()),
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
+    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+    device: torch.device = _DEVICE,
+    assert_equal: bool = True,
+) -> tuple[FakeViolationLog, FakeViolationLog]:
+    """Thin wrapper around ``_run_both_verify`` that creates a fresh log pair and packs (cuda, ref)
+    buf/plan/source arguments into 2-tuples to drop ~8 lines of boilerplate per call site."""
+    cuda_log, ref_log = make_log_pair(device=device)
+    _run_both_verify(
+        cuda_canary_buf=buf_pair[0],
+        ref_canary_buf=buf_pair[1],
+        plan_cuda=plan_pair[0],
+        plan_ref=plan_pair[1],
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_pair[0],
+        real_kv_sources_ref=real_kv_sources_pair[1],
+        real_kv_hash_mode=real_kv_hash_mode,
+        kernel_kind=kernel_kind,
+        assert_equal=assert_equal,
+    )
+    return cuda_log, ref_log
+
+
+def run_write_diff(
+    *,
+    buf_pair: tuple[torch.Tensor, torch.Tensor],
+    plan_pair: tuple[WritePlan, WritePlan],
+    fb_input_ids: torch.Tensor,
+    fb_positions: torch.Tensor,
+    fb_out_cache_loc: torch.Tensor,
+    expected_input_tokens: torch.Tensor,
+    expected_input_positions: torch.Tensor,
+    enable_write_verify_inputs: bool = False,
+    real_kv_sources_pair: tuple[
+        tuple[RealKvSource, ...], tuple[RealKvSource, ...]
+    ] = ((), ()),
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
+    kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
+    device: torch.device = _DEVICE,
+    assert_equal: bool = True,
+) -> tuple[FakeViolationLog, FakeViolationLog]:
+    """Thin wrapper around ``_run_both_write`` that creates a fresh log pair and packs (cuda, ref)
+    buf/plan/source arguments into 2-tuples to drop ~10 lines of boilerplate per call site."""
+    cuda_log, ref_log = make_log_pair(device=device)
+    _run_both_write(
+        cuda_canary_buf=buf_pair[0],
+        ref_canary_buf=buf_pair[1],
+        plan_cuda=plan_pair[0],
+        plan_ref=plan_pair[1],
+        fb_input_ids=fb_input_ids,
+        fb_positions=fb_positions,
+        fb_out_cache_loc=fb_out_cache_loc,
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
+        cuda_log=cuda_log,
+        ref_log=ref_log,
+        real_kv_sources_cuda=real_kv_sources_pair[0],
+        real_kv_sources_ref=real_kv_sources_pair[1],
+        real_kv_hash_mode=real_kv_hash_mode,
+        kernel_kind=kernel_kind,
+        assert_equal=assert_equal,
+    )
+    return cuda_log, ref_log
+
+
+def run_plan_diff(
+    *,
+    plan_pair: tuple[
+        tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]
+    ],
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    fb_extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    extras: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    swa_window_size: int = 0,
+    full_to_swa_index_mapping: Optional[torch.Tensor] = None,
+    assert_equal: bool = True,
+    active_verify_entries: Optional[int] = None,
+    active_write_reqs: Optional[int] = None,
+) -> None:
+    """Thin wrapper around ``_run_both_plan`` that unpacks ``((triton_v, triton_w), (ref_v, ref_w))``
+    plan pairs to drop the per-call-site ``triton_verify=.../triton_write=.../ref_verify=...`` block."""
+    (triton_verify, triton_write), (ref_verify, ref_write) = plan_pair
+    _run_both_plan(
+        triton_verify=triton_verify,
+        triton_write=triton_write,
+        ref_verify=ref_verify,
+        ref_write=ref_write,
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        extras=extras,
+        swa_window_size=swa_window_size,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        assert_equal=assert_equal,
+        active_verify_entries=active_verify_entries,
+        active_write_reqs=active_write_reqs,
+    )
