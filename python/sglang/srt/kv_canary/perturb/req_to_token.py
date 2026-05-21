@@ -53,9 +53,7 @@ def run(
 
     pick = int(torch.randint(0, len(entries), (1,)).item())
     target = entries[pick]
-    replacement_values = [
-        item.value for item in entries if item.value != target.value
-    ]
+    replacement_values = [item.value for item in entries if item.value != target.value]
     if not replacement_values:
         return
     replacement_pick = int(torch.randint(0, len(replacement_values), (1,)).item())
