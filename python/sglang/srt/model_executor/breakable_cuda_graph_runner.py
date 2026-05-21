@@ -180,6 +180,7 @@ class BreakableCudaGraphRunner:
                 dtype=torch.int64 if not is_npu() else torch.int32,
             )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
             if self.is_multimodal:
                 input_embeds = torch.zeros(
                     (self.max_num_tokens, model_runner.model_config.hidden_size),
@@ -211,6 +212,7 @@ class BreakableCudaGraphRunner:
             positions=positions,
             input_embeds=input_embeds,
             mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
         )
         self.buffers.share_buffers()
 

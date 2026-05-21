@@ -339,7 +339,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
 
-        if enable_num_token_non_padded_flag:
+        if (
+            enable_num_token_non_padded_flag
+            and forward_batch.num_token_non_padded is not None
+        ):
+            # Skip when batch.num_token_non_padded is None (e.g. DFLASH draft batches).
             if require_gathered_buffer and not dsa_enable_prefill_cp:
                 num_tokens_per_dp = bs * num_tokens_per_bs
                 local = compute_local_num_token_non_padded(

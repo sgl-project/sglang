@@ -1132,7 +1132,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
 
 def enable_num_token_non_padded():
-    return get_moe_expert_parallel_world_size() > 1
+    # True for EP > 1 (routing) or decode CUDA graph on (where padding lives).
+    return (
+        get_moe_expert_parallel_world_size() > 1
+        or not get_global_server_args().disable_cuda_graph
+    )
 
 
 class PPProxyTensors:

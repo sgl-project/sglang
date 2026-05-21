@@ -1002,21 +1002,19 @@ def _mask_topk_ids_padded_region(
 ) -> None:
     if num_token_non_padded is None:
         return
-    # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32:
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = -1
+        mask = (indices >= num_token_non_padded).unsqueeze(-1)
+        topk_ids.masked_fill_(mask, -1)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
-def _biased_grouped_topk_postprocess(
-    topk_ids, expert_location_dispatch_info, num_token_non_padded
-):
-    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-    return topk_ids
+def _biased_grouped_topk_postprocess(topk_ids, expert_location_dispatch_info):
+    # Pad-token masking is applied by the caller outside this compiled region:
+    # _mask_topk_ids_padded_region calls a tvm_ffi op that Dynamo cannot trace.
+    return topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
 
 
 def biased_grouped_topk_gpu(
@@ -1309,13 +1307,16 @@ def _post_process_topk_ids(
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
             routed_cols = _biased_grouped_topk_postprocess(
-                routed_cols, expert_location_dispatch_info, num_token_non_padded
+                routed_cols, expert_location_dispatch_info
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
         else:
             topk_ids = _biased_grouped_topk_postprocess(
-                topk_ids, expert_location_dispatch_info, num_token_non_padded
+                topk_ids, expert_location_dispatch_info
             )
+        # Mask padded rows AFTER the compiled postprocess; the mask op uses
+        # a tvm_ffi kernel that Dynamo cannot trace.
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
