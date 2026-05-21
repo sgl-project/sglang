@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb import (
+    real_kv_post_forward,
     real_kv_unused_cache,
     real_kv_used,
     req_to_token,
@@ -24,7 +25,8 @@ class PerturbManager:
     invocation to the three perturb-point modules.
 
     Per-perturb logic lives in :mod:`sglang.srt.kv_canary.perturb.req_to_token`,
-    :mod:`...perturb.real_kv_used`, :mod:`...perturb.real_kv_unused_cache`.
+    :mod:`...perturb.real_kv_used`, :mod:`...perturb.real_kv_unused_cache`,
+    :mod:`...perturb.real_kv_post_forward`.
     """
 
     def __init__(
@@ -51,6 +53,9 @@ class PerturbManager:
         self.perturb_real_kv_used(forward_batch)
         self.perturb_real_kv_unused_cache(forward_batch)
 
+    def end_of_forward(self, forward_batch: Optional["ForwardBatch"]) -> None:
+        self.perturb_real_kv_post_forward(forward_batch)
+
     def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
             forward_batch=forward_batch,
@@ -76,5 +81,15 @@ class PerturbManager:
             config=self._config,
             buffer_groups=self._buffer_groups,
             radix_cache=self._radix_cache,
+            warmup_gate=self._warmup_gate,
+        )
+
+    def perturb_real_kv_post_forward(
+        self, forward_batch: Optional["ForwardBatch"]
+    ) -> None:
+        real_kv_post_forward.run(
+            forward_batch=forward_batch,
+            config=self._config,
+            buffer_groups=self._buffer_groups,
             warmup_gate=self._warmup_gate,
         )
