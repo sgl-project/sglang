@@ -835,7 +835,6 @@ class CommonKVSender(BaseKVSender):
             f"in KVPoll.Bootstrapping",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
         return KVPoll.Failed
 
     def poll(self) -> KVPoll:
@@ -1063,7 +1062,6 @@ class CommonKVReceiver(BaseKVReceiver):
             f"in KVPoll.WaitingForInput",
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-        self.conclude_state = KVPoll.Failed
         return KVPoll.Failed
 
     def failure_exception(self):
