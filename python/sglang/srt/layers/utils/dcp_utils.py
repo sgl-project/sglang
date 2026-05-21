@@ -436,7 +436,16 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     return gathered_kv_a
 
 
-def prepare_dcp_kv_cache(
+def all_gather_dcp_kv_cache_for_chunk_mha(kv_a: torch.Tensor, k_pe: torch.Tensor):
+    if get_dcp_world_size() > 1:
+        return (
+            _all_gather_dcp_kv_cache(kv_a).contiguous(),
+            _all_gather_dcp_kv_cache(k_pe).contiguous(),
+        )
+    return kv_a, k_pe
+
+
+def all_gather_dcp_kv_cache_for_mha(
     token_to_kv_pool,
     attn_mqa,
     dcp_local_prefix_kv_indices,
@@ -474,3 +483,12 @@ def prepare_dcp_kv_cache(
     kv_a = torch.cat(kv_a_tuple, dim=0)
     k_pe = torch.cat(k_pe_tuple, dim=0)
     return kv_a, k_pe
+
+
+def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
+    if get_dcp_world_size() > 1:
+        kv_indices = (
+            kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
+            // get_dcp_world_size()
+        )
+    return kv_indices

@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_rank,
     get_dcp_world_size,
 )
 from sglang.srt.environ import envs
@@ -13,7 +12,11 @@ from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_p
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.utils.dcp_utils import prepare_dcp_kv_cache
+from sglang.srt.layers.utils.dcp_utils import (
+    all_gather_dcp_kv_cache_for_chunk_mha,
+    all_gather_dcp_kv_cache_for_mha,
+    filter_dcp_local_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -239,7 +242,7 @@ class DeepseekMHAForwardMixin:
             else:
                 # BF16/FP16 path: directly fetch from cache
                 if get_dcp_world_size() > 1:
-                    kv_a, k_pe = prepare_dcp_kv_cache(
+                    kv_a, k_pe = all_gather_dcp_kv_cache_for_mha(
                         forward_batch.token_to_kv_pool,
                         self.attn_mha,
                         forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
@@ -395,9 +398,7 @@ class DeepseekMHAForwardMixin:
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
                 kv_indices, q.dtype, forward_batch
             )
-            if get_dcp_world_size() > 1:
-                kv_a_normed = self._all_gather_dcp_kv_cache(kv_a_normed).contiguous()
-                k_pe = self._all_gather_dcp_kv_cache(k_pe).contiguous()
+            kv_a_normed, k_pe = all_gather_dcp_kv_cache_for_chunk_mha(kv_a_normed, k_pe)
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
@@ -459,11 +460,7 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
     ):
         if _is_cuda or _use_aiter_gfx95:
-            if get_dcp_world_size() > 1:
-                kv_indices = (
-                    kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
-                    // get_dcp_world_size()
-                )
+            kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
             kv_a, k_pe = forward_batch.token_to_kv_pool.get_mla_kv_buffer(
                 self.attn_mha, kv_indices, dst_dtype
             )
