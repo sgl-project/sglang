@@ -10,6 +10,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -228,3 +229,20 @@ def verify_tree_greedy_func(
             target_predict=target_predict,
         )
     return predicts, accept_index, accept_token_num
+
+
+def get_draft_hidden_dim(model_runner: ModelRunner) -> int:
+    """Derive the hidden dimension of target hidden states fed to the draft model."""
+    hf_config = model_runner.model_config.hf_config
+    eagle_config = getattr(hf_config, "eagle_config", {})
+    use_aux = eagle_config.get("use_aux_hidden_state", False)
+    spec_algorithm = model_runner.spec_algorithm
+
+    if spec_algorithm is not None and spec_algorithm.is_eagle3() and use_aux:
+        base = getattr(hf_config, "target_hidden_size", None)
+        if base is None:
+            base = model_runner.model_config.hidden_size
+        layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids", [])
+        num_aux = max(len(layer_ids), 1)
+        return base * num_aux
+    return model_runner.model_config.spec_hidden_size

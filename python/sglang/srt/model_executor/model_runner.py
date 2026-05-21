@@ -2787,7 +2787,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-    def init_piecewise_cuda_graphs(self):
+    def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
@@ -2797,8 +2797,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
+        # Draft models skip here during __init__; the eagle worker calls
+        # this method explicitly (force_for_draft_worker=True) after
+        # init_lm_head so graphs capture the final embedding weights.
+        if self.is_draft_worker and not force_for_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models
