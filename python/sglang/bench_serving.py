@@ -316,7 +316,7 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
 
-                            if args.cache_report:
+                            if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
 
                             # NOTE: Some completion API might have a last
@@ -472,7 +472,7 @@ async def async_request_openai_chat_completions(
                         output.output_len = response_json.get("usage", {}).get(
                             "completion_tokens", output_len
                         )
-                        if args.cache_report:
+                        if getattr(args, "cache_report", False):
                             _extract_cache_from_sglext(response_json, output)
                     else:
                         # Streaming response
@@ -493,7 +493,7 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                                if args.cache_report:
+                                if getattr(args, "cache_report", False):
                                     _extract_cache_from_sglext(data, output)
 
                                 choices = data.get("choices") or []
@@ -694,7 +694,7 @@ async def async_request_sglang_generate(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if args.cache_report:
+                            if getattr(args, "cache_report", False):
                                 _meta = data.get("meta_info") or {}
                                 output.cached_tokens = _meta.get("cached_tokens", 0)
                                 output.cached_tokens_details = _meta.get(
