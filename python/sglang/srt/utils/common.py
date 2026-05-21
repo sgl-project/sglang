@@ -1496,6 +1496,7 @@ class RefCountedGauge:
 
 def add_prometheus_track_response_middleware(app):
     from prometheus_client import Counter, Gauge
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
     http_request_counter = Counter(
         name="sglang:http_requests_total",
@@ -1525,38 +1526,83 @@ def add_prometheus_track_response_middleware(app):
     )
 
     # Fix: replace BaseHTTPMiddleware's call_next with a pure ASGI version
-    # that passes `receive` through, so request.is_disconnected() keeps working.
+    # that passes `receive` through, so request.is_disconnected() keeps working
+    # for any other middleware registered via @app.middleware("http").
     from sglang.srt.utils.http_middleware_patch import patch_app_http_middleware
 
     patch_app_http_middleware(app)
 
-    @app.middleware("http")
-    async def track_http_status_code(request, call_next):
-        # With recording all requests, we have the risk of high cardinality if requests have arbitrary unhandled paths.
-        # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
-        path, is_handled_path = _get_fastapi_request_path(request)
-        method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
+    # Pure ASGI middleware that doesn't wrap the request object.
+    # This preserves request.is_disconnected() functionality (fixes issue #15686)
+    # for the metrics middleware itself, which previously used
+    # @app.middleware("http") + BaseHTTPMiddleware and broke disconnect detection.
+    class MetricsMiddleware:
+        def __init__(self, app: ASGIApp):
+            self.app = app
 
-        http_request_counter.labels(endpoint=path, method=method).inc()
-        http_requests_active.labels(endpoint=path, method=method).inc()
-        if routing_key:
-            routing_keys_active.inc(routing_key)
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            if scope["type"] != "http":
+                await self.app(scope, receive, send)
+                return
 
-        try:
-            response = await call_next(request)
+            # Extract HTTP metadata from ASGI scope
+            path = scope.get("path", "")
+            method = scope.get("method", "")
 
-            http_response_counter.labels(
-                endpoint=path,
-                method=method,
-                status_code=str(response.status_code),
-            ).inc()
+            # Try to get FastAPI route path for better metrics cardinality
+            try:
+                from starlette.requests import Request as StarletteRequest
+                from starlette.routing import Match
 
-            return response
-        finally:
-            http_requests_active.labels(endpoint=path, method=method).dec()
+                request = StarletteRequest(scope)
+                for route in app.routes:
+                    match, child_scope = route.matches(request.scope)
+                    if match == Match.FULL:
+                        path = route.path
+                        break
+            except Exception:
+                # Fallback to raw path if FastAPI routing lookup fails
+                pass
+
+            # Get routing key from headers
+            headers_dict = dict(scope.get("headers", []))
+            routing_key = headers_dict.get(b"x-smg-routing-key", b"").decode(
+                "utf-8", errors="ignore"
+            )
+
+            # Record request metrics
+            http_request_counter.labels(endpoint=path, method=method).inc()
+            http_requests_active.labels(endpoint=path, method=method).inc()
             if routing_key:
-                routing_keys_active.dec(routing_key)
+                routing_keys_active.inc(routing_key)
+
+            # Track response status code
+            status_code = None
+            response_started = False
+
+            async def send_wrapper(message):
+                nonlocal status_code, response_started
+                if message["type"] == "http.response.start":
+                    status_code = message.get("status", 500)
+                    response_started = True
+                await send(message)
+
+            try:
+                await self.app(scope, receive, send_wrapper)
+                # Record response only if response was actually sent
+                if response_started and status_code is not None:
+                    http_response_counter.labels(
+                        endpoint=path,
+                        method=method,
+                        status_code=str(status_code),
+                    ).inc()
+            finally:
+                http_requests_active.labels(endpoint=path, method=method).dec()
+                if routing_key:
+                    routing_keys_active.dec(routing_key)
+
+    # Add the middleware at the top of the stack to avoid interfering with other middleware
+    app.add_middleware(MetricsMiddleware)
 
 
 # https://github.com/blueswen/fastapi-observability/blob/132a3c576f8b09e5311c68bd553215013bc75685/fastapi_app/utils.py#L98
