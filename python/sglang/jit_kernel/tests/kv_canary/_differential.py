@@ -379,16 +379,18 @@ def run_verify_diff(
     *,
     buf_pair: tuple[torch.Tensor, torch.Tensor],
     plan_pair: tuple[VerifyPlan, VerifyPlan],
-    real_kv_sources_pair: tuple[
-        tuple[RealKvSource, ...], tuple[RealKvSource, ...]
-    ] = ((), ()),
+    real_kv_sources_pair: tuple[tuple[RealKvSource, ...], tuple[RealKvSource, ...]] = (
+        (),
+        (),
+    ),
     real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     device: torch.device = _DEVICE,
     assert_equal: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Thin wrapper around ``_run_both_verify`` that creates a fresh log pair and packs (cuda, ref)
-    buf/plan/source arguments into 2-tuples to drop ~8 lines of boilerplate per call site."""
+    buf/plan/source arguments into 2-tuples to drop ~8 lines of boilerplate per call site.
+    """
     cuda_log, ref_log = make_log_pair(device=device)
     _run_both_verify(
         cuda_canary_buf=buf_pair[0],
@@ -416,16 +418,18 @@ def run_write_diff(
     expected_input_tokens: torch.Tensor,
     expected_input_positions: torch.Tensor,
     enable_write_verify_inputs: bool = False,
-    real_kv_sources_pair: tuple[
-        tuple[RealKvSource, ...], tuple[RealKvSource, ...]
-    ] = ((), ()),
+    real_kv_sources_pair: tuple[tuple[RealKvSource, ...], tuple[RealKvSource, ...]] = (
+        (),
+        (),
+    ),
     real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     device: torch.device = _DEVICE,
     assert_equal: bool = True,
 ) -> tuple[FakeViolationLog, FakeViolationLog]:
     """Thin wrapper around ``_run_both_write`` that creates a fresh log pair and packs (cuda, ref)
-    buf/plan/source arguments into 2-tuples to drop ~10 lines of boilerplate per call site."""
+    buf/plan/source arguments into 2-tuples to drop ~10 lines of boilerplate per call site.
+    """
     cuda_log, ref_log = make_log_pair(device=device)
     _run_both_write(
         cuda_canary_buf=buf_pair[0],
@@ -451,9 +455,7 @@ def run_write_diff(
 
 def run_plan_diff(
     *,
-    plan_pair: tuple[
-        tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]
-    ],
+    plan_pair: tuple[tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]],
     fb_req_pool_indices: torch.Tensor,
     fb_prefix_lens: torch.Tensor,
     fb_extend_seq_lens: torch.Tensor,
@@ -466,7 +468,8 @@ def run_plan_diff(
     active_write_reqs: Optional[int] = None,
 ) -> None:
     """Thin wrapper around ``_run_both_plan`` that unpacks ``((triton_v, triton_w), (ref_v, ref_w))``
-    plan pairs to drop the per-call-site ``triton_verify=.../triton_write=.../ref_verify=...`` block."""
+    plan pairs to drop the per-call-site ``triton_verify=.../triton_write=.../ref_verify=...`` block.
+    """
     (triton_verify, triton_write), (ref_verify, ref_write) = plan_pair
     _run_both_plan(
         triton_verify=triton_verify,
