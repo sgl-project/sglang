@@ -439,8 +439,6 @@ class TestTRTLLMMLA(CustomTestCase):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.cpu(),
         )
-        fb.req_to_token_pool = model_runner.req_to_token_pool
-        fb.token_to_kv_pool = model_runner.token_to_kv_pool
         # Publish backend for RadixAttention dispatch.
         set_forward_context(ForwardContext(attn_backend=backend))
 
@@ -1173,8 +1171,6 @@ class TestTRTLLMMLA(CustomTestCase):
                         attn_attend_prefix_cache=False,
                         mha_return_lse=False,
                     )
-                    fb.req_to_token_pool = model_runner.req_to_token_pool
-                    fb.token_to_kv_pool = model_runner.token_to_kv_pool
                     # Publish backend for RadixAttention dispatch.
                     set_forward_context(ForwardContext(attn_backend=backend))
 

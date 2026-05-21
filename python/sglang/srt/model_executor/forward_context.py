@@ -21,6 +21,12 @@ This is **distinct** from
 collects compilation-time refs (attention_layers / quant_config / moe_layers /
 moe_fusions) for the piecewise CUDA graph backend. The two contexts have
 different lifetimes and audiences and intentionally live in separate modules.
+
+Concurrency: ``_current`` is a plain module-level global, **not** thread-local.
+This matches the existing ``pool_context`` / ``global_server_args`` precedent
+and is safe because SGLang runs each forward synchronously on a single Python
+thread per worker process. Code that forks worker threads sharing a process
+would need to migrate this to ``contextvars.ContextVar``; today no caller does.
 """
 
 from __future__ import annotations

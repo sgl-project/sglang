@@ -344,13 +344,8 @@ class Compressor(nn.Module):
     def get_state_pool(
         self,
         forward_batch: ForwardBatch,
-        attn_backend: Optional[AttentionBackend] = None,
+        attn_backend: AttentionBackend,
     ) -> CompressStatePool:
-        if attn_backend is None:
-            raise RuntimeError(
-                "Compressor.get_state_pool needs an attn_backend argument now "
-                "that ForwardBatch no longer carries token_to_kv_pool."
-            )
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
