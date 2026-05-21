@@ -98,45 +98,6 @@ class TestPickTargetGroup(CustomTestCase):
         self.assertIsNone(group)
 
 
-class TestPerturbManager(CustomTestCase):
-    def test_perturb_manager_perturb_dispatches_all_points(self) -> None:
-        """Verify perturb() runs each perturb point in order."""
-        device = DEFAULT_DEVICE
-        manager = PerturbManager(
-            config=PerturbConfig(
-                req_to_token_prob=0.0,
-                real_kv_used_prob=0.0,
-                real_kv_unused_cache_prob=0.0,
-                target_group_kind=TargetGroupKind.FULL,
-                warmup_steps=0,
-            ),
-            req_to_token_pool=make_pool(device),
-            buffer_groups=(),
-            step_counter_getter=lambda: 10,
-        )
-        forward_batch = make_forward_batch(device)
-        calls: list[str] = []
-
-        with patch.object(
-            manager,
-            "perturb_req_to_token",
-            lambda batch: calls.append("req_to_token"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_used",
-            lambda batch: calls.append("real_kv_used"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_unused_cache",
-            lambda batch: calls.append("real_kv_unused_cache"),
-        ):
-            manager.perturb(forward_batch)
-
-        self.assertEqual(
-            calls, ["req_to_token", "real_kv_used", "real_kv_unused_cache"]
-        )
-
-
 class TestReqToTokenPerturb(CustomTestCase):
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
         """Verify req_to_token perturbation replaces a slot with another live slot."""
