@@ -25,8 +25,8 @@ import torch.nn as nn
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig, Qwen3VLMoeTextConfig
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
@@ -117,8 +117,12 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 layer_idx - 1, input_deepstack_embeds
             )
             a2a_backend = get_moe_a2a_backend()
-            if deepstack_embeds is not None and a2a_backend.is_deepep() and post_residual_addition.shape[0] != residual.shape[0]:
-                post_residual_addition = post_residual_addition.tensor_split(
+            if (
+                deepstack_embeds is not None
+                and a2a_backend.is_deepep()
+                and deepstack_embeds.shape[0] != residual.shape[0]
+            ):
+                deepstack_embeds = deepstack_embeds.tensor_split(
                     self.attn_tp_size
                 )[self.attn_tp_rank]
             hidden_states, residual = layer(
