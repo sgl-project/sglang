@@ -250,6 +250,8 @@ class RMSNorm(MultiPlatformOp):
                 out = out.reshape(original_shape)
             return out
         if residual is not None:
+            if self.cast_x_before_out_mul:
+                return self.forward_native(x, residual, post_residual_addition)
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
             # (hidden_states+residual)+post_residual_addition != hidden_states+(residual+post_residual_addition),
