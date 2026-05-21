@@ -827,14 +827,7 @@ class Scheduler(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
 
-        # Different MoE architectures expose the per-token expert count under
-        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
-        moe_topk_attrs = (
-            "num_experts_per_tok",
-            "num_experts_per_token",
-            "top_k_experts",
-        )
-        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
+        if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
@@ -2843,11 +2836,10 @@ class Scheduler(
         if self.is_generation:
             if self.enable_overlap:
                 # Spec v2 pre-isolation CPU mirror prep: D2H new_seq_lens_buf
-                # into batch.seq_lens_cpu + set seq_lens_sum. For non-spec_v2,
-                # ForwardBatch.init_new lazily computes the sum.
-                if batch.is_spec_v2:
-                    # FIXME: make this optional to different backends.
-                    self.future_map.resolve_seq_lens_cpu(batch)
+                # into batch.seq_lens_cpu + set seq_lens_sum. Self-gates via
+                # batch.spec_info.future_indices; non-spec_v2 batches no-op,
+                # ForwardBatch.init_new lazily computes the sum for them.
+                self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
@@ -2856,11 +2848,7 @@ class Scheduler(
                     # draft_extend; publish moves the fence to verify-end so
                     # schedule prep can overlap with draft_extend.
                     fwd_kwargs = (
-                        {
-                            "on_verify_complete": partial(
-                                self.future_map.publish, future_indices
-                            )
-                        }
+                        {"on_publish": partial(self.future_map.publish, future_indices)}
                         if batch.is_spec_v2
                         else {}
                     )
@@ -2902,9 +2890,13 @@ class Scheduler(
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-                    # Schedule-stream sentinel between iters; next iter's
-                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
-                    batch.seq_lens = -future_indices.indices
+                    # None sentinel between iters; next iter's resolve_future
+                    # reassigns batch.seq_lens from new_seq_lens_buf. None is
+                    # used (rather than a sentinel tensor) so any accidental
+                    # value read between iters raises AttributeError fast
+                    # instead of silently picking up garbage. filter_batch and
+                    # merge_batch propagate None - see their None guards.
+                    batch.seq_lens = None
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
