@@ -193,9 +193,8 @@ class ImageTransform(object):
             elif not x.is_floating_point():
                 x = x.to(torch.float32)
             if self.normalize:
-                import torchvision.transforms as T
 
-                x = T.Normalize(self.mean, self.std)(x)
+                x = TF.Normalize(self.mean, self.std)(x)
             return x
         x = self.transform(img)
         return x
@@ -540,9 +539,9 @@ class DeepseekOCRProcessor(ProcessorMixin):
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
 
-            image_shapes.append(get_image_size(image))
-
             img_w, img_h = get_image_size(image)
+            image_shapes.append((img_w, img_h))
+
             if img_w <= 640 and img_h <= 640:
                 crop_ratio = [1, 1]
             else:
