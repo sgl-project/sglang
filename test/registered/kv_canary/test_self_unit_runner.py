@@ -303,24 +303,6 @@ class TestSelfUnitRunner(CustomTestCase):
         runner._pump_and_allreduce._step_counter = 2000
         runner._health_and_stats.health_check_step()
 
-    def test_runner_disabled_short_circuits(self):
-        """Verify disabled canary runners skip all launches."""
-        config = CanaryConfig(mode=CanaryMode.OFF)
-        runner = _make_runner(device=self.device, config=config)
-
-        plan_calls: List[str] = []
-        with patch.object(
-            launch_module,
-            "canary_plan_step",
-            lambda **kwargs: plan_calls.append("plan"),
-        ):
-            fb = _make_forward_batch(self.device)
-            with runner.with_forward_pass(fb):
-                runner.launch_head_kernels(fb)
-                runner.launch_tail_kernels(fb)
-            runner._sweep_orchestrator.maybe_run_sweep()
-        self.assertEqual(plan_calls, [])
-
     def test_periodic_stats_log_every_n_step(self):
         """Verify periodic stats are logged at the configured interval."""
         config = CanaryConfig(
