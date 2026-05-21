@@ -60,6 +60,7 @@ class CompressorBackendMixin:
         rotate: bool,
         compress_ratio: int,
         page_size: int,
+        out_loc: torch.Tensor,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -89,7 +90,7 @@ class CompressorBackendMixin:
             norm_weight=norm.weight,
             norm_eps=norm.variance_epsilon,
             freq_cis=freqs_cis_cache,
-            out_loc=self._get_out_loc(compress_ratio),
+            out_loc=out_loc,
             kvcache=kv_cache,
             page_size=page_size,
         )
@@ -109,12 +110,19 @@ class CompressorBackendMixin:
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
         state_pool = compressor.get_state_pool(forward_batch)
+        out_loc = self._get_out_loc(compressor.ratio)
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
         else:
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
             kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
             page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+            if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
+                # The v2 compressor writes directly into the raw C4 KV tensor.
+                # HiSparse C4 therefore needs the physical C4 location here.
+                out_loc = compress_kv_pool.translate_loc_to_hisparse_device(out_loc)
         self._forward_compress_all_in_one(
             kv_score_buffer=state_pool.kv_score_buffer.kv_score,
             kv_score_input=kv_score_input,
@@ -127,6 +135,7 @@ class CompressorBackendMixin:
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
             page_size=page_size,
+            out_loc=out_loc,
         )
 
     # NOTE: alias for backward compatibility

@@ -993,6 +993,8 @@ void decode_accumulate_kv_splits(
 
   // parallel on [batches, num_heads]
   at::parallel_for(0, batches * num_heads, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, ni{0};
+    data_index_init(begin, bi, batches, ni, num_heads);
     // NB: here we use logits[b][h][0] as acc, since
     // for the first kv split (kv_id == 0):
     //   m_delta = std::exp(-inf) = 0
@@ -1025,9 +1027,11 @@ void decode_accumulate_kv_splits(
         m_prime = m_i;
       }
       if (has_sink) {
-        s_prime += std::exp(sinks_ptr[i % num_heads] - m_prime);
+        s_prime += std::exp(sinks_ptr[ni] - m_prime);
       }
       copy_stub<scalar_t>(output + i * head_size_v, acc, 1 / s_prime, head_size_v);
+      // move to the next index
+      data_index_step(bi, batches, ni, num_heads);
     }
   });
 }
