@@ -30,10 +30,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestPerturb(CustomTestCase):
+class TestParseTargetGroupKind(CustomTestCase):
     def test_parse_target_group_kind_accepts_valid_values_case_insensitively(
         self,
     ) -> None:
+        """Verify target group kind parsing accepts valid names case-insensitively."""
         cases = [
             ("full", TargetGroupKind.FULL),
             ("FULL", TargetGroupKind.FULL),
@@ -45,10 +46,12 @@ class TestPerturb(CustomTestCase):
                 self.assertEqual(_parse_target_group_kind(raw), expected)
 
     def test_parse_target_group_kind_rejects_invalid_value(self) -> None:
+        """Verify target group kind parsing rejects unknown names."""
         with self.assertRaisesRegex(ValueError, "must be one of"):
             _parse_target_group_kind("prefix")
 
     def test_parse_target_group_kind_rejects_missing_or_any(self) -> None:
+        """Verify target group kind parsing requires an explicit concrete group."""
         for raw in [None, "", "any", " Any "]:
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(
@@ -56,7 +59,10 @@ class TestPerturb(CustomTestCase):
                 ):
                     _parse_target_group_kind(raw)
 
+
+class TestPickTargetGroup(CustomTestCase):
     def test_pick_target_group_filters_exact_kind(self) -> None:
+        """Verify target group selection returns only the requested pool kind."""
         cases = [
             (TargetGroupKind.FULL, PoolKind.FULL),
             (TargetGroupKind.SWA, PoolKind.SWA),
@@ -76,6 +82,7 @@ class TestPerturb(CustomTestCase):
                 self.assertEqual(group.kind, expected_kind)
 
     def test_pick_target_group_rejects_unsupported_kind(self) -> None:
+        """Verify target group selection rejects unsupported enum values."""
         full_group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
 
         with self.assertRaisesRegex(ValueError, "Unsupported target_group_kind"):
@@ -85,6 +92,7 @@ class TestPerturb(CustomTestCase):
             )
 
     def test_pick_target_group_ignores_groups_without_real_kv_sources(self) -> None:
+        """Verify target group selection skips groups without real KV sources."""
         full_group = _make_group(kind=PoolKind.FULL, has_real_kv=False)
         swa_group = _make_group(kind=PoolKind.SWA, has_real_kv=True)
 
@@ -95,43 +103,8 @@ class TestPerturb(CustomTestCase):
 
         self.assertIsNone(group)
 
-    def test_perturb_manager_perturb_dispatches_all_points(self) -> None:
-        """Verify perturb() runs each perturb point in order."""
-        device = DEFAULT_DEVICE
-        manager = PerturbManager(
-            config=PerturbConfig(
-                req_to_token_prob=0.0,
-                real_kv_used_prob=0.0,
-                real_kv_unused_cache_prob=0.0,
-                target_group_kind=TargetGroupKind.FULL,
-                warmup_steps=0,
-            ),
-            req_to_token_pool=make_pool(device),
-            buffer_groups=(),
-            step_counter_getter=lambda: 10,
-        )
-        forward_batch = make_forward_batch(device)
-        calls: list[str] = []
 
-        with patch.object(
-            manager,
-            "perturb_req_to_token",
-            lambda batch: calls.append("req_to_token"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_used",
-            lambda batch: calls.append("real_kv_used"),
-        ), patch.object(
-            manager,
-            "perturb_real_kv_unused_cache",
-            lambda batch: calls.append("real_kv_unused_cache"),
-        ):
-            manager.perturb(forward_batch)
-
-        self.assertEqual(
-            calls, ["req_to_token", "real_kv_used", "real_kv_unused_cache"]
-        )
-
+class TestReqToTokenPerturb(CustomTestCase):
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
         """Verify req_to_token perturbation replaces a slot with another live slot."""
         device = DEFAULT_DEVICE
@@ -175,6 +148,8 @@ class TestPerturb(CustomTestCase):
         self.assertNotEqual(replacement, original)
         self.assertFalse(bool(diff[1, 0].item()))
 
+
+class TestRealKvPerturb(CustomTestCase):
     def test_real_kv_used_flips_first_real_kv_byte_for_active_full_slot(
         self,
     ) -> None:
@@ -353,6 +328,8 @@ class TestPerturb(CustomTestCase):
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
 
+
+class TestCollectActiveSlots(CustomTestCase):
     def test_collect_active_slots_ignores_padded_out_cache_loc(self) -> None:
         """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE

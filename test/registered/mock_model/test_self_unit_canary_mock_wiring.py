@@ -44,6 +44,7 @@ def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) ->
 
 class TestFillExpectedInputs(CustomTestCase):
     def test_fill_expected_inputs_decode_one_token_per_req(self) -> None:
+        """Verify decode mode fills one expected token per request."""
         oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
@@ -83,6 +84,7 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])
 
     def test_fill_expected_inputs_extend_uses_extend_seq_lens(self) -> None:
+        """Verify extend mode fills expected tokens from per-request sequence lengths."""
         oracle = HashOracle(vocab_size=32000)
         hook = install_oracle_sampler(oracle=oracle)
 
@@ -121,6 +123,7 @@ class TestFillExpectedInputs(CustomTestCase):
     def test_fill_expected_inputs_zero_tokens_is_noop(
         self,
     ) -> None:
+        """Verify filling zero expected tokens leaves the output buffer unchanged."""
         hook = install_oracle_sampler(oracle=HashOracle(vocab_size=100))
 
         rid_a = "req-a"
@@ -151,6 +154,7 @@ class TestFillExpectedInputs(CustomTestCase):
 
 class TestMockModelServerLaunchHelpers(CustomTestCase):
     def test_mock_model_server_args_adds_canary_defaults(self) -> None:
+        """Verify mock model launch args include KV canary defaults before user args."""
         args = mock_model_server_args("--tp", "2")
 
         self.assertIn("--load-format", args)
@@ -162,12 +166,14 @@ class TestMockModelServerLaunchHelpers(CustomTestCase):
         self.assertEqual(args[-2:], ["--tp", "2"])
 
     def test_mock_model_server_env_enables_input_check_by_default(self) -> None:
+        """Verify mock model launch env enables canary input checking by default."""
         env = mock_model_server_env()
 
         self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "1")
         self.assertEqual(env["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"], "1")
 
     def test_mock_model_server_env_can_disable_input_check(self) -> None:
+        """Verify mock model launch env can disable canary input checking."""
         env = mock_model_server_env(input_check_enabled=False)
 
         self.assertEqual(env["SGLANG_KV_CANARY_INPUT_CHECK"], "0")

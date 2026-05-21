@@ -20,12 +20,16 @@ class TestFutureTensor(CustomTestCase):
         self.assertNotEqual(alt_stream.stream_id, default_stream.stream_id)
 
         src_first = torch.tensor([41], dtype=torch.int32, device=device)
-        future_first = FutureTensor.create(src_device=src_first, stream=alt_stream)
+        future_first = FutureTensor.device_to_host(
+            src_device=src_first, stream=alt_stream
+        )
         result_first = future_first.wait()
         self.assertEqual(int(result_first.item()), 41)
 
         src_second = torch.tensor([97], dtype=torch.int32, device=device)
-        future_second = FutureTensor.create(src_device=src_second, stream=alt_stream)
+        future_second = FutureTensor.device_to_host(
+            src_device=src_second, stream=alt_stream
+        )
         result_second = future_second.wait()
         self.assertEqual(int(result_second.item()), 97)
 
@@ -34,7 +38,7 @@ class TestFutureTensor(CustomTestCase):
         device = torch.device("cuda")
         alt_stream = torch.cuda.Stream(device=device)
         src = torch.tensor([5], dtype=torch.int32, device=device)
-        future = FutureTensor.create(src_device=src, stream=alt_stream)
+        future = FutureTensor.device_to_host(src_device=src, stream=alt_stream)
         self.assertTrue(future._tensor.is_pinned())
         self.assertEqual(int(future.wait().item()), 5)
 
@@ -44,8 +48,8 @@ class TestFutureTensor(CustomTestCase):
         alt_stream = torch.cuda.Stream(device=device)
         src_a = torch.tensor([13], dtype=torch.int32, device=device)
         src_b = torch.tensor([29], dtype=torch.int32, device=device)
-        future_a = FutureTensor.create(src_device=src_a, stream=alt_stream)
-        future_b = FutureTensor.create(src_device=src_b, stream=alt_stream)
+        future_a = FutureTensor.device_to_host(src_device=src_a, stream=alt_stream)
+        future_b = FutureTensor.device_to_host(src_device=src_b, stream=alt_stream)
         self.assertNotEqual(future_a._tensor.data_ptr(), future_b._tensor.data_ptr())
         self.assertEqual(int(future_a.wait().item()), 13)
         self.assertEqual(int(future_b.wait().item()), 29)
