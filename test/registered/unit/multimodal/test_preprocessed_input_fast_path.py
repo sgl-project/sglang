@@ -7,6 +7,7 @@ import torch
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     ShmPointerMMData,
+    _get_multimodal_indices_from_offsets,
 )
 from sglang.srt.managers.schedule_batch import (
     Modality,
@@ -213,6 +214,18 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
 
         self.assertEqual(output_ids, [1, -1001, -1001, 2, -1002, -1002, 3])
         self.assertEqual(input_ids, [1, 42, 42, 2, 43, 43, 3])
+
+    def test_offset_placement_indices_respect_batch_starts_and_chunks(self):
+        indices = _get_multimodal_indices_from_offsets(
+            items_size=[0, 2, 3],
+            prefix_length=[2, 0],
+            extend_length=[5, 4],
+            items_offset_list=[[(1, 3), (6, 8)], [(0, 1)]],
+            input_token_starts=[0, 5],
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(indices.tolist(), [0, 1, 4, 5, 6])
 
     def test_shm_pointer_materialize_keeps_zero_copy_view_alive(self):
         source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
