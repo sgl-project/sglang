@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import contextlib
 import ctypes
 import logging
 import multiprocessing as mp
@@ -7,6 +8,7 @@ import os
 import pickle
 import time
 import traceback
+from collections import defaultdict
 from http import HTTPStatus
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -81,6 +83,8 @@ rid_to_cond: Dict[str, asyncio.Condition] = {}
 use_image_processor_gpu = (
     int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
 )
+
+ENCODER_MAX_BATCH_SIZE = int(os.getenv("SGLANG_ENCODER_MAX_BATCH_SIZE", "8"))
 
 
 class MMError(Exception):
@@ -1225,6 +1229,211 @@ class MMEncoder:
                 logger.debug(f"Created error EmbeddingData: {mm_data}")
             return 0, 0, 0, error_msg, error_code
 
+    async def encode_request(self, req: dict, modality: Modality):
+        """Single-request encode dispatcher: picks cache vs no-cache path."""
+        if self.mm_global_cache is not None:
+            return await self.encode_with_global_cache(
+                mm_items=req["mm_items"],
+                modality=modality,
+                req_id=req["req_id"],
+                num_parts=req["num_parts"],
+                part_idx=req["part_idx"],
+                hashes=req.get("hashes"),
+            )
+        return await self.encode(
+            mm_items=req["mm_items"],
+            modality=modality,
+            req_id=req["req_id"],
+            num_parts=req["num_parts"],
+            part_idx=req["part_idx"],
+        )
+
+    async def batch_encode(
+        self, requests: List[dict], modality: Modality
+    ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
+        """Cross-request ViT fusion. Skips local mm_cache (whole-request key)."""
+        items_per_req, flat_items = [], []
+        for req in requests:
+            v = req["mm_items"]
+            if not isinstance(v, (list, tuple)):
+                v = [v]
+            leaves = []
+            for x in v:
+                leaves.extend(x if isinstance(x, (list, tuple)) else [x])
+            items_per_req.append(len(leaves))
+            flat_items.extend(leaves)
+        total = sum(items_per_req)
+
+        try:
+            mm_inputs, get_feat = await self._process_mm_items(flat_items, modality)
+        except NotImplementedError as e:
+            return self._batch_set_error(
+                requests, modality, InternalError(f"Not implemented error: {e}")
+            )
+        except Exception as e:
+            return self._batch_set_error(
+                requests, modality, BadRequestError(f"Failed to process mm items: {e}")
+            )
+
+        try:
+            mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
+            grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            cache = self.mm_global_cache
+
+            if cache is None:
+                final_slices = await self._encode_missing(
+                    mm_feature,
+                    mm_inputs,
+                    list(range(total)),
+                    modality,
+                    get_feat,
+                )
+            else:
+                # Cache path: lookup → ViT on miss → prefetch hits → fallback if
+                # prefetch fails. Collectives run once over the union for TP sync.
+                batch_id = f"batch:{requests[0]['req_id']}:{len(requests)}"
+                # Concat per-request user-supplied hashes; fall back to compute
+                # if any request lacks them.
+                user_hashes: Optional[List] = []
+                for req in requests:
+                    h = req.get("hashes")
+                    if h is None:
+                        user_hashes = None
+                        break
+                    user_hashes.extend(h if isinstance(h, list) else [h])
+
+                if self.rank == 0:
+                    mm_hashes = user_hashes or self._calculate_hashes_from_features(
+                        mm_feature, grid_dim, modality
+                    )
+                    mask = torch.tensor(
+                        await cache.batch_is_exist(mm_hashes), dtype=torch.int32
+                    )
+                else:
+                    mm_hashes = None
+                    mask = torch.zeros(total, dtype=torch.int32)
+                if self.server_args.tp_size > 1:
+                    torch.distributed.broadcast(
+                        mask, src=0, group=cache.prefetch_tp_group
+                    )
+                miss = [i for i, e in enumerate(mask.tolist()) if not e]
+                hit = [i for i, e in enumerate(mask.tolist()) if e]
+
+                new_slices = (
+                    await self._encode_missing(
+                        mm_feature, mm_inputs, miss, modality, get_feat
+                    )
+                    if miss
+                    else []
+                )
+
+                status = torch.tensor([1], dtype=torch.int32)
+                if self.rank == 0 and hit:
+                    cache.prefetch(
+                        batch_id,
+                        [mm_hashes[i] for i in hit],
+                        [self.get_num_tokens(grid_dim[i], modality) for i in hit],
+                        modality,
+                    )
+                    try:
+
+                        async def _wait():
+                            while not cache.check_prefetch_progress(batch_id):
+                                await asyncio.sleep(0.005)
+
+                        await asyncio.wait_for(_wait(), timeout=60.0)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.error(
+                            f"Prefetch failed for {batch_id}: {e}; ViT fallback for {len(hit)} items"
+                        )
+                        status[0] = 0
+                if self.server_args.tp_size > 1:
+                    torch.distributed.broadcast(
+                        status, src=0, group=cache.prefetch_tp_group
+                    )
+
+                fallback = (
+                    await self._encode_missing(
+                        mm_feature, mm_inputs, hit, modality, get_feat
+                    )
+                    if status.item() == 0 and hit
+                    else None
+                )
+
+                if self.rank != 0:
+                    if self.profiler is not None:
+                        self.profiler.step()
+                    return [(0, 0, 0, None, None) for _ in requests]
+
+                final_slices = [None] * total
+                for i, idx in enumerate(miss):
+                    final_slices[idx] = new_slices[i]
+                if hit:
+                    if status.item() == 1:
+                        cached = cache.get_embeddings([mm_hashes[i] for i in hit])
+                        for i, idx in enumerate(hit):
+                            final_slices[idx] = cached[i]
+                    elif fallback is not None:
+                        for i, idx in enumerate(hit):
+                            final_slices[idx] = fallback[i]
+
+                new_hashes = [mm_hashes[i] for i in miss]
+                new_data = list(new_slices)
+                if fallback is not None:
+                    new_hashes += [mm_hashes[i] for i in hit]
+                    new_data += list(fallback)
+                if new_hashes:
+                    task = asyncio.create_task(
+                        asyncio.to_thread(cache.insert_batch, new_hashes, new_data)
+                    )
+                    self.background_tasks.add(task)
+                    task.add_done_callback(self.background_tasks.discard)
+
+            if self.profiler is not None:
+                self.profiler.step()
+            aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
+            results = []
+            offset = 0
+            for req, n in zip(requests, items_per_req):
+                slices = final_slices[offset : offset + n]
+                emb = slices[0] if n == 1 else torch.cat(slices, dim=0)
+                if self.rank == 0:
+                    self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                        req["req_id"],
+                        req["num_parts"],
+                        req["part_idx"],
+                        grid_dim[offset : offset + n],
+                        modality,
+                        emb,
+                        **aux_data,
+                    )
+                results.append((emb.nbytes, emb.shape[0], emb.shape[1], None, None))
+                offset += n
+            return results
+        except Exception as e:
+            return self._batch_set_error(
+                requests, modality, InternalError(f"Internal encoding error: {e}")
+            )
+
+    def _batch_set_error(
+        self, requests: List[dict], modality: Modality, exc: Exception
+    ) -> List[Tuple[int, int, int, str, int]]:
+        code = getattr(exc, "code", HTTPStatus.INTERNAL_SERVER_ERROR)
+        msg = str(exc)
+        logger.error(f"Rank {self.rank} batch_encode failed: {msg} {code = }")
+        if self.rank == 0:
+            for req in requests:
+                self.embedding_to_send[req["req_id"]] = EmbeddingData(
+                    req["req_id"],
+                    req["num_parts"],
+                    req["part_idx"],
+                    None,
+                    modality,
+                    error_msg=msg,
+                    error_code=code,
+                )
+        return [(0, 0, 0, msg, code)] * len(requests)
+
     # For zmq_to_tokenizer zmq_to_scheduler and mooncake
     async def send(
         self, req_id, prefill_host, embedding_port, session_id=None, buffer_address=None
@@ -1396,9 +1605,190 @@ class EncoderProfiler:
         return True, None
 
 
-app = FastAPI()
+class PendingRequest:
+    __slots__ = ("request", "future", "submit_time")
+
+    def __init__(self, request: dict, loop: asyncio.AbstractEventLoop):
+        self.request = request
+        self.future: asyncio.Future = loop.create_future()
+        self.submit_time = time.time()
+
+
+# VIDEO excluded: per-video preprocess kwargs (do_sample_frames, video_metadata)
+# vary per request and can't merge into one HF processor call.
+_BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
+
+
+class EncoderScheduler:
+    """Aggregate concurrent /encode requests into bounded ViT batches."""
+
+    def __init__(
+        self,
+        encoder: "MMEncoder",
+        send_sockets: List[zmq.Socket],
+        max_batch_size: int,
+    ):
+        self.encoder = encoder
+        self.send_sockets = send_sockets
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._batch_worker())
+            logger.info(
+                f"EncoderScheduler started with max_batch_size={self.max_batch_size}"
+            )
+
+    async def stop(self) -> None:
+        if self._worker_task is not None:
+            self._worker_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker_task
+            self._worker_task = None
+        # Reject any requests still queued so their HTTP handlers don't hang.
+        while True:
+            try:
+                pending = self.pending_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not pending.future.done():
+                pending.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+
+    async def submit(self, request: dict) -> Tuple:
+        pending = PendingRequest(request, asyncio.get_running_loop())
+        await self.pending_queue.put(pending)
+        return await pending.future
+
+    async def _collect_batch(self) -> List[PendingRequest]:
+        batch = [await self.pending_queue.get()]
+        while len(batch) < self.max_batch_size:
+            try:
+                batch.append(self.pending_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return batch
+
+    async def _batch_worker(self) -> None:
+        while True:
+            batch: List[PendingRequest] = []
+            try:
+                batch = await self._collect_batch()
+                groups: Dict[Modality, List[PendingRequest]] = defaultdict(list)
+                for p in batch:
+                    groups[
+                        Modality.from_str(p.request.get("modality", "image"))
+                    ].append(p)
+                for modality, group in groups.items():
+                    await self._dispatch_group(group, modality)
+            except asyncio.CancelledError:
+                for p in batch:
+                    if not p.future.done():
+                        p.future.set_exception(RuntimeError("EncoderScheduler stopped"))
+                raise
+            except Exception as e:
+                logger.error(
+                    f"Error in EncoderScheduler batch worker: {e}", exc_info=True
+                )
+                for p in batch:
+                    if not p.future.done():
+                        p.future.set_exception(e)
+
+    async def _dispatch_group(
+        self, group: List[PendingRequest], modality: Modality
+    ) -> None:
+        # Video can't fuse (per-video preprocess kwargs vary).
+        if modality not in _BATCHABLE_MODALITIES:
+            await self._dispatch_per_request(group, modality)
+            return
+
+        requests = [p.request for p in group]
+        start = time.time()
+        for sock in self.send_sockets:
+            sock.send_pyobj(
+                {
+                    "type": "batch_encode",
+                    "modality": modality.name,
+                    "requests": requests,
+                    "enter_time": start,
+                }
+            )
+
+        logger.info(f"Dispatching batch of {len(group)} {modality.name} requests")
+
+        try:
+            results = await self.encoder.batch_encode(requests, modality)
+            if len(group) > 1:
+                logger.info(
+                    f"Batch of {len(group)} {modality.name} requests completed in "
+                    f"{(time.time() - start) * 1000:.1f}ms"
+                )
+        except Exception as e:
+            logger.error(
+                f"batch_encode raised; falling back to per-request: {e}", exc_info=True
+            )
+            # Workers are back in recv loop after their failed batch_encode;
+            # re-broadcast per request to keep TP in sync.
+            await self._dispatch_per_request(group, modality)
+            return
+
+        if len(results) != len(group):
+            err = RuntimeError(
+                f"batch_encode returned {len(results)} results for {len(group)} requests"
+            )
+            logger.error(str(err))
+            for p in group:
+                if not p.future.done():
+                    p.future.set_exception(err)
+            return
+
+        for p, result in zip(group, results):
+            if not p.future.done():
+                p.future.set_result(result)
+
+    async def _dispatch_per_request(
+        self,
+        group: List[PendingRequest],
+        modality: Modality,
+    ) -> None:
+        for p in group:
+            req = p.request
+            try:
+                for sock in self.send_sockets:
+                    sock.send_pyobj(req)
+                result = await self.encoder.encode_request(req, modality)
+                if not p.future.done():
+                    p.future.set_result(result)
+            except Exception as e:
+                logger.error(
+                    f"Per-request encode failed for req_id={req.get('req_id')}: {e}"
+                )
+                if not p.future.done():
+                    p.future.set_exception(e)
+
+
 encoder: Optional[MMEncoder] = None
 send_sockets: List[zmq.Socket] = []
+encoder_scheduler: Optional[EncoderScheduler] = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global encoder_scheduler
+    if encoder is not None:
+        encoder_scheduler = EncoderScheduler(
+            encoder, send_sockets, max_batch_size=ENCODER_MAX_BATCH_SIZE
+        )
+        encoder_scheduler.start()
+    try:
+        yield
+    finally:
+        if encoder_scheduler is not None:
+            await encoder_scheduler.stop()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 async def run_encoder(
@@ -1414,24 +1804,15 @@ async def run_encoder(
                 encoder.profiler.start(request)
             else:
                 encoder.profiler.stop()
+        elif isinstance(request, dict) and request.get("type") == "batch_encode":
+            await encoder.batch_encode(
+                request["requests"],
+                Modality.from_str(request["modality"]),
+            )
         else:
-            if encoder.mm_global_cache is not None:
-                await encoder.encode_with_global_cache(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes", None),
-                )
-            else:
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                )
+            await encoder.encode_request(
+                request, Modality.from_str(request["modality"])
+            )
 
 
 def launch_encoder(server_args, schedule_path, dist_init_method, rank):
@@ -1489,30 +1870,17 @@ async def handle_encode_request(request: dict):
             encoder.background_tasks.add(task)
             task.add_done_callback(encoder.background_tasks.discard)
 
-        # broadcast request
         request.update({"enter_time": time.time()})
-        for socket in send_sockets:
-            socket.send_pyobj(request)
-        if encoder.mm_global_cache is not None:
+        modality = Modality.from_str(request["modality"])
+        if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode_with_global_cache(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                    hashes=request.get("hashes", None),
-                )
+                await encoder_scheduler.submit(request)
             )
         else:
+            for socket in send_sockets:
+                socket.send_pyobj(request)
             nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder.encode(
-                    mm_items=request["mm_items"],
-                    modality=Modality.from_str(request["modality"]),
-                    req_id=request["req_id"],
-                    num_parts=request["num_parts"],
-                    part_idx=request["part_idx"],
-                )
+                await encoder.encode_request(request, modality)
             )
 
         if error_msg:
