@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -161,6 +162,7 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepSeekR1MXFP4ArFusionEvalMI35x(unittest.TestCase):
     """DeepSeek-R1-MXFP4 GSM8K Evaluation with AllReduce Fusion for AMD MI35x."""
 

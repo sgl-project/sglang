@@ -15,6 +15,8 @@ import unittest
 from dataclasses import dataclass
 from typing import List, Optional
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import (
@@ -102,6 +104,7 @@ def get_kimi_k25_mxfp4_models() -> List[ModelConfig]:
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25MXFP4AiterMlaEvalMI35x(unittest.TestCase):
     """Kimi-K2.5-MXFP4 aiter MLA backend accuracy tests on MI35x."""
 
