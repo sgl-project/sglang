@@ -37,11 +37,14 @@ class PerturbManager:
         buffer_groups: tuple[CanaryBufferGroup, ...],
         step_counter_getter: Callable[[], int],
         swa_window_size: int = 0,
+        sweep_interval: int = 0,
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
+        self._step_counter_getter = step_counter_getter
         self._swa_window_size = swa_window_size
+        self._sweep_interval = sweep_interval
         self._radix_cache: Optional["BasePrefixCache"] = None
         self._warmup_gate = WarmupGate(
             config=config, step_counter_getter=step_counter_getter
@@ -72,6 +75,7 @@ class PerturbManager:
             config=self._config,
             req_to_token_pool=self._req_to_token_pool,
             buffer_groups=self._buffer_groups,
+            swa_window_size=self._swa_window_size,
             warmup_gate=self._warmup_gate,
         )
 
@@ -84,6 +88,8 @@ class PerturbManager:
             buffer_groups=self._buffer_groups,
             radix_cache=self._radix_cache,
             swa_window_size=self._swa_window_size,
+            sweep_interval=self._sweep_interval,
+            step_counter=self._step_counter_getter(),
             warmup_gate=self._warmup_gate,
         )
 
