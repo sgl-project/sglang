@@ -386,6 +386,7 @@ class ServerArgsAutoTuner:
     def _should_auto_enable_dit_layerwise_offload(self) -> bool:
         args = self.server_args
 
+        # only for wan for now
         if not self._is_wan_pipeline_config():
             return False
         if not self._deployment_config().auto_dit_layerwise_offload:
@@ -408,8 +409,7 @@ class ServerArgsAutoTuner:
         # auto mode is performance-first: profiling only showed clear wins for
         # Wan2.2 A14B, where coarse DiT CPU offload creates large step spikes
         return (
-            args.performance_mode == "auto"
-            and self._is_wan2_2_a14b_pipeline_config()
+            args.performance_mode == "auto" and self._is_wan2_2_a14b_pipeline_config()
         )
 
     def _is_wan2_2_a14b_pipeline_config(self) -> bool:
