@@ -34,7 +34,6 @@ from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
 
-import sglang
 from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
