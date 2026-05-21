@@ -239,6 +239,18 @@ class FuzzyMatchProvider(ABC):
         """
         return None
 
+    def on_cache_reset(self) -> None:
+        """Optional hook: called when the owning radix cache is reset.
+
+        Providers that keep side stores keyed by radix-tree nodes or request
+        ids should clear them here. ``/flush_cache`` resets the radix tree and
+        KV pools; keeping provider-side donor handles after that point can make
+        later fuzzy matches reference stale node ids or freed KV slots.
+
+        Default is a no-op for backward compatibility.
+        """
+        return None
+
     @abstractmethod
     def match_on_prefix_miss(
         self,

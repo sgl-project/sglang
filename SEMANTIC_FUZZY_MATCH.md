@@ -399,7 +399,7 @@ python -m sglang.launch_server \
 #   add --fuzzy-discovery-only
 ```
 
-The SemBlend Python package (`pip install semblend`) supplies the
+The SemBlend Python package (`pip install 'semblend[onnx-gpu]>=0.3.10'`) supplies the
 actual semantic pipeline; this PR's `semantic_embedding.py` is the
 registration surface inside SGLang.
 
@@ -414,7 +414,7 @@ for the chosen model. No internal services or datasets are required.
 ```bash
 git checkout <this-PR-branch>
 pip install -e "python[all]"
-pip install semblend  # supplies the SemanticEmbedding pipeline
+pip install -U "semblend[onnx-gpu]>=0.3.10" aiohttp
 ```
 
 ### 2. Start a server
@@ -430,11 +430,29 @@ python -m sglang.launch_server \
     --fuzzy-min-match-length 1 \
     --fuzzy-semantic-threshold 0.60 \
     --fuzzy-min-reuse-ratio 0.50 \
+    --fuzzy-min-cached-tokens 1024 \
     --cache-fuzzy-results \
     --mem-fraction-static 0.75 \
     --port 8000 \
   2>&1 | tee sglang-server.log
 ```
+
+### Long-context cold-vs-warm benchmark
+
+The long-context probe and datasets live in `scripts/`:
+
+- `quality_clusters_exactrun_8k_16k.json` validates the current
+  upstream-friendly `|exact|fuzzy|miss|` path. At 16K, `partial_80`,
+  `partial_60`, and `paraphrase` should recover roughly 15.9K cached
+  tokens and show large TTFT speedups.
+- `quality_clusters_fragmented_8k_16k.json` intentionally exercises
+  fragmented overlap. Today SGLang realizes one contiguous fuzzy block, so
+  this dataset demonstrates why multi-segment realization is a follow-up
+  rather than a regression.
+
+Run instructions are in `scripts/README_semblend_long_quality_probe.md`.
+Use `--require-fuzzy-log-events` so missing or old-format logs fail fast
+instead of silently reporting zero cached tokens.
 
 Smaller GPU? Drop to Qwen2.5-1.5B-Instruct (no AWQ quant required) and
 keep every other flag. The fuzzy plumbing is model-size-independent.
@@ -663,12 +681,11 @@ realizes per-chunk matches via N:M alignment.
   minimum chunk-overlap ratio required to surface a match. Lowering
   either increases recall but reduces precision.
 
-## Re-validation against Chenxin's 2026-05-10 feedback (v0.3.6)
+## Re-validation against Chenxin's 2026-05-10 feedback
 
 Chenxin flagged three concrete issues after his 2026-05-10 testing pass.
 This section documents what changed and what the rebuilt artifact
-(`semblend 0.3.6` + `fuzzy-semantic-provider-rebase@58c1bc2`) does on
-the exact same probes.
+(`semblend>=0.3.10` + this PR branch) does on the exact same probes.
 
 ### Issues he raised
 
@@ -676,11 +693,9 @@ the exact same probes.
    `SemBlendProviderConfig` / `SemBlendProviderAdapter`.** The published
    PyPI artifact (`0.3.1`) predates the SGLang integration entrypoints.
    - **Resolution:** SGLang's `SemanticEmbeddingProvider` now enforces
-     a minimum-version gate (`_MIN_SEMBLEND_VERSION = "0.3.6"`). The
-     branch tip at `WorldFlowAI/semblend@feat/sglang-semantic-provider`
-     ships 0.3.6 with the integration entrypoints. Installing from that
-     branch (or pinning to the equivalent tarball) is the supported
-     path until the PyPI publish catches up.
+     a minimum-version gate (`_MIN_SEMBLEND_VERSION = "0.3.10"`). The
+     PyPI package includes the SGLang integration entrypoints, exact-run
+     recovery, and the adapter reset hook used by `/flush_cache`.
 
 2. **`ValueError: too many values to unpack` in
    `multi_donor_alignment.py:318`** — `_fuzzy_match_chunk` returns 3
@@ -722,9 +737,11 @@ the exact same probes.
 
 ### Re-validation runs
 
-All numbers from `sglang-semblend-7bawq-fixed5` (Qwen2.5-7B-Instruct-AWQ
-on A10G, `--chunked-prefill-size 4096`, `--mem-fraction-static 0.70`)
-running `semblend 0.3.6` + `fuzzy-semantic-provider-rebase@58c1bc2`.
+Earlier replay numbers below were collected on
+`sglang-semblend-7bawq-fixed5` (Qwen2.5-7B-Instruct-AWQ on A10G,
+`--chunked-prefill-size 4096`, `--mem-fraction-static 0.70`). Current
+long-context validation should use `semblend>=0.3.10` and the
+`scripts/README_semblend_long_quality_probe.md` runbook above.
 
 #### Chenxin's exact Case 1 / Case 2 prompts
 

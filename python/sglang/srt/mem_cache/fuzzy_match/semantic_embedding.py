@@ -26,6 +26,7 @@ from typing import List, Optional
 
 import torch
 
+from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.mem_cache.fuzzy_match.config import FuzzyMatchConfig
 from sglang.srt.mem_cache.fuzzy_match.fuzzy_match_provider import (
     FuzzyMatchProvider,
@@ -46,7 +47,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
     network or service dependency.
     """
 
-    _MIN_SEMBLEND_VERSION = "0.3.9"
+    _MIN_SEMBLEND_VERSION = "0.3.10"
 
     def __init__(self, config: FuzzyMatchConfig):
         super().__init__(config)
@@ -79,7 +80,8 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 f"'semblend>={self._MIN_SEMBLEND_VERSION}'"
             ) from e
 
-        adapter_config = SemBlendProviderConfig.from_dict(
+        self._adapter_cls = SemBlendProviderAdapter
+        self._adapter_config = SemBlendProviderConfig.from_dict(
             {
                 "min_similarity": config.fuzzy_semantic_threshold,
                 "min_reuse_ratio": config.fuzzy_min_reuse_ratio,
@@ -95,7 +97,7 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
                 "discovery_only": config.discovery_only,
             }
         )
-        self._adapter = SemBlendProviderAdapter(config=adapter_config)
+        self._adapter = self._adapter_cls(config=self._adapter_config)
         logger.info(
             "SemanticEmbeddingProvider initialized: threshold=%.2f, "
             "min_reuse=%.2f, model_arch=%s, enable_bathtub=%s",
@@ -119,16 +121,32 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         radix_tree=None,
     ) -> bool:
         import time as _time
-        t_decode_start = _time.monotonic()
-        prompt_text = self._decode(request, token_ids[cache_start_pos:cache_end_pos])
-        t_decode_ms = (_time.monotonic() - t_decode_start) * 1000
         request_id = getattr(request, "rid", None) or getattr(request, "request_id", None)
         if request_id is None:
             logger.debug("[SemanticEmbedding] request has no rid; skipping registration")
             return False
+        request_id = str(request_id)
+        if request_id.startswith(HEALTH_CHECK_RID_PREFIX):
+            logger.debug(
+                "[SemanticEmbedding] skipping health-check donor registration: %s",
+                request_id,
+            )
+            return False
+        if cache_end_pos <= cache_start_pos:
+            logger.debug(
+                "[SemanticEmbedding] skipping donor registration for empty "
+                "cache range: rid=%s start=%d end=%d",
+                request_id,
+                cache_start_pos,
+                cache_end_pos,
+            )
+            return False
+        t_decode_start = _time.monotonic()
+        prompt_text = self._decode(request, token_ids[cache_start_pos:cache_end_pos])
+        t_decode_ms = (_time.monotonic() - t_decode_start) * 1000
         t_submit_start = _time.monotonic()
         ok = self._adapter.register_donor(
-            request_id=str(request_id),
+            request_id=request_id,
             token_ids=list(token_ids),
             kv_cache=kv_cache,
             cache_start_pos=cache_start_pos,
@@ -161,6 +179,15 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
         )
         if adapter_result is None:
             return None
+        min_cached = getattr(self.config, "fuzzy_min_cached_tokens", 0)
+        if adapter_result.cached_token_count < min_cached:
+            logger.info(
+                "[FUZZY] SemanticEmbeddingProvider rejected small realized "
+                "block: cached=%d < fuzzy_min_cached_tokens=%d",
+                adapter_result.cached_token_count,
+                min_cached,
+            )
+            return None
         return _adapter_to_sglang_result(adapter_result)
 
     def on_donor_inserted(self, request, donor_last_node_id: int) -> None:
@@ -178,6 +205,36 @@ class SemanticEmbeddingProvider(FuzzyMatchProvider):
             request_id=str(request_id),
             donor_last_node_id=donor_last_node_id,
         )
+
+    def on_cache_reset(self) -> None:
+        """Clear provider-side donor state after SGLang flushes radix/KV cache.
+
+        Older SemBlend adapters did not expose a public clear API. When it is
+        missing, reinstantiating the adapter is the safest way to clear both the
+        donor handle map and embedding donor store so no later fuzzy match can
+        point at KV slots or radix nodes invalidated by ``/flush_cache``.
+        """
+        old_adapter = getattr(self, "_adapter", None)
+        clear = getattr(old_adapter, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+                logger.info("[FUZZY] SemanticEmbeddingProvider cleared adapter state")
+                return
+            except Exception:
+                logger.debug("[SemanticEmbedding] adapter clear failed", exc_info=True)
+
+        executor = getattr(old_adapter, "_register_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+            except Exception:
+                logger.debug("[SemanticEmbedding] adapter executor shutdown failed", exc_info=True)
+
+        self._adapter = self._adapter_cls(config=self._adapter_config)
+        logger.info("[FUZZY] SemanticEmbeddingProvider reset adapter state")
 
     # ------------------------------------------------------------------
     # Helpers

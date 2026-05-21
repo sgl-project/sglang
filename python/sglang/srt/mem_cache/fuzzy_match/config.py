@@ -97,6 +97,12 @@ class FuzzyMatchConfig:
     # cost of the layer-recompute mask the bathtub model emits.
     fuzzy_min_reuse_ratio: float = 0.50
 
+    # Minimum number of realized fuzzy tokens required before RadixCache
+    # accepts a provider hit. This is an execution-side cost gate, separate
+    # from the provider's semantic/reuse gates. Default 0 preserves legacy
+    # behavior and keeps short validation examples working.
+    fuzzy_min_cached_tokens: int = 0
+
     # Informational PPL guardrail (telemetry; not enforced in-flight).
     quality_gate_ppl_threshold: float = 1.065
 
@@ -142,6 +148,12 @@ class FuzzyMatchConfig:
                 f"fuzzy_min_reuse_ratio must be in (0.0, 1.0], "
                 f"got {self.fuzzy_min_reuse_ratio}"
             )
+
+        if self.fuzzy_min_cached_tokens < 0:
+            raise ValueError(
+                f"fuzzy_min_cached_tokens must be >= 0, "
+                f"got {self.fuzzy_min_cached_tokens}"
+            )
     
     @classmethod
     def from_server_args(cls, server_args):
@@ -168,6 +180,7 @@ class FuzzyMatchConfig:
             enable_bathtub=getattr(server_args, 'enable_bathtub', True),
             fuzzy_top_k=getattr(server_args, 'fuzzy_top_k', 5),
             fuzzy_min_reuse_ratio=getattr(server_args, 'fuzzy_min_reuse_ratio', 0.50),
+            fuzzy_min_cached_tokens=getattr(server_args, 'fuzzy_min_cached_tokens', 0),
             quality_gate_ppl_threshold=getattr(
                 server_args, 'quality_gate_ppl_threshold', 1.065,
             ),

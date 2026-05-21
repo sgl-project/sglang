@@ -384,6 +384,7 @@ class ServerArgs:
     enable_bathtub: bool = True
     fuzzy_top_k: int = 5
     fuzzy_min_reuse_ratio: float = 0.50
+    fuzzy_min_cached_tokens: int = 0
     quality_gate_ppl_threshold: float = 1.065
     fuzzy_discovery_only: bool = False
     
@@ -4465,6 +4466,15 @@ class ServerArgs:
             type=float,
             default=ServerArgs.fuzzy_min_reuse_ratio,
             help="Minimum reuse ratio (matched / prompt tokens) for a semantic hit.",
+        )
+        parser.add_argument(
+            "--fuzzy-min-cached-tokens",
+            type=int,
+            default=ServerArgs.fuzzy_min_cached_tokens,
+            help=(
+                "Minimum realized fuzzy tokens required before RadixCache "
+                "accepts a provider hit. Default 0 preserves legacy behavior."
+            ),
         )
         parser.add_argument(
             "--quality-gate-ppl-threshold",

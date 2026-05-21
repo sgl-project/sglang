@@ -370,6 +370,13 @@ class RadixCache(BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        fuzzy_provider = getattr(self, "fuzzy_match_provider", None)
+        if fuzzy_provider is not None:
+            try:
+                fuzzy_provider.on_cache_reset()
+            except Exception as e:
+                logger.warning(f"[FUZZY RADIX] on_cache_reset failed: {e}")
+
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=[], extra_key=None)
@@ -380,6 +387,8 @@ class RadixCache(BasePrefixCache):
         self.evictable_size_ = 0
         self.protected_size_ = 0
         self.evictable_leaves.clear()
+        self._node_registry.clear()
+        self._register_node(self.root_node)
         self._record_all_cleared_event()
     
     def init_fuzzy_match(self, config: FuzzyMatchConfig, provider: FuzzyMatchProvider):
@@ -489,12 +498,58 @@ class RadixCache(BasePrefixCache):
             )
             
             fuzzy_result = self.match_prefix_fuzzy(
-                params=MatchPrefixParams(key=key),
+                params=MatchPrefixParams(
+                    key=key,
+                    req=params.req,
+                    cow_mamba=params.cow_mamba,
+                ),
                 exact_matched_len=exact_matched_len,
             )
             
             if fuzzy_result is not None:
                 fuzzy_matched_len = fuzzy_result.cached_token_count
+                min_cached = getattr(
+                    self.fuzzy_config,
+                    "fuzzy_min_cached_tokens",
+                    0,
+                )
+                if fuzzy_matched_len < min_cached:
+                    rid = (
+                        getattr(params.req, "rid", None)
+                        if params.req is not None
+                        else None
+                    )
+                    logger.info(
+                        f"[FUZZY RADIX] dropping fuzzy match: rid={rid} "
+                        f"cached={fuzzy_matched_len} < "
+                        f"fuzzy_min_cached_tokens={min_cached}"
+                    )
+                    return MatchResult(
+                        device_indices=value,
+                        last_device_node=last_node,
+                        last_host_node=last_node,
+                    )
+
+                donor_last_node_id = getattr(
+                    fuzzy_result, "donor_last_node_id", None
+                )
+                if (
+                    donor_last_node_id is not None
+                    and donor_last_node_id not in self._node_registry
+                ):
+                    rid = getattr(params.req, "rid", None) if params.req is not None else None
+                    logger.warning(
+                        f"[FUZZY RADIX] dropping fuzzy match for stale "
+                        f"rid={rid} "
+                        f"donor_last_node_id={donor_last_node_id}; "
+                        f"the radix cache was likely reset after the donor "
+                        f"was registered"
+                    )
+                    return MatchResult(
+                        device_indices=value,
+                        last_device_node=last_node,
+                        last_host_node=last_node,
+                    )
 
                 # Reserve realization slots up front. _correct_fuzzy_kv_rope
                 # consumes from req.fuzzy_realized_locs; if we let it
@@ -664,13 +719,27 @@ class RadixCache(BasePrefixCache):
             # and the radix tree manages node lifecycle independently.
             
             if result is not None:
+                rid = getattr(params.req, "rid", None) if params.req is not None else None
+                quality = getattr(result, "quality_signals", None)
+                quality_msg = ""
+                if quality is not None:
+                    quality_msg = (
+                        f", quality_reuse={float(quality.reuse_ratio):.3f}, "
+                        f"quality_cosine={float(quality.cosine_similarity):.3f}, "
+                        f"quality_tier={quality.confidence_tier}, "
+                        f"quality_passed={quality.passed_quality_gate}"
+                    )
                 logger.info(
-                    f"[FUZZY RADIX] Fuzzy match success: cached={result.cached_token_count}, "
-                    f"prompt={result.prompt_token_count}, offset={result.position_offset}"
+                    f"[FUZZY RADIX] Fuzzy match success: rid={rid} "
+                    f"cached={result.cached_token_count}, "
+                    f"prompt={result.prompt_token_count}, "
+                    f"offset={result.position_offset}{quality_msg}"
                 )
             else:
+                rid = getattr(params.req, "rid", None) if params.req is not None else None
                 logger.info(
-                    f"[FUZZY RADIX] Fuzzy match failed: no suitable match found"
+                    f"[FUZZY RADIX] Fuzzy match failed: rid={rid} "
+                    f"no suitable match found"
                 )
             
             return result
