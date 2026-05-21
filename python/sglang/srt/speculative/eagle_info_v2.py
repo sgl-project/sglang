@@ -246,7 +246,7 @@ class EagleDraftInputV2Mixin:
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:
-            draft_model_runner.attn_backend.init_forward_metadata(forward_batch)
+            draft_model_runner.attn_backend.init_forward_data(forward_batch)
         return forward_batch
 
 
@@ -306,7 +306,7 @@ class EagleVerifyInputV2Mixin:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
         else:
             if not batch.forward_mode.is_idle():
-                target_worker.model_runner.attn_backend.init_forward_metadata(
+                target_worker.model_runner.attn_backend.init_forward_data(
                     verify_forward_batch
                 )
 
