@@ -29,7 +29,7 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
-from sglang.srt.kv_canary.runner import launch as launch_module
+from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -172,7 +172,7 @@ class TestSelfUnitRunner(CustomTestCase):
         self.device = DEFAULT_DEVICE
         # Stub plan/verify/write kernels so CPU runs don't need CUDA JIT.
         self._patchers = [
-            patch.object(launch_module, "canary_plan_step", lambda **kwargs: None),
+            patch.object(kernel_launch_module, "canary_plan_step", lambda **kwargs: None),
             patch.object(endpoint_module, "canary_verify_step", lambda **kwargs: None),
             patch.object(endpoint_module, "canary_write_step", lambda **kwargs: None),
         ]
@@ -194,7 +194,7 @@ class TestSelfUnitRunner(CustomTestCase):
         """Verify per-forward execution launches plan, head, and tail kernels."""
         calls: List = []
         with patch.object(
-            launch_module,
+            kernel_launch_module,
             "canary_plan_step",
             lambda **kwargs: calls.append("plan"),
         ), patch.object(
@@ -269,7 +269,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
         plan_calls: List[str] = []
         with patch.object(
-            launch_module,
+            kernel_launch_module,
             "canary_plan_step",
             lambda **kwargs: plan_calls.append("plan"),
         ):
@@ -353,7 +353,7 @@ class TestSelfUnitRunner(CustomTestCase):
         )
         forward_batch.num_token_non_padded_cpu = 1
 
-        launch_module.launch_endpoints_per_forward(
+        kernel_launch_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
@@ -402,7 +402,7 @@ class TestSelfUnitRunner(CustomTestCase):
             [7], dtype=torch.int32, device=self.device
         )
 
-        launch_module.launch_endpoints_per_forward(
+        kernel_launch_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,

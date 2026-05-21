@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.plan_input_builder import (
     fill_plan_input_per_forward,
 )
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
-from sglang.srt.kv_canary.runner.launch import (
+from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )

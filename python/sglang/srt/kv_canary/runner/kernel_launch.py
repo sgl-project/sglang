@@ -66,13 +66,19 @@ def launch_endpoints_per_forward(
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: bool,
 ) -> None:
-    positions = _canonicalize_boundary_int64(forward_batch.positions, "forward_batch.positions")
+    positions = _canonicalize_boundary_int64(
+        forward_batch.positions, "forward_batch.positions"
+    )
     out_cache_loc = None
     if forward_batch.out_cache_loc is not None:
-        out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, "forward_batch.out_cache_loc")
+        out_cache_loc = _canonicalize_boundary_int64(
+            forward_batch.out_cache_loc, "forward_batch.out_cache_loc"
+        )
     input_ids = None
     if forward_batch.input_ids is not None:
-        input_ids = _canonicalize_boundary_int64(forward_batch.input_ids, "forward_batch.input_ids")
+        input_ids = _canonicalize_boundary_int64(
+            forward_batch.input_ids, "forward_batch.input_ids"
+        )
 
     num_tokens = int(positions.shape[0])
     if expected_inputs.tokens.shape[0] != num_tokens:
