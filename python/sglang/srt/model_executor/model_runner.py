@@ -2669,7 +2669,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if lora_ids is not None:
             self.lora_manager.prepare_lora_batch(forward_batch)
 
-        self.attn_backend.init_forward_metadata(forward_batch)
+        self.attn_backend.init_forward_data(forward_batch)
 
         def run_once():
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
@@ -2988,13 +2988,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
-                self.decode_attn_backend.init_forward_metadata(forward_batch)
+                self.decode_attn_backend.init_forward_data(forward_batch)
                 # PDmux selects a per-stream backend; publish it to model-layer
                 # readers via the active ForwardContext so RadixAttention etc.
                 # dispatch against the right backend for this forward.
                 pdmux_override = True
             else:
-                self.attn_backend.init_forward_metadata(forward_batch)
+                self.attn_backend.init_forward_data(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -3075,7 +3075,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
-            self.attn_backend.init_forward_metadata(forward_batch)
+            self.attn_backend.init_forward_data(forward_batch)
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3098,7 +3098,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # in this case, we need to reinit the forward metadata, otherwise the stale
         # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
         if forward_batch.batch_size > 0:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            self.attn_backend.init_forward_data(forward_batch)
 
         kwargs = {}
         if self.support_pp:
@@ -3123,7 +3123,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
-            self.attn_backend.init_forward_metadata(forward_batch)
+            self.attn_backend.init_forward_data(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
