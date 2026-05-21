@@ -1286,12 +1286,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_draft_worker:
             if self.device == "cpu":
                 if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
-                    torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
+                    try:
+                        # Bind OpenMP threads to CPU cores
+                        torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
-                    # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+                        # Set local size to hint SGLang to use shared memory based AllReduce
+                        os.environ["LOCAL_SIZE"] = str(self.tp_size)
+                        torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
+
+                    except AttributeError:
+                        # sgl_kernel CPU ops aren't registered on macOS (the
+                        # CUDA-only sglang-kernel wheel isn't installed). Skip
+                        # the OpenMP/SHM-AllReduce hooks so the CPU path is
+                        # still usable for local dev.
+                        logger.warning(
+                            "sgl_kernel CPU ops not available; "
+                            "skipping init_cpu_threads_env and SHM-AllReduce setup."
+                        )
 
                 else:
                     logger.warning(

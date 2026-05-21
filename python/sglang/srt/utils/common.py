@@ -3755,6 +3755,12 @@ def parse_lscpu_topology():
         output = subprocess.check_output(
             ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
         )
+    except FileNotFoundError:
+        # macOS / non-Linux: lscpu is unavailable. Synthesize a single-node,
+        # one-CPU-per-physical-core topology so downstream callers (NUMA
+        # binding, CPU memory capacity probing) keep working for local dev.
+        n = psutil.cpu_count(logical=True) or 1
+        return [(i, i, 0, 0) for i in range(n)]
     except Exception as e:
         raise RuntimeError(f"Unexpected error running 'lscpu': {e}")
 
@@ -3791,7 +3797,12 @@ def get_physical_cpus_by_numa():
             ] = cpu  # pick first CPU seen for that physical core
 
     # Retrieves CPUs that the current process is allowed to run on
-    cpus_allowed_list = psutil.Process().cpu_affinity()
+    try:
+        cpus_allowed_list = psutil.Process().cpu_affinity()
+    except AttributeError:
+        # cpu_affinity() is Linux/Windows/FreeBSD only. On macOS, fall back
+        # to "all CPUs" so NUMA binding logic still resolves to a valid set.
+        cpus_allowed_list = list(range(psutil.cpu_count(logical=True) or 1))
 
     # Convert to list of physical CPUs per node
     # 0: [0,1,2,...,42]
