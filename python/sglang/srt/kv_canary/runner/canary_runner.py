@@ -67,18 +67,18 @@ class CanaryRunner:
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
 
-        endpoints: list[CanaryEndpoint] = []
-        for group in self._buffer_groups:
-            endpoints.extend(
-                build_endpoints_from_group(group=group, device_state=self._device_state)
+        self._endpoints: tuple[CanaryEndpoint, ...] = tuple(
+            endpoint
+            for group in self._buffer_groups
+            for endpoint in build_endpoints_from_group(
+                group=group, device_state=self._device_state
             )
-        self._endpoints: tuple[CanaryEndpoint, ...] = tuple(endpoints)
-
-        active: set[CanaryLaunchTag] = set()
-        for endpoint in self._endpoints:
-            active.add(endpoint.kernel_kind)
+        )
         self._active_tags: tuple[CanaryLaunchTag, ...] = tuple(
-            sorted(active, key=lambda tag: tag.value)
+            sorted(
+                {endpoint.kernel_kind for endpoint in self._endpoints},
+                key=lambda tag: tag.value,
+            )
         )
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
