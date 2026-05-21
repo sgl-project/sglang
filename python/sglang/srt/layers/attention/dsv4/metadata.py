@@ -111,7 +111,7 @@ class PagedIndexerMetadata:
             import deep_gemm
 
             if envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
@@ -126,7 +126,7 @@ class PagedIndexerMetadata:
 
             assert isinstance(self.deep_gemm_metadata, torch.Tensor)
 
-        from sglang.jit_kernel.deepseek_v4 import plan_topk_v2
+        from sglang.jit_kernel.dsv4 import plan_topk_v2
 
         if envs.SGLANG_OPT_USE_TOPK_V2.get() and not (
             is_cpu() and cpu_has_amx_support()

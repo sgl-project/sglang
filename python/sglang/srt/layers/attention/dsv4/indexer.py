@@ -8,9 +8,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
-    fused_rope,
+    fused_rope_inplace,
     topk_transform_512,
     topk_transform_512_v2,
 )
@@ -599,7 +599,7 @@ class C4Indexer(nn.Module):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if _is_cpu and _cpu_amx:
             # TODO: fuse below
-            fused_rope(
+            fused_rope_inplace(
                 q[..., -self.rope_head_dim :],
                 None,
                 self.freqs_cis,

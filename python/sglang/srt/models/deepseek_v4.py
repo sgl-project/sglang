@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import time
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -20,10 +21,9 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
-    fused_rope,
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -461,7 +461,7 @@ class MQALayer(nn.Module):
         if _is_cpu and _cpu_amx:
             q = rms_normalize_cpu(q, self.eps)
             if positions is not None:
-                fused_rope(
+                fused_rope_inplace(
                     q[..., -self.qk_rope_head_dim :],
                     None,
                     self.freqs_cis,
@@ -663,7 +663,7 @@ class MQALayer(nn.Module):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         q = rms_normalize_cpu(q, self.eps)
         kv = self.kv_norm(kv)
-        fused_rope(
+        fused_rope_inplace(
             q[..., -self.qk_rope_head_dim :],
             kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
             self.freqs_cis,
@@ -862,6 +862,70 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        paths = (
+            (
+                "attn",
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.input_layernorm,
+            ),
+            (
+                "ffn",
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
+            ),
+        )
+
+        with torch.inference_mode():
+            for num_tokens in token_counts:
+                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
+                    tic = time.perf_counter()
+                    residual = torch.empty(
+                        (num_tokens, self.hc_mult, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    y, post, comb, _ = self.hc_pre(
+                        residual,
+                        hc_fn,
+                        hc_scale,
+                        hc_base,
+                        norm=norm,
+                    )
+                    del residual, y, post, comb
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
+                        path_name,
+                        num_tokens,
+                        time.perf_counter() - tic,
+                    )
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
+
+        token_counts = get_mhc_pre_token_count_representatives(
+            max_num_tokens, self.hc_mult * self.hidden_size
+        )
+        if not token_counts:
+            return token_counts
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
+            max_num_tokens,
+            token_counts,
+        )
+        self.prewarm_mhc_token_counts(token_counts, device)
+        return token_counts
 
     def hc_pre(
         self,
@@ -1171,6 +1235,24 @@ class DeepseekV4Model(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
 
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        tic = time.perf_counter()
+        logger.info(
+            "Running DeepSeek V4 MHC prewarm for max_num_tokens=%s",
+            max_num_tokens,
+        )
+        token_counts = self.layers[self.start_layer].prewarm_mhc_token_count_buckets(
+            max_num_tokens, device
+        )
+        logger.info(
+            "DeepSeek V4 MHC prewarm finished in %.3fs for representative token counts: %s",
+            time.perf_counter() - tic,
+            token_counts,
+        )
+        return token_counts
+
     def hc_head(
         self,
         x: torch.Tensor,
@@ -1325,6 +1407,33 @@ class DeepseekV4ForCausalLM(nn.Module):
         if self.dsa_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
+
+    def kernel_warmup(self, model_runner) -> None:
+        if not model_runner.is_hybrid_swa:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+
+        max_num_tokens = model_runner.server_args.chunked_prefill_size
+        if max_num_tokens is None or max_num_tokens <= 0:
+            max_num_tokens = 8192
+
+        token_counts = self.prewarm_mhc_token_count_buckets(
+            max_num_tokens, model_runner.device
+        )
+        model_runner.tp_group.barrier()
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
+            token_counts,
+        )
 
     @property
     def routed_experts_weights_of_layer(self):
