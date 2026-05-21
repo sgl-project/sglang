@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import fnmatch
 import io
 import os
-import re
 import string
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +13,10 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
+from sglang.test.kv_canary.violation_log_utils import (
+    assert_no_violation_in_log,
+    find_violation_in_log,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -181,16 +183,12 @@ class CanaryE2EBase(CustomTestCase):
         """
         time.sleep(flush_wait_seconds)
         log_text = self._captured_log_text()
-        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
-        for match in line_re.finditer(log_text):
-            tag = match.group(1)
-            reason_field = match.group(2)
-            if fail_reason not in reason_field.split("+"):
-                continue
-            if any(
-                fnmatch.fnmatchcase(tag, pattern) for pattern in launch_tag_patterns
-            ):
-                return
+        if find_violation_in_log(
+            log_text,
+            launch_tag_patterns=launch_tag_patterns,
+            fail_reason=fail_reason,
+        ):
+            return
         raise AssertionError(
             f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
             f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
@@ -201,11 +199,7 @@ class CanaryE2EBase(CustomTestCase):
         """Assert no ``kv_canary violation:`` line appears in the captured server log within
         wait_seconds."""
         time.sleep(wait_seconds)
-        log_text = self._captured_log_text()
-        if "kv_canary violation:" in log_text:
-            raise AssertionError(
-                f"Unexpected canary violation found. Log tail:\n{log_text[-2000:]}"
-            )
+        assert_no_violation_in_log(self._captured_log_text())
 
     def _captured_log_text(self) -> str:
         stdout_text = (
