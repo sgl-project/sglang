@@ -202,7 +202,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         checkpoint_uses_packed_qkv: bool = False,
-        swap_weight_nibbles: bool = True,
+        swap_weight_nibbles: bool = False,
     ) -> None:
         super().__init__(exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -261,7 +261,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
     def from_config(cls, config: Dict[str, Any]) -> ModelOptFp4Config:
         group_size = None
         exclude_modules = []
-        swap_weight_nibbles = True
+        swap_weight_nibbles = False
 
         # Flat format (config.json quantization_config)
         quant_method = config.get("quant_algo")
@@ -273,7 +273,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                     first_group = next(iter(config_groups.values()), {})
                     group_size = first_group.get("weights", {}).get("group_size")
             exclude_modules = config.get("ignore", [])
-            swap_weight_nibbles = config.get("swap_weight_nibbles", True)
+            swap_weight_nibbles = config.get(
+                "swap_weight_nibbles",
+                config.get("checkpoint_uses_packed_qkv", False),
+            )
         else:
             # Nested format (hf_quant_config.json)
             try:
@@ -283,7 +286,10 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 exclude_modules = quant_config.get("exclude_modules", [])
                 swap_weight_nibbles = quant_config.get(
                     "swap_weight_nibbles",
-                    config.get("swap_weight_nibbles", True),
+                    config.get(
+                        "swap_weight_nibbles",
+                        config.get("checkpoint_uses_packed_qkv", False),
+                    ),
                 )
             except (ValueError, KeyError):
                 raise ValueError("Cannot find 'quant_algo' in quantization config.")
@@ -494,7 +500,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         w = layer.weight.data
         w_swapped = _prepare_nvfp4_weight_bytes(
             w,
-            swap_weight_nibbles=getattr(self.quant_config, "swap_weight_nibbles", True),
+            swap_weight_nibbles=getattr(
+                self.quant_config, "swap_weight_nibbles", False
+            ),
         )
 
         _, flashinfer_backend = _get_fp4_gemm_op()
@@ -554,8 +562,13 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales[:B, :M, :K] = scales
 
         _, flashinfer_backend = _get_fp4_gemm_op()
-        if flashinfer_backend is None:
-            # CUTLASS (sgl_kernel) path: blockwise interleave to TMA layout
+        uses_flux1_scale_layout = not getattr(
+            self.quant_config, "checkpoint_uses_packed_qkv", False
+        ) and getattr(layer, "prefix", "").startswith(
+            ("transformer_blocks.", "single_transformer_blocks.")
+        )
+        if flashinfer_backend is None or uses_flux1_scale_layout:
+            # CUTLASS and FLUX.1 CUDNN paths need the TMA scale layout.
             padded_scales = padded_scales.reshape(
                 B, M_padded // 128, 4, 32, K_padded // 4, 4
             )
