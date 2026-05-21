@@ -1276,9 +1276,19 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["web_search_preview", "code_interpreter", "function"] = Field(
         description="Type of tool to enable"
     )
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: bool = False
+
+    @model_validator(mode="after")
+    def validate_function_tool(self) -> "ResponseTool":
+        if self.type == "function" and not self.name:
+            raise ValueError("Function tools must include a name.")
+        return self
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1356,8 +1366,57 @@ class ResponsesRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responses_input(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        input_value = values.get("input")
+        if not isinstance(input_value, list):
+            return values
+
+        values = values.copy()
+        values["input"] = [
+            cls._normalize_input_item_for_validation(item) for item in input_value
+        ]
+        return values
+
+    @staticmethod
+    def _normalize_input_item_for_validation(item):
+        if not isinstance(item, dict):
+            return item
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return item
+
+        item = item.copy()
+        item["content"] = [
+            ResponsesRequest._normalize_content_part_for_validation(part)
+            for part in content
+        ]
+        return item
+
+    @staticmethod
+    def _normalize_content_part_for_validation(part):
+        if not isinstance(part, dict):
+            return part
+
+        part_type = part.get("type")
+        if part_type != "input_image" or part.get("detail") is not None:
+            return part
+
+        part = part.copy()
+        part["detail"] = "auto"
+        return part
+
     def to_sampling_params(
-        self, default_max_tokens: int, default_params: Optional[Dict] = None
+        self,
+        default_max_tokens: int,
+        default_params: Optional[Dict] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation."""
         if default_params is None:
@@ -1369,7 +1428,13 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 2 token
+        # Reserve 2 tokens of headroom against context_len. The caller in
+        # serving_responses subtracts `num_reserved_tokens` (e.g. EAGLE spec
+        # slots) from `default_max_tokens` already, but the engine appends
+        # one or two special tokens (e.g. BOS/EOS, an extra GPT-OSS marker)
+        # on top of the rendered prompt + budget, so a tight max_tokens that
+        # exactly fills context_len can still trip the length check. The
+        # value was bumped from 1 to 2 to accommodate the GPT-OSS path.
         max_tokens -= 2
 
         # Get parameters with defaults
@@ -1389,7 +1454,7 @@ class ResponsesRequest(BaseModel):
             "top_p": top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
-            "stop": self.stop,
+            "stop": self.stop if stop is None else stop,
             "top_k": self.top_k,
             "min_p": self.min_p,
             "repetition_penalty": self.repetition_penalty,
@@ -1399,6 +1464,32 @@ class ResponsesRequest(BaseModel):
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        has_existing_constraints = (
+            params.get("regex")
+            or params.get("ebnf")
+            or params.get("structural_tag")
+            or params.get("json_schema")
+        )
+        if tool_call_constraint and has_existing_constraints:
+            # Refuse the request rather than silently dropping the tool-call
+            # grammar: leaving the user-supplied constraint active while the
+            # tool-call constraint is never installed would silently disable
+            # tool calling and the caller would never know.
+            raise ValueError(
+                "Cannot combine tool calls with constrained decoding "
+                "(regex / ebnf / structural_tag / json_schema). Remove one."
+            )
+        if tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type in ("structural_tag", "json_schema"):
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                    if hasattr(constraint_value, "model_dump")
+                    else constraint_value
+                )
+            else:
+                params[constraint_type] = constraint_value
 
         return params
 
