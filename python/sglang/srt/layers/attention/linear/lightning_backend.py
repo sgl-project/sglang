@@ -1,6 +1,5 @@
 import logging
 import math
-from typing import Optional, Union
 
 import torch
 
@@ -12,9 +11,8 @@ from sglang.srt.layers.attention.linear.lightning_attn import (
 from sglang.srt.layers.attention.linear.linear_metadata import BailingLinearMetadata
 from sglang.srt.layers.attention.linear.seg_la import SegLaMeta, seg_la_fwd
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +65,7 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             f"linear_backend for linear attention in hybrid_linear_backend: {self.linear_backend}"
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = BailingLinearMetadata.prepare_mixed(
             metadata.query_start_loc,
@@ -75,35 +73,33 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
-        )
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
+        Dispatches to ``_capture_metadata`` / ``_replay_metadata`` -- see
+        ``MambaAttnBackendBase.init_forward_data_out_graph`` for the rationale
+        (capture-time placeholders vs replay-time real data + padding). Wraps
+        the resulting base ForwardMetadata with ``BailingLinearMetadata.prepare_decode``.
+        """
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
         self.forward_metadata = BailingLinearMetadata.prepare_decode(
             metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
         )
