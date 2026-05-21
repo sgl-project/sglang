@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.perturb import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.utils import WarmupGate
-from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
+from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -33,14 +33,14 @@ class PerturbManager:
         config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
-        pump_and_allreduce: PumpAndAllreduce,
+        violation_pump: ViolationSignalPump,
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
         self._radix_cache: Optional["BasePrefixCache"] = None
         self._warmup_gate = WarmupGate(
-            config=config, pump_and_allreduce=pump_and_allreduce
+            config=config, violation_pump=violation_pump
         )
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:

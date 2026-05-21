@@ -21,7 +21,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
+from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
     until server shutdown. The runner itself is a thin facade; per-concern state and behavior
-    live on the component classes (PumpAndAllreduce, SweepOrchestrator, ViolationReporter,
+    live on the component classes (ViolationSignalPump, SweepOrchestrator, ViolationReporter,
     PerturbManager, PerForwardOrchestrator, KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger).
     """
@@ -83,7 +83,7 @@ class CanaryRunner:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
-        self._pump_and_allreduce = PumpAndAllreduce(
+        self._violation_pump = ViolationSignalPump(
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
@@ -97,18 +97,18 @@ class CanaryRunner:
             req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
             sweep_verify_capacity=launch_capacities.sweep_verify_capacity,
-            pump_and_allreduce=self._pump_and_allreduce,
+            violation_pump=self._violation_pump,
         )
         self._violation_reporter = ViolationReporter(
             config=config,
             device_state=self._device_state,
-            pump_and_allreduce=self._pump_and_allreduce,
+            violation_pump=self._violation_pump,
         )
         self._perturb_manager = PerturbManager(
             config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
-            pump_and_allreduce=self._pump_and_allreduce,
+            violation_pump=self._violation_pump,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,
@@ -129,14 +129,14 @@ class CanaryRunner:
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            pump_and_allreduce=self._pump_and_allreduce,
+            violation_pump=self._violation_pump,
             d2h_stream=self._d2h_stream,
         )
         self._stats_logger = PeriodicCanaryStatsLogger(
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            pump_and_allreduce=self._pump_and_allreduce,
+            violation_pump=self._violation_pump,
             sweep_orchestrator=self._sweep_orchestrator,
             d2h_stream=self._d2h_stream,
         )
@@ -188,7 +188,7 @@ class CanaryRunner:
 
         self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
-        any_rank_errored = self._pump_and_allreduce.pump_and_drain()
+        any_rank_errored = self._violation_pump.pump_and_drain()
         self._health_checker.step()
         self._stats_logger.step()
 

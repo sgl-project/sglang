@@ -8,7 +8,7 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
-from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
+from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +27,15 @@ class WarmupGate:
         self,
         *,
         config: PerturbConfig,
-        pump_and_allreduce: PumpAndAllreduce,
+        violation_pump: ViolationSignalPump,
     ) -> None:
         self._config = config
-        self._pump_and_allreduce = pump_and_allreduce
+        self._violation_pump = violation_pump
         self._warmup_disable_logged: bool = False
         self._warmup_enable_logged: bool = False
 
     def is_in_warmup(self) -> bool:
-        step = self._pump_and_allreduce.step_counter
+        step = self._violation_pump.step_counter
         warmup_steps = self._config.warmup_steps
 
         if step < warmup_steps:

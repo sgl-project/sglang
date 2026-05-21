@@ -15,7 +15,7 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_sweep,
 )
-from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
+from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
@@ -44,7 +44,7 @@ class SweepOrchestrator:
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
         sweep_verify_capacity: int,
-        pump_and_allreduce: PumpAndAllreduce,
+        violation_pump: ViolationSignalPump,
     ) -> None:
         self._config = config
         self._device_state = device_state
@@ -52,7 +52,7 @@ class SweepOrchestrator:
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._pump_and_allreduce = pump_and_allreduce
+        self._violation_pump = violation_pump
         self._radix_cache: Optional["BasePrefixCache"] = None
 
         self._verify_plan_sweep_radix = VerifyPlan.allocate(
@@ -73,7 +73,7 @@ class SweepOrchestrator:
     def maybe_run_sweep(self) -> None:
         if self._config.sweep_interval == 0:
             return
-        step_counter = self._pump_and_allreduce.step_counter
+        step_counter = self._violation_pump.step_counter
         if (
             self._last_sweep_step >= 0
             and step_counter - self._last_sweep_step < self._config.sweep_interval

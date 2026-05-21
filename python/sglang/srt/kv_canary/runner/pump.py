@@ -9,7 +9,7 @@ from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 
-class PumpAndAllreduce:
+class ViolationSignalPump:
     def __init__(
         self,
         *,
