@@ -1,7 +1,7 @@
 """Perturb point (a): flip the req_to_token pointer of a currently-active req.
 
 The hook picks a random (req_pool_idx, position, value) from active reqs and
-overwrites table[req_pool_idx, position] with another active req's slot id.
+overwrites req_to_token[req_pool_idx, position] with another active req's slot id.
 KV bytes are not touched.
 
 Modeled after the bug class: req_to_token bookkeeping (out_cache_loc updates,
