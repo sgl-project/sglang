@@ -237,6 +237,17 @@ class OpenAIServingChat(OpenAIServingBase):
         # Values: "dsv32", "dsv4", or None.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
+        # OpenAI-chat analogue of #25265: skip add_special_tokens=False when
+        # the tokenizer doesn't auto-add specials (e.g. Kimi) so the encode
+        # stays on the fast internal path.
+        try:
+            self._tokenizer_auto_adds_specials = (
+                len(self.tokenizer_manager.tokenizer.encode("")) > 0
+            )
+        except Exception:
+            self._tokenizer_auto_adds_specials = True
+
+
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
@@ -661,10 +672,15 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
-            # Split apply_chat_template(tokenize=True) into render-only and
-            # encode-only so /metrics can attribute time to each. Mirrors what
-            # HF does internally: chat templates already include role/special
-            # tokens, so the follow-up encode uses add_special_tokens=False.
+            # Split apply_chat_template(tokenize=True) into render and encode so
+            # /metrics can attribute time to each, and so we can skip
+            # add_special_tokens=False on tokenizers that don't auto-add
+            # specials (Kimi-like, OpenAI-chat analogue of #25265).
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
             chat_template_render_duration: Optional[float] = None
             chat_template_encode_duration: Optional[float] = None
             try:
@@ -679,7 +695,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 _t1 = time.perf_counter()
                 prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                    rendered_prompt, add_special_tokens=False
+                    rendered_prompt, **encode_kwargs
                 )
                 _t2 = time.perf_counter()
                 chat_template_render_duration = _t1 - _t0
@@ -706,7 +722,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     )
                     _t1 = time.perf_counter()
                     prompt_ids = self.tokenizer_manager.tokenizer.encode(
-                        rendered_prompt, add_special_tokens=False
+                        rendered_prompt, **encode_kwargs
                     )
                     _t2 = time.perf_counter()
                     chat_template_render_duration = _t1 - _t0
