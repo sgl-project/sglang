@@ -29,6 +29,21 @@ def _device_name_for_config_key() -> str:
     return _DEVICE_NAME_CACHED
 
 
+_CONFIG_DIR_CACHED: Optional[str] = None
+
+
+def _resolved_config_dir() -> str:
+    """PCG / Dynamo compatibility: resolve the config dir once and cache the
+    result. ``os.path.realpath`` / ``os.environ.get`` reach into OS state that
+    Dynamo refuses to trace under fullgraph; a cached string is fine."""
+    global _CONFIG_DIR_CACHED
+    if _CONFIG_DIR_CACHED is None:
+        _CONFIG_DIR_CACHED = os.environ.get(
+            "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
+        )
+    return _CONFIG_DIR_CACHED
+
+
 def get_config_file_name(
     E: int,
     N: int,
@@ -47,7 +62,9 @@ def get_config_file_name(
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
 
 
-@functools.lru_cache
+_MOE_CONFIG_CACHE: Dict[Tuple, Optional[Dict[int, Any]]] = {}
+
+
 def get_moe_configs(
     E: int,
     N: int,
@@ -60,11 +77,34 @@ def get_moe_configs(
     """
     Return optimized configurations for the fused MoE kernel.
 
-    The return value will be a dictionary that maps an irregular grid of
-    batch sizes to configurations of the fused_moe kernel. To evaluate the
-    kernel on a given batch size bs, the closest batch size in the grid should
-    be picked and the associated configuration chosen to invoke the kernel.
+    Module-level dict cache (instead of @functools.lru_cache) so Dynamo can
+    follow the cache-hit path under fullgraph. The first call for a given
+    (E, N, ...) tuple computes via filesystem I/O (untraceable); subsequent
+    calls hit the cache and Dynamo traces the dict lookup as a plain Python
+    op. PCG warmup_compile (which runs outside the captured region) primes
+    the cache before capture so capture traces only see cache hits.
     """
+    key = (E, N, dtype, block_n, block_k, per_channel_quant, down_moe)
+    if key in _MOE_CONFIG_CACHE:
+        return _MOE_CONFIG_CACHE[key]
+    result = _compute_moe_configs(
+        E, N, dtype, block_n, block_k, per_channel_quant, down_moe
+    )
+    _MOE_CONFIG_CACHE[key] = result
+    return result
+
+
+def _compute_moe_configs(
+    E: int,
+    N: int,
+    dtype: Optional[str],
+    block_n: Optional[int] = 0,
+    block_k: Optional[int] = 0,
+    per_channel_quant: bool = False,
+    down_moe: bool = False,
+) -> Optional[Dict[int, Any]]:
+    """Original get_moe_configs body — filesystem I/O. Don't call from
+    inside the captured PCG region; call via the cached get_moe_configs."""
     if get_global_server_args().enable_deterministic_inference:
         logger.warning(
             "Deterministic inference is enabled, using default MoE kernel config."
@@ -84,9 +124,10 @@ def get_moe_configs(
 
     # We found that using the fused_moe_kernel config from Triton 3.1.0 with Triton 3.2.0 results in negative performance gains,
     # so we also include the Triton version as a key for finding the fused_moe_kernel config to achieve the best performance.
-    config_dir = os.environ.get(
-        "SGLANG_MOE_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
-    )
+    # PCG / Dynamo: cache the resolved config_dir at module level so
+    # `os.path.realpath(__file__)` (which Dynamo refuses to trace) only runs
+    # the first time. Cached string read is trace-friendly.
+    config_dir = _resolved_config_dir()
 
     triton_version = triton.__version__
     version_dir = f"triton_{triton_version.replace('.', '_')}"

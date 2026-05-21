@@ -54,6 +54,21 @@ def _device_name_for_config_key() -> str:
     return _DEVICE_NAME_CACHED
 
 
+_CONFIG_DIR_CACHED: Optional[str] = None
+
+
+def _resolved_config_dir() -> str:
+    """PCG / Dynamo compatibility: resolve the config dir once and cache the
+    result. ``os.path.realpath`` / ``os.environ.get`` reach into OS state that
+    Dynamo refuses to trace under fullgraph; a cached string is fine."""
+    global _CONFIG_DIR_CACHED
+    if _CONFIG_DIR_CACHED is None:
+        _CONFIG_DIR_CACHED = os.environ.get(
+            "SGLANG_LORA_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
+        )
+    return _CONFIG_DIR_CACHED
+
+
 def get_lora_config_file_name(
     kernel: str,
     K: int,
@@ -72,7 +87,9 @@ def get_lora_config_file_name(
     return f"lora_{kernel},K={K},R={R},S={S},device={device_name}.json"
 
 
-@functools.lru_cache
+_LORA_CONFIG_CACHE: Dict[tuple, Optional[Dict[int, Dict[str, Any]]]] = {}
+
+
 def get_lora_configs(
     kernel: str,
     K: int,
@@ -81,14 +98,27 @@ def get_lora_configs(
 ) -> Optional[Dict[int, Dict[str, Any]]]:
     """Load pre-tuned LoRA kernel configs from JSON files.
 
-    Returns a dict mapping chunk_size (BLOCK_M) to block size configs,
-    or None if no config file is found.
+    Module-level dict cache so Dynamo can trace the cache-hit path under PCG
+    fullgraph. Same pattern as fused_moe_triton_config.get_moe_configs.
     """
+    key = (kernel, K, R, S)
+    if key in _LORA_CONFIG_CACHE:
+        return _LORA_CONFIG_CACHE[key]
+    result = _compute_lora_configs(kernel, K, R, S)
+    _LORA_CONFIG_CACHE[key] = result
+    return result
+
+
+def _compute_lora_configs(
+    kernel: str,
+    K: int,
+    R: int,
+    S: int,
+) -> Optional[Dict[int, Dict[str, Any]]]:
+    """Original get_lora_configs body — filesystem I/O."""
     json_file_name = get_lora_config_file_name(kernel, K, R, S)
 
-    config_dir = os.environ.get(
-        "SGLANG_LORA_CONFIG_DIR", os.path.dirname(os.path.realpath(__file__))
-    )
+    config_dir = _resolved_config_dir()
     configs_root = os.path.join(config_dir, "csgmv_configs")
 
     triton_version = triton.__version__
