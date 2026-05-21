@@ -846,6 +846,8 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Normalize distributed init config before any single-node fast paths.
+        self._handle_dist_init_addr()
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
@@ -1088,6 +1090,31 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
+
+    def _handle_dist_init_addr(self):
+        if self.nnodes < 1:
+            raise ValueError("--nnodes must be at least 1.")
+        if self.node_rank < 0:
+            raise ValueError("--node-rank must be non-negative.")
+        if self.node_rank >= self.nnodes:
+            raise ValueError(
+                f"--node-rank ({self.node_rank}) must be smaller than --nnodes ({self.nnodes})."
+            )
+
+        if self.nnodes == 1:
+            if self.dist_init_addr is not None:
+                logger.warning(
+                    "--dist-init-addr is ignored when --nnodes=1. "
+                    "Using a local distributed init address instead."
+                )
+                self.dist_init_addr = None
+            return
+
+        if self.dist_init_addr is None:
+            raise ValueError("--dist-init-addr is required when --nnodes > 1.")
+
+        # Validate the user-provided address eagerly to fail before model loading.
+        NetworkAddress.parse(self.dist_init_addr)
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -7536,7 +7563,7 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
-            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+            if server_args.dist_init_addr is None:
                 na = NetworkAddress("127.0.0.1", server_args.port + ZMQ_TCP_PORT_DELTA)
             else:
                 na = NetworkAddress.parse(server_args.dist_init_addr)

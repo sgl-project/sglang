@@ -34,6 +34,17 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_prepare_server_args_ignores_dist_init_addr_on_single_node(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dist-init-addr",
+                "10.0.0.1:25000",
+            ]
+        )
+        self.assertIsNone(server_args.dist_init_addr)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
@@ -148,7 +159,7 @@ class TestPortArgs(unittest.TestCase):
         server_args.port = 30000
         server_args.nccl_port = None
         server_args.enable_dp_attention = True
-        server_args.nnodes = 1
+        server_args.nnodes = 2
         server_args.dist_init_addr = "192.168.1.1:25000"
 
         worker_ports = [25006, 25007, 25008, 25009]
