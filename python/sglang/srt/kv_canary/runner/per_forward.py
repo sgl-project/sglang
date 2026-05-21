@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+
 class PerForwardOrchestrator:
     """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
     capture boundary:
