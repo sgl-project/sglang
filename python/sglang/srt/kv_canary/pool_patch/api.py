@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Callable, Dict, Type
 
 import torch
@@ -15,6 +16,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+logger = logging.getLogger(__name__)
 
 PoolAttacher = Callable[..., tuple[CanaryBufferGroup, ...]]
 
@@ -52,4 +55,13 @@ def attach_canary_buffers(
         )
 
     read_bytes = resolve_read_bytes(config)
-    return attacher(pool=pool, device=device, read_bytes=read_bytes)
+    groups = attacher(pool=pool, device=device, read_bytes=read_bytes)
+    logger.info(
+        "attach_canary_buffers: pool=%s attacher=%s read_bytes=%d n_groups=%d kinds=%s",
+        type(pool).__name__,
+        attacher.__name__,
+        read_bytes,
+        len(groups),
+        [g.kind.name for g in groups],
+    )
+    return groups
