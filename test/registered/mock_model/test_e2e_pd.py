@@ -5,11 +5,14 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import ClassVar, Dict, List, Optional
 
 import requests
+
+from utils import MOCK_MODEL_PATH, mock_model_server_args
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -22,25 +25,9 @@ register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 # canary e2e test. The canary kernel must run inside the cuda graph alongside
 # the real attn kernel; disabling the graph silently bypasses the only path
 # that exercises that invariant end-to-end.
-_MODEL = "Qwen/Qwen3-0.6B"
-
-_MOCK_PD_COMMON_ARGS: List[str] = [
-    "--load-format",
-    "dummy",
-    "--json-model-override-args",
-    '{"num_hidden_layers": 1}',
-    "--sampling-backend",
-    "token_oracle",
-    "--kv-canary",
-    "raise",
-]
-
-_DEFAULT_PROMPTS: List[str] = [
-    "Hello world",
-    "The quick brown fox jumps over the lazy dog",
-    "Explain in one sentence what a transformer is.",
-    "1 + 1 =",
-]
+_NUM_PROMPTS = 8
+_INPUT_LEN = 6144
+_OUTPUT_LEN = 1024
 
 
 def _send_parallel_requests(
@@ -52,9 +39,8 @@ def _send_parallel_requests(
     max_workers: int = 16,
 ) -> List[Dict[str, object]]:
     def _one(i: int) -> Dict[str, object]:
-        prompt = _DEFAULT_PROMPTS[i % len(_DEFAULT_PROMPTS)]
         payload = {
-            "text": f"{prompt} {i}",
+            "input_ids": _make_input_ids(seed=i, length=_INPUT_LEN),
             "sampling_params": {"max_new_tokens": max_new_tokens, "temperature": 0.0},
         }
         try:
@@ -70,6 +56,10 @@ def _send_parallel_requests(
             results.append(fut.result())
     results.sort(key=lambda r: r["index"])
     return results
+
+
+def _make_input_ids(*, seed: int, length: int) -> List[int]:
+    return [((seed + i) % 2048) + 1 for i in range(length)]
 
 
 def _tee_stream(src: object, sinks: List[object]) -> None:
@@ -126,16 +116,78 @@ def _popen_pd_with_capture(
 
 
 class _MockModelPDBase(PDDisaggregationServerBase):
-    model: ClassVar[str] = _MODEL
-    extra_prefill_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS
-    extra_decode_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS
+    model: ClassVar[str] = MOCK_MODEL_PATH
+    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args()
+    extra_decode_args: ClassVar[List[str]] = mock_model_server_args()
+    _stdout_bufs: ClassVar[List[io.StringIO]]
+    _stderr_bufs: ClassVar[List[io.StringIO]]
 
     @classmethod
     def setUpClass(cls) -> None:
         os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
         os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
+        cls._stdout_bufs = []
+        cls._stderr_bufs = []
         super().setUpClass()
         cls.launch_all()
+
+    @classmethod
+    def start_prefill(cls) -> None:
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+        ] + list(cls.extra_prefill_args)
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = cls._popen_with_capture(cls.prefill_url, prefill_args)
+
+    @classmethod
+    def start_decode(cls) -> None:
+        decode_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "decode",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp",
+            "1",
+            "--base-gpu-id",
+            "1",
+        ] + list(cls.extra_decode_args)
+        decode_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_decode = cls._popen_with_capture(cls.decode_url, decode_args)
+
+    @classmethod
+    def _popen_with_capture(
+        cls, base_url: str, other_args: List[str]
+    ) -> subprocess.Popen:
+        stdout_buf = io.StringIO()
+        stderr_buf = io.StringIO()
+        cls._stdout_bufs.append(stdout_buf)
+        cls._stderr_bufs.append(stderr_buf)
+        env = {
+            "SGLANG_KV_CANARY_INPUT_CHECK": "1",
+            "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
+        }
+        return _popen_pd_with_capture(
+            cls.model,
+            base_url,
+            other_args,
+            env,
+            stdout_buf,
+            stderr_buf,
+        )
+
+    def assert_no_canary_violation(self) -> None:
+        time.sleep(2)
+        log_text = "".join(buf.getvalue() for buf in self._stdout_bufs) + "".join(
+            buf.getvalue() for buf in self._stderr_bufs
+        )
+        self.assertNotIn("kv_canary violation:", log_text)
 
 
 class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
@@ -144,7 +196,11 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
     def test_pd_transfer_canary_clean(self) -> None:
         # Step 1: send parallel requests through the LB to exercise PD transfer path.
         results = _send_parallel_requests(
-            self.lb_url, n=16, max_new_tokens=32, timeout=60.0
+            self.lb_url,
+            n=_NUM_PROMPTS,
+            max_new_tokens=_OUTPUT_LEN,
+            timeout=240.0,
+            max_workers=_NUM_PROMPTS,
         )
 
         # Step 2: every request must complete with status 200.
@@ -154,28 +210,33 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
         # Step 3: servers must stay alive.
         self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
+        self.assert_no_canary_violation()
 
 
 class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 
-    extra_prefill_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS + [
+    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
         "1",
-    ]
-    extra_decode_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS + [
+    )
+    extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
         "1",
-    ]
+    )
 
     def test_pd_transfer_checksum_full_real_data(self) -> None:
         # Step 1: drive traffic through the PD path with full real-KV hashing.
         results = _send_parallel_requests(
-            self.lb_url, n=16, max_new_tokens=32, timeout=60.0
+            self.lb_url,
+            n=_NUM_PROMPTS,
+            max_new_tokens=_OUTPUT_LEN,
+            timeout=240.0,
+            max_workers=_NUM_PROMPTS,
         )
 
         # Step 2: all requests must succeed.
@@ -185,6 +246,7 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
         # Step 3: servers must stay healthy.
         self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
+        self.assert_no_canary_violation()
 
 
 if __name__ == "__main__":
