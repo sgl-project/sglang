@@ -340,24 +340,16 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    # NOTE: used by v2 compressor backend
-    def get_state_pool(
-        self,
-        forward_batch: ForwardBatch,
-        attn_backend: AttentionBackend,
-    ) -> CompressStatePool:
+    def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
         token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
             ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
-    # NOTE: used by v2 compressor backend
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
@@ -375,7 +367,7 @@ class Compressor(nn.Module):
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: Optional[AttentionBackend] = None,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
@@ -383,17 +375,10 @@ class Compressor(nn.Module):
 
         kv_score = self.compute_kv_score(x, forward_batch)
 
-        backend = attn_backend
-        if backend is None:
-            raise RuntimeError(
-                "Compressor.forward needs an attn_backend argument now that "
-                "ForwardBatch no longer carries attn_backend."
-            )
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self.get_state_pool(forward_batch, attn_backend=backend)
-        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
-        return backend.forward_compress(
+            assert isinstance(attn_backend, DeepseekV4AttnBackend)
+        kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
+        return attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
             ape=self.ape.view(-1, self.head_dim),

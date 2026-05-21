@@ -23,9 +23,6 @@ class HybridAttnBackend(AttentionBackend):
         self.prefill_backend = prefill_backend
         self.decode_backend = decode_backend
         self.data_type = model_runner.kv_cache_dtype
-        # Pool refs — captured at construction so ``get_token_to_kv_pool()`` /
-        # ``get_req_to_token_pool()`` resolve correctly when a ForwardContext
-        # publishes the hybrid dispatcher itself (Pattern A invariant).
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token_pool = model_runner.req_to_token_pool
 

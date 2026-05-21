@@ -126,13 +126,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
-        # Pool refs — captured at construction so they survive deletion of the
-        # corresponding ForwardBatch fields. See step02 plan in
-        # attention/02-pool-out-of-forward-batch.md.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-
-        # Store multi-item scoring flag for efficient access
         self.enable_mis = model_runner.server_args.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer

@@ -54,13 +54,9 @@ def execute_overlapped_operations(
     assert delta_stage_a == 0
     delta_stage = delta_stage_b
 
-    # If the active backend is a TBO dispatcher, each child sub-batch must
-    # execute against its own per-child backend (children[i] has metadata
-    # init'd for sub-batch i; the parent's primary has metadata for the full
-    # pre-split batch). Pre-PR, this was carried on forward_batch.attn_backend
-    # per child; under ForwardContext we wrap each executor.next() with a
-    # `replace(get_forward_context(), attn_backend=children[i])` context so
-    # downstream get_attn_backend() reads resolve to the right child.
+    # Each TBO child sub-batch dispatches against its own per-child backend
+    # (children[i] has metadata init'd for sub-batch i; the parent's primary
+    # has metadata for the full pre-split batch).
     child_ctx_a, child_ctx_b = _resolve_tbo_child_contexts()
 
     stages_a = _convert_operations_to_stages(operations_a)

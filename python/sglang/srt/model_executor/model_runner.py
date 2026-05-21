@@ -3235,22 +3235,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Publish this runner's ``self.attn_backend`` for the duration of the
-        # forward so that ``get_attn_backend()`` / ``get_token_to_kv_pool()``
-        # / ``get_req_to_token_pool()`` resolve to the right objects regardless
-        # of which other ModelRunner instances have been initialized in this
-        # process. Pool refs are derived from ``attn_backend.*`` (Pattern A
-        # invariant — every backend caches both pools at construction).
-        #
-        # If the caller has already published a ForwardContext (e.g. spec
-        # workers wrapping the per-step draft forward with the i-th child
-        # backend), honor it — overriding would defeat the per-call control.
+        # Honor an outer-published context (spec workers wrap each per-step
+        # draft forward with the i-th child backend); otherwise publish this
+        # runner's own attn_backend for the forward.
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
             ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
         with ctx_mgr:
-            # Check whether can run cuda graph
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph
                 if self.device == "cpu"

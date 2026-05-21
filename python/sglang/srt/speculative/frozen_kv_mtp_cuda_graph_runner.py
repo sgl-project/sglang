@@ -281,10 +281,6 @@ class FrozenKVMTPCudaGraphRunner:
             capture_hidden_mode=CaptureHiddenMode.LAST,
         )
 
-        self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
-            forward_batch
-        )
-
         def run_once():
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
@@ -304,17 +300,19 @@ class FrozenKVMTPCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        self.deepep_adapter.capture(is_extend_in_batch=False)
-        # Frozen-KV MTP graph capture: swap the draft backend's token_to_kv_pool
-        # to the frozen target pool and publish the draft backend into the active
-        # ForwardContext for the duration of the capture. The single backend-attr
-        # swap is seen by both readers — ``get_token_to_kv_pool()`` (it resolves
-        # through ``get_attn_backend()``) and the backend's own pool reads.
+        # Swap the draft backend's token_to_kv_pool to the frozen target pool
+        # for the capture; the single backend-attr swap is seen by both
+        # ``get_token_to_kv_pool()`` (via ``get_attn_backend()``) and the
+        # backend's own reads.
         target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
         try:
             with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+                self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
+                    forward_batch
+                )
+                self.deepep_adapter.capture(is_extend_in_batch=False)
                 self._capture_init(run_once)
                 out = self._capture_graph(
                     graph, get_global_graph_memory_pool(), stream, run_once

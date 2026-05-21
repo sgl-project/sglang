@@ -691,20 +691,18 @@ class CPUGraphRunner:
             num_token_non_padded=self.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
         )
-        self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            None,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
-        )
-        # Do infernence to avoid setting attr at runtime, e.g.,
-        # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
+            self.model_runner.attn_backend.init_forward_metadata_capture_cpu_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                None,
+                forward_batch.forward_mode,
+                forward_batch.spec_info,
+            )
             with torch.no_grad():
                 self.model_runner.tp_group.barrier()
                 self.model_runner.model.forward(

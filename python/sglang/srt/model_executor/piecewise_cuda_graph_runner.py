@@ -584,11 +584,8 @@ class PiecewiseCudaGraphRunner:
                 lora_ids=None,
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
-        # Publish attn_backend into the ForwardContext for the full capture
-        # lifecycle. Setup hooks that read get_attn_backend() — notably
-        # TboForwardBatchPreparer.prepare_raw invoked by
-        # self.tbo_plugin.capture_one_batch_size below — must see the same
-        # backend that warmup/capture do. Restored on exit (incl. errors).
+        # Setup hooks below read get_attn_backend() and must run inside the
+        # same ForwardContext as the warmup/capture forward.
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):

@@ -463,9 +463,9 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                # forward_context is already active here — set by the outer
-                # ModelRunner._forward_raw whose body called replay. Don't
-                # re-wrap; doing so would clobber PDmux per-stream overrides.
+                # No forward_context wrap here: replay is called from
+                # ModelRunner._forward_raw which has already published one,
+                # and re-wrapping would clobber PDmux per-stream overrides.
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
                 with set_forward_context(
                     static_forward_batch,

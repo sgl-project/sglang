@@ -1038,9 +1038,8 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
 
-        # HiSparse: trip the coordinator so the hisparse code path is captured
-        # into the graph. Backends read self.model_runner.hisparse_coordinator
-        # directly now.
+        # Trip the coordinator so the hisparse code path is captured into the
+        # graph; backends read it from self.model_runner.hisparse_coordinator.
         hisparse_coordinator = self.model_runner.hisparse_coordinator
         if hisparse_coordinator is not None:
             hisparse_coordinator.num_real_reqs.fill_(bs)
@@ -1048,19 +1047,15 @@ class CudaGraphRunner:
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
-        # Publish the (possibly per-stream) attn_backend into the active
-        # ForwardContext for the full capture lifecycle. Setup hooks that
-        # read get_attn_backend() — notably TboForwardBatchPreparer.prepare_raw
-        # invoked by self.tbo_plugin.capture_one_batch_size below, and the
-        # DeepEP adapter — must see the same backend that warmup/capture do.
-        # Restored on exit (incl. errors).
+        # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
+        # DeepEP adapter, …) so they must run inside the same ForwardContext
+        # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            # Attention backend
             attn_backend.init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -1071,14 +1066,13 @@ class CudaGraphRunner:
                 forward_batch.spec_info,
             )
 
-            # Run and capture
             def run_once():
-                # Without this, warmup-1 caches the translation; the capture run gets
-                # a hit, skips the gather, and replay reuses stale SWA locations.
+                # Without this, warmup-1 caches the translation; the capture
+                # run hits the cache, skips the gather, and replay reuses
+                # stale SWA locations.
                 if self.model_runner.is_hybrid_swa:
                     self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
-                # Clean intermediate result cache for DP attention
                 forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
                     None
                 )
