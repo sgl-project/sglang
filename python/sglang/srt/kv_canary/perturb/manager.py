@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 class PerturbManager:
     """Thin orchestrator that owns the per-canary-runner state (config, buffer groups,
     req-to-token pool, radix cache handle, warmup gate) and dispatches each per-forward
-    invocation to the three perturb-point modules.
+    invocation to the four perturb-point modules.
 
     Per-perturb logic lives in :mod:`sglang.srt.kv_canary.perturb.req_to_token`,
     :mod:`...perturb.real_kv_used`, :mod:`...perturb.real_kv_unused_cache`,
