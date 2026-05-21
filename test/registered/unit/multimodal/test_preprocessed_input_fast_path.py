@@ -284,6 +284,45 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertEqual(tuple(mrope_positions.shape), (3, len(input_ids)))
         self.assertEqual(tuple(mrope_delta.shape), (1, 1))
 
+    def test_qwen_image_only_mrope_offset_fast_path_matches_generic(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.hf_config = SimpleNamespace(
+            vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=None)
+        )
+        processor.mm_tokens = SimpleNamespace(image_token_id=42, video_token_id=43)
+        processor.vision_start_token_id = 11
+        processor.model_type = "qwen3_5"
+
+        mm_items = []
+        for offset, grid in (
+            ((1, 4), torch.tensor([[1, 4, 4]])),
+            ((7, 15), torch.tensor([[1, 6, 6]])),
+        ):
+            mm_items.append(
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[offset],
+                    model_specific_data={"image_grid_thw": grid},
+                )
+            )
+
+        input_ids = [11, 42, 42, 42, 42, 12, 11] + [42] * 9 + [12]
+        generic_positions, generic_delta = processor.compute_mrope_positions(
+            input_ids, mm_items
+        )
+        (
+            fast_positions,
+            fast_delta,
+        ) = processor._compute_image_only_mrope_positions_from_offsets(
+            input_len=len(input_ids),
+            mm_items=mm_items,
+            dtype=torch.long,
+            device=torch.device("cpu"),
+        )
+
+        self.assertTrue(torch.equal(fast_positions.squeeze(1), generic_positions))
+        self.assertTrue(torch.equal(fast_delta, generic_delta))
+
 
 if __name__ == "__main__":
     unittest.main()

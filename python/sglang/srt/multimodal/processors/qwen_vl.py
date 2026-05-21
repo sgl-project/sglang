@@ -2,7 +2,7 @@ import math
 import os
 import re
 import time
-from typing import List, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import torch
@@ -395,6 +395,98 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    def _compute_image_only_mrope_positions_from_offsets(
+        self,
+        input_len: int,
+        mm_items: List[MultimodalDataItem],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        if self.model_type not in (
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "intern_s2_preview",
+        ):
+            return None
+
+        image_items = [item for item in mm_items if item.is_image()]
+        if not image_items or len(image_items) != len(mm_items):
+            return None
+
+        spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        sorted_items = sorted(image_items, key=lambda item: item.offsets[0][0])
+        position_segments = []
+        st = 0
+        next_pos = 0
+
+        for item in sorted_items:
+            if item.offsets is None or len(item.offsets) != 1:
+                return None
+
+            start, end = item.offsets[0]
+            if start < st or end >= input_len:
+                return None
+
+            text_len = start - st
+            if text_len > 0:
+                position_segments.append(
+                    torch.arange(text_len, dtype=dtype, device=device)
+                    .view(1, -1)
+                    .expand(3, -1)
+                    + next_pos
+                )
+                next_pos += text_len
+
+            grid = self._as_grid_batch(item.model_specific_data.get("image_grid_thw"))
+            if grid is None or grid.shape[0] != 1:
+                return None
+            t, h, w = [int(x) for x in grid[0].tolist()]
+            llm_grid_t = t
+            llm_grid_h = h // spatial_merge_size
+            llm_grid_w = w // spatial_merge_size
+            num_image_tokens = llm_grid_t * llm_grid_h * llm_grid_w
+            if num_image_tokens != end - start + 1:
+                return None
+
+            t_index = (
+                torch.arange(llm_grid_t, dtype=dtype, device=device)
+                .view(-1, 1)
+                .expand(llm_grid_t, llm_grid_h * llm_grid_w)
+                .reshape(-1)
+            )
+            h_index = (
+                torch.arange(llm_grid_h, dtype=dtype, device=device)
+                .view(1, -1, 1)
+                .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                .reshape(-1)
+            )
+            w_index = (
+                torch.arange(llm_grid_w, dtype=dtype, device=device)
+                .view(1, 1, -1)
+                .expand(llm_grid_t, llm_grid_h, llm_grid_w)
+                .reshape(-1)
+            )
+            position_segments.append(
+                torch.stack([t_index, h_index, w_index]) + next_pos
+            )
+            next_pos += max(llm_grid_t, llm_grid_h, llm_grid_w)
+            st = end + 1
+
+        if st < input_len:
+            text_len = input_len - st
+            position_segments.append(
+                torch.arange(text_len, dtype=dtype, device=device)
+                .view(1, -1)
+                .expand(3, -1)
+                + next_pos
+            )
+
+        mrope_positions = torch.cat(position_segments, dim=1).unsqueeze(1)
+        mrope_position_delta = (mrope_positions.max() + 1 - input_len).reshape(1, 1)
+        return mrope_positions, mrope_position_delta
+
     @staticmethod
     def _get_processor_output_value(ret, key):
         if ret is None:
@@ -620,28 +712,43 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             request_obj.video_data,
         )
 
-        mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
-            spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
-            image_token_id=self.mm_tokens.image_token_id,
-            video_token_id=self.mm_tokens.video_token_id,
-            vision_start_token_id=self.vision_start_token_id,
-            model_type=self.model_type,
-            tokens_per_second=getattr(
-                self.hf_config.vision_config, "tokens_per_second", None
-            ),
-            # use the expanded token ids
-            input_ids=input_ids.unsqueeze(0),
-            image_grid_thw=image_grid_thw,
-            video_grid_thw=video_grid_thw,
-            second_per_grid_ts=second_per_grid_ts,
-            use_audio_in_video=False,
-            audio_seqlens=audio_feature_lengths,
-            audio_token_id=getattr(self.hf_config, "audio_token_id", None),
-            audio_start_token_id=self.audio_start_token_id,
-            position_id_per_seconds=getattr(
-                self.hf_config, "position_id_per_seconds", None
-            ),
-        )
+        mrope_result = None
+        if (
+            video_grid_thw is None
+            and second_per_grid_ts is None
+            and audio_feature_lengths is None
+        ):
+            mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+                input_len=len(input_ids_list),
+                mm_items=mm_items,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+        if mrope_result is None:
+            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                image_token_id=self.mm_tokens.image_token_id,
+                video_token_id=self.mm_tokens.video_token_id,
+                vision_start_token_id=self.vision_start_token_id,
+                model_type=self.model_type,
+                tokens_per_second=getattr(
+                    self.hf_config.vision_config, "tokens_per_second", None
+                ),
+                # use the expanded token ids
+                input_ids=input_ids.unsqueeze(0),
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                use_audio_in_video=False,
+                audio_seqlens=audio_feature_lengths,
+                audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+                audio_start_token_id=self.audio_start_token_id,
+                position_id_per_seconds=getattr(
+                    self.hf_config, "position_id_per_seconds", None
+                ),
+            )
+        else:
+            mrope_positions, mrope_position_delta = mrope_result
         mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
         logger.debug(
