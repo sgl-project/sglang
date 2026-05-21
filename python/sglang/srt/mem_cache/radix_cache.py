@@ -28,7 +28,7 @@ import sys
 import time
 from collections import defaultdict
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Iterator, List, Optional, TextIO, Tuple, Union
 
 import torch
 
@@ -550,9 +550,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         req.last_node = new_last_node
 
-    def pretty_print(self):
-        self._print_helper(self.root_node, 0)
-        print(f"#tokens: {self.total_size()}")
+    def pretty_print_to_file(self, f: TextIO) -> None:
+        self._print_helper(self.root_node, 0, f)
+        print(f"#tokens: {self.total_size()}", file=f)
+        print(f"#evictable_size: {self.evictable_size_}", file=f)
+        print(f"#protected_size: {self.protected_size_}", file=f)
+
+    def pretty_print(self) -> None:
+        self.pretty_print_to_file(sys.stdout)
 
     def total_size(self):
         return self._total_size_helper()
@@ -752,7 +757,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._record_store_event(new_node)
         return total_prefix_length
 
-    def _print_helper(self, node: TreeNode, indent: int):
+    def _print_helper(self, node: TreeNode, indent: int, f: TextIO) -> None:
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
         while stack:
@@ -762,6 +767,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 len(current_node.key),
                 current_node.key.token_ids[:10],
                 f"r={current_node.lock_ref}",
+                file=f,
             )
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))

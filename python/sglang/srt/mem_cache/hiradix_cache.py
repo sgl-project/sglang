@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import atexit
-import queue
+import hashlib
 import heapq
+import io
 import json
 import logging
 import os
+import queue
+import sys
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, TextIO
 
 import torch
 
@@ -112,6 +115,8 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
+        self.hicache_sanity_check_interval = server_args.hicache_sanity_check_interval
+        self._hicache_event_round = 0
 
         (
             extra_config,
@@ -1103,6 +1108,7 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
+        self._hicache_event_round += 1
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -1111,6 +1117,10 @@ class HiRadixCache(RadixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+        if self.hicache_sanity_check_interval > 0 and (
+            self._hicache_event_round % self.hicache_sanity_check_interval == 0
+        ):
+            self.sanity_check()
         self._reap_completed_async_work()
 
     @staticmethod

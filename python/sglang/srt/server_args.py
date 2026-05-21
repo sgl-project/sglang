@@ -636,6 +636,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_sanity_check_interval: int = 0
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -5891,6 +5892,12 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
+        parser.add_argument(
+            "--hicache-sanity-check-interval",
+            type=int,
+            default=ServerArgs.hicache_sanity_check_interval,
+            help="Run HiCache PP sanity check every N scheduler rounds.",
+        )
 
         # Hierarchical sparse attention
         parser.add_argument(
@@ -6847,6 +6854,9 @@ class ServerArgs:
 
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
+        assert (
+            self.hicache_sanity_check_interval >= 0
+        ), "hicache_sanity_check_interval must be non-negative"
 
         assert self.moe_dense_tp_size in {
             1,
