@@ -44,6 +44,7 @@ from sglang.srt.utils import (
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
+        DispatchOutput,
         StandardDispatchOutput,
     )
 
@@ -637,10 +638,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_npu(
         self,
         layer: torch.nn.Module,
-        dispatch_output: StandardDispatchOutput,
+        dispatch_output: "DispatchOutput",
     ) -> CombineInput:
 
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+        if DispatchOutputChecker.format_is_deepep(dispatch_output):
+            return self._forward_npu_deepep(layer, dispatch_output)
 
         # x.shape = [B*S, H]
         x = dispatch_output.hidden_states
@@ -718,6 +723,46 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         )
 
         return StandardCombineInput(hidden_states=final_hidden_states)
+
+    def _forward_npu_deepep(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "DispatchOutput",
+    ) -> CombineInput:
+        from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+            npu_fused_moe_without_routing_weights_bf16,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import (
+            DeepEPLLCombineInput,
+            DeepEPNormalCombineInput,
+        )
+        from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutputChecker
+
+        # NOTE: Ascend's Dispatch & Combine does not support FP16
+        output_dtype = torch.bfloat16
+        group_list_type = 1
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            hidden_states, _, _, _, num_recv_tokens_per_expert = dispatch_output
+            group_list = torch.tensor(
+                num_recv_tokens_per_expert,
+                dtype=torch.int64,
+                device=hidden_states.device,
+            )
+            combine_cls = DeepEPNormalCombineInput
+        else:
+            hidden_states, _, _, _, group_list, _ = dispatch_output
+            group_list = group_list.to(torch.int64)
+            combine_cls = DeepEPLLCombineInput
+
+        hidden_states = npu_fused_moe_without_routing_weights_bf16(
+            layer, hidden_states, group_list_type, group_list, output_dtype
+        )
+        return combine_cls(
+            hidden_states=hidden_states,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
