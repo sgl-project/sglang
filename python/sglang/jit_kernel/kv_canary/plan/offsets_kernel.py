@@ -443,4 +443,8 @@ def _plan_write_offsets(
         mask=seed_mask,
     )
 
-    tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
+    write_active_mark = tl.where(
+        (rpi != REQ_POOL_IDX_PADDING) & (write_lens > 0), bs_offs + 1, 0
+    )
+    write_num_valid_reqs = tl.max(write_active_mark, axis=0)
+    tl.store(out_write_num_valid_reqs_ptr, write_num_valid_reqs.to(tl.int32))

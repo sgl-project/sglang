@@ -265,4 +265,11 @@ def _materialize_write_metadata(
             )
         )
 
-    write_plan_out.write_num_valid_reqs.fill_(int(bs))
+    write_num_valid_reqs = 0
+    for r in range(bs):
+        rpi = int(req_pool_indices_host[r].item())
+        extend_len = int(extend_seq_lens_host[r].item())
+        if rpi != 0 and extend_len > 0:
+            write_num_valid_reqs = r + 1
+
+    write_plan_out.write_num_valid_reqs.fill_(int(write_num_valid_reqs))
