@@ -9,12 +9,9 @@ This module contains implementations of prompt encoding stages for diffusion pip
 
 import inspect
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
-from sglang.multimodal_gen.registry import (
-    get_model_info,
-    get_pipeline_config_classes,
-)
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
@@ -36,6 +33,20 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+_NEGATIVE_CACHE_KEY_UNSET = object()
+
+
+@lru_cache(maxsize=1)
+def get_model_default_negative_prompt(
+    model_path: str, backend: Any, model_id: str | None
+):
+    from sglang.multimodal_gen.registry import get_model_info
+
+    model_info = get_model_info(model_path, backend=backend, model_id=model_id)
+    if model_info is None:
+        return None
+    return model_info.sampling_param_cls().negative_prompt
 
 
 @dataclass(frozen=True)
@@ -91,8 +102,6 @@ class TextEncodingStage(PipelineStage):
         self.text_encoders = text_encoders
         self._negative_text_cache_key = None
         self._negative_text_cache_value = None
-        self._default_negative_prompt_key = None
-        self._default_negative_prompt_value = None
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -108,28 +117,48 @@ class TextEncodingStage(PipelineStage):
         ]
 
     def get_or_compute_negative_text_embedding(
-        self, batch: Req, server_args: ServerArgs, all_indices: list[int]
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        all_indices: list[int],
+        negative_cache_key: Any = _NEGATIVE_CACHE_KEY_UNSET,
     ):
-        negative_cache_key = self._build_negative_text_cache_key(
-            batch, server_args, all_indices
-        )
+        """Get the cached text embedding result or compute
+
+           this is a one-slot cache for the model-default negative prompt:
+           most requests don't override the negative prompt, the cache hit rate is considerably high
+        """
+        if negative_cache_key is _NEGATIVE_CACHE_KEY_UNSET:
+            negative_cache_key = self._build_negative_text_cache_key(
+                batch, server_args, all_indices
+            )
         cached_negative = self._get_cached_negative_text_embedding(negative_cache_key)
         if cached_negative is not None:
             return cached_negative
 
+        return self._compute_and_cache_negative_text_embedding(
+            batch, server_args, all_indices, negative_cache_key
+        )
+
+    def _compute_and_cache_negative_text_embedding(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        all_indices: list[int],
+        negative_cache_key,
+    ):
         negative_text_outputs = self.encode_text(
             batch.negative_prompt,
             server_args,
             encoder_index=all_indices,
             return_attention_mask=True,
         )
-        self._cache_negative_text_embedding(negative_cache_key, negative_text_outputs)
+        self._maybe_cache_negative_text_embedding(negative_cache_key, negative_text_outputs)
         return negative_text_outputs
 
     def _should_cache_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
-        """If and only if the reqs use the model-default negative prompt, will the embedding be cached"""
         if not batch.is_warmup:
             return True
         return self._uses_model_default_negative_prompt(batch, server_args)
@@ -141,11 +170,13 @@ class TextEncodingStage(PipelineStage):
             return self._negative_text_cache_value
         return None
 
-    def _cache_negative_text_embedding(
+    def _maybe_cache_negative_text_embedding(
         self,
         negative_cache_key,
         negative_text_outputs,
     ) -> None:
+
+        # skip caching if None
         if negative_cache_key is None:
             return
         self._negative_text_cache_key = negative_cache_key
@@ -156,13 +187,14 @@ class TextEncodingStage(PipelineStage):
     def _build_negative_text_cache_key(
         self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
     ):
+        """if the current req doesn't worth caching, returns None"""
+        # skip if we don't cache for current req
         if not self._should_cache_negative_text_embedding(batch, server_args):
             return None
 
         # Negative text encoding changes when the template or max length changes,
         # even if the visible negative prompt string is the same.
         return (
-            server_args.pipeline_class_name,
             tuple(encoder_indices),
             self.freeze_for_dedup(batch.negative_prompt),
             self.freeze_for_dedup(batch.prompt_template),
@@ -172,7 +204,6 @@ class TextEncodingStage(PipelineStage):
     def _uses_model_default_negative_prompt(
         self, batch: Req, server_args: ServerArgs
     ) -> bool:
-        """Returns if the current Req adopts the model default negative prompts"""
         default_negative_prompt = self._get_model_default_negative_prompt(server_args)
         if default_negative_prompt is None:
             return False
@@ -180,41 +211,12 @@ class TextEncodingStage(PipelineStage):
             batch.negative_prompt
         ) == self._normalize_negative_prompt_for_default_match(default_negative_prompt)
 
-    def _get_model_default_negative_prompt(self, server_args: ServerArgs) -> str:
-        """Get the default negative prompt of this model for caching usage"""
-        model_key = (
-            server_args.pipeline_class_name,
+    def _get_model_default_negative_prompt(self, server_args: ServerArgs) -> str | None:
+        return get_model_default_negative_prompt(
             server_args.model_path,
             server_args.backend,
             server_args.model_id,
         )
-        if self._default_negative_prompt_key == model_key:
-            return self._default_negative_prompt_value
-
-        sampling_params_cls = None
-        if server_args.pipeline_class_name is not None:
-            config_classes = get_pipeline_config_classes(
-                server_args.pipeline_class_name
-            )
-            if config_classes is not None:
-                _, sampling_params_cls = config_classes
-
-        if sampling_params_cls is None:
-            model_info = get_model_info(
-                server_args.model_path,
-                backend=server_args.backend,
-                model_id=server_args.model_id,
-            )
-            if model_info is not None:
-                sampling_params_cls = model_info.sampling_param_cls
-
-        default_negative_prompt = None
-        if sampling_params_cls is not None:
-            default_negative_prompt = sampling_params_cls().negative_prompt
-
-        self._default_negative_prompt_key = model_key
-        self._default_negative_prompt_value = default_negative_prompt
-        return default_negative_prompt
 
     @staticmethod
     def _normalize_negative_prompt_for_default_match(value):
@@ -426,8 +428,6 @@ class TextEncodingStage(PipelineStage):
         # Get max_sequence_length from batch if available
         max_seq_length = getattr(batch, "max_sequence_length", None)
 
-        negative_cache_key = None
-        cached_negative = None
         if batch.do_classifier_free_guidance:
             negative_cache_key = self._build_negative_text_cache_key(
                 batch, server_args, all_indices
@@ -435,8 +435,12 @@ class TextEncodingStage(PipelineStage):
             cached_negative = self._get_cached_negative_text_embedding(
                 negative_cache_key
             )
+        else:
+            negative_cache_key = None
+            cached_negative = None
 
         if cached_negative is not None:
+            # the negative prompt embedding is cached
             (
                 prompt_embeds_list,
                 prompt_masks_list,
@@ -458,6 +462,7 @@ class TextEncodingStage(PipelineStage):
                 neg_seq_lens_list,
             ) = cached_negative
         elif self._should_encode_cfg_text_batch(batch, server_args):
+            # perform pos/neg prompt encoding
             (
                 prompt_embeds_list,
                 prompt_masks_list,
@@ -472,8 +477,7 @@ class TextEncodingStage(PipelineStage):
             ) = self._encode_cfg_text_batch(
                 batch, server_args, prompt_text, all_indices, max_seq_length
             )
-
-            self._cache_negative_text_embedding(
+            self._maybe_cache_negative_text_embedding(
                 negative_cache_key,
                 (
                     neg_embeds_list,
@@ -483,8 +487,8 @@ class TextEncodingStage(PipelineStage):
                     neg_seq_lens_list,
                 ),
             )
-
         else:
+            # only encode the positive prompt
             (
                 prompt_embeds_list,
                 prompt_masks_list,
@@ -505,8 +509,8 @@ class TextEncodingStage(PipelineStage):
                     neg_pooler_embeds_list,
                     neg_embeds_masks_list,
                     neg_seq_lens_list,
-                ) = self.get_or_compute_negative_text_embedding(
-                    batch, server_args, all_indices
+                ) = self._compute_and_cache_negative_text_embedding(
+                    batch, server_args, all_indices, negative_cache_key
                 )
 
         self._append_positive_text_outputs(
