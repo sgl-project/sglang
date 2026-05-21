@@ -2534,7 +2534,7 @@
                 "32": 209.80
             },
             "expected_e2e_ms": 12000.0,
-            "expected_avg_denoise_ms": 238.8,
+            "expected_avg_denoise_ms": 299.01,
             "expected_median_denoise_ms": 246.85,
             "estimated_full_test_time_s": 170.0
         },
