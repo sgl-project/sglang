@@ -198,7 +198,7 @@ class MambaAttnBackendBase(AttentionBackend):
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
             if forward_batch.forward_mode.is_draft_extend_v2():
-                # HybridLinearAttnBackend.init_forward_metadata calls all sub-backends
+                # HybridLinearAttnBackend.init_forward_data calls all sub-backends
                 # unconditionally, but DRAFT_EXTEND_V2 only runs full-attn layers in
                 # the draft model, so mamba metadata can be skipped.
                 query_start_loc = None
@@ -264,7 +264,7 @@ class MambaAttnBackendBase(AttentionBackend):
             has_mamba_track_mask=has_mamba_track_mask,
         )
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
         self.forward_metadata = self._forward_metadata(forward_batch)
 
@@ -390,34 +390,37 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_dst.to(self.device, non_blocking=True),
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        self.forward_metadata = self._capture_metadata(
-            bs, req_pool_indices, forward_mode, spec_info
-        )
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        self.forward_metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
+        Dispatches to ``_capture_metadata`` at capture (no real seq_lens /
+        spec_info data yet) and ``_replay_metadata`` at replay (real data +
+        per-iter padding handling). The two helpers have different bodies
+        because at capture ``seq_lens_cpu`` is uniformly the fill value
+        and ``spec_info`` tensors are None, while at replay both carry real
+        data; merging into a single body would require multiple None-guards.
+
+        Capture is detected via ``get_is_capture_mode()`` (set by the cuda
+        graph runner around its capture context).
+        """
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            self.forward_metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            self.forward_metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
 
     def init_forward_metadata_capture_cpu_graph(
         self,
@@ -670,7 +673,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         assert config is not None
         self.mamba_chunk_size = config.mamba_chunk_size
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         self._execute_deferred_mamba_cow_and_clear(forward_batch)
         metadata = self._forward_metadata(forward_batch)
         self.forward_metadata = Mamba2Metadata.prepare_mixed(
@@ -679,39 +682,33 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             forward_batch,
         )
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
-        self.forward_metadata = Mamba2Metadata.prepare_decode(
-            metadata,
-            seq_lens,
-            is_target_verify=forward_mode.is_target_verify(),
-            draft_token_num=draft_token_num,
-        )
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
+        Dispatches to ``_capture_metadata`` / ``_replay_metadata`` -- see
+        ``MambaAttnBackendBase.init_forward_data_out_graph`` for the rationale
+        (capture-time placeholders vs replay-time real data + padding). Wraps
+        the resulting base ForwardMetadata with ``Mamba2Metadata.prepare_decode``.
+        """
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
             metadata,
@@ -782,9 +779,9 @@ class HybridLinearAttnBackend(AttentionBackend):
         assert layer_id is not None, "either layer or layer_id must be provided"
         return layer_id in self.full_attn_layers
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata(forward_batch)
+            attn_backend.init_forward_data(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
@@ -794,26 +791,16 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cpu_graph_state(max_bs, max_num_tokens)
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
+
+        Merged from old capture/replay variants: both fan out to all
+        sub-backends (full_attn + linear_attn) by forwarding the per-iter
+        prep call. The new contract delegates via each sub-backend's
+        ``init_forward_data_out_graph``.
+        """
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
+            attn_backend.init_forward_data_out_graph(forward_batch)
 
     def init_forward_metadata_capture_cpu_graph(
         self,
@@ -834,29 +821,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 encoder_lens,
                 forward_mode,
                 spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
