@@ -6,6 +6,7 @@ from sgl_kernel_npu.norm.l1_norm import l1_norm
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
 from sglang.srt.layers.moe.topk import StandardTopKOutput, select_experts
+from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 
 if TYPE_CHECKING:
@@ -26,11 +27,22 @@ def fused_topk_npu(
     renormalize = topk_config.renormalize
     correction_bias = topk_config.correction_bias
 
+    _is_deepep_fusion = (
+        topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend()
+    )
+    # When fusion is enabled, only select routed experts from native op;
+    # shared expert column is appended afterwards.
+    k = (
+        topk_config.top_k - topk_config.num_fused_shared_experts
+        if _is_deepep_fusion
+        else topk_config.top_k
+    )
+
     # Fast path: simple top-k without grouped routing and bias
     if not use_grouped_topk and correction_bias is None:
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
             router_logits,
-            k=topk_config.top_k,
+            k=k,
         )
 
         if renormalize:
@@ -49,7 +61,7 @@ def fused_topk_npu(
     ):
         topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
             router_logits.to(torch.float32),
-            k=topk_config.top_k,
+            k=k,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
@@ -80,13 +92,68 @@ def fused_topk_npu(
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
-    if expert_location_dispatch_info is not None:
-        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
-    if (cap := get_global_experts_capturer()) is not None:
-        cap.capture(
-            layer_id=layer_id,
-            topk_indices=topk_ids,
+    # DeepEP fusion post-processing: append shared expert columns, apply
+    # EPLB remap (routed only), then remap to interleaved layout.
+    if _is_deepep_fusion:
+        num_experts = router_logits.shape[-1]
+        n = topk_config.num_fused_shared_experts
+        topk_ids = torch.cat(
+            [
+                topk_ids,
+                topk_ids.new_full((topk_ids.shape[0], n), num_experts),
+            ],
+            dim=-1,
         )
+        topk_weights = torch.cat(
+            [
+                topk_weights,
+                topk_weights.new_full(
+                    (topk_weights.shape[0], n),
+                    (
+                        1.0 / topk_config.routed_scaling_factor
+                        if topk_config.routed_scaling_factor
+                        else 1.0
+                    ),
+                ),
+            ],
+            dim=-1,
+        )
+
+        if expert_location_dispatch_info is not None:
+            routed_cols = topk_ids[:, :-n]
+            routed_cols = topk_ids_logical_to_physical(
+                routed_cols, expert_location_dispatch_info
+            )
+            topk_ids = torch.cat([routed_cols, topk_ids[:, -n:]], dim=-1)
+
+        if (cap := get_global_experts_capturer()) is not None:
+            cap.capture(
+                layer_id=layer_id,
+                topk_indices=topk_ids,
+            )
+
+        from sglang.srt.layers.moe.topk import _remap_topk_for_deepep
+
+        topk_ids, topk_weights = _remap_topk_for_deepep(
+            topk_ids,
+            topk_weights,
+            topk_config.num_fused_shared_experts,
+            router_logits.shape[1],
+            topk_config,
+        )
+
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    else:
+        if expert_location_dispatch_info is not None:
+            topk_ids = topk_ids_logical_to_physical(
+                topk_ids, expert_location_dispatch_info
+            )
+
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+        if (cap := get_global_experts_capturer()) is not None:
+            cap.capture(
+                layer_id=layer_id,
+                topk_indices=topk_ids,
+            )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
