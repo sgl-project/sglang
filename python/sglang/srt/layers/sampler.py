@@ -141,17 +141,13 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
+            # Post process logits
+            logits.div_(sampling_info.temperatures)
+
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
-                logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
-                )
-                del logits_div_temperature
+                logprobs_via_logsoftmax_kernel = torch.log_softmax(logits, dim=-1)
 
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
@@ -177,8 +173,6 @@ class Sampler(nn.Module):
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
-                logits.div_(sampling_info.temperatures)
-
                 # In-place op to save memory
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
