@@ -40,9 +40,7 @@ class TestPlanRefOverflowGate(CustomTestCase):
         req_pool_indices = torch.tensor(
             list(range(1, bs + 1)), dtype=torch.int64, device=self.device
         )
-        prefix_lens = torch.tensor(
-            prefix_lens, dtype=torch.int64, device=self.device
-        )
+        prefix_lens = torch.tensor(prefix_lens, dtype=torch.int64, device=self.device)
         extend_seq_lens = torch.zeros(bs, dtype=torch.int64, device=self.device)
         req_to_token = torch.arange(
             (bs + 1) * max_seq_len, dtype=torch.int32, device=self.device

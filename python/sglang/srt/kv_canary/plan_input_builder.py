@@ -53,13 +53,9 @@ class PlanInput:
         device: torch.device,
     ) -> "PlanInput":
         return cls(
-            req_pool_indices=torch.zeros(
-                bs_capacity, dtype=torch.int64, device=device
-            ),
+            req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-            extend_seq_lens=torch.zeros(
-                bs_capacity, dtype=torch.int64, device=device
-            ),
+            extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
         )
 
     def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
