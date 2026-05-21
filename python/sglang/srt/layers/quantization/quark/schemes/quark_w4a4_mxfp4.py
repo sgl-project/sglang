@@ -40,6 +40,10 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
 
         if not self.is_checkpoint_mxfp4_serialized:
+            if not _is_hip:
+                raise NotImplementedError(
+                    "Online MXFP4 quantization is currently only supported on AMD ROCm devices."
+                )
             logger.info_once(
                 "Using online MXFP4 quantization from a higher precision checkpoint. Beware that this optimization may degrade prediction quality - please validate your model accuracy. More details at https://docs.sglang.io/advanced_features/quantization.html#online-quantization."
             )

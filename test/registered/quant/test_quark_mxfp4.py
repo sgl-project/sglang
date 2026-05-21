@@ -1,5 +1,6 @@
 import io
 import re
+import unittest
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
@@ -26,6 +27,10 @@ class TestOnlineQuantizationMemoryLoad(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if not is_hip():
+            raise unittest.SkipTest(
+                "online MXFP4 quantization is only supported on AMD ROCm devices"
+            )
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.stdout = io.StringIO()
         cls.stderr = io.StringIO()
@@ -179,6 +184,4 @@ class TestOnlineQuantizationMemoryLoadMOE(TestOnlineQuantizationMemoryLoad):
 
 
 if __name__ == "__main__":
-    import unittest
-
     unittest.main()
