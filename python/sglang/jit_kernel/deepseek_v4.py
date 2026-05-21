@@ -23,8 +23,12 @@ if _use_aiter:
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
+from sglang.srt.layers import deep_gemm_wrapper
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+_linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 
 
 def make_name(name: str) -> str:
@@ -143,18 +147,6 @@ def _jit_compress_module(
             ("prefill", f"{kernel_class}::run_prefill"),
         ],
         extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-@cache_once
-def _jit_rmsnorm_head_module(head_dim: int, dtype: torch.dtype):
-    args = make_cpp_args(head_dim, dtype, is_arch_support_pdl())
-    kernel_class = f"RMSNormKernel<{args}>"
-    return load_jit(
-        make_name("rmsnorm_head"),
-        *args,
-        cuda_files=["deepseek_v4/rmsnorm.cuh"],
-        cuda_wrappers=[("run_self", f"{kernel_class}::run_self")],
     )
 
 
@@ -1033,16 +1025,6 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(
-    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    if out is None:
-        out = q.new_empty(q.shape)
-    module.run_self(q, out, eps)
-    return out
-
-
 @cache_once
 def _jit_torch_cublas_bf16_fp32() -> Any:
     import torch.utils.cpp_extension
@@ -1104,12 +1086,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    from sglang.srt.environ import envs
-
-    algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
     if _is_cpu and _cpu_amx:
-        algo = "cpu_amx"
-    return _dispatch_bf16_fp32_backend(x, y, algo=algo)
+        _linear_bf16_fp32_algo = "cpu_amx"
+    return _dispatch_bf16_fp32_backend(x, y, algo=_linear_bf16_fp32_algo)
 
 
 def _dispatch_bf16_fp32_backend(
@@ -1119,10 +1098,8 @@ def _dispatch_bf16_fp32_backend(
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
     elif algo == "deep_gemm":
-        import deep_gemm
-
-        z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
-        deep_gemm.bf16_gemm_nt(x, y, z)
+        z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
+        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
     elif algo == "cpu_amx":
         return torch.ops.sgl_kernel.weight_packed_linear(
