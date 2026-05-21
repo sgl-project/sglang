@@ -779,7 +779,9 @@ class ServerArgs:
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
-    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    num_reserved_decode_tokens: Optional[int] = (
+        None  # used for decode kv cache offload in PD
+    )
     # FIXME: hack to reduce ITL when decode bs is small
     disaggregation_decode_polling_interval: int = 1
 
@@ -3708,6 +3710,13 @@ class ServerArgs:
             return False
 
     def _handle_pd_disaggregation(self):
+        if self.num_reserved_decode_tokens is None:
+            self.num_reserved_decode_tokens = (
+                4096
+                if self.enable_hisparse and self.disaggregation_mode == "decode"
+                else 512
+            )
+
         if self.disaggregation_mode == "decode":
             if self.disaggregation_decode_enable_radix_cache:
                 if self.enable_hisparse:
