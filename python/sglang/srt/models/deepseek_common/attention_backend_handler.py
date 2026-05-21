@@ -1,5 +1,6 @@
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -147,13 +148,13 @@ def handle_attention_aiter(attn, forward_batch):
         return AttnForwardMethod.MLA
 
 
-def handle_attention_nsa(attn, forward_batch):
+def handle_attention_dsa(attn, forward_batch):
     """
-    Dispatch logic is centralized in NativeSparseAttnBackend.set_nsa_prefill_impl and executed
+    Dispatch logic is centralized in DeepseekSparseAttnBackend.set_dsa_prefill_impl and executed
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
 
-    backend = forward_batch.attn_backend
+    backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
         backend = backend.primary
     if hasattr(backend, "use_mha") and backend.use_mha:
@@ -191,6 +192,9 @@ AttentionBackendRegistry.register("fa4", handle_attention_fa4)
 AttentionBackendRegistry.register("trtllm_mla", handle_attention_trtllm_mla)
 AttentionBackendRegistry.register("tokenspeed_mla", handle_attention_tokenspeed_mla)
 AttentionBackendRegistry.register("aiter", handle_attention_aiter)
-AttentionBackendRegistry.register("nsa", handle_attention_nsa)
+AttentionBackendRegistry.register("dsa", handle_attention_dsa)
+AttentionBackendRegistry.register(
+    "nsa", handle_attention_dsa
+)  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)

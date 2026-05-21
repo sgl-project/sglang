@@ -11,6 +11,10 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -109,6 +113,9 @@ class TestFlashAttentionBackend(CustomTestCase):
         self.backend = FlashAttentionBackend(self.model_runner)
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
         self.model_runner.model_config.num_attention_heads = self.num_heads
+        # Publish the backend for any RadixAttention.forward path the tests
+        # exercise; tearDown is unnecessary here since each test re-inits.
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
     def _mock_write_to_req_to_token_pool(self, batch_size, seq_len, page_size):
         # if page_size > 1, the token pool stores the index to the page.
@@ -223,7 +230,6 @@ class TestFlashAttentionBackend(CustomTestCase):
                 extend_seq_lens_cpu=torch.tensor(
                     [q_len] * self.batch_size, device="cpu"
                 ),
-                attn_backend=self.backend,
             )
             if attn_cp_size > 1:
                 forward_batch.attn_cp_metadata = type(
@@ -273,16 +279,11 @@ class TestFlashAttentionBackend(CustomTestCase):
                     [total_len] * self.batch_size, device=self.device
                 ),
                 seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
 
-        # Add token pool
-        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
-
-        # Write current batch's req_to_token to req_to_token_pool
+        # Pool refs are resolved via the active ForwardContext (published in
+        # setUp). Write the test fixture's req_to_token mapping.
         self._mock_write_to_req_to_token_pool(self.batch_size, total_len, page_size)
-        # Add kv pool for this forward batch
-        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
 
         return forward_batch
 
@@ -307,7 +308,7 @@ class TestFlashAttentionBackend(CustomTestCase):
         )
 
         # Set the prefix KV cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
+        self.model_runner.token_to_kv_pool.set_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
             cache_k,

@@ -333,7 +333,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.enable_hisparse = False
         scheduler.waiting_queue = []
         scheduler.last_batch = None
-        scheduler.stream_output = MagicMock()
+        scheduler.output_streamer = MagicMock()
         queue.scheduler = scheduler
 
         # Initial budget says the request fits; post-lock budget says it does not.
