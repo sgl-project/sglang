@@ -24,11 +24,11 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
-from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -422,7 +422,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
 
 class TestPlanRefOverflowGate(CustomTestCase):
     def setUp(self):
-        self.device = CPU_DEVICE
+        self.device = torch.device("cpu")
 
     @staticmethod
     def _empty_extras(device):

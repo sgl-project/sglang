@@ -11,13 +11,13 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.plan_input import PlanInput, fill_plan_input_per_forward
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
