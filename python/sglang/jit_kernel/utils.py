@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import importlib.util
 import logging
 import os
 import pathlib
+import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import (
@@ -91,6 +93,7 @@ DEFAULT_INCLUDE = [str(KERNEL_PATH / "include")]
 DEFAULT_CFLAGS = ["-std=c++20", "-O3"]
 DEFAULT_LDFLAGS = []
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, str, bool, torch.dtype]
+JIT_SOURCE_EXTENSIONS = frozenset((".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp"))
 
 
 class CPPArgList(list[str]):
@@ -126,6 +129,150 @@ def make_cpp_args(*args: CPP_TEMPLATE_TYPE) -> CPPArgList:
         raise TypeError(f"Unsupported argument type for cpp template: {type(arg)}")
 
     return CPPArgList(_convert(arg) for arg in args)
+
+
+def _file_digest(path: str) -> tuple[str, str]:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return str(pathlib.Path(path).relative_to(KERNEL_PATH)), digest.hexdigest()
+
+
+@cache_once
+def _git_jit_kernel_tree_hash() -> str | None:
+    for parent in (KERNEL_PATH, *KERNEL_PATH.parents):
+        if not (parent / ".git").exists():
+            continue
+        try:
+            rel = KERNEL_PATH.relative_to(parent)
+            return subprocess.check_output(
+                ["git", "-C", str(parent), "rev-parse", f"HEAD:{rel.as_posix()}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            ).strip()
+        except Exception:
+            return None
+    return None
+
+
+@cache_once
+def _jit_kernel_version_token() -> str:
+    value = os.getenv("SGLANG_JIT_KERNEL_CACHE_VERSION")
+    if value:
+        return f"SGLANG_JIT_KERNEL_CACHE_VERSION={value}"
+
+    git_tree = _git_jit_kernel_tree_hash()
+    if git_tree:
+        return f"git-tree={git_tree}"
+
+    try:
+        from sglang.version import __version__
+    except Exception:
+        __version__ = "unknown"
+    return f"sglang-version={__version__}"
+
+
+@cache_once
+def _jit_kernel_public_include_digest() -> str:
+    digest = hashlib.sha256()
+    root = KERNEL_PATH / "include" / "sgl_kernel"
+    if not root.exists():
+        return digest.hexdigest()
+    for path in sorted(p for p in root.glob("*") if p.is_file()):
+        if path.suffix not in JIT_SOURCE_EXTENSIONS:
+            continue
+        digest.update(repr(_file_digest(str(path))).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _jit_build_directory(
+    module_name: str,
+    *,
+    cpp_files: List[str],
+    cuda_files: List[str],
+    cpp_wrappers: List[Tuple[str, str]],
+    cuda_wrappers: List[Tuple[str, str]],
+    extra_cflags: List[str],
+    extra_cuda_cflags: List[str],
+    target_arch: str | None,
+    extra_ldflags: List[str],
+    extra_include_paths: List[str],
+    extra_dependencies: List[str] | None,
+    header_only: bool,
+) -> pathlib.Path:
+    import tvm_ffi
+
+    digest = hashlib.sha256()
+
+    def add(value: object) -> None:
+        digest.update(repr(value).encode())
+        digest.update(b"\0")
+
+    add(module_name)
+    add(header_only)
+    add(
+        [
+            str(pathlib.Path(path).relative_to(KERNEL_PATH / "csrc"))
+            for path in cpp_files
+        ]
+    )
+    add(
+        [
+            str(pathlib.Path(path).relative_to(KERNEL_PATH / "csrc"))
+            for path in cuda_files
+        ]
+    )
+    add(cpp_wrappers)
+    add(cuda_wrappers)
+    add(extra_cflags)
+    add(extra_cuda_cflags)
+    add(target_arch)
+    add(extra_ldflags)
+    add(extra_include_paths)
+    add(sorted(extra_dependencies or []))
+    add(getattr(tvm_ffi, "__version__", None))
+    add(torch.version.cuda)
+    add(_jit_kernel_version_token())
+    add(_jit_kernel_public_include_digest())
+    add([_file_digest(path) for path in sorted(cpp_files)])
+    add([_file_digest(path) for path in sorted(cuda_files)])
+
+    cache_dir = _tvm_ffi_cache_dir()
+    return cache_dir / f"{module_name}_{digest.hexdigest()[:16]}"
+
+
+def _tvm_ffi_cache_dir() -> pathlib.Path:
+    from sglang.srt.environ import envs
+
+    return pathlib.Path(envs.SGLANG_CACHE_DIR.get()).expanduser() / "tvm-ffi"
+
+
+def _load_cached_jit_module(
+    module_name: str, build_directory: pathlib.Path
+) -> Module | None:
+    lib_path = build_directory / f"{module_name}.so"
+    if not lib_path.exists():
+        return None
+
+    try:
+        from tvm_ffi.module import load_module
+
+        logger.info(
+            "Loading cached SGLang JIT module %s from %s", module_name, lib_path
+        )
+        return load_module(str(lib_path), keep_module_alive=True)
+    except Exception:
+        logger.warning(
+            "Failed to load cached SGLang JIT module %s from %s; rebuilding",
+            module_name,
+            lib_path,
+            exc_info=True,
+        )
+        lib_path.unlink(missing_ok=True)
+        return None
 
 
 def load_jit(
@@ -195,6 +342,40 @@ def load_jit(
         extra_include_paths += _REGISTERED_DEPENDENCIES[dep]()
 
     module_name = "sgl_kernel_jit_" + "_".join(str(arg) for arg in args)
+    with _jit_compile_context():
+        default_cuda_cflags = _get_default_target_flags()
+        target_arch = (
+            os.environ.get("TVM_FFI_ROCM_ARCH_LIST")
+            if is_hip_runtime()
+            else os.environ.get("TVM_FFI_CUDA_ARCH_LIST")
+        )
+
+    load_from_content_addressed_cache = build_directory is None
+    if build_directory is None:
+        build_directory = str(
+            _jit_build_directory(
+                module_name,
+                cpp_files=cpp_files,
+                cuda_files=cuda_files,
+                cpp_wrappers=cpp_wrappers or [],
+                cuda_wrappers=cuda_wrappers or [],
+                extra_cflags=DEFAULT_CFLAGS + extra_cflags,
+                extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
+                target_arch=target_arch,
+                extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
+                extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
+                extra_dependencies=extra_dependencies,
+                header_only=header_only,
+            )
+        )
+
+    if load_from_content_addressed_cache:
+        cached_module = _load_cached_jit_module(
+            module_name, pathlib.Path(build_directory)
+        )
+        if cached_module is not None:
+            return cached_module
+
     if header_only:
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
@@ -210,7 +391,7 @@ def load_jit(
                 cpp_sources=cpp_sources,
                 cuda_sources=cuda_sources,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
@@ -223,7 +404,7 @@ def load_jit(
                 cpp_files=cpp_files,
                 cuda_files=cuda_files,
                 extra_cflags=DEFAULT_CFLAGS + extra_cflags,
-                extra_cuda_cflags=_get_default_target_flags() + extra_cuda_cflags,
+                extra_cuda_cflags=default_cuda_cflags + extra_cuda_cflags,
                 extra_ldflags=DEFAULT_LDFLAGS + extra_ldflags,
                 extra_include_paths=DEFAULT_INCLUDE + extra_include_paths,
                 build_directory=build_directory,
