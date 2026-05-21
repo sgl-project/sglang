@@ -338,18 +338,20 @@ class C4IndexerBackendMixin:
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        skip_compressor: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
         q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
-        self.forward_indexer_compressor(
-            x=x,
-            forward_batch=forward_batch,
-            layer_id=c4_indexer.layer_id,
-            compressor=c4_indexer.compressor,
-        )
+        if not skip_compressor:
+            self.forward_indexer_compressor(
+                x=x,
+                forward_batch=forward_batch,
+                layer_id=c4_indexer.layer_id,
+                compressor=c4_indexer.compressor,
+            )
         c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
             layer_id=c4_indexer.layer_id,
         )
@@ -364,6 +366,7 @@ class C4IndexerBackendMixin:
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        skip_compressor: bool = False,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -402,6 +405,7 @@ class C4IndexerBackendMixin:
                 positions=core_metadata.positions,
                 forward_batch=forward_batch,
                 token_to_kv_pool=token_to_kv_pool,
+                skip_compressor=skip_compressor,
             )
 
         assert len(q_fp8.shape) == 3
@@ -595,6 +599,7 @@ class C4Indexer(nn.Module):
         forward_batch: ForwardBatch,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        skip_compressor: bool = False,
     ) -> None:
         return forward_batch.attn_backend.forward_c4_indexer(
             x=x,
@@ -604,4 +609,5 @@ class C4Indexer(nn.Module):
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
+            skip_compressor=skip_compressor,
         )
