@@ -29,11 +29,13 @@ __global__ void count_and_sort_expert_tokens_kernel(
     const scalar_t* __restrict__ topk_ids,
     int32_t* __restrict__ sorted_token_ids,
     int32_t* __restrict__ cumsum_buffer,
-    size_t numel) {
+    size_t numel,
+    bool ignore_invalid_expert) {
   const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const size_t stride = blockDim.x * gridDim.x;
 
   for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
     int32_t expert_id = topk_ids[i] + 1;
     int32_t rank_post_pad = atomicAdd(&cumsum_buffer[expert_id], 1);
     sorted_token_ids[rank_post_pad] = i;
@@ -63,6 +65,7 @@ __global__ void moe_align_block_size_kernel(
     size_t numel,
     int32_t* __restrict__ cumsum,
     bool pad_sorted_token_ids,
+    bool ignore_invalid_expert,
     const int32_t scan_size,
     int32_t max_num_tokens_padded) {
   // Use a separate thread block to populate sorted_token_ids
@@ -95,6 +98,7 @@ __global__ void moe_align_block_size_kernel(
   __syncthreads();
 
   for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
     int expert_id = topk_ids[i] + 1;
     atomicAdd(&shared_counts[expert_id], 1);
   }
@@ -242,6 +246,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
     int32_t block_size,
     size_t numel,
     bool pad_sorted_token_ids,
+    bool ignore_invalid_expert,
     int32_t max_num_tokens_padded) {
   // Adapted from
   // https://github.com/vllm-project/vllm/pull/29642/files#diff-5647b1413f4ae9aacba904eca8f8a8aee9079321eadff4c10101a2c6962dcc53R226
@@ -275,6 +280,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
     int32_t expert_id = topk_ids[i] + 1;
     ++tokens_cnts[(tid + 1) * num_experts + expert_id];
   }
@@ -307,6 +313,7 @@ __global__ void moe_align_block_size_small_batch_expert_kernel(
   }
 
   for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
     int32_t expert_id = topk_ids[i] + 1;
     int32_t rank_post_pad = tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
     sorted_token_ids[rank_post_pad] = i;
@@ -322,7 +329,8 @@ void moe_align_block_size(
     torch::Tensor experts_ids,
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
-    bool pad_sorted_token_ids) {
+    bool pad_sorted_token_ids,
+    bool ignore_invalid_expert) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   int threads = 1024;
@@ -348,6 +356,7 @@ void moe_align_block_size(
           block_size,
           topk_ids.numel(),
           pad_sorted_token_ids,
+          ignore_invalid_expert,
           max_num_tokens_padded);
     } else {
       auto align_kernel = moe_align_block_size_kernel<scalar_t>;
@@ -364,6 +373,7 @@ void moe_align_block_size(
           topk_ids.numel(),
           cumsum_buffer.data_ptr<int32_t>(),
           pad_sorted_token_ids,
+          ignore_invalid_expert,
           scan_size,
           max_num_tokens_padded);
 
@@ -377,7 +387,8 @@ void moe_align_block_size(
           topk_ids.data_ptr<scalar_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           cumsum_buffer.data_ptr<int32_t>(),
-          topk_ids.numel());
+          topk_ids.numel(),
+          ignore_invalid_expert);
     }
   });
 }
