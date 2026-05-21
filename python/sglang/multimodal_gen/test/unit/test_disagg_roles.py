@@ -64,6 +64,28 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
 from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
+class _GlobalStageArgsMixin:
+    def _install_stage_server_args(self, **kwargs):
+        server_args = SimpleNamespace(
+            comfyui_mode=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+            attention_backend=None,
+            **kwargs,
+        )
+        set_global_server_args(server_args)
+        return server_args
+
+    def setUp(self):
+        super().setUp()
+        self._prev_global_server_args = server_args_module._global_server_args
+        self._install_stage_server_args()
+
+    def tearDown(self):
+        set_global_server_args(self._prev_global_server_args)
+        super().tearDown()
+
+
 class TestRoleType(unittest.TestCase):
     def test_from_string(self):
         self.assertEqual(RoleType.from_string("monolithic"), RoleType.MONOLITHIC)
@@ -317,11 +339,12 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
             extra_allowed_modules=extras,
         )
         self.assertEqual(extras, {"vae", "transformer"})
-        self.assertIn("text_encoder", QwenImageLayeredPipeline._required_config_modules)
+        self.assertNotIn(
+            "text_encoder", QwenImageLayeredPipeline._required_config_modules
+        )
         self.assertEqual(
             set(filtered),
             {
-                "text_encoder",
                 "vae",
                 "tokenizer",
                 "processor",
@@ -405,7 +428,7 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
         self.assertEqual(extras, {"video_vae", "audio_vae"})
 
 
-class TestQwenImageLayeredDtype(unittest.TestCase):
+class TestQwenImageLayeredDtype(_GlobalStageArgsMixin, unittest.TestCase):
     def test_text_encoder_dtype_uses_parameter_dtype_without_dtype_attr(self):
         text_encoder = torch.nn.Linear(1, 1, bias=False).to(dtype=torch.bfloat16)
         self.assertEqual(
@@ -444,7 +467,7 @@ class TestQwenImageLayeredDtype(unittest.TestCase):
         )
 
 
-class TestImageVAEEncodingStageComponentName(unittest.TestCase):
+class TestImageVAEEncodingStageComponentName(_GlobalStageArgsMixin, unittest.TestCase):
     def test_component_name_can_follow_non_default_vae_key(self):
         stage = ImageVAEEncodingStage(vae=object(), component_name="video_vae")
         server_args = SimpleNamespace(
@@ -455,28 +478,6 @@ class TestImageVAEEncodingStageComponentName(unittest.TestCase):
         self.assertEqual(len(uses), 1)
         self.assertEqual(uses[0].component_name, "video_vae")
         self.assertEqual(uses[0].target_dtype, torch.bfloat16)
-
-
-class _GlobalStageArgsMixin:
-    def _install_stage_server_args(self, **kwargs):
-        server_args = SimpleNamespace(
-            comfyui_mode=False,
-            enable_torch_compile=False,
-            enable_cfg_parallel=False,
-            attention_backend=None,
-            **kwargs,
-        )
-        set_global_server_args(server_args)
-        return server_args
-
-    def setUp(self):
-        super().setUp()
-        self._prev_global_server_args = server_args_module._global_server_args
-        self._install_stage_server_args()
-
-    def tearDown(self):
-        set_global_server_args(self._prev_global_server_args)
-        super().tearDown()
 
 
 class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
@@ -510,6 +511,27 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
     def test_mova_decoding_stage_is_decoder_affine(self):
         stage = object.__new__(MOVADecodingStage)
         self.assertEqual(stage.role_affinity, RoleType.DECODER)
+
+    def test_mova_skips_torch_compile_on_rocm(self):
+        class _CompileTrackingModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.compile_called = False
+
+            def compile(self, *args, **kwargs):
+                self.compile_called = True
+
+        stage = object.__new__(MOVADenoisingStage)
+        module = _CompileTrackingModule()
+        server_args = SimpleNamespace(enable_torch_compile=True)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova.current_platform.is_hip",
+            return_value=True,
+        ):
+            stage._maybe_enable_torch_compile(module, server_args)
+
+        self.assertFalse(module.compile_called)
 
     def test_hunyuan3d_shape_only_disagg_accepts_non_monolithic_roles(self):
         pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
