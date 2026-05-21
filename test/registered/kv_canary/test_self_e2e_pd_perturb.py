@@ -12,8 +12,7 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 class TestPDBaselineMha(CanaryPDFixture, unittest.TestCase):
     model_mode = "mha"
 
-    def test_no_violation(self) -> None:
-        """Verify a clean PD run produces no canary violation on either side."""
+    def test_clean_pd_run_produces_no_canary_violation_on_either_side(self) -> None:
         self.send_parallel_short_requests(n=4)
         self.assert_no_violation_on("prefill")
         self.assert_no_violation_on("decode")
@@ -22,8 +21,7 @@ class TestPDBaselineMha(CanaryPDFixture, unittest.TestCase):
 class TestPDBaselineSwa(CanaryPDFixture, unittest.TestCase):
     model_mode = "swa"
 
-    def test_no_violation(self) -> None:
-        """Verify a clean PD run produces no canary violation on either side."""
+    def test_clean_pd_run_produces_no_canary_violation_on_either_side(self) -> None:
         self.send_parallel_short_requests(n=4)
         self.assert_no_violation_on("prefill")
         self.assert_no_violation_on("decode")
@@ -47,9 +45,7 @@ class _PDPerturbBase(CanaryPDFixture):
         }
         super().setUpClass()
 
-    def test_d_catches_real_kv_hash_violation(self) -> None:
-        """Verify P-side post-forward perturbation surfaces a real_kv_hash violation
-        on the D side."""
+    def test_p_side_perturb_surfaces_real_kv_hash_violation_on_d_first_forward(self) -> None:
         self.send_parallel_short_requests(n=4)
         self.assert_d_per_forward_violation_reported(
             fail_reason="real_kv_hash",
