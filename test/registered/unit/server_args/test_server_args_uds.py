@@ -58,6 +58,20 @@ class TestServerArgsUDS(unittest.TestCase):
         args = ServerArgs(model_path="dummy")
         self.assertIsNone(args.uds)
 
+    def test_uds_cli_flag_parsed(self):
+        from sglang.srt.server_args import prepare_server_args
+        from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
+
+        args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--uds",
+                "/tmp/sglang-cli.sock",
+            ]
+        )
+        self.assertEqual(args.uds, "/tmp/sglang-cli.sock")
+
 
 if __name__ == "__main__":
     unittest.main()

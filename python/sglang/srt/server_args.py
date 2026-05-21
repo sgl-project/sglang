@@ -4623,6 +4623,16 @@ class ServerArgs:
             help="The port of the HTTP server.",
         )
         parser.add_argument(
+            "--uds",
+            type=str,
+            default=ServerArgs.uds,
+            help=(
+                "Bind the public HTTP server to this Unix domain socket "
+                "path instead of host/port. Mutually exclusive with "
+                "--host / --port. Linux/macOS only."
+            ),
+        )
+        parser.add_argument(
             "--fastapi-root-path",
             type=str,
             default=ServerArgs.fastapi_root_path,
