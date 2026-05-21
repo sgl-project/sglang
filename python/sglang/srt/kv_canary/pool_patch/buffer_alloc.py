@@ -33,11 +33,29 @@ def alloc_canary_buf(
 
 
 def _clip_read_bytes_aligned(*, requested: int, num_bytes_per_token: int) -> int:
-    """Clamp requested read_bytes to ``[0, num_bytes_per_token]`` and round down to a multiple of 16
-    (the CUDA fold kernel issues 128-bit aligned loads).
-    """
-    clipped = max(0, min(int(requested), num_bytes_per_token))
-    return (clipped // _REAL_KV_READ_ALIGN) * _REAL_KV_READ_ALIGN
+    """Validate read_bytes for the CUDA fold kernel's 128-bit aligned loads."""
+    if num_bytes_per_token <= 0 or num_bytes_per_token % _REAL_KV_READ_ALIGN != 0:
+        raise ValueError(
+            "kv-canary: num_bytes_per_token must be a positive multiple of "
+            f"{_REAL_KV_READ_ALIGN}, got {num_bytes_per_token}"
+        )
+    if requested == 0:
+        return 0
+    if requested == sys.maxsize:
+        return num_bytes_per_token
+    if requested < 0:
+        raise ValueError(f"kv-canary: read_bytes must be non-negative, got {requested}")
+    if requested > num_bytes_per_token:
+        raise ValueError(
+            "kv-canary: read_bytes must be <= num_bytes_per_token "
+            f"({num_bytes_per_token}), got {requested}"
+        )
+    if requested % _REAL_KV_READ_ALIGN != 0:
+        raise ValueError(
+            "kv-canary: read_bytes must be a multiple of "
+            f"{_REAL_KV_READ_ALIGN}, got {requested}"
+        )
+    return requested
 
 
 def make_row_source(

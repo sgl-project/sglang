@@ -7,7 +7,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 logger = logging.getLogger(__name__)
@@ -88,17 +88,17 @@ def should_run_perturbation(
 def pick_target_group(
     *,
     buffer_groups: tuple[CanaryBufferGroup, ...],
-    target_kind: str,
+    target_kind: TargetGroupKind,
 ) -> Optional[CanaryBufferGroup]:
-    """Filter buffer_groups by target_kind ('full' / 'swa' exact, 'any' random) restricted to
+    """Filter buffer_groups by target_kind (FULL / SWA exact, ANY random) restricted to
     groups with non-empty real_kv_sources_k. Returns None if no group matches."""
     eligible = [group for group in buffer_groups if group.real_kv_sources_k]
     if not eligible:
         return None
-    if target_kind == "any":
+    if target_kind == TargetGroupKind.ANY:
         pick = int(torch.randint(0, len(eligible), (1,)).item())
         return eligible[pick]
-    want = PoolKind.FULL if target_kind == "full" else PoolKind.SWA
+    want = PoolKind(target_kind.value)
     filtered = [group for group in eligible if group.kind == want]
     if not filtered:
         return None

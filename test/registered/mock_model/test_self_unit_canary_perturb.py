@@ -5,7 +5,8 @@ import pytest
 from _pytest.logging import LogCaptureFixture
 
 from sglang.srt.kv_canary.perturb import real_kv_used
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
+
+from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
 from sglang.srt.kv_canary.perturb.slot_picker import ReqToTokenEntry
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -19,7 +20,7 @@ def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
         req_to_token_prob=0.0,
         real_kv_used_prob=1.0,
         real_kv_unused_cache_prob=0.0,
-        target_group_kind="full",
+        target_group_kind=TargetGroupKind.FULL,
         warmup_steps=0,
     )
     warmup_gate = Mock()
