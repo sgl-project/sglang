@@ -234,17 +234,11 @@ For some operators, the execution time is too long. As a result, the metric data
 
 Input Shapes set to an empty value indicates that when the format is "; ; ; ;", the current input is a scalar. Here, ";" serves as the separator for each dimension. The output dimension of the operator follows the same principle.
 
-Task Duration (us)
+- **Task Duration (us)**: Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
 
-Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
+- **Task Wait Time (us)**: Interval between the end time of the previous task and the start time of the current task. The unit is μs.
 
-Task Wait Time (us)
-
-Interval between the end time of the previous task and the start time of the current task. The unit is μs.
-
-Block Dim
-
-Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
+- **Block Dim**: Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
 
 ## Optimization
 
