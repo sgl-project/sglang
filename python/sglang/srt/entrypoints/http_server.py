@@ -2330,6 +2330,10 @@ def _setup_and_run_http_server(
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
 
+        if server_args.uds:
+            _prepare_uds_path(server_args.uds)
+            logger.info(f"Listening on {_format_listen_addr(server_args)}")
+
         if server_args.ssl_certfile:
             logger.info(
                 f"SSL enabled: certfile={server_args.ssl_certfile}, "
@@ -2342,8 +2346,7 @@ def _setup_and_run_http_server(
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **_uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2379,8 +2382,7 @@ def _setup_and_run_http_server(
                 # Default case, one tokenizer process
                 uvicorn.run(
                     app,
-                    host=server_args.host,
-                    port=server_args.port,
+                    **_uvicorn_bind_kwargs(server_args),
                     root_path=server_args.fastapi_root_path,
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
@@ -2409,8 +2411,7 @@ def _setup_and_run_http_server(
 
             uvicorn.run(
                 "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
+                **_uvicorn_bind_kwargs(server_args),
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
