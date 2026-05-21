@@ -173,12 +173,8 @@ class TransferStatus:
     received_state_per_pp: Set[int] = dataclasses.field(default_factory=set)
     # Whether state data is expected (set based on state_type).
     expects_state: bool = False
-    # Mark as failed
-    is_failure: bool = False
 
     def is_done(self):
-        if self.is_failure:
-            return True
         if self.num_pp_ranks_expected is None or not self.received_aux:
             return False
         # If state data is expected, check all PP ranks have sent it
@@ -195,9 +191,6 @@ class TransferStatus:
             if len(self.received_kvs_per_pp[pp_rank]) != expected:
                 return False
         return True
-
-    def is_failed(self):
-        return self.is_failure
 
 
 class NixlKVManager(CommonKVManager):
@@ -457,23 +450,6 @@ class NixlKVManager(CommonKVManager):
             self._staging_ctx.prefetch_sockets,
         )
         self._staging_ctx.prefetched_rooms.add(room)
-
-    def _handle_node_failure(self, failed_bootstrap_addr: str):
-        """Handle failure of a prefill node (nixl-specific: also marks transfer_statuses)."""
-        with self.connection_lock:
-            possible_affected_rooms = self.addr_to_rooms_tracker.get(
-                failed_bootstrap_addr, []
-            )
-
-        # Mark transfer_statuses before the common cleanup marks rooms as Failed
-        for room in possible_affected_rooms:
-            if (
-                room in self.transfer_statuses
-                and not self.transfer_statuses[room].is_done()
-            ):
-                self.transfer_statuses[room].is_failure = True
-
-        super()._handle_node_failure(failed_bootstrap_addr)
 
     def check_status(self, bootstrap_room: int):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
@@ -1893,14 +1869,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
                 self.bootstrap_room
             )
-            # Check if the transfer failed
-            if self.kv_mgr.transfer_statuses[self.bootstrap_room].is_failed():
-                self.conclude_state = KVPoll.Failed
-                logger.error(
-                    f"Transfer for room {self.bootstrap_room} failed due to node failure"
-                )
-            else:
-                self.conclude_state = KVPoll.Success
+            self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore

@@ -688,7 +688,7 @@ class CommonKVManager(BaseKVManager):
 
         logger.error(
             f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
-            f"{len(affected_rooms)} transfers affected"
+            f"{len(affected_rooms)} requests affected"
         )
 
 
