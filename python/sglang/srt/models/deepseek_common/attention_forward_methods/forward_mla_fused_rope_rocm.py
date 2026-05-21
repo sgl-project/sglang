@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.layers.quantization.fp8_kernel import per_tensor_quant_mla_fp8
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
+from sglang.srt.model_executor.pool_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
@@ -109,10 +112,10 @@ class DeepseekMLARocmForwardMixin:
             device=q.device,
         )
         attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
-            forward_batch.attn_backend.forward_metadata
+            get_attn_backend().forward_metadata
         )
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        num_kv_split = forward_batch.attn_backend.num_kv_splits
+        num_kv_split = get_attn_backend().num_kv_splits
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
             attn_logits = torch.empty(

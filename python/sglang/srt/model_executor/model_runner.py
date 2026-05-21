@@ -154,7 +154,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.pool_context import set_kv_pools
+from sglang.srt.model_executor.pool_context import set_attn_backend, set_kv_pools
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -2989,7 +2989,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = self.decode_attn_backend
+                # PDmux selects a per-stream backend; publish it to model-layer
+                # readers via pool_context so RadixAttention etc. dispatch
+                # against the right backend for this forward.
+                set_attn_backend(self.decode_attn_backend)
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
@@ -3219,12 +3222,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Activate this runner's pools for the duration of the forward so that
-        # get_token_to_kv_pool() / get_req_to_token_pool() resolve to the right
-        # objects regardless of which other ModelRunner instances have been
-        # initialized in this process. Frozen-KV MTP swaps self.token_to_kv_pool
-        # itself before calling forward(), so this set picks up that override.
+        # Activate this runner's pools + attn_backend for the duration of the
+        # forward so that get_token_to_kv_pool() / get_req_to_token_pool() /
+        # get_attn_backend() resolve to the right objects regardless of which
+        # other ModelRunner instances have been initialized in this process.
+        # Frozen-KV MTP swaps self.token_to_kv_pool itself before calling
+        # forward(), so this set picks up that override.
         prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
+        prev_backend = set_attn_backend(self.attn_backend)
         try:
             return self._forward_raw_body(
                 forward_batch,
@@ -3235,6 +3240,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         finally:
             set_kv_pools(*prev_pools)
+            set_attn_backend(prev_backend)
 
     def _forward_raw_body(
         self,
