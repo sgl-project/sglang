@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from multiprocessing import shared_memory
 from types import SimpleNamespace
@@ -389,6 +390,69 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
 
         self.assertTrue(torch.equal(output_positions, positions.squeeze(1)))
         self.assertTrue(torch.equal(output_delta, delta))
+
+    def test_qwen_reuses_precomputed_padded_input_ids_from_processor_output(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            vision_config=SimpleNamespace(spatial_merge_size=1, tokens_per_second=None),
+        )
+        processor.model_type = "qwen3_5"
+        processor.mm_tokens = SimpleNamespace(
+            image_token_id=42,
+            video_token_id=43,
+            audio_token_id=None,
+        )
+        processor.vision_start_token_id = 11
+        processor.vision_end_token_id = 12
+        processor.audio_start_token_id = None
+
+        input_ids = [11, 42, 42, 12]
+        padded_input_ids = [11, -1001, -1001, 12]
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(1, 2)],
+                pad_value=-1001,
+                feature=torch.arange(8).reshape(2, 4),
+            )
+        ]
+        processor_output = {
+            "padded_input_ids": padded_input_ids,
+            "mrope_positions": torch.arange(12, dtype=torch.long).reshape(3, 4),
+            "mrope_position_delta": torch.tensor([[0]], dtype=torch.long),
+        }
+        base_output = BaseMultiModalProcessorOutput(
+            input_text="",
+            input_ids=input_ids,
+            images=[processor_output],
+        )
+        request_obj = SimpleNamespace(
+            rid="rid",
+            video_data=None,
+            audio_data=None,
+        )
+        processor.load_mm_data = lambda **kwargs: base_output
+        processor.process_and_combine_mm_data = lambda *args, **kwargs: (
+            mm_items,
+            torch.tensor(input_ids),
+            processor_output,
+        )
+
+        original_build = MultimodalProcessorOutput.build_padded_input_ids
+
+        def fail_build(*args, **kwargs):
+            raise AssertionError("padded_input_ids should not be rebuilt")
+
+        try:
+            MultimodalProcessorOutput.build_padded_input_ids = staticmethod(fail_build)
+            output = asyncio.run(
+                processor.process_mm_data_async([], "", request_obj)
+            )
+        finally:
+            MultimodalProcessorOutput.build_padded_input_ids = original_build
+
+        self.assertEqual(output.padded_input_ids, padded_input_ids)
 
 
 if __name__ == "__main__":

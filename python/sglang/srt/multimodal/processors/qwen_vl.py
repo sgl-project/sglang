@@ -722,23 +722,28 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         input_ids = input_ids.flatten()
         input_ids_list = input_ids.tolist()
-        padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
-            input_ids_list, mm_items
-        )
-
-        image_grid_thw = self._get_grid_from_output_or_items(
-            ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
-        )
-        video_grid_thw = self._get_grid_from_output_or_items(
-            ret,
-            mm_items,
-            "video_grid_thw",
-            Modality.VIDEO,
-            request_obj.video_data,
-        )
+        padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
+        if padded_input_ids is None:
+            padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids_list, mm_items
+            )
+        elif isinstance(padded_input_ids, torch.Tensor):
+            padded_input_ids = padded_input_ids.flatten().tolist()
+        else:
+            padded_input_ids = list(padded_input_ids)
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
         if mrope_result is None:
+            image_grid_thw = self._get_grid_from_output_or_items(
+                ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
+            )
+            video_grid_thw = self._get_grid_from_output_or_items(
+                ret,
+                mm_items,
+                "video_grid_thw",
+                Modality.VIDEO,
+                request_obj.video_data,
+            )
             if (
                 video_grid_thw is None
                 and second_per_grid_ts is None
