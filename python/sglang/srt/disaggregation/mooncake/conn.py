@@ -1536,9 +1536,9 @@ class MooncakeKVManager(CommonKVManager):
         return self.engine.get_session_id()
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
-        """Clean up completed rooms from the tracker on successful heartbeat."""
         current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
         for bootstrap_room in current_rooms:
+            # Remove KVPoll.Success requests from the tracker
             if bootstrap_room not in self.request_status:
                 self.addr_to_rooms_tracker[bootstrap_addr].discard(bootstrap_room)
 
@@ -1741,10 +1741,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
         elif status == KVPoll.WaitingForInput:
             timeout_result = self._check_waiting_timeout()
             if timeout_result is not None:
-                logger.warning_once(
-                    "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
-                    "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
-                )
                 return timeout_result
 
         return status

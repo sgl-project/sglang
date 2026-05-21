@@ -711,6 +711,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
+        self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -826,20 +827,23 @@ class CommonKVSender(BaseKVSender):
         pass
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
-        """Check if bootstrapping has timed out. Returns KVPoll.Failed if timed out, None otherwise."""
-        init_time = getattr(self, "init_time", None)
-        if init_time is None:
+        if self.init_time is None:
             return None
-        elapsed = time.time() - init_time
-        if elapsed >= self.kv_mgr.bootstrap_timeout:
-            reason = (
-                f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-                "in KVPoll.Bootstrapping"
-            )
-            self.kv_mgr.record_failure(self.bootstrap_room, reason)
-            self.conclude_state = KVPoll.Failed
-            return KVPoll.Failed
-        return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.bootstrap_timeout:
+            return None
+        logger.warning_once(
+            "Some requests timed out when bootstrapping, "
+            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.Bootstrapping",
+        )
+        self.conclude_state = KVPoll.Failed
+        return KVPoll.Failed
 
     def poll(self) -> KVPoll:
         pass
@@ -880,6 +884,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        self.init_time: Optional[float] = None
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -1050,21 +1055,22 @@ class CommonKVReceiver(BaseKVReceiver):
         raise NotImplementedError
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
-        """Check if waiting for KV transfer has timed out.
-        Returns KVPoll.Failed if timed out, None otherwise."""
-        init_time = getattr(self, "init_time", None)
-        if init_time is None:
+        if self.init_time is None:
             return None
-        elapsed = time.time() - init_time
-        if elapsed >= self.kv_mgr.waiting_timeout:
-            reason = (
-                f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
-                "in KVPoll.WaitingForInput"
-            )
-            self.kv_mgr.record_failure(self.bootstrap_room, reason)
-            self.conclude_state = KVPoll.Failed
-            return KVPoll.Failed
-        return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.waiting_timeout:
+            return None
+        logger.warning_once(
+            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.WaitingForInput",
+        )
+        self.conclude_state = KVPoll.Failed
+        return KVPoll.Failed
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")
