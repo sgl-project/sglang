@@ -279,7 +279,7 @@ def launch_canary_verify_kernel(
         - Safe in cuda-graph capture; caller refills plan in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary.verify_ref.run_canary_verify_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.verify_ref.launch_canary_verify_kernel_torch_reference`; CUDA must match
     byte-for-byte.
     """
     canary_buf = context.canary_buf

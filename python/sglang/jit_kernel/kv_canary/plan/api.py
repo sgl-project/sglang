@@ -81,7 +81,7 @@ def launch_canary_plan_kernels(
         - Padding rows contribute zero entries.
 
     Pinned by Python reference
-    :func:`sglang.jit_kernel.kv_canary.plan_ref.run_canary_plan_torch_reference`; Triton must match
+    :func:`sglang.jit_kernel.kv_canary.plan_ref.launch_canary_plan_kernels_torch_reference`; Triton must match
     byte-for-byte.
     """
     bs = int(req_pool_indices.shape[0])

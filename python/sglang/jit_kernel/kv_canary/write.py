@@ -171,7 +171,7 @@ def launch_canary_write_kernel(
           in-place before replay.
 
     Pinned by torch reference
-    :func:`sglang.jit_kernel.kv_canary.write_ref.run_canary_write_torch_reference`; CUDA must match
+    :func:`sglang.jit_kernel.kv_canary.write_ref.launch_canary_write_kernel_torch_reference`; CUDA must match
     byte-for-byte.
     """
     canary_buf = context.canary_buf

@@ -7,16 +7,16 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import canary_plan_step_torch_reference
+from sglang.jit_kernel.kv_canary.plan_ref import launch_canary_plan_kernels_torch_reference
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary.verify_ref import canary_verify_step_torch_reference
+from sglang.jit_kernel.kv_canary.verify_ref import launch_canary_verify_kernel_torch_reference
 from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
-from sglang.jit_kernel.kv_canary.write_ref import canary_write_step_torch_reference
+from sglang.jit_kernel.kv_canary.write_ref import launch_canary_write_kernel_torch_reference
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
@@ -200,9 +200,9 @@ def _run_both_and_assert_pipeline_equal(
         **shared,
     )
     plan_v_ref, plan_w_ref = _run_pipeline(
-        plan_fn=canary_plan_step_torch_reference,
-        write_fn=canary_write_step_torch_reference,
-        verify_fn=canary_verify_step_torch_reference,
+        plan_fn=launch_canary_plan_kernels_torch_reference,
+        write_fn=launch_canary_write_kernel_torch_reference,
+        verify_fn=launch_canary_verify_kernel_torch_reference,
         synchronize=False,
         canary_buf=buf_ref,
         log=log_ref,
@@ -661,7 +661,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         full_to_swa_index_mapping=None,
         verify_capacity=int(plan_v_real.verify_slot_indices.shape[0]),
     )
-    canary_plan_step_torch_reference(
+    launch_canary_plan_kernels_torch_reference(
         verify_plan_out=plan_v_ref,
         write_plan_out=plan_w_ref,
         req_pool_indices=req_pool_indices,
@@ -686,7 +686,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     )
     torch.cuda.synchronize()
 
-    canary_verify_step_torch_reference(
+    launch_canary_verify_kernel_torch_reference(
         canary_buf=buf_ref,
         plan=plan_v_ref,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
