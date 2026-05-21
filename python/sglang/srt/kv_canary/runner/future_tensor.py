@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class FutureTensor:
     _tensor: torch.Tensor | None
     _event: torch.cuda.Event | None
@@ -33,6 +33,6 @@ class FutureTensor:
             raise RuntimeError("FutureTensor.wait() was called more than once")
 
         event.synchronize()
-        object.__setattr__(self, "_tensor", None)
-        object.__setattr__(self, "_event", None)
+        self._tensor = None
+        self._event = None
         return tensor
