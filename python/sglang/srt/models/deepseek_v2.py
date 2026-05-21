@@ -61,7 +61,6 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
@@ -71,7 +70,10 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
-from sglang.srt.layers.communicator_dsa_cp import DSACPLayerCommunicator
+
+# DSACPLayerCommunicator was folded into LayerCommunicator. The base class
+# now detects the CP per-layer SCATTERED↔FULL transitions via its dispatch
+# table; the strategy supplies the actual NCCL collectives.
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -126,7 +128,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1881,28 +1882,18 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
-        if self.dsa_enable_prefill_cp:
-            self.layer_communicator = DSACPLayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
-                qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            )
-        else:
-            self.layer_communicator = LayerCommunicator(
-                layer_scatter_modes=self.layer_scatter_modes,
-                input_layernorm=self.input_layernorm,
-                post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
-                is_last_layer=(
-                    is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
-                ),
-                qkv_latent_func=self.self_attn.prepare_qkv_latent,
-            )
+        # The base LayerCommunicator now handles DSA-CP SCATTERED↔FULL
+        # transitions through its dispatch table + active CP strategy.
+        self.layer_communicator = LayerCommunicator(
+            layer_scatter_modes=self.layer_scatter_modes,
+            input_layernorm=self.input_layernorm,
+            post_attention_layernorm=self.post_attention_layernorm,
+            allow_reduce_scatter=True,
+            is_last_layer=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
+            qkv_latent_func=self.self_attn.prepare_qkv_latent,
+        )
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -2499,13 +2490,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(
-                len(input_ids), self.cp_size, self.use_dsa, forward_batch
+            from sglang.srt.layers.utils.cp_strategy import get_cp_strategy
+
+            _cp_strategy = get_cp_strategy()
+            if _cp_strategy is not None and _cp_strategy.can_apply(
+                len(input_ids), forward_batch
             ):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                forward_batch.attn_cp_metadata = _cp_strategy.build_metadata(
                     len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
 

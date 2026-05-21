@@ -34,10 +34,8 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
-    is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
@@ -68,7 +66,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -83,9 +80,7 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 
 if not _is_hip:
-    from sglang.srt.layers.utils.cp_utils import (
-        prepare_context_parallel_metadata,
-    )
+    pass
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -1160,24 +1155,37 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+            from sglang.srt.layers.utils.cp_strategy import get_cp_strategy
+
+            _cp_strategy = get_cp_strategy()
+            if _cp_strategy is not None and _cp_strategy.can_apply(
+                len(input_ids), forward_batch
+            ):
+                forward_batch.attn_cp_metadata = _cp_strategy.build_metadata(
                     len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                if is_dsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
-                    core_meta = metadata.core_attn_metadata
-                    core_meta.apply_cp_reindex()
-                    core_meta.init_flashmla_related()
-                    if metadata.indexer_metadata is not None:
-                        metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
+                # Interleave (round-robin) reindexes the FlashMLA tensors and
+                # rebuilds indexer metadata so the dsv4 backend sees per-rank
+                # shaping. ``reindex_attn_metadata`` is a no-op for zigzag.
+                metadata = forward_batch.attn_backend.forward_metadata
+                core_meta = metadata.core_attn_metadata
+                pre_reindex_len = (
+                    core_meta.seq_lens_casual.shape[0]
+                    if hasattr(core_meta, "seq_lens_casual")
+                    else None
+                )
+                _cp_strategy.reindex_attn_metadata(core_meta)
+                if (
+                    pre_reindex_len is not None
+                    and core_meta.seq_lens_casual.shape[0] != pre_reindex_len
+                    and metadata.indexer_metadata is not None
+                ):
+                    metadata.indexer_metadata = (
+                        forward_batch.attn_backend.init_forward_metadata_indexer(
+                            core_meta
                         )
+                    )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
