@@ -22,7 +22,7 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
@@ -1056,17 +1056,20 @@ class CudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_batch.forward_mode,
-                forward_batch.spec_info,
-            )
+            # Attention backend: per-iter prep runs OUTSIDE the graph capture
+            # scope. The matching in-graph hook below is invoked inside
+            # `with graph.capture():` via `run_once`.
+            attn_backend.init_forward_data_out_graph(forward_batch)
 
             def run_once():
+                # The in-graph metadata hook is recorded into the cuda graph
+                # at capture time and auto-replayed by graph.replay(). Default
+                # impl is no-op for most backends in the initial migration;
+                # it is also exercised during warmup runs (outside the graph
+                # context), which is safe because no-op is harmless and any
+                # backend that overrides it must keep ops graph-recordable.
+                attn_backend.init_forward_data_in_graph(forward_batch)
+
                 # Without this, warmup-1 caches the translation; the capture
                 # run hits the cache, skips the gather, and replay reuses
                 # stale SWA locations.
@@ -1157,6 +1160,37 @@ class CudaGraphRunner:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
+    def _build_replay_forward_batch_view(
+        self,
+        forward_batch: ForwardBatch,
+        buffers,
+        bs: int,
+        raw_bs: int,
+    ) -> ForwardBatch:
+        """Build a lightweight ForwardBatch view for the replay path.
+
+        Backends now read every metadata field off the ForwardBatch (the old
+        positional capture/replay signatures are gone), so caller-side
+        construction of a padded-bs view replaces the previous per-arg
+        plumbing. Fields not derived from the padded buffers (spec_info,
+        out_cache_loc, etc.) are inherited from the live ``forward_batch``;
+        dsv4 still consults those through the legacy side channel until
+        step 04 fully covers them here.
+        """
+        return replace(
+            forward_batch,
+            forward_mode=self.capture_forward_mode,
+            batch_size=bs,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
+            seq_lens_sum=forward_batch.seq_lens_sum
+            + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            encoder_lens=(
+                buffers.encoder_lens[:bs] if self.is_encoder_decoder else None
+            ),
+        )
+
     def replay_prepare(
         self,
         forward_batch: ForwardBatch,
@@ -1220,17 +1254,17 @@ class CudaGraphRunner:
             attn_backend = self.attn_backend
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
+        # Step 04 removes the side channel once the fb view below covers every
+        # field dsv4 reads from it (out_cache_loc / forward_mode / IDLE
+        # replacement). Step 03 keeps set/clear to preserve that coverage.
         attn_backend._replay_forward_batch = forward_batch
-        attn_backend.init_forward_metadata_replay_cuda_graph(
-            bs,
-            buffers.req_pool_indices[:bs],
-            buffers.seq_lens[:bs],
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
-            buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
-            forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+        fb_view = self._build_replay_forward_batch_view(
+            forward_batch=forward_batch,
+            buffers=buffers,
+            bs=bs,
+            raw_bs=raw_bs,
         )
+        attn_backend.init_forward_data_out_graph(fb_view)
         attn_backend._replay_forward_batch = None
 
         # Store fields
