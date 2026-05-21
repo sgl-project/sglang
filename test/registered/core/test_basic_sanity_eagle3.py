@@ -16,6 +16,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_amd_ci,
     popen_launch_server,
 )
 
@@ -35,6 +36,13 @@ class TestBasicSanityEagle3(
     # Match vanilla gate at 97; EAGLE3 spec should sustain similar
     # single-batch occupancy. Adjust per CI calibration.
     fwd_occupancy_threshold = 97.0
+
+    @unittest.skipIf(
+        is_in_amd_ci(),
+        "EAGLE3 fwd_occupancy threshold is calibrated for CUDA, not AMD CI yet",
+    )
+    def test_fwd_occupancy(self):
+        super().test_fwd_occupancy()
 
     @classmethod
     def setUpClass(cls):
