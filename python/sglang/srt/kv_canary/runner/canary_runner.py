@@ -211,5 +211,4 @@ class CanaryRunner:
         self._swa_divergence_stats.emit_log_if_due(
             step_counter=self._step_counter,
             period=self.config.stats_print_every_n_steps,
-            full_to_swa_index_mapping=self._get_swa_index_lut(),
         )

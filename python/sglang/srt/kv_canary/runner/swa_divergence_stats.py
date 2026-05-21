@@ -20,21 +20,6 @@ SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary swa_divergence:"
 
 
 class SwaDivergenceStats:
-    """Env-gated per-forward observation of SWA-vs-FULL divergence signals.
-
-    When disabled (env var unset) every public method is a no-op and no device
-    tensors are allocated. Enabling the env var wires in three signals:
-
-    - verify_full / verify_swa: cumulative ``VerifyPlan.verify_num_valid`` per
-      group. Per-step the orchestrator calls ``observe_after_invoke_plan`` once
-      per group, which accumulates the on-device int32 verify_num_valid into a
-      group-specific int64 accumulator.
-    - mapping_nonidentity: ``(full_to_swa_index_mapping[:-1] != arange).sum()``
-      computed lazily on log-emit.
-    - swa_pool_wrap: ``SWATokenToKVPoolAllocator.wrap_count``, read directly
-      from the allocator. Always-on int counter; reader-side only.
-    """
-
     def __init__(
         self,
         *,
@@ -56,6 +41,7 @@ class SwaDivergenceStats:
         self._pending_verify_full_future: Optional[FutureTensor] = None
         self._pending_verify_swa_future: Optional[FutureTensor] = None
         self._pending_mapping_nonidentity_future: Optional[FutureTensor] = None
+        self._pending_wrap_count_future: Optional[FutureTensor] = None
         self._pending_step: Optional[int] = None
 
         self._latest_verify_full: int = 0
@@ -99,7 +85,6 @@ class SwaDivergenceStats:
         *,
         step_counter: int,
         period: int,
-        full_to_swa_index_mapping: Optional[torch.Tensor],
     ) -> None:
         if not self._enabled:
             return
@@ -109,10 +94,7 @@ class SwaDivergenceStats:
             return
 
         self._drain_pending_futures()
-        self._stage_async_snapshots(
-            step_counter=step_counter,
-            full_to_swa_index_mapping=full_to_swa_index_mapping,
-        )
+        self._stage_async_snapshots(step_counter=step_counter)
 
     def _drain_pending_futures(self) -> None:
         if self._pending_step is None:
@@ -121,19 +103,22 @@ class SwaDivergenceStats:
         verify_full_future = self._pending_verify_full_future
         verify_swa_future = self._pending_verify_swa_future
         mapping_future = self._pending_mapping_nonidentity_future
+        wrap_future = self._pending_wrap_count_future
         assert verify_full_future is not None
         assert verify_swa_future is not None
-        assert mapping_future is not None
 
         verify_full = int(verify_full_future.wait().item())
         verify_swa = int(verify_swa_future.wait().item())
-        mapping_nonidentity = int(mapping_future.wait().item())
+        mapping_nonidentity = (
+            int(mapping_future.wait().item()) if mapping_future is not None else 0
+        )
+        wrap_count = (
+            int(wrap_future.wait().item()) if wrap_future is not None else 0
+        )
 
         self._latest_verify_full = verify_full
         self._latest_verify_swa = verify_swa
         self._latest_mapping_nonidentity = mapping_nonidentity
-
-        wrap_count = self._read_wrap_count()
 
         line = (
             f"{SWA_DIVERGENCE_LOG_PREFIX} "
@@ -148,14 +133,10 @@ class SwaDivergenceStats:
         self._pending_verify_full_future = None
         self._pending_verify_swa_future = None
         self._pending_mapping_nonidentity_future = None
+        self._pending_wrap_count_future = None
         self._pending_step = None
 
-    def _stage_async_snapshots(
-        self,
-        *,
-        step_counter: int,
-        full_to_swa_index_mapping: Optional[torch.Tensor],
-    ) -> None:
+    def _stage_async_snapshots(self, *, step_counter: int) -> None:
         assert self._verify_full_total_device is not None
         assert self._verify_swa_total_device is not None
 
@@ -168,34 +149,20 @@ class SwaDivergenceStats:
             stream=self._d2h_stream,
         )
 
-        mapping_nonidentity_device = _compute_mapping_nonidentity(
-            full_to_swa_index_mapping=full_to_swa_index_mapping,
-            device=self._device,
+        allocator = (
+            self._swa_allocator_getter() if self._swa_allocator_getter is not None else None
         )
-        self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
-            src_device=mapping_nonidentity_device,
-            stream=self._d2h_stream,
-        )
+        if allocator is not None:
+            self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
+                src_device=allocator._nonidentity_write_count_device,
+                stream=self._d2h_stream,
+            )
+            self._pending_wrap_count_future = FutureTensor.device_to_host(
+                src_device=allocator._wrap_count_device,
+                stream=self._d2h_stream,
+            )
+        else:
+            self._pending_mapping_nonidentity_future = None
+            self._pending_wrap_count_future = None
+
         self._pending_step = step_counter
-
-    def _read_wrap_count(self) -> int:
-        if self._swa_allocator_getter is None:
-            return 0
-        allocator = self._swa_allocator_getter()
-        if allocator is None:
-            return 0
-        return int(allocator.wrap_count)
-
-
-def _compute_mapping_nonidentity(
-    *,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-    device: torch.device,
-) -> torch.Tensor:
-    if full_to_swa_index_mapping is None:
-        return torch.zeros(1, dtype=torch.int64, device=device)
-
-    mapping = full_to_swa_index_mapping[:-1]
-    indices = torch.arange(mapping.shape[0], device=mapping.device, dtype=mapping.dtype)
-    diff_count = (mapping != indices).sum().view(1).to(torch.int64)
-    return diff_count

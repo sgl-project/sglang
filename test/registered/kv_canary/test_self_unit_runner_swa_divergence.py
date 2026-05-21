@@ -34,8 +34,26 @@ class _RecordingFuture:
 
 
 class _FakeAllocator:
-    def __init__(self, wrap_count: int = 0) -> None:
-        self.wrap_count = wrap_count
+    def __init__(
+        self,
+        *,
+        wrap_count: int = 0,
+        nonidentity_write_count: int = 0,
+    ) -> None:
+        self._wrap_count_device = torch.tensor(
+            [wrap_count], dtype=torch.int64, device=_DEVICE
+        )
+        self._nonidentity_write_count_device = torch.tensor(
+            [nonidentity_write_count], dtype=torch.int64, device=_DEVICE
+        )
+
+    @property
+    def wrap_count(self) -> int:
+        return int(self._wrap_count_device.item())
+
+    @property
+    def nonidentity_write_count(self) -> int:
+        return int(self._nonidentity_write_count_device.item())
 
 
 class _AllocatorWrapObserver:
@@ -44,10 +62,17 @@ class _AllocatorWrapObserver:
         self._max_observed_swa_idx_device = torch.zeros(
             1, dtype=torch.int64, device=_DEVICE
         )
+        self._nonidentity_write_count_device = torch.zeros(
+            1, dtype=torch.int64, device=_DEVICE
+        )
 
     @property
     def wrap_count(self) -> int:
         return int(self._wrap_count_device.item())
+
+    @property
+    def nonidentity_write_count(self) -> int:
+        return int(self._nonidentity_write_count_device.item())
 
     def observe_swa_alloc(self, alloc_swa_indices: torch.Tensor) -> None:
         if alloc_swa_indices.numel() == 0:
@@ -62,6 +87,18 @@ class _AllocatorWrapObserver:
             batch_max,
             out=self._max_observed_swa_idx_device,
         )
+
+    def observe_swa_mapping_write(
+        self,
+        full_indices: torch.Tensor,
+        swa_indices: torch.Tensor,
+    ) -> None:
+        if full_indices.numel() == 0:
+            return
+        full_flat = full_indices.reshape(-1).to(torch.int64)
+        swa_flat = swa_indices.reshape(-1).to(torch.int64)
+        nonidentity = (swa_flat != full_flat).sum().to(torch.int64).view(1)
+        self._nonidentity_write_count_device.add_(nonidentity)
 
 
 def _make_verify_plan(value: int) -> VerifyPlan:
@@ -157,20 +194,11 @@ class TestSwaDivergenceStats(CustomTestCase):
             )
             stats.on_forward_completed()
             with _LogCapture() as capture:
-                stats.emit_log_if_due(
-                    step_counter=10, period=10, full_to_swa_index_mapping=None
-                )
+                stats.emit_log_if_due(step_counter=10, period=10)
             self.assertEqual(capture.lines(), [])
 
     def test_swa_divergence_log_emitted_when_env_enabled(self) -> None:
-        mapping = torch.arange(8, dtype=torch.int64, device=_DEVICE)
-        mapping[3] = 7
-        mapping[5] = 1
-        mapping_with_sentinel = torch.cat(
-            [mapping, torch.tensor([-1], dtype=torch.int64, device=_DEVICE)]
-        )
-
-        allocator = _FakeAllocator(wrap_count=13)
+        allocator = _FakeAllocator(wrap_count=13, nonidentity_write_count=2)
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
             True
         ), _patch_future_tensor():
@@ -192,16 +220,8 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.on_forward_completed()
 
             with _LogCapture() as capture:
-                stats.emit_log_if_due(
-                    step_counter=10,
-                    period=10,
-                    full_to_swa_index_mapping=mapping_with_sentinel,
-                )
-                stats.emit_log_if_due(
-                    step_counter=20,
-                    period=10,
-                    full_to_swa_index_mapping=mapping_with_sentinel,
-                )
+                stats.emit_log_if_due(step_counter=10, period=10)
+                stats.emit_log_if_due(step_counter=20, period=10)
 
             lines = [
                 line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
@@ -229,16 +249,8 @@ class TestSwaDivergenceStats(CustomTestCase):
 
             def _take_snapshot(step: int) -> None:
                 with _LogCapture() as capture:
-                    stats.emit_log_if_due(
-                        step_counter=step,
-                        period=10,
-                        full_to_swa_index_mapping=None,
-                    )
-                    stats.emit_log_if_due(
-                        step_counter=step + 10,
-                        period=10,
-                        full_to_swa_index_mapping=None,
-                    )
+                    stats.emit_log_if_due(step_counter=step, period=10)
+                    stats.emit_log_if_due(step_counter=step + 10, period=10)
                 matching = [
                     line
                     for line in capture.lines()
@@ -258,7 +270,7 @@ class TestSwaDivergenceStats(CustomTestCase):
                         verify_plan=_make_verify_plan(2),
                     )
                     stats.on_forward_completed()
-                allocator.wrap_count = (batch + 1) * 4
+                allocator._wrap_count_device.fill_((batch + 1) * 4)
                 _take_snapshot(step=10 + 20 * batch)
 
             for idx in range(1, len(snapshots)):
@@ -273,22 +285,15 @@ class TestSwaDivergenceStats(CustomTestCase):
                     snapshots[idx - 1]["swa_pool_wrap"],
                 )
 
-    def test_swa_divergence_mapping_nonidentity_zero_when_only_identity_writes(
-        self,
-    ) -> None:
-        identity_mapping = torch.cat(
-            [
-                torch.arange(16, dtype=torch.int64, device=_DEVICE),
-                torch.tensor([-1], dtype=torch.int64, device=_DEVICE),
-            ]
-        )
+    def test_nonidentity_write_count_emitted_from_allocator(self) -> None:
+        allocator = _FakeAllocator(wrap_count=0, nonidentity_write_count=7)
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
             True
         ), _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator_getter=lambda: _FakeAllocator(wrap_count=0),
+                swa_allocator_getter=lambda: allocator,
             )
             stats.observe_after_invoke_plan(
                 group=_make_group(PoolKind.FULL),
@@ -301,23 +306,15 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats.on_forward_completed()
 
             with _LogCapture() as capture:
-                stats.emit_log_if_due(
-                    step_counter=10,
-                    period=10,
-                    full_to_swa_index_mapping=identity_mapping,
-                )
-                stats.emit_log_if_due(
-                    step_counter=20,
-                    period=10,
-                    full_to_swa_index_mapping=identity_mapping,
-                )
+                stats.emit_log_if_due(step_counter=10, period=10)
+                stats.emit_log_if_due(step_counter=20, period=10)
 
             matching = [
                 line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
             ]
             self.assertEqual(len(matching), 1, matching)
             fields = _parse_swa_divergence_line(matching[0])
-            self.assertEqual(fields["mapping_nonidentity"], 0)
+            self.assertEqual(fields["mapping_nonidentity"], 7)
 
 
 class TestSwaPoolWrapCount(CustomTestCase):
@@ -338,6 +335,38 @@ class TestSwaPoolWrapCount(CustomTestCase):
         self.assertEqual(observer.wrap_count, 1)
         observer.observe_swa_alloc(torch.tensor([5], dtype=torch.int64))
         self.assertEqual(observer.wrap_count, 2)
+
+
+class TestSwaPoolNonidentityWriteCount(CustomTestCase):
+    def test_nonidentity_write_count_zero_when_no_alloc(self) -> None:
+        observer = _AllocatorWrapObserver()
+        self.assertEqual(observer.nonidentity_write_count, 0)
+
+    def test_nonidentity_write_count_increments_on_nonidentity_write(self) -> None:
+        observer = _AllocatorWrapObserver()
+        observer.observe_swa_mapping_write(
+            full_indices=torch.tensor([5], dtype=torch.int64),
+            swa_indices=torch.tensor([100], dtype=torch.int64),
+        )
+        self.assertEqual(observer.nonidentity_write_count, 1)
+        observer.observe_swa_mapping_write(
+            full_indices=torch.tensor([6, 7], dtype=torch.int64),
+            swa_indices=torch.tensor([200, 300], dtype=torch.int64),
+        )
+        self.assertEqual(observer.nonidentity_write_count, 3)
+
+    def test_nonidentity_write_count_unchanged_on_identity_write(self) -> None:
+        observer = _AllocatorWrapObserver()
+        observer.observe_swa_mapping_write(
+            full_indices=torch.tensor([5], dtype=torch.int64),
+            swa_indices=torch.tensor([5], dtype=torch.int64),
+        )
+        self.assertEqual(observer.nonidentity_write_count, 0)
+        observer.observe_swa_mapping_write(
+            full_indices=torch.tensor([10, 11, 12], dtype=torch.int64),
+            swa_indices=torch.tensor([10, 11, 12], dtype=torch.int64),
+        )
+        self.assertEqual(observer.nonidentity_write_count, 0)
 
 
 if __name__ == "__main__":
