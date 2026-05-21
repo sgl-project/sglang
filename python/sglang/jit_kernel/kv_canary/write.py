@@ -32,10 +32,6 @@ class WritePlan:
     Req r's write entries occupy flat indices [write_offsets[r], write_offsets[r+1]). seed_slot_idx == -1 means
     K_req_old == 0 (anchor on CANARY_CHAIN_ANCHOR).
 
-    Sweep callers fill an "empty" WritePlan (write_num_valid_reqs = 0) and skip canary_write_step entirely —
-    plan kernel always produces both VerifyPlan and WritePlan in one launch, so an unused WritePlan is the
-    price of that fusion.
-
     Fields:
         write_offsets: Exclusive prefix-sum offsets indexing into ForwardBatch's input_ids / positions /
             out_cache_loc, shape [write_req_capacity + 1], int64. write_offsets[0] == 0;

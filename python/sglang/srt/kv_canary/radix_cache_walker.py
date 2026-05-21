@@ -39,7 +39,7 @@ def walk_radix_cache_for_canary(
     - Position = depth-from-root of the slot.
 
     Returns host int64 tensors (then runner H2D-copies). NOT SWA-translated — caller does the LUT
-    lookup before packing into PlanInput.
+    lookup before writing the sweep VerifyPlan.
 
     Args:
         unlocked_only: When True, skip nodes whose cache-specific lock ref is positive (i.e.
