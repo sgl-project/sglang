@@ -1247,7 +1247,25 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 rope_type="rope_3d",
             )
         else:
+            import os
             import time
+
+            if os.environ.get("VIT_PROFILE", "") == "1":
+                with torch.profiler.profile(
+                    activities=[
+                        torch.profiler.ProfilerActivity.CPU,
+                        torch.profiler.ProfilerActivity.CUDA,
+                    ],
+                    record_shapes=True,
+                ) as prof:
+                    result = self.visual(pixel_values, grid_thw=image_grid_thw)
+                    torch.cuda.synchronize()
+                prof.export_chrome_trace("/tmp/vit_trace.json")
+                logger.info(
+                    f"[VIT] profile saved to /tmp/vit_trace.json, "
+                    f"images={len(items)} tokens={pixel_values.shape[0]}"
+                )
+                return result
 
             torch.cuda.synchronize()
             t0 = time.perf_counter()
