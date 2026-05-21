@@ -323,11 +323,21 @@ jobs:
         run: |
           python3 -m pip install -r experimental/sgl-router/tests/e2e/requirements.txt
 
+      # IMPORTANT: --ignore=tests/e2e/k8s_integration. The k8s integration
+      # suite is owned by the `sgl-router-k8s-integration` job which has
+      # kind + kubectl installed and a real cluster running. The e2e GPU
+      # runner has neither, so pytest's recursive collection of
+      # tests/e2e/ would ERROR every k8s test at setup. Both tiers must
+      # be allowed to fail independently — k8s flakes (cluster boot,
+      # image pull) must not surface as e2e failures on H100, and e2e
+      # flakes (model load, HF auth) must not surface as k8s failures.
       - name: Run e2e
         working-directory: experimental/sgl-router
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: python3 -m pytest tests/e2e/ -v -s --tb=short
+        run: |
+          python3 -m pytest tests/e2e/ -v -s --tb=short \
+            --ignore=tests/e2e/k8s_integration
 
       - name: Tokenizer parity matrix (uses HF cache populated by e2e)
         working-directory: experimental/sgl-router
