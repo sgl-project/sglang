@@ -29,7 +29,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.pool_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

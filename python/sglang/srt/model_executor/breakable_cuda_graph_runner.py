@@ -57,11 +57,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     freeze_gc,
 )
-from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -392,8 +392,9 @@ class BreakableCudaGraphRunner:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
-        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
-        try:
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -402,8 +403,6 @@ class BreakableCudaGraphRunner:
             graph = BreakableCUDAGraph()
             with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
                 output = run_once()
-        finally:
-            set_attn_backend(prev_attn_backend)
 
         return graph, output
 

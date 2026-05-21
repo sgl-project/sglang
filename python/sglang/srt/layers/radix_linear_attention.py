@@ -22,7 +22,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
-from sglang.srt.model_executor.pool_context import get_attn_backend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:

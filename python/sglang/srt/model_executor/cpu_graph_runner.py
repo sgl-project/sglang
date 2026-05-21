@@ -36,7 +36,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.model_executor.pool_context import set_attn_backend
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import (
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -702,8 +702,9 @@ class CPUGraphRunner:
         )
         # Do infernence to avoid setting attr at runtime, e.g.,
         # self.attn_mha.kv_b_proj = self.kv_b_proj for full graph compile on CPU
-        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
-        try:
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
             with torch.no_grad():
                 self.model_runner.tp_group.barrier()
                 self.model_runner.model.forward(
@@ -732,8 +733,6 @@ class CPUGraphRunner:
                 # Save the captured forward_batch
                 self.captured_forward_batches[bs] = forward_batch
                 return forward, out
-        finally:
-            set_attn_backend(prev_attn_backend)
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 

@@ -65,8 +65,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     compute_local_num_token_non_padded,
     enable_num_token_non_padded,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -1105,10 +1105,10 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        # Publish the (possibly per-stream) attn_backend into pool_context so
-        # model code reads the right backend during warmup and capture.
-        prev_attn_backend = set_attn_backend(attn_backend)
-        try:
+        # Publish the (possibly per-stream) attn_backend into the active
+        # ForwardContext so model code reads the right backend during warmup
+        # and capture.
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
             for _ in range(2):
                 self.device_module.synchronize()
                 self.model_runner.tp_group.barrier()
@@ -1123,8 +1123,6 @@ class CudaGraphRunner:
             out = self._capture_graph(
                 graph, get_global_graph_memory_pool(), stream, run_once
             )
-        finally:
-            set_attn_backend(prev_attn_backend)
 
         return graph, out
 

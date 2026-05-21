@@ -8,6 +8,10 @@ from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBack
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -112,6 +116,8 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         self.backend = FlashAttentionBackend(self.model_runner)
         self.ref_backend = TorchNativeAttnBackend(self.model_runner)
         self.num_local_heads = 2
+        # Publish the backend so RadixAttention.forward resolves correctly.
+        set_forward_context(ForwardContext(attn_backend=self.backend))
 
     def _init_model_runner(self):
         self.model_runner = MockModelRunner(
@@ -192,7 +198,6 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 extend_seq_lens_cpu=torch.tensor(
                     [q_len] * self.batch_size, device="cpu"
                 ),
-                attn_backend=self.backend,
             )
 
         else:  # ForwardMode.DECODE
@@ -216,7 +221,6 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                     [total_len] * self.batch_size, device=self.device
                 ),
                 seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
-                attn_backend=self.backend,
             )
 
         # Add token pool from model runner to forward batch
