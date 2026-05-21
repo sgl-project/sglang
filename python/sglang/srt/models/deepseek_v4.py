@@ -1623,17 +1623,28 @@ class MQALayer(nn.Module):
         # [bs, n_local_heads, head_dim]
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        q = rms_normalize_triton(q, self.eps)
 
-        if positions is not None:
-            fused_rope(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
+        if _is_hip and positions is not None:
+            q_2d = q.view(-1, self.head_dim)
+            positions_expanded = positions.unsqueeze(1).expand(
+                -1, self.n_local_heads
+            ).reshape(-1)
+            fused_norm_rope_inplace_triton(
+                q_2d, None, self.eps, self.freqs_cis, positions=positions_expanded,
             )
         else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+            q = rms_normalize_triton(q, self.eps)
+            if positions is not None:
+                fused_rope(
+                    q[..., -self.qk_rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions=positions,
+                )
+            else:
+                apply_rotary_emb_triton(
+                    q[..., -self.qk_rope_head_dim :], self.freqs_cis
+                )
         return q
 
     def _compute_kv(
@@ -1756,18 +1767,32 @@ class MQALayer(nn.Module):
         # [bs, n_local_heads, head_dim]
         q, _ = self.wq_b(q_for_wqb)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        # [bs, n_local_heads, head_dim]
-        q = rms_normalize_triton(q, self.eps)
 
         # fp8 tuple: same as wq_a
         kv = self.kv_norm(kv)
 
-        fused_rope(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
+        if _is_hip:
+            # Fused Q per-head RMSNorm + Q RoPE (single Triton kernel)
+            q_2d = q.view(-1, self.head_dim)
+            positions_expanded = positions.unsqueeze(1).expand(
+                -1, self.n_local_heads
+            ).reshape(-1)
+            fused_norm_rope_inplace_triton(
+                q_2d, None, self.eps, self.freqs_cis, positions=positions_expanded,
+            )
+            apply_rotary_emb_triton(
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
+        else:
+            q = rms_normalize_triton(q, self.eps)
+            fused_rope(
+                q[..., -self.qk_rope_head_dim :],
+                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+                self.freqs_cis,
+                positions=positions,
+            )
 
         _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         if _use_cp:
