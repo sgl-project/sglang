@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
+from contextlib import nullcontext
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -33,6 +34,9 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
@@ -1134,13 +1138,19 @@ class DeepseekV4Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
+            ctx = (
+                nullcontext()
+                if not get_global_server_args().disable_piecewise_cuda_graph
+                else get_global_expert_distribution_recorder().with_current_layer(i)
             )
+            with ctx:
+                hidden_states = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
