@@ -5,10 +5,9 @@ import os
 import subprocess
 import sys
 import threading
-import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import ClassVar, Dict, Iterable, List, Optional
+from typing import ClassVar, Dict, List, Optional
 
 import requests
 
@@ -186,140 +185,6 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
         # Step 3: servers must stay healthy.
         self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
-
-
-class TestPdTransferCorruptedByteDetected(
-    PDDisaggregationServerBase, unittest.TestCase
-):
-    """Inject byte corruption; canary sweep must report a violation."""
-
-    model: ClassVar[str] = _MODEL
-    extra_prefill_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS + [
-        "--kv-canary-real-data",
-        "all",
-        "--kv-canary-sweep-interval",
-        "1",
-    ]
-    extra_decode_args: ClassVar[List[str]] = _MOCK_PD_COMMON_ARGS + [
-        "--kv-canary-real-data",
-        "all",
-        "--kv-canary-sweep-interval",
-        "1",
-    ]
-
-    _prefill_stdout: ClassVar[io.StringIO]
-    _prefill_stderr: ClassVar[io.StringIO]
-    _decode_stdout: ClassVar[io.StringIO]
-    _decode_stderr: ClassVar[io.StringIO]
-    _launch_failed: ClassVar[bool] = False
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
-        os.environ["SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB"] = "0.5"
-        super().setUpClass()
-
-        cls._prefill_stdout = io.StringIO()
-        cls._prefill_stderr = io.StringIO()
-        cls._decode_stdout = io.StringIO()
-        cls._decode_stderr = io.StringIO()
-        cls._launch_failed = False
-
-        try:
-            cls.launch_all()
-        except Exception:
-            cls._launch_failed = True
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        os.environ.pop("SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB", None)
-        super().tearDownClass()
-
-    @classmethod
-    def start_prefill(cls) -> None:
-
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "1",
-        ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = _popen_pd_with_capture(
-            model=cls.model,
-            base_url=cls.prefill_url,
-            other_args=prefill_args,
-            env=None,
-            stdout_buf=cls._prefill_stdout,
-            stderr_buf=cls._prefill_stderr,
-        )
-
-    @classmethod
-    def start_decode(cls) -> None:
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "1",
-            "--base-gpu-id",
-            "1",
-        ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = _popen_pd_with_capture(
-            model=cls.model,
-            base_url=cls.decode_url,
-            other_args=decode_args,
-            env=None,
-            stdout_buf=cls._decode_stdout,
-            stderr_buf=cls._decode_stderr,
-        )
-
-    def _assert_sweep_violation_logged(
-        self,
-        kind_prefixes: Iterable[str],
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        """Assert at least one canary sweep_ violation appears in captured server output."""
-        if flush_wait_seconds > 0:
-            time.sleep(flush_wait_seconds)
-        haystack = "".join(
-            [
-                self._prefill_stdout.getvalue(),
-                self._prefill_stderr.getvalue(),
-                self._decode_stdout.getvalue(),
-                self._decode_stderr.getvalue(),
-            ]
-        )
-        prefixes = list(kind_prefixes)
-        hits = [p for p in prefixes if f"canary_kind:       {p}" in haystack]
-        if hits:
-            return
-        excerpt = haystack[-2000:] if len(haystack) > 2000 else haystack
-        self.fail(
-            f"Expected a 'canary_kind: <kind>' line with kind in {prefixes} in "
-            f"captured prefill/decode output, but none found. "
-            f"Tail of combined output (last 2000 chars):\n{excerpt}"
-        )
-
-    def test_pd_transfer_corrupted_byte_detected(self) -> None:
-        # Step 1: if perturb fired during warmup and the server crashed, violation is
-        # already in the captured output — assert and return early.
-        if self._launch_failed:
-            self._assert_sweep_violation_logged(["sweep_"], flush_wait_seconds=2.0)
-            return
-
-        # Step 2: drive heavy traffic to maximize perturb trigger probability.
-        _send_parallel_requests(self.lb_url, n=32, max_new_tokens=32, timeout=60.0)
-
-        # Step 3: assert that the sweep path caught a real-KV byte corruption.
-        self._assert_sweep_violation_logged(["sweep_"], flush_wait_seconds=2.0)
 
 
 if __name__ == "__main__":

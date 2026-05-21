@@ -156,7 +156,8 @@ class PerForwardOrchestrator:
             )
 
         self._perturb_hook.perturb_req_to_token_hook(forward_batch)
-        self._perturb_hook.perturb_real_kv_hook(forward_batch)
+        self._perturb_hook.perturb_real_kv_used_hook(forward_batch)
+        self._perturb_hook.perturb_real_kv_unused_cache_hook(forward_batch)
 
         if self._config.input_check_mode:
             manager = self._token_oracle_manager

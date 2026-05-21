@@ -18,6 +18,7 @@ namespace canary {
 namespace {
 
 constexpr uint32_t kVerifyBlockSize = 128;
+constexpr uint32_t kPersistentBlocks = 64;
 
 // Per-launch parameters packed into a single struct so the kernel signature stays manageable. Pointers are
 // raw int64*/int32*/uint8* views of tvm-ffi TensorView::data_ptr() results.
@@ -48,89 +49,79 @@ struct VerifyKernelParams {
 };
 
 __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ p) {
-  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t lane_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t stride = gridDim.x * blockDim.x;
 
-  // Unconditional kernel_run_counter bump (single writer per launch). Health monitor reads this to detect
-  // "canary actually ran" across warmup forwards with all-padding plans.
-  if (tid == 0) {
+  if (lane_tid == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
   }
 
-  // Partial-fallback gate: when the plan kernel detects requested > verify_capacity it sets
-  // verify_enable[0] = 0 to skip the whole verify launch this step. Done after the kernel_run_counter bump
-  // so the "canary actually ran" health signal is preserved; slot_run_counter stays at 0 for the skipped step.
   if (*p.verify_enable == 0) {
     return;
   }
 
   const int32_t active = *p.verify_num_valid;
-  const bool is_active_entry = (tid < static_cast<uint32_t>(active));
 
-  // slot_run_counter: warp-reduce per-thread "did I process an active entry?" via __ballot_sync + popc,
-  // then warp-leader atomicAdd. Done outside the early-exit so the popc covers the whole warp even when
-  // some lanes are inactive.
-  const unsigned int warp_mask = __ballot_sync(0xFFFFFFFFu, is_active_entry);
-  if ((threadIdx.x & 31u) == 0u && warp_mask != 0u) {
+  uint32_t local_active_count = 0;
+  for (uint32_t entry = lane_tid; entry < static_cast<uint32_t>(active); entry += stride) {
+    ++local_active_count;
+
+    const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[entry]);
+    const int64_t expected_position = static_cast<int64_t>(p.verify_positions[entry]);
+    const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[entry]);
+
+    if (slot_idx == kCanaryReservedSlot) {
+      continue;
+    }
+
+    const int64_t stored_token = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldToken);
+    const int64_t stored_position =
+        canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    const int64_t stored_chain_hash =
+        canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash);
+    const int64_t stored_real_kv_hash =
+        canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash);
+
+    const int64_t expected_chain_hash =
+        static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
+
+    const uint64_t expected_real_kv_hash_u64 =
+        real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
+    const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
+
+    FailReason fail_reason_bits{};
+    if (stored_chain_hash != expected_chain_hash) {
+      fail_reason_bits |= FailReason::kChainHash;
+    }
+    if (stored_position != expected_position) {
+      fail_reason_bits |= FailReason::kPosition;
+    }
+    if (stored_real_kv_hash != expected_real_kv_hash) {
+      fail_reason_bits |= FailReason::kRealKvHash;
+    }
+
+    if (fail_reason_bits != FailReason{}) {
+      record_violation(
+          p.violation_sink,
+          ViolationRow{
+              /* slot_idx = */ slot_idx,
+              /* position = */ stored_position,
+              /* stored_token = */ stored_token,
+              /* expected_token = */ 0,
+              /* stored_chain_hash = */ stored_chain_hash,
+              /* expected_aux = */ expected_chain_hash,
+              /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),
+          });
+    }
+  }
+
+  uint32_t warp_active_count = local_active_count;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    warp_active_count += __shfl_down_sync(0xFFFFFFFFu, warp_active_count, offset);
+  }
+  if ((threadIdx.x & 31u) == 0u && warp_active_count != 0u) {
     atomicAdd(
-        reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(__popc(warp_mask)));
-  }
-
-  if (!is_active_entry) {
-    return;
-  }
-
-  const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[tid]);
-  const int64_t expected_position = static_cast<int64_t>(p.verify_positions[tid]);
-  const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[tid]);
-
-  // Skip the reserved padding sentinel so unfilled req_to_token positions (zero-initialized) do not
-  // produce spurious chain_hash/position violations from an untouched slot.
-  if (slot_idx == kCanaryReservedSlot) {
-    return;
-  }
-
-  const int64_t stored_token = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldToken);
-  const int64_t stored_position = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
-  const int64_t stored_chain_hash =
-      canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash);
-  const int64_t stored_real_kv_hash =
-      canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldRealKvHash);
-
-  // Expected chain hash: advance the chain one step from prev_slot_idx (or anchor on
-  // splitmix64(kCanaryChainAnchor) when prev_slot_idx < 0 = chain head).
-  const int64_t expected_chain_hash =
-      static_cast<int64_t>(compute_slot_hash(p.canary_buf, p.slot_stride_bytes, prev_slot_idx));
-
-  const uint64_t expected_real_kv_hash_u64 =
-      real_kv_fold_sources(p.sources, p.num_sources, slot_idx, p.real_kv_hash_mode);
-  const int64_t expected_real_kv_hash = static_cast<int64_t>(expected_real_kv_hash_u64);
-
-  FailReason fail_reason_bits{};
-  if (stored_chain_hash != expected_chain_hash) {
-    fail_reason_bits |= FailReason::kChainHash;
-  }
-  if (stored_position != expected_position) {
-    fail_reason_bits |= FailReason::kPosition;
-  }
-  if (stored_real_kv_hash != expected_real_kv_hash) {
-    fail_reason_bits |= FailReason::kRealKvHash;
-  }
-
-  if (fail_reason_bits != FailReason{}) {
-    // Verify path has no token oracle, so the violation row's "expected_token" column is 0 (matches the
-    // torch reference). The "stored_chain_hash" column carries the slot's stored prev_hash; the
-    // "expected_aux" column carries the recomputed expected chain hash.
-    record_violation(
-        p.violation_sink,
-        ViolationRow{
-            /* slot_idx = */ slot_idx,
-            /* position = */ stored_position,
-            /* stored_token = */ stored_token,
-            /* expected_token = */ 0,
-            /* stored_chain_hash = */ stored_chain_hash,
-            /* expected_aux = */ expected_chain_hash,
-            /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),
-        });
+        reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(warp_active_count));
   }
 }
 
@@ -273,11 +264,7 @@ inline void canary_verify_step_cuda(
   p.num_sources = static_cast<int32_t>(num_sources);
   p.real_kv_hash_mode = static_cast<RealKvHashMode>(real_kv_hash_mode);
 
-  // Grid: one thread per verify_capacity entry; the kernel early-exits on tid >= verify_num_valid[0].
-  // Always launch at least one block so the unconditional kernel_run_counter bump runs even when
-  // verify_capacity == 0.
-  const uint32_t effective_threads = verify_capacity == 0 ? 1u : static_cast<uint32_t>(verify_capacity);
-  const uint32_t grid = div_ceil(effective_threads, kVerifyBlockSize);
+  const uint32_t grid = kPersistentBlocks;
   LaunchKernel(grid, kVerifyBlockSize, device)(canary_verify_kernel, p);
 }
 

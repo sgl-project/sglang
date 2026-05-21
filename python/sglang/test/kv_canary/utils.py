@@ -25,7 +25,13 @@ _DEFAULT_PROMPTS: List[str] = [
 
 
 class CanaryE2EBase(CustomTestCase):
-    """Common scaffold for canary server-launch e2e tests.
+    """Deprecated: superseded by ``sglang.test.kv_canary.e2e_base.CanaryE2EBase``.
+
+    New canary e2e tests must use the e2e_base version, which drives server launch
+    from a ``mode = "mha" / "swa"`` class attribute plus declarative ``perturb_env``,
+    ``sweep_interval`` and ``kv_canary_mode`` knobs. This older base is kept only as
+    long as legacy callers (currently ``test_self_e2e_swa_gemma3.py``) still depend on
+    it; once those migrate, delete this class.
 
     Subclasses set ``model`` and (optionally) ``extra_server_args``,
     ``perturb_prob``, ``kv_canary_mode``. ``setUpClass`` launches the server
