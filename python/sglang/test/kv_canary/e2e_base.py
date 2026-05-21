@@ -76,6 +76,7 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
+
 class CanaryE2EBase(CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
     ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
@@ -287,7 +288,9 @@ class CanaryE2EBase(CustomTestCase):
                 f"SWA divergence not observed: swa_pool_wrap={last_parsed.swa_pool_wrap} "
                 f"< min={min_pool_wrap}. Line: {last_line}"
             )
-        if require_verify_lag and not (last_parsed.verify_swa < last_parsed.verify_full):
+        if require_verify_lag and not (
+            last_parsed.verify_swa < last_parsed.verify_full
+        ):
             raise AssertionError(
                 f"SWA divergence not observed: verify_swa={last_parsed.verify_swa} "
                 f"not strictly less than verify_full={last_parsed.verify_full}. "
