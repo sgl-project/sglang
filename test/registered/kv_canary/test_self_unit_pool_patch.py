@@ -112,9 +112,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
                     self.assertEqual(ptrs_after, ptrs_before)
 
     def test_swa_attach_splices_full_into_contiguous_and_swa_into_state(self):
-        """FULL group splices into ``get_contiguous_buf_infos`` (FULL sub-pool),
-        SWA group splices into ``get_state_buf_infos`` (SWA sub-pool). +4 entries each
-        (K head + K tail + V head + V tail)."""
+        """Verify SWA patching splices canary buffers into both buffer lists."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         contiguous_before, _, _ = pool.get_contiguous_buf_infos()
         state_before, _, _ = pool.get_state_buf_infos()
