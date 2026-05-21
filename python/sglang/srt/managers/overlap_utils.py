@@ -60,18 +60,15 @@ class FutureMap:
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
         else:
-            # Schedule-consumed buf (new_seq_lens_buf): eager, fixed shape /
-            # dtype so publish() can write unconditionally from iter 1.
+            # Schedule-consumed buf, eager fixed dtype.
             self.new_seq_lens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-            # bonus_tokens_buf is forward-only but its dtype is fixed —
-            # eagerly allocate so stash() doesn't need to peek shape.
+            # Forward-only buf, eager fixed dtype.
             self.bonus_tokens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
             )
-            # Forward-only bufs: lazy because per-req shape depends on worker
-            # (topk * num_steps for multi-layer EAGLE) and hidden dtype.
+            # Remaining forward-only bufs are lazy (worker-dependent shape).
             self._forward_buf_initialized = False
 
         # Fences the schedule-consumed buf fields.
