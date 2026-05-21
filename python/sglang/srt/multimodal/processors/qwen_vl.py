@@ -721,7 +721,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
-        input_ids_list = input_ids.tolist()
+        if (
+            isinstance(base_output.input_ids, list)
+            and len(base_output.input_ids) == input_ids.numel()
+        ):
+            input_ids_list = base_output.input_ids
+        else:
+            input_ids_list = input_ids.tolist()
         padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
         if padded_input_ids is None:
             padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(

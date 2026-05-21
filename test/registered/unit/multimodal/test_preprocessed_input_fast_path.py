@@ -41,6 +41,20 @@ class DummyProcessor(BaseMultimodalProcessor):
         raise NotImplementedError
 
 
+class NoToListInputIds:
+    def __init__(self, values):
+        self.values = values
+
+    def flatten(self):
+        return self
+
+    def numel(self):
+        return len(self.values)
+
+    def tolist(self):
+        raise AssertionError("input_ids.tolist should not run")
+
+
 def make_processor():
     processor = DummyProcessor.__new__(DummyProcessor)
     processor._tokenizer = FailingTokenizer()
@@ -451,6 +465,50 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
             MultimodalProcessorOutput.build_padded_input_ids = original_build
 
         self.assertEqual(output.padded_input_ids, padded_input_ids)
+
+    def test_qwen_reuses_base_output_input_ids_list(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        processor.hf_config = SimpleNamespace(
+            model_type="qwen3_5",
+            vision_config=SimpleNamespace(spatial_merge_size=1, tokens_per_second=None),
+        )
+        processor.model_type = "qwen3_5"
+        processor.mm_tokens = SimpleNamespace(
+            image_token_id=42,
+            video_token_id=43,
+            audio_token_id=None,
+        )
+        processor.vision_start_token_id = 11
+        processor.vision_end_token_id = 12
+        processor.audio_start_token_id = None
+
+        input_ids = [11, 42, 42, 12]
+        padded_input_ids = [11, -1001, -1001, 12]
+        processor_output = {
+            "padded_input_ids": padded_input_ids,
+            "mrope_positions": torch.arange(12, dtype=torch.long).reshape(3, 4),
+            "mrope_position_delta": torch.tensor([[0]], dtype=torch.long),
+        }
+        base_output = BaseMultiModalProcessorOutput(
+            input_text="",
+            input_ids=input_ids,
+            images=[processor_output],
+        )
+        request_obj = SimpleNamespace(
+            rid="rid",
+            video_data=None,
+            audio_data=None,
+        )
+        processor.load_mm_data = lambda **kwargs: base_output
+        processor.process_and_combine_mm_data = lambda *args, **kwargs: (
+            [],
+            NoToListInputIds(input_ids),
+            processor_output,
+        )
+
+        output = asyncio.run(processor.process_mm_data_async([], "", request_obj))
+
+        self.assertIs(output.input_ids, input_ids)
 
 
 if __name__ == "__main__":
