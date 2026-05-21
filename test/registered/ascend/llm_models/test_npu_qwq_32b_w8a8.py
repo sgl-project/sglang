@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
@@ -29,6 +30,7 @@ class TestQWQ32BW8A8(GSM8KAscendMixin, CustomTestCase):
         "--quantization",
         "modelslim",
     ]
+    os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 
 if __name__ == "__main__":

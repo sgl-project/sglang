@@ -21,8 +21,12 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 if _use_aiter:
     from aiter.tuned_gemm import tgemm
 
+from sglang.srt.layers import deep_gemm_wrapper
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+_linear_bf16_fp32_algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
 
 
 def make_name(name: str) -> str:
@@ -1013,10 +1017,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    from sglang.srt.environ import envs
-
-    algo = envs.SGLANG_OPT_BF16_FP32_GEMM_ALGO.get()
-    return _dispatch_bf16_fp32_backend(x, y, algo=algo)
+    return _dispatch_bf16_fp32_backend(x, y, algo=_linear_bf16_fp32_algo)
 
 
 def _dispatch_bf16_fp32_backend(
@@ -1026,10 +1027,8 @@ def _dispatch_bf16_fp32_backend(
         module = _jit_torch_cublas_bf16_fp32()
         return module.linear_bf16_fp32(x, y)
     elif algo == "deep_gemm":
-        import deep_gemm
-
-        z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
-        deep_gemm.bf16_gemm_nt(x, y, z)
+        z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
+        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
     elif _use_aiter:
         return tgemm.mm(x, y, otype=torch.float32)
