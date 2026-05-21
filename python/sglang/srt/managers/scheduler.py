@@ -22,6 +22,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -2844,18 +2845,18 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
-                    # Callback the worker fires between sample (target-end /
-                    # verify-end) and draft_extend for spec_v2. Writes
-                    # new_seq_lens_buf and records the cross-stream fence
-                    # early so schedule prep can overlap with draft_extend.
-                    # Only spec_v2 workers accept this kwarg.
-                    fwd_kwargs = {}
-                    if batch.is_spec_v2:
-
-                        def on_verify_complete(new_seq_lens):
-                            self.future_map.publish(future_indices, new_seq_lens)
-
-                        fwd_kwargs["on_verify_complete"] = on_verify_complete
+                    # Spec_v2 worker fires this between sample-end and
+                    # draft_extend; publish moves the fence to verify-end so
+                    # schedule prep can overlap with draft_extend.
+                    fwd_kwargs = (
+                        {
+                            "on_verify_complete": partial(
+                                self.future_map.publish, future_indices
+                            )
+                        }
+                        if batch.is_spec_v2
+                        else {}
+                    )
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
