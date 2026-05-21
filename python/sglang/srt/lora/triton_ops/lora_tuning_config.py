@@ -40,6 +40,19 @@ from sglang.srt.utils import get_device_name
 
 logger = logging.getLogger(__name__)
 
+# PCG / Dynamo compatibility: get_device_name() reaches into the CUDA driver
+# and returns a Python str, which Dynamo refuses to trace under fullgraph=True.
+# Resolve it once at first call and reuse the cached string — Dynamo then sees
+# a plain str constant via the cached read instead of a torch.cuda call.
+_DEVICE_NAME_CACHED: Optional[str] = None
+
+
+def _device_name_for_config_key() -> str:
+    global _DEVICE_NAME_CACHED
+    if _DEVICE_NAME_CACHED is None:
+        _DEVICE_NAME_CACHED = get_device_name().replace(" ", "_")
+    return _DEVICE_NAME_CACHED
+
 
 def get_lora_config_file_name(
     kernel: str,
@@ -55,7 +68,7 @@ def get_lora_config_file_name(
         R: The max LoRA rank
         S: num_slices (qkv=3, gate_up=2, others=1)
     """
-    device_name = get_device_name().replace(" ", "_")
+    device_name = _device_name_for_config_key()
     return f"lora_{kernel},K={K},R={R},S={S},device={device_name}.json"
 
 

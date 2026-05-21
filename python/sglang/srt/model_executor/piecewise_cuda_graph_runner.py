@@ -150,12 +150,13 @@ def set_torch_compile_config():
     if hasattr(torch._dynamo.config, "cache_size_limit"):
         torch._dynamo.config.cache_size_limit = 1024
 
-    # A-Lite: by default Dynamo treats integer attributes of nn.Modules as static,
-    # so `lora_backend.batch_info.bs` (read inside sgemm_lora kernel grids)
-    # becomes a specialization guard that fails when bs changes between
-    # capture and replay (or between captures). Setting this to True lets
-    # Dynamo treat such ints as dynamic — a single captured graph handles
-    # multiple bs values at replay via tensor-backed int parameters.
+    # A-Lite: allow_unspec_int_on_nn_module lets Dynamo treat
+    # `lora_backend.batch_info.bs` as dynamic so the captured cudaGraph at one
+    # bs bucket can replay at a different live bs without firing a recompile
+    # ("PCG capture stream is not set" assert). The flag also has a 4x per-call
+    # overhead cost (Inductor runtime guard cost grows under dynamic-int), so
+    # we keep `capture_bs_buckets` small ([1, 4]) to minimize the number of
+    # captured shapes contributing to per-call work.
     if hasattr(torch._dynamo.config, "allow_unspec_int_on_nn_module"):
         torch._dynamo.config.allow_unspec_int_on_nn_module = True
 
@@ -258,13 +259,16 @@ class PiecewiseCudaGraphRunner:
         # beyond live bs are padded with seg_lens=0 / weight_indices=0
         # (handled by triton_backend.prepare_lora_batch).
         if model_runner.server_args.enable_lora:
-            # Empirically [1, 16] gives the best speedup vs eager at bs<=16;
-            # wider buckets (e.g. [1, 16, 256, 2048]) trigger a sharp PCG
-            # slowdown (~30x) — likely guard-checking cost growing with cache
-            # entry count under allow_unspec_int_on_nn_module=True. Beyond
-            # max_capture_bs we fall back to eager (still correct, and faster
-            # than wide-bucket PCG anyway).
-            self.capture_bs_buckets = sorted(set([1, 16]))
+            # Per-bs cuda graph capture: each bucket has its own kernel grid
+            # `(num_pid_s * num_pid_n, batch_info.bs)`. The grid scales linearly
+            # with the bucket size; at bs_bucket=16 the LoRA sgemm kernel
+            # launches ~16x more blocks than at bs_bucket=1, even when most
+            # are no-ops (early-return on seg_len=0). Empirically bs_bucket=16
+            # is already slower than eager LoRA for the same live bs because
+            # of block-dispatch overhead. We restrict PCG dispatch to bs<=4
+            # buckets and let larger bs fall back to eager (or the sglang
+            # decode-cuda-graph path, which is faster than pure eager).
+            self.capture_bs_buckets = sorted(set([1, 4]))
         else:
             self.capture_bs_buckets = [1]
         self.max_capture_bs = max(self.capture_bs_buckets)

@@ -15,6 +15,19 @@ from sglang.srt.utils import get_device_name, is_hip
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
+# PCG / Dynamo compatibility: get_device_name() reaches into the CUDA driver
+# and returns a Python str, which Dynamo refuses to trace under fullgraph=True.
+# Resolve it once at first call and reuse the cached string — Dynamo then sees
+# a plain str constant via the cached read instead of a torch.cuda call.
+_DEVICE_NAME_CACHED: Optional[str] = None
+
+
+def _device_name_for_config_key() -> str:
+    global _DEVICE_NAME_CACHED
+    if _DEVICE_NAME_CACHED is None:
+        _DEVICE_NAME_CACHED = get_device_name().replace(" ", "_")
+    return _DEVICE_NAME_CACHED
+
 
 def get_config_file_name(
     E: int,
@@ -24,7 +37,7 @@ def get_config_file_name(
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> str:
-    device_name = get_device_name().replace(" ", "_")
+    device_name = _device_name_for_config_key()
     dtype_selector = "" if not dtype else f",dtype={dtype}"
     block_shape_selector = (
         "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"

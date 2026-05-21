@@ -108,9 +108,7 @@ class BreakableCudaGraphRunner:
         # still bake their kernel grids (which include batch_info.bs). So we
         # still need one cuda graph per (num_tokens, bs_bucket).
         if model_runner.server_args.enable_lora:
-            # Mirror PCG's [1, 16] choice; see piecewise_cuda_graph_runner.py
-            # for the wider-bucket slowdown rationale.
-            self.capture_bs_buckets = sorted(set([1, 16]))
+            self.capture_bs_buckets = sorted(set([1, 4]))
         else:
             self.capture_bs_buckets = [1]
         self.max_capture_bs = max(self.capture_bs_buckets)
