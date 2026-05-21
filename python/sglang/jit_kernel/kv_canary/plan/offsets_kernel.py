@@ -287,10 +287,18 @@ def _plan_offsets_kernel(
 
     window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)  # [BS_BLOCK]
 
+    verify_lens = prefix_lens - window_starts  # [BS_BLOCK]
+    verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
+    verify_lens = tl.where(is_active, verify_lens, 0)
+    verify_exclusive, total_verify = _exclusive_offsets_and_total(verify_lens)
+
+    write_lens = tl.where(extend_lens > 0, extend_lens, 0)  # [BS_BLOCK]
+    write_lens = tl.where(is_active, write_lens, 0)
+    write_exclusive, total_write = _exclusive_offsets_and_total(write_lens)
+
     _plan_verify_offsets(
-        prefix_lens,
-        window_starts,
-        is_active,
+        verify_exclusive,
+        total_verify,
         bs_offs,
         bs_mask,
         out_verify_offsets_ptr,
@@ -302,9 +310,10 @@ def _plan_offsets_kernel(
     _plan_write_offsets(
         rpi,
         prefix_lens,
-        extend_lens,
+        write_lens,
+        write_exclusive,
+        total_write,
         has_prefix,
-        is_active,
         bs_offs,
         bs_mask,
         req_to_token_ptr,
@@ -323,10 +332,15 @@ def _plan_offsets_kernel(
 
 
 @triton.jit
+def _exclusive_offsets_and_total(lens):
+    inclusive = tl.cumsum(lens, axis=0)
+    return inclusive - lens, tl.sum(lens, axis=0)
+
+
+@triton.jit
 def _plan_verify_offsets(
-    prefix_lens,
-    window_starts,
-    is_active,
+    verify_exclusive,
+    total_verify,
     bs_offs,
     bs_mask,
     out_verify_offsets_ptr,
@@ -335,27 +349,11 @@ def _plan_verify_offsets(
     bs,
     VERIFY_CAPACITY: tl.constexpr,
 ):
-    verify_lens = prefix_lens - window_starts  # [BS_BLOCK]
-    verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
-    verify_lens = tl.where(is_active, verify_lens, 0)
-
-    # Inclusive cumsum → exclusive offsets via subtraction.
-    verify_inclusive = tl.cumsum(verify_lens, axis=0)  # [BS_BLOCK]
-    verify_exclusive = verify_inclusive - verify_lens  # [BS_BLOCK]
-
-    # Scatter exclusive offsets into the [bs+1]-sized output tensor. Positions [0, bs) get the exclusive sum;
-    # position bs gets the total (totals = verify_inclusive at index bs - 1 if bs > 0, else 0).
-    out_offsets_mask = bs_mask  # [BS_BLOCK] bool
     tl.store(
         out_verify_offsets_ptr + bs_offs,
         verify_exclusive.to(tl.int64),
-        mask=out_offsets_mask,
+        mask=bs_mask,
     )
-
-    # Totals: sum of all per-req lens. Same value as the last inclusive entry but tl.sum is robust to bs == 0.
-    total_verify = tl.sum(verify_lens, axis=0)  # scalar
-
-    # Store the [bs] slot of verify_offsets (one element past the last per-req entry).
     tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int64))
 
     # Scalar writes: out_verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
@@ -372,9 +370,10 @@ def _plan_verify_offsets(
 def _plan_write_offsets(
     rpi,
     prefix_lens,
-    extend_lens,
+    write_lens,
+    write_exclusive,
+    total_write,
     has_prefix,
-    is_active,
     bs_offs,
     bs_mask,
     req_to_token_ptr,
@@ -390,9 +389,6 @@ def _plan_write_offsets(
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
 ):
-    write_lens = tl.where(extend_lens > 0, extend_lens, 0)  # [BS_BLOCK]
-    write_lens = tl.where(is_active, write_lens, 0)
-
     has_write_contribution = has_prefix & (write_lens > 0)  # [BS_BLOCK] bool
 
     # Seed slot per req. prefix_lens == 0 means no prefix → -1 sentinel. Padding row → no write contribution
@@ -421,10 +417,6 @@ def _plan_write_offsets(
         has_write_contribution, seed_translated, minus_one
     )  # [BS_BLOCK]
 
-    # Inclusive cumsum → exclusive offsets via subtraction.
-    write_inclusive = tl.cumsum(write_lens, axis=0)  # [BS_BLOCK]
-    write_exclusive = write_inclusive - write_lens  # [BS_BLOCK]
-
     write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN  # [BS_BLOCK] bool
     tl.store(
         out_write_offsets_ptr + bs_offs,
@@ -439,9 +431,6 @@ def _plan_write_offsets(
         seed_slot.to(tl.int64),
         mask=seed_mask,
     )
-
-    # Totals: sum of all per-req lens. Same value as the last inclusive entry but tl.sum is robust to bs == 0.
-    total_write = tl.sum(write_lens, axis=0)  # scalar
 
     # Store the [bs] slot of out_write_offsets (one element past the last per-req entry).
     # out_write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
