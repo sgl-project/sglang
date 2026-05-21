@@ -48,8 +48,8 @@ def collect_active_slots(
     if req_pool_indices is None or seq_lens is None:
         return []
 
-    table = req_to_token_pool.req_to_token
-    if not isinstance(table, torch.Tensor) or table.numel() == 0:
+    req_to_token = req_to_token_pool.req_to_token
+    if not isinstance(req_to_token, torch.Tensor) or req_to_token.numel() == 0:
         return []
 
     excluded: set[int] = set()
@@ -60,7 +60,7 @@ def collect_active_slots(
 
     req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
     seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
-    rows, cols = int(table.shape[0]), int(table.shape[1])
+    rows, cols = int(req_to_token.shape[0]), int(req_to_token.shape[1])
 
     candidates: list[ActiveSlotTarget] = []
     for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
@@ -71,7 +71,7 @@ def collect_active_slots(
         upper = min(seq_len_int, cols)
         if upper <= 0:
             continue
-        row_slots = table[req_pool_idx_int, :upper].detach().to("cpu").tolist()
+        row_slots = req_to_token[req_pool_idx_int, :upper].detach().to("cpu").tolist()
         for pos, raw_slot in enumerate(row_slots):
             slot = int(raw_slot)
             if slot < 0:
