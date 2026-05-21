@@ -42,8 +42,18 @@ logger = logging.getLogger(__name__)
 
 # Repo-relative path to the release binary. Set ``SGL_ROUTER_BINARY`` to
 # override (e.g. a debug build, or a non-default ``CARGO_TARGET_DIR``).
+# This file is at `experimental/sgl-router/tests/e2e/infra/gateway.py`,
+# so four `.parent` hops to reach the sgl-router workspace root
+# (infra → e2e → tests → sgl-router). Cargo lands the binary at
+# `experimental/sgl-router/target/release/sgl-router`. A previous
+# version used three hops and pointed at `tests/target/`, which
+# would have broken any test that actually launches the router via
+# this helper.
 DEFAULT_BINARY = (
-    Path(__file__).resolve().parent.parent.parent / "target" / "release" / "sgl-router"
+    Path(__file__).resolve().parent.parent.parent.parent
+    / "target"
+    / "release"
+    / "sgl-router"
 )
 
 
