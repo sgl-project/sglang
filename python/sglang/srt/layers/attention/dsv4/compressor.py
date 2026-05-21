@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
+from sglang.jit_kernel.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-    linear_bf16_fp32,
-    triton_create_paged_compress_data,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs

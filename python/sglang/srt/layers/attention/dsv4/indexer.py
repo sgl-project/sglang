@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
     topk_transform_512_v2,

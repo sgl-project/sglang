@@ -79,7 +79,7 @@ try:
 except ImportError:
     pass
 
-from sglang.jit_kernel.deepseek_v4 import mask_topk_ids
+from sglang.jit_kernel.dsv4 import mask_topk_ids
 from sglang.srt.distributed import (
     get_moe_expert_parallel_rank,
     get_moe_expert_parallel_world_size,
