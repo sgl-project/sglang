@@ -154,8 +154,7 @@ class TestPerturbManager(CustomTestCase):
 
 class TestRealKvPostForwardPerturb(CustomTestCase):
     def test_real_kv_post_forward_flips_a_byte_in_out_cache_loc_slot(self) -> None:
-        """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers
-        untouched."""
+        """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers untouched."""
         device = DEFAULT_DEVICE
         group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]

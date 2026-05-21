@@ -29,11 +29,7 @@ class TestPDBaselineSwa(CanaryPDFixture, unittest.TestCase):
 
 
 class _PDPerturbBase(CanaryPDFixture):
-    """Perturb point (d): P-side post-forward flip on a slot in out_cache_loc just
-    before send_kv_chunk transfers it to D. D's first decode forward HEAD/TAIL
-    kernel verifies against the canary written before the flip, so the
-    real_kv_hash mismatch shows up on the D-side log only.
-    """
+    """Perturb point (d): P-side post-forward flip; D-side detects the real_kv_hash mismatch."""
 
     target_group: ClassVar[TargetGroupKind]
 

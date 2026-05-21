@@ -21,14 +21,7 @@ _SHORT_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 8).strip
 
 
 class CanaryPDFixture(PDDisaggregationServerBase):
-    """Base for PD disagg canary self-tests.
-
-    Launches P + D + LB with ``--kv-canary <mode>`` and a per-mode model
-    (MHA: Qwen3-0.6B, SWA: gemma-3-1b-it). Subclasses set ``model_mode`` and
-    optionally ``extra_prefill_env`` / ``extra_decode_env`` to drive P-only or
-    D-only perturbation. Log-assertion helpers parse the ViolationReporter line
-    format on either side independently.
-    """
+    """Base for PD disagg canary self-tests."""
 
     model_mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[CanaryMode] = CanaryMode.LOG
@@ -68,8 +61,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
         max_new_tokens: int = 1,
         timeout: float = 60.0,
     ) -> list[dict]:
-        """Fan out n parallel /generate requests with short prompts so each request fits
-        in a single prefill forward (no chunked-prefill on the P side)."""
+        """Fan out n parallel /generate requests with short prompts."""
         prompts = [_SHORT_PROMPT_BODY] * n
 
         def _send(prompt: str) -> dict:
@@ -105,9 +97,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
         target_group: TargetGroupKind,
         flush_wait_seconds: float = 4.0,
     ) -> None:
-        """Scan the decode-side log for a HEAD_*/TAIL_* canary violation matching the
-        target group. The longer default flush_wait_seconds accounts for D-side D2H
-        pump latency plus PD transfer overhead."""
+        """Assert a HEAD_*/TAIL_* canary violation for target_group appears on the decode side."""
         suffix = f"_{target_group.name}"
         self._assert_violation_logged_any(
             side="decode",
