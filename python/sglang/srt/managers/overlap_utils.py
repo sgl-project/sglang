@@ -117,6 +117,11 @@ class FutureMap:
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             # Resolve seq_lens placeholder (-indices) to the post-verify view.
             batch.seq_lens = draft_input.new_seq_lens
+            # Async guard: post-resolve all values must be positive (real
+            # seq_lens). Catches a stale (-indices) sentinel slipping through
+            # if publish_ready fencing or buf indexing is wrong. CPU-free,
+            # surfaces on next stream sync.
+            torch._assert_async((batch.seq_lens > 0).all())
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
