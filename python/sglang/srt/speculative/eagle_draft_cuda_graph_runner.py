@@ -522,8 +522,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.seq_lens,
             forward_batch.out_cache_loc,
             forward_batch.positions,
-            forward_batch.spec_info.topk_p,
-            forward_batch.spec_info.topk_index,
+            forward_batch.spec_info.topk_p.clamp(0, 1),
+            forward_batch.spec_info.topk_index.clamp(
+                0, self.model_runner.model_config.vocab_size - 1
+            ),
             forward_batch.req_pool_indices,
         ]
         if buffers.rids_int is not None and forward_batch.rids_int is not None:
