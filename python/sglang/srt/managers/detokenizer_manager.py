@@ -44,6 +44,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.network import get_zmq_socket
+from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import (
     TypeBasedDispatcher,
@@ -189,6 +190,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         space_list: List[bool],
     ) -> List[str]:
         """Batch decode with grouping by (skip_special_tokens, spaces_between_special_tokens)."""
+
+        if not getattr(self.tokenizer, "is_fast", False):
+            return [
+                decode_without_hf_kwargs(self.tokenizer, ids, skip)
+                for ids, skip in zip(ids_list, skip_list)
+            ]
 
         # fast path
         first_skip, first_space = skip_list[0], space_list[0]
