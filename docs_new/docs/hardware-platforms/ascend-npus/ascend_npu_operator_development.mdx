@@ -5,12 +5,20 @@ description: "How to develop custom operators (Ascend C / Triton) for Ascend NPU
 
 ## Overview
 
-[SGL-Kernel-NPU](https://github.com/sgl-project/sgl-kernel-npu) is the official operator library provided by the SGLang framework for Ascend NPU. It includes two types of operator implementations:
+[SGL-Kernel-NPU](https://github.com/sgl-project/sgl-kernel-npu) is the official
+operator library provided by the SGLang framework for Ascend NPU. It includes
+two types of operator implementations:
 
-1. **Ascend C operators**: High-performance C++ kernels written in Ascend C, compiled into `libsgl_kernel_npu.so`, and registered through PyTorch's custom operator mechanism (`TORCH_LIBRARY_FRAGMENT`). Called in SGLang via `torch.ops.npu.<op_name>()`.
-2. **Triton operators**: Python kernels written in Triton, adapted for Ascend NPU. Called directly via `from sgl_kernel_npu.xxx import ...`.
+1. **Ascend C operators**: High-performance C++ kernels written in Ascend C,
+   compiled into `libsgl_kernel_npu.so`, and registered through PyTorch's custom
+   operator mechanism (`TORCH_LIBRARY_FRAGMENT`). Called in SGLang via
+   `torch.ops.npu.<op_name>()`.
+2. **Triton operators**: Python kernels written in Triton, adapted for Ascend
+   NPU. Called directly via `from sgl_kernel_npu.xxx import ...`.
 
-When SGLang detects an NPU device, it automatically loads `sgl_kernel_npu` and uses its operators in place of GPU counterparts, providing optimized inference on Ascend hardware.
+When SGLang detects an NPU device, it automatically loads `sgl_kernel_npu` and
+uses its operators in place of GPU counterparts, providing optimized inference
+on Ascend hardware.
 
 ## Directory Structure
 
@@ -48,14 +56,19 @@ sgl-kernel-npu/
 
 A complete Ascend C operator consists of two parts:
 
-- **Device part**: Kernel code running on the NPU AICore, responsible for actual computation. Written using the Ascend C API.
-- **Host part**: Code running on the CPU, responsible for parameter validation, data pre-processing, tiling, and kernel launch.
+- **Device part**: Kernel code running on the NPU AICore, responsible for actual
+  computation. Written using the Ascend C API.
+- **Host part**: Code running on the CPU, responsible for parameter validation,
+  data pre-processing, tiling, and kernel launch.
 
-We recommend starting with the [helloworld](https://github.com/sgl-project/sgl-kernel-npu/tree/main/csrc/helloworld) example, a simple operator that performs element-wise addition on two tensors.
+We recommend starting with the
+[helloworld](https://github.com/sgl-project/sgl-kernel-npu/tree/main/csrc/helloworld)
+example, a simple operator that performs element-wise addition on two tensors.
 
 ### Step 1: Create the operator directory and files
 
-Create a new operator directory under `csrc/`, following the `op_host/` + `op_kernel/` structure:
+Create a new operator directory under `csrc/`, following the `op_host/` +
+`op_kernel/` structure:
 
 ```text
 csrc/<op_name>/
@@ -67,7 +80,9 @@ csrc/<op_name>/
 
 ### Step 2: Write the Device-side Kernel (op_kernel)
 
-Device-side code runs on AICore and follows the Ascend C programming model. The core structure is a class with `Init()` and `Process()` methods, plus an `extern "C"` entry function.
+Device-side code runs on AICore and follows the Ascend C programming model. The
+core structure is a class with `Init()` and `Process()` methods, plus an
+`extern "C"` entry function.
 
 Using helloworld as an example:
 
@@ -134,15 +149,24 @@ extern "C" __global__ __aicore__ void helloworld(
 
 **Key points:**
 - Class methods must be marked with `__aicore__`, indicating they run on AICore.
-- Use `AscendC::TPipe` + `AscendC::TQue` to build a pipeline that overlaps data movement and computation.
-- The entry function must be declared `extern "C" __global__ __aicore__`. The compile tool generates a host-callable launch header `aclrtlaunch_<func_name>.h` from the function name.
-- Simple operators (e.g., helloworld, cache_assign, lora) do not need extra workspace memory. Complex operators (e.g., mla_preprocess, alloc_extend, build_tree) require temporary workspace memory and are compiled separately in `CMakeLists.txt`.
+- Use `AscendC::TPipe` + `AscendC::TQue` to build a pipeline that overlaps data
+  movement and computation.
+- The entry function must be declared `extern "C" __global__ __aicore__`. The
+  compile tool generates a host-callable launch header
+  `aclrtlaunch_<func_name>.h` from the function name.
+- Simple operators (e.g., helloworld, cache_assign, lora) do not need extra
+  workspace memory. Complex operators (e.g., mla_preprocess, alloc_extend,
+  build_tree) require temporary workspace memory and are compiled separately in
+  `CMakeLists.txt`.
 
-For more in-depth Ascend C programming knowledge, refer to the [Ascend C Kernel Development Guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/opdevg/Ascendcopdevg/atlas_ascendc_10_0001.html).
+For more in-depth Ascend C programming knowledge, refer to the
+[Ascend C Kernel Development Guide](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/850alpha001/opdevg/Ascendcopdevg/atlas_ascendc_10_0001.html).
 
 ### Step 3: Write the Host-side Code (op_host)
 
-Host-side code is responsible for passing PyTorch Tensors to the kernel and launching it. The key macro is `EXEC_KERNEL_CMD` (located in `csrc/utils/torch_helper.h`).
+Host-side code is responsible for passing PyTorch Tensors to the kernel and
+launching it. The key macro is `EXEC_KERNEL_CMD` (located in
+`csrc/utils/torch_helper.h`).
 
 ```cpp
 // csrc/helloworld/op_host/helloworld.cpp
@@ -178,8 +202,10 @@ HOST_API at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y)
 
 **Key points:**
 - The namespace must be `sglang::npu_kernel`.
-- Function signatures follow the pattern `at::Tensor <op_name>(const at::Tensor &input, ...)`.
-- For operators with multiple outputs, use `std::tuple<at::Tensor, at::Tensor, ...>` or non-const reference parameters.
+- Function signatures follow the pattern
+  `at::Tensor <op_name>(const at::Tensor &input, ...)`.
+- For operators with multiple outputs, use
+  `std::tuple<at::Tensor, at::Tensor, ...>` or non-const reference parameters.
 
 ### Step 4: Declare the C++ Interface (include/sgl_kenel_npu_ops.h)
 
@@ -198,7 +224,8 @@ at::Tensor helloworld(const at::Tensor &x, const at::Tensor &y);
 
 ### Step 5: Register the PyTorch Custom Operator (pytorch_extensions.cpp)
 
-Register the operator in `csrc/pytorch_extensions.cpp` in two steps: define the schema and bind the implementation.
+Register the operator in `csrc/pytorch_extensions.cpp` in two steps: define the
+schema and bind the implementation.
 
 ```cpp
 // csrc/pytorch_extensions.cpp
@@ -222,21 +249,26 @@ TORCH_LIBRARY_IMPL(npu, PrivateUse1, m)
 ```
 
 **Schema conventions:**
-- The namespace is fixed to `npu`. In SGLang, operators are called via `torch.ops.npu.<op_name>()`.
+- The namespace is fixed to `npu`. In SGLang, operators are called via
+  `torch.ops.npu.<op_name>()`.
 - Output tensor parameters use the `Tensor(a!)` mutating annotation.
-- Optional parameters use the `Tensor?` annotation, with `c10::optional<T>` handling in the impl.
-- For detailed schema syntax, see the [PyTorch Schema Reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func).
+- Optional parameters use the `Tensor?` annotation, with `c10::optional<T>`
+  handling in the impl.
+- For detailed schema syntax, see the
+  [PyTorch Schema Reference](https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#func).
 
 **Implementation binding rules:**
 - The device name is fixed to `PrivateUse1` (PyTorch NPU backend identifier).
 - Use the `TORCH_FN` macro to bind to the implementation function.
-- For complex operators with optional parameters, use lambda expressions to unpack the arguments.
+- For complex operators with optional parameters, use lambda expressions to
+  unpack the arguments.
 
 ### Step 6: Update the Build Configuration (csrc/CMakeLists.txt)
 
 Add the new operator's source files to `csrc/CMakeLists.txt`:
 
-**For operators not requiring workspace** (simple operators), add kernel source to `no_workspace_kernel`:
+**For operators not requiring workspace** (simple operators), add kernel source
+to `no_workspace_kernel`:
 
 ```cmake
 ascendc_library(no_workspace_kernel STATIC
@@ -245,7 +277,8 @@ ascendc_library(no_workspace_kernel STATIC
 )
 ```
 
-**For operators requiring workspace** (complex operators), add kernel source to `workspace_kernel` with the `-DHAVE_WORKSPACE -DHAVE_TILING` compile flags:
+**For operators requiring workspace** (complex operators), add kernel source to
+`workspace_kernel` with the `-DHAVE_WORKSPACE -DHAVE_TILING` compile flags:
 
 ```cmake
 ascendc_library(workspace_kernel STATIC
@@ -265,7 +298,8 @@ FILE(GLOB OP_SRCS
 
 ### Step 7: Build
 
-Build following the steps in the [python/sgl_kernel_npu/README.md](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md):
+Build following the steps in the
+[python/sgl_kernel_npu/README.md](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md):
 
 ```bash
 cd sgl-kernel-npu
@@ -277,11 +311,13 @@ bash build.sh
 pip install output/sgl_kernel_npu*.whl
 ```
 
-The compiled `libsgl_kernel_npu.so` is copied into `python/sgl_kernel_npu/sgl_kernel_npu/lib/` and loaded by the Python package.
+The compiled `libsgl_kernel_npu.so` is copied into
+`python/sgl_kernel_npu/sgl_kernel_npu/lib/` and loaded by the Python package.
 
 ## Developing Triton Operators
 
-Triton operators are located under `python/sgl_kernel_npu/sgl_kernel_npu/`, organized by function category:
+Triton operators are located under `python/sgl_kernel_npu/sgl_kernel_npu/`,
+organized by function category:
 
 ```text
 python/sgl_kernel_npu/sgl_kernel_npu/
@@ -297,17 +333,22 @@ python/sgl_kernel_npu/sgl_kernel_npu/
 **Development steps:**
 
 1. Create a new `.py` file in the appropriate category subdirectory.
-2. Write the kernel using the Triton language, using existing operators in the same directory as templates.
+2. Write the kernel using the Triton language, using existing operators in the
+   same directory as templates.
 3. Export functions in the corresponding `__init__.py` if needed.
 4. Write tests under `tests/python/sgl_kernel_npu/`.
 
-**Note:** Many Triton operators are adapted from SGLang's GPU Triton kernels (e.g., comments in `fla/utils.py` note the original source). Pay special attention to differences between NPU and GPU when adapting.
+**Note:** Many Triton operators are adapted from SGLang's GPU Triton kernels
+(e.g., comments in `fla/utils.py` note the original source). Pay special
+attention to differences between NPU and GPU when adapting.
 
 ## Integrating Operators into SGLang
 
 ### Ascend C Operator Integration
 
-After completing operator registration and wheel package updates in `sgl-kernel-npu`, call operators in SGLang as follows:
+After completing the [Steps 1-7](#developing-ascend-c-operators) above (writing
+the kernel, registering the torch op, building), and installing the
+`sgl-kernel-npu` wheel, call the operator in SGLang as follows:
 
 ```python
 import sgl_kernel_npu  # Loading the library auto-triggers libsgl_kernel_npu.so loading
@@ -347,19 +388,24 @@ from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 ### sgl-kernel-npu Wheel Update Process
 
-Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates require a multi-PR workflow:
+Since SGLang and sgl-kernel-npu are separate Python packages, dependency updates
+require a multi-PR workflow:
 
-1. **Submit sgl-kernel-npu PR**: Add/modify operators in the sgl-kernel-npu repository, ensuring all tests pass.
-2. **Bump sgl-kernel-npu version**: Update the version number in sgl-kernel-npu. Merging triggers an automatic PyPI release.
+1. **Submit sgl-kernel-npu PR**: Add/modify operators in the sgl-kernel-npu
+   repository, ensuring all tests pass.
+2. **Bump sgl-kernel-npu version**: Update the version number in sgl-kernel-npu.
+   Merging triggers an automatic PyPI release.
 3. **Reference the new version in SGLang**:
-   - Update the `sgl-kernel-npu` version requirement in SGLang's `python/pyproject.toml`.
+   - Update the `sgl-kernel-npu` version requirement in SGLang's
+     `python/pyproject.toml`.
    - Use the new operator in SGLang code.
 
 If not urgent, you can wait for a regular release (typically within one week).
 
 ## Writing Unit Tests
 
-Each operator needs a corresponding unit test under `tests/python/sgl_kernel_npu/`, using Python's `unittest` framework.
+Each operator needs a corresponding unit test under
+`tests/python/sgl_kernel_npu/`, using Python's `unittest` framework.
 
 Test file naming convention: `test_<op_name>.py`
 
@@ -408,7 +454,9 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-**Note:** If `pre-commit run --all-files` fails the first time, run it again to ensure all lint errors are auto-fixed. All code must pass checks before submitting a PR.
+**Note:** If `pre-commit run --all-files` fails the first time, run it again to
+ensure all lint errors are auto-fixed. All code must pass checks before
+submitting a PR.
 
 ### C++ Code Style
 
@@ -422,20 +470,27 @@ pre-commit run --all-files
 
 - Follow PEP 8.
 - Use snake_case for file and function names.
-- When adapting from SGLang GPU code, note the original source in the file header.
+- When adapting from SGLang GPU code, note the original source in the file
+  header.
 
 ### General Principles
 
-- Avoid code duplication: extract shared functions for any repeated code blocks over 5 lines.
-- Minimize device synchronization: reduce CPU-NPU sync operations like `tensor.item()` or `tensor.cpu()`.
+- Avoid code duplication: extract shared functions for any repeated code blocks
+  over 5 lines.
+- Minimize device synchronization: reduce CPU-NPU sync operations like
+  `tensor.item()` or `tensor.cpu()`.
 - Keep functions pure: avoid in-place argument modification.
 - Keep files concise: split files exceeding 2,000 lines.
 
 ## Submitting a PR
 
-1. **Fork the repo**: Fork [sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu) on GitHub, then clone locally.
-2. **Create a branch**: Create a new branch from `main`, e.g., `feature/add-my-op`.
-3. **Develop and test**: Develop the operator and write tests following the steps above. Ensure all tests pass.
+1. **Fork the repo**: Fork
+   [sgl-kernel-npu](https://github.com/sgl-project/sgl-kernel-npu) on GitHub,
+   then clone locally.
+2. **Create a branch**: Create a new branch from `main`, e.g.,
+   `feature/add-my-op`.
+3. **Develop and test**: Develop the operator and write tests following the
+   steps above. Ensure all tests pass.
 4. **Run pre-commit**: Ensure code formatting compliance.
 5. **Commit and push**:
    ```bash
@@ -443,8 +498,10 @@ pre-commit run --all-files
    git commit -m "feat: add <op_name> operator"
    git push origin feature/add-my-op
    ```
-6. **Create a PR**: Open a Pull Request on GitHub from your branch to `sgl-project/sgl-kernel-npu:main`.
-7. **Wait for CI and review**: CI checks include linting, compilation, and operator tests. After passing, wait for maintainer review and merge.
+6. **Create a PR**: Open a Pull Request on GitHub from your branch to
+   `sgl-project/sgl-kernel-npu:main`.
+7. **Wait for CI and review**: CI checks include linting, compilation, and
+   operator tests. After passing, wait for maintainer review and merge.
 
 ## References
 
