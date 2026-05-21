@@ -1,9 +1,13 @@
 import unittest
+from multiprocessing import shared_memory
 from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    ShmPointerMMData,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -209,6 +213,33 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
 
         self.assertEqual(output_ids, [1, -1001, -1001, 2, -1002, -1002, 3])
         self.assertEqual(input_ids, [1, 42, 42, 2, 43, 43, 3])
+
+    def test_shm_pointer_materialize_keeps_zero_copy_view_alive(self):
+        source = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        pointer = ShmPointerMMData(source)
+        shm_name = pointer.shm_name
+        receiver = ShmPointerMMData.__new__(ShmPointerMMData)
+        output = None
+
+        try:
+            receiver.__setstate__(pointer.__getstate__())
+            output = receiver.materialize()
+
+            self.assertEqual(output.tolist(), source.tolist())
+            self.assertTrue(hasattr(output, "_sglang_shm_handle"))
+            with self.assertRaises(FileNotFoundError):
+                shared_memory.SharedMemory(name=shm_name)
+        finally:
+            if output is not None:
+                shm_handle = getattr(output, "_sglang_shm_handle", None)
+                if shm_handle is not None:
+                    shm_handle.close()
+            try:
+                shm = shared_memory.SharedMemory(name=shm_name)
+                shm.unlink()
+                shm.close()
+            except FileNotFoundError:
+                pass
 
     def test_qwen_mrope_collects_all_split_image_grids(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
