@@ -172,7 +172,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         end_head = start_head + self.num_heads
         return [layer_sparse_attention_config[i] for i in range(start_head, end_head)]
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
 
         forward_mode: ForwardMode = forward_batch.forward_mode
@@ -532,19 +532,33 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[None],
-    ):
-        metadata = DualChunkFlashAttentionMetadata()
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
 
-        if forward_mode.is_decode_or_idle():
+        Body merged from old ``init_forward_metadata_capture_cuda_graph`` and
+        ``init_forward_metadata_replay_cuda_graph`` -- both wrote to the same
+        pre-allocated ``self.decode_metadata`` buffers. Called outside
+        ``with graph.capture():`` at both capture (initial alloc + fill) and
+        replay (per-iter refresh). On first call per ``bs`` we build the
+        ``DualChunkFlashAttentionMetadata`` object with buffers bound to
+        ``self.decode_metadata[*][:bs]`` slices plus a fresh fancy-indexed
+        ``block_tables`` tensor whose pointer the captured graph records;
+        subsequent calls reuse that same metadata object so the recorded
+        pointers stay valid, copying refreshed data into the bound buffers.
+        """
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+
+        if not forward_mode.is_decode_or_idle():
+            self.forward_metadata = DualChunkFlashAttentionMetadata()
+            return
+
+        # Allocate metadata + bind buffers on first call per bs; reuse afterwards
+        # so the captured CUDA graph's recorded tensor pointers stay valid.
+        if bs not in self.decode_metadata:
+            metadata = DualChunkFlashAttentionMetadata()
             if self.original_max_position_embeddings > 0:
                 metadata.scaling_factor = self.decode_metadata["scaling_factor"][:bs]
 
@@ -578,22 +592,7 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
 
             self.decode_metadata[bs] = metadata
 
-        self.forward_metadata = metadata
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[None],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: torch.Tensor = None,
-    ):
-        """Initialize forward metadata for replaying CUDA graph."""
-        assert forward_mode.is_decode()
+        # Populate the bound buffers with per-iter data.
         seq_lens = seq_lens[:bs]
         req_pool_indices = req_pool_indices[:bs]
         metadata = self.decode_metadata[bs]
