@@ -96,6 +96,7 @@ def _make_model_runner(
     max_running_requests=None,
     hisparse_config=None,
     kv_cache_dtype="fake_bf16",
+    disaggregation_mode="null",
 ):
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
@@ -138,6 +139,7 @@ def _make_model_runner(
     sa.page_size = page_size
     sa.max_running_requests = max_running_requests
     sa.hisparse_config = hisparse_config
+    sa.disaggregation_mode = disaggregation_mode
     mr.server_args = sa
 
     spec = MagicMock()
@@ -336,6 +338,7 @@ class TestDSAModelConfigurator(unittest.TestCase):
             max_running_requests=max_running_requests,
             hisparse_config=hisparse_config,
             kv_cache_dtype=torch.bfloat16,
+            disaggregation_mode="decode" if enable_hisparse else "null",
         )
 
     def _calculate_config(self, mr, available_bytes):
