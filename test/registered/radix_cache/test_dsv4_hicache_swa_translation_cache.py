@@ -39,7 +39,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=800, stage="base-c", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=800, suite="weekly-8-gpu-h200", nightly=True)
 
 
 class TestDSV4HiCacheSWATranslationCache(UnifiedRadixTreeTestMixin, CustomTestCase):
