@@ -1507,28 +1507,36 @@ class Scheduler(
 
         def _gc_callback(phase, info):
             if phase == "start":
-                gc._debug_t0 = _gc_time.monotonic()
+                gc._debug_t0 = _gc_time.perf_counter()
                 gc._debug_gen = info.get("generation", -1)
+                gc._debug_count = gc.get_count()
             elif phase == "stop":
                 dur = (
-                    _gc_time.monotonic()
-                    - getattr(gc, "_debug_t0", _gc_time.monotonic())
+                    _gc_time.perf_counter()
+                    - getattr(gc, "_debug_t0", _gc_time.perf_counter())
                 ) * 1000
                 gen = getattr(gc, "_debug_gen", -1)
                 collected = info.get("collected", 0)
                 uncollectable = info.get("uncollectable", 0)
-                if dur > 5:
-                    logger.info(
-                        "[GC] gen=%d collected=%d uncollectable=%d dur=%.1fms ts=%.6f",
-                        gen,
-                        collected,
-                        uncollectable,
-                        dur,
-                        _gc_time.time(),
-                    )
+                count_before = getattr(gc, "_debug_count", (0, 0, 0))
+                logger.info(
+                    "[GC] gen=%d collected=%d uncollectable=%d dur=%.1fms "
+                    "count_before=%s ts=%.6f",
+                    gen,
+                    collected,
+                    uncollectable,
+                    dur,
+                    count_before,
+                    _gc_time.time(),
+                )
 
         gc.callbacks.append(_gc_callback)
-        logger.info("[GC] callback installed, thresholds=%s", gc.get_threshold())
+        gc.set_debug(gc.DEBUG_STATS)
+        logger.info(
+            "[GC] debug+callback installed, thresholds=%s count=%s",
+            gc.get_threshold(),
+            gc.get_count(),
+        )
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
