@@ -9,7 +9,6 @@ a slot whose KV byte was silently overwritten.
 from __future__ import annotations
 
 import logging
-import random
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -17,7 +16,7 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.slot_picker import pick_active_slot
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
-    flip_first_byte_in_source,
+    flip_random_source_byte_and_log,
     pick_target_group,
     should_run_perturbation,
 )
@@ -59,37 +58,16 @@ def run(
         buffer_groups=buffer_groups,
         target_kind=config.target_group_kind,
     )
-    if group is None or not group.real_kv_sources_k:
+    if group is None:
         logger.info(
-            "kv_canary perturb real_kv_used: skipped because no target group with real_kv_sources_k "
-            "matched target_group_kind=%s slot=%d",
+            "kv_canary perturb real_kv_used: skipped because no target group matched "
+            "target_group_kind=%s slot=%d",
             config.target_group_kind,
             target.value,
         )
         return
-    source_pick = random.randrange(len(group.real_kv_sources_k))
-    source = group.real_kv_sources_k[source_pick]
-    flip_result = flip_first_byte_in_source(
-        group=group, source=source, slot_idx=target.value
-    )
-    if flip_result is None:
-        logger.info(
-            "kv_canary perturb real_kv_used: skipped because slot=%d could not be mapped into "
-            "group=%s source_idx=%d",
-            target.value,
-            group.kind.name,
-            source_pick,
-        )
-        return
-    row, col, original_byte = flip_result
-    logger.info(
-        "kv_canary perturb real_kv_used: group=%s source_idx=%d slot=%d row=%d col=%d "
-        "original_byte=0x%02X new_byte=0x%02X",
-        group.kind.name,
-        source_pick,
-        target.value,
-        row,
-        col,
-        original_byte,
-        original_byte ^ 0xFF,
+    flip_random_source_byte_and_log(
+        perturb_name="real_kv_used",
+        group=group,
+        slot_idx=target.value,
     )

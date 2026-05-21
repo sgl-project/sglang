@@ -111,6 +111,52 @@ def pick_target_group(
     return filtered[pick]
 
 
+def flip_random_source_byte_and_log(
+    *,
+    perturb_name: str,
+    group: CanaryBufferGroup,
+    slot_idx: int,
+) -> None:
+    """Pick a random K-half real_kv source on group, flip byte_offset=0 of slot_idx
+    in it, and log the result. Logs and returns silently when the group has no
+    real_kv_sources_k or the slot cannot be mapped into the chosen source."""
+    if not group.real_kv_sources_k:
+        logger.info(
+            "kv_canary perturb %s: skipped because group=%s has no real_kv_sources_k",
+            perturb_name,
+            group.kind.name,
+        )
+        return
+    source_pick = random.randrange(len(group.real_kv_sources_k))
+    source = group.real_kv_sources_k[source_pick]
+    flip_result = flip_first_byte_in_source(
+        group=group, source=source, slot_idx=slot_idx
+    )
+    if flip_result is None:
+        logger.info(
+            "kv_canary perturb %s: skipped because slot=%d could not be mapped "
+            "into group=%s source_idx=%d",
+            perturb_name,
+            slot_idx,
+            group.kind.name,
+            source_pick,
+        )
+        return
+    row, col, original_byte = flip_result
+    logger.info(
+        "kv_canary perturb %s: group=%s source_idx=%d slot=%d row=%d col=%d "
+        "original_byte=0x%02X new_byte=0x%02X",
+        perturb_name,
+        group.kind.name,
+        source_pick,
+        slot_idx,
+        row,
+        col,
+        original_byte,
+        original_byte ^ 0xFF,
+    )
+
+
 def flip_first_byte_in_source(
     *,
     group: CanaryBufferGroup,
