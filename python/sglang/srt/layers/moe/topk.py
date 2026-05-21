@@ -31,6 +31,9 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
+if TYPE_CHECKING:
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+
 try:
     from triton_kernels.tensor import make_ragged_tensor_metadata
     from triton_kernels.topk import topk as triton_kernels_topk
@@ -256,7 +259,7 @@ class StandardTopKOutput(NamedTuple):
 class TritonKernelTopKOutput(NamedTuple):
     """Triton kernel top-k output format."""
 
-    a_ragged_metadata: object
+    a_ragged_metadata: RaggedTensorMetadata
     gather_indx: torch.Tensor
     scatter_indx: torch.Tensor
     gate_scal: torch.Tensor

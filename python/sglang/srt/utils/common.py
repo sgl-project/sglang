@@ -80,6 +80,7 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
+import triton
 from packaging import version as pkg_version
 from PIL import Image
 from starlette.routing import Mount
@@ -89,7 +90,6 @@ from torch.utils._contextlib import _DecoratorContextManager
 from torchvision.io import decode_jpeg
 from typing_extensions import Literal
 
-import triton
 from sglang.srt.environ import envs
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper

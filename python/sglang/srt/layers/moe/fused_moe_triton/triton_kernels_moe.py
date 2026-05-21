@@ -25,6 +25,8 @@ else:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 
 if TYPE_CHECKING:
+    from triton_kernels.tensor_details.ragged_tensor import RaggedTensorMetadata
+
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
 
@@ -87,7 +89,7 @@ def triton_kernel_fused_experts(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
-    a_ragged_metadata,
+    a_ragged_metadata: RaggedTensorMetadata,
     gather_indx: torch.Tensor,
     scatter_indx: Optional[torch.Tensor],
     gate_scal: torch.Tensor,
@@ -237,7 +239,7 @@ def triton_kernel_fused_experts_with_bias(
     w2: torch.Tensor,
     w2_pcg,
     b2: torch.Tensor,
-    a_ragged_metadata,
+    a_ragged_metadata: RaggedTensorMetadata,
     gather_indx: torch.Tensor,
     scatter_indx: Optional[torch.Tensor],
     gate_scal: torch.Tensor,
