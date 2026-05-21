@@ -21,7 +21,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '32b': {
       baseName: '32B',
@@ -43,7 +43,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '8b': {
       baseName: '8B',
@@ -54,7 +54,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '4b': {
       baseName: '4B',
@@ -65,7 +65,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '1.7b': {
       baseName: '1.7B',
@@ -76,7 +76,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     },
     '0.6b': {
       baseName: '0.6B',
@@ -87,7 +87,7 @@ export const Qwen3Deployment = () => {
       mi300x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi325x: { tp: 1, ep: 0, bf16: true, fp8: true },
       mi355x: { tp: 1, ep: 0, bf16: true, fp8: true },
-      xeon: { tp: 6, ep: 0, bf16: true, fp8: true }
+      xeon: { tp: 3, ep: 0, bf16: true, fp8: true }
     }
   };
 
@@ -276,43 +276,28 @@ export const Qwen3Deployment = () => {
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
 
-    let modelPath;
+    let modelName;
     if (config.hasThinkingVariants) {
       if (category === 'base') {
-        modelPath = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
+        modelName = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
       } else {
         const thinkingSuffix = category === 'thinking' ? '-Thinking' : '-Instruct';
         const dateSuffix = '-2507';
-        modelPath = `Qwen/Qwen3-${config.baseName}${thinkingSuffix}${dateSuffix}${quantSuffix}`;
+        modelName = `Qwen/Qwen3-${config.baseName}${thinkingSuffix}${dateSuffix}${quantSuffix}`;
       }
     } else {
-      modelPath = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
-    }
-
-    if (hardware === 'xeon') {
-      let cpuCmd = 'python -m sglang.launch_server \
-';
-      cpuCmd += `  --model ${modelPath} \
-  --tp 6 \
-  --device cpu \
-  --disable-overlap-schedule`;
-
-      if (reasoningParser === 'enabled' && category !== 'instruct') {
-        cpuCmd += ' \
-  --reasoning-parser qwen3';
-      }
-
-      if (toolcall === 'enabled') {
-        cpuCmd += ' \
-  --tool-call-parser qwen25';
-      }
-
-      return cpuCmd;
+      modelName = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
     }
 
     let cmd = 'python -m sglang.launch_server \
 ';
     cmd += `  --model ${modelPath}`;
+
+    if (hardware === 'xeon') {
+      cmd += ` \
+  --device cpu \
+  --disable-overlap-schedule`;
+    }
 
     if (hwConfig.tp > 1) {
       cmd += ` \
