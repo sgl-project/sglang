@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+from typing import Optional
+
+import torch
+
+from sglang.jit_kernel.kv_canary.plan.entries_kernel import (
+    launch_plan_entries_kernel,
+)
+from sglang.jit_kernel.kv_canary.plan.extras_kernel import (
+    launch_plan_extras_kernel,
+)
+from sglang.jit_kernel.kv_canary.plan.offsets_kernel import (
+    _PLAN_BS_BLOCK_SIZE,
+    launch_plan_offsets_kernel,
+)
+from sglang.jit_kernel.kv_canary.plan.utils import _resolve_swa_lut
+from sglang.jit_kernel.kv_canary.verify import (
+    VerifyPlan,
+    _assert_contiguous,
+)
+from sglang.jit_kernel.kv_canary.write import WritePlan
+
+
+def canary_plan_step(
+    *,
+    verify_plan_out: VerifyPlan,
+    write_plan_out: WritePlan,
+    fb_req_pool_indices: torch.Tensor,
+    fb_prefix_lens: torch.Tensor,
+    fb_extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    extra_verify_slot_indices: torch.Tensor,
+    extra_verify_positions: torch.Tensor,
+    extra_verify_prev_slot_indices: torch.Tensor,
+    extra_verify_num_valid: torch.Tensor,
+    swa_window_size: int,
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+    verify_capacity: int,
+) -> None:
+    """Fill verify_plan_out + write_plan_out from ForwardBatch primitives + optional pre-walked flat verify
+    entries. Single Triton launch.
+
+    For each req r with fb_req_pool_indices[r] != 0 (0 = padding sentinel):
+
+    - **Verify entries**: one per pos in [window_start, fb_prefix_lens[r]), where window_start = max(0,
+      fb_prefix_lens[r] - swa_window_size) if SWA else 0. slot_idx = req_to_token[fb_req_pool_indices[r], pos]
+      (SWA-translated via full_to_swa_index_mapping if non-None); prev_slot_idx =
+      req_to_token[fb_req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
+      the writer chains across the entire prefix; sweep verify within an SWA window dereferences the real
+      predecessor for chain-link reconstruction.)
+    - **Write metadata** (when fb_extend_seq_lens[r] > 0): contribute fb_extend_seq_lens[r] to the per-req
+      write count (for write_offsets cumsum). Per-req chain seed = req_to_token[fb_req_pool_indices[r],
+      fb_prefix_lens[r]-1] (SWA-translated), or -1 if fb_prefix_lens[r] == 0. Per-token write data
+      (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — canary_write_step reads it
+      directly from ForwardBatch via write_offsets.
+
+    Extra flat verify entries (extra_verify_*[: extra_verify_num_valid[0]]) are appended to verify_plan_out
+    **after** the per-req-derived entries. Used by radix-cache-orphan sweep; caller is responsible for
+    SWA-translating these entries before passing in (plan kernel does NOT translate the extras).
+
+    Sweep callers pass fb_extend_seq_lens = all-zero → write_plan_out is filled with write_num_valid_reqs = 0;
+    downstream skips canary_write_step.
+
+    Args:
+        verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
+        write_plan_out: Pre-allocated WritePlan; filled in-place. write_num_valid_reqs = 0 for sweep callers.
+        fb_req_pool_indices: ForwardBatch.req_pool_indices; per-row ReqToTokenPool row index, shape [bs],
+            int64. 0 is the padding sentinel.
+        fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int64. Caller
+            normalizes: extend → ForwardBatch.extend_prefix_lens, decode → ForwardBatch.seq_lens - 1, sweep
+            over running → seq_lens.
+        fb_extend_seq_lens: ForwardBatch.extend_seq_lens; per-req tokens being written this step, shape [bs],
+            int64. 1 for pure decode; 0 for sweep.
+        req_to_token: ReqToTokenPool.req_to_token; full-pool slot index table, shape [max_reqs, max_seq_len],
+            int32.
+        extra_verify_slot_indices: Pre-walked extra verify slots, shape [extra_verify_capacity], int64.
+            Caller-translated to the target index space.
+        extra_verify_positions: Same shape, int64. Expected position per extra entry.
+        extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
+        extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for per-forward and running-sweep
+            callers.
+        swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
+        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. Required (non-None) iff
+            swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
+            Loaded element-typed via Triton ``tl.load``; intermediate translated slot values are int64 inside the
+            kernel and stored in the int64 plan schema.
+
+    Implementation:
+        - Three sub-kernels with action-named identifiers, launched in sequence:
+          1. ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
+             reads fb_req_pool_indices[r], fb_prefix_lens[r], fb_extend_seq_lens[r] for each r; computes
+             verify_count = (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0
+             padding); gathers seed_slot_full = req_to_token[rp, prefix_lens - 1] (or -1 if prefix_lens == 0),
+             SWA-translates seed_slot via full_to_swa_index_mapping[seed_slot_full] if non-None; runs
+             block-level cumsum (``tl.cumsum``) to produce verify_offsets[bs+1] and
+             write_plan_out.write_offsets[bs+1] in-place; scatters write_seed slots; writes scalar totals
+             ``verify_plan_out.verify_num_valid`` and ``write_plan_out.write_num_valid_reqs``.
+          2. ``_plan_entries_kernel`` (2-D grid ``(bs, max_j_tiles)``, masked by per-req verify_count): for
+             each (r, j) with j < verify_count[r], gather slot = req_to_token[fb_req_pool_indices[r],
+             window_start[r] + j] (SWA-translated), prev_slot = req_to_token[..., window_start[r] + j - 1]
+             when (window_start[r] + j) > 0 (also translated) else -1, position = window_start[r] + j;
+             scatter (slot, position, prev_slot) into verify_plan_out at flat index verify_offsets[r] + j.
+          3. ``_plan_extras_kernel`` (1-D grid ``(k_tiles,)``, only launched when extra_verify_num_valid > 0):
+             copy extra_verify_*[: num_valid] into verify_plan_out.verify_* starting at flat index
+             verify_offsets[bs]. Extras are caller-pre-translated, no LUT pass.
+        - All output tensors are addressed at addresses baked into the cuda-graph capture; the 2nd and 3rd
+          kernels are conditionally launched based on cached host-side scalars from the 1st (graph-safe
+          under stream-capture conditionals).
+
+    Calling contract:
+        - Pure side-effect; no host work, no D2H.
+        - Safe in cuda-graph capture; caller refills all input tensors in-place before replay.
+        - Single kernel launch fills both plans end-to-end.
+        - Padding rows contribute zero entries.
+
+    Pinned by Python reference
+    :func:`sglang.jit_kernel.kv_canary.plan_ref.canary_plan_step_torch_reference`; Triton must match
+    byte-for-byte.
+    """
+    bs = int(fb_req_pool_indices.shape[0])
+    if bs > _PLAN_BS_BLOCK_SIZE:
+        raise ValueError(
+            f"kv-canary: canary_plan_step supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
+            f"got bs={bs}. Bump _PLAN_BS_BLOCK_SIZE if real workloads need this."
+        )
+    if swa_window_size > 0 and full_to_swa_index_mapping is None:
+        raise ValueError(
+            "kv-canary: canary_plan_step requires full_to_swa_index_mapping when swa_window_size > 0"
+        )
+
+    _assert_contiguous(
+        verify_plan_out.verify_slot_indices, "verify_plan_out.verify_slot_indices"
+    )
+    _assert_contiguous(
+        verify_plan_out.verify_positions, "verify_plan_out.verify_positions"
+    )
+    _assert_contiguous(
+        verify_plan_out.verify_prev_slot_indices,
+        "verify_plan_out.verify_prev_slot_indices",
+    )
+    _assert_contiguous(
+        verify_plan_out.verify_num_valid, "verify_plan_out.verify_num_valid"
+    )
+    _assert_contiguous(verify_plan_out.enable, "verify_plan_out.enable")
+    _assert_contiguous(write_plan_out.write_offsets, "write_plan_out.write_offsets")
+    _assert_contiguous(
+        write_plan_out.write_seed_slot_indices, "write_plan_out.write_seed_slot_indices"
+    )
+    _assert_contiguous(
+        write_plan_out.write_num_valid_reqs, "write_plan_out.write_num_valid_reqs"
+    )
+    _assert_contiguous(fb_req_pool_indices, "fb_req_pool_indices")
+    _assert_contiguous(fb_prefix_lens, "fb_prefix_lens")
+    _assert_contiguous(fb_extend_seq_lens, "fb_extend_seq_lens")
+    _assert_contiguous(req_to_token, "req_to_token")
+    _assert_contiguous(extra_verify_slot_indices, "extra_verify_slot_indices")
+    _assert_contiguous(extra_verify_positions, "extra_verify_positions")
+    _assert_contiguous(extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices")
+    _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
+    if full_to_swa_index_mapping is not None:
+        _assert_contiguous(full_to_swa_index_mapping, "full_to_swa_index_mapping")
+
+    device = verify_plan_out.verify_slot_indices.device
+    verify_offsets_scratch = torch.zeros(
+        _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int64, device=device
+    )
+
+    plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
+    if verify_capacity != plan_verify_capacity:
+        raise ValueError(
+            f"kv-canary: canary_plan_step verify_capacity={verify_capacity} does not match "
+            f"verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
+        )
+    write_req_capacity_plus_one = int(write_plan_out.write_offsets.shape[0])
+    write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
+    extras_capacity = int(extra_verify_slot_indices.shape[0])
+
+    lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
+        full_to_swa_index_mapping, device
+    )
+
+    req_to_token_stride0 = int(req_to_token.stride(0))
+
+    # Match the ref's tail-reset semantics: write_offsets positions past index bs are zeroed so a smaller
+    # batch never leaks stale prefix-sum entries from a larger previous call. In-place .zero_() is
+    # cuda-graph-safe (no allocation) and avoids one Triton launch.
+    write_plan_out.write_offsets.zero_()
+
+    # Offsets kernel: per-req count + seed gather + block-level cumsum, single program; the num_valid
+    # scalars are written by the same program (it has the totals in registers already).
+    launch_plan_offsets_kernel(
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_to_token=req_to_token,
+        lut_tensor=lut_tensor,
+        extra_verify_num_valid=extra_verify_num_valid,
+        verify_offsets_scratch=verify_offsets_scratch,
+        write_offsets=write_plan_out.write_offsets,
+        write_seed_slot_indices=write_plan_out.write_seed_slot_indices,
+        verify_num_valid=verify_plan_out.verify_num_valid,
+        verify_enable=verify_plan_out.enable,
+        write_num_valid_reqs=write_plan_out.write_num_valid_reqs,
+        bs=bs,
+        req_to_token_stride0=req_to_token_stride0,
+        lut_len=lut_len,
+        swa_window_size=int(swa_window_size),
+        has_swa_lut=has_swa_lut,
+        write_offsets_len=write_req_capacity_plus_one,
+        write_req_capacity=write_req_capacity,
+        verify_capacity=verify_capacity,
+    )
+
+    # Entries kernel: per-(req, j-tile) verify entry materialization. The j-axis upper bound is
+    # verify_capacity (each req cannot contribute more than verify_capacity entries); we mask per-req actual
+    # count read back from verify_offsets_scratch inside the kernel.
+    launch_plan_entries_kernel(
+        fb_req_pool_indices=fb_req_pool_indices,
+        fb_prefix_lens=fb_prefix_lens,
+        req_to_token=req_to_token,
+        lut_tensor=lut_tensor,
+        verify_offsets_scratch=verify_offsets_scratch,
+        verify_slot_indices=verify_plan_out.verify_slot_indices,
+        verify_positions=verify_plan_out.verify_positions,
+        verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
+        bs=bs,
+        req_to_token_stride0=req_to_token_stride0,
+        lut_len=lut_len,
+        verify_capacity=verify_capacity,
+        swa_window_size=int(swa_window_size),
+        has_swa_lut=has_swa_lut,
+    )
+
+    # Extras kernel: append extras into the verify tail. The base index lives in verify_offsets_scratch[bs].
+    launch_plan_extras_kernel(
+        extra_verify_slot_indices=extra_verify_slot_indices,
+        extra_verify_positions=extra_verify_positions,
+        extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
+        extra_verify_num_valid=extra_verify_num_valid,
+        verify_offsets_scratch=verify_offsets_scratch,
+        verify_slot_indices=verify_plan_out.verify_slot_indices,
+        verify_positions=verify_plan_out.verify_positions,
+        verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
+        bs=bs,
+        verify_capacity=verify_capacity,
+        extras_capacity=extras_capacity,
+    )
