@@ -29,6 +29,7 @@ from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
 from sglang.srt.function_call.mimo_detector import MiMoDetector
 from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.minicpm5_detector import MiniCPM5Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.poolside_v1_detector import PoolsideV1Detector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
@@ -66,6 +67,7 @@ class FunctionCallParser:
         "lfm2": Lfm2Detector,
         "llama3": Llama32Detector,
         "mimo": MiMoDetector,
+        "minicpm5": MiniCPM5Detector,
         "mistral": MistralDetector,
         "poolside_v1": PoolsideV1Detector,
         "pythonic": PythonicDetector,
