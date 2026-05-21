@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
-from sglang.srt.kv_canary.runner.violation import ViolationReporter
+from sglang.srt.kv_canary.runner.violation_reporter import ViolationReporter
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 
