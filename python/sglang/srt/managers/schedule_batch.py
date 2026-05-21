@@ -1463,7 +1463,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
-    output_ids: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
@@ -2392,15 +2391,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 )
             else:
                 self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                    self.output_ids.to(torch.int64)
+                    self.input_ids
                 )
 
-        # Update fields
-        # Coerce to int64: torch sampling helpers (sampling_from_probs_torch /
-        # top_k_top_p_min_p_sampling_from_probs_torch) return int32 token ids,
-        # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
-        self.input_ids = self.output_ids.to(torch.int64)
-        self.output_ids = None
+        # input_ids is set at end of previous run_batch (placeholder for
+        # overlap; next_token_ids cast for non-overlap).
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
@@ -2425,7 +2420,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        self.seq_lens_sum += bs
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
@@ -2451,10 +2448,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def maybe_wait_verify_done(self):
+        # Use event.wait() (stream-level wait) instead of .synchronize()
+        # (CPU block). Schedule-stream prep ops following this call get
+        # ordered after the forward-stream verify via the wait; CPU is not
+        # blocked. Subsequent .cpu()/.item() naturally sync the stream.
         if self.is_spec_v2:
             draft_input: EagleDraftInput = self.spec_info
             if draft_input.verify_done is not None:
-                draft_input.verify_done.synchronize()
+                draft_input.verify_done.wait()
+
+    def refresh_seq_lens_cpu(self, sync: bool = True):
+        # sync=True: D2H from seq_lens (needed when seq_lens_cpu is stale
+        # relative to seq_lens, i.e. spec v2's mid-forward GPU rebind).
+        # sync=False: caller asserts seq_lens_cpu already fresh — skip D2H,
+        # only recompute the cached sum.
+        if sync and self.is_spec_v2:
+            self.seq_lens_cpu = self.seq_lens.cpu()
+        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
     def filter_batch(
         self,
@@ -2506,10 +2516,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        self.seq_lens_sum = self.seq_lens.sum().item()
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
 
-        if self.output_ids is not None:
-            self.output_ids = self.output_ids[keep_indices_device]
+        if self.input_ids is not None:
+            self.input_ids = self.input_ids[keep_indices_device]
 
         self.mamba_track_indices = None
         self.mamba_track_mask = None
@@ -2566,9 +2578,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        self.seq_lens_sum += other.seq_lens_sum
-        if self.output_ids is not None:
-            self.output_ids = torch.cat([self.output_ids, other.output_ids])
+        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
+        # or lazily in ForwardBatch.init_new).
+        self.seq_lens_sum = None
+        if self.input_ids is not None:
+            self.input_ids = torch.cat([self.input_ids, other.input_ids])
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
