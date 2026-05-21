@@ -27,6 +27,7 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -557,10 +558,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         device = model_runner.device
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-            from sglang.srt.kv_canary.token_oracle.rid_hash import (
-                _hash_rids_to_i64_tensor,
-            )
-
             hashed = _hash_rids_to_i64_tensor(
                 rids=[req.rid for req in batch.reqs],
                 device=device,
@@ -1059,6 +1056,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
+        if self.rids_hashed is not None:
+            # rids_hashed was sized to len(batch.reqs) in init_new (before cuda-graph
+            # padding); re-mirror onto sampling_info so both consumers see the
+            # padded length.
+            self.rids_hashed = self._pad_tensor_to_size(self.rids_hashed, bs)
+            if self.sampling_info is not None:
+                self.sampling_info.rids_hashed = self.rids_hashed
+
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
@@ -1292,3 +1297,15 @@ if is_cuda() or is_hip():
     clamp_position = clamp_position_cuda
 else:
     clamp_position = _clamp_position_native
+
+
+def _hash_rids_to_i64_tensor(
+    *, rids: List[str], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_rid_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)
