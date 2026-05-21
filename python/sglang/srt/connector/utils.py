@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 
 from sglang.srt.connector import BaseConnector
 
-
 COMMON_REMOTE_MODEL_FILES = [
     "config.json",
     "generation_config.json",

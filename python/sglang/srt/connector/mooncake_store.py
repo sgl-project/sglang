@@ -59,14 +59,11 @@ def _check_batch_get_results(
         if result < 0:
             failures.append(f"{key}: error={result}")
         elif result != tensor_size:
-            failures.append(
-                f"{key}: expected {tensor_size} bytes, got {result}"
-            )
+            failures.append(f"{key}: expected {tensor_size} bytes, got {result}")
 
     if failures:
         raise RuntimeError(
-            "Mooncake batch_get_into failed for some tensors: "
-            + "; ".join(failures)
+            "Mooncake batch_get_into failed for some tensors: " + "; ".join(failures)
         )
 
 
@@ -78,14 +75,11 @@ def _check_batch_put_results(keys: List[str], results: List[int]) -> None:
         )
 
     failures = [
-        f"{key}: error={result}"
-        for key, result in zip(keys, results)
-        if result != 0
+        f"{key}: error={result}" for key, result in zip(keys, results) if result != 0
     ]
     if failures:
         raise RuntimeError(
-            "Mooncake batch_put_from failed for some tensors: "
-            + "; ".join(failures)
+            "Mooncake batch_put_from failed for some tensors: " + "; ".join(failures)
         )
 
 
@@ -244,7 +238,9 @@ class MooncakeStoreConnector(BaseKVConnector):
                         failures.append(f"{key}: error={ret_code}")
                     continue
 
-                num_chunks = (len(data) + STANDALONE_CHUNK_SIZE - 1) // STANDALONE_CHUNK_SIZE
+                num_chunks = (
+                    len(data) + STANDALONE_CHUNK_SIZE - 1
+                ) // STANDALONE_CHUNK_SIZE
                 for chunk_idx in range(num_chunks):
                     start = chunk_idx * STANDALONE_CHUNK_SIZE
                     end = start + STANDALONE_CHUNK_SIZE
@@ -267,9 +263,7 @@ class MooncakeStoreConnector(BaseKVConnector):
                         self._rep_config,
                     )
                     if ret_code != 0:
-                        failures.append(
-                            f"{_chunk_manifest_key(key)}: error={ret_code}"
-                        )
+                        failures.append(f"{_chunk_manifest_key(key)}: error={ret_code}")
             if failures:
                 raise RuntimeError(
                     "Mooncake put failed for some tensors: " + "; ".join(failures)
