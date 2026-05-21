@@ -176,17 +176,6 @@ export const Qwen3Deployment = () => {
       delete options.reasoningParser;
     }
 
-    // Xeon uses TP-only deployment and should not retain stale GPU-only combinations
-    if (values.hardware === 'xeon') {
-      options.hardware = {
-        ...options.hardware,
-        items: options.hardware.items.map(item => ({
-          ...item,
-          default: item.id === 'xeon'
-        }))
-      };
-    }
-
     return options;
   };
 
