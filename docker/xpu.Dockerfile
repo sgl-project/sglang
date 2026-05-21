@@ -68,8 +68,7 @@ RUN --mount=type=secret,id=github_token \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps xgrammar==0.1.33 && \
-    # index will change after torch 2.12 release
-    pip install triton-xpu --index-url https://download.pytorch.org/whl/test/xpu --force-reinstall && \
+    pip install triton-xpu==3.7.1 --index-url https://download.pytorch.org/whl/xpu --force-reinstall && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc
 
