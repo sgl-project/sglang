@@ -2844,11 +2844,29 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
+                    # Callback the worker fires between verify and draft_extend
+                    # for spec_v2. Dispatches the buf write whose values are
+                    # consumed by schedule stream (resolve_seq_lens_cpu), so
+                    # the fence event lands at verify-end and schedule prep
+                    # can overlap with draft_extend on forward stream. Only
+                    # spec_v2 workers accept this kwarg.
+                    fwd_kwargs = {}
+                    if batch.is_spec_v2:
+
+                        def on_verify_complete(new_seq_lens, bonus_tokens):
+                            self.future_map.store_post_verify(
+                                future_indices, new_seq_lens, bonus_tokens
+                            )
+
+                        fwd_kwargs["on_verify_complete"] = on_verify_complete
+
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **fwd_kwargs
+                        )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).

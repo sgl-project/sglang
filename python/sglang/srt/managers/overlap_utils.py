@@ -149,17 +149,53 @@ class FutureMap:
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def _record_store_done(self) -> None:
-        # Must be called on forward stream right after a store_to_map write.
-        # Reuses the same Event across iters; record() repositions it to the
-        # current forward-stream point. FIFO of forward stream guarantees the
-        # new position is at-or-past every prior store_to_map.
+        # Must be called on forward stream right after a buf write that
+        # produces values consumed by schedule stream. Reuses one Event across
+        # iters; record() repositions it to the current forward-stream point.
+        # Forward-stream FIFO guarantees the new position is at-or-past every
+        # prior write recorded on this event.
         if self._last_store_done is None:
             self._last_store_done = torch.get_device_module(self.device).Event()
         self._last_store_done.record()
 
+    def store_post_verify(
+        self,
+        future_indices: FutureIndices,
+        new_seq_lens: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+    ) -> None:
+        """Forward stream. Writes the buf fields produced at verify-end
+        (new_seq_lens, bonus_tokens) and records the cross-stream fence here.
+
+        The fence lands at verify-end rather than at store_to_map (which runs
+        after draft_extend), so schedule-stream consumers (resolve_seq_lens_cpu)
+        unblock as soon as verify is done — preserving the schedule prep /
+        draft_extend overlap window on forward stream.
+
+        First iter (buf not yet allocated): no-op. The subsequent store_to_map
+        will lazy-init, write these fields too, and record the fence.
+        """
+        if self.spec_algo.is_none() or not self.buf_initialized:
+            return
+        indices = future_indices.indices
+        if indices.shape[0] == 0:
+            # DP idle: nothing to store for this rank.
+            return
+        # Advanced indexing requires explicit dtype cast (slice assignment
+        # used to coerce implicitly).
+        self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
+        self.bonus_tokens_buf[indices] = bonus_tokens.to(self.bonus_tokens_buf.dtype)
+        self._record_store_done()
+
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
+        """Forward stream. Writes the buf fields produced at draft_extend-end
+        (topk_p, topk_index, hidden_states). new_seq_lens / bonus_tokens are
+        written earlier by store_post_verify on steady-state iters; this
+        method also writes them on the first iter (where post_verify was a
+        no-op pre-lazy-init) and records the fence then.
+        """
         if self.spec_algo.is_none():
             indices = future_indices.indices
             if indices.shape[0] == 0:
@@ -170,14 +206,10 @@ class FutureMap:
             # next_token_ids is int32; buf is int64. Slice assignment used to
             # cast implicitly, but advanced indexing requires an explicit match.
             self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
-        else:
-            draft_input: EagleDraftInput = batch_result.next_draft_input
-            self.store_to_map_for_new_batch(future_indices, draft_input)
-        self._record_store_done()
+            self._record_store_done()
+            return
 
-    def store_to_map_for_new_batch(
-        self, future_indices: FutureIndices, draft_input: EagleDraftInput
-    ):
+        draft_input: EagleDraftInput = batch_result.next_draft_input
         indices = future_indices.indices
         if indices.shape[0] == 0:
             # DP idle rank: draft_input fields are empty stubs without a usable
@@ -185,7 +217,8 @@ class FutureMap:
             # would IndexError. Defer init until a real batch arrives.
             return
 
-        if not self.buf_initialized:
+        first_iter = not self.buf_initialized
+        if first_iter:
             self._lazy_init_buf(draft_input)
 
         # Slice assignment used to coerce src dtype to buf dtype implicitly;
@@ -195,13 +228,46 @@ class FutureMap:
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
         )
-        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
-            self.bonus_tokens_buf.dtype
+        if first_iter:
+            # store_post_verify was a no-op (buf not allocated then). Catch up
+            # on its writes here and record the fence.
+            self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
+                self.new_seq_lens_buf.dtype
+            )
+            self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
+                self.bonus_tokens_buf.dtype
+            )
+            self._record_store_done()
+        if spec_need_hidden_states():
+            self.hidden_states_buf[indices] = draft_input.hidden_states.to(
+                self.hidden_states_buf.dtype
+            )
+
+    def store_to_map_for_new_batch(
+        self, future_indices: FutureIndices, draft_input: EagleDraftInput
+    ) -> None:
+        """Bootstrap helper for disagg-decode prebuilt batches. The caller
+        constructs a fully-populated EagleDraftInput (all post-verify and
+        post-draft_extend fields) and asks FutureMap to seed the buf in one
+        shot, recording the fence so subsequent resolve_seq_lens_cpu sees
+        valid data. Equivalent to the first-iter path in store_to_map."""
+        indices = future_indices.indices
+        if indices.shape[0] == 0:
+            return
+        if not self.buf_initialized:
+            self._lazy_init_buf(draft_input)
+        self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
+        self.topk_index_buf[indices] = draft_input.topk_index.to(
+            self.topk_index_buf.dtype
         )
         self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
             self.new_seq_lens_buf.dtype
+        )
+        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            self.bonus_tokens_buf.dtype
         )
         if spec_need_hidden_states():
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
+        self._record_store_done()

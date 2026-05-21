@@ -669,7 +669,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_verify_complete=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -706,6 +706,15 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            # Dispatch the post-verify buf write on forward stream BEFORE
+            # draft_extend, so the cross-stream fence point lands at verify-end
+            # rather than after draft_extend — preserving schedule prep /
+            # draft_extend overlap.
+            if on_verify_complete is not None:
+                on_verify_complete(
+                    batch_output.next_draft_input.new_seq_lens,
+                    batch_output.next_draft_input.bonus_tokens,
+                )
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
