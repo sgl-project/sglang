@@ -22,9 +22,7 @@ def find_violation_in_log(
         reason_field = match.group(2)
         if fail_reason not in reason_field.split("+"):
             continue
-        if any(
-            fnmatch.fnmatchcase(tag, pattern) for pattern in launch_tag_patterns
-        ):
+        if any(fnmatch.fnmatchcase(tag, pattern) for pattern in launch_tag_patterns):
             return True
     return False
 
