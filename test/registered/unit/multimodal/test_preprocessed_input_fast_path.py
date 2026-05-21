@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,
@@ -146,6 +152,63 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertEqual(len(mm_items), 1)
         self.assertIs(mm_items[0].feature, feature)
         self.assertIsNotNone(mm_items[0].pad_value)
+
+    def test_precomputed_padded_input_ids_are_preserved(self):
+        input_ids = [1, 42, 42, 2, 42, 3]
+        mm_items = [
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(1, 2)],
+                pad_value=-1001,
+                feature=torch.arange(8).reshape(2, 4),
+            ),
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                offsets=[(4, 4)],
+                pad_value=-1002,
+                feature=torch.arange(4).reshape(1, 4),
+            ),
+        ]
+
+        padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+            torch.tensor([input_ids]), mm_items
+        )
+        processor_output = MultimodalProcessorOutput(
+            input_ids=input_ids,
+            padded_input_ids=padded_input_ids,
+            mm_items=mm_items,
+            im_token_id=42,
+        )
+        mm_inputs = MultimodalInputs.from_processor_output(processor_output)
+
+        self.assertEqual(padded_input_ids, [1, -1001, -1001, 2, -1002, 3])
+        self.assertEqual(mm_inputs.padded_input_ids, padded_input_ids)
+
+    def test_multimodal_token_padding_uses_offsets(self):
+        input_ids = [1, 42, 42, 2, 43, 43, 3]
+        mm_inputs = MultimodalInputs(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    offsets=[(1, 2)],
+                    pad_value=-1001,
+                ),
+                MultimodalDataItem(
+                    modality=Modality.VIDEO,
+                    offsets=[(4, 5)],
+                    pad_value=-1002,
+                ),
+            ],
+            im_token_id=42,
+            video_token_id=43,
+        )
+
+        output_ids = MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            input_ids, mm_inputs
+        )
+
+        self.assertEqual(output_ids, [1, -1001, -1001, 2, -1002, -1002, 3])
+        self.assertEqual(input_ids, [1, 42, 42, 2, 43, 43, 3])
 
     def test_qwen_mrope_collects_all_split_image_grids(self):
         processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)

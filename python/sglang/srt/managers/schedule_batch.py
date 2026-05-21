@@ -378,12 +378,13 @@ class MultimodalProcessorOutput:
 
     This is the typed replacement for the dict previously returned by
     ``BaseMultimodalProcessor.process_mm_data_async``.  Preprocessed inputs may
-    already carry ``pad_value`` and ``hash`` to avoid hashing the same tensor once
-    per scheduler TP rank.
+    already carry ``pad_value``/``hash`` and ``padded_input_ids`` to avoid
+    repeated scheduler work on each TP rank.
     """
 
     mm_items: List[MultimodalDataItem]
     input_ids: Optional[List[int]] = None
+    padded_input_ids: Optional[List[int]] = None
 
     # image
     im_token_id: Optional[int] = None
@@ -417,6 +418,7 @@ class MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
             mm_items=d["mm_items"],
             input_ids=d.get("input_ids"),
+            padded_input_ids=d.get("padded_input_ids"),
             im_token_id=d.get("im_token_id"),
             im_start_id=d.get("im_start_id"),
             im_end_id=d.get("im_end_id"),
@@ -433,6 +435,27 @@ class MultimodalProcessorOutput:
             visible_frame_counts=d.get("visible_frame_counts"),
         )
 
+    @staticmethod
+    def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):
+        if input_ids is None or not mm_items:
+            return None
+
+        for item in mm_items:
+            if item.pad_value is None or item.offsets is None:
+                return None
+
+        if isinstance(input_ids, torch.Tensor):
+            padded_input_ids = input_ids.flatten().tolist()
+        else:
+            padded_input_ids = list(input_ids)
+
+        for item in mm_items:
+            for start, end in item.offsets:
+                padded_input_ids[start : end + 1] = [item.pad_value] * (
+                    end - start + 1
+                )
+        return padded_input_ids
+
 
 @dataclasses.dataclass
 class MultimodalInputs:
@@ -440,6 +463,7 @@ class MultimodalInputs:
 
     # items of data
     mm_items: List[MultimodalDataItem]
+    padded_input_ids: Optional[List[int]] = None
     image_pad_len: Optional[list] = None
     num_image_tokens: Optional[int] = None
 
@@ -481,6 +505,7 @@ class MultimodalInputs:
 
         ret = MultimodalInputs(
             mm_items=mm_items,
+            padded_input_ids=obj.padded_input_ids,
         )
 
         assert isinstance(ret.mm_items, list)

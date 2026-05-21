@@ -606,6 +606,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+        padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+            input_ids, mm_items
+        )
 
         image_grid_thw = self._get_grid_from_output_or_items(
             ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
@@ -653,6 +656,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
+            padded_input_ids=padded_input_ids,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
