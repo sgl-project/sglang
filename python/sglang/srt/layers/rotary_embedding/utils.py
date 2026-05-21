@@ -7,7 +7,7 @@ from typing import Tuple
 
 import torch
 
-from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -70,7 +70,6 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,

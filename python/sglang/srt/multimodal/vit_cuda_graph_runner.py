@@ -208,7 +208,7 @@ class ViTCudaGraphRunner:
     # Capture
     # ------------------------------------------------------------------
 
-    def _capture(self, bucket_size: int) -> None:
+    def _capture(self, bucket_size: int, stream: torch.cuda.Stream) -> None:
         """Capture a CUDA graph for a single bucket size."""
         B = bucket_size
         self._alloc_buffers(B)
@@ -223,76 +223,38 @@ class ViTCudaGraphRunner:
         if ViTCudaGraphRunner._graph_memory_pool is None:
             ViTCudaGraphRunner._graph_memory_pool = device_module.graph_pool_handle()
 
-        # Disable dynamo during warmup+capture to avoid polluting the
-        # dynamo cache with bucket-specific shape guards
-        # (rotary_embedding uses torch.compile internally).
-        @torch._dynamo.disable
-        def _warmup_and_capture():
-            for _ in range(2):
-                block_out, ds_outs = self.vit.run_blocks(
-                    input_buf, fwd_metadata, rotary_cos, rotary_sin
-                )
-                self.vit.run_merger(block_out, ds_outs)
-            device_module.synchronize()
+        # Warmup
+        for _ in range(2):
+            block_out, ds_outs = self.vit.run_blocks(
+                input_buf, fwd_metadata, rotary_cos, rotary_sin
+            )
+            self.vit.run_merger(block_out, ds_outs)
+        device_module.synchronize()
 
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
-                block_out, ds_outs = self.vit.run_blocks(
-                    input_buf, fwd_metadata, rotary_cos, rotary_sin
-                )
-                output = self.vit.run_merger(block_out, ds_outs)
-            return graph, output
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            graph, pool=ViTCudaGraphRunner._graph_memory_pool, stream=stream
+        ):
+            block_out, ds_outs = self.vit.run_blocks(
+                input_buf, fwd_metadata, rotary_cos, rotary_sin
+            )
+            output = self.vit.run_merger(block_out, ds_outs)
 
-        graph, output = _warmup_and_capture()
         self.graphs[B] = graph
         self.output_bufs[B] = output
 
     def capture_all(self) -> None:
         """Eagerly capture graphs for all bucket sizes. Called at model init."""
-        import logging
+        from sglang.srt.distributed.parallel_state import graph_capture
 
-        logger = logging.getLogger(__name__)
-        # Capture largest first so the graph pool's initial allocation is big
-        # enough for smaller graphs to reuse (same strategy as LLM CUDA graph).
-        for B in reversed(self.BUCKET_SIZES):
-            self._capture(B)
-        logger.info("[VIT_GRAPH] capture done, warming up eager fallback")
-
-        import time as _time
-
-        # Warmup with a large token count (larger than any typical image)
-        # to absorb first-call CUDA initialization for large problem sizes.
-        WARMUP_TOKENS = 34048  # > typical max ~33600
-        cfg = self.config
-        warmup_x = torch.zeros(
-            WARMUP_TOKENS, 1, cfg.hidden_dim, device=self.device, dtype=self.dtype
-        )
-        warmup_cos = torch.zeros(
-            WARMUP_TOKENS, cfg.rotary_dim, device=self.device, dtype=self.dtype
-        )
-        warmup_sin = torch.zeros(
-            WARMUP_TOKENS, cfg.rotary_dim, device=self.device, dtype=self.dtype
-        )
-        warmup_cu = torch.tensor(
-            [0, WARMUP_TOKENS], device=self.device, dtype=torch.int32
-        )
-        warmup_sl = torch.tensor([WARMUP_TOKENS], device=self.device, dtype=torch.int32)
-        warmup_meta = VisionAttentionMetadata(
-            cu_seqlens=warmup_cu,
-            seq_lens=warmup_sl,
-            max_seqlen=WARMUP_TOKENS,
-        )
-
-        t0 = _time.monotonic()
-        self._eager_fallback(warmup_x, warmup_meta, warmup_cos, warmup_sin)
-        torch.get_device_module(self.device).synchronize()
-        t1 = _time.monotonic()
-        logger.info(
-            "[VIT_GRAPH] eager warmup took %.1fms (tokens=%d)",
-            (t1 - t0) * 1000,
-            WARMUP_TOKENS,
-        )
-        del warmup_x, warmup_cos, warmup_sin, warmup_cu, warmup_sl, warmup_meta
+        # Use a dedicated stream for capture, same as LLM CUDA graph.
+        with graph_capture() as graph_capture_context:
+            stream = graph_capture_context.stream
+            # Capture largest first so the graph pool's initial allocation
+            # is big enough for smaller graphs to reuse.
+            for B in reversed(self.BUCKET_SIZES):
+                self._capture(B, stream)
 
     # ------------------------------------------------------------------
     # Replay
@@ -431,22 +393,7 @@ class ViTCudaGraphRunner:
                 bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
 
-        # Fallback: total tokens exceed max bucket, run eager.
-        # Disable dynamo so torch.compile'd functions (e.g.
-        # apply_rotary_pos_emb_native) run in plain eager mode,
-        # avoiding Triton JIT recompilation on novel shapes.
-        return self._eager_fallback(
-            x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
-        )
-
-    @torch._dynamo.disable
-    def _eager_fallback(
-        self,
-        x: torch.Tensor,
-        forward_metadata: VisionAttentionMetadata,
-        rotary_pos_emb_cos: torch.Tensor,
-        rotary_pos_emb_sin: torch.Tensor,
-    ) -> torch.Tensor:
+        # Fallback: total tokens exceed max bucket, run eager
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
