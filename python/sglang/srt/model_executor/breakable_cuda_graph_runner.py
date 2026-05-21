@@ -330,7 +330,8 @@ class BreakableCudaGraphRunner:
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        self._run_forward(forward_batch, num_tokens)
+        with enable_breakable_cuda_graph():
+            self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""

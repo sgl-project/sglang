@@ -2856,6 +2856,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 elif hasattr(layer.self_attn, "attn_mqa"):
                     # For DeepSeek model
                     attn_layer = layer.self_attn.attn_mqa
+                    # Aiter BCG/PCG uses MHA during capture; breaks must target attn_mha.
+                    if self.server_args.attention_backend == "aiter" and hasattr(
+                        layer.self_attn, "attn_mha"
+                    ):
+                        attn_layer = layer.self_attn.attn_mha
             # For hybrid model
             elif hasattr(layer, "attn"):
                 attn_layer = layer.attn
