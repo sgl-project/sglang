@@ -1282,9 +1282,7 @@ class BaseMultimodalProcessor(ABC):
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):
                     item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
-                if (
-                    isinstance(item.precomputed_embeddings, torch.Tensor)
-                ):
+                if isinstance(item.precomputed_embeddings, torch.Tensor):
                     item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
                         item.precomputed_embeddings
                     )

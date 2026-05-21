@@ -5,11 +5,14 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultiModalProcessorOutput,
     BaseMultimodalProcessor,
+    BaseMultiModalProcessorOutput,
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class FailingTokenizer:
