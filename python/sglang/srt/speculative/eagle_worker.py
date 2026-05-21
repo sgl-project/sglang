@@ -881,7 +881,11 @@ class EAGLEWorker(TpModelWorker):
             ):
                 out_cache_loc = out_cache_loc.contiguous()
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+            # Swap the per-step backend on the runner so _forward_raw publishes
+            # it via pool_context to the model layer.
+            self.draft_model_runner.attn_backend = (
+                self.draft_attn_backend.attn_backends[i]
+            )
             spec_info.hidden_states = hidden_states
 
             # Run forward
@@ -1203,7 +1207,9 @@ class EAGLEWorker(TpModelWorker):
                     or self.draft_model_runner.attn_backend
                 )
                 attn_backend.init_forward_metadata(forward_batch)
-                forward_batch.attn_backend = attn_backend
+                # Swap on the runner so _forward_raw publishes via
+                # pool_context.
+                self.draft_model_runner.attn_backend = attn_backend
             logits_output = self.draft_model_runner.forward(
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
