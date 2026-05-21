@@ -99,7 +99,9 @@ impl PodInfo {
     pub fn should_include(pod: &Pod, config: &ServiceDiscoveryConfig) -> bool {
         if config.pd_mode {
             if config.prefill_selector.is_empty() && config.decode_selector.is_empty() {
-                warn!("PD mode enabled but both prefill_selector and decode_selector are empty");
+                    warn!(
+                        "PD mode enabled but both prefill_selector and decode_selector are empty"
+                    );
                 return false;
             }
             Self::matches_selector(pod, &config.prefill_selector)
