@@ -3840,9 +3840,8 @@ class ServerArgs:
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
 
-            if self.cuda_graph_mode[Phase.PREFILL] == Backend.DISABLED:
-                self.cuda_graph_mode[Phase.DECODE] = Backend.DISABLED
-                self.cuda_graph_mode[Phase.PREFILL] = Backend.DISABLED
+            if self.disable_piecewise_cuda_graph or self.disable_cuda_graph:
+                self.disable_cuda_graph = True
                 logger.warning(
                     "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
                 )
