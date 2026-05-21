@@ -78,13 +78,6 @@ def launch_endpoints_per_forward(
     if input_ids is not None:
         input_ids = _canonicalize_boundary_int64(input_ids, "forward_batch.input_ids")
 
-    valid_num_tokens = get_valid_num_tokens(forward_batch=forward_batch)
-    positions = positions[:valid_num_tokens]
-    if input_ids is not None:
-        input_ids = input_ids[:valid_num_tokens]
-    if out_cache_loc is not None:
-        out_cache_loc = out_cache_loc[:valid_num_tokens]
-
     num_tokens = int(positions.shape[0])
     if expected_inputs.tokens.shape[0] != num_tokens:
         raise RuntimeError(
@@ -151,13 +144,6 @@ def _endpoint_belongs_to_group(
 ) -> bool:
     suffix = endpoint.kernel_kind.name.rsplit("_", 1)[1]
     return suffix == group.kind.name
-
-
-def get_valid_num_tokens(*, forward_batch: "ForwardBatch") -> int:
-    num_token_non_padded_cpu = forward_batch.num_token_non_padded_cpu
-    if num_token_non_padded_cpu is not None:
-        return int(num_token_non_padded_cpu)
-    return int(forward_batch.positions.shape[0])
 
 
 def _canonicalize_boundary_int64(tensor: torch.Tensor, name: str) -> torch.Tensor:

@@ -18,7 +18,6 @@ from sglang.srt.kv_canary.plan_input_builder import (
 )
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.launch import (
-    get_valid_num_tokens,
     invoke_plan,
     launch_endpoints_per_forward,
 )
@@ -186,7 +185,7 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        num_tokens = get_valid_num_tokens(forward_batch=forward_batch)
+        num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             invoke_plan(
@@ -215,7 +214,7 @@ class PerForwardOrchestrator:
             return
 
         violation_log = self._device_state.violation_log
-        num_tokens = get_valid_num_tokens(forward_batch=forward_batch)
+        num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             launch_endpoints_per_forward(

@@ -337,8 +337,8 @@ class TestSelfUnitRunner(CustomTestCase):
 
         self.assertEqual([target.value for target in targets], [0])
 
-    def test_launch_endpoints_per_forward_uses_unpadded_token_tensors(self):
-        """Verify endpoint launch receives tensors sliced to the real token count."""
+    def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self):
+        """Verify endpoint launch preserves CUDA graph-stable tensor shapes."""
         group = _make_group(device=self.device)
         endpoint = _RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = _make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -360,7 +360,7 @@ class TestSelfUnitRunner(CustomTestCase):
             verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
             write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
             forward_batch=forward_batch,
-            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.OFF,
             input_check_mode=False,
@@ -371,19 +371,19 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 call["fb_input_ids"],
-                torch.tensor([101], dtype=torch.int64, device=self.device),
+                torch.tensor([101, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
                 call["fb_positions"],
-                torch.tensor([10], dtype=torch.int64, device=self.device),
+                torch.tensor([10, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
                 call["fb_out_cache_loc"],
-                torch.tensor([7], dtype=torch.int64, device=self.device),
+                torch.tensor([7, 0, 0], dtype=torch.int64, device=self.device),
             )
         )
 
