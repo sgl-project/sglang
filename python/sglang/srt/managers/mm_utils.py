@@ -1123,17 +1123,48 @@ def general_mm_embed_routine(
         _ts_after_vit = _ts_time.time()
         _vit_dur = (_ts_after_vit - _ts_routine_start) * 1000
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    if _has_mm:
+        import os
+
+        _spike_profile_dir = os.environ.get("SPIKE_PROFILE_DIR", "")
+        if _spike_profile_dir:
+            os.makedirs(_spike_profile_dir, exist_ok=True)
+            with torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+            ) as _prof:
+                hidden_states = language_model(
+                    input_ids=None,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                    **kwargs,
+                )
+                torch.cuda.synchronize()
+        else:
+            _prof = None
+            hidden_states = language_model(
+                input_ids=None,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                **kwargs,
+            )
+            torch.cuda.synchronize()
+    else:
+        _prof = None
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
 
     if _has_mm:
-        torch.cuda.synchronize()
         _ts_after_llm = _ts_time.time()
         _llm_dur = (_ts_after_llm - _ts_after_vit) * 1000
+        import datetime
         import logging
 
         logging.getLogger(__name__).info(
@@ -1143,6 +1174,16 @@ def general_mm_embed_routine(
             _vit_dur + _llm_dur,
             _ts_after_llm,
         )
+        # Save profile only for spikes
+        if _prof is not None and _llm_dur > 200:
+            _ts_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            _trace_path = os.path.join(
+                _spike_profile_dir, f"spike_llm_{_llm_dur:.0f}ms_{_ts_str}.json"
+            )
+            _prof.export_chrome_trace(_trace_path)
+            logging.getLogger(__name__).info(
+                "[SPIKE_PROFILE] saved to %s (llm=%.1fms)", _trace_path, _llm_dur
+            )
 
     return hidden_states
 
