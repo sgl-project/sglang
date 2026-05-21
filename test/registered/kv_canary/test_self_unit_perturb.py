@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestPerturb(CustomTestCase):
+class TestParseTargetGroupKind(CustomTestCase):
     def test_parse_target_group_kind_accepts_valid_values_case_insensitively(
         self,
     ) -> None:
@@ -50,6 +50,8 @@ class TestPerturb(CustomTestCase):
                 ):
                     _parse_target_group_kind(raw)
 
+
+class TestPickTargetGroup(CustomTestCase):
     def test_pick_target_group_filters_exact_kind(self) -> None:
         cases = [
             (TargetGroupKind.FULL, PoolKind.FULL),
@@ -89,6 +91,8 @@ class TestPerturb(CustomTestCase):
 
         self.assertIsNone(group)
 
+
+class TestPerturbManager(CustomTestCase):
     def test_perturb_manager_perturb_dispatches_all_points(self) -> None:
         """Verify perturb() runs each perturb point in order."""
         device = DEFAULT_DEVICE
@@ -126,6 +130,8 @@ class TestPerturb(CustomTestCase):
             calls, ["req_to_token", "real_kv_used", "real_kv_unused_cache"]
         )
 
+
+class TestReqToTokenPerturb(CustomTestCase):
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
         """Verify req_to_token perturbation replaces a slot with another live slot."""
         device = DEFAULT_DEVICE
@@ -169,6 +175,8 @@ class TestPerturb(CustomTestCase):
         self.assertNotEqual(replacement, original)
         self.assertFalse(bool(diff[1, 0].item()))
 
+
+class TestCollectActiveSlots(CustomTestCase):
     def test_collect_active_slots_ignores_padded_out_cache_loc(self) -> None:
         """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE
