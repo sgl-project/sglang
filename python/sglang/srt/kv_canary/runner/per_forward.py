@@ -193,21 +193,25 @@ class PerForwardOrchestrator:
         # Drain the previous step's enable mirror right before overwriting the slot, matching the
         # double-buffer pattern PumpAndAllreduce uses for its violation signal: the wait stalls the
         # host as late as possible so the d2h copy gets a full forward pass of headroom.
-        previous = self._pending_enable_future
-        if previous is not None:
-            enable_value = int(previous.wait().item())
-            if enable_value == 0:
-                self._overflow_count_total += 1
-                logger.warning(
-                    "kv-canary: per-forward verify skipped this step due to overflow "
-                    "(total=%d, capacity=%d); check ServerArgs / pool sizing",
-                    self._overflow_count_total,
-                    self._verify_capacity,
-                )
+        self._drain_previous_enable_mirror()
         self._pending_enable_future = FutureTensor.create(
             src_device=self._verify_plan_per_forward.enable,
             stream=self._d2h_stream,
         )
+
+    def _drain_previous_enable_mirror(self) -> None:
+        previous = self._pending_enable_future
+        if previous is None:
+            return
+        enable_value = int(previous.wait().item())
+        if enable_value == 0:
+            self._overflow_count_total += 1
+            logger.warning(
+                "kv-canary: per-forward verify skipped this step due to overflow "
+                "(total=%d, capacity=%d); check ServerArgs / pool sizing",
+                self._overflow_count_total,
+                self._verify_capacity,
+            )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
