@@ -930,7 +930,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
     ) -> torch.Tensor:
-        """Dispatch to CUDA graph runner with bin-packing.
+        """Dispatch to CUDA graph runner.
 
         Args:
             x: [total_tokens, 1, hidden_dim] - all images packed, 3D.
@@ -938,34 +938,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             rotary_pos_emb_cos: [total_tokens, rotary_dim]
             rotary_pos_emb_sin: [total_tokens, rotary_dim]
         """
-        import time
-
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-        # Split per-image
-        num_images = len(token_cu_seqlens) - 1
-        per_image_tokens = []
-        per_image_cos = []
-        per_image_sin = []
-        for i in range(num_images):
-            start = int(token_cu_seqlens[i])
-            end = int(token_cu_seqlens[i + 1])
-            per_image_tokens.append(x[start:end, 0, :])  # [si, hidden_dim]
-            per_image_cos.append(rotary_pos_emb_cos[start:end])
-            per_image_sin.append(rotary_pos_emb_sin[start:end])
-
-        result = self.cuda_graph_runner.run(
-            per_image_tokens, per_image_cos, per_image_sin
+        return self.cuda_graph_runner.run(
+            x, token_cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
-
-        torch.cuda.synchronize()
-        dt = (time.perf_counter() - t0) * 1000
-        total_tokens = int(token_cu_seqlens[-1])
-        logger.info(
-            f"[VIT CG] images={num_images} tokens={total_tokens} time={dt:.2f}ms"
-        )
-        return result
 
     def forward_with_npu_graph(
         self,
