@@ -16,6 +16,7 @@ class _BaselineBase(CanaryE2EBase):
     extra_env = {}
 
     def test_no_violation(self) -> None:
+        """Verify the baseline canary run completes without violations."""
         self.send_parallel_requests(n=4)
         self.assert_no_violation(wait_seconds=2.0)
 

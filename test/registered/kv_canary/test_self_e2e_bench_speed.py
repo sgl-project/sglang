@@ -103,6 +103,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
+        """Verify canary prefill overhead stays within the expected bound."""
         _measure_overhead(
             scenario_key="qwen3-0.6b/prefill_bs32_isl16384_osl1",
             batch_size=32,
@@ -111,6 +112,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
     def test_qwen3_decode_overhead_bs256_isl4096_osl1024(self) -> None:
+        """Verify canary decode overhead stays within the expected bound."""
         _measure_overhead(
             scenario_key="qwen3-0.6b/decode_bs256_isl4096_osl1024",
             batch_size=256,

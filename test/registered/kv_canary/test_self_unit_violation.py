@@ -33,6 +33,7 @@ def _make_row(
 
 
 def test_format_violation_verify_path_labels_each_bit() -> None:
+    """Verify verify-path violations render each fail-reason bit."""
     row = _make_row(
         stored_chain_hash=0x1111111111111111,
         expected_aux=0x2222222222222222,
@@ -52,8 +53,7 @@ def test_format_violation_verify_path_labels_each_bit() -> None:
 
 
 def test_format_violation_write_token_mismatch_labels_and_position() -> None:
-    """Regression: write violations were silently labeled `fail_reasons: none` and `expected_aux`
-    was printed as a hex prev_hash even though it carries `expected_position`."""
+    """Verify write-token violations render token and position details."""
     row = _make_row(
         position=42,
         stored_token=999,
@@ -76,6 +76,7 @@ def test_format_violation_write_token_mismatch_labels_and_position() -> None:
 def test_format_violation_write_position_mismatch_uses_expected_aux_as_position() -> (
     None
 ):
+    """Verify write-position violations render expected_aux as a position."""
     row = _make_row(
         position=42,
         stored_token=111,
@@ -90,6 +91,7 @@ def test_format_violation_write_position_mismatch_uses_expected_aux_as_position(
 
 
 def test_format_violation_combined_write_bits_render_both_labels() -> None:
+    """Verify combined write violation bits render both labels."""
     row = _make_row(
         fail_reason_bits=int(
             FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
@@ -101,6 +103,7 @@ def test_format_violation_combined_write_bits_render_both_labels() -> None:
 
 
 def test_format_violation_unknown_kernel_kind_renders_unknown_label() -> None:
+    """Verify unknown kernel kinds render an unknown label."""
     row = _make_row(fail_reason_bits=int(FailReason.CHAIN_HASH))
     row[consts.VIOLATION_FIELD_KERNEL_KIND] = 9999
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)

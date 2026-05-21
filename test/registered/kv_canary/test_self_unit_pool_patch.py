@@ -29,6 +29,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.config = make_base_config()
 
     def test_canary_buffer_group_allocate_full_only(self):
+        """Verify MHA pools allocate only full canary buffers."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device
@@ -43,6 +44,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(group.v_head.shape, (16, CANARY_SLOT_BYTES))
 
     def test_canary_buffer_group_allocate_full_and_swa(self):
+        """Verify SWA pools allocate full and SWA canary buffers."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device
@@ -55,6 +57,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
 
     def test_real_kv_sources_above_4_raises(self):
+        """Verify too many real KV sources are rejected."""
         from sglang.jit_kernel.kv_canary.verify import (
             CanaryLaunchTag,
             VerifyPlan,
@@ -91,6 +94,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
             )
 
     def test_get_contiguous_buf_infos_inserts_canary_entries(self):
+        """Verify contiguous buffer metadata includes canary entries after patching."""
         for patched in (False, True):
             with self.subTest(patched=patched):
                 pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
@@ -108,6 +112,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
                     self.assertEqual(ptrs_after, ptrs_before)
 
     def test_swa_attach_splices_full_into_contiguous_and_swa_into_state(self):
+        """Verify SWA patching splices canary buffers into both buffer lists."""
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
         contiguous_before, _, _ = pool.get_contiguous_buf_infos()
         state_before, _, _ = pool.get_state_buf_infos()
@@ -120,6 +125,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(len(state_after), len(state_before) + 4)
 
     def test_pd_layout_canary_inserted_correctly(self):
+        """Verify paged-decoding canary buffers are inserted in layout order."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
@@ -142,6 +148,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(ptrs_after[-1], canary_v_ptrs[1])
 
     def test_pd_naive_first_last_insert_fails_layout_check(self):
+        """Verify paged-decoding layout is not a naive first-last insertion."""
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
@@ -161,6 +168,7 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertNotEqual(ptrs_after, naive_layout)
 
     def test_canary_buf_per_token_bytes_within_budget(self):
+        """Verify canary per-token storage stays below the real KV budget."""
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)
         groups_tuple = attach_canary_buffers(
             pool=pool, config=self.config, device=self.device
