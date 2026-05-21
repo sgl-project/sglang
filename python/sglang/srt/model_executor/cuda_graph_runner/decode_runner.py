@@ -44,14 +44,15 @@ from sglang.srt.distributed.parallel_state import (
     set_pdmux_status,
 )
 from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.utils import should_record_nolora_graph
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_backend.breakable_cudagraph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -157,10 +158,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
-        self.record_nolora_graph = should_record_nolora_graph()
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
@@ -185,7 +185,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+            self.num_tokens_per_bs = (
+                model_runner.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.speculative_num_draft_tokens, model_runner.is_draft_worker
+                )
+            )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -256,7 +260,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
-            is_hybrid_swa=model_runner.is_hybrid_swa,
+            hc_hidden_size=getattr(
+                self.model_runner.model_config, "hc_hidden_size", None
+            ),
         )
         self.buffers.share_buffers()
 
@@ -314,9 +320,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        variant_label = self._resolve_lora_variant(forward_batch)
-        stream_idx = get_current_stream_idx() if self.enable_pdmux else None
-        graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
+        graph_key = cuda_graph_bs
+        if self.enable_pdmux:
+            graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
         is_bs_supported = (
             self.backend.has_shape(graph_key)
@@ -457,8 +463,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         with self.backend.capture_session(self.stream):
                             _capture_one_stream(i)
 
-        _set_capture_lora_variant(None)
-
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 
@@ -500,7 +504,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
-            and not self.nsa_enable_prefill_cp
+            and not self.dsa_enable_prefill_cp
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
@@ -739,7 +743,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
+            dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )
