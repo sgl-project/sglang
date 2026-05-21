@@ -656,7 +656,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
-        # TODO(augusto.yjh) for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
+        # for decode and dcp_world_size > 1, lse should be returned to compute final attn_out
         # Direct call to run without the wrapper
         out = decode_wrapper.run(
             q_nope,

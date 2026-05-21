@@ -436,7 +436,10 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     return gathered_kv_a
 
 
-def all_gather_dcp_kv_cache_for_chunk_mha(kv_a: torch.Tensor, k_pe: torch.Tensor):
+def all_gather_kv_cache_for_mha_chunk_extend(
+    kv_a: torch.Tensor,
+    k_pe: torch.Tensor,
+):
     if get_dcp_world_size() > 1:
         return (
             _all_gather_dcp_kv_cache(kv_a).contiguous(),
@@ -445,7 +448,7 @@ def all_gather_dcp_kv_cache_for_chunk_mha(kv_a: torch.Tensor, k_pe: torch.Tensor
     return kv_a, k_pe
 
 
-def all_gather_dcp_kv_cache_for_mha(
+def all_gather_kv_cache_for_mha_extend(
     token_to_kv_pool,
     attn_mqa,
     dcp_local_prefix_kv_indices,
@@ -492,3 +495,53 @@ def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
             // get_dcp_world_size()
         )
     return kv_indices
+
+
+def all_gather_q_for_mla_decode(
+    q_nope_out: torch.Tensor,
+    q_pe: torch.Tensor,
+):
+    with use_symmetric_memory(get_dcp_group()):
+        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
+    gathered = get_dcp_group().all_gather(combined, dim=0)
+    d_pe = q_pe.size(-1)
+    d_nope = q_nope_out.size(-1)
+    q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
+    q_pe = q_pe.transpose(0, 1)
+    q_nope_out = q_nope_out.transpose(0, 1)
+    return q_nope_out, q_pe
+
+
+def all_gather_kv_cache_for_mla_extend(
+    token_to_kv_pool,
+    attn_mqa,
+    dcp_local_prefix_kv_indices,
+    dcp_extend_prefix_lens_sum,
+    dcp_kv_buffer,
+    kv_lora_rank,
+    k_nope,
+    k_pe,
+):
+    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
+        attn_mqa,
+        dcp_local_prefix_kv_indices,
+    )
+    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    local_cache_kv = torch.cat((cache_k_nope, cache_k_rope), dim=-1)
+    get_dcp_group().all_gather_into_tensor(
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum],
+        local_cache_kv,
+    )
+
+    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    dcp_kv_buffer[
+        dcp_extend_prefix_lens_sum:,
+        ...,
+        :kv_lora_rank,
+    ] = k_nope
+    dcp_kv_buffer[
+        dcp_extend_prefix_lens_sum:,
+        ...,
+        kv_lora_rank:,
+    ] = k_pe
