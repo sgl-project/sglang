@@ -1247,7 +1247,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 rope_type="rope_3d",
             )
         else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+            import time
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            result = self.visual(pixel_values, grid_thw=image_grid_thw)
+            torch.cuda.synchronize()
+            dt = (time.perf_counter() - t0) * 1000
+            logger.info(
+                f"[VIT] images={len(items)} tokens={pixel_values.shape[0]} time={dt:.2f}ms"
+            )
+            return result
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         # in qwen-vl, last dim is the same
