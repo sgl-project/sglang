@@ -101,7 +101,13 @@ def _parse_swa_divergence_line(line: str) -> dict[str, int]:
     match = re.search(pattern, line)
     if match is None:
         raise AssertionError(f"line does not match swa_divergence format: {line!r}")
-    keys = ("forward_ct", "verify_full", "verify_swa", "mapping_nonidentity", "swa_pool_wrap")
+    keys = (
+        "forward_ct",
+        "verify_full",
+        "verify_swa",
+        "mapping_nonidentity",
+        "swa_pool_wrap",
+    )
     return {key: int(match.group(idx + 1)) for idx, key in enumerate(keys)}
 
 
@@ -139,7 +145,9 @@ class TestSwaDivergenceStats(CustomTestCase):
         )
 
         allocator = _FakeAllocator(wrap_count=13)
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(True), _patch_future_tensor():
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
+            True
+        ), _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
@@ -169,7 +177,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                     full_to_swa_index_mapping=mapping_with_sentinel,
                 )
 
-            lines = [line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line]
+            lines = [
+                line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
+            ]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
             self.assertEqual(fields["forward_ct"], 4)
@@ -180,7 +190,9 @@ class TestSwaDivergenceStats(CustomTestCase):
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         allocator = _FakeAllocator(wrap_count=0)
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(True), _patch_future_tensor():
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
+            True
+        ), _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
@@ -202,7 +214,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                         full_to_swa_index_mapping=None,
                     )
                 matching = [
-                    line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
+                    line
+                    for line in capture.lines()
+                    if SWA_DIVERGENCE_LOG_PREFIX in line
                 ]
                 self.assertTrue(matching, capture.lines())
                 snapshots.append(_parse_swa_divergence_line(matching[-1]))
@@ -242,7 +256,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                 torch.tensor([-1], dtype=torch.int64, device=_DEVICE),
             ]
         )
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(True), _patch_future_tensor():
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
+            True
+        ), _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
