@@ -1,3 +1,10 @@
+---
+title: "Operator Performance Optimizing Guidance"
+metatags:
+    description: "Operator Performance Optimizing Guidance for NPU"
+---
+
+
 # Operator Performance Optimizing Guidance
 
 # Performance_benchmark
@@ -8,7 +15,6 @@ Before optimizing the performance, you need to obtain accurate performance data,
 
 ### Network
 ```python
-
 import torch
 import torch_npu
 
@@ -50,14 +56,12 @@ with torch_npu.profiler.profile(
     for step in range(steps):
         train_one_step(step, steps, train_loader, model, optimizer, criterion)
         prof.step()
-
 ```
 
 
 Refer to the function event_loop_overlap below to revise the same function in scheduler.py
 
 ```python
-    
 def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         self.result_queue: Deque[
@@ -68,9 +72,9 @@ def event_loop_overlap(self):
         # Process the results of the last batch
         tmp_batch, tmp_result = self.result_queue.popleft()
         self.process_batch_result(tmp_batch, tmp_result)
-    
+
     enable_profiling = 1 and self.tp_rank == 0
-    prof_bs = 1 
+    prof_bs = 1
     prof_step = 10
     profiling_stage: str = "prefill"
     if enable_profiling:
@@ -170,7 +174,6 @@ def event_loop_overlap(self):
         self.last_batch = batch
         if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
             self.self_check_during_busy()
-
 ```
 
 ### Device-end
@@ -181,7 +184,6 @@ msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 ```
 
 ```text
-
 |------|------|
 | Name | DequantSwigluQuant_int32_high_performance_100000000 |
 | Type | DequantSwigluQuant |
@@ -225,7 +227,6 @@ msprof op --kernel-name=xxxxx python3 test_xxxxx.py
 | aiv_mte3_ratio | 0.165 |
 | aiv_icache_miss_rate | 0.005 |
 | cube_utilization(%) | 0 |
-
 ```
 
 The Task Duration field indicates the time consumed by each operator. You can sort the operators by Task Duration to find the operators that consume the most time, or sort the operators by Task Type to view the operators that consume the most time on the AI Core or AI CPU.
@@ -234,33 +235,32 @@ For some operators, the execution time is too long. As a result, the metric data
 
 Input Shapes set to an empty value indicates that when the format is "; ; ; ;", the current input is a scalar. Here, ";" serves as the separator for each dimension. The output dimension of the operator follows the same principle.
 
-#### Task Duration (us)
-    Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
-#### Task Wait Time (us)
-    Interval between the end time of the previous task and the start time of the current task. The unit is μs.
-#### Block Dim
-    Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
+Task Duration (us)
+
+Time required for running a task, including the time for scheduling a task to the accelerator, execution time on the accelerator, and response end time. The unit is μs.
+
+Task Wait Time (us)
+
+Interval between the end time of the previous task and the start time of the current task. The unit is μs.
+
+Block Dim
+
+Number of blocks into which a task is divided, which corresponds to the number of cores used for running the task. If task_time is L0, this field is not collected and is displayed as 0.
 
 
 # Optimization
 
 ## Specification
 ### 1. Ascend core compute units
-#### AI Core: the core that actually performs matrix/vector computation
-#### Vector Unit: responsible for SIMD computation (similar to CUDA Core)
-#### Scalar Unit: responsible for control/loop
-#### L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
+- AI Core: the core that actually performs matrix/vector computation
+- Vector Unit: responsible for SIMD computation (similar to CUDA Core)
+- Scalar Unit: responsible for control/loop
+- L0/L1/L2 cache: The smaller the size, the faster the speed. L0 is only 64 KB, L1 is 256 KB, and L2 is shared.
 ### 2. Ascend memory hierarchy (from fastest to slowest)
 Register → Fastest
-```
-L0/L1 cache → Very fast
-```
-```
-On-chip cache (L2) → Fast
-```
-```
-DDR (host memory) → Slowest
-```
+- L0/L1 cache → Very fast
+- On-chip cache (L2) → Fast
+- DDR (host memory) → Slowest
 
 ### 3. Characteristics of Ascend instructions
 Good at accessing large contiguous memory blocks
