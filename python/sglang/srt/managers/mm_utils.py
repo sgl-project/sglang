@@ -520,9 +520,7 @@ def maybe_shard_items_for_dp_encoder(
         server_args = get_global_server_args()
     except Exception:
         return None
-    if server_args is None or not getattr(
-        server_args, "mm_enable_dp_encoder", False
-    ):
+    if server_args is None or not getattr(server_args, "mm_enable_dp_encoder", False):
         return None
 
     # Defer import to avoid a top-level circular dependency with dp_attention.

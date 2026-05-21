@@ -143,9 +143,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import (
-    has_shm_features,
-    init_mm_embedding_cache,
-    unwrap_shm_features,
     maybe_shard_items_for_dp_encoder,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors

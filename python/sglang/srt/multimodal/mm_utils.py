@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import pybase64
