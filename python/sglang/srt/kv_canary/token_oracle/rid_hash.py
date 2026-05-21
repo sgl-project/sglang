@@ -6,9 +6,7 @@ from typing import List
 import torch
 
 
-def _hash_rids_to_i64_tensor(
-    *, rids: List[str], device: torch.device
-) -> torch.Tensor:
+def _hash_rids_to_i64_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
     values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
     return torch.tensor(values, dtype=torch.int64, device=device)
 

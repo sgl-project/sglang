@@ -148,9 +148,7 @@ class TestFillExpectedInputs(CustomTestCase):
             expected_inputs_out=expected_inputs,
         )
 
-        self.assertEqual(
-            expected_inputs.tokens.tolist(), initial_tokens.tolist()
-        )
+        self.assertEqual(expected_inputs.tokens.tolist(), initial_tokens.tolist())
 
 
 class TestMockModelEngineKwargs(CustomTestCase):
