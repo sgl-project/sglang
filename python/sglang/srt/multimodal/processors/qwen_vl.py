@@ -30,9 +30,7 @@ from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
-from sglang.srt.multimodal.processors.base_processor import (
-    MultimodalSpecialTokens,
-)
+from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
@@ -606,8 +604,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+        input_ids_list = input_ids.tolist()
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
-            input_ids, mm_items
+            input_ids_list, mm_items
         )
 
         image_grid_thw = self._get_grid_from_output_or_items(
@@ -655,7 +654,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids_list,
             padded_input_ids=padded_input_ids,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
