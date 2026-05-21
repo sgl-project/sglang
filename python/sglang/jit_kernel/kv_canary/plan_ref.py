@@ -9,7 +9,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def run_canary_plan_torch_reference(
+def canary_plan_step_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
@@ -28,7 +28,7 @@ def run_canary_plan_torch_reference(
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     if verify_capacity != plan_verify_capacity:
         raise ValueError(
-            f"kv-canary: run_canary_plan_torch_reference verify_capacity={verify_capacity} does not "
+            f"kv-canary: canary_plan_step_torch_reference verify_capacity={verify_capacity} does not "
             f"match verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
@@ -94,8 +94,11 @@ def _swa_translate_slot(*, slot: int, lut: torch.Tensor) -> int:
     if slot < 0:
         return slot
     lut_len = int(lut.shape[0])
-    safe_idx = min(slot, lut_len - 1) if lut_len > 0 else slot
-    return int(lut[safe_idx].item())
+    if slot >= lut_len:
+        raise ValueError(
+            f"kv-canary: SWA slot {slot} is outside full_to_swa_index_mapping length {lut_len}"
+        )
+    return int(lut[slot].item())
 
 
 def _materialize_verify_entries(
