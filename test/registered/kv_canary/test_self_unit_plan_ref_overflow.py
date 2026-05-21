@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestPlanRefOverflowGate(CustomTestCase):
+class PlanRefOverflowHelper:
     def setUp(self) -> None:
         self.device = torch.device("cpu")
 
@@ -67,6 +67,8 @@ class TestPlanRefOverflowGate(CustomTestCase):
         )
         return verify_plan
 
+
+class TestPlanRefOverflowGate(PlanRefOverflowHelper, CustomTestCase):
     def test_plan_ref_sets_enable_zero_and_clamps_when_overflow(self) -> None:
         """Verify plan reference disables verification and clamps overflow output."""
         # requested = sum(prefix_lens) = 8 > capacity = 4.
@@ -81,6 +83,8 @@ class TestPlanRefOverflowGate(CustomTestCase):
         self.assertEqual(int(plan.enable[0].item()), 1)
         self.assertEqual(int(plan.verify_num_valid[0].item()), 4)
 
+
+class TestVerifyRefDisabledPlan(PlanRefOverflowHelper, CustomTestCase):
     def test_verify_ref_skips_when_enable_zero(self) -> None:
         """Verify verify reference skips work when the plan is disabled."""
         plan = self._run_plan_ref(verify_capacity=4, bs=2, prefix_lens=[5, 5])
