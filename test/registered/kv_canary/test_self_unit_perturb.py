@@ -390,7 +390,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
         source_snapshot = source.tensor.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
             real_kv_unused_cache_module,
-            "pick_orphan_slot",
+            "_pick_sweep_slot_for_group",
             return_value=3,
         ):
             manager.perturb(forward_batch)
@@ -431,7 +431,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         snapshot = source.tensor.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
             real_kv_unused_cache_module,
-            "pick_orphan_slot",
+            "_pick_sweep_slot_for_group",
             return_value=3,
         ):
             manager.perturb_real_kv_unused_cache(None)
@@ -471,6 +471,28 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             manager.perturb_real_kv_unused_cache(None)
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
+
+
+class TestPerturbUtils(CustomTestCase):
+    def test_flip_first_byte_in_physical_swa_slot_does_not_translate_twice(
+        self,
+    ) -> None:
+        """Verify a physical SWA slot selected from sweep is not LUT-translated again."""
+        group = _make_group(kind=PoolKind.SWA, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor[2, 0] = 0x12
+        source.tensor[3, 0] = 0x34
+
+        result = flip_first_byte_in_source(
+            group=group,
+            source=source,
+            slot_idx=2,
+            slot_is_physical=True,
+        )
+
+        self.assertEqual(result, (2, 0, 0x12))
+        self.assertEqual(int(source.tensor[2, 0].item()), 0xED)
+        self.assertEqual(int(source.tensor[3, 0].item()), 0x34)
 
 
 def _make_group(
