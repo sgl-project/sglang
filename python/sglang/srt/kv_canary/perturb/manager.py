@@ -46,6 +46,11 @@ class PerturbManager:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
+    def perturb(self, forward_batch: Optional["ForwardBatch"]) -> None:
+        self.perturb_req_to_token(forward_batch)
+        self.perturb_real_kv_used(forward_batch)
+        self.perturb_real_kv_unused_cache(forward_batch)
+
     def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
             forward_batch=forward_batch,
