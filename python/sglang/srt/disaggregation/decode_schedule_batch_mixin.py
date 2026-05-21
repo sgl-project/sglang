@@ -65,7 +65,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 # the prefill-reported cached_tokens in _commit_transfer_to_req, so
                 # a decode-side prefix shorter than the prefill report must not
                 # subtract from cached_tokens.
-                req.cached_tokens += max(0, pre_len - req.already_computed)
+                delta = max(0, pre_len - req.already_computed)
+                req.cached_tokens += delta
+                req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
             pre_lens.append(pre_len)
