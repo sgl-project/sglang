@@ -88,6 +88,11 @@ class CanaryE2EBase(CustomTestCase):
     def tearDownClass(cls) -> None:
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
+        for buf in (cls._stdout_buf, cls._stderr_buf):
+            if buf is not None:
+                buf.close()
+        cls._stdout_buf = None
+        cls._stderr_buf = None
 
     def make_prompts(self, n: int) -> list[str]:
         if self.use_unique_prompts:

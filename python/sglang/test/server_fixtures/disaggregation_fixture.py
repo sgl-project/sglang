@@ -174,6 +174,19 @@ class PDDisaggregationServerBase(CustomTestCase):
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
+        for buf in (
+            cls._prefill_stdout_buf,
+            cls._prefill_stderr_buf,
+            cls._decode_stdout_buf,
+            cls._decode_stderr_buf,
+        ):
+            if buf is not None:
+                buf.close()
+        cls._prefill_stdout_buf = None
+        cls._prefill_stderr_buf = None
+        cls._decode_stdout_buf = None
+        cls._decode_stderr_buf = None
+
         # wait for 5 seconds
         time.sleep(5)
 
