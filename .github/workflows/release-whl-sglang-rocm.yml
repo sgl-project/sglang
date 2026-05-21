@@ -46,7 +46,7 @@ jobs:
   check-aiter-version:
     if: |
       github.repository == 'sgl-project/sglang' &&
-      (inputs.rocm_version == 'all' || inputs.rocm_version == matrix.rocm-version || inputs.rocm_version == '')
+      (github.event_name == 'pull_request' || inputs.rocm_version == 'all' || inputs.rocm_version == matrix.rocm-version || inputs.rocm_version == '')
     runs-on: ubuntu-latest
     strategy:
       matrix:
