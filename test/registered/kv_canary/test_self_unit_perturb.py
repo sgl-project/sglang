@@ -11,6 +11,8 @@ from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb import (
     real_kv_post_forward,
+)
+from sglang.srt.kv_canary.perturb import (
     real_kv_unused_cache as real_kv_unused_cache_module,
 )
 from sglang.srt.kv_canary.perturb.config import (
