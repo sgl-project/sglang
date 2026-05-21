@@ -451,9 +451,7 @@ class MultimodalProcessorOutput:
 
         for item in mm_items:
             for start, end in item.offsets:
-                padded_input_ids[start : end + 1] = [item.pad_value] * (
-                    end - start + 1
-                )
+                padded_input_ids[start : end + 1] = [item.pad_value] * (end - start + 1)
         return padded_input_ids
 
 

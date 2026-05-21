@@ -1922,9 +1922,10 @@ class Scheduler(
 
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
-            if not self._try_apply_padded_mm_input_ids(
-                recv_req, req, image_inputs
-            ) and self.pad_input_ids_func:
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
                 req.origin_input_ids = self.pad_input_ids_func(
                     req.origin_input_ids, image_inputs
                 )
@@ -2197,9 +2198,10 @@ class Scheduler(
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if not self._try_apply_padded_mm_input_ids(
-                recv_req, req, image_inputs
-            ) and self.pad_input_ids_func:
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
                 req.origin_input_ids = self.pad_input_ids_func(
                     req.origin_input_ids, image_inputs
                 )
