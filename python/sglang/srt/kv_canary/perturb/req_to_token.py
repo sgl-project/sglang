@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.kv_canary.runner.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.runner.perturb.utils import (
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     collect_active_slots,
 )

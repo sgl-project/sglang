@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.runner.perturb.hook import PerturbHook
+from sglang.srt.kv_canary.perturb.hook import PerturbHook
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 

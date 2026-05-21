@@ -9,7 +9,7 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
-from sglang.srt.kv_canary.runner.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 if TYPE_CHECKING:

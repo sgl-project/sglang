@@ -3,13 +3,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
-from sglang.srt.kv_canary.runner.perturb import (
+from sglang.srt.kv_canary.perturb import (
     real_kv_unused_cache,
     real_kv_used,
     req_to_token,
 )
-from sglang.srt.kv_canary.runner.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.runner.perturb.utils import WarmupGate
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.utils import WarmupGate
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ class PerturbHook:
     req-to-token pool, radix cache handle, warmup gate) and dispatches each per-forward
     invocation to the three perturb-point modules.
 
-    Per-perturb logic lives in :mod:`sglang.srt.kv_canary.runner.perturb.req_to_token`,
+    Per-perturb logic lives in :mod:`sglang.srt.kv_canary.perturb.req_to_token`,
     :mod:`...perturb.real_kv_used`, :mod:`...perturb.real_kv_unused_cache`.
     """
 

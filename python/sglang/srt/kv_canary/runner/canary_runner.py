@@ -16,8 +16,8 @@ from sglang.srt.kv_canary.endpoint import (
 )
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.runner.perturb.hook import PerturbHook
-from sglang.srt.kv_canary.runner.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.hook import PerturbHook
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
