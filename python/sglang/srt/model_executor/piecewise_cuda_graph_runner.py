@@ -257,7 +257,7 @@ class PiecewiseCudaGraphRunner:
                 else None
             )
             mamba_track_seqlens = (
-                torch.zeros((self.max_bs,), dtype=torch.int32)
+                torch.zeros((self.max_bs,), dtype=torch.int64)
                 if self.mamba_track_enabled
                 else None
             )
@@ -376,6 +376,20 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+
+        # When mamba extra buffer is enabled, set the first track mask to True and
+        # a valid seqlen so that the tracking code path (track_conv_indices,
+        # track_ssm_h_*, track_ssm_final_*) is exercised during warmup.  This
+        # ensures torch.compile / Dynamo can observe the data-flow through those
+        # tensors and include them in the captured graph.
+        if mamba_track_mask is not None:
+            mamba_track_mask[0] = True
+        if mamba_track_seqlens is not None:
+            # Use the runtime chunk size so warmup stays valid when page_size >
+            # FLA_CHUNK_SIZE. This still keeps the tracking logic on the aligned
+            # path, which is the simplest case for capture.
+            mamba_track_seqlens[0] = self.model_runner.server_args.mamba_cache_chunk_size
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
@@ -412,7 +426,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -446,6 +460,14 @@ class PiecewiseCudaGraphRunner:
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
             return False
+        # For multimodal-capable models, only allow PCG on text-only requests.
+        # Note that mrope_positions is also populated for text-only requests on some
+        # models, so it cannot be used as a multimodal signal here.
+        if (
+            forward_batch.contains_mm_inputs()
+            or forward_batch.mm_input_embeds is not None
+        ):
+            return False
         # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
         # TARGET_VERIFY has different spec_info and capture_hidden_mode,
         # so it must not use PCG-captured graphs.
@@ -459,6 +481,16 @@ class PiecewiseCudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+
+        # When mamba extra buffer is enabled, the forward batch carries mamba_track
+        # tensors that must be replayed through the captured graph. If the graph was
+        # captured without mamba track support, we cannot use it.
+        if (
+            forward_batch.mamba_track_mask is not None
+            and not self.mamba_track_enabled
+        ):
+            return False
+
         num_tokens = len(forward_batch.input_ids)
         if forward_batch.return_logprob:
             for start_len, seq_len in zip(
@@ -529,6 +561,16 @@ class PiecewiseCudaGraphRunner:
             if buffers.mamba_track_seqlens is not None
             else None
         )
+
+        # When mamba extra buffer is enabled, set the first track mask to True and
+        # a valid seqlen so that the tracking code path is exercised during capture.
+        # This mirrors the logic in warmup_compile and ensures the captured graph
+        # includes data-flow through the track tensors.
+        if mamba_track_mask is not None:
+            mamba_track_mask[0] = True
+        if mamba_track_seqlens is not None:
+            mamba_track_seqlens[0] = self.model_runner.server_args.mamba_cache_chunk_size
+
         positions = buffers.positions[:num_tokens]
         mrope_positions = (
             buffers.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -579,7 +621,7 @@ class PiecewiseCudaGraphRunner:
                 mrope_positions=mrope_positions,
                 spec_algorithm=None,
                 spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                capture_hidden_mode=self.capture_hidden_mode,
                 num_token_non_padded=None,
                 num_token_non_padded_cpu=num_tokens,
                 global_forward_mode=ForwardMode.EXTEND,
@@ -660,21 +702,25 @@ class PiecewiseCudaGraphRunner:
         buffers.positions[:num_tokens].copy_(forward_batch.positions)
         buffers.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
 
-        if (
-            buffers.mamba_track_indices is not None
-            and forward_batch.mamba_track_indices is not None
-        ):
-            buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
-        if (
-            buffers.mamba_track_mask is not None
-            and forward_batch.mamba_track_mask is not None
-        ):
-            buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
-        if (
-            buffers.mamba_track_seqlens is not None
-            and forward_batch.mamba_track_seqlens is not None
-        ):
-            buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+        if buffers.mamba_track_indices is not None:
+            if forward_batch.mamba_track_indices is not None:
+                buffers.mamba_track_indices[:bs].copy_(forward_batch.mamba_track_indices)
+            # Zero out padding slots beyond the actual batch size to avoid
+            # stale indices from a previous replay leaking into this one.
+            if bs < self.max_bs:
+                buffers.mamba_track_indices[bs:].zero_()
+        if buffers.mamba_track_mask is not None:
+            if forward_batch.mamba_track_mask is not None:
+                buffers.mamba_track_mask[:bs].copy_(forward_batch.mamba_track_mask)
+            # Zero out padding slots so that padding requests are not tracked
+            if bs < self.max_bs:
+                buffers.mamba_track_mask[bs:].zero_()
+        if buffers.mamba_track_seqlens is not None:
+            if forward_batch.mamba_track_seqlens is not None:
+                buffers.mamba_track_seqlens[:bs].copy_(forward_batch.mamba_track_seqlens)
+            # Zero out padding slots
+            if bs < self.max_bs:
+                buffers.mamba_track_seqlens[bs:].zero_()
 
         input_ids = buffers.input_ids[:static_num_tokens]
         positions = buffers.positions[:static_num_tokens]
