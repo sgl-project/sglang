@@ -65,7 +65,7 @@ def _spec_eagle_env() -> dict[str, str]:
 
 
 class TestEaglePositionsMisalignRegression(CustomTestCase):
-    """Revert PR #25015 fix and expect canary to fire POSITION_MISMATCH."""
+    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -101,7 +101,10 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
         haystack = (self._stderr_buf.getvalue() if self._stderr_buf else "") + (
             self._stdout_buf.getvalue() if self._stdout_buf else ""
         )
-        self.assertIn("POSITION_MISMATCH", haystack)
+        self.assertRegex(
+            haystack,
+            r"kv_canary violation: launch_tag=\S+ fail_reason=\S*position\S*",
+        )
 
 
 class TestEaglePositionsMatchWithFix(CustomTestCase):
