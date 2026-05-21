@@ -109,7 +109,9 @@ class TestDSV4StaleLocCrash(CustomTestCase):
         pool = _build_pool(self.mapping_v1, large_pool, start_layer=0)
 
         # Pass 1: swa_layer_id=1, cached_loc is None → compute and cache [4,5,6,7].
-        pool.set_swa_key_buffer_radix_fused(self.swa_layer_id, self.raw_loc, self.cache_k)
+        pool.set_swa_key_buffer_radix_fused(
+            self.swa_layer_id, self.raw_loc, self.cache_k
+        )
         self.assertEqual(pool.cached_loc.tolist(), [4, 5, 6, 7], "Pass 1: cache primed")
 
         # PRE-FIX register_mapping: replace mapping WITHOUT clearing cached_loc.
@@ -130,19 +132,27 @@ class TestDSV4StaleLocCrash(CustomTestCase):
         pool = _build_pool(self.mapping_v1, large_pool, start_layer=0)
 
         # Pass 1: prime cache → cached_loc = [4,5,6,7].
-        pool.set_swa_key_buffer_radix_fused(self.swa_layer_id, self.raw_loc, self.cache_k)
+        pool.set_swa_key_buffer_radix_fused(
+            self.swa_layer_id, self.raw_loc, self.cache_k
+        )
         self.assertEqual(pool.cached_loc.tolist(), [4, 5, 6, 7])
 
         # FIXED register_mapping: clears cached_loc.
         pool.register_mapping(self.mapping_v2)
-        self.assertIsNone(pool.cached_loc, "Fix: cached_loc cleared by register_mapping")
+        self.assertIsNone(
+            pool.cached_loc, "Fix: cached_loc cleared by register_mapping"
+        )
 
         # Pass 2 on the smaller pool: cached_loc is None → recompute with mapping_v2.
         small_pool = _SWAPoolMock(_SWA_SMALL)
         pool.swa_kv_pool = small_pool
-        pool.set_swa_key_buffer_radix_fused(self.swa_layer_id, self.raw_loc, self.cache_k)
+        pool.set_swa_key_buffer_radix_fused(
+            self.swa_layer_id, self.raw_loc, self.cache_k
+        )
 
-        self.assertEqual(pool.cached_loc.tolist(), [0, 1, 2, 3], "Fresh indices after fix")
+        self.assertEqual(
+            pool.cached_loc.tolist(), [0, 1, 2, 3], "Fresh indices after fix"
+        )
         # Verify data landed in the correct SWA slots [0-3], not the stale [4-7].
         self.assertTrue(
             small_pool.buf[0:4].abs().sum().item() > 0,
