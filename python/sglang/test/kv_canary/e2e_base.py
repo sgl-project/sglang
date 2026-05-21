@@ -190,9 +190,7 @@ class CanaryE2EBase(CustomTestCase):
         """
         time.sleep(flush_wait_seconds)
         log_text = self._captured_log_text()
-        line_re = re.compile(
-            r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)"
-        )
+        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
         for match in line_re.finditer(log_text):
             tag = match.group(1)
             reason_field = match.group(2)
@@ -217,8 +215,12 @@ class CanaryE2EBase(CustomTestCase):
             )
 
     def _captured_log_text(self) -> str:
-        stdout_text = self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
-        stderr_text = self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
+        stdout_text = (
+            self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
+        )
+        stderr_text = (
+            self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
+        )
         return stdout_text + stderr_text
 
 
