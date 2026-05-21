@@ -8,7 +8,6 @@ import torch
 from sglang.srt.environ import envs
 
 _FLASHINFER_TIE_BREAK_VALUES = {
-    "none": 0,
     "small": 1,
     "large": 2,
 }
@@ -259,10 +258,13 @@ def _build_flashinfer_paged_args(
 
 
 def _flashinfer_tie_break_value() -> int:
-    mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get().lower()
+    mode = envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get()
+    if mode is None:
+        return 0
+    mode = mode.lower()
     if mode not in _FLASHINFER_TIE_BREAK_VALUES:
         raise RuntimeError(
             "SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK must be one of "
-            f"{tuple(_FLASHINFER_TIE_BREAK_VALUES)}, got {mode!r}."
+            f"{tuple(_FLASHINFER_TIE_BREAK_VALUES)} or unset, got {mode!r}."
         )
     return _FLASHINFER_TIE_BREAK_VALUES[mode]
