@@ -1420,7 +1420,7 @@ class TestRunCounter:
 
     def test_grid_stride_processes_entries_beyond_grid_size(self) -> None:
         """``verify_num_valid`` exceeding the persistent grid thread count is fully processed via grid-stride."""
-        n_active = 10000
+        n_active = 40000
         cuda_buf, ref_buf = make_canary_buf_pair(
             num_slots=n_active + 1, slot_stride_bytes=32, device=_DEVICE
         )

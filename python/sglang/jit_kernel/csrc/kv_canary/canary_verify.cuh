@@ -17,7 +17,7 @@ namespace canary {
 
 namespace {
 
-constexpr uint32_t kVerifyBlockSize = 128;
+constexpr uint32_t kVerifyBlockSize = 512;
 constexpr uint32_t kPersistentBlocks = 64;
 
 // Per-launch parameters packed into a single struct so the kernel signature stays manageable. Pointers are

@@ -241,7 +241,7 @@ def canary_verify_step(
 
     Implementation:
         - CUDA __global__ `canary_verify_kernel`: fixed 1-D grid `(kPersistentBlocks=64, 1, 1)` blocks ×
-          `(kVerifyBlockSize=128, 1, 1)` threads (= 8192 threads total). Each thread grid-strides over
+          `(kVerifyBlockSize=512, 1, 1)` threads (= 32768 threads total). Each thread grid-strides over
           verify entries `entry_idx ∈ [tid, tid + grid_threads, ...)` until
           `min(plan.verify_num_valid[0], verify_capacity)`.
         - Per thread, gather:
