@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
+from sglang.srt.mem_cache.common import new_tokens_for_alloc
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -556,9 +557,6 @@ class PrefillAdder:
             alloc = extend_input_len
         return max(alloc, self.tree_cache.sliding_window_size) + self.page_size
 
-    def ceil_paged_tokens(self, tokens: int) -> int:
-        return -(-tokens // self.page_size) * self.page_size
-
     def budget_state(self):
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
@@ -581,13 +579,14 @@ class PrefillAdder:
     def _update_prefill_budget(
         self, prefix_len: int, extend_input_len: int, max_new_tokens: int
     ):
-        # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
-        extend_input_len = self.ceil_paged_tokens(extend_input_len)
-
-        # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
-        page_overhead = self.page_size
-        self.rem_total_token_offset += extend_input_len + max_new_tokens + page_overhead
-        self.cur_rem_token_offset += extend_input_len + page_overhead
+        new_extend_tokens = new_tokens_for_alloc(
+            prefix_len, extend_input_len, self.page_size
+        )
+        new_full_tokens = new_tokens_for_alloc(
+            prefix_len, extend_input_len + max_new_tokens, self.page_size
+        )
+        self.rem_total_token_offset += new_full_tokens
+        self.cur_rem_token_offset += new_extend_tokens
         self.rem_input_tokens -= extend_input_len
 
         if self.is_hybrid_swa:
@@ -685,7 +684,7 @@ class PrefillAdder:
         req.fill_ids = req.fill_ids[: len(req.prefix_indices) + req.extend_input_len]
         self.can_run_list.append(req)
         self._update_prefill_budget(
-            0,
+            req.kv_committed_len,
             req.extend_input_len,
             (
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
@@ -715,7 +714,7 @@ class PrefillAdder:
                 self.tree_cache.dec_lock_ref(last_node)
 
     def add_one_req_ignore_eos(self, req: Req):
-        paged_input = self.ceil_paged_tokens(req.extend_input_len)
+        paged_input = new_tokens_for_alloc(0, req.extend_input_len, self.page_size)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -758,8 +757,8 @@ class PrefillAdder:
         if not self.is_hybrid_swa:
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
-            cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
-                req.extend_input_len
+            cur_rem_tokens = self.cur_rem_tokens - new_tokens_for_alloc(
+                0, req.extend_input_len, self.page_size
             )
             tokens_freed = 0
             for i, (tokens_left, tokens_occupied) in enumerate(self.req_states):
@@ -836,21 +835,16 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead. The paged allocator
-        # may consume up to one extra page per request (see alloc_extend), and
-        # _update_prefill_budget already accounts for this in the deduction.
-        # Without this, admission is more optimistic than the actual budget
-        # deduction, allowing over-admission when the pool is nearly full.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
-        total_tokens = req.extend_input_len + max_new + self.page_size
-
-        # adjusting the input_tokens based on host_hit_length and page_size
-        real_input_tokens = req.extend_input_len - req.host_hit_length
-        real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
         prefix_len = len(req.prefix_indices)
+        total_tokens = new_tokens_for_alloc(
+            prefix_len, req.extend_input_len + max_new, self.page_size
+        )
+
+        real_input_tokens = req.extend_input_len - req.host_hit_length
 
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
@@ -893,7 +887,7 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
-            input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+            input_tokens = req.extend_input_len
 
             if (
                 self.rem_chunk_tokens is None

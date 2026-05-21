@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_hip, support_triton
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, get_num_new_pages
 
 _is_hip = is_hip()
 
@@ -41,6 +41,27 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
 
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
+
+
+def new_pages_for_alloc(allocated_len: int, next_alloc_len: int, page_size: int) -> int:
+    # Exact physical page count for allocating next_alloc_len more tokens on top
+    # of allocated_len. Mirrors the kernel formula in alloc_extend_kernel.
+    if page_size == 1:
+        return next_alloc_len
+    return (
+        ceil_align(allocated_len + next_alloc_len, page_size)
+        - ceil_align(allocated_len, page_size)
+    ) // page_size
+
+
+def new_tokens_for_alloc(
+    allocated_len: int, next_alloc_len: int, page_size: int
+) -> int:
+    if page_size == 1:
+        return next_alloc_len
+    return ceil_align(allocated_len + next_alloc_len, page_size) - ceil_align(
+        allocated_len, page_size
+    )
 
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
@@ -363,9 +384,15 @@ def alloc_paged_token_slots_extend(
     extend_num_tokens: int,
     backup_state: bool = False,
 ):
-    # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
-    num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    num_tokens = (
+        get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=allocator.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        * allocator.page_size
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -501,8 +528,25 @@ def alloc_paged_token_slots_decode(
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
     allocator = tree_cache.token_to_kv_pool_allocator
-    # Over estimate the number of tokens: assume each request needs a new page.
-    num_tokens = len(seq_lens) * allocator.page_size
+    if token_per_req == 1:
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                decode=True,
+            )
+            * allocator.page_size
+        )
+    else:
+        prefix_lens_cpu = seq_lens_cpu - token_per_req
+        num_tokens = (
+            get_num_new_pages(
+                seq_lens=seq_lens_cpu,
+                page_size=allocator.page_size,
+                prefix_lens=prefix_lens_cpu,
+            )
+            * allocator.page_size
+        )
     evict_from_tree_cache(tree_cache, num_tokens)
 
     out_cache_loc = allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
