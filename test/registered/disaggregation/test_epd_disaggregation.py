@@ -3,6 +3,7 @@ import threading
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -27,6 +28,7 @@ KIMI_VL_MODEL = "moonshotai/Kimi-VL-A3B-Instruct"
 register_cuda_ci(est_time=242, stage="extra-b", runner_config="4-gpu-h100")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
     """Regression test for Kimi-VL two-dimensional image grids in E/PD mode."""
 
@@ -205,6 +207,7 @@ class TestEPDDisaggregationKimiVL(PDDisaggregationServerBase):
             )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEPDDisaggregationMultiEncoders(MMMUMixin, PDDisaggregationServerBase):
     """
     Test EPD disaggregation with multiple encode servers for load balancing.
