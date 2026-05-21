@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
@@ -11,10 +13,12 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=450, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):
     attention_backend = "fa3"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingTriton(
     StandaloneServerBase, CustomTestCase, RegexConstrainedMixin, JSONConstrainedMixin
 ):
@@ -22,6 +26,7 @@ class TestStandaloneV2SpeculativeDecodingTriton(
     attention_backend = "triton"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingFlashinfer(
     StandaloneServerBase, CustomTestCase
 ):
