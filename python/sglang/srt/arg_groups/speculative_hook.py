@@ -14,7 +14,7 @@ def _resolve_speculative_algorithm_alias(
     speculative_algorithm: Optional[str],
     speculative_draft_model_path: Optional[str],
     trust_remote_code: bool = False,
-    kwargs: dict = {},
+    kwargs: Optional[dict] = {},
 ) -> Optional[str]:
     """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
 
