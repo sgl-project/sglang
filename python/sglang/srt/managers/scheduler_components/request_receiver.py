@@ -74,6 +74,8 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_forward_mode()):
                 return []
 
+        if _VLM_PROFILE:
+            _pull_t0 = _time.monotonic()
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
@@ -84,6 +86,13 @@ class SchedulerRequestReceiver:
         recv_reqs = self._apply_mm_receiver(recv_reqs)
 
         self._finalize_shm_features(recv_reqs)
+
+        if _VLM_PROFILE and recv_reqs:
+            _vlm_log(
+                "recv_requests",
+                n_reqs=len(recv_reqs),
+                pull_dur=_time.monotonic() - _pull_t0,
+            )
 
         return recv_reqs
 
