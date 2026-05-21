@@ -407,7 +407,9 @@ class TestPadding:
         fb_rpi = _tensor([1, 0, 2])
         fb_pfx = _tensor([5, 99999, 3])
         fb_ext = _tensor([1, 99999, 1])
-        rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
+        rtt = make_req_to_token(
+            kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
+        )
         extras = _empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=8, extras_count=0, bs=3
@@ -545,7 +547,9 @@ class TestSwa:
 
         triton_w = plans[0][1]
         # FULL slot at (rp=1, pos=2) = 1 * max_seq_len + 2 = 18; expected SWA seed = 18 + 100 = 118.
-        assert int(triton_w.write_seed_slot_indices[0].item()) == 1 * max_seq_len + 2 + 100
+        assert (
+            int(triton_w.write_seed_slot_indices[0].item()) == 1 * max_seq_len + 2 + 100
+        )
 
     def test_verify_covers_all_tokens_in_swa_window(self) -> None:
         """SWA group with window=128 + bs=4 → verify_num_valid == Σ min(prefix_lens[r], 128)."""
@@ -637,7 +641,9 @@ class TestExtras:
         fb_rpi = _tensor([rp])
         fb_pfx = _tensor([prefix])
         fb_ext = _tensor([1])
-        rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
+        rtt = make_req_to_token(
+            kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
+        )
 
         extras_slot_list = [500, 501, 502]
         extras_position_list = [10, 11, 12]
@@ -688,7 +694,9 @@ class TestExtras:
         fb_rpi = _tensor([rp])
         fb_pfx = _tensor([prefix])
         fb_ext = _tensor([1])
-        rtt = make_req_to_token(kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE)
+        rtt = make_req_to_token(
+            kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
+        )
 
         extras_slot_list = [600, 601, 602]
         extras_position_list = [20, 21, 22]
@@ -773,7 +781,9 @@ class TestMisc:
         fb_rpi = _tensor([1, 2, 3])
         fb_pfx = _tensor([4, 7, 2])
         fb_ext = _tensor([2, 1, 3])
-        rtt = make_req_to_token(kind="linear", max_reqs=8, max_seq_len=16, device=_DEVICE)
+        rtt = make_req_to_token(
+            kind="linear", max_reqs=8, max_seq_len=16, device=_DEVICE
+        )
         extras = _empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=13, extras_count=0, bs=3
@@ -822,7 +832,9 @@ class TestMisc:
 
     def test_shrink_bs_clears_stale_write_offsets(self) -> None:
         """Reusing a WritePlan with smaller bs: write_offsets beyond new bs must be zeroed by the kernel."""
-        rtt = make_req_to_token(kind="linear", max_reqs=16, max_seq_len=16, device=_DEVICE)
+        rtt = make_req_to_token(
+            kind="linear", max_reqs=16, max_seq_len=16, device=_DEVICE
+        )
         extras = _empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=80, extras_count=0, bs=8
@@ -843,7 +855,9 @@ class TestMisc:
                 write_req_capacity=write_req_capacity, device=_DEVICE
             )
             runner = (
-                canary_plan_step if label == "real" else canary_plan_step_torch_reference
+                canary_plan_step
+                if label == "real"
+                else canary_plan_step_torch_reference
             )
             runner(
                 verify_plan_out=verify_plan,
