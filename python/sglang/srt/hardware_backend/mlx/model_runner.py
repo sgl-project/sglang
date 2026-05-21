@@ -31,6 +31,8 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     BatchedDecodeContext,
     ContiguousKVCache,
+    MlxAOTKernelContext,
+    MlxAOTRoPEContext,
     MLXAttentionWrapper,
     OffsetCache,
     PoolBackedCache,
@@ -330,7 +332,7 @@ class MlxModelRunner:
         return self._pool_size
 
     def _maybe_get_rope_state(self):
-        """Build state for the AOT custom Metal RoPE kernel (default-on).
+        """Build state for the AOT custom Metal RoPE kernel (opt-in).
 
         Returns ``(rope_base, rope_config)``:
           * ``rope_base`` is the model's RoPE theta when the AOT kernel
@@ -339,13 +341,14 @@ class MlxModelRunner:
           * ``rope_config`` is the standard dict ``{head_dim, rope_dim,
             num_qo_heads, num_kv_heads}``; empty when the kernel is unused.
 
-        The AOT kernel is enabled by default. Set ``SGLANG_DISABLE_CUSTOM_ROPE=1``
-        to force the MLX ``mx.fast.rope`` fallback. The fallback also kicks
-        in automatically when the kernel hasn't been built (``sgl-kernel``
-        Metal extension missing) or when the model uses an unsupported RoPE
-        variant (``traditional=True`` or ``rope_dim != head_dim``).
+        The AOT kernel is disabled by default. Set
+        ``SGLANG_MLX_USE_CUSTOM_ROPE=1`` to enable it for supported models.
+        The fallback also kicks in automatically when the kernel hasn't been
+        built (``sgl-kernel`` Metal extension missing) or when the model uses
+        an unsupported RoPE variant (``traditional=True`` or
+        ``rope_dim != head_dim``).
         """
-        if envs.SGLANG_DISABLE_CUSTOM_ROPE.get():
+        if not envs.SGLANG_MLX_USE_CUSTOM_ROPE.get():
             return 0.0, {}
         if hasattr(self, "_cached_rope_state"):
             return self._cached_rope_state
@@ -362,15 +365,6 @@ class MlxModelRunner:
             self._cached_rope_state = (0.0, {})
             return self._cached_rope_state
 
-        if not metal.is_available():
-            logger.info(
-                "AOT Metal RoPE kernel not available - falling back to "
-                "mx.fast.rope. Build the kernel with: "
-                "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace` "
-                "to enable."
-            )
-            self._cached_rope_state = (0.0, {})
-            return self._cached_rope_state
         layer_list, attn_attr = find_attention_layers(self.model)
         if not layer_list:
             self._cached_rope_state = (0.0, {})
@@ -518,12 +512,12 @@ class MlxModelRunner:
         for req_id in list(self._req_caches.keys()):
             self._sync_decode_kv_to_pool(req_id)
 
-    def _decode_rope_kwargs(
+    def _build_aot_kernel_context(
         self,
         req_ids: list[str],
         caches: list[list[ContiguousKVCache | PoolBackedCache]],
     ) -> dict:
-        """Return BatchedDecodeContext kwargs for the AOT RoPE path."""
+        """Return BatchedDecodeContext kwargs for optional AOT kernels."""
         rope_base, rope_config = self._maybe_get_rope_state()
         if rope_base <= 0.0 or not rope_config or self._kv_pool is None:
             return {}
@@ -551,10 +545,14 @@ class MlxModelRunner:
                 )
 
         return {
-            "rope_config": rope_config,
-            "rope_base": rope_base,
-            "kv_pool": self._kv_pool,
-            "new_token_slots": new_token_slots,
+            "aot": MlxAOTKernelContext(
+                rope=MlxAOTRoPEContext(
+                    config=rope_config,
+                    base=rope_base,
+                    kv_pool=self._kv_pool,
+                    new_token_slots=new_token_slots,
+                )
+            )
         }
 
     def decode_batch(
@@ -751,7 +749,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
-            **self._decode_rope_kwargs(req_ids, caches),
+            **self._build_aot_kernel_context(req_ids, caches),
         )
         set_context(ctx)
         try:
@@ -827,7 +825,7 @@ class MlxModelRunner:
             batch_size=batch_size,
             seq_lens=seq_lens,
             layer_caches=layer_caches,
-            **self._decode_rope_kwargs(prev.req_ids, caches),
+            **self._build_aot_kernel_context(prev.req_ids, caches),
         )
         set_context(ctx)
         try:

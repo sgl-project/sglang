@@ -83,8 +83,9 @@ The MLX backend supports two quantization paths on Apple Silicon:
    ```
    The MLX backend silently ignores `--quantization mlx_q4` when the model is already quantized in its HF config (path 1), so the same flag is safe to pass either way.
 
-Set `SGLANG_DISABLE_CUSTOM_ROPE=1` to force the MLX RoPE fallback when the
-optional custom RoPE kernel is available. This is useful for A/B testing.
+Set `SGLANG_MLX_USE_CUSTOM_ROPE=1` to enable the optional custom RoPE kernel.
+It is disabled by default so the MLX backend uses the standard RoPE path unless
+you opt in for A/B testing.
 
 
 ## Benchmarking with Requests

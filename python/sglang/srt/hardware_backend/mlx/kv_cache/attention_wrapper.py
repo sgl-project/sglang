@@ -19,14 +19,35 @@ _thread_local = threading.local()
 
 def _import_sgl_kernel_metal():
     try:
-        return import_module("sgl_kernel.metal")
+        metal = import_module("sgl_kernel.metal")
     except ModuleNotFoundError:
         for parent in Path(__file__).resolve().parents:
             candidate = parent / "sgl-kernel" / "python"
             if (candidate / "sgl_kernel" / "metal.py").is_file():
                 sys.path.insert(0, str(candidate))
-                return import_module("sgl_kernel.metal")
-        raise
+                metal = import_module("sgl_kernel.metal")
+                break
+        else:
+            raise
+    if getattr(metal, "_metal", None) is None:
+        raise ImportError(
+            "sgl_kernel._metal is not available. Build with "
+            "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace`."
+        )
+    return metal
+
+
+@dataclass
+class MlxAOTRoPEContext:
+    config: dict
+    base: float
+    kv_pool: Any
+    new_token_slots: Optional[mx.array] = None
+
+
+@dataclass
+class MlxAOTKernelContext:
+    rope: Optional[MlxAOTRoPEContext] = None
 
 
 # TODO: Move from threading to multiprocessing or asyncio
@@ -39,13 +60,10 @@ class BatchedDecodeContext:
     # layer_caches[layer_idx][req_idx] = ContiguousKVCache
     layer_caches: list[list[ContiguousKVCache]]
 
-    # AOT custom Metal RoPE kernel state. When populated, the wrapper invokes
-    # `sgl_kernel.metal.rope_pool_fused` to rotate Q/K and scatter K/V into
-    # the shared pool for the new decode token.
-    rope_config: dict = field(default_factory=dict)
-    rope_base: float = 0.0
-    kv_pool: Optional[Any] = None  # MlxKVPool
-    new_token_slots: Optional[mx.array] = None  # int32 [B], slot per request
+    # Optional AOT kernel state. Keep kernel-specific fields out of the regular
+    # MLX decode path so future AOT kernels can be added without growing this
+    # context one field at a time.
+    aot: MlxAOTKernelContext = field(default_factory=MlxAOTKernelContext)
 
     # Derived tensors/metadata, shared across all layers in one forward pass.
     offsets: mx.array = field(init=False)
@@ -122,18 +140,15 @@ class MLXAttentionWrapper(nn.Module):
         # Vectorized RoPE with per-batch offsets (cached on the context).
         offsets = ctx.offsets
 
-        if ctx.kv_pool is not None and ctx.rope_config:
+        if ctx.aot.rope is not None:
             # AOT path: real .metallib RoPE + fused KV pool scatter.
             queries, keys = self._rope_custom_aot(
                 queries,
                 keys,
                 values,
                 offsets,
-                ctx.kv_pool,
-                ctx.new_token_slots,
                 layer_idx,
-                ctx.rope_config,
-                ctx.rope_base,
+                ctx.aot.rope,
             )
         else:
             # Fallback: MLX's built-in mx.fast.rope (used when the AOT kernel
@@ -195,11 +210,8 @@ class MLXAttentionWrapper(nn.Module):
         keys: mx.array,
         values: mx.array,
         positions: mx.array,
-        kv_pool: Any,
-        new_token_slots: Optional[mx.array],
         layer_idx: int,
-        rope_config: dict,
-        rope_base: float,
+        rope_ctx: MlxAOTRoPEContext,
     ) -> tuple[mx.array, mx.array]:
         """AOT path: rotate Q/K and scatter K/V into the shared pool.
 
@@ -219,13 +231,13 @@ class MLXAttentionWrapper(nn.Module):
         v_flat = values[:, :, 0, :]
         B = q_flat.shape[0]
 
-        if new_token_slots is None:
+        if rope_ctx.new_token_slots is None:
             slots = mx.full((B,), -1, dtype=mx.int32)
         else:
-            slots = new_token_slots.astype(mx.int32)
+            slots = rope_ctx.new_token_slots.astype(mx.int32)
 
-        k_pool = kv_pool.k_buffer[layer_idx]
-        v_pool = kv_pool.v_buffer[layer_idx]
+        k_pool = rope_ctx.kv_pool.k_buffer[layer_idx]
+        v_pool = rope_ctx.kv_pool.v_buffer[layer_idx]
 
         q_rot, k_rot, k_pool_new, v_pool_new = rope_pool_fused(
             q_flat,
@@ -235,14 +247,14 @@ class MLXAttentionWrapper(nn.Module):
             slots,
             k_pool,
             v_pool,
-            head_dim=rope_config["head_dim"],
-            num_qo_heads=rope_config["num_qo_heads"],
-            num_kv_heads=rope_config["num_kv_heads"],
-            rope_base=rope_base,
+            head_dim=rope_ctx.config["head_dim"],
+            num_qo_heads=rope_ctx.config["num_qo_heads"],
+            num_kv_heads=rope_ctx.config["num_kv_heads"],
+            rope_base=rope_ctx.base,
         )
         # Rebind pool buffers (zero-copy donation result).
-        kv_pool.k_buffer[layer_idx] = k_pool_new
-        kv_pool.v_buffer[layer_idx] = v_pool_new
+        rope_ctx.kv_pool.k_buffer[layer_idx] = k_pool_new
+        rope_ctx.kv_pool.v_buffer[layer_idx] = v_pool_new
 
         # (B, n_heads, head_dim) -> (B, n_heads, 1, head_dim) for SDPA path
         return q_rot[:, :, None, :], k_rot[:, :, None, :]

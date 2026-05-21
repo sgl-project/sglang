@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import mlx.core as mx
@@ -28,20 +28,6 @@ else:
 # Python wrappers for the compiled `_metal.*` entry points go below. Wrappers
 # validate input shapes/dtypes and then invoke AOT C++ entry points. They do
 # not force `mx.eval`, so MLX can keep these calls inside its lazy graph.
-
-
-def is_available() -> bool:
-    """Return whether the Metal extension and metallib were loaded."""
-    return _metal is not None and _IMPORT_ERROR is None
-
-
-def _require_metal() -> Any:
-    if _metal is None:
-        raise ImportError(
-            "sgl_kernel._metal is not available. Build with "
-            "`TOOLCHAINS=metal python sgl-kernel/setup_metal.py build_ext --inplace`."
-        ) from _IMPORT_ERROR
-    return _metal
 
 
 def rope_pool_fused(
@@ -73,8 +59,6 @@ def rope_pool_fused(
     Returns:
         `(q_rot, k_rot, k_pool_new, v_pool_new)`.
     """
-    metal = _require_metal()
-
     if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
         raise ValueError("rope_pool_fused expects q/k/v to be 3-D")
     if positions.ndim != 1 or slots.ndim != 1:
@@ -112,7 +96,7 @@ def rope_pool_fused(
     if k_pool.dtype != q.dtype or v_pool.dtype != q.dtype:
         raise ValueError("pool dtypes must match q/k/v dtype")
 
-    return metal.rope_pool_fused(
+    return _metal.rope_pool_fused(
         q,
         k,
         v,
