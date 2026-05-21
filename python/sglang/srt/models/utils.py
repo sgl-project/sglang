@@ -276,10 +276,11 @@ class AutoWeightsLoader:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
+    pool = get_token_to_kv_pool()
     return (
         _is_cuda
-        and get_token_to_kv_pool().dtype == torch.bfloat16
-        and not isinstance(get_token_to_kv_pool(), SWAKVPool)
+        and pool.dtype == torch.bfloat16
+        and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 

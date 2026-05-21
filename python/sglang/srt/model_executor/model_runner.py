@@ -3219,6 +3219,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Activate this runner's pools for the duration of the forward so that
+        # get_token_to_kv_pool() / get_req_to_token_pool() resolve to the right
+        # objects regardless of which other ModelRunner instances have been
+        # initialized in this process. Frozen-KV MTP swaps self.token_to_kv_pool
+        # itself before calling forward(), so this set picks up that override.
+        prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
+        try:
+            return self._forward_raw_body(
+                forward_batch,
+                skip_attn_backend_init=skip_attn_backend_init,
+                pp_proxy_tensors=pp_proxy_tensors,
+                reinit_attn_backend=reinit_attn_backend,
+                split_forward_count=split_forward_count,
+            )
+        finally:
+            set_kv_pools(*prev_pools)
+
+    def _forward_raw_body(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
         # Check whether can run cuda graph
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph

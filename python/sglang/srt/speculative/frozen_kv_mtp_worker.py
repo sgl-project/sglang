@@ -251,7 +251,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         return frozen_kv_target_view(forward_batch, self.kv_context)
 
     def _target_kv_pool_view(self, forward_batch: ForwardBatch):
-        return target_kv_pool_view(forward_batch, self.kv_context)
+        return target_kv_pool_view(
+            forward_batch, self.kv_context, self.draft_model_runner
+        )
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
         set_frozen_kv_positions(forward_batch, self.topk)
