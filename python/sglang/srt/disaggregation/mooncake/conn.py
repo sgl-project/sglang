@@ -719,6 +719,10 @@ class MooncakeKVManager(CommonKVManager):
 
         When dst_attn_tp_size is provided and differs from prefill TP,
         head slicing is applied for MHA models (MLA is TP-invariant).
+
+        Note: PP (pipeline parallelism) is not supported — layer_id indexes
+        kv_data_ptrs directly assuming all layers are on the current rank.
+        The caller (_get_pipeline_group_size) guards against pp_size > 1.
         """
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -1394,7 +1398,9 @@ class MooncakeKVManager(CommonKVManager):
                         if len(kv_chunk.prefill_kv_indices) == 0:
                             ret = 0
                         elif kv_chunk.layer_id is not None:
-                            # Layer-pipelined mode: sync CUDA event, send single layer
+                            # Layer-pipelined mode: sync CUDA event, send single layer.
+                            # All layers in the same group share one event; repeated
+                            # synchronize() on an already-completed event is a no-op.
                             if kv_chunk.cuda_event is not None:
                                 kv_chunk.cuda_event.synchronize()
                             # Detect TP mismatch for MHA head slicing
@@ -1885,6 +1891,8 @@ class MooncakeKVSender(CommonKVSender):
             layer_id=layer_id,
             cuda_event=cuda_event,
         )
+        if is_last:
+            self._record_transfer_indices(kv_indices, state_indices)
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:

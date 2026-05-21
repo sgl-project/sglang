@@ -3037,7 +3037,7 @@ class Scheduler(
             # send_kv_chunk in process_batch_result after the forward pass.
             is_last_group = group_end == num_layers
             for req, page_indices in zip(batch.reqs, req_page_indices_list):
-                if len(page_indices) == 0 or req.is_chunked > 0:
+                if len(page_indices) == 0 or req.inflight_middle_chunks > 0:
                     continue
                 for layer_id in range(group_start, group_end):
                     is_last = is_last_group and layer_id == num_layers - 1
