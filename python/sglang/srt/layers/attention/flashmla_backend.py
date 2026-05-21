@@ -20,7 +20,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 
 PAGE_SIZE = 64
@@ -84,7 +83,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
         if forward_batch.forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(
@@ -148,7 +147,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
             )
         else:
-            super().init_forward_metadata(forward_batch)
+            super().init_forward_data(forward_batch)
 
     def init_cuda_graph_state(
         self,
@@ -183,16 +182,14 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_mla_metadata_view = None
         self.cuda_graph_num_splits_view = None
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        num_tokens = bs
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        encoder_lens = forward_batch.encoder_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
         if forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
@@ -280,117 +277,6 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 encoder_lens,
                 forward_mode,
                 spec_info,
-            )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            seq_lens = seq_lens[:bs]
-            seq_lens_cpu = seq_lens_cpu[:bs]
-            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-            )
-            num_q_heads = self.num_q_heads
-
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
-
-            actual_num_sm_parts = mla_metadata.shape[0]
-
-            if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
-                import logging
-
-                logger = logging.getLogger(__name__)
-                logger.warning(
-                    f"num_sm_parts mismatch in CUDA Graph replay: "
-                    f"capture={self.cuda_graph_mla_metadata_view.shape[0]}, "
-                    f"replay={actual_num_sm_parts}. "
-                    f"This may indicate batch size changed between capture and replay."
-                )
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
-
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
-            self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
-                :bs, :max_seqlen_pad
-            ]
-
-        elif forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            seq_lens_cpu = seq_lens_cpu[:bs] + self.num_draft_tokens
-            max_seqlen_pad = triton.cdiv(seq_lens_cpu.max().item(), PAGE_SIZE)
-
-            create_flashmla_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices[:bs],
-                seq_lens,
-                None,
-                self.cuda_graph_kv_indices,
-                self.req_to_token.stride(0),
-                self.cuda_graph_kv_indices.stride(0),
-            )
-
-            mla_metadata, num_splits = get_mla_metadata(
-                seq_lens.to(torch.int32),
-                self.num_draft_tokens * self.num_q_heads,
-                1,
-                is_fp8_kvcache=self.is_fp8_kvcache,
-            )
-
-            actual_num_sm_parts = mla_metadata.shape[0]
-
-            if actual_num_sm_parts != self.cuda_graph_mla_metadata_view.shape[0]:
-                self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
-                    :actual_num_sm_parts
-                ]
-                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
-
-            self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
-            self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
-
-            self.forward_metadata.mla_metadata = self.cuda_graph_mla_metadata_view
-            self.forward_metadata.num_splits = self.cuda_graph_num_splits_view
-            self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
-                :bs, :max_seqlen_pad
-            ]
-        else:
-            super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
             )
 
     def get_cuda_graph_seq_len_fill_value(self):
@@ -589,10 +475,10 @@ class FlashMLAMultiStepDraftBackend:
         for i in range(self.speculative_num_steps - 1):
             call_fn(i, forward_batch)
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         def call_fn(i, forward_batch):
             assert forward_batch.spec_info is not None
-            self.attn_backends[i].init_forward_metadata(forward_batch)
+            self.attn_backends[i].init_forward_data(forward_batch)
 
         self.common_template(forward_batch, call_fn)
 
@@ -602,39 +488,8 @@ class FlashMLAMultiStepDraftBackend:
                 max_bs, max_num_tokens, block_kv_indices=None
             )
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         def call_fn(i, forward_batch):
-            # EAGLE draft worker uses DECODE mode for draft steps
-            from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-            # Create a dummy forward_mode for draft step
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
-    ):
-        def call_fn(i, forward_batch):
-            from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+            self.attn_backends[i].init_forward_data_out_graph(forward_batch)
 
         self.common_template(forward_batch, call_fn)
