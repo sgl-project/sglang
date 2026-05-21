@@ -140,7 +140,11 @@ def _build_layer(
     output_size, input_size_half = weight_fp4.shape
     input_size = input_size_half * 2
     method = ModelOptFp4LinearMethod(
-        ModelOptFp4Config(is_checkpoint_nvfp4_serialized=True, group_size=BLOCK_SIZE)
+        ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=BLOCK_SIZE,
+            swap_weight_nibbles=True,
+        )
     )
     layer = torch.nn.Module()
     method.create_weights(

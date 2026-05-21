@@ -10,12 +10,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
+    DSAIndexerPoolHost,
     HostPoolGroup,
     LogicalHostPool,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
-    NSAIndexerPoolHost,
     PoolEntry,
 )
 
@@ -325,6 +325,7 @@ def build_deepseek_v4_hicache_stack(
         item_bytes=kvcache.swa_kv_pool.bytes_per_page_padded,
         num_host_pages=swa_num_host_pages,
         slot_page_size=kvcache.swa_page_size,
+        layout=server_args.hicache_mem_layout,
         allocator_type=server_args.hicache_storage_backend,
     )
     swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
@@ -357,6 +358,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c4_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_host_pool = DeepSeekV4PagedHostPool(
@@ -368,6 +370,7 @@ def build_deepseek_v4_hicache_stack(
             ),
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_state_host_pool = DeepSeekV4StateHostPool(
@@ -378,6 +381,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c4_indexer_state_host_pool = DeepSeekV4StateHostPool(
@@ -388,6 +392,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
@@ -430,6 +435,7 @@ def build_deepseek_v4_hicache_stack(
             item_bytes=kvcache.c128_kv_pool.bytes_per_page_padded,
             num_host_pages=num_host_pages,
             slot_page_size=page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         c128_state_host_pool = DeepSeekV4StateHostPool(
@@ -440,6 +446,7 @@ def build_deepseek_v4_hicache_stack(
             ],
             num_host_pages=swa_num_host_pages,
             swa_page_size=kvcache.swa_page_size,
+            layout=server_args.hicache_mem_layout,
             allocator_type=server_args.hicache_storage_backend,
         )
         entries.extend(
@@ -649,9 +656,9 @@ def attach_hybrid_pool_to_unified_cache(
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import (
+        DSATokenToKVPool,
         HybridLinearKVPool,
         MLATokenToKVPool,
-        NSATokenToKVPool,
     )
     from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
     from sglang.srt.mem_cache.unified_cache_components import ComponentType
@@ -660,7 +667,7 @@ def attach_hybrid_pool_to_unified_cache(
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         swa_stack = isinstance(kvcache, SWAKVPool)
         mamba_stack = isinstance(kvcache, HybridLinearKVPool)
-        nsa_stack = isinstance(kvcache, NSATokenToKVPool)
+        dsa_stack = isinstance(kvcache, DSATokenToKVPool)
         deepseek_v4_stack = isinstance(kvcache, DeepSeekV4TokenToKVPool)
 
         if deepseek_v4_stack:
@@ -813,7 +820,7 @@ def attach_hybrid_pool_to_unified_cache(
                 cache.swa_kv_pool_host
             )
             transfer_layer_num = len(full_layer_mapping | swa_layer_mapping)
-        elif nsa_stack:
+        elif dsa_stack:
             full_layer_mapping = {
                 layer_id: layer_id for layer_id in range(full_kv_pool.layer_num)
             }
@@ -831,7 +838,7 @@ def attach_hybrid_pool_to_unified_cache(
                 storage_backend=None,
                 use_mla=use_mla,
                 override_kv_cache_dim=full_kv_pool.kv_cache_dim,
-                sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+                sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                     full_kv_pool,
                     kv_host_pool,
                     server_args.hicache_mem_layout,
@@ -890,7 +897,7 @@ def attach_hybrid_pool_to_unified_cache(
             pools_desc = "KV + MAMBA"
         elif swa_stack:
             pools_desc = "KV + SWA"
-        elif nsa_stack:
+        elif dsa_stack:
             pools_desc = "KV + INDEXER"
         else:
             pools_desc = "KV"
@@ -904,7 +911,7 @@ def attach_hybrid_pool_to_unified_cache(
         raise
 
 
-def attach_hybrid_nsa_pool_to_hiradix_cache(
+def attach_hybrid_dsa_pool_to_hiradix_cache(
     radix_cache: HiRadixCache,
     params: CacheInitParams,
     server_args: ServerArgs,
@@ -918,7 +925,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
-    This entrypoint is currently intended only for HiRadixCache's NSA path.
+    This entrypoint is currently intended only for HiRadixCache's DSA path.
     """
     try:
         kv = radix_cache.kv_cache
@@ -938,7 +945,7 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             use_mla=True,
             override_kv_cache_dim=kv.kv_cache_dim,
             prefetch_threshold=prefetch_threshold,
-            sidecar_host_pool_factory=lambda kv_host_pool: NSAIndexerPoolHost(
+            sidecar_host_pool_factory=lambda kv_host_pool: DSAIndexerPoolHost(
                 kv,
                 kv_host_pool,
                 server_args.hicache_mem_layout,
@@ -954,12 +961,12 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
         radix_cache.token_to_kv_pool_host = host_pool_group
         radix_cache.cache_controller = cache_controller
         logger.info(
-            "Attached hybrid NSA pool stack to HiRadixCache: pools=KV + INDEXER, "
+            "Attached hybrid DSA pool stack to HiRadixCache: pools=KV + INDEXER, "
             "transfer_layer_num=%s",
             len(layer_mapping),
         )
     except Exception:
-        logger.exception("attach_hybrid_nsa_pool_to_hiradix_cache failed")
+        logger.exception("attach_hybrid_dsa_pool_to_hiradix_cache failed")
         raise
 
 

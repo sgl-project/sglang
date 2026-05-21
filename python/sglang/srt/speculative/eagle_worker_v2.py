@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
@@ -153,7 +154,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # FIXME
+                pp_rank=0,  # spec workers don't support pipeline parallelism
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -189,6 +190,10 @@ class EagleDraftWorker(BaseDraftWorker):
             speculative_moe_a2a_backend_context(),
         ):
             self.init_attention_backend()
+            if server_args.enable_breakable_cuda_graph:
+                self.draft_runner.init_piecewise_cuda_graphs(
+                    force_for_draft_worker=True
+                )
             self.init_cuda_graphs()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
@@ -314,6 +319,7 @@ class EagleDraftWorker(BaseDraftWorker):
         supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
+            or isinstance(self.draft_extend_attn_backend, TokenspeedMLABackend)
         )
         # Capture extend
         # TODO: support draft extend cuda graph for more attention backends
@@ -801,13 +807,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
-            # Record a CUDA event after draft() GPU work is dispatched.
-            # This event will be waited on by plan_stream in verify()
-            # to ensure draft CUDA graph kernels finish before plan_stream
-            # begins metadata preparation.
-            if self.plan_stream:
-                self._draft_done_event = torch.get_device_module(self.device).Event()
-                self._draft_done_event.record()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             with (
@@ -973,12 +972,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
-            # Wait for the draft CUDA graph to finish before plan_stream
-            # begins its work. Using an event is more targeted than
-            # wait_stream(main_stream) — it only waits for draft GPU
-            # work, not all queued main_stream operations.
-            if self.plan_stream and hasattr(self, "_draft_done_event"):
-                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
