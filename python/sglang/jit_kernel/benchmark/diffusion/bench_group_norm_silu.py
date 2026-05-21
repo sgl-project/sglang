@@ -38,6 +38,14 @@ CASES = [
     Case("video_3d_small", (1, 64, 4, 16, 16), 32),
     Case("threshold_3d", (1, 128, 1, 256, 256), 32),
     Case("hunyuan_video_large", (1, 128, 20, 256, 256), 32),
+    # LTX-2 audio VAE (`runtime/models/vaes/ltx_2_audio.py`):
+    # default config has `base_channels=128`, `ch_mult=(1,2,4)`,
+    # `num_groups=32`, `mel_bins=64`, latent downsample factor=4.
+    # 1 s of 16 kHz audio at hop=160 → 100 time frames; the three
+    # resnet-block shape regimes that appear in encode + decode are:
+    Case("ltx2_audio_512_25x16",  (1, 512, 25, 16),  32),   # bottleneck + norm_out (encoder)
+    Case("ltx2_audio_256_50x32",  (1, 256, 50, 32),  32),   # mid level
+    Case("ltx2_audio_128_100x64", (1, 128, 100, 64), 32),   # early level + norm_out (decoder)
 ]
 CASE_BY_NAME = {case.name: case for case in CASES}
 

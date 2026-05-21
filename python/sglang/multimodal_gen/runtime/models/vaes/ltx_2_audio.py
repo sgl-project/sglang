@@ -9,6 +9,7 @@ from diffusers.models.autoencoders.vae import (
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch import nn
 
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes.ltx_audio import LTXAudioVAEConfig
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 
@@ -228,15 +229,13 @@ class LTX2AudioResnetBlock(nn.Module):
     def forward(
         self, x: torch.Tensor, temb: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        h = self.norm1(x)
-        h = self.non_linearity(h)
+        h = apply_group_norm_silu(x, self.norm1, self.non_linearity)
         h = self.conv1(h)
 
         if temb is not None:
             h = h + self.temb_proj(self.non_linearity(temb))[:, :, None, None]
 
-        h = self.norm2(h)
-        h = self.non_linearity(h)
+        h = apply_group_norm_silu(h, self.norm2, self.non_linearity)
         h = self.dropout(h)
         h = self.conv2(h)
 
@@ -528,8 +527,9 @@ class LTX2AudioEncoder(nn.Module):
         hidden_states = self.mid.attn_1(hidden_states)
         hidden_states = self.mid.block_2(hidden_states, temb=None)
 
-        hidden_states = self.norm_out(hidden_states)
-        hidden_states = self.non_linearity(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.norm_out, self.non_linearity
+        )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states
@@ -728,8 +728,9 @@ class LTX2AudioDecoder(nn.Module):
         if self.give_pre_end:
             return hidden_features
 
-        hidden = self.norm_out(hidden_features)
-        hidden = self.non_linearity(hidden)
+        hidden = apply_group_norm_silu(
+            hidden_features, self.norm_out, self.non_linearity
+        )
         decoded_output = self.conv_out(hidden)
         decoded_output = torch.tanh(decoded_output) if self.tanh_out else decoded_output
 
