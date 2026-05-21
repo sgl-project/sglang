@@ -16,7 +16,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.plan_input_builder import PlanInput
+from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.state import ViolationLog
 
 if TYPE_CHECKING:

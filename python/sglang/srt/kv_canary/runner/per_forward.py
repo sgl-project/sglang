@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.plan_input_builder import PlanInput
+from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.runner.enable_warner import _CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,

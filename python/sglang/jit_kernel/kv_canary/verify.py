@@ -68,9 +68,9 @@ class RealKvSource:
     (layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
     collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case.
 
-    A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — canary_*_step iterates
-    the source list and folds each into the running real_kv_hash via splitmix64 (one int64 fingerprint per slot,
-    regardless of source count).
+    A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — the launch wrappers
+    iterate the source list and fold each into the running real_kv_hash via splitmix64 (one int64 fingerprint
+    per slot, regardless of source count).
 
     Pool patchers construct sources by:
     - viewing / reshaping the underlying KV layer into the canonical [num_rows, dim1_bytes] form (no stage-copy
@@ -137,6 +137,20 @@ class RealKvSource:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class VerifyOrWriteContext:
+    """Shared launch context for canary verify/write kernels."""
+
+    canary_buf: torch.Tensor
+    kernel_kind: CanaryLaunchTag
+    violation_ring: torch.Tensor
+    violation_write_index: torch.Tensor
+    slot_run_counter: torch.Tensor
+    kernel_run_counter: torch.Tensor
+    real_kv_sources: tuple[RealKvSource, ...]
+    real_kv_hash_mode: consts.RealKvHashMode
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class VerifyPlan:
     """Flat verify entries consumed by launch_canary_verify_kernel.
 
@@ -193,15 +207,8 @@ class VerifyPlan:
 
 def launch_canary_verify_kernel(
     *,
-    canary_buf: torch.Tensor,
+    context: VerifyOrWriteContext,
     plan: VerifyPlan,
-    kernel_kind: CanaryLaunchTag,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
     """Verify one canary buffer against a VerifyPlan.
 
@@ -220,21 +227,9 @@ def launch_canary_verify_kernel(
     is sufficient).
 
     Args:
-        canary_buf: Canary buffer this launch verifies, shape [num_slots, slot_stride_bytes], uint8.
-            slot_stride_bytes is read from canary_buf.shape[1].
+        context: Shared verify/write launch context, including canary buffer, launch tag, violation sink,
+            health counters, and real KV fingerprint sources.
         plan: Pre-allocated VerifyPlan; addresses baked into cuda-graph capture.
-        kernel_kind: CanaryLaunchTag identifying which launch fired. Stamped (as int) into every violation row
-            so host can attribute a violation back to its source launch.
-        violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared across
-            all canary launches; fill-once.
-        violation_write_index: Global monotonic violation counter, shape [1], int32.
-        slot_run_counter: Health counter, shape [1], int64. Incremented by the active entry count processed.
-        kernel_run_counter: Health counter, shape [1], int64. Incremented by 1 per call (even for all-padding
-            plans).
-        real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
-            tuple disables the mixin. Multiple sources are folded sequentially via splitmix64. Each source's
-            buf is shape [num_slots, slot_stride_bytes], uint8.
-        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
 
     Slot 0 is unconditionally skipped by the verify kernel — it is sglang's reserved padding sink per
     ``memory_pool.py:152``. All canary-attached pools MUST reserve slot 0 (free_slots starts at 1).
@@ -269,6 +264,8 @@ def launch_canary_verify_kernel(
     :func:`sglang.jit_kernel.kv_canary.verify_ref.run_canary_verify_torch_reference`; CUDA must match
     byte-for-byte.
     """
+    canary_buf = context.canary_buf
+    real_kv_sources = context.real_kv_sources
     if len(real_kv_sources) > consts.MAX_REAL_KV_SOURCES:
         raise ValueError(
             f"kv-canary: at most {consts.MAX_REAL_KV_SOURCES} RealKvSource entries supported by the CUDA ABI, "
@@ -281,10 +278,10 @@ def launch_canary_verify_kernel(
     _assert_contiguous(plan.verify_prev_slot_indices, "plan.verify_prev_slot_indices")
     _assert_contiguous(plan.verify_num_valid, "plan.verify_num_valid")
     _assert_contiguous(plan.enable, "plan.enable")
-    _assert_contiguous(violation_ring, "violation_ring")
-    _assert_contiguous(violation_write_index, "violation_write_index")
-    _assert_contiguous(slot_run_counter, "slot_run_counter")
-    _assert_contiguous(kernel_run_counter, "kernel_run_counter")
+    _assert_contiguous(context.violation_ring, "violation_ring")
+    _assert_contiguous(context.violation_write_index, "violation_write_index")
+    _assert_contiguous(context.slot_run_counter, "slot_run_counter")
+    _assert_contiguous(context.kernel_run_counter, "kernel_run_counter")
 
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
@@ -298,18 +295,18 @@ def launch_canary_verify_kernel(
         plan.verify_prev_slot_indices,
         plan.verify_num_valid,
         plan.enable,
-        int(kernel_kind),
-        violation_ring,
-        violation_write_index,
-        slot_run_counter,
-        kernel_run_counter,
+        int(context.kernel_kind),
+        context.violation_ring,
+        context.violation_write_index,
+        context.slot_run_counter,
+        context.kernel_run_counter,
         padded_bufs[0],
         padded_bufs[1],
         padded_bufs[2],
         padded_bufs[3],
         source_params,
         len(real_kv_sources),
-        int(real_kv_hash_mode),
+        int(context.real_kv_hash_mode),
     )
 
 
