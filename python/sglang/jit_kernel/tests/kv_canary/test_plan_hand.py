@@ -32,9 +32,9 @@ def _tensor(values: list[int]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.int32, device=_DEVICE)
 
 
-def _plan_pair(*, verify_capacity: int, write_req_capacity: int) -> tuple[
-    tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]
-]:
+def _plan_pair(
+    *, verify_capacity: int, write_req_capacity: int
+) -> tuple[tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]]:
     triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
         verify_capacity=verify_capacity, write_req_capacity=write_req_capacity
     )
