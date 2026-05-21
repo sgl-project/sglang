@@ -21,6 +21,7 @@ import gc
 import inspect
 import logging
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
@@ -1108,7 +1109,17 @@ class CudaGraphRunner:
         for _ in range(2):
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
-            run_once()
+            if not getattr(self, "_first_warmup_logged", False):
+                tic = time.perf_counter()
+                run_once()
+                self.device_module.synchronize()
+                self._first_warmup_elapsed = time.perf_counter() - tic
+                logger.info(
+                    f"Warmup forward pass end. Time elapsed: {self._first_warmup_elapsed:.2f} s"
+                )
+                self._first_warmup_logged = True
+            else:
+                run_once()
             attn_backend.on_after_cuda_graph_warmup()
 
         if get_global_graph_memory_pool() is None:
