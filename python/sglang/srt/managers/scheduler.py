@@ -2844,19 +2844,16 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
-                    # Callback the worker fires between verify and draft_extend
-                    # for spec_v2. Dispatches the buf write whose values are
-                    # consumed by schedule stream (resolve_seq_lens_cpu), so
-                    # the fence event lands at verify-end and schedule prep
-                    # can overlap with draft_extend on forward stream. Only
-                    # spec_v2 workers accept this kwarg.
+                    # Callback the worker fires between sample (target-end /
+                    # verify-end) and draft_extend for spec_v2. Writes
+                    # new_seq_lens_buf and records the cross-stream fence
+                    # early so schedule prep can overlap with draft_extend.
+                    # Only spec_v2 workers accept this kwarg.
                     fwd_kwargs = {}
                     if batch.is_spec_v2:
 
-                        def on_verify_complete(new_seq_lens, bonus_tokens):
-                            self.future_map.store_post_verify(
-                                future_indices, new_seq_lens, bonus_tokens
-                            )
+                        def on_verify_complete(new_seq_lens):
+                            self.future_map.publish(future_indices, new_seq_lens)
 
                         fwd_kwargs["on_verify_complete"] = on_verify_complete
 
@@ -2877,7 +2874,12 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
+                            stash_payload = (
+                                batch_result.next_draft_input
+                                if batch.is_spec_v2
+                                else batch_result.next_token_ids
+                            )
+                            self.future_map.stash(future_indices, stash_payload)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
@@ -2980,7 +2982,10 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
+            self.future_map.stash(
+                batch_result.future_indices, batch_result.next_token_ids
+            )
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,

@@ -680,11 +680,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
-            # Same fence point as decode: after target forward + sample, before
-            # draft_extend. new_seq_lens = batch.seq_lens (post-prefill input
-            # length, unchanged by target forward); bonus = next_token_ids.
+            # Same fence point as decode: after target forward + sample,
+            # before draft_extend. new_seq_lens = batch.seq_lens (post-prefill
+            # input length, unchanged by target forward).
             if on_verify_complete is not None:
-                on_verify_complete(batch.seq_lens, batch_output.next_token_ids)
+                on_verify_complete(batch.seq_lens)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
@@ -717,10 +717,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             # rather than after draft_extend — preserving schedule prep /
             # draft_extend overlap.
             if on_verify_complete is not None:
-                on_verify_complete(
-                    batch_output.next_draft_input.new_seq_lens,
-                    batch_output.next_draft_input.bonus_tokens,
-                )
+                on_verify_complete(batch_output.next_draft_input.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
