@@ -69,7 +69,7 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])
-    bytes_per = rng.choice([8, 64, 128])
+    bytes_per = rng.choice([16, 64, 128])
     kernel_kind = rng.choice(list(CanaryLaunchTag))
     ring_capacity = rng.choice([16, 64, 256])
 

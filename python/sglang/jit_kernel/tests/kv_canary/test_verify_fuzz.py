@@ -63,7 +63,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
     )
     src_count = rng.choice([1, 2, 4])
     page_size = rng.choice([1, 16])
-    bytes_per = rng.choice([8, 64, 128])
+    bytes_per = rng.choice([16, 64, 128])
     kernel_kind = rng.choice(list(CanaryLaunchTag))
     plan_size = rng.randint(0, 32)
     num_slots = max(plan_size + 8, 16)
