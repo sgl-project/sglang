@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.kv_canary.plan_input_builder import PlanInput
+from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
