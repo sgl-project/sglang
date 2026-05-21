@@ -2,12 +2,21 @@
 `Req.origin_input_ids` / `Req.output_ids` over one request lifecycle.
 
 Simulated steps (per batch):
-    1. ingest   -- tokenizer list[int] -> storage container.
-    2. prefill  -- (a) fill_ids = origin + output,
-                   (b) per-req slice fill_ids[prefix_len:],
-                   (c) cross-req flatten + pinned cuda tensor build.
-    3. decode   -- per-step output.append(next_token) for n_decode steps.
-    4. finish   -- (origin + output)[:kv_committed_len] for radix cache.
+    1. ingest        -- tokenizer list[int] -> storage container.
+    2. prefix_match  -- scheduler radix-tree lookup; RadixKey.match()
+                        zip+!= walk. Exposes the per-element PyLong-boxing
+                        cost array.array introduces (list[int] iterates
+                        existing PyLongs and pays nothing).
+    3. prefill       -- (a) fill_ids = origin + output,
+                        (b) per-req slice fill_ids[prefix_len:],
+                        (c) cross-req flatten + pinned cuda tensor build.
+    4. decode        -- per-step output.append(next_token) for n_decode steps.
+    5. finish        -- cache_finished_req:
+                        (a) concat (origin + output)[:kv_committed_len]
+                            for the radix-tree insert.
+                        (b) RadixKey.match() zip+!= walk during insert's
+                            tree traversal — second PyLong-boxing hotspot
+                            on the array.array path.
 
 Usage:
     python benchmark/scheduler/bench_token_storage.py
@@ -29,11 +38,13 @@ import torch
 # is the single cross-req prepare_for_extend tensor build.
 STAGES = (
     "ingest",
+    "prefix_match",
     "prefill_concat",
     "prefill_perreq_slice",
     "batch_torch_tensor",
     "decode_append",
     "finish_concat",
+    "cache_finished_req",
 )
 
 
@@ -51,6 +62,16 @@ def _empty_list() -> list[int]:
 
 def _empty_pyarray() -> array:
     return array("q")
+
+
+def _zip_iterate(t0: Any, t1: Any) -> int:
+    """Simulate zip iteration which surface PyLong boxing cost in array scenario"""
+    i = 0
+    for a, b in zip(t0, t1):
+        if a != b:
+            break
+        i += 1
+    return i
 
 
 def _batch_tensor_from_lists(parts: list[list[int]]) -> torch.Tensor:
@@ -112,30 +133,39 @@ def simulate(
             origins[i] = ingest_fn(seed)
         outputs[i] = empty_fn()
 
-    # 2. prefill
+    # 2. prefix_match: simulating the worse scenario of PyLong-boxing overhead during prefix_match
+    for i in range(n_reqs):
+        with timed(timings, "prefix_match"):
+            _ = _zip_iterate(origins[i], origins[i])
+
+    # 3. prefill
     per_req_slices: list[Any] = [None] * n_reqs
     for i in range(n_reqs):
-        # 2a. fill_ids = origin_input_ids + output_ids
+        # 3a. fill_ids = origin_input_ids + output_ids
         with timed(timings, "prefill_concat"):
             fill_ids = origins[i] + outputs[i]
-        # 2b. input_ids = fill_ids[len(prefix_indices):]; prefix_len=0 here.
+        # 3b. input_ids = fill_ids[len(prefix_indices):]; prefix_len=0 here.
         with timed(timings, "prefill_perreq_slice"):
             per_req_slices[i] = fill_ids[0:]
-    # 2c. prepare_for_extend tensor build: flatten per-req slices, then
+    # 3c. prepare_for_extend tensor build: flatten per-req slices, then
     #     build the pinned GPU tensor (kit-specific path).
     with timed(timings, "batch_torch_tensor"):
         _ = batch_torch_fn(per_req_slices)
 
-    # 3. decode
+    # 4. decode
     for i in range(n_reqs):
         with timed(timings, "decode_append"):
             for j in range(n_decode):
                 outputs[i].append(j)
 
-    # 4. finish: cache_finished_req builds (origin + output)[:kv_committed_len].
+    # 5. finish: cache_finished_req -> insert -> _insert_helper tree walk.
     for i in range(n_reqs):
+        # 5a. (origin + output)[:kv_committed_len] for the radix-tree insert.
         with timed(timings, "finish_concat"):
-            _ = (origins[i] + outputs[i])[: n_origins[i] + n_decode]
+            committed = (origins[i] + outputs[i])[: n_origins[i] + n_decode]
+        # 5b. simulating the worse scenario of PyLong-boxing overhead during cache_finished_req
+        with timed(timings, "cache_finished_req"):
+            _ = _zip_iterate(committed, committed)
 
     return timings
 
