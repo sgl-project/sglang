@@ -21,14 +21,18 @@ class DummyTextEncodingStage(TextEncodingStage):
 
     def encode_text(self, *args, **kwargs):
         self.calls += 1
-        embeds = torch.full((1, 1, 1), float(self.calls))
-        mask = torch.ones((1, 1), dtype=torch.int64)
-        return [embeds], [mask], [], [mask], [[1]]
+        text = args[0]
+        batch_size = len(text) if isinstance(text, list) else 1
+        embeds = torch.full((batch_size, 1, 1), float(self.calls))
+        mask = torch.ones((batch_size, 1), dtype=torch.int64)
+        return [embeds], [mask], [], [mask], [[1] * batch_size]
 
 
 def make_req(**kwargs):
     defaults = {
+        "prompt": "hello",
         "negative_prompt": "bad quality",
+        "do_classifier_free_guidance": True,
         "prompt_template": {"template": "{}"},
         "max_sequence_length": 1024,
         "is_warmup": False,
@@ -37,9 +41,37 @@ def make_req(**kwargs):
     return SimpleNamespace(**defaults)
 
 
+def make_forward_req(**kwargs):
+    defaults = {
+        "prompt_embeds": [],
+        "pooled_embeds": [],
+        "prompt_attention_mask": None,
+        "prompt_embeds_mask": None,
+        "prompt_seq_lens": None,
+        "negative_prompt_embeds": [],
+        "neg_pooled_embeds": [],
+        "negative_attention_mask": None,
+        "negative_prompt_embeds_mask": None,
+        "negative_prompt_seq_lens": None,
+    }
+    defaults.update(make_req(**kwargs).__dict__)
+    return SimpleNamespace(**defaults)
+
+
+def make_server_args(**kwargs):
+    defaults = {
+        "pipeline_class_name": "LTX2TwoStagePipeline",
+        "pipeline_config": SimpleNamespace(text_encoder_configs=[]),
+    }
+    defaults.update(kwargs)
+    return SimpleNamespace(
+        **defaults,
+    )
+
+
 def test_negative_text_cache_key_tracks_encode_options():
     stage = DummyTextEncodingStage()
-    server_args = SimpleNamespace(pipeline_class_name="LTX2TwoStagePipeline")
+    server_args = make_server_args()
 
     stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
     stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
@@ -58,11 +90,37 @@ def test_negative_text_cache_key_tracks_encode_options():
 
 def test_negative_text_cache_skips_warmup():
     stage = DummyTextEncodingStage()
-    server_args = SimpleNamespace(pipeline_class_name="LTX2TwoStagePipeline")
+    server_args = make_server_args()
 
     stage.get_or_compute_negative_text_embedding(
         make_req(is_warmup=True), server_args, [0]
     )
     stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
+
+    assert stage.calls == 2
+
+
+def test_cfg_text_batch_encodes_positive_and_negative_once():
+    stage = DummyTextEncodingStage()
+    server_args = make_server_args()
+    batch = make_forward_req()
+
+    stage.forward(batch, server_args)
+
+    assert stage.calls == 1
+    assert batch.prompt_embeds[0].shape[0] == 1
+    assert batch.negative_prompt_embeds[0].shape[0] == 1
+
+
+def test_cfg_text_batch_skips_dmd_pipeline():
+    stage = DummyTextEncodingStage()
+    server_args = make_server_args(
+        pipeline_config=SimpleNamespace(
+            text_encoder_configs=[],
+            dmd_denoising_steps=1,
+        )
+    )
+
+    stage.forward(make_forward_req(), server_args)
 
     assert stage.calls == 2

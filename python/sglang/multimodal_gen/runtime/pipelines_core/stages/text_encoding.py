@@ -104,17 +104,9 @@ class TextEncodingStage(PipelineStage):
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
-        negative_cache_key = self._build_negative_text_cache_key(
+        cached_negative = self._get_cached_negative_text_embedding(
             batch, server_args, all_indices
         )
-        use_negative_cache = not batch.is_warmup
-        cached_negative = None
-        if use_negative_cache:
-            cached_negative = (
-                self._negative_text_cache_value
-                if self._negative_text_cache_key == negative_cache_key
-                else None
-            )
         if cached_negative is None:
             (
                 neg_embeds_list,
@@ -129,14 +121,16 @@ class TextEncodingStage(PipelineStage):
                 return_attention_mask=True,
             )
 
-            if use_negative_cache:
-                self._negative_text_cache_key = negative_cache_key
-                self._negative_text_cache_value = (
-                    tuple(neg_embeds_list),
-                    tuple(neg_masks_list),
-                    tuple(neg_pooler_embeds_list),
-                    tuple(neg_embeds_masks_list),
-                    tuple(neg_seq_lens_list),
+            if self._should_cache_negative_text_embedding(batch):
+                self._cache_negative_text_embedding(
+                    batch,
+                    server_args,
+                    all_indices,
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
                 )
         else:
             (
@@ -154,6 +148,43 @@ class TextEncodingStage(PipelineStage):
             neg_seq_lens_list,
         )
 
+    def _should_cache_negative_text_embedding(self, batch: Req) -> bool:
+        return not batch.is_warmup
+
+    def _get_cached_negative_text_embedding(
+        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
+    ):
+        if batch.is_warmup:
+            return None
+        negative_cache_key = self._build_negative_text_cache_key(
+            batch, server_args, encoder_indices
+        )
+        if self._negative_text_cache_key == negative_cache_key:
+            return self._negative_text_cache_value
+        return None
+
+    def _cache_negative_text_embedding(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        encoder_indices: list[int],
+        neg_embeds_list,
+        neg_masks_list,
+        neg_pooler_embeds_list,
+        neg_embeds_masks_list,
+        neg_seq_lens_list,
+    ) -> None:
+        self._negative_text_cache_key = self._build_negative_text_cache_key(
+            batch, server_args, encoder_indices
+        )
+        self._negative_text_cache_value = (
+            tuple(neg_embeds_list),
+            tuple(neg_masks_list),
+            tuple(neg_pooler_embeds_list),
+            tuple(neg_embeds_masks_list),
+            tuple(neg_seq_lens_list),
+        )
+
     def _build_negative_text_cache_key(
         self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
     ):
@@ -166,6 +197,185 @@ class TextEncodingStage(PipelineStage):
             self.freeze_for_dedup(batch.prompt_template),
             batch.max_sequence_length,
         )
+
+    def _split_cfg_text_outputs(
+        self,
+        *,
+        prompt_count: int,
+        prompt_embeds_list,
+        prompt_masks_list,
+        pooler_embeds_list,
+        prompt_embeds_masks_list,
+        prompt_seq_lens_list,
+    ):
+        prompt_embeds = [tensor[:prompt_count] for tensor in prompt_embeds_list]
+        negative_prompt_embeds = [tensor[prompt_count:] for tensor in prompt_embeds_list]
+        prompt_masks = [tensor[:prompt_count] for tensor in prompt_masks_list]
+        negative_masks = [tensor[prompt_count:] for tensor in prompt_masks_list]
+        prompt_embeds_masks = [
+            tensor[:prompt_count] for tensor in prompt_embeds_masks_list
+        ]
+        negative_prompt_embeds_masks = [
+            tensor[prompt_count:] for tensor in prompt_embeds_masks_list
+        ]
+        prompt_seq_lens = [seq_lens[:prompt_count] for seq_lens in prompt_seq_lens_list]
+        negative_prompt_seq_lens = [
+            seq_lens[prompt_count:] for seq_lens in prompt_seq_lens_list
+        ]
+
+        pooled_embeds = [tensor[:prompt_count] for tensor in pooler_embeds_list]
+        negative_pooled_embeds = [
+            tensor[prompt_count:] for tensor in pooler_embeds_list
+        ]
+
+        return (
+            prompt_embeds,
+            prompt_masks,
+            pooled_embeds,
+            prompt_embeds_masks,
+            prompt_seq_lens,
+            negative_prompt_embeds,
+            negative_masks,
+            negative_pooled_embeds,
+            negative_prompt_embeds_masks,
+            negative_prompt_seq_lens,
+        )
+
+    def _append_positive_text_outputs(
+        self,
+        batch: Req,
+        prompt_embeds_list,
+        prompt_masks_list,
+        pooler_embeds_list,
+        prompt_embeds_masks_list,
+        prompt_seq_lens_list,
+    ) -> None:
+        for pe in prompt_embeds_list:
+            batch.prompt_embeds.append(pe)
+
+        for pe in pooler_embeds_list:
+            batch.pooled_embeds.append(pe)
+
+        if batch.prompt_attention_mask is None:
+            batch.prompt_attention_mask = []
+            for am in prompt_masks_list:
+                batch.prompt_attention_mask.append(am)
+
+        batch.prompt_embeds_mask = []
+        batch.prompt_seq_lens = []
+        for mask in prompt_embeds_masks_list:
+            batch.prompt_embeds_mask.append(mask)
+        for seq_lens in prompt_seq_lens_list:
+            batch.prompt_seq_lens.append(seq_lens)
+
+    def _append_negative_text_outputs(
+        self,
+        batch: Req,
+        prompt_embeds_list,
+        neg_embeds_list,
+        neg_masks_list,
+        neg_pooler_embeds_list,
+        neg_embeds_masks_list,
+        neg_seq_lens_list,
+    ) -> None:
+        assert batch.negative_prompt_embeds is not None
+
+        # a single negative prompt can be shared across positive prompts
+        target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
+
+        def align_negative_batch_dim(
+            tensor: torch.Tensor, target_batch: int, name: str
+        ) -> torch.Tensor:
+            if tensor.shape[0] == target_batch:
+                return tensor
+            if tensor.shape[0] == 1 and target_batch > 1:
+                return tensor.expand(target_batch, *tensor.shape[1:])
+            raise ValueError(
+                f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
+            )
+
+        def align_negative_seq_lens(
+            seq_lens: list[int], target_batch: int, name: str
+        ) -> list[int]:
+            if len(seq_lens) == target_batch:
+                return [int(x) for x in seq_lens]
+            if len(seq_lens) == 1 and target_batch > 1:
+                return [int(seq_lens[0])] * target_batch
+            raise ValueError(
+                f"{name} batch dimension mismatch: got {len(seq_lens)}, expected 1 or {target_batch}"
+            )
+
+        for idx, ne in enumerate(neg_embeds_list):
+            target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+            ne = align_negative_batch_dim(ne, target_batch, "negative_prompt_embeds")
+            batch.negative_prompt_embeds.append(ne)
+
+        for idx, pe in enumerate(neg_pooler_embeds_list):
+            target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+            pe = align_negative_batch_dim(pe, target_batch, "negative_pooled_embeds")
+            batch.neg_pooled_embeds.append(pe)
+        if batch.negative_attention_mask is None:
+            batch.negative_attention_mask = []
+            for idx, nm in enumerate(neg_masks_list):
+                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+                nm = align_negative_batch_dim(
+                    nm, target_batch, "negative_attention_mask"
+                )
+                batch.negative_attention_mask.append(nm)
+
+        batch.negative_prompt_embeds_mask = []
+        batch.negative_prompt_seq_lens = []
+        for idx, nm in enumerate(neg_embeds_masks_list):
+            target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+            nm = align_negative_batch_dim(
+                nm, target_batch, "negative_prompt_embeds_mask"
+            )
+            batch.negative_prompt_embeds_mask.append(nm)
+        for idx, seq_lens in enumerate(neg_seq_lens_list):
+            target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
+            batch.negative_prompt_seq_lens.append(
+                align_negative_seq_lens(
+                    seq_lens, target_batch, "negative_prompt_seq_lens"
+                )
+            )
+
+    def _encode_cfg_text_batch(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        prompt_text: str | list[str],
+        all_indices: list[int],
+        max_seq_length: int | None,
+    ):
+        assert isinstance(batch.negative_prompt, str)
+        prompts = [prompt_text] if isinstance(prompt_text, str) else list(prompt_text)
+        combined_text = prompts + [batch.negative_prompt]
+        outputs = self.encode_text(
+            combined_text,
+            server_args,
+            encoder_index=all_indices,
+            return_attention_mask=True,
+            max_length=max_seq_length,
+        )
+        return self._split_cfg_text_outputs(
+            prompt_count=len(prompts),
+            prompt_embeds_list=outputs[0],
+            prompt_masks_list=outputs[1],
+            pooler_embeds_list=outputs[2],
+            prompt_embeds_masks_list=outputs[3],
+            prompt_seq_lens_list=outputs[4],
+        )
+
+    def _should_encode_cfg_text_batch(
+        self, batch: Req, server_args: ServerArgs
+    ) -> bool:
+        if not batch.do_classifier_free_guidance:
+            return False
+        if not isinstance(batch.negative_prompt, str):
+            return False
+        # TurboWan/DMD output changed in validation when positive/negative text
+        # were encoded in the same batch; keep that path on separated encoding
+        return not hasattr(server_args.pipeline_config, "dmd_denoising_steps")
 
     @torch.no_grad()
     def forward(
@@ -190,117 +400,104 @@ class TextEncodingStage(PipelineStage):
         # Get max_sequence_length from batch if available
         max_seq_length = getattr(batch, "max_sequence_length", None)
 
-        (
-            prompt_embeds_list,
-            prompt_masks_list,
-            pooler_embeds_list,
-            prompt_embeds_masks_list,
-            prompt_seq_lens_list,
-        ) = self.encode_text(
-            prompt_text,
-            server_args,
-            encoder_index=all_indices,
-            return_attention_mask=True,
-            max_length=max_seq_length,
-        )
-
-        for pe in prompt_embeds_list:
-            batch.prompt_embeds.append(pe)
-
-        for pe in pooler_embeds_list:
-            batch.pooled_embeds.append(pe)
-
-        if batch.prompt_attention_mask is None:
-            batch.prompt_attention_mask = []
-            for am in prompt_masks_list:
-                batch.prompt_attention_mask.append(am)
-
-        batch.prompt_embeds_mask = []
-        batch.prompt_seq_lens = []
-        for mask in prompt_embeds_masks_list:
-            batch.prompt_embeds_mask.append(mask)
-        for seq_lens in prompt_seq_lens_list:
-            batch.prompt_seq_lens.append(seq_lens)
-
-        # Encode negative prompt if CFG is enabled
+        cached_negative = None
         if batch.do_classifier_free_guidance:
-            assert isinstance(batch.negative_prompt, str)
+            cached_negative = self._get_cached_negative_text_embedding(
+                batch, server_args, all_indices
+            )
+
+        if cached_negative is not None:
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+            ) = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+                max_length=max_seq_length,
+            )
             (
                 neg_embeds_list,
                 neg_masks_list,
                 neg_pooler_embeds_list,
                 neg_embeds_masks_list,
                 neg_seq_lens_list,
-            ) = self.get_or_compute_negative_text_embedding(
-                batch, server_args, all_indices
+            ) = cached_negative
+        elif self._should_encode_cfg_text_batch(batch, server_args):
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            ) = self._encode_cfg_text_batch(
+                batch, server_args, prompt_text, all_indices, max_seq_length
             )
-
-            assert batch.negative_prompt_embeds is not None
-
-            # A single negative prompt can be shared across positive prompts.
-            target_batch_sizes = [pe.shape[0] for pe in prompt_embeds_list]
-
-            def align_negative_batch_dim(
-                tensor: torch.Tensor, target_batch: int, name: str
-            ) -> torch.Tensor:
-                if tensor.shape[0] == target_batch:
-                    return tensor
-                if tensor.shape[0] == 1 and target_batch > 1:
-                    return tensor.expand(target_batch, *tensor.shape[1:])
-                raise ValueError(
-                    f"{name} batch dimension mismatch: got {tensor.shape[0]}, expected 1 or {target_batch}"
+            if self._should_cache_negative_text_embedding(batch):
+                self._cache_negative_text_embedding(
+                    batch,
+                    server_args,
+                    all_indices,
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                )
+        else:
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+            ) = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+                max_length=max_seq_length,
+            )
+            if batch.do_classifier_free_guidance:
+                (
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                ) = self.get_or_compute_negative_text_embedding(
+                    batch, server_args, all_indices
                 )
 
-            def align_negative_seq_lens(
-                seq_lens: list[int], target_batch: int, name: str
-            ) -> list[int]:
-                if len(seq_lens) == target_batch:
-                    return [int(x) for x in seq_lens]
-                if len(seq_lens) == 1 and target_batch > 1:
-                    return [int(seq_lens[0])] * target_batch
-                raise ValueError(
-                    f"{name} batch dimension mismatch: got {len(seq_lens)}, expected 1 or {target_batch}"
-                )
+        self._append_positive_text_outputs(
+            batch,
+            prompt_embeds_list,
+            prompt_masks_list,
+            pooler_embeds_list,
+            prompt_embeds_masks_list,
+            prompt_seq_lens_list,
+        )
 
-            for idx, ne in enumerate(neg_embeds_list):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                ne = align_negative_batch_dim(
-                    ne, target_batch, "negative_prompt_embeds"
-                )
-                batch.negative_prompt_embeds.append(ne)
-
-            for idx, pe in enumerate(neg_pooler_embeds_list):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                pe = align_negative_batch_dim(
-                    pe, target_batch, "negative_pooled_embeds"
-                )
-                batch.neg_pooled_embeds.append(pe)
-            if batch.negative_attention_mask is None:
-                batch.negative_attention_mask = []
-                for idx, nm in enumerate(neg_masks_list):
-                    target_batch = target_batch_sizes[
-                        min(idx, len(target_batch_sizes) - 1)
-                    ]
-                    nm = align_negative_batch_dim(
-                        nm, target_batch, "negative_attention_mask"
-                    )
-                    batch.negative_attention_mask.append(nm)
-
-            batch.negative_prompt_embeds_mask = []
-            batch.negative_prompt_seq_lens = []
-            for idx, nm in enumerate(neg_embeds_masks_list):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                nm = align_negative_batch_dim(
-                    nm, target_batch, "negative_prompt_embeds_mask"
-                )
-                batch.negative_prompt_embeds_mask.append(nm)
-            for idx, seq_lens in enumerate(neg_seq_lens_list):
-                target_batch = target_batch_sizes[min(idx, len(target_batch_sizes) - 1)]
-                batch.negative_prompt_seq_lens.append(
-                    align_negative_seq_lens(
-                        seq_lens, target_batch, "negative_prompt_seq_lens"
-                    )
-                )
+        # Encode negative prompt if CFG is enabled
+        if batch.do_classifier_free_guidance:
+            self._append_negative_text_outputs(
+                batch,
+                prompt_embeds_list,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            )
 
         return batch
 
