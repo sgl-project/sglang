@@ -67,9 +67,7 @@ class FutureMap:
             # Forward-only bufs are lazy (worker-dependent shape).
             self._forward_buf_initialized = False
 
-        # Fences the schedule-consumed buf fields. Created lazily on first
-        # publish via torch.get_device_module(device).Event() to keep the
-        # type cuda/hip-agnostic.
+        # Fences schedule-consumed buf fields; lazy device.Event() (cuda/hip-agnostic).
         self.publish_ready = None
 
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
@@ -117,10 +115,8 @@ class FutureMap:
             draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             # Resolve seq_lens placeholder (-indices) to the post-verify view.
             batch.seq_lens = draft_input.new_seq_lens
-            # Async guard: post-resolve all values must be positive (real
-            # seq_lens). Catches a stale (-indices) sentinel slipping through
-            # if publish_ready fencing or buf indexing is wrong. CPU-free,
-            # surfaces on next stream sync.
+            # Async guard: catches a (-indices) sentinel slipping through if
+            # publish_ready fencing or buf indexing is wrong.
             torch._assert_async((batch.seq_lens > 0).all())
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
@@ -156,9 +152,7 @@ class FutureMap:
         """Store forward-only fields for the next forward batch to pick up."""
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            # DP idle rank: payload (non-spec next_token_ids or spec
-            # draft_input) holds empty stubs whose shape would IndexError the
-            # lazy-init shape peek; defer until a real batch arrives.
+            # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
         if self.spec_algo.is_none():
             # next_token_ids is int32; buf is int64. Advanced indexing requires
