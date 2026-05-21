@@ -27,7 +27,7 @@ _KIMI_K2_SPECIAL_TOKENS = [
     "<|tool_call_argument_begin|>",
 ]
 
-_KIMI_LOOSE_OBJECT_SCHEMA = {"type": "object"}
+_KIMI_NON_STRICT_ARGUMENTS_SCHEMA = {"type": "object"}
 
 
 def _strip_special_tokens(text: str) -> str:
@@ -359,8 +359,12 @@ class KimiK2Detector(BaseFormatDetector):
             converted_tool = tool.model_dump()
             function = converted_tool["function"]
             if not function.get("strict", False):
+                # Kimi's parser accepts only object-shaped tool arguments. XGrammar
+                # treats strict=False arguments as unconstrained JSON, which can
+                # generate strings/arrays/numbers that Kimi cannot parse. Keep
+                # non-strict semantics loose by constraining only the outer type.
                 function["strict"] = True
-                function["parameters"] = _KIMI_LOOSE_OBJECT_SCHEMA
+                function["parameters"] = _KIMI_NON_STRICT_ARGUMENTS_SCHEMA
             converted_tools.append(converted_tool)
 
         converted_tool_choice = (
