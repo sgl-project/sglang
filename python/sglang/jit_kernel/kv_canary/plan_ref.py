@@ -9,7 +9,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
-def run_canary_plan_torch_reference(
+def canary_plan_step_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
@@ -28,7 +28,7 @@ def run_canary_plan_torch_reference(
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
     if verify_capacity != plan_verify_capacity:
         raise ValueError(
-            f"kv-canary: run_canary_plan_torch_reference verify_capacity={verify_capacity} does not "
+            f"kv-canary: canary_plan_step_torch_reference verify_capacity={verify_capacity} does not "
             f"match verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
@@ -73,31 +73,6 @@ def run_canary_plan_torch_reference(
     _write_num_valid_and_enable(
         verify_plan_out=verify_plan_out,
         requested=total_verify,
-        verify_capacity=verify_capacity,
-    )
-
-
-def canary_plan_step_torch_reference(
-    *,
-    verify_plan_out: VerifyPlan,
-    write_plan_out: WritePlan,
-    req_pool_indices: torch.Tensor,
-    prefix_lens: torch.Tensor,
-    extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    swa_window_size: int,
-    full_to_swa_index_mapping: Optional[torch.Tensor],
-    verify_capacity: int,
-) -> None:
-    run_canary_plan_torch_reference(
-        verify_plan_out=verify_plan_out,
-        write_plan_out=write_plan_out,
-        req_pool_indices=req_pool_indices,
-        prefix_lens=prefix_lens,
-        extend_seq_lens=extend_seq_lens,
-        req_to_token=req_to_token,
-        swa_window_size=swa_window_size,
-        full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_capacity=verify_capacity,
     )
 
