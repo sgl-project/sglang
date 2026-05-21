@@ -24,6 +24,9 @@ if TYPE_CHECKING:
 
 
 _BOUNDARY_INT_DTYPES = (torch.int32, torch.int64)
+_INPUT_IDS = "forward_batch.input_ids"
+_OUT_LOC = "forward_batch.out_cache_loc"
+_POSITIONS = "forward_batch.positions"
 
 
 def invoke_plan(
@@ -66,19 +69,9 @@ def launch_endpoints_per_forward(
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: bool,
 ) -> None:
-    positions = _canonicalize_boundary_int64(
-        forward_batch.positions, "forward_batch.positions"
-    )
-    out_cache_loc = None
-    if forward_batch.out_cache_loc is not None:
-        out_cache_loc = _canonicalize_boundary_int64(
-            forward_batch.out_cache_loc, "forward_batch.out_cache_loc"
-        )
-    input_ids = None
-    if forward_batch.input_ids is not None:
-        input_ids = _canonicalize_boundary_int64(
-            forward_batch.input_ids, "forward_batch.input_ids"
-        )
+    positions = _canonicalize_boundary_int64(forward_batch.positions, _POSITIONS)
+    out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
+    input_ids = _canonicalize_boundary_int64(forward_batch.input_ids, _INPUT_IDS)
 
     num_tokens = int(positions.shape[0])
     if expected_inputs.tokens.shape[0] != num_tokens:
@@ -155,7 +148,11 @@ def _endpoint_belongs_to_group(
     return suffix == group.kind.name
 
 
-def _canonicalize_boundary_int64(tensor: torch.Tensor, name: str) -> torch.Tensor:
+def _canonicalize_boundary_int64(
+    tensor: torch.Tensor | None, name: str
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
     if tensor.dtype not in _BOUNDARY_INT_DTYPES:
         raise TypeError(
             f"kv-canary: {name} must have dtype torch.int32 or torch.int64, got {tensor.dtype}"
