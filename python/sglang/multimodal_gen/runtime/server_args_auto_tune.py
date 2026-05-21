@@ -201,7 +201,7 @@ class ServerArgsAutoTuner:
             self._enable_cfg_parallel_if_supported()
 
     def maybe_adjust_auto_default_layerwise_offload(self) -> None:
-        """Enable verified non-DiT layerwise defaults for unset component placement."""
+        """Enable verified layerwise defaults for unset component placement."""
         args = self.server_args
         if args.performance_mode != "auto":
             return
@@ -220,7 +220,7 @@ class ServerArgsAutoTuner:
             return
 
         logger.info(
-            "Automatically enable default non-DiT layerwise offload for %s: %s",
+            "Automatically enable default layerwise offload for %s: %s",
             args.pipeline_config.__class__.__name__,
             layerwise_components,
         )
@@ -367,17 +367,38 @@ class ServerArgsAutoTuner:
             or args.dit_layerwise_offload is True
         ):
             # The legacy --dit-layerwise-offload flag is a DiT-only selector.
-            # Do not merge implicit non-DiT defaults into that explicit mode.
+            # Do not merge implicit defaults into that explicit mode.
             return []
 
         # `*_cpu_offload` is the component placement knob. If a user explicitly
         # set it to either true or false, keep that component out of default
         # layerwise selection.
-        return [
+        components = [
             component_name
             for component_name, arg_name in DEFAULT_LAYERWISE_COMPONENT_ARG_NAMES
             if not args.is_arg_explicitly_set(arg_name)
         ]
+        if self._should_auto_enable_dit_layerwise_offload():
+            components.insert(0, LAYERWISE_OFFLOAD_DIT_GROUP)
+        return components
+
+    def _should_auto_enable_dit_layerwise_offload(self) -> bool:
+        args = self.server_args
+        deployment_config = self._deployment_config()
+        return (
+            deployment_config.auto_dit_layerwise_offload
+            and self._is_wan_pipeline_config()
+            and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
+            and not envs.SGLANG_CACHE_DIT_ENABLED
+            and not args.use_fsdp_inference
+            and not args.is_arg_explicitly_set("dit_cpu_offload")
+        )
+
+    def _is_wan_pipeline_config(self) -> bool:
+        return any(
+            cls.__module__.endswith(".wan")
+            for cls in self.server_args.pipeline_config.__class__.mro()
+        )
 
     def _auto_uses_dit_offload(self) -> bool:
         args = self.server_args

@@ -502,12 +502,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):
@@ -518,12 +518,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.use_fsdp_inference)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_auto_wan_layerwise_offload_does_not_disable_explicit_fsdp(self):
@@ -543,6 +543,37 @@ class TestOffloadDefaults(unittest.TestCase):
         )
         self.assertTrue(args.use_fsdp_inference)
 
+    def test_auto_wan_layerwise_offload_preserves_explicit_dit_cpu_offload(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V480PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+                "performance_mode": "auto",
+                "dit_cpu_offload": True,
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_mova_layerwise_offload_does_not_implicitly_add_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            MOVAPipelineConfig(),
+            kwargs={
+                "model_path": "OpenMOSS-Team/MOVA-360p",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.dit_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["text_encoder", "image_encoder", "vae"],
+        )
+
     def test_auto_multi_gpu_wan_uses_layerwise_offload_without_cfg(self):
         with patch.object(ServerArgs, "_model_default_uses_cfg", return_value=False):
             args = self._from_dict_with_pipeline_config(
@@ -556,13 +587,13 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertFalse(args.enable_cfg_parallel)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertTrue(args.layerwise_offload_components)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_explicit_multi_gpu_dit_layerwise_only_selects_dit_group(self):
@@ -825,12 +856,12 @@ class TestOffloadDefaults(unittest.TestCase):
 
         self.assertFalse(args.use_fsdp_inference)
         self.assertTrue(args.layerwise_offload_components)
-        self.assertTrue(args.dit_cpu_offload)
+        self.assertFalse(args.dit_cpu_offload)
         self.assertFalse(args.text_encoder_cpu_offload)
         self.assertFalse(args.image_encoder_cpu_offload)
         self.assertEqual(
             args.layerwise_offload_components,
-            ["text_encoder", "image_encoder", "vae"],
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_memory_mode_preserves_explicit_fsdp(self):
