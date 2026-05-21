@@ -525,6 +525,49 @@ class TestAnthropicToolUse(CustomTestCase):
                 "content_block_start should come before content_block_stop",
             )
 
+        # Type/index invariant: every content_block_delta must carry a
+        # delta whose type matches the block-type at the same index, as
+        # established by the most recent content_block_start. Anthropic
+        # SDK clients enforce this with assertions like
+        #   if (block.type !== "text") throw "Content block is not a text block"
+        # so violating it crashes the client mid-stream.
+        block_type_at_index: dict = {}
+        for ev in events:
+            etype = ev.get("type")
+            idx = ev.get("index")
+            if etype == "content_block_start":
+                cb_type = ev.get("content_block", {}).get("type")
+                if isinstance(idx, int) and isinstance(cb_type, str):
+                    block_type_at_index[idx] = cb_type
+            elif etype == "content_block_stop":
+                if isinstance(idx, int):
+                    block_type_at_index.pop(idx, None)
+            elif etype == "content_block_delta":
+                delta_type = ev.get("delta", {}).get("type")
+                if not isinstance(idx, int):
+                    continue
+                open_type = block_type_at_index.get(idx)
+                self.assertIsNotNone(
+                    open_type,
+                    f"content_block_delta with type={delta_type} at "
+                    f"index={idx} arrived with no open content block",
+                )
+                if delta_type == "text_delta":
+                    self.assertEqual(
+                        open_type,
+                        "text",
+                        f"text_delta at index={idx} but open block is "
+                        f"type={open_type} (would crash Anthropic SDK "
+                        f"with 'Content block is not a text block')",
+                    )
+                elif delta_type == "input_json_delta":
+                    self.assertEqual(
+                        open_type,
+                        "tool_use",
+                        f"input_json_delta at index={idx} but open block "
+                        f"is type={open_type}",
+                    )
+
     def test_no_tools_no_tool_use(self):
         """Test that without tools, no tool_use blocks appear."""
         payload = {
