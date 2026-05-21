@@ -1251,7 +1251,7 @@ class MMEncoder:
     async def batch_encode(
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
-        """Cross-request ViT fusion. Skips local mm_cache (whole-request key)."""
+        """Cross-request encoder fusion (image/audio). Skips local mm_cache."""
         items_per_req, flat_items = [], []
         for req in requests:
             v = req["mm_items"]
@@ -1289,8 +1289,9 @@ class MMEncoder:
                     get_feat,
                 )
             else:
-                # Cache path: lookup → ViT on miss → prefetch hits → fallback if
-                # prefetch fails. Collectives run once over the union for TP sync.
+                # Cache path: lookup → encoder forward on miss → prefetch hits →
+                # fallback if prefetch fails. Collectives run once over the
+                # union for TP sync.
                 batch_id = f"batch:{requests[0]['req_id']}:{len(requests)}"
                 # Concat per-request user-supplied hashes; fall back to compute
                 # if any request lacks them.
@@ -1344,7 +1345,7 @@ class MMEncoder:
                         await asyncio.wait_for(_wait(), timeout=60.0)
                     except (asyncio.TimeoutError, Exception) as e:
                         logger.error(
-                            f"Prefetch failed for {batch_id}: {e}; ViT fallback for {len(hit)} items"
+                            f"Prefetch failed for {batch_id}: {e}; encoder fallback for {len(hit)} items"
                         )
                         status[0] = 0
                 if self.server_args.tp_size > 1:
@@ -1620,7 +1621,7 @@ _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 
 
 class EncoderScheduler:
-    """Aggregate concurrent /encode requests into bounded ViT batches."""
+    """Aggregate concurrent /encode requests into bounded image/audio batches."""
 
     def __init__(
         self,
