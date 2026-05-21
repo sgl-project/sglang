@@ -477,6 +477,7 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d"],
+    local_item_indices: Optional[list[int]] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -485,12 +486,22 @@ def run_dp_sharded_mrope_vision_model(
 
     Args:
         vision_model (torch.nn.Module): Vision model.
-        pixel_values (torch.Tensor): Image/Video input tensor.
-        grid_thw_list: List of grid dimensions for each image
+        pixel_values (torch.Tensor): Image/Video input tensor. When
+            ``local_item_indices`` is ``None`` this must be the *full* concat
+            of all items' patches; when ``local_item_indices`` is provided it
+            must already contain only the local-rank items concatenated in
+            ``local_item_indices`` order (which must equal
+            ``sorted(image_idxs_local)`` under the same LB assignment).
+        grid_thw_list: List of grid dimensions for *all* images (one row per
+            item) -- used for the LB decision and for output reassembly.
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
                    "rope_2d" for 2D rope (e.g., Kimi-VL)
+        local_item_indices: Optional. If provided, ``pixel_values`` is treated
+            as already containing only the local rank's items, in this exact
+            order. This avoids materializing the full concat on every rank
+            (the whole point of pre-H2D item sharding).
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -535,14 +546,41 @@ def run_dp_sharded_mrope_vision_model(
     # cu_gpu_sample_counts = [0, 1, 4]
     cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
 
-    # GPU_0 image_idxs_local = [0]
-    # GPU_1 image_idxs_local = [2, 1, 3]
-    image_idxs_local = image_to_tp_rank[
-        cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
-    ]
+    # Canonicalize within-rank order to ``sorted`` (= original-item order). The
+    # LB decision (which items live on which rank) is unaffected; only the
+    # within-rank ordering is fixed so that the pre-sharded caller path
+    # (``local_item_indices`` provided) and the legacy slice path produce
+    # identical output. Output assembly below uses the same canonical order.
+    rank_image_order: list[list[int]] = []
+    for rank in range(tp_size):
+        idxs = image_to_tp_rank[
+            cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+        ]
+        rank_image_order.append(sorted(idxs))
 
-    # Get the pixel values for the local images based on the image_idxs_local
-    if len(image_idxs_local) > 0:
+    image_idxs_local = rank_image_order[tp_rank_local]
+
+    # Consistency check: when the caller pre-sharded items, its local_item_indices
+    # must match what the LB produces here (both are deterministic from the same
+    # patches_per_item, so this is a sanity assertion, not a runtime branch).
+    if local_item_indices is not None:
+        assert local_item_indices == image_idxs_local, (
+            "DP-encoder pre-shard mismatch: `local_item_indices` provided by "
+            "the caller (built from "
+            "`sglang.srt.managers.mm_utils.maybe_shard_items_for_dp_encoder` + "
+            "`build_local_pixel_values_for_dp_encoder`) disagrees with the LB "
+            "decision in `sglang.srt.multimodal.mm_utils."
+            "run_dp_sharded_mrope_vision_model`: "
+            f"caller={local_item_indices} vs in-helper={image_idxs_local}. "
+            "This indicates the two LB call sites saw different "
+            "`patches_per_item`."
+        )
+        # pixel_values already contains only the local items in
+        # image_idxs_local order -- skip the redundant slice/concat.
+        pixel_values_local = pixel_values
+    elif len(image_idxs_local) > 0:
+        # Legacy path: pixel_values contains all items; slice out the local ones
+        # in canonical order.
         pixel_values_local = torch.cat(
             [
                 pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
@@ -647,14 +685,12 @@ def run_dp_sharded_mrope_vision_model(
 
     # Reconstruct embeddings in the original order
     original_order_embeddings = [None] * len(grid_thw_list)
-    current_idx = 0
     for rank in range(tp_size):
         count = gpu_sample_counts[rank]
         if count > 0:
-            # Get images assigned to this rank in shuffled order
-            # GPU_0 = image_idxs_local  [0]
-            # GPU_1 = image_idxs_local  [2, 1, 3]
-            rank_images = image_to_tp_rank[current_idx : current_idx + count]
+            # Get images assigned to this rank in canonical (sorted) order,
+            # matching the within-rank order used to build pixel_values_local.
+            rank_images = rank_image_order[rank]
 
             rank_embed = rank_embeddings[rank]
             # Split rank embeddings back to individual images
@@ -665,6 +701,5 @@ def run_dp_sharded_mrope_vision_model(
                     embed_start : embed_start + img_patches
                 ]
                 embed_start += img_patches
-            current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings

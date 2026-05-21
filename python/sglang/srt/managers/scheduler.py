@@ -149,6 +149,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
     init_mm_embedding_cache,
+    maybe_shard_items_for_dp_encoder,
     unwrap_shm_features,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -1931,9 +1932,31 @@ class Scheduler(
 
     def _get_multimodal_inputs(self, mm_inputs_dict):
         if self.server_args.enable_broadcast_mm_inputs_process:
-            return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
+            image_inputs = self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
-            return MultimodalInputs.from_processor_output(mm_inputs_dict)
+            image_inputs = MultimodalInputs.from_processor_output(mm_inputs_dict)
+
+        # DP-encoder CPU-side sharding: every TP scheduler process currently
+        # holds the full pixel_values dict that arrived over IPC. Under
+        # ``mm_enable_dp_encoder`` the encoder forward is partitioned across
+        # attention-TP ranks via a deterministic load-balancer keyed on the
+        # CPU-resident ``image_grid_thw`` metadata, so each rank can drop the
+        # ``item.feature`` for items it does not own without any communication.
+        # We run this AFTER ``from_processor_output`` (and AFTER the broadcast,
+        # if any) so that ``hash`` / ``pad_value`` / ``image_grid_thw`` are
+        # already populated -- those are required to remain consistent across
+        # ranks for radix caching and embedding-cache keys. The downstream
+        # ``maybe_shard_items_for_dp_encoder`` at H2D time stays idempotent
+        # (same LB → already-None features remain None, local ones are kept).
+        if image_inputs is not None and image_inputs.mm_items:
+            try:
+                maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
+            except Exception as e:
+                logger.warning(
+                    f"DP-encoder scheduler-side mm sharding skipped due to: {e}"
+                )
+
+        return image_inputs
 
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
