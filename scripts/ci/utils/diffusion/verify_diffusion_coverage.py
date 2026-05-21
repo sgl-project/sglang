@@ -21,8 +21,8 @@ from pathlib import Path
 from diffusion_case_parser import (
     BASELINE_REL_PATH,
     RUN_SUITE_REL_PATH,
-    TESTCASE_CONFIG_REL_PATH,
     collect_diffusion_suites,
+    resolve_case_config_path,
 )
 
 DYNAMIC_SUITES = {"1-gpu", "2-gpu"}
@@ -39,18 +39,18 @@ def load_execution_reports(reports_dir: Path) -> list[dict]:
 
 def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     """
-    Get all expected cases from testcase_configs.py and run_suite.py.
+    Get all expected cases from case config and run_suite.py.
 
     Returns:
         Dictionary mapping suite name to set of expected case IDs.
         Standalone files are represented as "standalone:<filename>".
     """
-    testcase_config_path = repo_root / TESTCASE_CONFIG_REL_PATH
     baseline_path = repo_root / BASELINE_REL_PATH
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
+    case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
     suites = collect_diffusion_suites(
-        testcase_config_path,
+        case_config_path,
         run_suite_path,
         baseline_path,
     )
@@ -64,6 +64,21 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
         for standalone_file in suite_info.standalone_files:
             case_ids.add(f"standalone:{standalone_file}")
         expected[suite_name] = case_ids
+
+    empty_dynamic_suites = [
+        suite_name
+        for suite_name in DYNAMIC_SUITES
+        if suite_name in expected
+        and not any(
+            not case_id.startswith("standalone:") for case_id in expected[suite_name]
+        )
+    ]
+    if empty_dynamic_suites:
+        raise RuntimeError(
+            "Parsed zero parametrized cases for diffusion suites: "
+            + ", ".join(sorted(empty_dynamic_suites))
+            + ". Refuse to pass coverage verification."
+        )
 
     return expected
 
@@ -268,7 +283,11 @@ def main():
         sys.exit(1)
 
     # Get expected cases
-    expected = get_expected_cases(repo_root)
+    try:
+        expected = get_expected_cases(repo_root)
+    except (RuntimeError, FileNotFoundError) as exc:
+        print(f"\nERROR: {exc}")
+        sys.exit(1)
     print("\nExpected cases by suite:")
     for suite, cases in expected.items():
         print(f"  {suite}: {len(cases)} cases")

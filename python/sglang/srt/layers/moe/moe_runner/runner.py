@@ -43,6 +43,10 @@ class MoeRunner:
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
             self.runner_core = DeepGemmRunnerCore(config)
+        elif runner_backend.is_aiter():
+            from sglang.srt.layers.moe.moe_runner.aiter import AiterRunnerCore
+
+            self.runner_core = AiterRunnerCore(config)
         elif runner_backend.is_marlin():
             if lora_enabled:
                 from sglang.srt.lora.lora_moe_runner_marlin import MarlinLoraRunnerCore
@@ -159,11 +163,9 @@ class MoeRunner:
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = down_gemm_overlap_args
         self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None

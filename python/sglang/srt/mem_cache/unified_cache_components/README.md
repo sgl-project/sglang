@@ -93,7 +93,7 @@ Find the longest cached prefix for a token sequence.
 
 **Algorithm detail:**
 1. Calls `create_match_validator()` once per component — returns a stateful closure (e.g., SWA tracks accumulated window length)
-2. Walks tree edges via `key_match_fn`; at each node, calls all validator closures — the match boundary is only advanced when **all** validators return `True`
+2. Walks tree edges via `RadixKey.match()`; at each node, calls all validator closures — the match boundary is only advanced when **all** validators return `True`
 3. If match ends mid-node, calls `_split_node` → triggers `redistribute_on_node_split()` per component
 4. Post-match (`_match_post_processor`):
    - Promotes matched path to MRU in each component's LRU via `node_has_component_data()` as filter
