@@ -690,8 +690,8 @@ class TestMockMode:
 class TestSlotHandling:
     def test_negative_slot_skips_entry(self) -> None:
         """``fb_out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
-        slot_run_counter bump. Covers both SWA out-of-window (after caller-side LUT gather) and
-        explicit padding intents.
+        canary slot mutation. It still counts as a processed write entry for health accounting.
+        Covers both SWA out-of-window (after caller-side LUT gather) and explicit padding intents.
         """
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
@@ -716,8 +716,7 @@ class TestSlotHandling:
 
         stored_token, _, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=4)
         assert stored_token == 42
-        # slot_run_counter counts only non-skipped entries (1, not 2).
-        assert int(cuda_log.slot_run_counter.item()) == 1
+        assert int(cuda_log.slot_run_counter.item()) == 2
 
     def test_pre_translated_slot_writes_normally(self) -> None:
         """``fb_out_cache_loc[i] >= 0`` → the kernel writes to exactly that slot, with no LUT applied. This
