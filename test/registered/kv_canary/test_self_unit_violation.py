@@ -3,7 +3,7 @@ from __future__ import annotations
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
-from sglang.srt.kv_canary.runner.violation import _format_violation
+from sglang.srt.kv_canary.runner.violation_reporter import _format_violation
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, stage="extra-a", runner_config="1-gpu-large")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
@@ -10,7 +11,6 @@ from sglang.srt.kv_canary.perturb import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.utils import WarmupGate
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -33,13 +33,15 @@ class PerturbManager:
         config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
-        violation_pump: ViolationPump,
+        step_counter_getter: Callable[[], int],
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
         self._radix_cache: Optional["BasePrefixCache"] = None
-        self._warmup_gate = WarmupGate(config=config, violation_pump=violation_pump)
+        self._warmup_gate = WarmupGate(
+            config=config, step_counter_getter=step_counter_getter
+        )
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache

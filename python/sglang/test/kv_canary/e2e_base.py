@@ -82,7 +82,7 @@ class CanaryE2EBase(CustomTestCase):
     ``tearDownClass`` kills the server.
 
     Violation log assertions parse the stable one-line summary emitted by
-    ViolationReporter (see python/sglang/srt/kv_canary/runner/violation.py):
+    ViolationReporter (see python/sglang/srt/kv_canary/runner/violation_reporter.py):
         ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
     """
 

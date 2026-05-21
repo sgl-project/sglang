@@ -202,7 +202,7 @@ class TestSelfUnitRunner(CustomTestCase):
             ),
             req_to_token_pool=_make_pool(self.device),
             buffer_groups=(),
-            violation_pump=SimpleNamespace(step_counter=10),
+            step_counter_getter=lambda: 10,
         )
         forward_batch = _make_forward_batch(self.device)
         calls: List[str] = []
@@ -278,7 +278,7 @@ class TestSelfUnitRunner(CustomTestCase):
             before = runner._sweep_orchestrator._last_sweep_step
             real_maybe()
             if runner._sweep_orchestrator._last_sweep_step != before:
-                sweep_calls.append(runner._violation_pump._step_counter)
+                sweep_calls.append(runner._step_counter)
 
         with patch.object(runner._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
@@ -326,7 +326,7 @@ class TestSelfUnitRunner(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(),
-            violation_pump=SimpleNamespace(step_counter=10),
+            step_counter_getter=lambda: 10,
         )
         forward_batch = _make_forward_batch(self.device, bs=2, seq_lens_list=(3, 3))
         forward_batch.out_cache_loc = torch.tensor(
@@ -454,10 +454,10 @@ class TestSelfUnitRunner(CustomTestCase):
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         """Verify the kernel watchdog raises when counters stop advancing."""
         runner = _make_runner(device=self.device)
-        runner._violation_pump._step_counter = 1000
+        runner._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
         runner._health_checker.step()
-        runner._violation_pump._step_counter = 2000
+        runner._step_counter = 2000
         with self.assertRaises(RuntimeError):
             runner._health_checker.step()
 
@@ -474,9 +474,9 @@ class TestSelfUnitRunner(CustomTestCase):
         ):
             runner._device_state.kernel_run_counters[tag.value] = 1
 
-        runner._violation_pump._step_counter = 1000
+        runner._step_counter = 1000
         runner._health_checker.step()
-        runner._violation_pump._step_counter = 2000
+        runner._step_counter = 2000
         runner._health_checker.step()
 
     def test_periodic_stats_log_every_n_step(self):
@@ -488,7 +488,7 @@ class TestSelfUnitRunner(CustomTestCase):
         with self.assertLogs(runner_module.logger.name, level=logging.INFO) as cm:
             for _ in range(11):
                 runner._stats_logger.step()
-                runner._violation_pump._step_counter += 1
+                runner._step_counter += 1
         log_text = "\n".join(cm.output)
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)

@@ -5,7 +5,6 @@ import logging
 from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger(__name__)
@@ -26,18 +25,16 @@ class ViolationReporter:
         *,
         config: CanaryConfig,
         device_state: CanaryDeviceState,
-        violation_pump: ViolationPump,
     ) -> None:
         self._config = config
         self._device_state = device_state
-        self._violation_pump = violation_pump
         self._raised: bool = False
 
     @property
     def is_raised(self) -> bool:
         return self._raised
 
-    def log_or_raise_violation(self) -> None:
+    def log_or_raise_violation(self, *, step_counter: int) -> None:
         violation_log = self._device_state.violation_log
         write_index = int(violation_log.violation_write_index.cpu().item())
         if write_index == 0:
@@ -48,7 +45,7 @@ class ViolationReporter:
             row=ring[0].tolist(),
             total=write_index,
             ring_overflow=ring_overflow,
-            step_when_pumped=self._violation_pump.step_counter,
+            step_when_pumped=step_counter,
         )
         # log mode: always surface every violation as WARNING. Never rate-limit or demote to
         # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever

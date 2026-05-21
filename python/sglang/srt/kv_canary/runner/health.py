@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Optional
 
 import torch
@@ -9,7 +10,6 @@ from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
-from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
@@ -33,18 +33,18 @@ class KernelRunCounterHealthChecker:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        violation_pump: ViolationPump,
+        step_counter_getter: Callable[[], int],
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
-        self._violation_pump = violation_pump
+        self._step_counter_getter = step_counter_getter
         self._d2h_stream = d2h_stream
         self._previous_health_future: Optional[FutureTensor] = None
 
     def step(self) -> None:
-        step_counter = self._violation_pump.step_counter
+        step_counter = self._step_counter_getter()
         if step_counter < _HEALTH_CHECK_WARMUP_STEPS:
             return
         if step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
@@ -81,14 +81,14 @@ class PeriodicCanaryStatsLogger:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        violation_pump: ViolationPump,
+        step_counter_getter: Callable[[], int],
         sweep_orchestrator: SweepOrchestrator,
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
-        self._violation_pump = violation_pump
+        self._step_counter_getter = step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
         self._d2h_stream = d2h_stream
         self._previous_slot_sum_future: Optional[FutureTensor] = None
@@ -98,7 +98,7 @@ class PeriodicCanaryStatsLogger:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
             return
-        step_counter = self._violation_pump.step_counter
+        step_counter = self._step_counter_getter()
         if step_counter == 0 or step_counter % period != 0:
             return
 
