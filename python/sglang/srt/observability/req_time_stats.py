@@ -106,6 +106,29 @@ class RequestStage:
         level=2,
     )
 
+    # Pre-scheduler sub-attribution (observed at scheduler receive time using
+    # timestamps propagated from APIServerReqTimeStats).
+    CHAT_TEMPLATE = RequestStageConfig(
+        "chat_template",
+        level=1,
+        metrics_is_observed=True,
+    )
+    HF_TOKENIZE = RequestStageConfig(
+        "hf_tokenize",
+        level=1,
+        metrics_is_observed=True,
+    )
+    # Full ZMQ transit from the tokenizer initiating send_pyobj to the
+    # scheduler receiving it: includes pickle + ZMQ send + wire + deserialize.
+    # We can't break this down further from the scheduler side because the
+    # tokenizer-side dispatch_finish_time is set after send_pyobj returns,
+    # so it isn't in the pickled payload.
+    ZMQ_WIRE = RequestStageConfig(
+        "zmq_wire",
+        level=1,
+        metrics_is_observed=True,
+    )
+
     # DP controller
     DPC_DISPATCH = RequestStageConfig(
         "dpc_dispatch",
@@ -329,19 +352,22 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     finished_time: float = 0.0
     first_token_time: float = 0.0
     last_time: float = 0.0
+    prompt_render_finish_time: float = 0.0
     tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     api_server_dispatch_finish_time: float = 0.0
     response_sent_to_client_time: float = 0.0
 
     def __getstate__(self) -> object:
-        state = {}
-        # send to DP controller or Scheduler
-        # If necessary, can propagate the timestamp here, for example:
-        # state = {
-        #    "created_time": self.created_time,
-        #    "api_server_dispatch_time": self.api_server_dispatch_time,
-        # }
+        # send to DP controller or Scheduler. These timestamps are used by
+        # SchedulerReqTimeStats.set_scheduler_recv_time to emit per-stage
+        # histograms (chat_template / hf_tokenize / zmq_wire).
+        state = {
+            "created_time": self.created_time,
+            "prompt_render_finish_time": self.prompt_render_finish_time,
+            "tokenize_finish_time": self.tokenize_finish_time,
+            "api_server_dispatch_time": self.api_server_dispatch_time,
+        }
         state.update(super().__getstate__())
         return state
 
@@ -367,6 +393,10 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def set_last_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.last_time = ts
+
+    def set_prompt_render_finish_time(self, ts=None):
+        ts = ts or time.perf_counter()
+        self.prompt_render_finish_time = ts
 
     def set_tokenize_finish_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -529,9 +559,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
     """
 
-    # Placeholder: not used currently
-    # propagated from tokenizer/grpc_server or dp controller
+    # Propagated from tokenizer/grpc_server or dp controller, used to emit
+    # per-stage histograms (chat_template / hf_tokenize / zmq_wire) at
+    # scheduler receive time.
     created_time: float = 0.0
+    prompt_render_finish_time: float = 0.0
+    tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     dpc_dispatch_time: float = 0.0
 
@@ -593,6 +626,25 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+
+        # Emit per-stage histograms covering the time before the request
+        # reached the scheduler. Source timestamps come from
+        # APIServerReqTimeStats and are propagated via __getstate__.
+        if self.created_time > 0.0 and self.prompt_render_finish_time > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE,
+                self.prompt_render_finish_time - self.created_time,
+            )
+        if self.prompt_render_finish_time > 0.0 and self.tokenize_finish_time > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.HF_TOKENIZE,
+                self.tokenize_finish_time - self.prompt_render_finish_time,
+            )
+        if self.api_server_dispatch_time > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.ZMQ_WIRE,
+                ts - self.api_server_dispatch_time,
+            )
 
     def set_spec_draft_start_time(self, ts=None):
         ts = ts or time.perf_counter()

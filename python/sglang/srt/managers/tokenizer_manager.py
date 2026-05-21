@@ -2635,6 +2635,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.server_args.enable_trace:
                 time_stats.init_trace_ctx(rid, bootstrap_room, external_trace_header)
             time_stats.set_created_time(created_time)
+            if getattr(obj, "prompt_render_finish_time", None):
+                time_stats.set_prompt_render_finish_time(obj.prompt_render_finish_time)
 
     def _should_dispatch_to_encoder(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput]

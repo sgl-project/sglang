@@ -245,6 +245,7 @@ class GenerateReqInput(BaseReq):
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
+    prompt_render_finish_time: Optional[float] = None
 
     # For EPD-disaggregated inference
     need_wait_for_mm_inputs: Optional[bool] = None
@@ -697,6 +698,7 @@ class GenerateReqInput(BaseReq):
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
+            prompt_render_finish_time=self.prompt_render_finish_time,
             multi_item_delimiter_indices=(
                 self.multi_item_delimiter_indices[i]
                 if self.multi_item_delimiter_indices is not None
@@ -865,6 +867,7 @@ class EmbeddingReqInput(BaseReq):
     # Propagates trace context via Engine.encode/async_encode
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
+    prompt_render_finish_time: Optional[float] = None
 
     # The number of dimensions the resulting output embeddings should have. It is applicable for Matryoshka Embeddings.
     dimensions: Optional[int] = None
@@ -1011,6 +1014,7 @@ class EmbeddingReqInput(BaseReq):
                 dimensions=self.dimensions,
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
+                prompt_render_finish_time=self.prompt_render_finish_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 multi_item_delimiter_indices=(
                     self.multi_item_delimiter_indices[i]
