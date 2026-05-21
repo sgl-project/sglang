@@ -14,7 +14,7 @@ from sglang.srt.kv_canary.state import CanaryDeviceState
 
 logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_runner")
 
-_HEALTH_CHECK_EVERY_N_STEPS: int = 1000
+_HEALTH_CHECK_EVERY_N_STEPS: int = 100
 _HEALTH_CHECK_WARMUP_STEPS: int = 100
 _SWEEP_TAGS: frozenset[CanaryLaunchTag] = frozenset(
     (
