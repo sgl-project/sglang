@@ -2964,10 +2964,10 @@ class ServerArgs:
             self.triton_attention_num_kv_splits = 16
 
     def _handle_nccl_pre_warm(self):
-        # pre_warm_nccl is only used with CUDA or HIP hardware
-        if self.pre_warm_nccl and not (is_cuda() or is_hip()):
+        # pre_warm_nccl is only used with CUDA or HIP or Ascend hardware
+        if self.pre_warm_nccl and not (is_cuda() or is_hip() or is_npu()):
             logger.warning(
-                "pre_warm_nccl is only applicable for CUDA or HIP hardware. "
+                "pre_warm_nccl is only applicable for CUDA or HIP or Ascend hardware. "
                 "Ignoring pre_warm_nccl setting on current hardware."
             )
             self.pre_warm_nccl = False
@@ -6224,7 +6224,7 @@ class ServerArgs:
         parser.add_argument(
             "--pre-warm-nccl",
             action="store_true",
-            help="Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
+            help="Pre-warm NCCL/RCCL/HCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL) and Ascend/NPU (HCCL).",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
