@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import orjson
 import torch
 import torch.nn as nn
 import tqdm
@@ -59,6 +60,7 @@ from sglang.srt.models.deepseek_common.utils import (
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
 
 if _use_aiter_gfx95:
@@ -374,6 +376,10 @@ class DeepseekV2WeightLoaderMixin:
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
+        extra_config = orjson.loads(get_global_server_args().model_loader_extra_config)
+        if extra_config.get("load_tp_by_experts", False):
+            self._ep_to_tp_transform_all_layers()
+
     def _initialize_nextn_conf(self, is_nextn: bool) -> NextNConfig:
         """
         Initialize the nextn configuration.
@@ -651,6 +657,74 @@ class DeepseekV2WeightLoaderMixin:
             return False
 
         return weight_name_filter
+
+    def _ep_to_tp_transform_all_layers(self) -> None:
+        """After EP-style weight loading, transform all MoE layers to TP layout.
+
+        Processes one layer at a time to keep peak memory overhead to ~1/num_layers.
+        Reuses intermediate buffers across layers for parameters of the same shape.
+        """
+
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        buf_cache: dict[tuple[torch.Size, torch.dtype], torch.Tensor] = {}
+
+        if hasattr(self.model, "layers"):
+            layers = self.model.layers[self.model.start_layer : self.model.end_layer]
+        elif hasattr(self.model, "decoder"):
+            layers = [self.model.decoder]
+        else:
+            raise ValueError("Internal error: model has no layers or decoder attribute")
+
+        for layer in layers:
+            mlp = layer.mlp
+
+            # Find the FusedMoE module (either mlp itself or mlp.experts)
+            moe_layer = None
+            if isinstance(mlp, FusedMoE):
+                moe_layer = mlp
+            elif hasattr(mlp, "experts") and isinstance(mlp.experts, FusedMoE):
+                moe_layer = mlp.experts
+
+            if moe_layer is None or not getattr(moe_layer, "_ep_load_for_tp", False):
+                continue
+
+            tp_size = moe_layer._orig_moe_tp_size
+            num_shared = moe_layer.num_fused_shared_experts
+            num_routed_local = moe_layer.num_local_experts - num_shared
+            num_routed_total = moe_layer.num_experts - num_shared
+            target_num_experts = num_routed_total + num_shared
+
+            # Allocate or reuse buffers for each parameter
+            for name, param in moe_layer.named_parameters():
+                shard_dim = moe_layer._get_ep_to_tp_shard_dim(name)
+
+                if shard_dim is not None:
+                    # Compute target shape: expert dim expands, shard dim shrinks by tp_size
+                    target_shape = list(param.data.shape)
+                    target_shape[0] = target_num_experts
+                    target_shape[shard_dim] = target_shape[shard_dim] // tp_size
+                    target_shape = torch.Size(target_shape)
+                else:
+                    # Scales with no intermediate dim: expert dim expands, rest same
+                    target_shape = list(param.data.shape)
+                    target_shape[0] = target_num_experts
+                    target_shape = torch.Size(target_shape)
+
+                cache_key = (target_shape, param.data.dtype)
+                if cache_key not in buf_cache:
+                    buf_cache[cache_key] = torch.empty(
+                        target_shape, dtype=param.data.dtype, device=param.data.device
+                    )
+
+                param._ep_to_tp_buf = buf_cache[cache_key]
+
+            moe_layer.ep_to_tp_transform()
+
+        # Free cached buffers
+        buf_cache.clear()
+
+        logger.info("EP→TP weight transformation complete for all MoE layers.")
 
     def _maybe_quant_weights_to_fp8_ue8m0(
         self,

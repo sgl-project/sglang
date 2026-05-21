@@ -7,6 +7,7 @@ from enum import Enum
 from functools import cached_property
 from typing import List, Optional, Tuple
 
+import orjson
 import torch
 from torch.nn.parameter import UninitializedParameter
 
@@ -203,6 +204,22 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
+
+        # When flag is true, load weights as-if using EP instead, then redistribute
+        # via all_to_all after loading. This results in better disk IO patterns.
+        # Only applies to pure TP (ep_size==1); with real EP this is a no-op.
+        extra_config = orjson.loads(get_global_server_args().model_loader_extra_config)
+        self._ep_load_for_tp = (
+            extra_config.get("load_tp_by_experts", False) and self.moe_ep_size == 1
+        )
+        if self._ep_load_for_tp:
+            self._orig_moe_tp_size = self.moe_tp_size
+            self._orig_moe_tp_rank = self.moe_tp_rank
+            self._orig_intermediate_size_per_partition = intermediate_size // self.moe_tp_size
+            self.moe_ep_size = self.moe_tp_size
+            self.moe_ep_rank = self.moe_tp_rank
+            self.moe_tp_size = 1
+            self.moe_tp_rank = 0
 
         # DeepEP: each rank has its own shared expert slot, so total shared
         # weight slots = num_fused_shared_experts * ep_size.
@@ -596,6 +613,180 @@ class FusedMoE(torch.nn.Module):
             return expert_id - self._num_global_routed + self._num_local_routed
         else:
             return -1
+
+    def ep_to_tp_transform(self) -> None:
+        """Transform EP-loaded weights to TP layout via all_to_all.
+
+        After load_tp_by_experts loading, each rank holds a disjoint subset of
+        experts with full intermediate_size. This redistributes so every rank holds
+        all experts with sharded intermediate_size (normal TP layout).
+
+        The caller must provide a pre-allocated buffer ``_ep_to_tp_buf`` on each
+        parameter that needs transformation (sized for the all_to_all output).
+        Each buffer is cloned into the parameter and then deleted, so the same
+        buffer may be reused across layers — but not across parameters within a
+        single call (each parameter must have its own buffer for the duration).
+        """
+        if not self._ep_load_for_tp:
+            return
+
+        import torch.distributed as dist
+
+        tp_size = self._orig_moe_tp_size
+        tp_rank = self._orig_moe_tp_rank
+        tp_group = get_tp_group().device_group
+        num_shared = self.num_fused_shared_experts
+        num_routed_local = self.num_local_experts - num_shared
+
+        for name, param in self.named_parameters():
+            if not hasattr(param, "_ep_to_tp_buf"):
+                continue
+
+            # Params with _sglang_require_global_experts=True (e.g. NVFP4
+            # input_scale) already hold scales for ALL experts on every rank,
+            # so they need no redistribution — just drop the buffer.
+            if getattr(param, "_sglang_require_global_experts", False):
+                del param._ep_to_tp_buf
+                continue
+
+            assert "input_scale" not in name, (
+                f"input_scale param {name} reached ep_to_tp_transform without "
+                "_sglang_require_global_experts=True"
+            )
+
+            data = param.data  # [num_routed_local + shared, ...]
+
+            # Separate routed and shared portions
+            routed = data[:num_routed_local]  # [R, ...]
+            shared = data[num_routed_local:] if num_shared > 0 else None
+
+            # Determine which dim holds intermediate_size to split
+            shard_dim = self._get_ep_to_tp_shard_dim(name)
+
+            is_w13 = "w13" in name
+
+            if shard_dim is not None:
+                # For w13 params, the shard dim contains fused [gate | up].
+                # TP shards each half independently, so we must split into
+                # gate/up, chunk each by tp_size, then interleave:
+                #   rank i gets [gate_shard_i | up_shard_i]
+                if is_w13:
+                    half = routed.shape[shard_dim] // 2
+                    gate = routed.narrow(shard_dim, 0, half)
+                    up = routed.narrow(shard_dim, half, half)
+                    gate_chunks = gate.chunk(tp_size, dim=shard_dim)
+                    up_chunks = up.chunk(tp_size, dim=shard_dim)
+                    # chunks[i] = cat(gate_shard_i, up_shard_i) along shard_dim
+                    chunks = [
+                        torch.cat([g, u], dim=shard_dim)
+                        for g, u in zip(gate_chunks, up_chunks)
+                    ]
+                    del gate, up, gate_chunks, up_chunks
+                else:
+                    chunks = list(routed.chunk(tp_size, dim=shard_dim))
+
+                stacked = torch.stack(chunks, dim=0)  # [P, R, ...]
+                del chunks
+                new_shape = (tp_size * num_routed_local,) + stacked.shape[2:]
+                send_buf = stacked.reshape(new_shape).contiguous()
+                del stacked
+
+                # Free original param data before the collective
+                param.data = torch.empty(0, dtype=data.dtype, device=data.device)
+                del data, routed
+
+                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                dist.all_to_all_single(recv_buf, send_buf, group=tp_group)
+                del send_buf
+
+                if num_shared > 0:
+                    if is_w13:
+                        # Shared experts also have fused [gate | up] — shard each half
+                        shared_half = shared.shape[shard_dim] // 2
+                        shared_shard = shared_half // tp_size
+                        sg = shared.narrow(shard_dim, tp_rank * shared_shard, shared_shard)
+                        su = shared.narrow(shard_dim, shared_half + tp_rank * shared_shard, shared_shard)
+                        shared_sliced = torch.cat([sg, su], dim=shard_dim).contiguous()
+                        del sg, su
+                    else:
+                        shard_size = shared.shape[shard_dim] // tp_size
+                        shared_sliced = shared.narrow(shard_dim, tp_rank * shard_size, shard_size).contiguous()
+                    del shared
+                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared_sliced
+                    del shared_sliced
+            else:
+                # Expert-only dimension (scales with no intermediate dim to shard)
+                # Just all_gather along expert dim
+                routed_contig = routed.contiguous()
+
+                # Free original param data before the collective
+                param.data = torch.empty(0, dtype=data.dtype, device=data.device)
+                del data, routed
+
+                recv_buf = param._ep_to_tp_buf[:num_routed_local * tp_size]
+                dist.all_gather_into_tensor(recv_buf, routed_contig, group=tp_group)
+                del routed_contig
+
+                if num_shared > 0:
+                    param._ep_to_tp_buf[num_routed_local * tp_size:] = shared
+                    del shared
+
+            # Clone buffer into param so the buffer can be reused for the next layer
+            param.data = param._ep_to_tp_buf.clone()
+            del param._ep_to_tp_buf
+
+        # Restore TP/EP fields to normal TP values
+        self.moe_tp_size = self._orig_moe_tp_size
+        self.moe_tp_rank = self._orig_moe_tp_rank
+        self.moe_ep_size = 1
+        self.moe_ep_rank = 0
+        num_routed_total = self.num_experts - num_shared
+        self.num_local_experts = num_routed_total + num_shared
+        self.intermediate_size_per_partition = self._orig_intermediate_size_per_partition
+
+        # Update MoeRunnerConfig (mutable dataclass, referenced by runners)
+        self.moe_runner_config.num_local_experts = self.num_local_experts
+        self.moe_runner_config.intermediate_size_per_partition = self.intermediate_size_per_partition
+
+        # Mark transform as complete so forward() can verify
+        self._ep_load_for_tp = False
+
+    def _get_ep_to_tp_shard_dim(self, param_name: str) -> int | None:
+        """Return the dimension holding intermediate_size for a given parameter,
+        or None if the parameter has no intermediate dimension to shard (e.g. per-tensor scales).
+
+        Shape abbreviations used in comments below:
+            E  = num_local_experts (number of experts on this rank)
+            I  = moe_intermediate_size (expert FFN intermediate width)
+            H  = hidden_size (model hidden dimension)
+            bn = block rows, bk = block cols (quantization block sizes)
+        """
+        is_triton = self.use_triton_kernels
+
+        if "w13_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+            # w13_weight: non-triton [E, 2*I, H], triton [E, H, 2*I]
+            return 2 if is_triton else 1
+        elif "w2_weight" in param_name and "scale" not in param_name and "bias" not in param_name:
+            # w2_weight: non-triton [E, H, I], triton [E, I, H]
+            return 1 if is_triton else 2
+        elif "w13_weight_bias" in param_name:
+            return 1  # [E, 2*I]
+        elif "weight_scale_2" in param_name:
+            # Per-tensor scales: scalar per expert, no intermediate dim
+            return None
+        elif "w13_weight_scale" in param_name:
+            # Block scale: [E, 2*ceil(I/bn), ceil(H/bk)] — shard dim 1
+            # Also covers w13_weight_scale_inv, w13_weight_scale1
+            return 1
+        elif "w2_weight_scale" in param_name:
+            # Block scale: [E, ceil(H/bn), ceil(I/bk)] — shard dim 2
+            # Also covers w2_weight_scale_inv, w2_weight_scale1
+            return 2
+        elif "weight_scale" in param_name:
+            # Remaining per-tensor scales: [E, 2] or [E] — no intermediate dim, just gather
+            return None
+        else:
+            return None
 
     def weight_loader(
         self,
@@ -1058,6 +1249,11 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        if self._ep_load_for_tp:
+            raise RuntimeError(
+                "Internal error: forward() called while model is still in EP-load state. "
+                "ep_to_tp_transform() must be called after load_weights() before inference for TP."
+            )
         if is_in_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
