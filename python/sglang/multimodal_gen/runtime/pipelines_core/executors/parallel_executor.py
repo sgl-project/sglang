@@ -8,6 +8,7 @@ from sglang.multimodal_gen.runtime.distributed import get_sp_group
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_cfg_group,
     get_classifier_free_guidance_rank,
+    get_world_group,
     get_world_rank,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -65,6 +66,7 @@ class ParallelExecutor(PipelineExecutor):
         else:
             rank = get_world_rank()
         cfg_group = get_cfg_group()
+        group = get_world_group()
 
         self.begin_component_residency_request(stages, batch, server_args)
         try:
@@ -76,7 +78,9 @@ class ParallelExecutor(PipelineExecutor):
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
 
@@ -92,15 +96,37 @@ class ParallelExecutor(PipelineExecutor):
                     if rank != 0:
                         batch = broadcasted_list[0]
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
 
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
+                elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
+                    if rank == 0:
+                        # Only main rank executes, others just wait
+                        self.before_stage(stage, stage_index, batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
+                        self.after_stage(stage_index)
+                    torch.distributed.barrier()
+
+                    # Send batch to other ranks
+                    obj_list = [batch] if rank == 0 else []
+                    broadcasted_list = broadcast_pyobj(
+                        obj_list, rank=rank, dist_group=group.cpu_group, src=0
+                    )
+                    if rank != 0:
+                        batch = broadcasted_list[0]
+                    torch.distributed.barrier()
         finally:
             self.finish_component_residency_request()
         return batch

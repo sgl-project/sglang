@@ -110,14 +110,15 @@ backend.
 ## Validated ModelOpt Checkpoints
 
 This section is the canonical support matrix for the nine diffusion ModelOpt
-checkpoints currently wired up in SGLang docs and B200 CI coverage.
+checkpoints currently wired up in SGLang docs and validation coverage.
 
 Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Eight of the nine repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
-official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
+Six of the nine repos live under `lmsys/*`. The Wan2.2 entries use NVIDIA's
+official full Diffusers repos, and the FLUX.2 NVFP4 entry keeps the official
+`black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -158,10 +159,10 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
     <tr>
       <td><code>FP8</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
-      <td><code>--transformer-path</code></td>
-      <td><code>lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
-      <td>primary <code>transformer</code> quantized, <code>transformer_2</code> kept BF16</td>
-      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
+      <td><code>--model-path</code></td>
+      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-FP8</code></td>
+      <td>full Diffusers repo with ModelOpt FP8 Wan2.2 components</td>
+      <td>validated through direct <code>--model-path</code> loading</td>
     </tr>
     <tr>
       <td><code>FP8</code></td>
@@ -206,24 +207,25 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
     <tr>
       <td><code>NVFP4</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
-      <td><code>--transformer-path</code></td>
-      <td><code>lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
-      <td>primary <code>transformer</code> quantized with ModelOpt NVFP4, <code>transformer_2</code> kept BF16</td>
-      <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn</code></td>
+      <td><code>--model-path</code></td>
+      <td><code>nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4</code></td>
+      <td>full Diffusers repo with ModelOpt NVFP4 Wan2.2 components</td>
+      <td>current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm</code></td>
     </tr>
   </tbody>
 </table>
 
-These nine checkpoints are also the intended case set for the B200 diffusion CI
-job (`multimodal-gen-test-1-b200`).
+The FP8 rows run in the regular H100 1-GPU diffusion CI shard; the NVFP4 rows
+run in the B200 diffusion CI shard (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
 
 ### Usage Examples
 
-Converted ModelOpt FP8 checkpoints should be loaded as transformer component
-overrides. If the repo or local directory already contains `config.json`, use
-`--transformer-path`.
+Converted ModelOpt FP8 transformer repos should be loaded as transformer
+component overrides. If the repo or local directory already contains
+`config.json`, use `--transformer-path`. Full Diffusers repos such as the
+NVIDIA Wan2.2 FP8 checkpoint can be passed directly with `--model-path`.
 
 ```bash
 sglang generate \
@@ -235,8 +237,7 @@ sglang generate \
 
 ```bash
 sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-FP8 \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -323,14 +324,12 @@ sglang generate \
   --save-output
 ```
 
-For a dual-transformer Wan2.2 export where only the primary `transformer`
-was quantized:
+For Wan2.2 NVFP4:
 
 ```bash
-SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
+SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm \
 sglang generate \
-  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
+  --model-path nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4 \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -341,17 +340,16 @@ sglang generate \
   directories that already include `config.json`.
 - Use `--transformer-weights-path` for raw NVFP4 exports, individual
   safetensors files, or repo layouts that should be treated as weights first.
-- For dual-transformer pipelines such as `Wan2.2-T2V-A14B-Diffusers`, the
-  primary `--transformer-path` override targets only `transformer`. Use a
-  per-component override such as `--transformer-2-path` only when you
-  intentionally want a non-default `transformer_2`.
+- For legacy mixed Wan2.2 transformer overrides, the primary
+  `--transformer-path` override targets only `transformer`. Use a per-component
+  override such as `--transformer-2-path` only when you intentionally want a
+  non-default `transformer_2`.
 - On Blackwell, the validated Wan2.2 ModelOpt NVFP4 path currently prefers
   FlashInfer FP4 GEMM via
-  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn`.
-- This environment-variable override is a current workaround for NVFP4 cases
-  where the default sglang JIT/CUTLASS `sm100` path rejects a large-M shape at
-  `can_implement()`. The intended long-term fix is to add a validated CUTLASS
-  fallback for those shapes rather than rely on the override.
+  `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=trtllm`.
+- This environment-variable override selects the validated Wan2.2 NVFP4
+  full-repo path on Blackwell while the other NVFP4 CI cases continue to use
+  the generic `cudnn` backend.
 - Direct `--model-path` loading is a compatibility path for FLUX.2 NVFP4-style
   repos or local directories.
 - If `--transformer-weights-path` is provided explicitly, it takes precedence

@@ -20,14 +20,14 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.configs.model_config import (
-    get_nsa_index_head_dim,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    is_deepseek_dsa,
     is_deepseek_v4,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
-from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 
@@ -84,7 +84,7 @@ class MemoryPoolConfigurator:
 
 
 class DefaultPoolConfigurator(MemoryPoolConfigurator):
-    """Configurator for standard models: MHA, MLA, NSA, FP4.
+    """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
     bias = 0
@@ -149,15 +149,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * kv_size
                 )
 
-            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(model_config.hf_config):
-                index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
+            # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
+            if is_deepseek_dsa(model_config.hf_config):
+                index_head_dim = get_dsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                    + index_head_dim // DSATokenToKVPool.quant_block_size * 4
                 )
                 element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                    DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
@@ -319,7 +319,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
-        self.compression_ratios = cfg.compress_ratios
+        # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+        self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+        if mr.pp_size > 1:
+            logger.info(
+                f"DSV4 pool PP slice: rank={mr.pp_group.rank_in_group} "
+                f"layers=[{mr.start_layer},{mr.end_layer}) "
+                f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
+            )
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None

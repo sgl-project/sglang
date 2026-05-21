@@ -505,6 +505,18 @@ class ServerArgs(DisaggArgsMixin):
             and self._is_ltx23_two_stage_pipeline()
         )
 
+    def _uses_ltx23_high_memory_resident_two_stage_mode(self) -> bool:
+        if (
+            self.ltx2_two_stage_device_mode != "resident"
+            or not self._is_ltx23_two_stage_pipeline()
+            or not current_platform.is_cuda()
+        ):
+            return False
+        return (
+            current_platform.get_device_total_memory() / BYTES_PER_GB
+            >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
+        )
+
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
@@ -1201,6 +1213,7 @@ class ServerArgs(DisaggArgsMixin):
             help="The number of warmup steps to perform for each resolution.",
         )
 
+        # layerwise offload
         parser.add_argument(
             "--dit-cpu-offload",
             action=StoreBoolean,
@@ -1233,11 +1246,8 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.dit_offload_prefetch_size,
             help="The size of prefetch for dit-layerwise-offload. If the value is between 0.0 and 1.0, it is treated as a ratio of the total number of layers. If the value is >= 1, it is treated as the absolute number of layers. 0.0 means prefetch 1 layer (lowest memory). Values above 0.5 might have peak memory close to no offload but worse performance.",
         )
-        parser.add_argument(
-            "--use-fsdp-inference",
-            action=StoreBoolean,
-            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
-        )
+
+        # offload flags
         parser.add_argument(
             "--text-encoder-cpu-offload",
             action=StoreBoolean,
@@ -1252,6 +1262,12 @@ class ServerArgs(DisaggArgsMixin):
             "--vae-cpu-offload",
             action=StoreBoolean,
             help="Use CPU offload for VAE. Enable if run out of memory.",
+        )
+
+        parser.add_argument(
+            "--use-fsdp-inference",
+            action=StoreBoolean,
+            help="Use FSDP inference to shard DiT weights across GPUs. For single-GPU memory pressure, prefer CPU or layerwise offload.",
         )
         parser.add_argument(
             "--pin-cpu-memory",
@@ -1278,6 +1294,7 @@ class ServerArgs(DisaggArgsMixin):
             help="Disable autocast for denoising loop and vae decoding in pipeline sampling",
         )
 
+        # quantization
         parser.add_argument(
             "--quantization",
             type=str,
@@ -1287,8 +1304,9 @@ class ServerArgs(DisaggArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Applies to both pre-quantized checkpoints and online "
                 "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
-                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(

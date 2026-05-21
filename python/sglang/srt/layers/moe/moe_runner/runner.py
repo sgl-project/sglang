@@ -163,11 +163,9 @@ class MoeRunner:
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict
     ):
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = down_gemm_overlap_args
         self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
-        assert self.fused_func is None, "Fused func is not supported for overlap args"
         self.down_gemm_overlap_args = None
         self.meta_overlap_args = None

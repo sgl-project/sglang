@@ -124,6 +124,9 @@ class UnifiedLRUList:
         pt = self._pt
         node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
         node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
+        # Clear self pointers to break reference cycles among evicted nodes.
+        node.lru_prev[pt] = None
+        node.lru_next[pt] = None
 
     def insert_mru(self, node: UnifiedTreeNode):
         assert node.id not in self.cache
