@@ -1181,7 +1181,11 @@ def _fused_append_shared_experts_kernel(
 
 
 def fused_append_shared_experts(
-    topk_ids, topk_weights, num_fused_shared_experts, scale_factor, N=None
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_fused_shared_experts: int,
+    scale_factor: float,
+    N: int = None,
 ):
     assert N is not None, "N (shared expert base id) must be provided"
     m, k = topk_ids.shape
