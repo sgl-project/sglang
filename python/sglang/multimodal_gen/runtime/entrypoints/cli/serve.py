@@ -36,7 +36,6 @@ def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None =
     if not server_args.is_arg_explicitly_set("warmup"):
         server_args.warmup = True
         logger.info("Warmup is enabled by default for sglang serve.")
-    server_args.enable_request_warmup_text_cache = True
 
     dispatch_launch(server_args)
 

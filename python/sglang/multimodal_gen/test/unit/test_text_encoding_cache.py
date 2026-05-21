@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.stages import text_encoding
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -61,8 +60,8 @@ def make_forward_req(**kwargs):
 
 def make_server_args(**kwargs):
     defaults = {
+        "pipeline_class_name": "LTX2TwoStagePipeline",
         "pipeline_config": SimpleNamespace(text_encoder_configs=[]),
-        "enable_request_warmup_text_cache": False,
     }
     defaults.update(kwargs)
     return SimpleNamespace(
@@ -101,18 +100,6 @@ def test_negative_text_cache_skips_warmup():
     assert stage.calls == 2
 
 
-def test_negative_text_cache_reuses_serve_warmup():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args(enable_request_warmup_text_cache=True)
-
-    stage.get_or_compute_negative_text_embedding(
-        make_req(is_warmup=True), server_args, [0]
-    )
-    stage.get_or_compute_negative_text_embedding(make_req(), server_args, [0])
-
-    assert stage.calls == 1
-
-
 def test_cfg_text_batch_encodes_positive_and_negative_once():
     stage = DummyTextEncodingStage()
     server_args = make_server_args()
@@ -134,40 +121,6 @@ def test_cfg_text_batch_skips_dmd_pipeline():
         )
     )
 
-    stage.forward(make_forward_req(), server_args)
-
-    assert stage.calls == 2
-
-
-def test_text_outputs_cache_skips_matching_generate_warmup_request():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-
-    stage.forward(make_forward_req(is_warmup=True), server_args)
-    stage.forward(make_forward_req(), server_args)
-    assert stage.calls == 2
-
-
-def test_text_outputs_cache_reuses_matching_serve_warmup_request():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args(enable_request_warmup_text_cache=True)
-
-    with patch.object(text_encoding.logger, "info") as mock_log:
-        stage.forward(make_forward_req(is_warmup=True), server_args)
-        stage.forward(make_forward_req(), server_args)
-
-    assert stage.calls == 1
-    assert mock_log.call_count == 1
-
-    stage.forward(make_forward_req(prompt="different"), server_args)
-    assert stage.calls == 2
-
-
-def test_text_outputs_cache_does_not_store_real_requests():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args(enable_request_warmup_text_cache=True)
-
-    stage.forward(make_forward_req(), server_args)
     stage.forward(make_forward_req(), server_args)
 
     assert stage.calls == 2
