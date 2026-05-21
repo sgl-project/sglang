@@ -6,13 +6,13 @@ import os
 import unittest
 
 import torch
-from utils import mock_model_engine_kwargs
 
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.srt.model_executor.forward_batch_info import _stable_hash_rid_i64
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.mock_model_utils import mock_model_engine_kwargs
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
