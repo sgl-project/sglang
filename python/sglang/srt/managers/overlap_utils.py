@@ -146,7 +146,7 @@ class FutureMap:
     def stash(
         self,
         future_indices: FutureIndices,
-        payload: Union[torch.Tensor, "EagleDraftInput"],
+        payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
         """Store forward-only fields for the next forward batch to pick up."""
         indices = future_indices.indices
@@ -161,7 +161,7 @@ class FutureMap:
             self.token_ids_buf[indices] = payload.to(torch.int64)
             return
 
-        draft_input: "EagleDraftInput" = payload
+        draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
         self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
