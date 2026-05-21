@@ -8,8 +8,8 @@ use std::time::Instant;
 use clap::Parser;
 
 use preprocess::{
-    preprocess_batch, preprocess_image, preprocess_image_fused_into, preprocess_image_into,
-    QwenCfg,
+    preprocess_batch_into, preprocess_image, preprocess_image_fused_into,
+    preprocess_image_into, QwenCfg,
 };
 
 #[derive(Parser, Debug)]
@@ -144,15 +144,19 @@ fn main() -> anyhow::Result<()> {
     if args.batch {
         println!();
         println!("## Batch timing (rayon, {} iters)", args.batch_iters);
-        // Batch = all fixtures as a single batch
+        // Batch = all fixtures as a single batch.
+        // preprocess_batch_into: each image has a caller-owned Vec<f32> we reuse
+        // across iterations, so the "no allocation after warm-up" contract holds.
         let bytes_only: Vec<Vec<u8>> = images.iter().map(|(_, b)| b.clone()).collect();
+        let mut out_buffers: Vec<Vec<f32>> = (0..bytes_only.len()).map(|_| Vec::new()).collect();
+
         // warm
-        let _ = preprocess_batch(&bytes_only, &cfg);
+        let _ = preprocess_batch_into(&bytes_only, &cfg, &mut out_buffers);
 
         let mut total_ns: u64 = 0;
         for _ in 0..args.batch_iters {
             let start = Instant::now();
-            let results = preprocess_batch(&bytes_only, &cfg);
+            let results = preprocess_batch_into(&bytes_only, &cfg, &mut out_buffers);
             let dur = start.elapsed().as_nanos() as u64;
             total_ns += dur;
             for r in &results {

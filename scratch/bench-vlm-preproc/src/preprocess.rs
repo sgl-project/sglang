@@ -276,45 +276,51 @@ fn decode_jpeg_strip_ffi(
 
 // ---------- JPEG decode via libjpeg-turbo ----------
 
-fn decode_jpeg_scaled(
-    bytes: &[u8],
+/// Pick the smallest libjpeg-turbo scaling factor (out of M/8 for M=1..16) whose
+/// scaled output is still ≥ target dims. Returns the factor and (scaled_h, scaled_w).
+fn pick_scale_factor(
+    header_h: usize,
+    header_w: usize,
     target_h: u32,
     target_w: u32,
-    rgb_pool: &mut Vec<u8>,
-) -> Result<(u32, u32)> {
-    let mut decomp = turbojpeg::Decompressor::new().context("tjInit decompress")?;
-    let header = decomp
-        .read_header(bytes)
-        .context("turbojpeg read_header")?;
-
-    // libjpeg-turbo exposes 16 fractional scaling factors (M/8 for M=1..16).
-    // libjpeg-turbo returns them sorted **descending by ratio** (2/1, …, 1/8).
-    // We want the SMALLEST factor whose scaled output is still >= target — iterate
-    // in reverse and pick the first that satisfies.
+) -> (turbojpeg::ScalingFactor, usize, usize) {
+    // libjpeg-turbo returns factors sorted descending by ratio (2/1 … 1/8); iterate
+    // in reverse, take the smallest factor whose output still covers target.
     let factors = turbojpeg::Decompressor::supported_scaling_factors();
     let mut chosen = turbojpeg::ScalingFactor::new(1, 1);
     for sf in factors.into_iter().rev() {
         if sf.num() > sf.denom() {
-            continue; // skip upscaling (>1)
+            continue;
         }
-        let h = sf.scale(header.height);
-        let w = sf.scale(header.width);
+        let h = sf.scale(header_h);
+        let w = sf.scale(header_w);
         if h >= target_h as usize && w >= target_w as usize {
             chosen = sf;
             break;
         }
     }
+    (chosen, chosen.scale(header_h), chosen.scale(header_w))
+}
+
+/// Decode a JPEG into `rgb_pool` using the supplied decompressor and pre-parsed header.
+fn decode_jpeg_with_header(
+    decomp: &mut turbojpeg::Decompressor,
+    bytes: &[u8],
+    header: &turbojpeg::DecompressHeader,
+    target_h: u32,
+    target_w: u32,
+    rgb_pool: &mut Vec<u8>,
+) -> Result<(u32, u32)> {
+    let (chosen, scaled_h, scaled_w) =
+        pick_scale_factor(header.height, header.width, target_h, target_w);
     decomp
         .set_scaling_factor(chosen)
         .context("turbojpeg set_scaling_factor")?;
-    let scaled_h = chosen.scale(header.height);
-    let scaled_w = chosen.scale(header.width);
+
     let needed = scaled_h * scaled_w * 3;
     rgb_pool.clear();
     rgb_pool.resize(needed + NEON_TAIL_PAD, 0u8);
 
-    // Image view borrows the first `needed` bytes; NEON in patchify reads up to
-    // `needed + 6` bytes (vld3q_u8 of 48 bytes at last patch).
     let image = turbojpeg::Image {
         pixels: &mut rgb_pool[..needed],
         width: scaled_w,
@@ -325,8 +331,20 @@ fn decode_jpeg_scaled(
     decomp
         .decompress(bytes, image)
         .context("turbojpeg decompress")?;
-
     Ok((scaled_h as u32, scaled_w as u32))
+}
+
+/// Convenience: parse header + decode using the thread-local pooled decompressor.
+fn decode_jpeg_scaled(
+    bytes: &[u8],
+    target_h: u32,
+    target_w: u32,
+    rgb_pool: &mut Vec<u8>,
+) -> Result<(u32, u32)> {
+    with_decompressor(|decomp| {
+        let header = decomp.read_header(bytes).context("read_header")?;
+        decode_jpeg_with_header(decomp, bytes, &header, target_h, target_w, rgb_pool)
+    })?
 }
 
 /// Tail padding bytes appended to every RGB buffer so the NEON vld3q_u8 inner
@@ -398,8 +416,21 @@ fn decode_png(bytes: &[u8], rgb_pool: &mut Vec<u8>) -> Result<(u32, u32)> {
 thread_local! {
     static RGB_POOL:     RefCell<Vec<u8>>  = RefCell::new(Vec::with_capacity(1024 * 1024));
     static RESIZED_POOL: RefCell<Vec<u8>>  = RefCell::new(Vec::with_capacity(1024 * 1024));
-    static OUTPUT_POOL:  RefCell<Vec<f32>> = RefCell::new(Vec::with_capacity(1024 * 1024));
     static RESIZER:      RefCell<Resizer>  = RefCell::new(Resizer::new());
+    // Long-lived libjpeg-turbo decompressor; init is non-trivial (tj3Init + state
+    // setup). Reused across requests on the same thread. Created lazily.
+    static DECOMP: RefCell<Option<turbojpeg::Decompressor>> = RefCell::new(None);
+}
+
+/// Run `f` with a thread-local turbojpeg::Decompressor (lazily constructed).
+fn with_decompressor<R>(f: impl FnOnce(&mut turbojpeg::Decompressor) -> R) -> Result<R> {
+    DECOMP.with(|d| {
+        let mut slot = d.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(turbojpeg::Decompressor::new().context("tj3Init")?);
+        }
+        Ok(f(slot.as_mut().unwrap()))
+    })
 }
 
 /// Bilinear resize RGB8 in-place using a borrowed src and pool-backed dst.
@@ -500,21 +531,24 @@ fn patchify_static_image(rgb: &[u8], h: u32, w: u32, cfg: &QwenCfg, out: &mut [f
                     unsafe {
                         patch_row_neon_p14(
                             rgb, patch_y0, patch_x0, stride_y, scale, bias,
-                            out, r_base, g_base, b_base, p,
+                            out, r_base, g_base, b_base, p, pps, tp,
                         );
                     }
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+                    unsafe {
+                        patch_row_avx2_p14(
+                            rgb, patch_y0, patch_x0, stride_y, scale, bias,
+                            out, r_base, g_base, b_base, p, pps, tp,
+                        );
+                    }
+                    #[cfg(not(any(
+                        target_arch = "aarch64",
+                        all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"),
+                    )))]
                     patch_row_scalar(
                         rgb, patch_y0, patch_x0, stride_y, c, scale, bias,
-                        out, r_base, g_base, b_base, p,
+                        out, r_base, g_base, b_base, p, pps, tp,
                     );
-
-                    if tp == 2 {
-                        for ch_base in [r_base, g_base, b_base] {
-                            let (lo, hi) = out.split_at_mut(ch_base + pps);
-                            hi[..pps].copy_from_slice(&lo[ch_base..ch_base + pps]);
-                        }
-                    }
                 }
             }
         }
@@ -541,6 +575,8 @@ unsafe fn patch_row_neon_p14(
     g_base: usize,
     b_base: usize,
     p: usize,
+    pps: usize,
+    tp: usize,
 ) {
     use std::arch::aarch64::*;
     let s_r = vdupq_n_f32(scale[0]);
@@ -552,22 +588,19 @@ unsafe fn patch_row_neon_p14(
 
     let in_ptr = rgb.as_ptr();
     let out_ptr = out.as_mut_ptr();
+    let dup = tp == 2; // store to both tp slots while values are in registers
 
     for py in 0..p {
         let src_off = (patch_y0 + py) * stride_y + patch_x0 * 3;
-        // Load 16 RGB triples (48 bytes). We use 14.
         let rgb_v = vld3q_u8(in_ptr.add(src_off));
         let r16 = rgb_v.0;
         let g16 = rgb_v.1;
         let b16 = rgb_v.2;
 
-        // Macro-style: u8x16 -> two f32x4 batches (low 4 + next 4 = 8 lanes).
-        // We need 14 lanes, but vfmaq writes 4 at a time. Do 4+4+4+2.
         let row_r_off = r_base + py * p;
         let row_g_off = g_base + py * p;
         let row_b_off = b_base + py * p;
 
-        // helper to expand u8x16 lanes [a..a+4) to f32x4
         let expand = |v: uint8x16_t, lo: bool| -> (float32x4_t, float32x4_t) {
             let u16x8_v = if lo { vmovl_u8(vget_low_u8(v)) } else { vmovl_high_u8(v) };
             let lo4 = vcvtq_f32_u32(vmovl_u16(vget_low_u16(u16x8_v)));
@@ -575,14 +608,13 @@ unsafe fn patch_row_neon_p14(
             (lo4, hi4)
         };
 
-        let (r_a, r_b4) = expand(r16, true);  // lanes 0..4, 4..8
+        let (r_a, r_b4) = expand(r16, true);
         let (g_a, g_b4) = expand(g16, true);
         let (b_a, b_b4) = expand(b16, true);
-        let (r_c, r_d) = expand(r16, false);  // lanes 8..12, 12..16
+        let (r_c, r_d) = expand(r16, false);
         let (g_c, g_d) = expand(g16, false);
         let (b_c, b_d) = expand(b16, false);
 
-        // FMA
         let ra = vfmaq_f32(b_r, r_a, s_r);
         let rb = vfmaq_f32(b_r, r_b4, s_r);
         let rc = vfmaq_f32(b_r, r_c, s_r);
@@ -596,7 +628,9 @@ unsafe fn patch_row_neon_p14(
         let bc = vfmaq_f32(b_b, b_c, s_b);
         let bd = vfmaq_f32(b_b, b_d, s_b);
 
-        // store lanes 0..4, 4..8, 8..12 directly (12 lanes), then 2 scalar
+        // Store lanes 0..12 contiguously, then 2 lane-extract scalars (tail).
+        // For Tp=2, store the same vectors/lanes to the duplicate slot at +pps —
+        // values already in registers, no extra arithmetic, no memcpy pass.
         vst1q_f32(out_ptr.add(row_r_off), ra);
         vst1q_f32(out_ptr.add(row_r_off + 4), rb);
         vst1q_f32(out_ptr.add(row_r_off + 8), rc);
@@ -606,19 +640,146 @@ unsafe fn patch_row_neon_p14(
         vst1q_f32(out_ptr.add(row_b_off), ba);
         vst1q_f32(out_ptr.add(row_b_off + 4), bb);
         vst1q_f32(out_ptr.add(row_b_off + 8), bc);
-
-        // last 2 of P=14 from lanes 12, 13 of rd/gd/bd.
-        // Use lane-extracts.
         *out_ptr.add(row_r_off + 12) = vgetq_lane_f32(rd, 0);
         *out_ptr.add(row_r_off + 13) = vgetq_lane_f32(rd, 1);
         *out_ptr.add(row_g_off + 12) = vgetq_lane_f32(gd, 0);
         *out_ptr.add(row_g_off + 13) = vgetq_lane_f32(gd, 1);
         *out_ptr.add(row_b_off + 12) = vgetq_lane_f32(bd, 0);
         *out_ptr.add(row_b_off + 13) = vgetq_lane_f32(bd, 1);
+        if dup {
+            vst1q_f32(out_ptr.add(row_r_off + pps), ra);
+            vst1q_f32(out_ptr.add(row_r_off + pps + 4), rb);
+            vst1q_f32(out_ptr.add(row_r_off + pps + 8), rc);
+            vst1q_f32(out_ptr.add(row_g_off + pps), ga);
+            vst1q_f32(out_ptr.add(row_g_off + pps + 4), gb);
+            vst1q_f32(out_ptr.add(row_g_off + pps + 8), gc);
+            vst1q_f32(out_ptr.add(row_b_off + pps), ba);
+            vst1q_f32(out_ptr.add(row_b_off + pps + 4), bb);
+            vst1q_f32(out_ptr.add(row_b_off + pps + 8), bc);
+            *out_ptr.add(row_r_off + pps + 12) = vgetq_lane_f32(rd, 0);
+            *out_ptr.add(row_r_off + pps + 13) = vgetq_lane_f32(rd, 1);
+            *out_ptr.add(row_g_off + pps + 12) = vgetq_lane_f32(gd, 0);
+            *out_ptr.add(row_g_off + pps + 13) = vgetq_lane_f32(gd, 1);
+            *out_ptr.add(row_b_off + pps + 12) = vgetq_lane_f32(bd, 0);
+            *out_ptr.add(row_b_off + pps + 13) = vgetq_lane_f32(bd, 1);
+        }
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+/// AVX2/FMA path for x86_64. Mirrors the NEON kernel: process the 14-pixel
+/// row in one 8-lane FMA batch + one 4-lane batch + 2 scalar tail per channel.
+/// Direct dual-store for Tp=2.
+///
+/// Requires the source RGB buffer to have at least 48 bytes of tail padding so
+/// the 16-byte unaligned loads at the last patch don't fault.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"))]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn patch_row_avx2_p14(
+    rgb: &[u8],
+    patch_y0: usize,
+    patch_x0: usize,
+    stride_y: usize,
+    scale: [f32; 3],
+    bias: [f32; 3],
+    out: &mut [f32],
+    r_base: usize,
+    g_base: usize,
+    b_base: usize,
+    p: usize,
+    pps: usize,
+    tp: usize,
+) {
+    use std::arch::x86_64::*;
+    let s_r = _mm256_set1_ps(scale[0]);
+    let s_g = _mm256_set1_ps(scale[1]);
+    let s_b = _mm256_set1_ps(scale[2]);
+    let b_r = _mm256_set1_ps(bias[0]);
+    let b_g = _mm256_set1_ps(bias[1]);
+    let b_b = _mm256_set1_ps(bias[2]);
+    let s_r4 = _mm_set1_ps(scale[0]);
+    let s_g4 = _mm_set1_ps(scale[1]);
+    let s_b4 = _mm_set1_ps(scale[2]);
+    let b_r4 = _mm_set1_ps(bias[0]);
+    let b_g4 = _mm_set1_ps(bias[1]);
+    let b_b4 = _mm_set1_ps(bias[2]);
+
+    let in_ptr = rgb.as_ptr();
+    let out_ptr = out.as_mut_ptr();
+    let dup = tp == 2;
+
+    for py in 0..p {
+        let src_off = (patch_y0 + py) * stride_y + patch_x0 * 3;
+        let row_r_off = r_base + py * p;
+        let row_g_off = g_base + py * p;
+        let row_b_off = b_base + py * p;
+
+        // Gather 8 RGB triples via scalar loads into temp arrays (deinterleave).
+        // AVX2 doesn't have a vld3 equivalent; scalar gather + load is the
+        // standard pattern. 8 lanes = 24 bytes read.
+        let mut rbuf = [0f32; 16];
+        let mut gbuf = [0f32; 16];
+        let mut bbuf = [0f32; 16];
+        for i in 0..14usize {
+            let off = src_off + i * 3;
+            rbuf[i] = *in_ptr.add(off) as f32;
+            gbuf[i] = *in_ptr.add(off + 1) as f32;
+            bbuf[i] = *in_ptr.add(off + 2) as f32;
+        }
+
+        // 8-lane FMA for lanes [0..8)
+        let r0 = _mm256_loadu_ps(rbuf.as_ptr());
+        let g0 = _mm256_loadu_ps(gbuf.as_ptr());
+        let b0 = _mm256_loadu_ps(bbuf.as_ptr());
+        let r0o = _mm256_fmadd_ps(r0, s_r, b_r);
+        let g0o = _mm256_fmadd_ps(g0, s_g, b_g);
+        let b0o = _mm256_fmadd_ps(b0, s_b, b_b);
+        _mm256_storeu_ps(out_ptr.add(row_r_off), r0o);
+        _mm256_storeu_ps(out_ptr.add(row_g_off), g0o);
+        _mm256_storeu_ps(out_ptr.add(row_b_off), b0o);
+        if dup {
+            _mm256_storeu_ps(out_ptr.add(row_r_off + pps), r0o);
+            _mm256_storeu_ps(out_ptr.add(row_g_off + pps), g0o);
+            _mm256_storeu_ps(out_ptr.add(row_b_off + pps), b0o);
+        }
+
+        // 4-lane FMA for lanes [8..12)
+        let r1 = _mm_loadu_ps(rbuf.as_ptr().add(8));
+        let g1 = _mm_loadu_ps(gbuf.as_ptr().add(8));
+        let b1 = _mm_loadu_ps(bbuf.as_ptr().add(8));
+        let r1o = _mm_fmadd_ps(r1, s_r4, b_r4);
+        let g1o = _mm_fmadd_ps(g1, s_g4, b_g4);
+        let b1o = _mm_fmadd_ps(b1, s_b4, b_b4);
+        _mm_storeu_ps(out_ptr.add(row_r_off + 8), r1o);
+        _mm_storeu_ps(out_ptr.add(row_g_off + 8), g1o);
+        _mm_storeu_ps(out_ptr.add(row_b_off + 8), b1o);
+        if dup {
+            _mm_storeu_ps(out_ptr.add(row_r_off + pps + 8), r1o);
+            _mm_storeu_ps(out_ptr.add(row_g_off + pps + 8), g1o);
+            _mm_storeu_ps(out_ptr.add(row_b_off + pps + 8), b1o);
+        }
+
+        // Scalar tail: lanes 12, 13.
+        for px in 12..14usize {
+            let r_v = rbuf[px] * scale[0] + bias[0];
+            let g_v = gbuf[px] * scale[1] + bias[1];
+            let b_v = bbuf[px] * scale[2] + bias[2];
+            *out_ptr.add(row_r_off + px) = r_v;
+            *out_ptr.add(row_g_off + px) = g_v;
+            *out_ptr.add(row_b_off + px) = b_v;
+            if dup {
+                *out_ptr.add(row_r_off + pps + px) = r_v;
+                *out_ptr.add(row_g_off + pps + px) = g_v;
+                *out_ptr.add(row_b_off + pps + px) = b_v;
+            }
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2", target_feature = "fma"),
+)))]
 #[inline]
 fn patch_row_scalar(
     rgb: &[u8],
@@ -633,7 +794,10 @@ fn patch_row_scalar(
     g_base: usize,
     b_base: usize,
     p: usize,
+    pps: usize,
+    tp: usize,
 ) {
+    let dup = tp == 2;
     for py in 0..p {
         let src_off = (patch_y0 + py) * stride_y + patch_x0 * c;
         let r_row = r_base + py * p;
@@ -646,6 +810,11 @@ fn patch_row_scalar(
             out[r_row + px] = r;
             out[g_row + px] = g;
             out[b_row + px] = b;
+            if dup {
+                out[r_row + px + pps] = r;
+                out[g_row + px + pps] = g;
+                out[b_row + px + pps] = b;
+            }
         }
     }
 }
@@ -792,13 +961,13 @@ fn fused_resize_normalize_patch_band(
                             out[r_row_off + px] = r;
                             out[g_row_off + px] = g;
                             out[b_row_off + px] = bb;
-                        }
-                        if tp == 2 {
-                            for ch_off in [out_off, out_off + tp * pps, out_off + 2 * tp * pps] {
-                                let dst0 = ch_off + py * p;
-                                let dst1 = ch_off + py * p + pps;
-                                let (lo, hi) = out.split_at_mut(dst1);
-                                hi[..p].copy_from_slice(&lo[dst0..dst0 + p]);
+                            // Direct dual-store for Tp=2: write the same value to
+                            // both temporal slots while still in registers, instead
+                            // of memcpy after the row.
+                            if tp == 2 {
+                                out[r_row_off + px + pps] = r;
+                                out[g_row_off + px + pps] = g;
+                                out[b_row_off + px + pps] = bb;
                             }
                         }
                     }
@@ -808,69 +977,85 @@ fn fused_resize_normalize_patch_band(
     }
 }
 
-/// Single-image fused pipeline entry point. Uses rayon for sub-image
-/// parallelism over the merge-block-row dimension.
-pub fn preprocess_image_fused_into(
-    bytes: &[u8],
-    cfg: &QwenCfg,
-    out: &mut Vec<f32>,
-) -> Result<(PreprocessOut, PreprocessTimings)> {
-    use rayon::prelude::*;
-    let t0 = std::time::Instant::now();
+// ---------- top-level: pool-aware entry points ----------
 
-    let (decoded_h, decoded_w, target) = if is_jpeg(bytes) {
-        let header = turbojpeg::read_header(bytes).context("read_header")?;
-        let target = smart_resize(header.height as u32, header.width as u32, cfg.resize)?;
-        // RST-aware parallel decode if the JPEG has restart markers; else fall back
-        // to single-thread libjpeg-turbo. Both paths produce bit-identical pixels.
-        let use_parallel = has_rst_markers(bytes);
-        let n_strips = rayon::current_num_threads().min(4).max(2);
-        let (dh, dw) = RGB_POOL.with(|p| {
-            let mut pool = p.borrow_mut();
-            if use_parallel {
-                decode_jpeg_parallel_rst(bytes, target.h, target.w, &mut pool, n_strips)
-            } else {
-                decode_jpeg_scaled(bytes, target.h, target.w, &mut pool)
-            }
-        })?;
-        (dh, dw, target)
+/// Decode the image bytes into the thread-local RGB pool and decide the
+/// smart_resize target. JPEG header is parsed exactly once. Returns
+/// (decoded_h, decoded_w, target).
+fn decode_to_rgb_pool(bytes: &[u8], cfg: &QwenCfg) -> Result<(u32, u32, crate::smart_resize::Target)> {
+    if is_jpeg(bytes) {
+        let (target, dh, dw) = with_decompressor(|decomp| -> Result<_> {
+            let header = decomp.read_header(bytes).context("read_header")?;
+            let target = smart_resize(header.height as u32, header.width as u32, cfg.resize)?;
+
+            // RST-aware parallel decode if the JPEG has restart markers; else
+            // single-thread libjpeg-turbo. Both produce bit-identical pixels.
+            let use_parallel = has_rst_markers(bytes);
+            let n_strips = rayon::current_num_threads().min(4).max(2);
+            let (dh, dw) = RGB_POOL.with(|p| -> Result<_> {
+                let mut pool = p.borrow_mut();
+                if use_parallel {
+                    decode_jpeg_parallel_rst(bytes, target.h, target.w, &mut pool, n_strips)
+                } else {
+                    decode_jpeg_with_header(decomp, bytes, &header, target.h, target.w, &mut pool)
+                }
+            })?;
+            Ok((target, dh, dw))
+        })??;
+        Ok((dh, dw, target))
     } else if is_png(bytes) {
         let (h, w) = RGB_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             decode_png(bytes, &mut pool)
         })?;
         let target = smart_resize(h, w, cfg.resize)?;
-        (h, w, target)
+        Ok((h, w, target))
     } else {
-        anyhow::bail!("unsupported image format")
-    };
+        anyhow::bail!("unsupported image format (JPEG/PNG only in bench)")
+    }
+}
 
-    let t_decode = t0.elapsed().as_nanos() as u64;
-
-    let num_patches = target.num_patches(cfg.patch_size);
-    let patch_features = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-    let total = (num_patches * patch_features) as usize;
+/// SAFETY: caller must guarantee every element of `out[..total]` is written
+/// before any read. The fused kernel writes every (gh_block, gw_block, mh, mw,
+/// py, px) ∈ full grid range, and within each writes 3 channels × 2 tp slots ×
+/// p² locations = patch_features = total / num_patches, so the whole tensor is
+/// covered. This is the path that skips `Vec::resize`'s zero-fill.
+fn reserve_uninit_f32(out: &mut Vec<f32>, total: usize) {
     out.clear();
-    out.resize(total, 0.0f32);
+    if out.capacity() < total {
+        out.reserve_exact(total);
+    }
+    unsafe {
+        out.set_len(total);
+    }
+}
 
-    let t1 = std::time::Instant::now();
+/// Run the fused single-pass pipeline on a pre-decoded RGB buffer that's
+/// currently sitting in `RGB_POOL`. Splits the work across rayon workers along
+/// the merge-block-row dimension.
+fn run_fused_band(
+    decoded_h: u32,
+    decoded_w: u32,
+    target: crate::smart_resize::Target,
+    cfg: &QwenCfg,
+    out: &mut Vec<f32>,
+) {
     let p = cfg.patch_size as usize;
     let m = cfg.merge_size as usize;
     let grid_h_mblock = (target.h as usize) / (m * p);
 
-    // Split merge-block-rows into chunks for rayon. Aim ~2× chunks per worker so
-    // smaller images don't get pinned to one worker.
+    let num_patches = target.num_patches(cfg.patch_size) as usize;
+    let patch_features = (3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size) as usize;
+    let total = num_patches * patch_features;
+    reserve_uninit_f32(out, total);
+
     let workers = rayon::current_num_threads().max(1);
     let chunks = (workers * 2).min(grid_h_mblock).max(1);
     let chunk_size = grid_h_mblock.div_ceil(chunks);
 
-    // Pass raw pointer as usize to dodge Send/Sync issues; we re-cast inside each spawn.
-    // SAFETY: every chunk writes only the patches in its band; bands are disjoint by
-    // construction (gh_block ranges are non-overlapping).
     let out_addr = out.as_mut_ptr() as usize;
 
-    // Pull the decoded RGB out of the thread-local for the duration of the parallel
-    // section (RefCell::borrow() can't escape its closure). We put it back after.
+    // Pull RGB buffer out of TLS for the rayon section, put it back after.
     let rgb_buf: Vec<u8> = RGB_POOL.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let src_slice: &[u8] = &rgb_buf;
 
@@ -884,9 +1069,10 @@ pub fn preprocess_image_fused_into(
                 if yb_end <= yb_start {
                     return;
                 }
-                let out_band: &mut [f32] = unsafe {
-                    std::slice::from_raw_parts_mut(out_addr as *mut f32, total)
-                };
+                // SAFETY: each spawn writes only the patches whose gh_block lies in
+                // [yb_start, yb_end). Bands are disjoint by construction.
+                let out_band: &mut [f32] =
+                    unsafe { std::slice::from_raw_parts_mut(out_addr as *mut f32, total) };
                 fused_resize_normalize_patch_band(
                     src_slice,
                     decoded_h,
@@ -901,15 +1087,30 @@ pub fn preprocess_image_fused_into(
         }
     });
 
-    // Return buffer to the thread-local pool for reuse.
     RGB_POOL.with(|p| *p.borrow_mut() = rgb_buf);
+}
+
+/// Single-image fused pipeline. Caller owns `out` (pool-friendly contract:
+/// stash it in a thread-local or CUDA-IPC pool and reuse across requests).
+pub fn preprocess_image_fused_into(
+    bytes: &[u8],
+    cfg: &QwenCfg,
+    out: &mut Vec<f32>,
+) -> Result<(PreprocessOut, PreprocessTimings)> {
+    let t0 = std::time::Instant::now();
+    let (decoded_h, decoded_w, target) = decode_to_rgb_pool(bytes, cfg)?;
+    let t_decode = t0.elapsed().as_nanos() as u64;
+
+    let t1 = std::time::Instant::now();
+    run_fused_band(decoded_h, decoded_w, target, cfg, out);
     let t_fused = t1.elapsed().as_nanos() as u64;
 
-    let grid_thw = [1, target.grid_h(cfg.patch_size), target.grid_w(cfg.patch_size)];
+    let num_patches = target.num_patches(cfg.patch_size);
+    let patch_features = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
     let info = PreprocessOut {
         num_patches,
         patch_features,
-        grid_thw,
+        grid_thw: [1, target.grid_h(cfg.patch_size), target.grid_w(cfg.patch_size)],
     };
     let timings = PreprocessTimings {
         decode_ns: t_decode,
@@ -925,45 +1126,26 @@ pub fn preprocess_image_fused_into(
     Ok((info, timings))
 }
 
-
-// ---------- top-level: pool-aware entry points ----------
-
-/// Preprocess into a caller-owned `out` Vec<f32> (which is grown / resized as needed).
-/// This is the pool-friendly variant: caller can stash `out` in a thread-local /
-/// CUDA-IPC buffer pool and reuse across requests.
+/// Default entry point — points at the fused pipeline.
 pub fn preprocess_image_into(
     bytes: &[u8],
     cfg: &QwenCfg,
     out: &mut Vec<f32>,
 ) -> Result<(PreprocessOut, PreprocessTimings)> {
+    preprocess_image_fused_into(bytes, cfg, out)
+}
+
+/// Comparison variant: separate fir resize → NEON patchify. The v3 pipeline,
+/// kept around so the bench can A/B vs the fused default.
+pub fn preprocess_image_resize_then_patch_into(
+    bytes: &[u8],
+    cfg: &QwenCfg,
+    out: &mut Vec<f32>,
+) -> Result<(PreprocessOut, PreprocessTimings)> {
     let t0 = std::time::Instant::now();
-
-    let (decoded_h, decoded_w, target) = if is_jpeg(bytes) {
-        // Need full dims for smart_resize; turbojpeg.read_header avoids decoding.
-        // We do header + decode in one call below by passing target to decode_jpeg_scaled,
-        // but it itself calls read_header internally.
-        // To keep smart_resize before turbojpeg's decode, re-read header here.
-        let header = turbojpeg::read_header(bytes).context("read_header")?;
-        let target = smart_resize(header.height as u32, header.width as u32, cfg.resize)?;
-        let (dh, dw) = RGB_POOL.with(|p| {
-            let mut pool = p.borrow_mut();
-            decode_jpeg_scaled(bytes, target.h, target.w, &mut pool)
-        })?;
-        (dh, dw, target)
-    } else if is_png(bytes) {
-        let (h, w) = RGB_POOL.with(|p| {
-            let mut pool = p.borrow_mut();
-            decode_png(bytes, &mut pool)
-        })?;
-        let target = smart_resize(h, w, cfg.resize)?;
-        (h, w, target)
-    } else {
-        anyhow::bail!("unsupported image format (JPEG/PNG only in bench)")
-    };
-
+    let (decoded_h, decoded_w, target) = decode_to_rgb_pool(bytes, cfg)?;
     let t_decode = t0.elapsed().as_nanos() as u64;
 
-    // Resize from RGB_POOL → RESIZED_POOL (zero-copy borrow on the src side).
     let t1 = std::time::Instant::now();
     let resize_res: Result<()> = RGB_POOL.with(|src_p| {
         RESIZED_POOL.with(|dst_p| {
@@ -982,14 +1164,12 @@ pub fn preprocess_image_into(
     resize_res?;
     let t_resize = t1.elapsed().as_nanos() as u64;
 
-    // Patchify into caller's output buffer.
     let t2 = std::time::Instant::now();
     let num_patches = target.num_patches(cfg.patch_size);
     let patch_features = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
     let total = (num_patches * patch_features) as usize;
-    out.clear();
-    out.resize(total, 0.0f32);
-
+    // SAFETY: patchify_static_image writes every element (see the reserve_uninit_f32 contract).
+    reserve_uninit_f32(out, total);
     RESIZED_POOL.with(|p| {
         let pool = p.borrow();
         patchify_static_image(&pool, target.h, target.w, cfg, out);
@@ -997,11 +1177,7 @@ pub fn preprocess_image_into(
     let t_normpack = t2.elapsed().as_nanos() as u64;
 
     let grid_thw = [1, target.grid_h(cfg.patch_size), target.grid_w(cfg.patch_size)];
-    let info = PreprocessOut {
-        num_patches,
-        patch_features,
-        grid_thw,
-    };
+    let info = PreprocessOut { num_patches, patch_features, grid_thw };
     let timings = PreprocessTimings {
         decode_ns: t_decode,
         resize_ns: t_resize,
@@ -1016,7 +1192,7 @@ pub fn preprocess_image_into(
     Ok((info, timings))
 }
 
-/// Allocating wrapper around `preprocess_image_into`.
+/// Allocating wrapper.
 pub fn preprocess_image(
     bytes: &[u8],
     cfg: &QwenCfg,
@@ -1026,7 +1202,25 @@ pub fn preprocess_image(
     Ok((out, info, t))
 }
 
-/// Parallel batch via rayon. Each worker thread reuses its own pool.
+/// Pool-friendly batch entry point: caller provides one `Vec<f32>` per image
+/// that gets reused across calls. Internally we map over rayon, so each worker
+/// thread reuses its own thread-local RGB / decompressor pools too — the
+/// design's "no allocation after warm-up" goal applies to the whole batch path.
+pub fn preprocess_batch_into(
+    images: &[Vec<u8>],
+    cfg: &QwenCfg,
+    outs: &mut [Vec<f32>],
+) -> Vec<Result<(PreprocessOut, PreprocessTimings)>> {
+    use rayon::prelude::*;
+    assert_eq!(images.len(), outs.len(), "outs slice must match images length");
+    images
+        .par_iter()
+        .zip(outs.par_iter_mut())
+        .map(|(b, o)| preprocess_image_into(b, cfg, o))
+        .collect()
+}
+
+/// Allocating batch (legacy convenience).
 pub fn preprocess_batch(
     images: &[Vec<u8>],
     cfg: &QwenCfg,
@@ -1036,4 +1230,19 @@ pub fn preprocess_batch(
         .par_iter()
         .map(|b| preprocess_image(b, cfg))
         .collect()
+}
+
+/// Initialize a bounded rayon thread pool for preprocessing — call once at
+/// startup if you don't want rayon's global default (= number of logical cores)
+/// to compete with the model server's other thread pools.
+///
+/// Calling more than once or after the global pool has already been used is a
+/// no-op and returns Ok(()). For per-request bounded execution, prefer
+/// `rayon::ThreadPoolBuilder::build_scoped` at the call site.
+pub fn init_thread_pool(n_threads: usize) -> Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .thread_name(|i| format!("vlm-preproc-{i}"))
+        .build_global()
+        .map_err(|e| anyhow::anyhow!("rayon thread pool init: {e}"))
 }
