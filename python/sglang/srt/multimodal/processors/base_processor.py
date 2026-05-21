@@ -436,7 +436,8 @@ class BaseMultimodalProcessor(ABC):
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                kwargs["device"] = "cuda"
+                base_gpu_id = get_global_server_args().base_gpu_id
+                kwargs["device"] = f"cuda:{base_gpu_id}"
             elif processor.__class__.__name__ not in {
                 "Glm4vProcessor",
             }:
