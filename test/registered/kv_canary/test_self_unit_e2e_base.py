@@ -149,6 +149,38 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                     max_retries=2,
                 )
 
+    def test_assert_swa_divergence_observed_catches_identity_mapping(self) -> None:
+        identity_only_line = (
+            "kv_canary swa_divergence: forward_ct=200 verify_full=10000 "
+            "verify_swa=2000 mapping_nonidentity=0 swa_pool_wrap=64"
+        )
+        harness, patcher = self._make_harness(identity_only_line + "\n")
+        with patcher:
+            with self.assertRaisesRegex(AssertionError, "mapping_nonidentity=0"):
+                harness.assert_swa_divergence_observed(
+                    min_mapping_nonidentity=1,
+                    min_pool_wrap=1,
+                    require_verify_lag=True,
+                    flush_wait_seconds=0.0,
+                    max_retries=1,
+                )
+
+    def test_assert_swa_divergence_observed_catches_no_pool_wrap(self) -> None:
+        no_wrap_line = (
+            "kv_canary swa_divergence: forward_ct=200 verify_full=10000 "
+            "verify_swa=2000 mapping_nonidentity=512 swa_pool_wrap=0"
+        )
+        harness, patcher = self._make_harness(no_wrap_line + "\n")
+        with patcher:
+            with self.assertRaisesRegex(AssertionError, "swa_pool_wrap=0"):
+                harness.assert_swa_divergence_observed(
+                    min_mapping_nonidentity=1,
+                    min_pool_wrap=1,
+                    require_verify_lag=True,
+                    flush_wait_seconds=0.0,
+                    max_retries=1,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
