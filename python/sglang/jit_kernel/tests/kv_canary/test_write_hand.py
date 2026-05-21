@@ -7,7 +7,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts, write as write_module
+from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary import write as write_module
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
