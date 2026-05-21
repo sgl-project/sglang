@@ -20,12 +20,16 @@ class TestFutureTensor(CustomTestCase):
         self.assertNotEqual(alt_stream.stream_id, default_stream.stream_id)
 
         src_first = torch.tensor([41], dtype=torch.int32, device=device)
-        future_first = FutureTensor.device_to_host(src_device=src_first, stream=alt_stream)
+        future_first = FutureTensor.device_to_host(
+            src_device=src_first, stream=alt_stream
+        )
         result_first = future_first.wait()
         self.assertEqual(int(result_first.item()), 41)
 
         src_second = torch.tensor([97], dtype=torch.int32, device=device)
-        future_second = FutureTensor.device_to_host(src_device=src_second, stream=alt_stream)
+        future_second = FutureTensor.device_to_host(
+            src_device=src_second, stream=alt_stream
+        )
         result_second = future_second.wait()
         self.assertEqual(int(result_second.item()), 97)
 
