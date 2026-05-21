@@ -72,10 +72,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         else:
             self.ssm_state_indices = cache_indices
 
-    def init_forward_metadata(self, forward_batch: ForwardBatch):
+    def init_forward_data(self, forward_batch: ForwardBatch) -> None:
         if forward_batch.forward_mode.is_draft_extend(True):
             return
-        super().init_forward_metadata(forward_batch)
+        super().init_forward_data(forward_batch)
         self.prepare_gdn_inputs(
             forward_batch.batch_size,
             forward_batch.forward_mode,
@@ -83,54 +83,25 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         )
         self.graph_mode = False
 
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        if forward_mode.is_draft_extend(True):
-            return
-        super().init_forward_metadata_capture_cuda_graph(
-            bs,
-            num_tokens,
-            req_pool_indices,
-            seq_lens,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-        )
-        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
-        self.graph_mode = True
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Capture + replay path -- merged from old capture/replay variants.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if forward_mode.is_draft_extend(True):
+        The pre-init hook (``self.prepare_gdn_inputs`` + ``self.graph_mode = True``)
+        is identical for both old variants, and the underlying
+        ``super().init_forward_metadata_{capture,replay}_cuda_graph`` bodies
+        are merged in the parent's ``init_forward_data_out_graph``. Capture
+        and replay therefore run the same body each iteration; per the
+        initial-stage choice, ``init_forward_data_in_graph`` is left as a
+        no-op.
+        """
+        if forward_batch.forward_mode.is_draft_extend(True):
             return
-        super().init_forward_metadata_replay_cuda_graph(
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
+        super().init_forward_data_out_graph(forward_batch)
+        self.prepare_gdn_inputs(
+            forward_batch.batch_size,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
         )
-        self.prepare_gdn_inputs(bs, forward_mode, spec_info)
         self.graph_mode = True
 
     def forward_decode(
