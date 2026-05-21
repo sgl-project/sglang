@@ -246,8 +246,21 @@ class ViTCudaGraphRunner:
 
     def capture_all(self) -> None:
         """Eagerly capture graphs for all bucket sizes. Called at model init."""
+        import logging
+
+        logger = logging.getLogger(__name__)
+        mem_before = torch.cuda.memory_allocated(self.device) / 1024**2
         for B in self.BUCKET_SIZES:
             self._capture(B)
+        mem_after = torch.cuda.memory_allocated(self.device) / 1024**2
+        mem_reserved = torch.cuda.memory_reserved(self.device) / 1024**2
+        logger.info(
+            "[VIT_GRAPH] capture_all done: mem_alloc %.0fMB -> %.0fMB (delta=%.0fMB), reserved=%.0fMB",
+            mem_before,
+            mem_after,
+            mem_after - mem_before,
+            mem_reserved,
+        )
 
     # ------------------------------------------------------------------
     # Replay
