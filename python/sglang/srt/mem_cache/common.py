@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
@@ -25,6 +26,126 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_cache_stat(tree_cache: BasePrefixCache | None, stat_name: str):
+    if tree_cache is None:
+        return None
+    stat_fn = getattr(tree_cache, stat_name, None)
+    if stat_fn is None:
+        return None
+    try:
+        return stat_fn()
+    except Exception as e:
+        return f"<{type(e).__name__}: {e}>"
+
+
+def _short_repr(value, limit: int = 256) -> str:
+    text = repr(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def _safe_call(obj, method_name: str):
+    fn = getattr(obj, method_name, None)
+    if fn is None:
+        return None
+    try:
+        return fn()
+    except Exception as e:
+        return f"<{type(e).__name__}: {e}>"
+
+
+def _safe_sub(*values):
+    if values and all(
+        isinstance(v, (int, float, np.integer, np.floating)) for v in values
+    ):
+        return int(values[0] - sum(values[1:]))
+    return None
+
+
+def _tensor_sum_int(value):
+    try:
+        return int(value.sum().item())
+    except Exception:
+        return None
+
+
+def _kv_pressure_snapshot(tree_cache: BasePrefixCache | None) -> dict[str, object]:
+    if tree_cache is None:
+        return {}
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    total_size = _safe_call(tree_cache, "total_size")
+    if isinstance(total_size, tuple) and len(total_size) == 2:
+        full_tree_total, swa_tree_total = total_size
+    else:
+        full_tree_total, swa_tree_total = total_size, None
+
+    fields: dict[str, object] = {
+        "allocator": type(allocator).__name__,
+        "tree_total": total_size,
+        "full_tree_evictable": _safe_cache_stat(tree_cache, "full_evictable_size"),
+        "swa_tree_evictable": _safe_cache_stat(tree_cache, "swa_evictable_size"),
+        "full_tree_protected": _safe_cache_stat(tree_cache, "full_protected_size"),
+        "swa_tree_protected": _safe_cache_stat(tree_cache, "swa_protected_size"),
+    }
+
+    if isinstance(allocator, SWATokenToKVPoolAllocator):
+        full_capacity = getattr(allocator, "size_full", None)
+        full_capacity = full_capacity() if callable(full_capacity) else full_capacity
+        swa_capacity = getattr(allocator, "size_swa", None)
+        swa_capacity = swa_capacity() if callable(swa_capacity) else swa_capacity
+        full_available = _safe_call(allocator, "full_available_size")
+        swa_available = _safe_call(allocator, "swa_available_size")
+
+        fields.update(
+            {
+                "full_capacity": full_capacity,
+                "full_available": full_available,
+                "full_used": _safe_sub(full_capacity, full_available),
+                "full_tree_total": full_tree_total,
+                "full_non_tree_live": _safe_sub(
+                    full_capacity, full_available, full_tree_total
+                ),
+                "swa_capacity": swa_capacity,
+                "swa_available": swa_available,
+                "swa_used": _safe_sub(swa_capacity, swa_available),
+                "swa_tree_total": swa_tree_total,
+                "swa_non_tree_live": _safe_sub(
+                    swa_capacity, swa_available, swa_tree_total
+                ),
+            }
+        )
+    else:
+        capacity = getattr(allocator, "size", None)
+        capacity = capacity() if callable(capacity) else capacity
+        available = _safe_call(allocator, "available_size")
+        fields.update(
+            {
+                "capacity": capacity,
+                "available": available,
+                "used": _safe_sub(capacity, available),
+                "non_tree_live": _safe_sub(capacity, available, full_tree_total),
+            }
+        )
+
+    return fields
+
+
+def _log_kv_alloc_debug(
+    event: str,
+    tree_cache: BasePrefixCache | None,
+    **fields,
+) -> None:
+    if not envs.SGLANG_DEBUG_MEMORY_POOL.get():
+        return
+    merged = {"event": event, **fields, **_kv_pressure_snapshot(tree_cache)}
+    logger.info(
+        "KV_ALLOC_DEBUG %s",
+        " ".join(f"{key}={_short_repr(value)}" for key, value in merged.items()),
+    )
 
 
 def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
@@ -366,7 +487,25 @@ def alloc_paged_token_slots_extend(
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
+    _log_kv_alloc_debug(
+        "extend_before_evict",
+        tree_cache,
+        extend_num_tokens=extend_num_tokens,
+        padded_num_tokens=num_tokens,
+        batch_size=len(seq_lens_cpu),
+        page_size=allocator.page_size,
+        prefix_tokens=_tensor_sum_int(prefix_lens_cpu),
+        seq_tokens=_tensor_sum_int(seq_lens_cpu),
+    )
     evict_from_tree_cache(tree_cache, num_tokens)
+    _log_kv_alloc_debug(
+        "extend_after_evict",
+        tree_cache,
+        extend_num_tokens=extend_num_tokens,
+        padded_num_tokens=num_tokens,
+        batch_size=len(seq_lens_cpu),
+        page_size=allocator.page_size,
+    )
 
     state = None
     if backup_state:
@@ -382,6 +521,14 @@ def alloc_paged_token_slots_extend(
     )
 
     if out_cache_loc is None:
+        _log_kv_alloc_debug(
+            "extend_oom",
+            tree_cache,
+            extend_num_tokens=extend_num_tokens,
+            padded_num_tokens=num_tokens,
+            batch_size=len(seq_lens_cpu),
+            page_size=allocator.page_size,
+        )
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"
             f"Try to allocate {extend_num_tokens} tokens.\n"
@@ -392,6 +539,14 @@ def alloc_paged_token_slots_extend(
             tree_cache.pretty_print()
         raise RuntimeError(error_msg)
 
+    _log_kv_alloc_debug(
+        "extend_after_alloc",
+        tree_cache,
+        extend_num_tokens=extend_num_tokens,
+        padded_num_tokens=num_tokens,
+        batch_size=len(seq_lens_cpu),
+        page_size=allocator.page_size,
+    )
     return (out_cache_loc, state) if backup_state else out_cache_loc
 
 
@@ -439,6 +594,14 @@ def alloc_for_extend(
     """
     # free out-of-window swa tokens
     batch.maybe_evict_swa()
+    _log_kv_alloc_debug(
+        "alloc_for_extend_batch",
+        batch.tree_cache,
+        batch_size=len(batch.reqs),
+        extend_num_tokens=batch.extend_num_tokens,
+        prefix_tokens=sum(batch.prefix_lens),
+        seq_tokens=_tensor_sum_int(batch.seq_lens_cpu),
+    )
 
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 

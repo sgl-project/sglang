@@ -18,10 +18,19 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+class _SWAAllocatorStub(SimpleNamespace):
+    def _set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        SWATokenToKVPoolAllocator._set_full_to_swa_mapping(
+            self, full_indices, swa_indices
+        )
+
+
 def _make_self(*, page_size: int, full_available: int, swa_available: int):
     full_indices = torch.tensor([10, 11], dtype=torch.int64)
     swa_indices = torch.tensor([20, 21], dtype=torch.int64)
-    return SimpleNamespace(
+    return _SWAAllocatorStub(
         page_size=page_size,
         full_attn_allocator=SimpleNamespace(
             available_size=lambda: full_available,
@@ -34,6 +43,7 @@ def _make_self(*, page_size: int, full_available: int, swa_available: int):
         translate_loc_from_full_to_swa=lambda last_loc: last_loc,
         full_to_swa_index_mapping=torch.zeros(64, dtype=torch.int64),
         _kvcache=SimpleNamespace(invalidate_loc_cache=lambda: None),
+        swa_to_full_index_mapping=torch.zeros(64, dtype=torch.int64),
     )
 
 
