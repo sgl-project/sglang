@@ -258,10 +258,10 @@ class ViTCudaGraphRunner:
             self._capture(B)
         logger.info("[VIT_GRAPH] capture done, warming up eager fallback")
 
-        # Warm up the eager fallback path through @torch._dynamo.disable.
-        # The first eager call after graph capture incurs a one-time stall
-        # (~3 s) from CUDA lazy initialization.  Absorb that cost here.
+        import time as _time
+
         B = self.BUCKET_SIZES[-1]
+        t0 = _time.monotonic()
         self._eager_fallback(
             self.input_bufs[B],
             self.forward_metadatas[B],
@@ -269,7 +269,10 @@ class ViTCudaGraphRunner:
             self.rotary_sin_bufs[B],
         )
         torch.get_device_module(self.device).synchronize()
-        logger.info("[VIT_GRAPH] capture_all done")
+        t1 = _time.monotonic()
+        logger.info(
+            "[VIT_GRAPH] eager warmup took %.1fms (tokens=%d)", (t1 - t0) * 1000, B
+        )
 
     # ------------------------------------------------------------------
     # Replay
