@@ -157,22 +157,8 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
         """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers
         untouched."""
         device = DEFAULT_DEVICE
-        source = RealKvSource(
-            tensor=torch.zeros(4, 16, dtype=torch.uint8, device=device),
-            page_size=1,
-            num_bytes_per_token=16,
-            read_bytes=16,
-        )
-        group = CanaryBufferGroup(
-            kind=PoolKind.FULL,
-            k_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-            k_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-            v_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-            v_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-            real_kv_sources_k=(source,),
-            real_kv_sources_v=(source,),
-            swa_index_lut=None,
-        )
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
         config = PerturbConfig(
             req_to_token_prob=0.0,
             real_kv_used_prob=0.0,
