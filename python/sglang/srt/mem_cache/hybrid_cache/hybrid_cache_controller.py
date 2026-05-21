@@ -124,7 +124,7 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
         self._lock = threading.Lock()
-        self._terminated_flag = False
+        self._ask_to_terminate_flag = False
         self.start_time = time.monotonic()
         super().__init__(
             host_indices,
@@ -134,19 +134,13 @@ class PrefetchOperation(StorageOperation):
             pool_transfers=pool_transfers,
         )
 
-    def increment(self, num_tokens: int):
+    def ask_to_terminate(self):
         with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
+            self._ask_to_terminate_flag = True
 
-    def mark_terminate(self):
+    def is_asked_to_terminate(self) -> bool:
         with self._lock:
-            self._terminated_flag = True
-
-    def is_terminated(self) -> bool:
-        return self._terminated_flag
+            return self._ask_to_terminate_flag
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -159,6 +153,7 @@ class HybridCacheController(BaseHiCacheController):
         load_cache_event: threading.Event,
         attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
         attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
@@ -179,6 +174,7 @@ class HybridCacheController(BaseHiCacheController):
             load_cache_event=load_cache_event,
             attn_cp_group=attn_cp_group,
             attn_tp_group=attn_tp_group,
+            pp_group=pp_group,
             write_policy=write_policy,
             io_backend=io_backend,
             storage_backend=None,
@@ -488,7 +484,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def _page_transfer(self, operation):
         # Transfer extra pools
-        if operation.pool_transfers and not operation.is_terminated():
+        if operation.pool_transfers and not operation.is_asked_to_terminate():
             self._resolve_sidecar_derived_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
