@@ -32,7 +32,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
         try:
             self.send_parallel_requests(
                 n=4,
-                assert_all_successs=False,
+                assert_all_success=False,
                 timeout=30.0,
             )
         except Exception:
