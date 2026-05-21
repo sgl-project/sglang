@@ -1262,7 +1262,7 @@ class SchedulerOutputProcessorMixin:
 
         # Send to detokenizer
         if reqs or is_idle_batch:
-            if self.model_config.is_multimodal_gen:
+            if getattr(self.model_config, "is_multimodal_gen", False):
                 return
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
