@@ -67,9 +67,7 @@ class _WriteSingleSlotInput:
 
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
@@ -95,9 +93,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
 
 def test_seed_slot_idx_negative_uses_anchor() -> None:
     """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(consts.CANARY_CHAIN_ANCHOR)``."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
@@ -126,9 +122,7 @@ def test_seed_slot_idx_negative_uses_anchor() -> None:
 
 def test_seed_slot_idx_loads_predecessor() -> None:
     """``seed_slot_idx >= 0`` → load 4 fields from ``canary_buf[seed]`` and splitmix64-advance into prev_hash."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
 
     # Step: pre-stamp slot 7 with a known chain link.
     seed_token, seed_position = 100, 4
@@ -170,9 +164,7 @@ def test_seed_slot_chain_link_continuous() -> None:
     """After write, ``slot[0].prev_hash`` is consistent with verify's chain reconstruction from seed."""
     # Step 1: write a chain from seed slot=7 → newly written slot=2. Then run verify with prev=7 and
     # assert no violation — i.e., slot[2].prev_hash is the correct splitmix64-mix of seed's 4 fields.
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     cuda_buf = buf_pair[0]
     seed_token, seed_position = 11, 0
     seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
@@ -224,9 +216,7 @@ def test_seed_slot_chain_link_continuous() -> None:
 
 def test_chain_link_byte_equal_5_step() -> None:
     """5-step chain, buf / ring / counters byte-equal against ref."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 5],
         seed_slot_indices=[-1],
@@ -247,9 +237,7 @@ def test_chain_link_byte_equal_5_step() -> None:
 
 def test_mock_mode_off_ignores_expected() -> None:
     """``enable_write_verify_inputs = OFF`` → expected tensors are ignored (we pass garbage to prove the kernel skips them)."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
@@ -272,9 +260,7 @@ def test_mock_mode_off_ignores_expected() -> None:
 
 def test_mock_mode_on_match_no_violation() -> None:
     """``enable_write_verify_inputs = ON`` and expected matches actual → no violation, chain advances."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
@@ -299,9 +285,7 @@ def test_mock_mode_on_match_no_violation() -> None:
 
 def test_mock_mode_on_token_mismatch_records_violation() -> None:
     """``enable_write_verify_inputs = ON`` token mismatch → violation recorded; chain advances on ACTUAL token."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
@@ -328,9 +312,7 @@ def test_mock_mode_on_token_mismatch_records_violation() -> None:
 
 def test_mock_mode_on_position_mismatch_records_violation() -> None:
     """``enable_write_verify_inputs = ON`` position mismatch → violation recorded; chain advances on ACTUAL position."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
@@ -356,9 +338,7 @@ def test_mock_mode_on_position_mismatch_records_violation() -> None:
 
 def test_mock_mode_chain_advances_on_actual_not_expected() -> None:
     """Expected differs from actual on every entry → downstream verify must NOT cascade chain errors."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     cuda_buf = buf_pair[0]
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 3],
@@ -408,9 +388,7 @@ def test_negative_slot_skips_entry() -> None:
     slot_run_counter bump. Covers both SWA out-of-window (after caller-side LUT gather) and
     explicit padding intents.
     """
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     # Two entries: first writes to slot 4 normally; second has slot=-1 and must be skipped.
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 2],
@@ -440,9 +418,7 @@ def test_pre_translated_slot_writes_normally() -> None:
     confirms the kernel is SWA-agnostic: SWA endpoints feed the same shape of input here after their
     host-side gather, so the contract is symmetric across FULL / SWA groups.
     """
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
         seed_slot_indices=[-1],
@@ -468,9 +444,7 @@ def test_pre_translated_slot_writes_normally() -> None:
 
 def test_real_kv_mode_off_writes_zero() -> None:
     """``consts.RealKvHashMode.OFF`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources = make_real_kv_sources(count=2, device=_DEVICE)
 
     plan_pair = make_write_plan_pair(
@@ -506,9 +480,7 @@ def test_real_kv_mode_off_writes_zero() -> None:
 )
 def test_real_kv_mode_byte_equal(mode: consts.RealKvHashMode) -> None:
     """PARTIAL / ALL modes both produce CUDA-vs-ref byte-equal write state on a 3-entry chain."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -535,9 +507,7 @@ def test_real_kv_mode_byte_equal(mode: consts.RealKvHashMode) -> None:
 @pytest.mark.parametrize("count", [1, 2, 3, 4])
 def test_real_kv_sources_fold_1_to_4(count: int) -> None:
     """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
     sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -601,9 +571,7 @@ def test_real_kv_source_above_4_raises() -> None:
 
 def test_kernel_run_counter_per_call() -> None:
     """``kernel_run_counter`` increments by 1 per call (even when ``write_num_valid_reqs == 0``)."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 0],
         seed_slot_indices=[-1],
@@ -642,9 +610,7 @@ def test_kernel_run_counter_per_call() -> None:
 
 def test_slot_run_counter_sums_entries() -> None:
     """``slot_run_counter`` += sum(entry_count) across all active reqs in this call."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 2, 5],
         seed_slot_indices=[-1, -1],
@@ -667,9 +633,7 @@ def test_slot_run_counter_sums_entries() -> None:
 
 def test_empty_plan_no_op() -> None:
     """``write_num_valid_reqs = 0`` → no buf write, no slot_run_counter bump, only kernel_run_counter += 1."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 0],
         seed_slot_indices=[-1],
@@ -695,9 +659,7 @@ def test_empty_plan_no_op() -> None:
 
 def test_padding_block_skipped() -> None:
     """``blockIdx.x >= write_num_valid_reqs[0]`` → block early-exits, no write to canary_buf."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     # Allocate plan with req_capacity=4 but only declare 1 active req.
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 1],
@@ -729,9 +691,7 @@ def test_padding_block_skipped() -> None:
 
 def test_chain_link_byte_equal_5_step_hardcoded() -> None:
     """5-step write chain with hand-computed splitmix64 expected fields per slot."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 5],
         seed_slot_indices=[-1],
@@ -794,9 +754,7 @@ def test_mock_violation_bit_injection_position_matrix(
         "MOCK_POSITION": consts.FailReason.WRITE_POSITION_MISMATCH,
     }[bit_to_trigger]
 
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, slot_count],
         seed_slot_indices=[-1],
@@ -890,9 +848,7 @@ def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
     # Step 2: verify hand-computed fold matches the hex literal.
     assert fold_fn(_PATTERN) == expected_hash
 
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     source_cuda = make_real_kv_source(
         num_slots=16, num_bytes_per_token=16, page_size=1, read_bytes=16, device=_DEVICE
     )
@@ -1012,9 +968,7 @@ def test_position_boundary_byte_equal_sweep(position_val: int) -> None:
 
 def test_pseudo_mode_on_catches_token_mismatch() -> None:
     """enable_write_verify_inputs=ON + intentional token mismatch → WRITE_TOKEN_MISMATCH bit recorded."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 5],
         seed_slot_indices=[-1],
@@ -1046,9 +1000,7 @@ def test_pseudo_mode_on_catches_token_mismatch() -> None:
 
 def test_chain_advances_with_real_kv_hash_all() -> None:
     """ALL mode + 2 sources + 5-step chain: stored prev_hash recoverable from seed."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     cuda_buf = buf_pair[0]
     sources_cuda = make_real_kv_sources(
         count=2,
@@ -1100,9 +1052,7 @@ def test_chain_advances_with_real_kv_hash_all() -> None:
 
 def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
     """fb_out_cache_loc[i] = -1 → that entry's slot is untouched by write kernel."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     cuda_buf = buf_pair[0]
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 3],
@@ -1135,9 +1085,7 @@ def test_write_skip_when_out_cache_loc_is_minus_one() -> None:
 
 def test_seed_continues_existing_chain() -> None:
     """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix4(seed.*)."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     seed_slot = 3
     seed_token = 7
     seed_position = 1
@@ -1187,9 +1135,7 @@ def test_seed_continues_existing_chain() -> None:
 
 def test_paged_real_kv_hash_consistent_across_slots() -> None:
     """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     sources_cuda = make_real_kv_sources(
         count=1,
         num_bytes_per_token=16,
@@ -1271,9 +1217,7 @@ def test_multi_source_real_kv_fold_order_matters() -> None:
 
 def test_pseudo_mode_off_skips_token_check() -> None:
     """enable_write_verify_inputs=False + intentional mismatch in expected_input_* → no violation recorded."""
-    buf_pair = make_canary_buf_pair(
-        num_slots=16, slot_stride_bytes=32, device=_DEVICE
-    )
+    buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
     plan_pair = make_write_plan_pair(
         write_offsets=[0, 3],
         seed_slot_indices=[-1],
