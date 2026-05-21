@@ -125,8 +125,22 @@ def _is_mxfp4_xpu_packed(
 # E2M1 lookup table: nibble value 0x0–0xF → float
 _E2M1_LUT = torch.tensor(
     [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,        # 0b0xxx (positive)
-        0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,  # 0b1xxx (negative)
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,  # 0b0xxx (positive)
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,  # 0b1xxx (negative)
     ],
     dtype=torch.float32,
 )
@@ -155,11 +169,11 @@ def _get_e2m1_lut(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
 
 @triton.jit
 def _mxfp4_dequant_kernel(
-    W_ptr,     # [E*N, half_K] uint8  - packed weights (flattened E*N)
-    S_ptr,     # [E*N, half_K // 16] float32 - block scales
-    LUT_ptr,   # [16] bfloat16 - E2M1 lookup table
-    Out_ptr,   # [E*N, K] bfloat16 - output
-    half_K,    # K // 2  (packed dimension)
+    W_ptr,  # [E*N, half_K] uint8  - packed weights (flattened E*N)
+    S_ptr,  # [E*N, half_K // 16] float32 - block scales
+    LUT_ptr,  # [16] bfloat16 - E2M1 lookup table
+    Out_ptr,  # [E*N, K] bfloat16 - output
+    half_K,  # K // 2  (packed dimension)
     stride_wn,
     stride_sn,
     stride_on,
@@ -237,10 +251,16 @@ def _upcast_mxfp4_triton(
     )
 
     _mxfp4_dequant_kernel[grid](
-        w_flat, s_flat, lut, out_flat,
+        w_flat,
+        s_flat,
+        lut,
+        out_flat,
         half_K,
-        stride_wn, stride_sn, stride_on,
-        BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        stride_wn,
+        stride_sn,
+        stride_on,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
     if target_dtype != torch.bfloat16:
@@ -806,7 +826,9 @@ def _fused_moe_kernel_sequence(
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
             assert swiglu_limit == 10
             assert intermediate_cache1.shape == (total_tokens, N)
-            assert _is_cuda or _is_hip or _is_xpu, "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
+            assert (
+                _is_cuda or _is_hip or _is_xpu
+            ), "DeepSeek V4 only supports CUDA/HIP/XPU downstream"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
@@ -1090,8 +1112,14 @@ def fused_experts_impl(
     # down-projection GEMMs to keep peak transient at ~8 GiB (TP=1)
     # instead of ~12 GiB.
     mxfp4_xpu = _is_mxfp4_xpu_packed(
-        hidden_states, w1, w2, w1_scale, w2_scale,
-        use_int8_w8a8, use_int8_w8a16, use_int4_w4a16,
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        use_int8_w8a8,
+        use_int8_w8a16,
+        use_int4_w4a16,
     )
     if mxfp4_xpu:
         mxfp4_target_dtype = (
@@ -1099,7 +1127,7 @@ def fused_experts_impl(
             if hidden_states.dtype in (torch.float16, torch.bfloat16)
             else torch.bfloat16
         )
-        #_log_mxfp4_xpu_budget(hidden_states, w1, w2, mxfp4_target_dtype)
+        # _log_mxfp4_xpu_budget(hidden_states, w1, w2, mxfp4_target_dtype)
         # The bf16 GEMM that follows must NOT see fp8/block-quant flags or
         # the packed scales: those are folded into the upcast result.
         gemm_use_fp8_w8a8 = False

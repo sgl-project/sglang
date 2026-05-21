@@ -56,7 +56,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align, is_xpu
 
-
 _is_xpu = is_xpu()
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -1037,9 +1036,11 @@ class DeepseekV4AttnBackend(
 
             if _is_xpu:
                 from .flash_mla_with_kvcache_torch import flash_mla_with_kvcache_torch
+
                 fn = flash_mla_with_kvcache_torch
             else:
                 import flash_mla
+
                 fn = flash_mla.flash_mla_with_kvcache
 
             o = fn(

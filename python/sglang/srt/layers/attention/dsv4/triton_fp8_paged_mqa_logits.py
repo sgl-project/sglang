@@ -1,7 +1,9 @@
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
-from typing import Any, Optional
+
 from sglang.srt.utils import is_hip
 
 if is_hip():

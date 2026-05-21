@@ -267,7 +267,11 @@ def throughput_test_once(
             "SGLANG_TORCH_PROFILER_DIR" in os.environ
         ), "Please set SGLANG_TORCH_PROFILER_DIR."
         os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
-        backend.start_profile(start_step=profile_start_step, num_steps=profile_steps, activities=profile_activities)
+        backend.start_profile(
+            start_step=profile_start_step,
+            num_steps=profile_steps,
+            activities=profile_activities,
+        )
 
     st = time.perf_counter()
     gen_out = backend.generate(
