@@ -36,6 +36,7 @@ __all__ = [
     "splitmix64",
     "splitmix64_mix4",
     "stamp_clean_chain",
+    "stamp_pair",
     "to_signed_int64",
     "write_slot_fields",
 ]
@@ -244,6 +245,31 @@ def write_slot_fields(
     view[slot_idx, 1] = position
     view[slot_idx, 2] = prev_hash
     view[slot_idx, 3] = real_kv_hash
+
+
+def stamp_pair(
+    buf_pair: tuple[torch.Tensor, torch.Tensor],
+    *,
+    slot_idx: int,
+    token: int,
+    position: int,
+    prev_hash: int,
+    real_kv_hash: int = 0,
+) -> None:
+    """Stamp the same slot fields into both (cuda, ref) canary buffers.
+
+    Replaces the ``for buf in (cuda_buf, ref_buf): write_slot_fields(...)`` loop that appears
+    dozens of times across the hand tests.
+    """
+    for buf in buf_pair:
+        write_slot_fields(
+            canary_buf=buf,
+            slot_idx=slot_idx,
+            token=token,
+            position=position,
+            prev_hash=prev_hash,
+            real_kv_hash=real_kv_hash,
+        )
 
 
 def read_slot_fields(
