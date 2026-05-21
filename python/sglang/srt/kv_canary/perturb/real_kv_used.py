@@ -61,7 +61,7 @@ def run(
     source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
     source = group.real_kv_sources_k[source_pick]
     flip_result = flip_first_byte_in_source(
-        group=group, source=source, slot_idx=target.slot
+        group=group, source=source, slot_idx=target.value
     )
     if flip_result is None:
         return
@@ -71,7 +71,7 @@ def run(
         "original_byte=0x%02X new_byte=0x%02X",
         group.kind.name,
         source_pick,
-        target.slot,
+        target.value,
         row,
         col,
         original_byte,
