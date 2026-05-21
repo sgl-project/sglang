@@ -14,6 +14,7 @@
 
 # Define a enum class for FP4 formats, including MXFP4, NVFP4 and future formats
 from enum import Enum
+from typing import Optional
 
 import torch
 
@@ -57,34 +58,58 @@ E2M1_BOUNDS = torch.tensor(
     [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5], dtype=torch.float32, device=_device
 )
 
+# Factor for Gaussian distribution to mxfp4 scale factor conversion, refer to: https://github.com/IST-DASLab/qutlass
+GAUSSIAN_FACTOR = 2.92247856
+
 
 class BlockFP4KVQuantizeUtil:
     """Block-wise FP4 (E2M1) quantization for KV cache.
 
-    Similar to MXFP4 but uses block_size=16 (MXFP4 spec defines block_size=32).
-    Each block of 16 elements shares one uint8 exponent-only scale factor.
+    Similar to MXFP4 but uses block_size=16, 32, 64 or 128
+    (MXFP4 spec defines block_size=32).
+    Each block of block_size elements shares one uint8 exponent-only scale factor.
     """
 
     @staticmethod
     @torch.compile
-    def batched_quantize(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def batched_quantize(
+        tensor: torch.Tensor,
+        block_size: Optional[int] = None,
+        hadamard_rotate: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Quantize tensor to KVFP4 format
         Args:
             tensor: Input tensor of shape [B, M, N]
-
+            block_size: Block size for quantization
+            hadamard_rotate: Whether to apply Hadamard rotation to the tensor
         Returns:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
-            scale_factors: Scale factors of shape [B, M*N/16]
+            scale_factors: Scale factors of shape [B, M*N/block_size]
         """
         b, m, n = tensor.shape
 
-        # Reshape to [B, M*N/16, 16] for block-wise quantization
-        reshaped = tensor.view(b, m * n // 16, 16)
+        if block_size is None:
+            block_size = 32
+
+        # Reshape to [B, M*N/block_size, block_size] for block-wise quantization
+        reshaped = tensor.view(b, m * n // block_size, block_size)
 
         # Compute scale factors per block
-        block_max = reshaped.abs().max(dim=-1, keepdim=True).values
-        scale_exp = torch.ceil(torch.log2(torch.clamp(block_max / E2M1_MAX, min=1e-10)))
+        if hadamard_rotate:
+            from sglang.jit_kernel.hadamard import hadamard_transform
+
+            reshaped = hadamard_transform(reshaped, scale=block_size**-0.5)
+            block_std = reshaped.std(dim=-1, correction=0, keepdim=True)
+            scale_exp = torch.floor(
+                torch.log2(block_std * (GAUSSIAN_FACTOR / E2M1_MAX) + 1e-8)
+            )
+        else:
+            block_max = reshaped.abs().max(dim=-1, keepdim=True).values
+            scale_exp = torch.ceil(
+                torch.log2(torch.clamp(block_max / E2M1_MAX, min=1e-10))
+            )
+
         scale_factors = (scale_exp + 127).squeeze(-1).to(torch.uint8)
 
         # Apply scaling
@@ -95,7 +120,11 @@ class BlockFP4KVQuantizeUtil:
         abs_vals = scaled.abs()
 
         # Pure tensor version (CUDA Graph safe)
-        magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= E2M1_BOUNDS, dim=-1)
+        bounds = E2M1_BOUNDS.to(device=abs_vals.device)
+        magnitude_bits = torch.sum(abs_vals.unsqueeze(-1) >= bounds, dim=-1)
+        is_midpoint = torch.any(abs_vals.unsqueeze(-1) == bounds, dim=-1)
+        tie_round_down = is_midpoint & ((magnitude_bits % 2) == 1)
+        magnitude_bits = magnitude_bits - tie_round_down.to(magnitude_bits.dtype)
 
         # Combine sign and magnitude
         fp4_vals = sign_bits + magnitude_bits.to(torch.uint8)
@@ -111,20 +140,22 @@ class BlockFP4KVQuantizeUtil:
     def batched_dequantize(
         quant_tensor: torch.Tensor,
         scale_factors: torch.Tensor,
+        hadamard_rotate: bool = False,
         dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         """
         Dequantize KVFP4 tensor
         Args:
             quant_tensor: Quantized tensor of shape [B, M, N/2]
-            scale_factors: Scale factors of shape [B, M*N/16]
+            scale_factors: Scale factors of shape [B, M*N/block_size]
+            hadamard_rotate: Whether to apply Hadamard rotation to the tensor
             dtype: Target dtype for output
-
         Returns:
             Dequantized tensor of shape [B, M, N]
         """
         b, m, n_half = quant_tensor.shape
         n = n_half * 2
+        block_size = (m * n) // scale_factors.shape[-1]
 
         # More efficient unpacking using bit operations
         fp4_vals = torch.empty(b, m, n, dtype=torch.uint8, device=quant_tensor.device)
@@ -136,16 +167,20 @@ class BlockFP4KVQuantizeUtil:
         magnitude_idx = fp4_vals & 0x07
 
         # Convert to float values
-        float_vals = E2M1_VALUES[magnitude_idx.long()]
+        float_vals = E2M1_VALUES.to(device=quant_tensor.device)[magnitude_idx.long()]
         float_vals = torch.where(sign_mask, -float_vals, float_vals)
 
         # Reshape for block-wise scaling
-        reshaped = float_vals.view(b, m * n // 16, 16)
+        reshaped = float_vals.view(b, m * n // block_size, block_size)
 
         # Apply scale factors
         scale_exp = scale_factors.float() - 127
         scaled = reshaped * torch.exp2(scale_exp.unsqueeze(-1))
 
+        if hadamard_rotate:
+            from sglang.jit_kernel.hadamard import hadamard_transform
+
+            scaled = hadamard_transform(scaled, scale=block_size**-0.5)
         return scaled.view(b, m, n).to(dtype)
 
 
