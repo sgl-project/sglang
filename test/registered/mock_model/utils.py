@@ -22,7 +22,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 MOCK_MODEL_PATH = "Qwen/Qwen3-0.6B"
 
 _MOCK_MODEL_SERVER_ARGS: list[str] = [

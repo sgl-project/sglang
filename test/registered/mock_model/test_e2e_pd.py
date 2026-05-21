@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import ClassVar, Dict, List, Optional
 
 import requests
-
 from utils import MOCK_MODEL_PATH, mock_model_server_args
 
 from sglang.test.ci.ci_register import register_cuda_ci
