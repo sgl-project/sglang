@@ -39,9 +39,7 @@ class PerturbManager:
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
         self._radix_cache: Optional["BasePrefixCache"] = None
-        self._warmup_gate = WarmupGate(
-            config=config, violation_pump=violation_pump
-        )
+        self._warmup_gate = WarmupGate(config=config, violation_pump=violation_pump)
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
