@@ -156,6 +156,7 @@ class Scheduler(SchedulerDisaggMixin):
         # warmup progress tracking
         self._warmup_total = 0
         self._warmup_processed = 0
+        self._logged_server_ready_after_warmup = False
 
         self.prepare_server_warmup_reqs()
 
@@ -296,6 +297,15 @@ class Scheduler(SchedulerDisaggMixin):
                     f"Warmup req processed in {GREEN}%.2f{RESET} seconds",
                     total_duration_s,
                 )
+            if (
+                not self._logged_server_ready_after_warmup
+                and (
+                    self._warmup_total <= 0
+                    or self._warmup_processed >= self._warmup_total
+                )
+            ):
+                logger.info("The server is fired up and ready to roll!")
+                self._logged_server_ready_after_warmup = True
         else:
             if self._warmup_total > 0:
                 logger.info(
