@@ -88,6 +88,36 @@ class TestSelfUnitEndpoint(CustomTestCase):
             )
         self.assertEqual(calls, ["verify"])
 
+    def test_launch_per_forward_passes_kernel_kind(self):
+        """Verify per-forward launch passes the endpoint kernel kind."""
+        captured: list[tuple[str, CanaryLaunchTag]] = []
+        with patch.object(
+            endpoint_module,
+            "launch_canary_verify_kernel",
+            lambda **kwargs: captured.append(("verify", kwargs["context"].kernel_kind)),
+        ), patch.object(
+            endpoint_module,
+            "launch_canary_write_kernel",
+            lambda **kwargs: captured.append(("write", kwargs["context"].kernel_kind)),
+        ):
+            ep = _make_endpoint(
+                device=self.device, kernel_kind=CanaryLaunchTag.TAIL_V_SWA
+            )
+            args = _make_kernel_args(self.device)
+            ep.launch_per_forward(
+                verify_plan=args.verify_plan,
+                write_plan=args.write_plan,
+                input_ids=args.input_ids,
+                positions=args.positions,
+                out_cache_loc=args.out_cache_loc,
+                input_check_mode=args.input_check_mode,
+                expected_inputs=args.expected_inputs,
+                violation_log=args.violation_log,
+                real_kv_hash_mode=args.real_kv_hash_mode,
+            )
+        self.assertIn(("verify", CanaryLaunchTag.TAIL_V_SWA), captured)
+        self.assertIn(("write", CanaryLaunchTag.TAIL_V_SWA), captured)
+
     def test_swa_endpoint_pre_translates_out_cache_loc(self):
         """Verify SWA endpoints translate cache locations before write launch."""
         captured: list[torch.Tensor] = []
