@@ -21,6 +21,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
+from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -55,10 +57,12 @@ class CanaryRunner:
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         token_oracle_manager: Optional[TokenOracleManager] = None,
+        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
+        self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
@@ -82,6 +86,12 @@ class CanaryRunner:
         )
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
+
+        self._swa_divergence_stats = SwaDivergenceStats(
+            device=device,
+            d2h_stream=self._d2h_stream,
+            swa_allocator_getter=self._get_swa_allocator,
+        )
 
         self._violation_manager = ViolationManager(
             config=config,
@@ -117,6 +127,7 @@ class CanaryRunner:
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
             d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
+            swa_divergence_stats=self._swa_divergence_stats,
         )
         self._health_checker = KernelRunCounterHealthChecker(
             config=config,
@@ -140,6 +151,15 @@ class CanaryRunner:
 
     def _get_step_counter(self) -> int:
         return self._step_counter
+
+    def _get_swa_allocator(self) -> Optional["SWATokenToKVPoolAllocator"]:
+        return self._swa_allocator
+
+    def _get_swa_index_lut(self) -> Optional["torch.Tensor"]:
+        for group in self._buffer_groups:
+            if group.swa_index_lut is not None:
+                return group.swa_index_lut
+        return None
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
@@ -188,3 +208,8 @@ class CanaryRunner:
         self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
+        self._swa_divergence_stats.emit_log_if_due(
+            step_counter=self._step_counter,
+            period=self.config.stats_print_every_n_steps,
+            full_to_swa_index_mapping=self._get_swa_index_lut(),
+        )

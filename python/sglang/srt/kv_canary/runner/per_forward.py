@@ -17,6 +17,7 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
+from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
@@ -55,6 +56,7 @@ class PerForwardOrchestrator:
         per_forward_write_entry_capacity: int,
         d2h_stream: Optional[torch.cuda.Stream] = None,
         token_oracle_manager: Optional[TokenOracleManager] = None,
+        swa_divergence_stats: Optional[SwaDivergenceStats] = None,
     ) -> None:
         self._config = config
         self._device_state = device_state
@@ -65,6 +67,7 @@ class PerForwardOrchestrator:
         self._perturb_manager = perturb_manager
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
+        self._swa_divergence_stats: Optional[SwaDivergenceStats] = swa_divergence_stats
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=per_forward_verify_capacity, device=device
@@ -148,6 +151,11 @@ class PerForwardOrchestrator:
                 req_to_token=self._req_to_token_pool.req_to_token,
                 swa_window_size=self._swa_window_size,
             )
+            if self._swa_divergence_stats is not None:
+                self._swa_divergence_stats.observe_after_invoke_plan(
+                    group=group,
+                    verify_plan=self._verify_plan_per_forward,
+                )
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
@@ -186,6 +194,8 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
+        if self._swa_divergence_stats is not None:
+            self._swa_divergence_stats.on_forward_completed()
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

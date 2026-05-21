@@ -381,6 +381,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
+        self.wrap_count: int = 0
+
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
@@ -630,6 +632,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
+        self.wrap_count += int(swa_indices.numel())
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):

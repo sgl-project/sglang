@@ -752,6 +752,11 @@ class Envs:
     # e2e tests to drive detection deterministically.
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    # SWA-vs-FULL divergence observation (testing-only). When True the runner
+    # accumulates per-forward verify_num_valid for the FULL/SWA groups, snapshots
+    # the non-identity mapping count, and emits a ``kv_canary swa_divergence:``
+    # log line on the periodic canary stats cadence. Default False = zero overhead.
+    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
     # ===================================================================

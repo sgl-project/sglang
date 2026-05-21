@@ -11,6 +11,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patch.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 if TYPE_CHECKING:
@@ -37,6 +38,10 @@ def install_canary(
         config=config,
         device=device,
     )
+    allocator = model_runner.token_to_kv_pool_allocator
+    swa_allocator = (
+        allocator if isinstance(allocator, SWATokenToKVPoolAllocator) else None
+    )
     runner = CanaryRunner(
         config=config,
         buffer_groups=buffer_groups,
@@ -52,6 +57,7 @@ def install_canary(
         ),
         swa_window_size=model_runner.sliding_window_size or 0,
         token_oracle_manager=token_oracle_manager,
+        swa_allocator=swa_allocator,
     )
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
