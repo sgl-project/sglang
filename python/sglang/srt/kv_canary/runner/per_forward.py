@@ -93,9 +93,13 @@ class PerForwardOrchestrator:
             d2h_stream=d2h_stream,
         )
 
+        self._last_forward_batch: Optional["ForwardBatch"] = None
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
+
+        self._last_forward_batch = forward_batch
 
         bs = int(forward_batch.batch_size)
         num_tokens = int(forward_batch.positions.shape[0])
@@ -185,6 +189,8 @@ class PerForwardOrchestrator:
     def end_of_step(self) -> None:
         if self._config.mode == "off":
             return
+        if self._last_forward_batch is not None:
+            self._perturb_manager.end_of_forward(self._last_forward_batch)
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
 
 
