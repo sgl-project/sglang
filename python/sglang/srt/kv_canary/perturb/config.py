@@ -36,11 +36,11 @@ class PerturbConfig:
             line.
     """
 
-    req_to_token_prob: float = 0.0
-    real_kv_used_prob: float = 0.0
-    real_kv_unused_cache_prob: float = 0.0
-    target_group_kind: TargetGroupKind = TargetGroupKind.ANY
-    warmup_steps: int = 50
+    req_to_token_prob: float
+    real_kv_used_prob: float
+    real_kv_unused_cache_prob: float
+    target_group_kind: TargetGroupKind
+    warmup_steps: int
 
     @classmethod
     def from_env(cls) -> "PerturbConfig":
