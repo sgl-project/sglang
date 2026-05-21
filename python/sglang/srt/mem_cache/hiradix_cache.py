@@ -16,6 +16,8 @@ from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.managers.cache_controller import (
     HiCacheController,
     PrefetchOperation,
+    hicache_debug_enabled,
+    log_hicache_debug,
     radix_evict_host_leaf_context,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -531,14 +533,14 @@ class HiRadixCache(RadixCache):
                 mp = cc.mem_pool_host
                 n = host_indices.numel()
                 avail_before = mp.available_size()
-                logger.debug(
+                log_hicache_debug(
                     "[HiCachePrefetchHostMem] host_mem_release_before_free num_indices=%s pool_size=%s available_size=%s",
                     n,
                     mp.size,
                     avail_before,
                 )
                 cc.mem_pool_host.free(host_indices)
-                logger.debug(
+                log_hicache_debug(
                     "[HiCachePrefetchHostMem] host_mem_release_after_free num_indices=%s pool_size=%s available_size=%s",
                     n,
                     mp.size,
@@ -897,10 +899,12 @@ class HiRadixCache(RadixCache):
         reason: Optional[str] = None,
         mutation: Optional[str] = None,
     ) -> None:
+        if not hicache_debug_enabled():
+            return
         rs = reason if reason is not None else "-"
         mut = mutation if mutation is not None else "-"
         logger.debug(
-            "[HiCacheHostLeafTrace] caller=%s phase=%s {%s} %s reason=%s mutation=%s "
+            "[HiCacheHostLeafDebug] caller=%s phase=%s {%s} %s reason=%s mutation=%s "
             "evictable_host_leaves_size=%s",
             caller,
             phase,
@@ -918,6 +922,8 @@ class HiRadixCache(RadixCache):
         req_id: str,
         evict_host_attempted: bool,
     ) -> None:
+        if not hicache_debug_enabled():
+            return
         ev_sz = len(self.evictable_host_leaves)
         root_child_total = len(self.root_node.children)
         if ev_sz == 0:
@@ -932,7 +938,7 @@ class HiRadixCache(RadixCache):
             hot_display = "n/a"
             diag_note = "skip_root_children_hot_backuped_count_evictable_host_leaves_nonempty"
         logger.debug(
-            "[HiCachePrefetchAbortTrace] phase=%s req_id=%s evict_host_attempted=%s "
+            "[HiCachePrefetchAbortDebug] phase=%s req_id=%s evict_host_attempted=%s "
             "evictable_host_leaves=%s root_children_total=%s root_children_backuped_T_evicted_F=%s diag=%s",
             phase,
             req_id,
@@ -1129,7 +1135,7 @@ class HiRadixCache(RadixCache):
         ]
         heapq.heapify(eviction_heap)
 
-        logger.debug(
+        log_hicache_debug(
             "[HiCacheHostEvict] evict_host_begin num_tokens_requested=%s evictable_host_leaves=%s heap_size=%s",
             num_tokens,
             n_evictable,
@@ -1242,7 +1248,7 @@ class HiRadixCache(RadixCache):
         else:
             exit_reason = "heap_exhausted"
 
-        logger.debug(
+        log_hicache_debug(
             "[HiCacheHostEvict] evict_host_summary exit_reason=%s num_tokens_requested=%s "
             "num_indices_freed_total=%s evictable_host_leaves_remain=%s successful_kv_node_frees=%s "
             "skip_hit_root_break=%s skip_not_evicted=%s skip_host_ref_blocked=%s heap_remain_size=%s",
@@ -1616,7 +1622,7 @@ class HiRadixCache(RadixCache):
             return
 
         mp = self.cache_controller.mem_pool_host
-        logger.debug(
+        log_hicache_debug(
             "[HiCachePrefetchHostMem] prefetch_from_storage_begin req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
             req_id,
             prefetch_length,
@@ -1628,7 +1634,7 @@ class HiRadixCache(RadixCache):
         evict_host_for_prefetch = False
         if host_indices is None:
             evict_host_for_prefetch = True
-            logger.debug(
+            log_hicache_debug(
                 "[HiCachePrefetchHostMem] prefetch_alloc_failed_then_radix_evict_host req_id=%s prefetch_length=%s pool_size=%s available_size=%s",
                 req_id,
                 prefetch_length,
@@ -1636,7 +1642,7 @@ class HiRadixCache(RadixCache):
                 mp.available_size(),
             )
             self.evict_host(prefetch_length)
-            logger.debug(
+            log_hicache_debug(
                 "[HiCachePrefetchHostMem] prefetch_after_radix_evict_host req_id=%s pool_size=%s available_size=%s",
                 req_id,
                 mp.size,
@@ -1649,7 +1655,7 @@ class HiRadixCache(RadixCache):
                 available_size % self.page_size
             )
             if reduced_prefetch_length >= self.prefetch_threshold:
-                logger.debug(
+                log_hicache_debug(
                     "[HiCachePrefetchHostMem] prefetch_retry_with_reduced_length req_id=%s "
                     "reduced_prefetch_length=%s pool_size=%s available_size=%s",
                     req_id,
@@ -1675,7 +1681,7 @@ class HiRadixCache(RadixCache):
                     req_id,
                     prefetch_length,
                 )
-                logger.debug(
+                log_hicache_debug(
                     "[HiCachePrefetchHostMem] prefetch_from_storage_abort req_id=%s "
                     "reason=host_mem_unavailable evict_host_attempted=%s pool_size=%s available_size=%s",
                     req_id,
@@ -1689,7 +1695,7 @@ class HiRadixCache(RadixCache):
                     evict_host_attempted=evict_host_for_prefetch,
                 )
                 return
-        logger.debug(
+        log_hicache_debug(
             "[HiCachePrefetchHostMem] prefetch_from_storage_alloc_ok req_id=%s prefetch_length=%s evict_host_attempted=%s pool_size=%s available_size=%s",
             req_id,
             prefetch_length,

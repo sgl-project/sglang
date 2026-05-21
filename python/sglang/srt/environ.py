@@ -362,6 +362,8 @@ class Envs:
 
     # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
     SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+    # Verbose HiCache host-leaf / prefetch / evict diagnostics (requires log level DEBUG).
+    SGLANG_HICACHE_DEBUG_LOGGING = EnvBool(False)
     # Trace / debug
     SGLANG_ASCEND_MEMCACHE_TRACE_LOGGING = EnvBool(True)
     SGLANG_ASCEND_MEMCACHE_TRACE_MAX_KEYS = EnvInt(0)

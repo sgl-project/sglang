@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -48,6 +49,17 @@ from sglang.srt.utils import get_device_module
 logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
+
+
+def hicache_debug_enabled() -> bool:
+    return envs.SGLANG_HICACHE_DEBUG_LOGGING.get() and logger.isEnabledFor(
+        logging.DEBUG
+    )
+
+
+def log_hicache_debug(msg: str, *args, **kwargs) -> None:
+    if hicache_debug_enabled():
+        logger.debug(msg, *args, **kwargs)
 
 # Snapshot of HiRadixCache.evictable_host_leaves cardinality when calling EvictKVPath
 # (`cache_controller.evict_host`). Other callers leave this unset (default None).
@@ -853,21 +865,21 @@ class HiCacheController:
         avail_before = mp.available_size()
         radix_leaves_hint = _radix_evictable_host_leaves.get()
         if radix_leaves_hint is not None:
-            logger.info(
+            log_hicache_debug(
                 "[HiCacheHostEvict] controller_evict_host radix_evictable_host_leaves=%s num_indices=%s pool_size=%s available_size=%s",
                 radix_leaves_hint,
                 n,
                 mp.size,
                 avail_before,
             )
-        logger.info(
+        log_hicache_debug(
             "[HiCachePrefetchHostMem] evict_host_before_free num_indices=%s pool_size=%s available_size=%s",
             n,
             mp.size,
             avail_before,
         )
         self.mem_pool_host.free(host_indices)
-        logger.info(
+        log_hicache_debug(
             "[HiCachePrefetchHostMem] evict_host_after_free num_indices=%s pool_size=%s available_size=%s",
             n,
             mp.size,
@@ -901,7 +913,7 @@ class HiCacheController:
             request_id, host_indices, new_input_tokens, last_hash, prefix_keys
         )
         mp = self.mem_pool_host
-        logger.info(
+        log_hicache_debug(
             "[HiCachePrefetchHostMem] prefetch_enqueued req_id=%s host_indices=%s pool_size=%s available_size=%s",
             request_id,
             host_indices.numel(),
@@ -1085,7 +1097,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                logger.info(
+                log_hicache_debug(
                     "[HiCachePrefetchHostMem] prefetch_thread_op_begin req_id=%s pool_size=%s available_size=%s prefetch_tokens_occupied=%s",
                     operation.request_id,
                     self.mem_pool_host.size,
@@ -1108,8 +1120,8 @@ class HiCacheController:
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
-                    logger.info(
-                        "[HiCacheL3Trace] prefetch_revoke req_id=%s storage_hit_tokens=%s prefetch_threshold=%s requested_tokens=%s",
+                    log_hicache_debug(
+                        "[HiCacheL3Debug] prefetch_revoke req_id=%s storage_hit_tokens=%s prefetch_threshold=%s requested_tokens=%s",
                         operation.request_id,
                         storage_hit_count,
                         self.prefetch_threshold,
@@ -1127,8 +1139,8 @@ class HiCacheController:
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
-                    logger.info(
-                        "[HiCacheL3Trace] prefetch_scheduled req_id=%s scheduled_pages=%s scheduled_tokens=%s requested_tokens=%s",
+                    log_hicache_debug(
+                        "[HiCacheL3Debug] prefetch_scheduled req_id=%s scheduled_pages=%s scheduled_tokens=%s requested_tokens=%s",
                         operation.request_id,
                         len(operation.hash_value),
                         storage_hit_count,
