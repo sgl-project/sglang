@@ -15,7 +15,7 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_sweep,
 )
-from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
+from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
 if TYPE_CHECKING:
@@ -44,7 +44,7 @@ class SweepOrchestrator:
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
         sweep_verify_capacity: int,
-        violation_pump: ViolationSignalPump,
+        violation_pump: ViolationPump,
     ) -> None:
         self._config = config
         self._device_state = device_state

@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.perturb import (
 )
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.utils import WarmupGate
-from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
+from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -33,7 +33,7 @@ class PerturbManager:
         config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
-        violation_pump: ViolationSignalPump,
+        violation_pump: ViolationPump,
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool

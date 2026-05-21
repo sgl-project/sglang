@@ -8,7 +8,7 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
-from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
+from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
@@ -33,7 +33,7 @@ class KernelRunCounterHealthChecker:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        violation_pump: ViolationSignalPump,
+        violation_pump: ViolationPump,
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
@@ -81,7 +81,7 @@ class PeriodicCanaryStatsLogger:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        violation_pump: ViolationSignalPump,
+        violation_pump: ViolationPump,
         sweep_orchestrator: SweepOrchestrator,
         d2h_stream: torch.cuda.Stream,
     ) -> None:

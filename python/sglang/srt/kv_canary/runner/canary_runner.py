@@ -21,7 +21,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.runner.pump import ViolationSignalPump
+from sglang.srt.kv_canary.runner.violation_pump import ViolationPump
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation import ViolationReporter
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
     until server shutdown. The runner itself is a thin facade; per-concern state and behavior
-    live on the component classes (ViolationSignalPump, SweepOrchestrator, ViolationReporter,
+    live on the component classes (ViolationPump, SweepOrchestrator, ViolationReporter,
     PerturbManager, PerForwardOrchestrator, KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger).
     """
@@ -83,7 +83,7 @@ class CanaryRunner:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
-        self._violation_pump = ViolationSignalPump(
+        self._violation_pump = ViolationPump(
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
