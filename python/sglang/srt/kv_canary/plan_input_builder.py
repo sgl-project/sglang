@@ -183,7 +183,9 @@ def _extract_prefix_lens_and_extend_seq_lens(
         out_prefix_lens.copy_(forward_batch.extend_prefix_lens[:bs].to(torch.int64))
         out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs].to(torch.int64))
     else:
-        raise NotImplementedError(f"Unsupported forward mode for kv-canary: {forward_mode}")
+        raise NotImplementedError(
+            f"Unsupported forward mode for kv-canary: {forward_mode}"
+        )
 
 
 def build_plan_input_radix_sweep(
