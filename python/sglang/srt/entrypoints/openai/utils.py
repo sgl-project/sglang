@@ -106,6 +106,21 @@ def process_routed_experts_from_ret(
     return ret_item["meta_info"].get("routed_experts", None)
 
 
+def process_actions_from_ret(ret_item: Dict[str, Any]) -> Optional[Any]:
+    """Process VLA actions from a ret item.
+
+    The scheduler stores customized info per emitted token. VLA action heads
+    normally emit one dummy token, so flatten that single-token wrapper for the
+    OpenAI-compatible extension surface.
+    """
+    actions = ret_item.get("meta_info", {}).get("actions", None)
+    if actions is None:
+        return None
+    if isinstance(actions, list) and len(actions) == 1:
+        return actions[0]
+    return actions
+
+
 def cached_tokens_details_from_dict(
     details: Dict[str, Any],
 ) -> CachedTokensDetails:
