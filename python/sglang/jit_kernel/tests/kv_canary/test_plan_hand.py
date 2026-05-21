@@ -29,7 +29,7 @@ _DEVICE = torch.device("cuda")
 
 
 def _tensor(values: list[int]) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, device=_DEVICE)
+    return torch.tensor(values, dtype=torch.int64, device=_DEVICE)
 
 
 def _plan_pair(
@@ -454,7 +454,7 @@ class TestSwa:
         )
         # Identity LUT keeps slot indices unchanged after SWA translation.
         full_pool_size = 4 * 512
-        lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
+        lut = torch.arange(full_pool_size + 1, dtype=torch.int64, device=_DEVICE)
         plans = _plan_pair(verify_capacity=256, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
@@ -475,7 +475,7 @@ class TestSwa:
             kind="linear", max_reqs=4, max_seq_len=512, device=_DEVICE
         )
         full_pool_size = 4 * 512
-        lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
+        lut = torch.arange(full_pool_size + 1, dtype=torch.int64, device=_DEVICE)
         plans = _plan_pair(verify_capacity=512, write_req_capacity=4)
         run_plan_diff(
             plan_pair=plans,
@@ -503,7 +503,7 @@ class TestSwa:
         # Build a LUT that maps FULL slot S → SWA slot (S + 100) for every S; chosen so we can distinguish a
         # translated value from a raw full slot.
         lut = (
-            torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE) + 100
+            torch.arange(full_pool_size + 1, dtype=torch.int64, device=_DEVICE) + 100
         ).contiguous()
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
@@ -531,7 +531,7 @@ class TestSwa:
         )
         full_pool_size = 4 * max_seq_len
         lut = (
-            torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE) + 100
+            torch.arange(full_pool_size + 1, dtype=torch.int64, device=_DEVICE) + 100
         ).contiguous()
         plans = _plan_pair(verify_capacity=64, write_req_capacity=4)
         run_plan_diff(
@@ -560,7 +560,7 @@ class TestSwa:
             kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
         )
         full_pool_size = 4 * max_seq_len
-        lut = torch.arange(full_pool_size + 1, dtype=torch.int32, device=_DEVICE)
+        lut = torch.arange(full_pool_size + 1, dtype=torch.int64, device=_DEVICE)
         plans = _plan_pair(verify_capacity=1024, write_req_capacity=8)
         run_plan_diff(
             plan_pair=plans,

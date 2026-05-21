@@ -126,16 +126,16 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
 
     fb_input_ids = torch.tensor(
         [rng.randint(0, 0xFFFFFFFF) for _ in range(total_tokens)],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=_DEVICE,
     )
     fb_positions = torch.tensor(
         [rng.randint(0, 1024) for _ in range(total_tokens)],
-        dtype=torch.int32,
+        dtype=torch.int64,
         device=_DEVICE,
     )
     fb_out_cache_loc = torch.tensor(
-        out_cache_loc_list, dtype=torch.int32, device=_DEVICE
+        out_cache_loc_list, dtype=torch.int64, device=_DEVICE
     )
     expected_input_tokens = fb_input_ids.clone()
     expected_input_positions = fb_positions.clone()

@@ -59,6 +59,8 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.fb_req_pool_indices[2:].tolist(), [0, 0])
         self.assertEqual(plan.fb_prefix_lens[:2].tolist(), [3, 5])
         self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [7, 7])
+        self.assertEqual(plan.fb_prefix_lens.dtype, torch.int64)
+        self.assertEqual(plan.fb_extend_seq_lens.dtype, torch.int64)
 
     def test_fill_plan_input_per_forward_target_verify(self):
         """Verify target-verify batches derive draft verification spans."""
@@ -136,6 +138,9 @@ class TestSelfUnitPlanInput(CustomTestCase):
             full_to_swa_index_mapping=None,
         )
         self.assertEqual(int(out.extra_verify_num_valid.item()), 3)
+        self.assertEqual(out.extra_verify_slot_indices.dtype, torch.int64)
+        self.assertEqual(out.extra_verify_positions.dtype, torch.int64)
+        self.assertEqual(out.extra_verify_prev_slot_indices.dtype, torch.int64)
         self.assertEqual(out.extra_verify_slot_indices[:3].tolist(), [100, 101, 102])
         self.assertEqual(out.extra_verify_positions[:3].tolist(), [0, 1, 2])
         self.assertEqual(

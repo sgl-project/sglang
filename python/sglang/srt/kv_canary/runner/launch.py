@@ -23,6 +23,9 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+_BOUNDARY_INT_DTYPES = (torch.int32, torch.int64)
+
+
 def invoke_plan(
     *,
     plan_input: PlanInput,
@@ -63,15 +66,17 @@ def launch_endpoints_per_forward(
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: bool,
 ) -> None:
-    positions = forward_batch.positions
-    if positions.dtype != torch.int32:
-        positions = positions.to(torch.int32)
+    positions = _canonicalize_boundary_int64(
+        forward_batch.positions, "forward_batch.positions"
+    )
     out_cache_loc = forward_batch.out_cache_loc
-    if out_cache_loc is not None and out_cache_loc.dtype != torch.int32:
-        out_cache_loc = out_cache_loc.to(torch.int32)
+    if out_cache_loc is not None:
+        out_cache_loc = _canonicalize_boundary_int64(
+            out_cache_loc, "forward_batch.out_cache_loc"
+        )
     input_ids = forward_batch.input_ids
-    if input_ids is not None and input_ids.dtype != torch.int32:
-        input_ids = input_ids.to(torch.int32)
+    if input_ids is not None:
+        input_ids = _canonicalize_boundary_int64(input_ids, "forward_batch.input_ids")
 
     valid_num_tokens = get_valid_num_tokens(forward_batch=forward_batch)
     positions = positions[:valid_num_tokens]
@@ -153,3 +158,13 @@ def get_valid_num_tokens(*, forward_batch: "ForwardBatch") -> int:
     if num_token_non_padded_cpu is not None:
         return int(num_token_non_padded_cpu)
     return int(forward_batch.positions.shape[0])
+
+
+def _canonicalize_boundary_int64(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if tensor.dtype not in _BOUNDARY_INT_DTYPES:
+        raise TypeError(
+            f"kv-canary: {name} must have dtype torch.int32 or torch.int64, got {tensor.dtype}"
+        )
+    if tensor.dtype == torch.int64:
+        return tensor
+    return tensor.to(torch.int64)

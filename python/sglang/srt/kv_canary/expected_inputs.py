@@ -13,8 +13,8 @@ class ExpectedInputs:
     @classmethod
     def allocate(cls, *, capacity: int, device: torch.device) -> "ExpectedInputs":
         return cls(
-            tokens=torch.zeros(capacity, dtype=torch.int32, device=device),
-            positions=torch.zeros(capacity, dtype=torch.int32, device=device),
+            tokens=torch.zeros(capacity, dtype=torch.int64, device=device),
+            positions=torch.zeros(capacity, dtype=torch.int64, device=device),
         )
 
     def slice(self, num_tokens: int) -> "ExpectedInputs":

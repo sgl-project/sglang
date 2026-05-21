@@ -54,8 +54,8 @@ class TokenOracleManager:
         expected_tokens = self.oracle.expected_tokens(
             req_ids=req_ids, positions=positions.to(torch.int64)
         )
-        expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens)
-        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int32))
+        expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
+        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
 
     def sample(self, *, req_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return self.oracle.expected_tokens(

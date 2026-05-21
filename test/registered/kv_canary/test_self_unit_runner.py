@@ -371,21 +371,54 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 call["fb_input_ids"],
-                torch.tensor([101], dtype=torch.int32, device=self.device),
+                torch.tensor([101], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
                 call["fb_positions"],
-                torch.tensor([10], dtype=torch.int32, device=self.device),
+                torch.tensor([10], dtype=torch.int64, device=self.device),
             )
         )
         self.assertTrue(
             torch.equal(
                 call["fb_out_cache_loc"],
-                torch.tensor([7], dtype=torch.int32, device=self.device),
+                torch.tensor([7], dtype=torch.int64, device=self.device),
             )
         )
+
+    def test_launch_endpoints_per_forward_accepts_int32_boundary_tensors(self):
+        """Verify int32 ForwardBatch tensors are promoted at the canary boundary."""
+        group = _make_group(device=self.device)
+        endpoint = _RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
+        forward_batch = _make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
+        forward_batch.input_ids = torch.tensor(
+            [101], dtype=torch.int32, device=self.device
+        )
+        forward_batch.positions = torch.tensor(
+            [10], dtype=torch.int32, device=self.device
+        )
+        forward_batch.out_cache_loc = torch.tensor(
+            [7], dtype=torch.int32, device=self.device
+        )
+
+        launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            input_check_mode=False,
+        )
+
+        call = endpoint.calls[0]
+        self.assertEqual(call["fb_input_ids"].dtype, torch.int64)
+        self.assertEqual(call["fb_positions"].dtype, torch.int64)
+        self.assertEqual(call["fb_out_cache_loc"].dtype, torch.int64)
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         """Verify the kernel watchdog raises when counters stop advancing."""
@@ -553,9 +586,9 @@ class TestPlanRefOverflowGate(CustomTestCase):
     @staticmethod
     def _empty_extras(device):
         return (
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
-            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
+            torch.zeros(1, dtype=torch.int64, device=device),
             torch.zeros(1, dtype=torch.int32, device=device),
         )
 
@@ -568,12 +601,12 @@ class TestPlanRefOverflowGate(CustomTestCase):
         )
         write_plan = WritePlan.allocate(write_req_capacity=bs, device=self.device)
         fb_req_pool_indices = torch.tensor(
-            list(range(1, bs + 1)), dtype=torch.int32, device=self.device
+            list(range(1, bs + 1)), dtype=torch.int64, device=self.device
         )
         fb_prefix_lens = torch.tensor(
-            prefix_lens, dtype=torch.int32, device=self.device
+            prefix_lens, dtype=torch.int64, device=self.device
         )
-        fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=self.device)
+        fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int64, device=self.device)
         req_to_token = torch.arange(
             (bs + 1) * max_seq_len, dtype=torch.int32, device=self.device
         ).reshape(bs + 1, max_seq_len)

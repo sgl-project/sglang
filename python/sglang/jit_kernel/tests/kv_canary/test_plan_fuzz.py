@@ -90,9 +90,9 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
             fb_rpi_list.append(rng.randint(1, max_reqs - 1))
             fb_pfx_list.append(rng.randint(0, max_seq_len - 1))
             fb_ext_list.append(rng.randint(1, max(1, max_seq_len // 4)))
-    fb_rpi = torch.tensor(fb_rpi_list, dtype=torch.int32, device=_DEVICE)
-    fb_pfx = torch.tensor(fb_pfx_list, dtype=torch.int32, device=_DEVICE)
-    fb_ext = torch.tensor(fb_ext_list, dtype=torch.int32, device=_DEVICE)
+    fb_rpi = torch.tensor(fb_rpi_list, dtype=torch.int64, device=_DEVICE)
+    fb_pfx = torch.tensor(fb_pfx_list, dtype=torch.int64, device=_DEVICE)
+    fb_ext = torch.tensor(fb_ext_list, dtype=torch.int64, device=_DEVICE)
 
     total_verify = 0
     for rpi, pfx in zip(fb_rpi_list, fb_pfx_list):
@@ -159,16 +159,16 @@ def _make_extras_for_kind(
     else:
         raise ValueError(f"unknown extras kind {kind}")
     n_valid = min(n_valid, capacity)
-    slots = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    positions = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
+    slots = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
+    positions = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
+    prevs = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
     if n_valid > 0:
         slot_pool = rng.sample(range(500, 500 + max(1000, n_valid * 8)), k=n_valid)
-        slots[:n_valid] = torch.tensor(slot_pool, dtype=torch.int32, device=_DEVICE)
+        slots[:n_valid] = torch.tensor(slot_pool, dtype=torch.int64, device=_DEVICE)
         pos_list = [rng.randint(0, 0xFFFF) for _ in range(n_valid)]
-        positions[:n_valid] = torch.tensor(pos_list, dtype=torch.int32, device=_DEVICE)
+        positions[:n_valid] = torch.tensor(pos_list, dtype=torch.int64, device=_DEVICE)
         prev_list = [-1] + slot_pool[: n_valid - 1]
-        prevs[:n_valid] = torch.tensor(prev_list, dtype=torch.int32, device=_DEVICE)
+        prevs[:n_valid] = torch.tensor(prev_list, dtype=torch.int64, device=_DEVICE)
     num_valid = torch.tensor([n_valid], dtype=torch.int32, device=_DEVICE)
     return slots, positions, prevs, num_valid
 

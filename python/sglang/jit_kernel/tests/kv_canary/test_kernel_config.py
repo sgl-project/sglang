@@ -69,9 +69,9 @@ def _build_write_fixtures(
         req_capacity=4,
         device=device,
     )
-    fb_input_ids = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int32, device=device)
-    fb_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=device)
-    fb_out_cache_loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device=device)
+    fb_input_ids = torch.tensor([10, 20, 30, 40, 50], dtype=torch.int64, device=device)
+    fb_positions = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=device)
+    fb_out_cache_loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int64, device=device)
     return plan_cuda, plan_ref, fb_input_ids, fb_positions, fb_out_cache_loc
 
 
@@ -89,9 +89,9 @@ def _build_plan_fixtures(
     bs = 3
     max_reqs = 4
     max_seq_len = 16
-    fb_req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int32, device=device)
-    fb_prefix_lens = torch.tensor([0, 4, 8], dtype=torch.int32, device=device)
-    fb_extend_seq_lens = torch.tensor([5, 1, 1], dtype=torch.int32, device=device)
+    fb_req_pool_indices = torch.tensor([1, 2, 3], dtype=torch.int64, device=device)
+    fb_prefix_lens = torch.tensor([0, 4, 8], dtype=torch.int64, device=device)
+    fb_extend_seq_lens = torch.tensor([5, 1, 1], dtype=torch.int64, device=device)
     rp_axis = torch.arange(max_reqs, device=device, dtype=torch.int32).unsqueeze(1)
     pos_axis = torch.arange(max_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
     req_to_token_int32 = (rp_axis * max_seq_len + pos_axis).contiguous()
@@ -317,13 +317,13 @@ def test_plan_extras_present_and_per_req_present_cartesian_4_combos(
     req_to_token = (rp_axis * max_seq_len + pos_axis).contiguous()
 
     if per_req_present:
-        fb_rpi = torch.tensor([1, 2], dtype=torch.int32, device=_DEVICE)
-        fb_prefix = torch.tensor([3, 5], dtype=torch.int32, device=_DEVICE)
-        fb_extend = torch.tensor([1, 1], dtype=torch.int32, device=_DEVICE)
+        fb_rpi = torch.tensor([1, 2], dtype=torch.int64, device=_DEVICE)
+        fb_prefix = torch.tensor([3, 5], dtype=torch.int64, device=_DEVICE)
+        fb_extend = torch.tensor([1, 1], dtype=torch.int64, device=_DEVICE)
     else:
-        fb_rpi = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-        fb_prefix = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-        fb_extend = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+        fb_rpi = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
+        fb_prefix = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
+        fb_extend = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
 
     if extras_present:
         extras = make_extras_explicit(

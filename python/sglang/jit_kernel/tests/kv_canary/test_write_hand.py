@@ -54,7 +54,7 @@ _DEVICE = torch.device("cuda")
 
 
 def _int32_tensor(values: list[int]) -> torch.Tensor:
-    return torch.tensor(values, dtype=torch.int32, device=_DEVICE)
+    return torch.tensor(values, dtype=torch.int64, device=_DEVICE)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1297,10 +1297,10 @@ class TestMisc:
         )
 
         garbage_expected_tokens = torch.full(
-            (1,), 0x7F7F7F7F, dtype=torch.int32, device=_DEVICE
+            (1,), 0x7F7F7F7F, dtype=torch.int64, device=_DEVICE
         )
         garbage_expected_positions = torch.full(
-            (1,), 0x7F7F7F7F, dtype=torch.int32, device=_DEVICE
+            (1,), 0x7F7F7F7F, dtype=torch.int64, device=_DEVICE
         )
 
         cuda_log, ref_log = run_write_diff(

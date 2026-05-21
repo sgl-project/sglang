@@ -27,22 +27,22 @@ class PlanInput:
             0 = padding sentinel. Per-forward path: pre-allocated static buffer that the runner
             writes into each step (see Static-buffer contract below). Radix-sweep path: empty.
         fb_prefix_lens: Per-req prefix length already written before this step, shape
-            [bs_capacity], int32. Per-forward extend → extend_prefix_lens; per-forward decode →
+            [bs_capacity], int64. Per-forward extend → extend_prefix_lens; per-forward decode →
             seq_lens - 1; radix-sweep → empty.
-        fb_extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int32.
+        fb_extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Per-forward → extend or all-ones (decode); radix-sweep → empty.
         extra_verify_slot_indices: Pre-walked flat verify slots, shape [extra_verify_capacity],
-            int32. Caller-translated to the target index space (SWA-aware if running on the SWA
+            int64. Caller-translated to the target index space (SWA-aware if running on the SWA
             group).
-        extra_verify_positions: Same shape, int32. Expected position per extra entry.
-        extra_verify_prev_slot_indices: Same shape, int32. -1 for chain-seed extras.
+        extra_verify_positions: Same shape, int64. Expected position per extra entry.
+        extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
         extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for the per-forward
             caller.
 
     extra_verify_capacity is per-runner: per-forward path uses 0 (path doesn't emit extras);
     radix-sweep path uses total-pool-slots (worst case radix-orphan covers entire pool).
-    Allocated up front by CanaryRunner. ForwardBatch.positions has dtype-by-backend (cuda=int32,
-    hip/npu=int64) — runner casts to int32 before passing to canary_write_step if needed.
+    Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as
+    int32 or int64 at the boundary; canary canonicalizes them to int64 internally.
 
     **Static-buffer contract (cuda-graph correctness, per-forward path only)**: the per-forward
     PlanInput's tensors are allocated once during CanaryRunner.__init__ (sized for the worst-case
@@ -75,18 +75,18 @@ class PlanInput:
             fb_req_pool_indices=torch.zeros(
                 bs_capacity, dtype=torch.int64, device=device
             ),
-            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
+            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
             fb_extend_seq_lens=torch.zeros(
-                bs_capacity, dtype=torch.int32, device=device
+                bs_capacity, dtype=torch.int64, device=device
             ),
             extra_verify_slot_indices=torch.zeros(
-                extra_verify_capacity, dtype=torch.int32, device=device
+                extra_verify_capacity, dtype=torch.int64, device=device
             ),
             extra_verify_positions=torch.zeros(
-                extra_verify_capacity, dtype=torch.int32, device=device
+                extra_verify_capacity, dtype=torch.int64, device=device
             ),
             extra_verify_prev_slot_indices=torch.zeros(
-                extra_verify_capacity, dtype=torch.int32, device=device
+                extra_verify_capacity, dtype=torch.int64, device=device
             ),
             extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
         )
@@ -142,7 +142,7 @@ def fill_plan_input_per_forward(
     spec_info = forward_batch.spec_info
     if forward_mode is None or forward_mode.is_decode_or_idle():
         plan_input_out.fb_prefix_lens[:bs].copy_(
-            (forward_batch.seq_lens[:bs] - 1).to(torch.int32)
+            (forward_batch.seq_lens[:bs] - 1).to(torch.int64)
         )
         plan_input_out.fb_extend_seq_lens[:bs].fill_(1)
     elif forward_mode.is_target_verify():
@@ -150,7 +150,7 @@ def fill_plan_input_per_forward(
         # forward_mode and assigns out_cache_loc for positions [seq_lens, seq_lens +
         # draft_token_num)). So prefix == current seq_lens, extend == uniform draft_token_num.
         plan_input_out.fb_prefix_lens[:bs].copy_(
-            forward_batch.seq_lens[:bs].to(torch.int32)
+            forward_batch.seq_lens[:bs].to(torch.int64)
         )
         plan_input_out.fb_extend_seq_lens[:bs].fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
@@ -158,19 +158,19 @@ def fill_plan_input_per_forward(
         # adds num_draft_tokens). forward_batch.extend_seq_lens is populated in both eager (via
         # init_new) and cuda-graph (the synthetic ForwardBatch sets it explicitly); only
         # extend_prefix_lens is missing in cuda-graph, so derive it as seq_lens - extend_seq_lens.
-        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int32)
+        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int64)
         plan_input_out.fb_extend_seq_lens[:bs].copy_(extend_seq_lens)
         plan_input_out.fb_prefix_lens[:bs].copy_(
-            forward_batch.seq_lens[:bs].to(torch.int32) - extend_seq_lens
+            forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
         )
     else:
         # EXTEND / MIXED / DRAFT_EXTEND / SPLIT_PREFILL / DLLM_EXTEND — extend_*_lens guaranteed
         # populated by init_new's else branch.
         plan_input_out.fb_prefix_lens[:bs].copy_(
-            forward_batch.extend_prefix_lens.to(torch.int32)
+            forward_batch.extend_prefix_lens.to(torch.int64)
         )
         plan_input_out.fb_extend_seq_lens[:bs].copy_(
-            forward_batch.extend_seq_lens.to(torch.int32)
+            forward_batch.extend_seq_lens.to(torch.int64)
         )
 
     return bs
@@ -214,8 +214,8 @@ def build_plan_input_radix_sweep(
     num_valid = int(slot_indices.shape[0])
 
     fb_req_pool_indices = torch.empty(0, dtype=torch.int64, device=device)
-    fb_prefix_lens = torch.empty(0, dtype=torch.int32, device=device)
-    fb_extend_seq_lens = torch.empty(0, dtype=torch.int32, device=device)
+    fb_prefix_lens = torch.empty(0, dtype=torch.int64, device=device)
+    fb_extend_seq_lens = torch.empty(0, dtype=torch.int64, device=device)
     extra_num_valid = torch.tensor([num_valid], dtype=torch.int32, device=device)
 
     return PlanInput(
@@ -247,7 +247,7 @@ def walk_radix_cache_for_canary(
     - The first slot of a root node's first child has predecessor = -1 (chain-seed anchor).
     - Position = depth-from-root of the slot.
 
-    Returns three host int32 tensors (then runner H2D-copies). NOT SWA-translated — caller does
+    Returns three host int64 tensors (then runner H2D-copies). NOT SWA-translated — caller does
     the LUT lookup before packing into PlanInput.
 
     Args:
@@ -283,9 +283,9 @@ def walk_radix_cache_for_canary(
         unlocked_only=unlocked_only,
     )
 
-    slot_tensor = torch.tensor(slot_buf, dtype=torch.int32)
-    position_tensor = torch.tensor(position_buf, dtype=torch.int32)
-    prev_slot_tensor = torch.tensor(prev_slot_buf, dtype=torch.int32)
+    slot_tensor = torch.tensor(slot_buf, dtype=torch.int64)
+    position_tensor = torch.tensor(position_buf, dtype=torch.int64)
+    prev_slot_tensor = torch.tensor(prev_slot_buf, dtype=torch.int64)
     return slot_tensor, position_tensor, prev_slot_tensor
 
 
@@ -360,12 +360,12 @@ def _swa_translate(
 ) -> torch.Tensor:
     if indices.numel() == 0:
         return indices
-    lut_dev = lut.to(indices.device).to(torch.int32)
+    lut_dev = lut.to(indices.device).to(torch.int64)
     sentinel_mask = indices < 0
     safe = torch.where(sentinel_mask, torch.zeros_like(indices), indices).to(
         torch.int64
     )
     translated = lut_dev[safe]
     return torch.where(
-        sentinel_mask, indices.to(torch.int32), translated.to(torch.int32)
+        sentinel_mask, indices.to(torch.int64), translated.to(torch.int64)
     )

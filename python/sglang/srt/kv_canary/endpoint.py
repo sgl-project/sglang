@@ -90,25 +90,19 @@ class CanaryEndpoint:
             real_kv_hash_mode=real_kv_hash_mode,
         )
 
-        # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel —
-        # the kernel itself is SWA-agnostic and only honours "slot < 0 ⇒ skip". Under cuda-graph capture the
-        # implicit casts/gather below are routed through PyTorch's private mempool — addresses are pinned on
-        # first capture and reused on replay.
-        fb_input_ids_for_canary = fb_input_ids.to(torch.int32)
-        fb_positions_for_canary = fb_positions.to(torch.int32)
+        # SWA endpoints translate the per-token slot indices host-side before invoking the write kernel.
         if self.full_to_swa_index_mapping is not None:
             fb_out_cache_loc_for_canary = self.full_to_swa_index_mapping[
-                fb_out_cache_loc.to(torch.int64)
+                fb_out_cache_loc
             ]
         else:
             fb_out_cache_loc_for_canary = fb_out_cache_loc
-        fb_out_cache_loc_for_canary = fb_out_cache_loc_for_canary.to(torch.int32)
 
         canary_write_step(
             canary_buf=self.canary_buf,
             plan=write_plan,
-            fb_input_ids=fb_input_ids_for_canary,
-            fb_positions=fb_positions_for_canary,
+            fb_input_ids=fb_input_ids,
+            fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
             enable_write_verify_inputs=input_check_mode,
