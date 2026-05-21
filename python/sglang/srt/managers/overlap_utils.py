@@ -119,8 +119,6 @@ class FutureMap:
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
-        """Schedule-stream D2H from new_seq_lens_buf into batch.seq_lens_cpu,
-        gated on publish_ready. No-op when there's no future state yet."""
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
@@ -130,15 +128,9 @@ class FutureMap:
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def publish(
-        self,
-        future_indices: FutureIndices,
-        new_seq_lens: torch.Tensor,
+        self, future_indices: FutureIndices, new_seq_lens: torch.Tensor
     ) -> None:
-        """Forward stream. Writes schedule-consumed buf (new_seq_lens_buf)
-        and records the fence — making the write visible to schedule stream.
-        Fired by worker callback at sample-end (verify-end for decode,
-        target-end for extend). Spec only — non-spec has no schedule
-        consumer."""
+        """Store schedule-consumed fields and signal publish_ready."""
         if self.spec_algo.is_none():
             return
         indices = future_indices.indices
@@ -150,12 +142,7 @@ class FutureMap:
         self.publish_ready.record()
 
     def stash(self, future_indices: FutureIndices, payload) -> None:
-        """Forward stream. Writes forward-only buf fields. Next iter's
-        resolve_future reads them on forward stream — same-stream FIFO covers,
-        no fence needed.
-
-        payload is `next_token_ids` tensor for non-spec, EagleDraftInput for
-        spec (the disagg bootstrap path passes the spec_info directly)."""
+        """Store forward-only fields for the next forward batch to pick up."""
         indices = future_indices.indices
         if indices.shape[0] == 0:
             return  # DP idle
