@@ -403,13 +403,13 @@ class ViTCudaGraphRunner:
         total_tokens = x.shape[0]
         bucket = self.find_bucket(total_tokens)
 
-        # # Fast path: fits in a bucket
-        # if bucket is not None:
-        #     return self.replay(
-        #         bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
-        #     )
+        # Fast path: fits in a bucket
+        if bucket is not None:
+            return self.replay(
+                bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
+            )
 
-        # DEBUG: skip replay, always eager
+        # Fallback: total tokens exceed max bucket, run eager
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )

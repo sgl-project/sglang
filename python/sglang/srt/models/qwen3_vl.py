@@ -460,15 +460,29 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        import logging
+        import time as _time
+
+        logger = logging.getLogger(__name__)
         deepstack_outs: List[torch.Tensor] = []
         ds_idx = 0
         for layer_num, blk in enumerate(self.blocks):
+            t0 = _time.monotonic()
             x = blk(
                 x,
                 forward_metadata=forward_metadata,
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
             )
+            torch.cuda.synchronize()
+            dt = (_time.monotonic() - t0) * 1000
+            if dt > 50:
+                logger.info(
+                    "[VIT_BLOCK] layer=%d tokens=%d time=%.1fms",
+                    layer_num,
+                    x.shape[0],
+                    dt,
+                )
             if layer_num in self.deepstack_visual_indexes:
                 ds_out = self.deepstack_merger_list[ds_idx](x)
                 deepstack_outs.append(ds_out)
