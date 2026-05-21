@@ -702,8 +702,11 @@ class Envs:
     # EPD
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
-
+    # Persistent receiver-side GPU embedding pool size for mooncake EPD transport.
+    # 0 disables (per-request register/deregister). 4096 = 4GB default per TP
+    SGLANG_EMBEDDING_POOL_SIZE_MB = EnvInt(4096)
     # Elastic EP Backup Port
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
