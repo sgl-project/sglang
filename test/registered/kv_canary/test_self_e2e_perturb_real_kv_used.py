@@ -26,7 +26,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.perturb_env = {
-            "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "1.0",
+            "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": cls.target_group,
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }

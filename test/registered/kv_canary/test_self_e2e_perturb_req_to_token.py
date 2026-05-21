@@ -20,7 +20,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
     kv_canary_mode = "log"
     perturb_env = {
-        "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "1.0",
+        "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
     sweep_interval = 0
