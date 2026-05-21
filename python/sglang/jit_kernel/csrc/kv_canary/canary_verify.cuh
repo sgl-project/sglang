@@ -49,10 +49,10 @@ struct VerifyKernelParams {
 };
 
 __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ p) {
-  const uint32_t lane_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t stride = gridDim.x * blockDim.x;
 
-  if (lane_tid == 0) {
+  if (tid == 0) {
     atomicAdd(reinterpret_cast<unsigned long long*>(p.kernel_run_counter), 1ULL);
   }
 
@@ -63,12 +63,12 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   const int32_t active = *p.verify_num_valid;
 
   uint32_t local_active_count = 0;
-  for (uint32_t entry = lane_tid; entry < static_cast<uint32_t>(active); entry += stride) {
+  for (uint32_t entry_idx = tid; entry_idx < static_cast<uint32_t>(active); entry_idx += stride) {
     ++local_active_count;
 
-    const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[entry]);
-    const int64_t expected_position = static_cast<int64_t>(p.verify_positions[entry]);
-    const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[entry]);
+    const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[entry_idx]);
+    const int64_t expected_position = static_cast<int64_t>(p.verify_positions[entry_idx]);
+    const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[entry_idx]);
 
     if (slot_idx == kCanaryReservedSlot) {
       continue;
