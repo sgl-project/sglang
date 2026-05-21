@@ -442,8 +442,12 @@ class EAGLEDraftCudaGraphRunner:
             "EagleDraftCudaGraphRunner.replay: topk_index vs vocab_size="
             f"{self.model_runner.model_config.vocab_size}",
         )
-        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
-        buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
+        buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p.clamp(0, 1))
+        buffers.topk_index[:raw_bs].copy_(
+            forward_batch.spec_info.topk_index.clamp(
+                0, self.model_runner.model_config.vocab_size - 1
+            )
+        )
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None

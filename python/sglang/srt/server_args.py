@@ -707,6 +707,7 @@ class ServerArgs:
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
+    disable_draft_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
@@ -6440,6 +6441,11 @@ class ServerArgs:
             "--disable-cuda-graph",
             action="store_true",
             help="Disable cuda graph.",
+        )
+        parser.add_argument(
+            "--disable-draft-cuda-graph",
+            action="store_true",
+            help="Disable cuda graph for draft model in speculative decoding.",
         )
         parser.add_argument(
             "--disable-cuda-graph-padding",
