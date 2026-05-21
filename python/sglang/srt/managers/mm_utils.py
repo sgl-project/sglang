@@ -566,8 +566,6 @@ def _get_chunked_embedding_by_item(
         miss_item_list = [item for _, item, _, _ in miss_items]
         _move_items_to_device(miss_item_list, device)
         if _VLM_PROFILE:
-            import torch
-
             torch.cuda.synchronize()
             _vit_t0 = _time.monotonic()
         all_miss_embedding = data_embedding_func(miss_item_list)
