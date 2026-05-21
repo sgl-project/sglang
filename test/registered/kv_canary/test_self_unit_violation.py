@@ -42,14 +42,17 @@ def test_format_violation_verify_path_labels_each_bit() -> None:
         ),
     )
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=7)
-    assert "chain_hash" in out
-    assert "position" in out
-    assert "real_kv_hash" in out
-    assert "write_token" not in out
-    assert "write_position" not in out
-    assert "stored:" in out
-    assert "prev_hash=0x1111111111111111" in out
-    assert "prev_hash=0x2222222222222222" in out
+    assert out == (
+        "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash+position+real_kv_hash "
+        "slot_idx=17 position=42 stored_token=111 expected_token=0 stored_chain_hash=0x1111111111111111 "
+        "expected_aux=0x2222222222222222\n"
+        "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
+        "canary_kind:       per_forward_head_k_full\n"
+        "  fail_reasons: chain_hash position real_kv_hash\n"
+        "  stored:   token_id=111   position=42 prev_hash=0x1111111111111111\n"
+        "  expected: prev_hash=0x2222222222222222\n"
+        "  total_violations=1 ring_overflow=False step_when_pumped=7"
+    )
 
 
 def test_format_violation_write_token_mismatch_labels_and_position() -> None:
@@ -63,14 +66,17 @@ def test_format_violation_write_token_mismatch_labels_and_position() -> None:
         fail_reason_bits=int(FailReason.WRITE_TOKEN_MISMATCH),
     )
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
-    assert "write_token" in out
-    assert "fail_reasons: none" not in out
-    assert "actual:" in out
-    assert "token_id=999" in out
-    assert "token_id=888" in out
-    assert "position=43" in out
-    # expected_aux must NOT be rendered as a chain hash on the write path.
-    assert "prev_hash=0x000000000000002b" not in out
+    assert out == (
+        "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=write_token slot_idx=17 position=42 "
+        "stored_token=999 expected_token=888 stored_chain_hash=0xdeadbeefcafebabe "
+        "expected_aux=0x000000000000002b\n"
+        "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
+        "canary_kind:       per_forward_head_k_full\n"
+        "  fail_reasons: write_token\n"
+        "  actual:   token_id=999   position=42 prev_hash=0xdeadbeefcafebabe\n"
+        "  expected: token_id=888   position=43\n"
+        "  total_violations=1 ring_overflow=False step_when_pumped=0"
+    )
 
 
 def test_format_violation_write_position_mismatch_uses_expected_aux_as_position() -> (
@@ -85,9 +91,17 @@ def test_format_violation_write_position_mismatch_uses_expected_aux_as_position(
         fail_reason_bits=int(FailReason.WRITE_POSITION_MISMATCH),
     )
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
-    assert "write_position" in out
-    assert "position=42" in out
-    assert "position=99" in out
+    assert out == (
+        "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=write_position slot_idx=17 position=42 "
+        "stored_token=111 expected_token=111 stored_chain_hash=0x0000000000000000 "
+        "expected_aux=0x0000000000000063\n"
+        "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
+        "canary_kind:       per_forward_head_k_full\n"
+        "  fail_reasons: write_position\n"
+        "  actual:   token_id=111   position=42 prev_hash=0x0000000000000000\n"
+        "  expected: token_id=111   position=99\n"
+        "  total_violations=1 ring_overflow=False step_when_pumped=0"
+    )
 
 
 def test_format_violation_combined_write_bits_render_both_labels() -> None:
@@ -98,8 +112,17 @@ def test_format_violation_combined_write_bits_render_both_labels() -> None:
         ),
     )
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
-    assert "write_token" in out
-    assert "write_position" in out
+    assert out == (
+        "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=write_token+write_position "
+        "slot_idx=17 position=42 stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+        "expected_aux=0x0000000000000000\n"
+        "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=17, position=42)\n"
+        "canary_kind:       per_forward_head_k_full\n"
+        "  fail_reasons: write_token write_position\n"
+        "  actual:   token_id=111   position=42 prev_hash=0x0000000000000000\n"
+        "  expected: token_id=0   position=0\n"
+        "  total_violations=1 ring_overflow=False step_when_pumped=0"
+    )
 
 
 def test_format_violation_unknown_kernel_kind_renders_unknown_label() -> None:
@@ -107,4 +130,14 @@ def test_format_violation_unknown_kernel_kind_renders_unknown_label() -> None:
     row = _make_row(fail_reason_bits=int(FailReason.CHAIN_HASH))
     row[consts.VIOLATION_FIELD_KERNEL_KIND] = 9999
     out = _format_violation(row=row, total=1, ring_overflow=False, step_when_pumped=0)
-    assert "unknown(9999)" in out
+    assert out == (
+        "kv_canary violation: launch_tag=unknown(9999) fail_reason=chain_hash slot_idx=17 position=42 "
+        "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+        "expected_aux=0x0000000000000000\n"
+        "KV cache canary violation detected (kernel_kind=unknown(9999), slot_idx=17, position=42)\n"
+        "canary_kind:       unknown(9999)\n"
+        "  fail_reasons: chain_hash\n"
+        "  stored:   token_id=111   position=42 prev_hash=0x0000000000000000\n"
+        "  expected: prev_hash=0x0000000000000000\n"
+        "  total_violations=1 ring_overflow=False step_when_pumped=0"
+    )
