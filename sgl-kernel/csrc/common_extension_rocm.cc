@@ -93,7 +93,8 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.def("get_meta_buffer_ipc_handle", &get_meta_buffer_ipc_handle);
   m.impl("get_meta_buffer_ipc_handle", torch::kCPU, &get_meta_buffer_ipc_handle);
 
-  // quick allreduce
+  // quick allreduce — CDNA only (uses MUBUF instructions unavailable on RDNA)
+#ifndef SGL_IS_RDNA
   m.def(
       "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
       "cast_bf2half) -> ()");
@@ -109,6 +110,7 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
 
   // Max input size in bytes
   m.def("qr_max_size", &qr_max_size);
+#endif  // !SGL_IS_RDNA
 
   /*
    * From csrc/moe
