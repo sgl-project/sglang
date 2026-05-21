@@ -9,6 +9,8 @@ Registry: nightly-amd-accuracy-8-gpu-mi35x-deepseek-v32-dp suite
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -35,6 +37,7 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 GSM8K_ACCURACY_THRESHOLD = 0.935
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV32DP(CustomTestCase):
     """Test DeepSeek V3.2 with DP=8 + TP=8 + dp-attention.
 

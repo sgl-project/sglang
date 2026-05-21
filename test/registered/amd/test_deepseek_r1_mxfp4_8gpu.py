@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -22,6 +23,7 @@ DEEPSEEK_R1_MODEL_PATH = "amd/DeepSeek-R1-MXFP4-Preview"
 SERVER_LAUNCH_TIMEOUT = 1800
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekR1MXFP4(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -93,6 +95,7 @@ class TestDeepseekR1MXFP4(CustomTestCase):
         self.assertGreater(speed, 75)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekR1MXFP4MTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
