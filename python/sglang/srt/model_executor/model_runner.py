@@ -2423,10 +2423,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.supports_target_verify_for_draft():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            num_tokens_per_bs = (
+                self.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
+                    self.server_args.speculative_num_draft_tokens, self.is_draft_worker
+                )
+            )
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2783,7 +2787,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
-    def init_piecewise_cuda_graphs(self):
+    def init_piecewise_cuda_graphs(self, force_for_draft_worker: bool = False):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
@@ -2793,8 +2797,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Draft models use decode CUDA graphs, not PCG
-        if self.is_draft_worker:
+        # Draft models skip here during __init__; the eagle worker calls
+        # this method explicitly (force_for_draft_worker=True) after
+        # init_lm_head so graphs capture the final embedding weights.
+        if self.is_draft_worker and not force_for_draft_worker:
             return
 
         # Disable piecewise CUDA graph for non-language models

@@ -536,6 +536,10 @@ class ServerArgs:
     prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
+    # Name of a custom radix-cache factory registered via
+    # register_radix_cache_backend. Leave unset (by default) to use the
+    # built-in default cache selection chain.
+    radix_cache_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
@@ -3739,11 +3743,7 @@ class ServerArgs:
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
 
-            if self.disable_piecewise_cuda_graph:
-                self.disable_cuda_graph = True
-                logger.warning(
-                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
-                )
+            self.disable_cuda_graph = True
 
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
@@ -5372,6 +5372,16 @@ class ServerArgs:
             choices=GRAMMAR_BACKEND_CHOICES,
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--radix-cache-backend",
+            type=str,
+            default=ServerArgs.radix_cache_backend,
+            help=(
+                "Name of a radix-cache backend previously registered via "
+                "register_radix_cache_backend. Omit this flag to use the "
+                "built-in default cache selection chain."
+            ),
         )
         parser.add_argument(
             "--mm-attention-backend",
