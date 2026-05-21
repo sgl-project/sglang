@@ -42,9 +42,9 @@ def invoke_plan(
     launch_canary_plan_kernels(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,
-        fb_req_pool_indices=plan_input.fb_req_pool_indices,
-        fb_prefix_lens=plan_input.fb_prefix_lens,
-        fb_extend_seq_lens=plan_input.fb_extend_seq_lens,
+        req_pool_indices=plan_input.req_pool_indices,
+        prefix_lens=plan_input.prefix_lens,
+        extend_seq_lens=plan_input.extend_seq_lens,
         req_to_token=req_to_token,
         swa_window_size=window,
         full_to_swa_index_mapping=group.swa_index_lut,

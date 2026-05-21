@@ -37,13 +37,13 @@ class TestPlanRefOverflowGate(CustomTestCase):
             verify_capacity=verify_capacity, device=self.device
         )
         write_plan = WritePlan.allocate(write_req_capacity=bs, device=self.device)
-        fb_req_pool_indices = torch.tensor(
+        req_pool_indices = torch.tensor(
             list(range(1, bs + 1)), dtype=torch.int64, device=self.device
         )
-        fb_prefix_lens = torch.tensor(
+        prefix_lens = torch.tensor(
             prefix_lens, dtype=torch.int64, device=self.device
         )
-        fb_extend_seq_lens = torch.zeros(bs, dtype=torch.int64, device=self.device)
+        extend_seq_lens = torch.zeros(bs, dtype=torch.int64, device=self.device)
         req_to_token = torch.arange(
             (bs + 1) * max_seq_len, dtype=torch.int32, device=self.device
         ).reshape(bs + 1, max_seq_len)
@@ -51,9 +51,9 @@ class TestPlanRefOverflowGate(CustomTestCase):
         run_canary_plan_torch_reference(
             verify_plan_out=verify_plan,
             write_plan_out=write_plan,
-            fb_req_pool_indices=fb_req_pool_indices,
-            fb_prefix_lens=fb_prefix_lens,
-            fb_extend_seq_lens=fb_extend_seq_lens,
+            req_pool_indices=req_pool_indices,
+            prefix_lens=prefix_lens,
+            extend_seq_lens=extend_seq_lens,
             req_to_token=req_to_token,
             extra_verify_slot_indices=extras[0],
             extra_verify_positions=extras[1],

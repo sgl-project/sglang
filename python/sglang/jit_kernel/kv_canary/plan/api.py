@@ -19,39 +19,36 @@ def launch_canary_plan_kernels(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
 ) -> None:
-    """Fill verify_plan_out + write_plan_out from ForwardBatch primitives.
+    """Fill verify_plan_out + write_plan_out from normalized canary plan inputs.
 
-    For each req r with fb_req_pool_indices[r] != 0 (0 = padding sentinel):
+    For each req r with req_pool_indices[r] != 0 (0 = padding sentinel):
 
-    - **Verify entries**: one per pos in [window_start, fb_prefix_lens[r]), where window_start = max(0,
-      fb_prefix_lens[r] - swa_window_size) if SWA else 0. slot_idx = req_to_token[fb_req_pool_indices[r], pos]
+    - **Verify entries**: one per pos in [window_start, prefix_lens[r]), where window_start = max(0,
+      prefix_lens[r] - swa_window_size) if SWA else 0. slot_idx = req_to_token[req_pool_indices[r], pos]
       (SWA-translated via full_to_swa_index_mapping if non-None); prev_slot_idx =
-      req_to_token[fb_req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
+      req_to_token[req_pool_indices[r], pos-1] for pos > 0, else -1. (SWA windows do NOT reset the chain —
       the writer chains across the entire prefix; sweep verify within an SWA window dereferences the real
       predecessor for chain-link reconstruction.)
-    - **Write metadata** (when fb_extend_seq_lens[r] > 0): contribute fb_extend_seq_lens[r] to the per-req
-      write count (for write_offsets cumsum). Per-req chain seed = req_to_token[fb_req_pool_indices[r],
-      fb_prefix_lens[r]-1] (SWA-translated), or -1 if fb_prefix_lens[r] == 0. Per-token write data
+    - **Write metadata** (when extend_seq_lens[r] > 0): contribute extend_seq_lens[r] to the per-req
+      write count (for write_offsets cumsum). Per-req chain seed = req_to_token[req_pool_indices[r],
+      prefix_lens[r]-1] (SWA-translated), or -1 if prefix_lens[r] == 0. Per-token write data
       (fb_input_ids / fb_positions / fb_out_cache_loc) is NOT materialized here — launch_canary_write_kernel
       reads it directly from ForwardBatch via write_offsets.
 
     Args:
         verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
         write_plan_out: Pre-allocated WritePlan; filled in-place.
-        fb_req_pool_indices: ForwardBatch.req_pool_indices; per-row ReqToTokenPool row index, shape [bs],
-            int64. 0 is the padding sentinel.
-        fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int64. Caller
-            normalizes: extend → ForwardBatch.extend_prefix_lens, decode → ForwardBatch.seq_lens - 1.
-        fb_extend_seq_lens: ForwardBatch.extend_seq_lens; per-req tokens being written this step, shape [bs],
-            int64. 1 for pure decode.
+        req_pool_indices: Per-row ReqToTokenPool row index, shape [bs], int64. 0 is the padding sentinel.
+        prefix_lens: Per-req prefix length already written before this step, shape [bs], int64.
+        extend_seq_lens: Per-req tokens being written this step, shape [bs], int64.
         req_to_token: ReqToTokenPool.req_to_token; full-pool slot index table, shape [max_reqs, max_seq_len],
             int32.
         swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
@@ -63,7 +60,7 @@ def launch_canary_plan_kernels(
     Implementation:
         - Two sub-kernels with action-named identifiers, launched in sequence:
           1. ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
-             reads fb_req_pool_indices[r], fb_prefix_lens[r], fb_extend_seq_lens[r] for each r; computes
+             reads req_pool_indices[r], prefix_lens[r], extend_seq_lens[r] for each r; computes
              verify_count = (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0
              padding); gathers seed_slot_full = req_to_token[rp, prefix_lens - 1] (or -1 if prefix_lens == 0),
              SWA-translates seed_slot via full_to_swa_index_mapping[seed_slot_full] if non-None; runs
@@ -71,7 +68,7 @@ def launch_canary_plan_kernels(
              write_plan_out.write_offsets[bs+1] in-place; scatters write_seed slots; writes scalar totals
              ``verify_plan_out.verify_num_valid`` and ``write_plan_out.write_num_valid_reqs``.
           2. ``_plan_entries_kernel`` (2-D grid ``(bs, max_j_tiles)``, masked by per-req verify_count): for
-             each (r, j) with j < verify_count[r], gather slot = req_to_token[fb_req_pool_indices[r],
+             each (r, j) with j < verify_count[r], gather slot = req_to_token[req_pool_indices[r],
              window_start[r] + j] (SWA-translated), prev_slot = req_to_token[..., window_start[r] + j - 1]
              when (window_start[r] + j) > 0 (also translated) else -1, position = window_start[r] + j;
              scatter (slot, position, prev_slot) into verify_plan_out at flat index verify_offsets[r] + j.
@@ -87,7 +84,7 @@ def launch_canary_plan_kernels(
     :func:`sglang.jit_kernel.kv_canary.plan_ref.run_canary_plan_torch_reference`; Triton must match
     byte-for-byte.
     """
-    bs = int(fb_req_pool_indices.shape[0])
+    bs = int(req_pool_indices.shape[0])
     if bs > _PLAN_BS_BLOCK_SIZE:
         raise ValueError(
             f"kv-canary: launch_canary_plan_kernels supports at most bs={_PLAN_BS_BLOCK_SIZE} reqs per launch, "
@@ -117,9 +114,9 @@ def launch_canary_plan_kernels(
     # Offsets kernel: per-req count + seed gather + block-level cumsum, single program; the num_valid
     # scalars are written by the same program (it has the totals in registers already).
     launch_plan_offsets_kernel(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
         req_to_token=req_to_token,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         out_verify_offsets_scratch=verify_offsets_scratch,
@@ -136,8 +133,8 @@ def launch_canary_plan_kernels(
     # verify_capacity (each req cannot contribute more than verify_capacity entries); we mask per-req actual
     # count read back from verify_offsets_scratch inside the kernel.
     launch_plan_entries_kernel(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
         req_to_token=req_to_token,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_offsets_scratch=verify_offsets_scratch,

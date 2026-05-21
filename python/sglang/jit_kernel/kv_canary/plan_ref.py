@@ -12,16 +12,16 @@ def run_canary_plan_torch_reference(
     *,
     verify_plan_out: VerifyPlan,
     write_plan_out: WritePlan,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_capacity: int,
 ) -> None:
     """Python reference for :func:`launch_canary_plan_kernels`. Same signature & byte-equal semantics."""
-    bs = int(fb_req_pool_indices.shape[0])
+    bs = int(req_pool_indices.shape[0])
     work_device = torch.device("cpu")
 
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
@@ -32,11 +32,11 @@ def run_canary_plan_torch_reference(
         )
     write_req_capacity = int(write_plan_out.write_seed_slot_indices.shape[0])
 
-    req_pool_indices_host = fb_req_pool_indices.detach().to(
+    req_pool_indices_host = req_pool_indices.detach().to(
         device=work_device, dtype=torch.int64
     )
-    prefix_lens_host = fb_prefix_lens.detach().to(device=work_device, dtype=torch.int64)
-    extend_seq_lens_host = fb_extend_seq_lens.detach().to(
+    prefix_lens_host = prefix_lens.detach().to(device=work_device, dtype=torch.int64)
+    extend_seq_lens_host = extend_seq_lens.detach().to(
         device=work_device, dtype=torch.int64
     )
     req_to_token_host = req_to_token.detach().to(device=work_device, dtype=torch.int64)

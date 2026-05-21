@@ -27,9 +27,9 @@ _PLAN_BS_BLOCK_SIZE: int = 4096
 
 def launch_plan_offsets_kernel(
     *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     out_verify_offsets_scratch: torch.Tensor,
@@ -41,7 +41,7 @@ def launch_plan_offsets_kernel(
     swa_window_size: int,
     verify_capacity: int,
 ) -> None:
-    bs = int(fb_req_pool_indices.shape[0])
+    bs = int(req_pool_indices.shape[0])
     lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
         full_to_swa_index_mapping, out_verify_offsets_scratch.device
     )
@@ -50,9 +50,9 @@ def launch_plan_offsets_kernel(
     write_req_capacity = int(out_write_seed_slot_indices.shape[0])
 
     _validate_offsets_kernel_inputs(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
-        fb_extend_seq_lens=fb_extend_seq_lens,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        extend_seq_lens=extend_seq_lens,
         req_to_token=req_to_token,
         lut_tensor=lut_tensor,
         out_verify_offsets_scratch=out_verify_offsets_scratch,
@@ -71,9 +71,9 @@ def launch_plan_offsets_kernel(
     )
 
     _plan_offsets_kernel[(1,)](
-        fb_req_pool_indices,
-        fb_prefix_lens,
-        fb_extend_seq_lens,
+        req_pool_indices,
+        prefix_lens,
+        extend_seq_lens,
         req_to_token,
         lut_tensor,
         out_verify_offsets_scratch,
@@ -96,9 +96,9 @@ def launch_plan_offsets_kernel(
 
 def _validate_offsets_kernel_inputs(
     *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
-    fb_extend_seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     lut_tensor: torch.Tensor,
     out_verify_offsets_scratch: torch.Tensor,
@@ -115,9 +115,9 @@ def _validate_offsets_kernel_inputs(
     write_req_capacity: int,
     verify_capacity: int,
 ) -> None:
-    _assert_contiguous(fb_req_pool_indices, "fb_req_pool_indices")
-    _assert_contiguous(fb_prefix_lens, "fb_prefix_lens")
-    _assert_contiguous(fb_extend_seq_lens, "fb_extend_seq_lens")
+    _assert_contiguous(req_pool_indices, "req_pool_indices")
+    _assert_contiguous(prefix_lens, "prefix_lens")
+    _assert_contiguous(extend_seq_lens, "extend_seq_lens")
     _assert_contiguous(req_to_token, "req_to_token")
     _assert_contiguous(lut_tensor, "lut_tensor")
     _assert_contiguous(out_verify_offsets_scratch, "out_verify_offsets_scratch")
@@ -127,9 +127,9 @@ def _validate_offsets_kernel_inputs(
     _assert_contiguous(out_verify_enable, "out_verify_enable")
     _assert_contiguous(out_write_num_valid_reqs, "out_write_num_valid_reqs")
 
-    _require_dtype(fb_req_pool_indices, "fb_req_pool_indices", torch.int64)
-    _require_dtype(fb_prefix_lens, "fb_prefix_lens", torch.int64)
-    _require_dtype(fb_extend_seq_lens, "fb_extend_seq_lens", torch.int64)
+    _require_dtype(req_pool_indices, "req_pool_indices", torch.int64)
+    _require_dtype(prefix_lens, "prefix_lens", torch.int64)
+    _require_dtype(extend_seq_lens, "extend_seq_lens", torch.int64)
     _require_dtype(req_to_token, "req_to_token", torch.int32)
     _require_dtype(lut_tensor, "lut_tensor", torch.int64)
     _require_dtype(
@@ -174,9 +174,9 @@ def _validate_offsets_kernel_inputs(
     if not has_swa_lut and lut_len != 0:
         raise ValueError("kv-canary: lut_len must be 0 when has_swa_lut is False")
 
-    _require_len(fb_req_pool_indices, "fb_req_pool_indices", bs)
-    _require_len(fb_prefix_lens, "fb_prefix_lens", bs)
-    _require_len(fb_extend_seq_lens, "fb_extend_seq_lens", bs)
+    _require_len(req_pool_indices, "req_pool_indices", bs)
+    _require_len(prefix_lens, "prefix_lens", bs)
+    _require_len(extend_seq_lens, "extend_seq_lens", bs)
     _require_2d(req_to_token, "req_to_token")
     _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
     _require_min_len(
@@ -214,9 +214,9 @@ def _validate_offsets_kernel_inputs(
         out_verify_offsets_scratch,
         "out_verify_offsets_scratch",
         (
-            (fb_req_pool_indices, "fb_req_pool_indices"),
-            (fb_prefix_lens, "fb_prefix_lens"),
-            (fb_extend_seq_lens, "fb_extend_seq_lens"),
+            (req_pool_indices, "req_pool_indices"),
+            (prefix_lens, "prefix_lens"),
+            (extend_seq_lens, "extend_seq_lens"),
             (req_to_token, "req_to_token"),
             (lut_tensor, "lut_tensor"),
             (out_write_offsets, "out_write_offsets"),

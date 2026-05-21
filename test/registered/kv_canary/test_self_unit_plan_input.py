@@ -18,9 +18,9 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 
 def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
     return PlanInput(
-        fb_req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-        fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-        fb_extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
     )
 
 
@@ -43,14 +43,13 @@ class TestSelfUnitPlanInput(CustomTestCase):
             is_extend=True,
         )
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
-        bs = plan.fill_from_forward_batch(forward_batch=fb)
-        self.assertEqual(bs, 2)
-        self.assertEqual(plan.fb_req_pool_indices[:2].tolist(), [1, 2])
-        self.assertEqual(plan.fb_req_pool_indices[2:].tolist(), [0, 0])
-        self.assertEqual(plan.fb_prefix_lens[:2].tolist(), [3, 5])
-        self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [7, 7])
-        self.assertEqual(plan.fb_prefix_lens.dtype, torch.int64)
-        self.assertEqual(plan.fb_extend_seq_lens.dtype, torch.int64)
+        plan.fill_from_forward_batch(forward_batch=fb)
+        self.assertEqual(plan.req_pool_indices[:2].tolist(), [1, 2])
+        self.assertEqual(plan.req_pool_indices[2:].tolist(), [0, 0])
+        self.assertEqual(plan.prefix_lens[:2].tolist(), [3, 5])
+        self.assertEqual(plan.extend_seq_lens[:2].tolist(), [7, 7])
+        self.assertEqual(plan.prefix_lens.dtype, torch.int64)
+        self.assertEqual(plan.extend_seq_lens.dtype, torch.int64)
 
     def test_plan_input_fill_from_forward_batch_target_verify(self):
         """Verify target-verify batches derive draft verification spans."""
@@ -68,10 +67,9 @@ class TestSelfUnitPlanInput(CustomTestCase):
             spec_info=spec_info,
         )
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
-        bs = plan.fill_from_forward_batch(forward_batch=fb)
-        self.assertEqual(bs, 2)
-        self.assertEqual(plan.fb_prefix_lens[:2].tolist(), [10, 14])
-        self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [4, 4])
+        plan.fill_from_forward_batch(forward_batch=fb)
+        self.assertEqual(plan.prefix_lens[:2].tolist(), [10, 14])
+        self.assertEqual(plan.extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_plan_input_fill_from_forward_batch_draft_extend_v2(self):
         """Verify draft-extend-v2 batches derive prefix lengths from sequence lengths."""
@@ -88,10 +86,9 @@ class TestSelfUnitPlanInput(CustomTestCase):
             is_draft_extend_v2=True,
         )
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
-        bs = plan.fill_from_forward_batch(forward_batch=fb)
-        self.assertEqual(bs, 2)
-        self.assertEqual(plan.fb_prefix_lens[:2].tolist(), [10, 14])
-        self.assertEqual(plan.fb_extend_seq_lens[:2].tolist(), [4, 4])
+        plan.fill_from_forward_batch(forward_batch=fb)
+        self.assertEqual(plan.prefix_lens[:2].tolist(), [10, 14])
+        self.assertEqual(plan.extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_plan_input_fill_from_forward_batch_decode(self):
         """Verify decode batches populate one-token verification spans."""
@@ -104,10 +101,9 @@ class TestSelfUnitPlanInput(CustomTestCase):
             is_extend=False,
         )
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
-        bs = plan.fill_from_forward_batch(forward_batch=fb)
-        self.assertEqual(bs, 3)
-        self.assertEqual(plan.fb_prefix_lens[:3].tolist(), [3, 6, 0])
-        self.assertEqual(plan.fb_extend_seq_lens[:3].tolist(), [1, 1, 1])
+        plan.fill_from_forward_batch(forward_batch=fb)
+        self.assertEqual(plan.prefix_lens[:3].tolist(), [3, 6, 0])
+        self.assertEqual(plan.extend_seq_lens[:3].tolist(), [1, 1, 1])
 
     def test_plan_input_padding_dummy_sentinel(self):
         """Verify padding sentinel rows remain valid plan input entries."""
@@ -121,8 +117,8 @@ class TestSelfUnitPlanInput(CustomTestCase):
         )
         plan = _make_static_plan_input(bs_capacity=4, device=self.device)
         plan.fill_from_forward_batch(forward_batch=fb)
-        self.assertEqual(plan.fb_req_pool_indices[:3].tolist(), [0, 5, 0])
-        self.assertEqual(plan.fb_req_pool_indices.dtype, torch.int64)
+        self.assertEqual(plan.req_pool_indices[:3].tolist(), [0, 5, 0])
+        self.assertEqual(plan.req_pool_indices.dtype, torch.int64)
 
 
 if __name__ == "__main__":

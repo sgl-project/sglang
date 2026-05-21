@@ -16,12 +16,12 @@ class PlanInput:
     All tensors live on device.
 
     Fields:
-        fb_req_pool_indices: Per-row ReqToTokenPool row index, shape [bs_capacity], int64.
+        req_pool_indices: Per-row ReqToTokenPool row index, shape [bs_capacity], int64.
             0 = padding sentinel. Pre-allocated static buffer that the runner writes into each
             step (see Static-buffer contract below).
-        fb_prefix_lens: Per-req prefix length already written before this step, shape
+        prefix_lens: Per-req prefix length already written before this step, shape
             [bs_capacity], int64. Extend → extend_prefix_lens; decode → seq_lens - 1.
-        fb_extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
+        extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
 
     Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as int32
@@ -36,14 +36,14 @@ class PlanInput:
     ``ModelRunner.forward`` BEFORE ``graph_runner.replay()`` or ``model.forward()``).
     """
 
-    fb_req_pool_indices: torch.Tensor
-    fb_prefix_lens: torch.Tensor
-    fb_extend_seq_lens: torch.Tensor
+    req_pool_indices: torch.Tensor
+    prefix_lens: torch.Tensor
+    extend_seq_lens: torch.Tensor
 
     def zero_(self) -> None:
-        self.fb_req_pool_indices.zero_()
-        self.fb_prefix_lens.zero_()
-        self.fb_extend_seq_lens.zero_()
+        self.req_pool_indices.zero_()
+        self.prefix_lens.zero_()
+        self.extend_seq_lens.zero_()
 
     @classmethod
     def allocate(
@@ -53,31 +53,29 @@ class PlanInput:
         device: torch.device,
     ) -> "PlanInput":
         return cls(
-            fb_req_pool_indices=torch.zeros(
+            req_pool_indices=torch.zeros(
                 bs_capacity, dtype=torch.int64, device=device
             ),
-            fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-            fb_extend_seq_lens=torch.zeros(
+            prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+            extend_seq_lens=torch.zeros(
                 bs_capacity, dtype=torch.int64, device=device
             ),
         )
 
-    def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> int:
+    def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
         """Fill static per-forward buffers in place from a ForwardBatch.
 
         This mutates the PlanInput's static buffers and does not allocate a new PlanInput.
 
-        - self.fb_req_pool_indices[:bs] <- forward_batch.req_pool_indices; rows beyond bs
+        - self.req_pool_indices[:bs] <- forward_batch.req_pool_indices; rows beyond bs
           are zeroed (padding sentinel).
-        - self.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
-          forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
+        - self.prefix_lens[:bs] / extend_seq_lens[:bs] are dispatched per forward_mode. Rows beyond bs are zeroed
+          (padding skipped
           via req_pool_indices sentinel; the lens value there is irrelevant).
-
-        Returns the current bs (valid prefix length of the per-forward buffers).
         """
         req_pool_indices = forward_batch.req_pool_indices
         bs = int(req_pool_indices.shape[0])
-        capacity = int(self.fb_req_pool_indices.shape[0])
+        capacity = int(self.req_pool_indices.shape[0])
         if bs > capacity:
             raise RuntimeError(
                 f"kv-canary: per-forward batch size {bs} exceeds static capacity {capacity}; "
@@ -85,16 +83,14 @@ class PlanInput:
             )
 
         self.zero_()
-        self.fb_req_pool_indices[:bs].copy_(req_pool_indices)
+        self.req_pool_indices[:bs].copy_(req_pool_indices)
 
         _extract_prefix_lens_and_extend_seq_lens(
             forward_batch=forward_batch,
-            out_prefix_lens=self.fb_prefix_lens[:bs],
-            out_extend_seq_lens=self.fb_extend_seq_lens[:bs],
+            out_prefix_lens=self.prefix_lens[:bs],
+            out_extend_seq_lens=self.extend_seq_lens[:bs],
             bs=bs,
         )
-
-        return bs
 
 
 def _extract_prefix_lens_and_extend_seq_lens(

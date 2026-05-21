@@ -25,8 +25,8 @@ _PLAN_VERIFY_INNER_BLOCK: int = 64
 
 def launch_plan_entries_kernel(
     *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
@@ -35,7 +35,7 @@ def launch_plan_entries_kernel(
     out_verify_prev_slot_indices: torch.Tensor,
     swa_window_size: int,
 ) -> None:
-    bs = int(fb_req_pool_indices.shape[0])
+    bs = int(req_pool_indices.shape[0])
     verify_capacity = int(out_verify_slot_indices.shape[0])
     lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
         full_to_swa_index_mapping, verify_offsets_scratch.device
@@ -43,8 +43,8 @@ def launch_plan_entries_kernel(
     req_to_token_stride0 = int(req_to_token.stride(0))
 
     _validate_entries_kernel_inputs(
-        fb_req_pool_indices=fb_req_pool_indices,
-        fb_prefix_lens=fb_prefix_lens,
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
         req_to_token=req_to_token,
         lut_tensor=lut_tensor,
         verify_offsets_scratch=verify_offsets_scratch,
@@ -66,8 +66,8 @@ def launch_plan_entries_kernel(
     ) // _PLAN_VERIFY_INNER_BLOCK
     grid_entries = (bs, max_j_tiles)
     _plan_entries_kernel[grid_entries](
-        fb_req_pool_indices,
-        fb_prefix_lens,
+        req_pool_indices,
+        prefix_lens,
         req_to_token,
         lut_tensor,
         verify_offsets_scratch,
@@ -85,8 +85,8 @@ def launch_plan_entries_kernel(
 
 def _validate_entries_kernel_inputs(
     *,
-    fb_req_pool_indices: torch.Tensor,
-    fb_prefix_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    prefix_lens: torch.Tensor,
     req_to_token: torch.Tensor,
     lut_tensor: torch.Tensor,
     verify_offsets_scratch: torch.Tensor,
@@ -99,8 +99,8 @@ def _validate_entries_kernel_inputs(
     verify_capacity: int,
     has_swa_lut: bool,
 ) -> None:
-    _assert_contiguous(fb_req_pool_indices, "fb_req_pool_indices")
-    _assert_contiguous(fb_prefix_lens, "fb_prefix_lens")
+    _assert_contiguous(req_pool_indices, "req_pool_indices")
+    _assert_contiguous(prefix_lens, "prefix_lens")
     _assert_contiguous(req_to_token, "req_to_token")
     _assert_contiguous(lut_tensor, "lut_tensor")
     _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
@@ -108,8 +108,8 @@ def _validate_entries_kernel_inputs(
     _assert_contiguous(out_verify_positions, "out_verify_positions")
     _assert_contiguous(out_verify_prev_slot_indices, "out_verify_prev_slot_indices")
 
-    _require_dtype(fb_req_pool_indices, "fb_req_pool_indices", torch.int64)
-    _require_dtype(fb_prefix_lens, "fb_prefix_lens", torch.int64)
+    _require_dtype(req_pool_indices, "req_pool_indices", torch.int64)
+    _require_dtype(prefix_lens, "prefix_lens", torch.int64)
     _require_dtype(req_to_token, "req_to_token", torch.int32)
     _require_dtype(lut_tensor, "lut_tensor", torch.int64)
     _require_dtype(verify_offsets_scratch, "verify_offsets_scratch", torch.int64)
@@ -140,8 +140,8 @@ def _validate_entries_kernel_inputs(
     if not has_swa_lut and lut_len != 0:
         raise ValueError("kv-canary: lut_len must be 0 when has_swa_lut is False")
 
-    _require_len(fb_req_pool_indices, "fb_req_pool_indices", bs)
-    _require_len(fb_prefix_lens, "fb_prefix_lens", bs)
+    _require_len(req_pool_indices, "req_pool_indices", bs)
+    _require_len(prefix_lens, "prefix_lens", bs)
     _require_2d(req_to_token, "req_to_token")
     _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
     _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
@@ -161,8 +161,8 @@ def _validate_entries_kernel_inputs(
         verify_offsets_scratch,
         "verify_offsets_scratch",
         (
-            (fb_req_pool_indices, "fb_req_pool_indices"),
-            (fb_prefix_lens, "fb_prefix_lens"),
+            (req_pool_indices, "req_pool_indices"),
+            (prefix_lens, "prefix_lens"),
             (req_to_token, "req_to_token"),
             (lut_tensor, "lut_tensor"),
             (out_verify_slot_indices, "out_verify_slot_indices"),
