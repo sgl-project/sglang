@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import unittest
 from typing import List
@@ -18,6 +19,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+logger = logging.getLogger(__name__)
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
@@ -62,7 +65,7 @@ def _spec_eagle_env() -> dict[str, str]:
 
 
 class TestEaglePositionsMisalignRegression(CustomTestCase):
-    """Revert PR #25015 fix and expect canary to fire POSITION_MISMATCH."""
+    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -73,6 +76,7 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
 
         env = _spec_eagle_env()
         env["SGLANG_DEBUG_REVERT_PR"] = "25015"
+        cls._launch_exc = None
         try:
             cls.process = popen_launch_server(
                 _MOCK_MODEL,
@@ -82,8 +86,11 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
                 env=env,
                 return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            cls._launch_exc = exc
+            logger.warning(
+                "server launch raised during revert path: %r", exc, exc_info=True
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -94,7 +101,10 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
         haystack = (self._stderr_buf.getvalue() if self._stderr_buf else "") + (
             self._stdout_buf.getvalue() if self._stdout_buf else ""
         )
-        self.assertIn("POSITION_MISMATCH", haystack)
+        self.assertRegex(
+            haystack,
+            r"kv_canary violation: launch_tag=\S+ fail_reason=\S*position\S*",
+        )
 
 
 class TestEaglePositionsMatchWithFix(CustomTestCase):
@@ -133,6 +143,10 @@ class TestEaglePositionsMatchWithFix(CustomTestCase):
         self.assertEqual(resp.status_code, 200, resp.text)
         health = requests.get(self.base_url + "/health", timeout=10.0)
         self.assertEqual(health.status_code, 200, health.text)
+        haystack = (self._stderr_buf.getvalue() if self._stderr_buf else "") + (
+            self._stdout_buf.getvalue() if self._stdout_buf else ""
+        )
+        self.assertNotIn("kv_canary violation:", haystack)
 
 
 if __name__ == "__main__":
