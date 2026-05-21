@@ -125,6 +125,24 @@ class FutureMap:
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
+    def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+        """Schedule-stream counterpart of resolve_future for the CPU mirror.
+
+        Reads post-verify seq_lens from new_seq_lens_buf into batch.seq_lens_cpu
+        and recomputes batch.seq_lens_sum. spec_info.verify_done provides the
+        cross-stream barrier — Scheduler records it AFTER store_to_map, so the
+        wait ensures the buf write is visible from schedule stream. No-op for
+        paths without future state (first iter / no spec_info).
+        """
+        spec_info = batch.spec_info
+        if spec_info is None or spec_info.future_indices is None:
+            return
+        if spec_info.verify_done is not None:
+            spec_info.verify_done.wait()
+        indices = spec_info.future_indices.indices
+        batch.seq_lens_cpu = self.new_seq_lens_buf[indices].cpu()
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):

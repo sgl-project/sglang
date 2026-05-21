@@ -1077,11 +1077,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, verify_input, accept_lens, accept_index, bs
             )
 
-        # verify_done event is allocated here, recorded by Scheduler.run_batch
-        # AFTER store_to_map on the forward stream — so that next iter's
-        # refresh_seq_lens_cpu wait on it covers the buf write, not just verify.
-        verify_done = torch.get_device_module(self.device).Event()
-
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -1102,7 +1097,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
         )
 
         # verify_forward_batch transitively holds verify-time GPU tensors

@@ -109,7 +109,6 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
@@ -2448,28 +2447,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-    def refresh_seq_lens_cpu(self, future_map: Optional["FutureMap"] = None):
-        # Standalone sync point for seq_lens_cpu / seq_lens_sum.
-        # When future_map is passed (spec v2, post-first-iter), D2H reads
-        # post-verify seq_lens from new_seq_lens_buf. The buf is written by the
-        # previous iter's forward stream (store_to_map), so we need an explicit
-        # cross-stream wait — .cpu() alone is NOT a cross-stream sync. The wait
-        # is encapsulated here: spec_info.verify_done is recorded by Scheduler
-        # AFTER store_to_map, so waiting on it covers the buf write.
-        # Otherwise (first iter / non-spec / lazy-fallback paths), the CPU mirror
-        # is already eagerly maintained — just recompute the cached sum.
-        # In handle mode batch.seq_lens is a placeholder between iters; never
-        # D2H from it directly here.
-        if (
-            future_map is not None
-            and self.is_spec_v2
-            and self.spec_info is not None
-            and self.spec_info.future_indices is not None
-        ):
-            if self.spec_info.verify_done is not None:
-                self.spec_info.verify_done.wait()
-            indices = self.spec_info.future_indices.indices
-            self.seq_lens_cpu = future_map.new_seq_lens_buf[indices].cpu()
+    def refresh_seq_lens_cpu(self):
+        # Recompute seq_lens_sum from the (eagerly maintained, or freshly
+        # synced via FutureMap.resolve_seq_lens_cpu) CPU mirror.
         self.seq_lens_sum = int(self.seq_lens_cpu.sum())
 
     def filter_batch(

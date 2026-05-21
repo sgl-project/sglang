@@ -2834,11 +2834,12 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Single pre-isolation sync site: refresh_seq_lens_cpu owns the
-                # D2H from new_seq_lens_buf (spec v2 placeholder path) AND the
-                # lazy sum recompute. .cpu() to host is itself the cross-stream
-                # sync; no explicit verify_done.wait() needed.
-                batch.refresh_seq_lens_cpu(self.future_map)
+                # Pre-isolation CPU mirror prep. resolve_seq_lens_cpu is the
+                # spec v2 buf-D2H counterpart of resolve_future (no-op for
+                # first iter / non-spec); cross-stream barrier on
+                # spec_info.verify_done is encapsulated inside.
+                self.future_map.resolve_seq_lens_cpu(batch)
+                batch.refresh_seq_lens_cpu()
 
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
@@ -2863,16 +2864,17 @@ class Scheduler(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
                             )
-                            # Record verify_done AFTER store_to_map so the
-                            # event covers the buf write (next iter's
-                            # refresh_seq_lens_cpu waits on it).
+                            # Allocate + record verify_done AFTER store_to_map.
+                            # Covers all forward-stream work (incl. buf write);
+                            # next iter's FutureMap.resolve_seq_lens_cpu waits
+                            # on it as the cross-stream barrier.
                             if (
                                 batch.is_spec_v2
                                 and batch_result.next_draft_input is not None
-                                and batch_result.next_draft_input.verify_done
-                                is not None
                             ):
-                                batch_result.next_draft_input.verify_done.record()
+                                evt = self.device_module.Event()
+                                evt.record()
+                                batch_result.next_draft_input.verify_done = evt
                         else:
                             batch_result.future_indices = future_indices
 
@@ -2976,13 +2978,12 @@ class Scheduler(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
             )
-            # Record verify_done AFTER store_to_map for the delay-sample path
-            # too (see Scheduler.run_batch for the non-delay path).
-            if (
-                batch_result.next_draft_input is not None
-                and batch_result.next_draft_input.verify_done is not None
-            ):
-                batch_result.next_draft_input.verify_done.record()
+            # Allocate + record verify_done AFTER store_to_map for the
+            # delay-sample path too (see Scheduler.run_batch for non-delay).
+            if batch_result.next_draft_input is not None:
+                evt = self.device_module.Event()
+                evt.record()
+                batch_result.next_draft_input.verify_done = evt
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds
