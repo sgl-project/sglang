@@ -33,22 +33,22 @@ def launch_plan_offsets_kernel(
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     extra_verify_num_valid: torch.Tensor,
-    verify_offsets_scratch: torch.Tensor,
-    write_offsets: torch.Tensor,
-    write_seed_slot_indices: torch.Tensor,
-    verify_num_valid: torch.Tensor,
-    verify_enable: torch.Tensor,
-    write_num_valid_reqs: torch.Tensor,
+    out_verify_offsets_scratch: torch.Tensor,
+    out_write_offsets: torch.Tensor,
+    out_write_seed_slot_indices: torch.Tensor,
+    out_verify_num_valid: torch.Tensor,
+    out_verify_enable: torch.Tensor,
+    out_write_num_valid_reqs: torch.Tensor,
     swa_window_size: int,
     verify_capacity: int,
 ) -> None:
     bs = int(fb_req_pool_indices.shape[0])
     lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
-        full_to_swa_index_mapping, verify_offsets_scratch.device
+        full_to_swa_index_mapping, out_verify_offsets_scratch.device
     )
     req_to_token_stride0 = int(req_to_token.stride(0))
-    write_offsets_len = int(write_offsets.shape[0])
-    write_req_capacity = int(write_seed_slot_indices.shape[0])
+    write_offsets_len = int(out_write_offsets.shape[0])
+    write_req_capacity = int(out_write_seed_slot_indices.shape[0])
 
     _validate_offsets_kernel_inputs(
         fb_req_pool_indices=fb_req_pool_indices,
@@ -57,12 +57,12 @@ def launch_plan_offsets_kernel(
         req_to_token=req_to_token,
         lut_tensor=lut_tensor,
         extra_verify_num_valid=extra_verify_num_valid,
-        verify_offsets_scratch=verify_offsets_scratch,
-        write_offsets=write_offsets,
-        write_seed_slot_indices=write_seed_slot_indices,
-        verify_num_valid=verify_num_valid,
-        verify_enable=verify_enable,
-        write_num_valid_reqs=write_num_valid_reqs,
+        out_verify_offsets_scratch=out_verify_offsets_scratch,
+        out_write_offsets=out_write_offsets,
+        out_write_seed_slot_indices=out_write_seed_slot_indices,
+        out_verify_num_valid=out_verify_num_valid,
+        out_verify_enable=out_verify_enable,
+        out_write_num_valid_reqs=out_write_num_valid_reqs,
         bs=bs,
         req_to_token_stride0=req_to_token_stride0,
         lut_len=lut_len,
@@ -79,12 +79,12 @@ def launch_plan_offsets_kernel(
         req_to_token,
         lut_tensor,
         extra_verify_num_valid,
-        verify_offsets_scratch,
-        write_offsets,
-        write_seed_slot_indices,
-        verify_num_valid,
-        verify_enable,
-        write_num_valid_reqs,
+        out_verify_offsets_scratch,
+        out_write_offsets,
+        out_write_seed_slot_indices,
+        out_verify_num_valid,
+        out_verify_enable,
+        out_write_num_valid_reqs,
         bs,
         req_to_token_stride0,
         lut_len,
@@ -105,12 +105,12 @@ def _validate_offsets_kernel_inputs(
     req_to_token: torch.Tensor,
     lut_tensor: torch.Tensor,
     extra_verify_num_valid: torch.Tensor,
-    verify_offsets_scratch: torch.Tensor,
-    write_offsets: torch.Tensor,
-    write_seed_slot_indices: torch.Tensor,
-    verify_num_valid: torch.Tensor,
-    verify_enable: torch.Tensor,
-    write_num_valid_reqs: torch.Tensor,
+    out_verify_offsets_scratch: torch.Tensor,
+    out_write_offsets: torch.Tensor,
+    out_write_seed_slot_indices: torch.Tensor,
+    out_verify_num_valid: torch.Tensor,
+    out_verify_enable: torch.Tensor,
+    out_write_num_valid_reqs: torch.Tensor,
     bs: int,
     req_to_token_stride0: int,
     lut_len: int,
@@ -125,12 +125,12 @@ def _validate_offsets_kernel_inputs(
     _assert_contiguous(req_to_token, "req_to_token")
     _assert_contiguous(lut_tensor, "lut_tensor")
     _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
-    _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
-    _assert_contiguous(write_offsets, "write_offsets")
-    _assert_contiguous(write_seed_slot_indices, "write_seed_slot_indices")
-    _assert_contiguous(verify_num_valid, "verify_num_valid")
-    _assert_contiguous(verify_enable, "verify_enable")
-    _assert_contiguous(write_num_valid_reqs, "write_num_valid_reqs")
+    _assert_contiguous(out_verify_offsets_scratch, "out_verify_offsets_scratch")
+    _assert_contiguous(out_write_offsets, "out_write_offsets")
+    _assert_contiguous(out_write_seed_slot_indices, "out_write_seed_slot_indices")
+    _assert_contiguous(out_verify_num_valid, "out_verify_num_valid")
+    _assert_contiguous(out_verify_enable, "out_verify_enable")
+    _assert_contiguous(out_write_num_valid_reqs, "out_write_num_valid_reqs")
 
     _require_dtype(fb_req_pool_indices, "fb_req_pool_indices", torch.int64)
     _require_dtype(fb_prefix_lens, "fb_prefix_lens", torch.int64)
@@ -138,12 +138,16 @@ def _validate_offsets_kernel_inputs(
     _require_dtype(req_to_token, "req_to_token", torch.int32)
     _require_dtype(lut_tensor, "lut_tensor", torch.int64)
     _require_dtype(extra_verify_num_valid, "extra_verify_num_valid", torch.int32)
-    _require_dtype(verify_offsets_scratch, "verify_offsets_scratch", torch.int64)
-    _require_dtype(write_offsets, "write_offsets", torch.int64)
-    _require_dtype(write_seed_slot_indices, "write_seed_slot_indices", torch.int64)
-    _require_dtype(verify_num_valid, "verify_num_valid", torch.int32)
-    _require_dtype(verify_enable, "verify_enable", torch.int32)
-    _require_dtype(write_num_valid_reqs, "write_num_valid_reqs", torch.int32)
+    _require_dtype(
+        out_verify_offsets_scratch, "out_verify_offsets_scratch", torch.int64
+    )
+    _require_dtype(out_write_offsets, "out_write_offsets", torch.int64)
+    _require_dtype(
+        out_write_seed_slot_indices, "out_write_seed_slot_indices", torch.int64
+    )
+    _require_dtype(out_verify_num_valid, "out_verify_num_valid", torch.int32)
+    _require_dtype(out_verify_enable, "out_verify_enable", torch.int32)
+    _require_dtype(out_write_num_valid_reqs, "out_write_num_valid_reqs", torch.int32)
 
     if bs < 0 or bs > _PLAN_BS_BLOCK_SIZE:
         raise ValueError(
@@ -183,15 +187,19 @@ def _validate_offsets_kernel_inputs(
     _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
     _require_min_len(extra_verify_num_valid, "extra_verify_num_valid", 1)
     _require_min_len(
-        verify_offsets_scratch,
-        "verify_offsets_scratch",
+        out_verify_offsets_scratch,
+        "out_verify_offsets_scratch",
         _PLAN_BS_BLOCK_SIZE + 1,
     )
-    _require_len(write_offsets, "write_offsets", write_offsets_len)
-    _require_len(write_seed_slot_indices, "write_seed_slot_indices", write_req_capacity)
-    _require_len(verify_num_valid, "verify_num_valid", 1)
-    _require_len(verify_enable, "verify_enable", 1)
-    _require_len(write_num_valid_reqs, "write_num_valid_reqs", 1)
+    _require_len(out_write_offsets, "out_write_offsets", write_offsets_len)
+    _require_len(
+        out_write_seed_slot_indices,
+        "out_write_seed_slot_indices",
+        write_req_capacity,
+    )
+    _require_len(out_verify_num_valid, "out_verify_num_valid", 1)
+    _require_len(out_verify_enable, "out_verify_enable", 1)
+    _require_len(out_write_num_valid_reqs, "out_write_num_valid_reqs", 1)
     _require_1d(lut_tensor, "lut_tensor")
 
     if write_offsets_len != write_req_capacity + 1:
@@ -210,8 +218,8 @@ def _validate_offsets_kernel_inputs(
         )
 
     _require_same_device(
-        verify_offsets_scratch,
-        "verify_offsets_scratch",
+        out_verify_offsets_scratch,
+        "out_verify_offsets_scratch",
         (
             (fb_req_pool_indices, "fb_req_pool_indices"),
             (fb_prefix_lens, "fb_prefix_lens"),
@@ -219,11 +227,11 @@ def _validate_offsets_kernel_inputs(
             (req_to_token, "req_to_token"),
             (lut_tensor, "lut_tensor"),
             (extra_verify_num_valid, "extra_verify_num_valid"),
-            (write_offsets, "write_offsets"),
-            (write_seed_slot_indices, "write_seed_slot_indices"),
-            (verify_num_valid, "verify_num_valid"),
-            (verify_enable, "verify_enable"),
-            (write_num_valid_reqs, "write_num_valid_reqs"),
+            (out_write_offsets, "out_write_offsets"),
+            (out_write_seed_slot_indices, "out_write_seed_slot_indices"),
+            (out_verify_num_valid, "out_verify_num_valid"),
+            (out_verify_enable, "out_verify_enable"),
+            (out_write_num_valid_reqs, "out_write_num_valid_reqs"),
         ),
     )
 
@@ -346,10 +354,10 @@ def _plan_offsets_kernel(
     total_verify = tl.sum(verify_lens, axis=0)  # scalar
     total_write = tl.sum(write_lens, axis=0)  # scalar
 
-    # Store the [bs] slot of verify_offsets and write_offsets (one element past the last per-req entry).
+    # Store the [bs] slot of verify_offsets and out_write_offsets (one element past the last per-req entry).
     # verify_offsets scratch has length BS_BLOCK + 1 so the bs slot is always in range.
     tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int64))
-    # write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
+    # out_write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
     write_tail_in_range = bs < WRITE_OFFSETS_LEN  # scalar bool
     tl.store(
         out_write_offsets_ptr + bs,
@@ -357,7 +365,7 @@ def _plan_offsets_kernel(
         mask=write_tail_in_range,
     )
 
-    # Scalar writes: verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
+    # Scalar writes: out_verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
     # never indexes past the buffer; enable carries the overflow bit (0 when requested > capacity) so the
     # verify kernel skips the whole launch and the host can warn-log this step.
     extras_count = tl.load(extra_verify_num_valid_ptr)  # scalar

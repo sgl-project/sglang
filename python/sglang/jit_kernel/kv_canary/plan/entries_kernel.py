@@ -30,13 +30,13 @@ def launch_plan_entries_kernel(
     req_to_token: torch.Tensor,
     full_to_swa_index_mapping: Optional[torch.Tensor],
     verify_offsets_scratch: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
+    out_verify_slot_indices: torch.Tensor,
+    out_verify_positions: torch.Tensor,
+    out_verify_prev_slot_indices: torch.Tensor,
     swa_window_size: int,
 ) -> None:
     bs = int(fb_req_pool_indices.shape[0])
-    verify_capacity = int(verify_slot_indices.shape[0])
+    verify_capacity = int(out_verify_slot_indices.shape[0])
     lut_tensor, lut_len, has_swa_lut = _resolve_swa_lut(
         full_to_swa_index_mapping, verify_offsets_scratch.device
     )
@@ -48,9 +48,9 @@ def launch_plan_entries_kernel(
         req_to_token=req_to_token,
         lut_tensor=lut_tensor,
         verify_offsets_scratch=verify_offsets_scratch,
-        verify_slot_indices=verify_slot_indices,
-        verify_positions=verify_positions,
-        verify_prev_slot_indices=verify_prev_slot_indices,
+        out_verify_slot_indices=out_verify_slot_indices,
+        out_verify_positions=out_verify_positions,
+        out_verify_prev_slot_indices=out_verify_prev_slot_indices,
         bs=bs,
         req_to_token_stride0=req_to_token_stride0,
         lut_len=lut_len,
@@ -71,9 +71,9 @@ def launch_plan_entries_kernel(
         req_to_token,
         lut_tensor,
         verify_offsets_scratch,
-        verify_slot_indices,
-        verify_positions,
-        verify_prev_slot_indices,
+        out_verify_slot_indices,
+        out_verify_positions,
+        out_verify_prev_slot_indices,
         req_to_token_stride0,
         lut_len,
         verify_capacity,
@@ -90,9 +90,9 @@ def _validate_entries_kernel_inputs(
     req_to_token: torch.Tensor,
     lut_tensor: torch.Tensor,
     verify_offsets_scratch: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
+    out_verify_slot_indices: torch.Tensor,
+    out_verify_positions: torch.Tensor,
+    out_verify_prev_slot_indices: torch.Tensor,
     bs: int,
     req_to_token_stride0: int,
     lut_len: int,
@@ -104,18 +104,20 @@ def _validate_entries_kernel_inputs(
     _assert_contiguous(req_to_token, "req_to_token")
     _assert_contiguous(lut_tensor, "lut_tensor")
     _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
-    _assert_contiguous(verify_slot_indices, "verify_slot_indices")
-    _assert_contiguous(verify_positions, "verify_positions")
-    _assert_contiguous(verify_prev_slot_indices, "verify_prev_slot_indices")
+    _assert_contiguous(out_verify_slot_indices, "out_verify_slot_indices")
+    _assert_contiguous(out_verify_positions, "out_verify_positions")
+    _assert_contiguous(out_verify_prev_slot_indices, "out_verify_prev_slot_indices")
 
     _require_dtype(fb_req_pool_indices, "fb_req_pool_indices", torch.int64)
     _require_dtype(fb_prefix_lens, "fb_prefix_lens", torch.int64)
     _require_dtype(req_to_token, "req_to_token", torch.int32)
     _require_dtype(lut_tensor, "lut_tensor", torch.int64)
     _require_dtype(verify_offsets_scratch, "verify_offsets_scratch", torch.int64)
-    _require_dtype(verify_slot_indices, "verify_slot_indices", torch.int64)
-    _require_dtype(verify_positions, "verify_positions", torch.int64)
-    _require_dtype(verify_prev_slot_indices, "verify_prev_slot_indices", torch.int64)
+    _require_dtype(out_verify_slot_indices, "out_verify_slot_indices", torch.int64)
+    _require_dtype(out_verify_positions, "out_verify_positions", torch.int64)
+    _require_dtype(
+        out_verify_prev_slot_indices, "out_verify_prev_slot_indices", torch.int64
+    )
 
     if bs < 0:
         raise ValueError(f"kv-canary: entries kernel bs must be non-negative, got {bs}")
@@ -143,9 +145,11 @@ def _validate_entries_kernel_inputs(
     _require_2d(req_to_token, "req_to_token")
     _require_min_len(lut_tensor, "lut_tensor", max(lut_len, 1))
     _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
-    _require_len(verify_slot_indices, "verify_slot_indices", verify_capacity)
-    _require_len(verify_positions, "verify_positions", verify_capacity)
-    _require_len(verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity)
+    _require_len(out_verify_slot_indices, "out_verify_slot_indices", verify_capacity)
+    _require_len(out_verify_positions, "out_verify_positions", verify_capacity)
+    _require_len(
+        out_verify_prev_slot_indices, "out_verify_prev_slot_indices", verify_capacity
+    )
 
     if req_to_token_stride0 != int(req_to_token.stride(0)):
         raise ValueError(
@@ -161,9 +165,9 @@ def _validate_entries_kernel_inputs(
             (fb_prefix_lens, "fb_prefix_lens"),
             (req_to_token, "req_to_token"),
             (lut_tensor, "lut_tensor"),
-            (verify_slot_indices, "verify_slot_indices"),
-            (verify_positions, "verify_positions"),
-            (verify_prev_slot_indices, "verify_prev_slot_indices"),
+            (out_verify_slot_indices, "out_verify_slot_indices"),
+            (out_verify_positions, "out_verify_positions"),
+            (out_verify_prev_slot_indices, "out_verify_prev_slot_indices"),
         ),
     )
 

@@ -23,12 +23,12 @@ def launch_plan_extras_kernel(
     extra_verify_prev_slot_indices: torch.Tensor,
     extra_verify_num_valid: torch.Tensor,
     verify_offsets_scratch: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
+    out_verify_slot_indices: torch.Tensor,
+    out_verify_positions: torch.Tensor,
+    out_verify_prev_slot_indices: torch.Tensor,
     bs: int,
 ) -> None:
-    verify_capacity = int(verify_slot_indices.shape[0])
+    verify_capacity = int(out_verify_slot_indices.shape[0])
     extras_capacity = int(extra_verify_slot_indices.shape[0])
 
     _validate_extras_kernel_inputs(
@@ -37,9 +37,9 @@ def launch_plan_extras_kernel(
         extra_verify_prev_slot_indices=extra_verify_prev_slot_indices,
         extra_verify_num_valid=extra_verify_num_valid,
         verify_offsets_scratch=verify_offsets_scratch,
-        verify_slot_indices=verify_slot_indices,
-        verify_positions=verify_positions,
-        verify_prev_slot_indices=verify_prev_slot_indices,
+        out_verify_slot_indices=out_verify_slot_indices,
+        out_verify_positions=out_verify_positions,
+        out_verify_prev_slot_indices=out_verify_prev_slot_indices,
         bs=bs,
         verify_capacity=verify_capacity,
         extras_capacity=extras_capacity,
@@ -58,9 +58,9 @@ def launch_plan_extras_kernel(
         extra_verify_prev_slot_indices,
         extra_verify_num_valid,
         verify_offsets_scratch,
-        verify_slot_indices,
-        verify_positions,
-        verify_prev_slot_indices,
+        out_verify_slot_indices,
+        out_verify_positions,
+        out_verify_prev_slot_indices,
         bs,
         verify_capacity,
         INNER_BLOCK=_PLAN_EXTRAS_INNER_BLOCK,
@@ -74,9 +74,9 @@ def _validate_extras_kernel_inputs(
     extra_verify_prev_slot_indices: torch.Tensor,
     extra_verify_num_valid: torch.Tensor,
     verify_offsets_scratch: torch.Tensor,
-    verify_slot_indices: torch.Tensor,
-    verify_positions: torch.Tensor,
-    verify_prev_slot_indices: torch.Tensor,
+    out_verify_slot_indices: torch.Tensor,
+    out_verify_positions: torch.Tensor,
+    out_verify_prev_slot_indices: torch.Tensor,
     bs: int,
     verify_capacity: int,
     extras_capacity: int,
@@ -86,9 +86,9 @@ def _validate_extras_kernel_inputs(
     _assert_contiguous(extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices")
     _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
     _assert_contiguous(verify_offsets_scratch, "verify_offsets_scratch")
-    _assert_contiguous(verify_slot_indices, "verify_slot_indices")
-    _assert_contiguous(verify_positions, "verify_positions")
-    _assert_contiguous(verify_prev_slot_indices, "verify_prev_slot_indices")
+    _assert_contiguous(out_verify_slot_indices, "out_verify_slot_indices")
+    _assert_contiguous(out_verify_positions, "out_verify_positions")
+    _assert_contiguous(out_verify_prev_slot_indices, "out_verify_prev_slot_indices")
 
     _require_dtype(extra_verify_slot_indices, "extra_verify_slot_indices", torch.int64)
     _require_dtype(extra_verify_positions, "extra_verify_positions", torch.int64)
@@ -97,9 +97,11 @@ def _validate_extras_kernel_inputs(
     )
     _require_dtype(extra_verify_num_valid, "extra_verify_num_valid", torch.int32)
     _require_dtype(verify_offsets_scratch, "verify_offsets_scratch", torch.int64)
-    _require_dtype(verify_slot_indices, "verify_slot_indices", torch.int64)
-    _require_dtype(verify_positions, "verify_positions", torch.int64)
-    _require_dtype(verify_prev_slot_indices, "verify_prev_slot_indices", torch.int64)
+    _require_dtype(out_verify_slot_indices, "out_verify_slot_indices", torch.int64)
+    _require_dtype(out_verify_positions, "out_verify_positions", torch.int64)
+    _require_dtype(
+        out_verify_prev_slot_indices, "out_verify_prev_slot_indices", torch.int64
+    )
 
     if bs < 0:
         raise ValueError(f"kv-canary: extras kernel bs must be non-negative, got {bs}")
@@ -123,9 +125,11 @@ def _validate_extras_kernel_inputs(
     )
     _require_min_len(extra_verify_num_valid, "extra_verify_num_valid", 1)
     _require_min_len(verify_offsets_scratch, "verify_offsets_scratch", bs + 1)
-    _require_len(verify_slot_indices, "verify_slot_indices", verify_capacity)
-    _require_len(verify_positions, "verify_positions", verify_capacity)
-    _require_len(verify_prev_slot_indices, "verify_prev_slot_indices", verify_capacity)
+    _require_len(out_verify_slot_indices, "out_verify_slot_indices", verify_capacity)
+    _require_len(out_verify_positions, "out_verify_positions", verify_capacity)
+    _require_len(
+        out_verify_prev_slot_indices, "out_verify_prev_slot_indices", verify_capacity
+    )
 
     _require_same_device(
         verify_offsets_scratch,
@@ -135,9 +139,9 @@ def _validate_extras_kernel_inputs(
             (extra_verify_positions, "extra_verify_positions"),
             (extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices"),
             (extra_verify_num_valid, "extra_verify_num_valid"),
-            (verify_slot_indices, "verify_slot_indices"),
-            (verify_positions, "verify_positions"),
-            (verify_prev_slot_indices, "verify_prev_slot_indices"),
+            (out_verify_slot_indices, "out_verify_slot_indices"),
+            (out_verify_positions, "out_verify_positions"),
+            (out_verify_prev_slot_indices, "out_verify_prev_slot_indices"),
         ),
     )
 
