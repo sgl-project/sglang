@@ -1243,9 +1243,7 @@ class TestLayoutAndScheduling:
 
     def test_disabled_plan_skips_slots_but_counts_kernel(self) -> None:
         """``VerifyPlan.enable = 0`` skips active entries while still marking the verify launch as run."""
-        canary_buf = make_canary_buf(
-            num_slots=16, slot_stride_bytes=32, device=_DEVICE
-        )
+        canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
         slot_idx = 5
         write_slot_fields(
             canary_buf=canary_buf,
@@ -1289,9 +1287,10 @@ class TestLayoutAndScheduling:
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)
         assert torch.equal(log.slot_run_counter, slot_run_before)
-        assert int(log.kernel_run_counter[0].item()) == int(
-            kernel_run_before[0].item()
-        ) + 1
+        assert (
+            int(log.kernel_run_counter[0].item())
+            == int(kernel_run_before[0].item()) + 1
+        )
 
     def test_paged_layout_page_size_16(self) -> None:
         """page_size=16: slot→page mapping doesn't change verify chain semantics on a clean chain."""
