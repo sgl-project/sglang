@@ -321,6 +321,25 @@ class TestBuildPerBsParams(unittest.TestCase):
             _, bs_params = build_per_bs_params(f.name)
         self.assertEqual(bs_params[1].up_hysteresis, 0.1)
 
+    def test_global_ema_params_inherited(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "ema_alpha": 0.3,
+                    "warmup_batches": 20,
+                    "update_interval": 10,
+                    "1": {"candidate_steps": [1, 3, 7]},
+                    "64": {"candidate_steps": [1, 3]},
+                },
+                f,
+            )
+            f.flush()
+            _, bs_params = build_per_bs_params(f.name)
+        for bs in [1, 64]:
+            self.assertEqual(bs_params[bs].ema_alpha, 0.3)
+            self.assertEqual(bs_params[bs].warmup_batches, 20)
+            self.assertEqual(bs_params[bs].update_interval, 10)
+
     def test_ceiling_coeff_passthrough(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
