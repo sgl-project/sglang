@@ -148,5 +148,47 @@ class TestDSV4FlashFP4H200FlashInferCutlass(ServerSanityMixin, CustomTestCase):
         self.assertGreater(metrics["score"], 0.93)
 
 
+class TestDSV4FlashFP4NonMTPH200(ServerSanityMixin, CustomTestCase):
+    """LowLatency recipe without MTP: TP=4, Marlin FP4, no speculative decoding."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--moe-runner-backend",
+                "marlin",
+                "--watchdog-timeout",
+                "900",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"[DSV4 Flash FP4 NonMTP H200] GSM8K {metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
+
+
 if __name__ == "__main__":
     unittest.main()
