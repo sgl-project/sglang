@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -12,7 +13,7 @@ class _BaselineBase(CanaryE2EBase):
     """No perturb, kv-canary=log, sweep off. Server should run clean with no canary
     violations and every request must come back 200."""
 
-    kv_canary_mode = "log"
+    kv_canary_mode = CanaryMode.LOG
     extra_env = {}
 
     def test_no_violation(self) -> None:

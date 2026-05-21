@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from typing import ClassVar
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
@@ -19,7 +20,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
     match ``target_group``.
     """
 
-    kv_canary_mode = "log"
+    kv_canary_mode = CanaryMode.LOG
     extra_server_args = ("--kv-canary-real-data", "partial")
 
     target_group: ClassVar[TargetGroupKind]

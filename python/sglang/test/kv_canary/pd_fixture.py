@@ -8,6 +8,7 @@ from typing import ClassVar, Literal, Optional
 
 import requests
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -28,7 +29,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
     """
 
     model_mode: ClassVar[Literal["mha", "swa"]]
-    kv_canary_mode: ClassVar[Literal["off", "log", "raise"]] = "log"
+    kv_canary_mode: ClassVar[CanaryMode] = CanaryMode.LOG
     extra_server_args: ClassVar[tuple[str, ...]] = ("--kv-canary-real-data", "partial")
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
@@ -41,7 +42,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
 
         canary_args = [
             "--kv-canary",
-            cls.kv_canary_mode,
+            cls.kv_canary_mode.value,
             "--context-length",
             "8192",
             *cls.extra_server_args,

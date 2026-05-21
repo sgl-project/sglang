@@ -11,6 +11,7 @@ from typing import ClassVar, Literal, Optional
 
 import requests
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
@@ -42,7 +43,7 @@ class CanaryE2EBase(CustomTestCase):
     """
 
     model_mode: ClassVar[Literal["mha", "swa"]]
-    kv_canary_mode: ClassVar[Literal["off", "log", "raise"]]
+    kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
@@ -64,7 +65,7 @@ class CanaryE2EBase(CustomTestCase):
 
         server_args = [
             "--kv-canary",
-            cls.kv_canary_mode,
+            cls.kv_canary_mode.value,
             "--context-length",
             "8192",
             *cls.extra_server_args,

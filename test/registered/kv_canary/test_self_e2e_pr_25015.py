@@ -6,6 +6,7 @@ import json
 import unittest
 from typing import ClassVar
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -38,7 +39,7 @@ _SPEC_EAGLE_SERVER_ARGS = (
 
 class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
     model_mode = "mha"
-    kv_canary_mode = "raise"
+    kv_canary_mode = CanaryMode.RAISE
     extra_server_args = _SPEC_EAGLE_SERVER_ARGS
     revert_pr: ClassVar[bool]
 
