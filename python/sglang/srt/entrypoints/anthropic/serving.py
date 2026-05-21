@@ -50,6 +50,38 @@ STOP_REASON_MAP = {
     "tool_calls": "tool_use",
 }
 
+# Map HTTP status codes to Anthropic error types
+_HTTP_STATUS_TO_ANTHROPIC_ERROR_TYPE = {
+    400: "invalid_request_error",
+    401: "authentication_error",
+    403: "permission_error",
+    404: "not_found_error",
+    429: "rate_limit_error",
+    500: "api_error",
+    503: "overloaded_error",
+}
+
+
+def _extract_error_message(body: dict, default: str = "Internal processing error") -> str:
+    """Extract error message from an OpenAI-style error response body.
+
+    Handles both flat format (from create_error_response):
+        {"object": "error", "message": "...", ...}
+    and nested format (from create_streaming_error_response):
+        {"error": {"message": "...", ...}}
+    """
+    # Try flat structure first: {"message": "..."}
+    msg = body.get("message")
+    if isinstance(msg, str) and msg:
+        return msg
+    # Try nested structure: {"error": {"message": "..."}}
+    error_obj = body.get("error")
+    if isinstance(error_obj, dict):
+        msg = error_obj.get("message")
+        if isinstance(msg, str) and msg:
+            return msg
+    return default
+
 
 def _wrap_sse_event(data: str, event_type: str) -> str:
     """Format an Anthropic SSE event with event type and data lines."""
@@ -362,11 +394,27 @@ class AnthropicServing:
 
         # Check for error responses from OpenAI handler
         if not isinstance(response, ChatCompletionResponse):
-            # It's an error response (ORJSONResponse)
+            # It's an error response (ORJSONResponse), extract the original error info
+            status_code = getattr(response, "status_code", 500)
+            error_message = "Internal processing error"
+            try:
+                error_body = json.loads(response.body)
+                error_message = _extract_error_message(error_body, error_message)
+            except Exception:
+                pass
+            # Map HTTP status code to Anthropic error type
+            error_type = _HTTP_STATUS_TO_ANTHROPIC_ERROR_TYPE.get(
+                status_code, "api_error"
+            )
+            logger.warning(
+                "OpenAI handler returned error (status=%s): %s",
+                status_code,
+                error_message,
+            )
             return self._error_response(
-                status_code=500,
-                error_type="internal_error",
-                message="Internal processing error",
+                status_code=status_code,
+                error_type=error_type,
+                message=error_message,
             )
 
         # Convert to Anthropic response
@@ -493,11 +541,22 @@ class AnthropicServing:
             try:
                 chunk = ChatCompletionStreamResponse.model_validate_json(data_str)
             except Exception:
-                logger.debug("Failed to parse stream chunk: %s", data_str)
+                # Try to extract error info from the original data
+                error_message = "Stream processing error"
+                try:
+                    error_data = json.loads(data_str)
+                    error_message = _extract_error_message(
+                        error_data, error_message
+                    )
+                except Exception:
+                    pass
+                logger.warning(
+                    "Failed to parse stream chunk: %s", data_str[:500]
+                )
                 error_event = AnthropicStreamEvent(
                     type="error",
                     error=AnthropicError(
-                        type="api_error", message="Stream processing error"
+                        type="api_error", message=error_message
                     ),
                 )
                 yield _wrap_sse_event(
