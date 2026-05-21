@@ -548,28 +548,24 @@ class MambaMixer2(torch.nn.Module):
             # NOTE: final output is an in-place update of out tensor
             varlen_state = mamba_chunk_scan_combined(
                 hidden_states_p.view(
-                    1, num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
+                    num_prefill_tokens, self.num_heads // self.tp_size, self.head_dim
                 ),
-                dt_p.unsqueeze(0),
+                dt_p,
                 self.A,
-                B_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
-                C_p.view(1, num_prefill_tokens, self.n_groups // self.tp_size, -1),
+                B_p.view(num_prefill_tokens, self.n_groups // self.tp_size, -1),
+                C_p.view(num_prefill_tokens, self.n_groups // self.tp_size, -1),
                 chunk_size=mixed_metadata.chunk_size,
                 D=self.D,
                 z=None,
                 dt_bias=self.dt_bias,
-                seq_idx=mixed_metadata.seq_idx,
-                chunk_indices=mixed_metadata.chunk_indices,
-                chunk_offsets=mixed_metadata.chunk_offsets,
                 cu_seqlens=query_start_loc_p,
+                cu_chunk_seqlens=mixed_metadata.cu_chunk_seqlens,
+                last_chunk_indices=mixed_metadata.last_chunk_indices,
+                seq_idx=mixed_metadata.seq_idx,
                 initial_states=initial_states,
-                return_varlen_states=True,
-                return_final_states=False,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
-                out=preallocated_ssm_out_p.view(
-                    1, num_prefill_tokens, -1, self.head_dim
-                ),
+                out=preallocated_ssm_out_p.view(num_prefill_tokens, -1, self.head_dim),
                 state_dtype=ssm_state.dtype,
             )
 
