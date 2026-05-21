@@ -33,7 +33,7 @@ import itertools
 import math
 import re
 from io import BytesIO
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import pybase64
@@ -477,6 +477,7 @@ def run_dp_sharded_mrope_vision_model(
     grid_thw_list: list,
     *,
     rope_type: Literal["rope_3d", "rope_2d"],
+    local_item_indices: Optional[list[int]] = None,
 ):
     """Run a vision model with data parallelism (DP) sharding.
     The function will shard the input image tensor on the
@@ -485,12 +486,22 @@ def run_dp_sharded_mrope_vision_model(
 
     Args:
         vision_model (torch.nn.Module): Vision model.
-        pixel_values (torch.Tensor): Image/Video input tensor.
-        grid_thw_list: List of grid dimensions for each image
+        pixel_values (torch.Tensor): Image/Video input tensor. When
+            ``local_item_indices`` is ``None`` this must be the *full* concat
+            of all items' patches; when ``local_item_indices`` is provided it
+            must already contain only the local-rank items concatenated in
+            ``local_item_indices`` order (which must equal
+            ``sorted(image_idxs_local)`` under the same LB assignment).
+        grid_thw_list: List of grid dimensions for *all* images (one row per
+            item) -- used for the LB decision and for output reassembly.
         rope_type: Type of rope used in the vision model.
                    Different rope types have different dimension to do ViT.
                    "rope_3d" for 3D rope (e.g., Qwen2.5-VL)
                    "rope_2d" for 2D rope (e.g., Kimi-VL)
+        local_item_indices: Optional. If provided, ``pixel_values`` is treated
+            as already containing only the local rank's items, in this exact
+            order. This avoids materializing the full concat on every rank
+            (the whole point of pre-H2D item sharding).
     Returns:
         torch.Tensor: Output image embeddings
 
@@ -520,42 +531,70 @@ def run_dp_sharded_mrope_vision_model(
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-    # print(f"{patches_per_image = }")
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
-    # Get load balancing assignment with all metadata
-    # image_to_tp_rank = [0, 2, 1, 3]
-    # gpu_sample_counts = [1, 3]
-    # grouped_pixel_values_len = [1000, 350]
-    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
-    )
+    if local_item_indices is not None:
+        # The caller already sharded pixel_values (e.g. scheduler-side early
+        # dispatch). Derive the full rank assignment directly from
+        # local_item_indices instead of recomputing the LB -- the scheduler may
+        # have used a different (larger) item set for its LB decision, so
+        # recomputing here on a subset would give inconsistent results.
+        all_indices = set(range(len(grid_thw_list)))
+        local_set = set(local_item_indices)
+        other_indices = sorted(all_indices - local_set)
 
-    # cu_gpu_sample_counts = [0, 1, 4]
-    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+        rank_image_order: list[list[int]] = [[] for _ in range(tp_size)]
+        rank_image_order[tp_rank_local] = list(local_item_indices)
+        if tp_size == 2:
+            other_rank = 1 - tp_rank_local
+            rank_image_order[other_rank] = other_indices
+        else:
+            # For tp_size > 2, distribute remaining items round-robin among
+            # other ranks (best-effort; exact match requires communication).
+            other_ranks = [r for r in range(tp_size) if r != tp_rank_local]
+            for i, idx in enumerate(other_indices):
+                rank_image_order[other_ranks[i % len(other_ranks)]].append(idx)
 
-    # GPU_0 image_idxs_local = [0]
-    # GPU_1 image_idxs_local = [2, 1, 3]
-    image_idxs_local = image_to_tp_rank[
-        cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
-    ]
+        gpu_sample_counts = [len(rank_image_order[r]) for r in range(tp_size)]
+        grouped_pixel_values_len = [
+            sum(patches_per_image[i] for i in rank_image_order[r])
+            for r in range(tp_size)
+        ]
 
-    # Get the pixel values for the local images based on the image_idxs_local
-    if len(image_idxs_local) > 0:
-        pixel_values_local = torch.cat(
-            [
-                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
-                for i in image_idxs_local
-            ]
-        )
+        image_idxs_local = local_item_indices
+        pixel_values_local = pixel_values
     else:
-        # Handle case where this rank has no images
-        pixel_values_local = torch.empty(
-            (0, pixel_values.shape[1]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
+        # Legacy path: compute LB and slice pixel_values locally.
+        image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
+            get_dp_encoder_lb_assignment(patches_per_image, tp_size)
         )
+        cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+
+        rank_image_order: list[list[int]] = []
+        for rank in range(tp_size):
+            idxs = image_to_tp_rank[
+                cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+            ]
+            rank_image_order.append(sorted(idxs))
+
+        image_idxs_local = rank_image_order[tp_rank_local]
+
+        if len(image_idxs_local) > 0:
+            pixel_values_local = torch.cat(
+                [
+                    pixel_values[
+                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
+                    ]
+                    for i in image_idxs_local
+                ]
+            )
+        else:
+            pixel_values_local = torch.empty(
+                (0, pixel_values.shape[1]),
+                device=pixel_values.device,
+                dtype=pixel_values.dtype,
+            )
     # embed_dim_reduction_factor = 2 * 2
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (
@@ -647,14 +686,12 @@ def run_dp_sharded_mrope_vision_model(
 
     # Reconstruct embeddings in the original order
     original_order_embeddings = [None] * len(grid_thw_list)
-    current_idx = 0
     for rank in range(tp_size):
         count = gpu_sample_counts[rank]
         if count > 0:
-            # Get images assigned to this rank in shuffled order
-            # GPU_0 = image_idxs_local  [0]
-            # GPU_1 = image_idxs_local  [2, 1, 3]
-            rank_images = image_to_tp_rank[current_idx : current_idx + count]
+            # Get images assigned to this rank in canonical (sorted) order,
+            # matching the within-rank order used to build pixel_values_local.
+            rank_images = rank_image_order[rank]
 
             rank_embed = rank_embeddings[rank]
             # Split rank embeddings back to individual images
@@ -665,6 +702,5 @@ def run_dp_sharded_mrope_vision_model(
                     embed_start : embed_start + img_patches
                 ]
                 embed_start += img_patches
-            current_idx += count
     out_embeddings = torch.cat(original_order_embeddings, dim=0)
     return out_embeddings

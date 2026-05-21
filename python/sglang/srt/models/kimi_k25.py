@@ -677,8 +677,17 @@ class KimiK25ForConditionalGeneration(nn.Module):
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         device = self.vision_tower.device
         target_dtype = self.vision_tower.patch_embed.proj.weight.dtype
-        pixel_values = torch.cat([item.feature for item in items], dim=0).to(
-            device=device, dtype=target_dtype
+        # Some items' feature may have been dropped to None by the DP-encoder
+        # pre-H2D sharding helper; only concat what we actually own.
+        from sglang.srt.managers.mm_utils import (
+            build_local_pixel_values_for_dp_encoder,
+        )
+
+        pixel_values, shard_indices = build_local_pixel_values_for_dp_encoder(
+            items,
+            dtype=target_dtype,
+            fallback_device=device,
+            to_device=device,
         )
         grid_thws = torch.concat([item.image_grid_thw for item in items], dim=0).to(
             device
@@ -690,6 +699,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 pixel_values,
                 grid_thws.tolist(),
                 rope_type="rope_2d",
+                local_item_indices=shard_indices,
             )
             image_features = self.mm_projector(image_embeds)
             return image_features
