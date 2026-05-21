@@ -26,7 +26,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
     sweep_interval = 0
 
     def test_chain_hash_violation_observed(self) -> None:
-        self.send_parallel_requests(n=4, max_new_tokens=8)
+        self.send_parallel_requests(n=4, max_new_tokens=200)
         # Per-forward verify emits launch_tag of the form HEAD_<kernel>_<GROUP> or
         # TAIL_<kernel>_<GROUP>. Try HEAD first; if not present, fall back to TAIL.
         try:

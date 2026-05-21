@@ -17,7 +17,7 @@ class _BaselineBase(CanaryE2EBase):
     sweep_interval = 0
 
     def test_no_violation(self) -> None:
-        results = self.send_parallel_requests(n=4, max_new_tokens=8)
+        results = self.send_parallel_requests(n=4, max_new_tokens=200)
         for r in results:
             self.assertEqual(r.get("status_code"), 200, r)
         self.assert_no_violation(wait_seconds=2.0)

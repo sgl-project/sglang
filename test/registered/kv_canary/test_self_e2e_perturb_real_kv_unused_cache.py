@@ -36,10 +36,10 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
 
     def test_sweep_real_kv_hash_violation_observed(self) -> None:
         # Step 1: first batch builds radix entries that will become orphans once finished.
-        self.send_parallel_requests(n=8, max_new_tokens=4)
+        self.send_parallel_requests(n=8, max_new_tokens=200)
         # Step 2: second batch drives more forward passes so the sweep cadence fires
         # while the orphan slots are still cached.
-        self.send_parallel_requests(n=8, max_new_tokens=4)
+        self.send_parallel_requests(n=8, max_new_tokens=200)
         suffix = "FULL" if self.target_group == "full" else "SWA"
         self.assert_violation_logged(
             launch_tag_pattern=f"SWEEP_*_{suffix}",

@@ -43,7 +43,7 @@ class _Gemma3SwaBase(CanaryE2EBase):
 class TestShortPromptFullSwaBothVerify(_Gemma3SwaBase, unittest.TestCase):
     def test_short_prompt_full_swa_both_verify(self) -> None:
         # Step 1: drive enough traffic to clear the cuda-graph warmup window.
-        results = self.send_parallel_requests(n=16, max_new_tokens=32)
+        results = self.send_parallel_requests(n=16, max_new_tokens=200)
 
         # Step 2: every request must complete and /health must stay up.
         for r in results:
@@ -79,7 +79,7 @@ class TestLongPromptSwaWindowClip(_Gemma3SwaBase, unittest.TestCase):
         results = self.send_parallel_requests(
             n=4,
             prompts=[_LONG_PROMPT],
-            max_new_tokens=8,
+            max_new_tokens=200,
             timeout=120.0,
         )
 
@@ -119,7 +119,7 @@ class TestMixedBatchNoViolations(_Gemma3SwaBase, unittest.TestCase):
             "Summarize the following text in one sentence:",
         ]
         results = self.send_parallel_requests(
-            n=32, prompts=mixed_prompts, max_new_tokens=16, timeout=60.0
+            n=32, prompts=mixed_prompts, max_new_tokens=200, timeout=60.0
         )
 
         # Step 2: every request must complete with status 200.
