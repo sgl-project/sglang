@@ -63,6 +63,17 @@ class PlanInput:
     extra_verify_prev_slot_indices: torch.Tensor
     extra_verify_num_valid: torch.Tensor
 
+    def zero_(self) -> "PlanInput":
+        self.fb_req_pool_indices.zero_()
+        self.fb_prefix_lens.zero_()
+        self.fb_extend_seq_lens.zero_()
+        self.extra_verify_slot_indices.zero_()
+        self.extra_verify_positions.zero_()
+        self.extra_verify_prev_slot_indices.zero_()
+        self.extra_verify_num_valid.zero_()
+
+        return self
+
     @classmethod
     def allocate(
         cls,
@@ -105,8 +116,7 @@ def fill_plan_input_per_forward(
     - plan_input_out.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
       forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
       via req_pool_indices sentinel; the lens value there is irrelevant).
-    - extra_verify_* untouched — they stay all-zero / num_valid = 0 (allocated once with 0
-      capacity).
+    - extra_verify_* zeroed — they stay all-zero / num_valid = 0 (allocated once with 0 capacity).
 
     Returns the current bs (valid prefix length of the per-forward buffers).
     """
@@ -119,14 +129,13 @@ def fill_plan_input_per_forward(
             "raise the buffer size in CanaryRunner.__init__"
         )
 
-    plan_input_out.fb_req_pool_indices.zero_()
+    plan_input_out.zero_()
     plan_input_out.fb_req_pool_indices[:bs].copy_(req_pool_indices)
-    plan_input_out.fb_prefix_lens.zero_()
-    plan_input_out.fb_extend_seq_lens.zero_()
 
     _fill_prefix_lens_and_extend_seq_lens(
         forward_batch=forward_batch,
-        plan_input_out=plan_input_out,
+        out_prefix_lens=plan_input_out.fb_prefix_lens[:bs],
+        out_extend_seq_lens=plan_input_out.fb_extend_seq_lens[:bs],
         bs=bs,
     )
 
@@ -136,7 +145,8 @@ def fill_plan_input_per_forward(
 def _fill_prefix_lens_and_extend_seq_lens(
     *,
     forward_batch: "ForwardBatch",
-    plan_input_out: PlanInput,
+    out_prefix_lens: torch.Tensor,
+    out_extend_seq_lens: torch.Tensor,
     bs: int,
 ) -> None:
     # Enumerate per forward_mode rather than trusting forward_batch.extend_prefix_lens /
@@ -156,37 +166,29 @@ def _fill_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode is None or forward_mode.is_decode_or_idle():
-        plan_input_out.fb_prefix_lens[:bs].copy_(
-            (forward_batch.seq_lens[:bs] - 1).to(torch.int64)
-        )
-        plan_input_out.fb_extend_seq_lens[:bs].fill_(1)
+        out_prefix_lens.copy_((forward_batch.seq_lens[:bs] - 1).to(torch.int64))
+        out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
         # seq_lens has NOT been bumped at TARGET_VERIFY (prepare_for_v2_verify only flips the
         # forward_mode and assigns out_cache_loc for positions [seq_lens, seq_lens +
         # draft_token_num)). So prefix == current seq_lens, extend == uniform draft_token_num.
-        plan_input_out.fb_prefix_lens[:bs].copy_(
-            forward_batch.seq_lens[:bs].to(torch.int64)
-        )
-        plan_input_out.fb_extend_seq_lens[:bs].fill_(int(spec_info.draft_token_num))
+        out_prefix_lens.copy_(forward_batch.seq_lens[:bs].to(torch.int64))
+        out_extend_seq_lens.fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
         # seq_lens HAS been bumped at DRAFT_EXTEND_V2 (prepare_for_extend_to_fill_draft_kvcache
         # adds num_draft_tokens). forward_batch.extend_seq_lens is populated in both eager (via
         # init_new) and cuda-graph (the synthetic ForwardBatch sets it explicitly); only
         # extend_prefix_lens is missing in cuda-graph, so derive it as seq_lens - extend_seq_lens.
         extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int64)
-        plan_input_out.fb_extend_seq_lens[:bs].copy_(extend_seq_lens)
-        plan_input_out.fb_prefix_lens[:bs].copy_(
+        out_extend_seq_lens.copy_(extend_seq_lens)
+        out_prefix_lens.copy_(
             forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
         )
     else:
         # EXTEND / MIXED / DRAFT_EXTEND / SPLIT_PREFILL / DLLM_EXTEND — extend_*_lens guaranteed
         # populated by init_new's else branch.
-        plan_input_out.fb_prefix_lens[:bs].copy_(
-            forward_batch.extend_prefix_lens.to(torch.int64)
-        )
-        plan_input_out.fb_extend_seq_lens[:bs].copy_(
-            forward_batch.extend_seq_lens.to(torch.int64)
-        )
+        out_prefix_lens.copy_(forward_batch.extend_prefix_lens[:bs].to(torch.int64))
+        out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs].to(torch.int64))
 
 
 def build_plan_input_radix_sweep(
