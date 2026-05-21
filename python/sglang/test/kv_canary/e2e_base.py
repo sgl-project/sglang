@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import os
+import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import ClassVar, Literal, Optional
@@ -68,9 +71,9 @@ class CanaryE2EBase(CustomTestCase):
     ``setUpClass`` launches the server with mode-specific args + canary env;
     ``tearDownClass`` kills the server and cleans env vars set in setUpClass.
 
-    NOTE: assert_violation_logged / assert_no_violation are placeholders this
-    commit (raise NotImplementedError); the follow-up commit stabilizes the
-    violation log format so they can be implemented for real.
+    Violation log assertions parse the stable one-line summary emitted by
+    ViolationReporter (see python/sglang/srt/kv_canary/runner/violation.py):
+        ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
     """
 
     mode: ClassVar[Literal["mha", "swa"]]
@@ -172,25 +175,44 @@ class CanaryE2EBase(CustomTestCase):
         flush_wait_seconds: float = 2.0,
     ) -> None:
         """Scan server log for a violation line whose launch_tag matches launch_tag_pattern
-        (fnmatch) and whose fail_reason set contains fail_reason.
+        (fnmatch) and whose fail_reason set contains fail_reason exactly.
 
-        Placeholder this commit: requires the next commit to stabilize the violation log
-        format. Concrete implementation lands then.
+        Looks for lines of the form
+            ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
+        emitted by ViolationReporter. Raises AssertionError if no matching line found.
         """
-        raise NotImplementedError(
-            "assert_violation_logged: requires the follow-up commit that stabilizes the "
-            "violation log format"
+        time.sleep(flush_wait_seconds)
+        log_text = self._captured_log_text()
+        line_re = re.compile(
+            r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)"
+        )
+        for match in line_re.finditer(log_text):
+            tag = match.group(1)
+            reason_field = match.group(2)
+            if not fnmatch.fnmatchcase(tag, launch_tag_pattern):
+                continue
+            if fail_reason in reason_field.split("+"):
+                return
+        raise AssertionError(
+            f"No canary violation matching launch_tag={launch_tag_pattern!r} "
+            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
+            f"{log_text[-2000:]}"
         )
 
     def assert_no_violation(self, *, wait_seconds: float = 2.0) -> None:
-        """No violation should be logged within wait_seconds.
+        """Assert no ``kv_canary violation:`` line appears in the captured server log within
+        wait_seconds."""
+        time.sleep(wait_seconds)
+        log_text = self._captured_log_text()
+        if "kv_canary violation:" in log_text:
+            raise AssertionError(
+                f"Unexpected canary violation found. Log tail:\n{log_text[-2000:]}"
+            )
 
-        Placeholder this commit: see assert_violation_logged.
-        """
-        raise NotImplementedError(
-            "assert_no_violation: requires the follow-up commit that stabilizes the "
-            "violation log format"
-        )
+    def _captured_log_text(self) -> str:
+        stdout_text = self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
+        stderr_text = self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
+        return stdout_text + stderr_text
 
 
 def _make_unique_prompts(n: int) -> list[str]:
