@@ -2081,7 +2081,9 @@ class AscendAttnBackend(AttentionBackend):
                         num_key_value_heads=layer.tp_k_head_num,
                         input_layout="BSND",
                         block_size=block_size,
-                        atten_mask=swa_mask if layer.sliding_window_size != -1 else None,
+                        atten_mask=(
+                            swa_mask if layer.sliding_window_size != -1 else None
+                        ),
                         sparse_mode=4 if layer.sliding_window_size != -1 else 0,
                         softmax_scale=layer.scaling,
                         block_table=block_tables,
