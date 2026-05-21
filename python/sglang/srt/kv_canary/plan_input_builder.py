@@ -152,7 +152,7 @@ def _extract_prefix_lens_and_extend_seq_lens(
     # unconditional copy.
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
-    if forward_mode is None or forward_mode.is_decode_or_idle():
+    if forward_mode.is_decode_or_idle():
         # Evidence: ForwardBatch.init_new leaves extend_* fields unset for decode/idle, while
         # attention backends treat decode as one query token whose cache length is seq_lens.
         # Therefore the covered span is prefix seq_lens - 1 plus one extend token.
@@ -176,12 +176,14 @@ def _extract_prefix_lens_and_extend_seq_lens(
         out_prefix_lens.copy_(
             forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
         )
-    else:
+    elif forward_mode.is_extend():
         # Evidence: ForwardBatch.init_new copies batch.prefix_lens and batch.extend_lens into
         # extend_prefix_lens / extend_seq_lens for non-decode, non-idle modes, matching regular
         # extend metadata builders that consume those tensors directly.
         out_prefix_lens.copy_(forward_batch.extend_prefix_lens[:bs].to(torch.int64))
         out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs].to(torch.int64))
+    else:
+        raise NotImplementedError(f"Unsupported forward mode for kv-canary: {forward_mode}")
 
 
 def build_plan_input_radix_sweep(
