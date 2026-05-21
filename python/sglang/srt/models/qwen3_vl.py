@@ -423,7 +423,8 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             config = self.get_graph_config()
             self.cuda_graph_runner = ViTCudaGraphRunner(self, config)
-            self.cuda_graph_runner.capture_all()
+            # capture_all() is called later by model_runner after LLM
+            # CUDA graph capture, so that CUDA infrastructure is warm.
 
     @property
     def dtype(self) -> torch.dtype:

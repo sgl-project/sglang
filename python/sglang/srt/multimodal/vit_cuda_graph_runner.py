@@ -245,100 +245,19 @@ class ViTCudaGraphRunner:
         self.output_bufs[B] = output
 
     def capture_all(self) -> None:
-        """Eagerly capture graphs for all bucket sizes. Called at model init."""
-        import logging
-        import time as _time
+        """Eagerly capture graphs for all bucket sizes.
 
+        Called by model_runner.init_vit_cuda_graphs() after LLM CUDA graph
+        capture, so that CUDA infrastructure is already warm.
+        """
         from sglang.srt.distributed.parallel_state import graph_capture
 
-        logger = logging.getLogger(__name__)
-        device_module = torch.get_device_module(self.device)
-        B_max = self.BUCKET_SIZES[-1]
-
-        def _timed_eager(label):
-            t0 = _time.monotonic()
-            self.vit.run_blocks(
-                self.input_bufs[B_max],
-                self.forward_metadatas[B_max],
-                self.rotary_cos_bufs[B_max],
-                self.rotary_sin_bufs[B_max],
-            )
-            device_module.synchronize()
-            dt = (_time.monotonic() - t0) * 1000
-            logger.info("[VIT_GRAPH] %s: %.1fms", label, dt)
-
-        # --- Diagnostic: isolate what causes the 1.4s first-eager cost ---
-
-        # Allocate buffers for the largest bucket (needed by _timed_eager)
-        self._alloc_buffers(B_max)
-
-        # Do the real capture
         with graph_capture() as graph_capture_context:
             stream = graph_capture_context.stream
+            # Capture largest first so the graph pool's initial allocation
+            # is big enough for smaller graphs to reuse.
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
-
-        # Test: warmup with B_max (16384), then test with a DIFFERENT size
-        _timed_eager("E1_warmup_16384")  # absorbs cold-start
-        # Now allocate a different-sized buffer and test
-        cfg = self.config
-        novel_x = torch.zeros(
-            33600, 1, cfg.hidden_dim, device=self.device, dtype=self.dtype
-        )
-        novel_cos = torch.zeros(
-            33600, cfg.rotary_dim, device=self.device, dtype=self.dtype
-        )
-        novel_sin = torch.zeros(
-            33600, cfg.rotary_dim, device=self.device, dtype=self.dtype
-        )
-        novel_cu = torch.tensor([0, 33600], device=self.device, dtype=torch.int32)
-        novel_sl = torch.tensor([33600], device=self.device, dtype=torch.int32)
-        novel_meta = VisionAttentionMetadata(
-            cu_seqlens=novel_cu,
-            seq_lens=novel_sl,
-            max_seqlen=33600,
-        )
-        t0 = _time.monotonic()
-        self.vit.run_blocks(novel_x, novel_meta, novel_cos, novel_sin)
-        device_module.synchronize()
-        dt = (_time.monotonic() - t0) * 1000
-        logger.info("[VIT_GRAPH] E2_novel_33600_after_warmup: %.1fms", dt)
-        del novel_x, novel_cos, novel_sin, novel_cu, novel_sl, novel_meta
-
-    def _capture_no_stream(self, bucket_size: int) -> None:
-        """Capture on default stream (no graph_capture context) for diagnosis."""
-        B = bucket_size
-        if B not in self.input_bufs:
-            self._alloc_buffers(B)
-
-        input_buf = self.input_bufs[B]
-        fwd_metadata = self.forward_metadatas[B]
-        rotary_cos = self.rotary_cos_bufs[B]
-        rotary_sin = self.rotary_sin_bufs[B]
-
-        device_module = torch.get_device_module(self.device)
-
-        if ViTCudaGraphRunner._graph_memory_pool is None:
-            ViTCudaGraphRunner._graph_memory_pool = device_module.graph_pool_handle()
-
-        # Warmup on default stream
-        for _ in range(2):
-            self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
-            self.vit.run_merger(
-                *self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
-            )
-        device_module.synchronize()
-
-        # Capture on default stream
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
-            block_out, ds_outs = self.vit.run_blocks(
-                input_buf, fwd_metadata, rotary_cos, rotary_sin
-            )
-            output = self.vit.run_merger(block_out, ds_outs)
-
-        self.graphs[B] = graph
-        self.output_bufs[B] = output
 
     # ------------------------------------------------------------------
     # Replay

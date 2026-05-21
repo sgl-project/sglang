@@ -819,6 +819,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize piecewise CUDA graph
         self.init_piecewise_cuda_graphs()
 
+        # Capture ViT CUDA graphs after LLM graphs so that all CUDA
+        # infrastructure (cuBLAS, attention backend, memory pool, etc.)
+        # is already warm.  This avoids a multi-second cold-start penalty
+        # on the first eager ViT forward.
+        self.init_vit_cuda_graphs()
+
         self.prealloc_symmetric_memory_pool()
 
     def adjust_hybrid_swa_layers_for_pp(self):
@@ -2784,6 +2790,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
+
+    def init_vit_cuda_graphs(self):
+        """Capture ViT CUDA graphs.
+
+        Must run after init_device_graphs() so CUDA infrastructure is warm.
+        Finds any ViTCudaGraphRunner on the model's vision encoder and calls
+        capture_all().
+        """
+        from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
+
+        for module in self.model.modules():
+            runner = getattr(module, "cuda_graph_runner", None)
+            if isinstance(runner, ViTCudaGraphRunner) and not runner.graphs:
+                runner.capture_all()
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
