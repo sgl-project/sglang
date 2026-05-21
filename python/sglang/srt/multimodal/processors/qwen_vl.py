@@ -703,21 +703,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 base_output, self.mm_tokens
             )
 
-        audio_feature_lengths = None
-
-        if self.model_type == "qwen3_omni_moe":
-            audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
-            if audio_item:
-                audio_feature_lengths = torch.sum(
-                    audio_item.feature_attention_mask, dim=1
-                )
-
-        second_per_grid_ts = self._get_processor_output_value(ret, "second_per_grid_ts")
-        if second_per_grid_ts is None:
-            second_per_grid_ts = self._get_processor_output_value(
-                ret, "video_second_per_grid"
-            )
-
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
@@ -740,6 +725,22 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
         if mrope_result is None:
+            audio_feature_lengths = None
+            if self.model_type == "qwen3_omni_moe":
+                audio_item = next((mm for mm in mm_items if mm.is_audio()), None)
+                if audio_item:
+                    audio_feature_lengths = torch.sum(
+                        audio_item.feature_attention_mask, dim=1
+                    )
+
+            second_per_grid_ts = self._get_processor_output_value(
+                ret, "second_per_grid_ts"
+            )
+            if second_per_grid_ts is None:
+                second_per_grid_ts = self._get_processor_output_value(
+                    ret, "video_second_per_grid"
+                )
+
             image_grid_thw = self._get_grid_from_output_or_items(
                 ret, mm_items, "image_grid_thw", Modality.IMAGE, image_data
             )

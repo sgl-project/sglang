@@ -55,6 +55,20 @@ class NoToListInputIds:
         raise AssertionError("input_ids.tolist should not run")
 
 
+class GuardedProcessorOutput(dict):
+    blocked_keys = {
+        "second_per_grid_ts",
+        "video_second_per_grid",
+        "image_grid_thw",
+        "video_grid_thw",
+    }
+
+    def get(self, key, default=None):
+        if key in self.blocked_keys:
+            raise AssertionError(f"{key} should not be read")
+        return super().get(key, default)
+
+
 def make_processor():
     processor = DummyProcessor.__new__(DummyProcessor)
     processor._tokenizer = FailingTokenizer()
@@ -431,11 +445,13 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
                 feature=torch.arange(8).reshape(2, 4),
             )
         ]
-        processor_output = {
-            "padded_input_ids": padded_input_ids,
-            "mrope_positions": torch.arange(12, dtype=torch.long).reshape(3, 4),
-            "mrope_position_delta": torch.tensor([[0]], dtype=torch.long),
-        }
+        processor_output = GuardedProcessorOutput(
+            {
+                "padded_input_ids": padded_input_ids,
+                "mrope_positions": torch.arange(12, dtype=torch.long).reshape(3, 4),
+                "mrope_position_delta": torch.tensor([[0]], dtype=torch.long),
+            }
+        )
         base_output = BaseMultiModalProcessorOutput(
             input_text="",
             input_ids=input_ids,
