@@ -395,6 +395,10 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
+            # model.forward() bypasses _forward_raw(), so invalidate manually.
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(

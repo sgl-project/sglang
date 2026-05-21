@@ -133,7 +133,7 @@ def _generate(
     max_new_tokens,
     return_logprob=False,
     logprob_start_len=-1,
-    temperature=1,
+    temperature=0.0,
 ):
     """Send generate request and return results."""
     json_data = {
@@ -156,7 +156,7 @@ def _generate(
     return response.json()
 
 
-def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=1):
+def _get_input_logprobs(base_url, new_input_ids, output_logprobs, temperature=0.0):
     """Run prefill to get input logprobs matching output logprobs."""
     _flush_cache(base_url)
     results = _generate(
