@@ -12,6 +12,11 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
+    # V4 is a DSA architecture; mark it so `is_dsa_enable_prefill_cp()` resolves
+    # correctly downstream (the V3.2 branch in server_args.__post_init__ sets
+    # this flag for V3.2, but V4 takes the v4-specific hook path and would
+    # otherwise stay False — leaving V4's CP code paths silently disabled).
+    server_args._is_dsa_model_arch = True
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
     logger.info(
