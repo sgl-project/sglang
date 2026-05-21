@@ -11,6 +11,11 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -24,11 +29,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -234,7 +234,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            from sglang.srt.layers.utils.cp_strategy import get_cp_strategy
+            from sglang.srt.layers.cp.strategy import get_cp_strategy
 
             _cp_strategy = get_cp_strategy()
             if _cp_strategy is not None and _cp_strategy.can_apply(

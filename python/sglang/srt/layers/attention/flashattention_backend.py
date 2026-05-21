@@ -10,8 +10,8 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.cp.strategy import cp_active, get_cp_strategy
 from sglang.srt.layers.radix_attention import AttentionType
-from sglang.srt.layers.utils.cp_strategy import cp_active, get_cp_strategy
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args

@@ -983,7 +983,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         the attn_cp group. Used by DSA-CP layers where attention runs
         SCATTERED but MLP/MoE wants the FULL sequence layout. Identical to
         the former ``DSACPCommunicateWithAllReduceAndLayerNormFn``."""
-        from sglang.srt.layers.utils.cp_strategy import (
+        from sglang.srt.layers.cp.strategy import (
             _cp_active_for_per_layer,
             get_cp_strategy,
         )
@@ -1336,7 +1336,7 @@ class CommunicateSummableTensorPairFn:
     ):
         """Reduce-scatter the FULL MLP output back to per-rank SCATTERED
         chunks via the attn_cp group. Used by DSA-CP layers."""
-        from sglang.srt.layers.utils.cp_strategy import (
+        from sglang.srt.layers.cp.strategy import (
             _cp_active_for_per_layer,
             get_cp_strategy,
         )

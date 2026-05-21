@@ -70,6 +70,11 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+)
 
 # DSACPLayerCommunicator was folded into LayerCommunicator. The base class
 # now detects the CP per-layer SCATTERED↔FULL transitions via its dispatch
@@ -124,11 +129,6 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -2490,7 +2490,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            from sglang.srt.layers.utils.cp_strategy import get_cp_strategy
+            from sglang.srt.layers.cp.strategy import get_cp_strategy
 
             _cp_strategy = get_cp_strategy()
             if _cp_strategy is not None and _cp_strategy.can_apply(

@@ -998,7 +998,7 @@ class ServerArgs:
         # still reads them (until full migration lands) keeps working. Also
         # bind the strategy singleton.
         self._sync_cp_legacy_aliases()
-        from sglang.srt.layers.utils.cp_strategy import init_cp_strategy
+        from sglang.srt.layers.cp.strategy import init_cp_strategy
 
         init_cp_strategy(self)
 

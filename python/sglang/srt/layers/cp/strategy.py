@@ -338,7 +338,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return torch.cat([pos_list[i] for i in cp_meta.zigzag_index], dim=-1)
 
     def gather_tokens(self, x, forward_batch, stream=None):
-        from sglang.srt.layers.utils.cp_collectives import (
+        from sglang.srt.layers.cp.collectives import (
             cp_all_gather_reorganized_into_tensor,
         )
 
@@ -354,7 +354,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return self._undo_zigzag(full, forward_batch, hidden_size)
 
     def gather_kv_cache(self, x, forward_batch, stream=None):
-        from sglang.srt.layers.utils.cp_collectives import (
+        from sglang.srt.layers.cp.collectives import (
             cp_all_gather_reorganized_into_tensor_kv_cache,
         )
 

@@ -996,7 +996,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         # Hand the per-forward CP metadata build off to the active strategy.
         # ``cp_active``-style predicates elsewhere then gate on whether
         # ``forward_batch.attn_cp_metadata`` was actually populated.
-        from sglang.srt.layers.utils.cp_strategy import get_cp_strategy
+        from sglang.srt.layers.cp.strategy import get_cp_strategy
 
         _cp_strategy = get_cp_strategy()
         if _cp_strategy is not None and _cp_strategy.can_apply(

@@ -75,19 +75,19 @@ def is_dsa_enable_prefill_cp():
 
 
 def is_dsa_prefill_cp_in_seq_split():
-    from sglang.srt.layers.utils.cp_strategy import is_zigzag
+    from sglang.srt.layers.cp.strategy import is_zigzag
 
     return is_dsa_enable_prefill_cp() and is_zigzag()
 
 
 def is_dsa_prefill_cp_round_robin_split():
-    from sglang.srt.layers.utils.cp_strategy import is_interleave
+    from sglang.srt.layers.cp.strategy import is_interleave
 
     return is_dsa_enable_prefill_cp() and is_interleave()
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    from sglang.srt.layers.utils.cp_strategy import get_cp_strategy, is_interleave
+    from sglang.srt.layers.cp.strategy import get_cp_strategy, is_interleave
 
     if not is_dsa_enable_prefill_cp() or not is_interleave():
         return False

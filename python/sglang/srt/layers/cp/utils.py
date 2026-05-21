@@ -22,11 +22,11 @@ from typing import Callable, List, Optional
 
 import torch
 
-from sglang.srt.layers.utils.cp_collectives import (
+from sglang.srt.layers.cp.collectives import (
     cp_all_gather_reorganized_into_tensor,
     cp_all_gather_reorganized_into_tensor_kv_cache,
 )
-from sglang.srt.layers.utils.cp_strategy import (
+from sglang.srt.layers.cp.strategy import (
     ContextParallelMetadata,
     get_cp_strategy,
     is_cp_enabled,
