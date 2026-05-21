@@ -2849,11 +2849,14 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
-                    # Both modes publish next-iter seq_lens via FutureMap;
-                    # spec_v2 fires post-verify (overlaps draft_extend), non-spec post-sample.
-                    fwd_kwargs = {
-                        "on_publish": partial(self.future_map.publish, future_indices)
-                    }
+                    # Spec_v2 fires on_publish mid-worker (between verify and
+                    # draft_extend) so schedule prep can overlap with draft_extend.
+                    # Non-spec has no later work — scheduler publishes after return.
+                    fwd_kwargs = (
+                        {"on_publish": partial(self.future_map.publish, future_indices)}
+                        if batch.is_spec_v2
+                        else {}
+                    )
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
@@ -2862,6 +2865,8 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        if not batch.is_spec_v2:
+                            self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).

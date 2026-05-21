@@ -451,7 +451,6 @@ class TpModelWorker(BaseTpWorker):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         is_verify: bool = False,
         skip_attn_backend_init=False,
-        on_publish=None,
     ) -> GenerationBatchResult:
         # FIXME(lsyin): maybe remove skip_attn_backend_init in forward_batch_generation,
         #               which requires preparing replay to always be in this function
@@ -487,13 +486,6 @@ class TpModelWorker(BaseTpWorker):
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
-
-            if batch is not None:
-                # Non-spec convention: batch.seq_lens INCLUDES this iter's token,
-                # so next iter expects current + 1.
-                batch_result.new_seq_lens = batch.seq_lens + 1
-                if on_publish is not None:
-                    on_publish(batch_result.new_seq_lens)
 
             if (
                 self.enable_overlap
