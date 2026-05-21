@@ -33,6 +33,7 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
     server_args = ServerArgs.from_cli_args(args, unknown_args)
+    server_args.enable_request_warmup_text_cache = True
 
     dispatch_launch(server_args)
 

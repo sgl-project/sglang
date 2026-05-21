@@ -223,6 +223,7 @@ class ServerArgs(DisaggArgsMixin):
     warmup: bool = False
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
+    enable_request_warmup_text_cache: bool = False
 
     disable_autocast: bool | None = None
 
