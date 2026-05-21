@@ -6,9 +6,13 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.plan_ref import launch_canary_plan_kernels_torch_reference
+from sglang.jit_kernel.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
-from sglang.jit_kernel.kv_canary.verify_ref import launch_canary_verify_kernel_torch_reference
+from sglang.jit_kernel.kv_canary.verify_ref import (
+    launch_canary_verify_kernel_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
