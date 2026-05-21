@@ -189,7 +189,11 @@ class Scheduler(SchedulerDisaggMixin):
         # TODO: return with SetLoRAResponse or something more appropriate
         req = reqs[0]
         return self.worker.set_lora(
-            req.lora_nickname, req.lora_path, req.target, req.strength
+            req.lora_nickname,
+            req.lora_path,
+            req.target,
+            req.strength,
+            req.merge_mode,
         )
 
     def _handle_merge_lora(self, reqs: List[Any]):

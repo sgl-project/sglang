@@ -119,13 +119,9 @@ def fused_marlin_moe(
         and w2_scale.dtype == torch.float8_e8m0fnu
     )
     if is_mxfp4_marlin:
-        assert w1_scale.dtype == torch.float8_e8m0fnu, (
-            "MXFP4 Marlin expects w1_scale to be torch.float8_e8m0fnu, "
-            f"got {w1_scale.dtype}"
-        )
-        assert w2_scale.dtype == torch.float8_e8m0fnu, (
-            "MXFP4 Marlin expects w2_scale to be torch.float8_e8m0fnu, "
-            f"got {w2_scale.dtype}"
+        assert hidden_states.dtype == torch.bfloat16, (
+            "MXFP4 Marlin with E8M0 scales is only instantiated for bfloat16 "
+            f"activations, got {hidden_states.dtype}"
         )
     else:
         assert (

@@ -263,26 +263,30 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
         if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
+            if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
+                    req.logprob.output_token_logprobs_val[0]
                 )
-            if req.output_token_logprobs_idx:  # not none or empty list
+            if req.logprob.output_token_logprobs_idx:  # not none or empty list
                 self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
+                    req.logprob.output_token_logprobs_idx[0]
                 )
 
-            if req.output_top_logprobs_val:  # not none or empty list
+            if req.logprob.output_top_logprobs_val:  # not none or empty list
                 self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
+                    : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    req.logprob.output_top_logprobs_val[0],
+                    dtype=torch.float32,
+                    device="cpu",
                 )
-            if req.output_top_logprobs_idx:  # not none or empty list
+            if req.logprob.output_top_logprobs_idx:  # not none or empty list
                 self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
+                    : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    req.logprob.output_top_logprobs_idx[0],
+                    dtype=torch.int32,
+                    device="cpu",
                 )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
@@ -553,6 +557,7 @@ def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
     draft_token_to_kv_pool=None,
+    total_kv_layers: int = None,
     req_to_token_pool=None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
@@ -560,8 +565,9 @@ def setup_state_kv_args(
     lives in one place.
     """
     from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
@@ -587,9 +593,9 @@ def setup_state_kv_args(
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
             )
-        elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+        elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
             if draft_token_to_kv_pool is not None and isinstance(
-                draft_token_to_kv_pool, NSATokenToKVPool
+                draft_token_to_kv_pool, DSATokenToKVPool
             ):
                 (
                     draft_data_ptrs,
@@ -599,9 +605,15 @@ def setup_state_kv_args(
                 data_ptrs = data_ptrs + draft_data_ptrs
                 data_lens = data_lens + draft_data_lens
                 item_lens = item_lens + draft_item_lens
-            append_state_component(
-                kv_args, StateType.NSA, data_ptrs, data_lens, item_lens
-            )
+            if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
+            else:
+                append_state_component(
+                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                )
 
     if (
         StateType.MAMBA not in kv_args.state_types
@@ -627,9 +639,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
     if req.return_logprob:
-        req.input_token_logprobs_val = []
-        req.input_token_logprobs_idx = []
-        req.input_top_logprobs_val = []
-        req.input_top_logprobs_idx = []
-        req.input_token_ids_logprobs_val = []
-        req.input_token_ids_logprobs_idx = []
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []

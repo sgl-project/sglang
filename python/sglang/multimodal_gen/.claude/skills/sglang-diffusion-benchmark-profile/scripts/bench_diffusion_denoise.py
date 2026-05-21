@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 19 preset models
+    # All 20 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -32,6 +32,7 @@ Input images required for image-guided models:
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -52,6 +53,9 @@ from diffusion_skill_env import (  # noqa: E402
 
 REPO_ROOT = get_repo_root()
 ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
+NIGHTLY_CONFIG_PATH = (
+    REPO_ROOT / "scripts" / "ci" / "utils" / "diffusion" / "comparison_configs.json"
+)
 GATED_MODELS = {"flux", "flux2"}
 DIFFUSERS_FALLBACK_SIGNALS = (
     "falling back to diffusers backend",
@@ -60,6 +64,18 @@ DIFFUSERS_FALLBACK_SIGNALS = (
 )
 CATALOG_TABLE_WIDTH = 105
 RESULTS_TABLE_WIDTH = 105
+NIGHTLY_PRESET_ORDER = (
+    "flux",
+    "flux2",
+    "qwen",
+    "qwen-edit",
+    "zimage",
+    "wan-t2v",
+    "wan-ti2v",
+    "ltx2",
+    "ltx23-ti2v-two-stage",
+    "wan-i2v",
+)
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -76,8 +92,6 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
             "--dit-layerwise-offload",
             "false",
         ],
@@ -90,8 +104,6 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
             "--dit-layerwise-offload",
             "false",
         ],
@@ -104,8 +116,6 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
         ],
     },
     # 4. Nightly: qwen_image_edit_2511
@@ -118,8 +128,6 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
         ],
     },
     # 5. Nightly: zimage_turbo_t2i_1024
@@ -130,8 +138,6 @@ MODELS = {
         "extra_args": [
             "--width=1024",
             "--height=1024",
-            "--num-inference-steps=9",
-            "--guidance-scale=4.0",
         ],
     },
     # 6. Nightly: wan22_t2v_a14b_720p
@@ -140,10 +146,9 @@ MODELS = {
         "path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
         "prompt": "A cat and a dog baking a cake together in a kitchen.",
         "extra_args": [
-            "--720p",
-            "--num-inference-steps=2",
+            "--width=1280",
+            "--height=720",
             "--num-frames=81",
-            "--guidance-scale=5.0",
             "--num-gpus=4",
             "--enable-cfg-parallel",
             "--ulysses-degree=2",
@@ -159,10 +164,9 @@ MODELS = {
         "prompt": "The cat starts walking slowly towards the camera.",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--720p",
+            "--width=1280",
+            "--height=720",
             "--num-frames=81",
-            "--num-inference-steps=50",
-            "--guidance-scale=5.0",
         ],
     },
     # 8. Nightly: ltx2_twostage_t2v
@@ -175,8 +179,6 @@ MODELS = {
             "--width=768",
             "--height=512",
             "--num-frames=121",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
             "--num-gpus=2",
             "--enable-cfg-parallel",
         ],
@@ -193,9 +195,8 @@ MODELS = {
             "--width=768",
             "--height=512",
             "--num-frames=121",
-            "--num-inference-steps=50",
-            "--guidance-scale=4.0",
             "--num-gpus=2",
+            "--cfg-parallel-size=2",
         ],
     },
     # 10. Nightly: wan22_i2v_a14b_720p
@@ -206,10 +207,9 @@ MODELS = {
         "prompt": "The cat starts walking slowly towards the camera.",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
-            "--720p",
-            "--num-inference-steps=2",
+            "--width=1280",
+            "--height=720",
             "--num-frames=81",
-            "--guidance-scale=5.0",
             "--num-gpus=4",
             "--enable-cfg-parallel",
             "--ulysses-degree=2",
@@ -322,6 +322,7 @@ MODELS = {
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
+            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -342,6 +343,7 @@ MODELS = {
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
+            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -362,6 +364,7 @@ MODELS = {
         "prompt": "Make the cat wear a red hat",
         "image_path": str(ASSET_DIR / "cat.png"),
         "extra_args": [
+            "--backend=sglang",
             "--width=1024",
             "--height=1024",
             "--num-inference-steps=40",
@@ -385,6 +388,7 @@ MODELS = {
             "paint_enable": False,
         },
         "extra_args": [
+            "--backend=sglang",
             "--num-inference-steps=50",
             "--guidance-scale=5.0",
             "--dit-layerwise-offload",
@@ -406,6 +410,7 @@ def required_gpus_for_model(model_key: str) -> int:
         "ltx23-ti2v-two-stage",
         "ltx23-one-stage",
         "ltx23-two-stage",
+        "ltx23-two-stage-cfg-parallel",
         "joyai-edit",
         "firered-edit-1.0",
         "firered-edit-1.1",
@@ -416,6 +421,123 @@ def required_gpus_for_model(model_key: str) -> int:
 
 def model_nightly_case_id(model_key: str) -> str:
     return MODELS[model_key].get("nightly_case_id", "-")
+
+
+def _parse_cli_args(args: list[str]) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not isinstance(arg, str) or not arg.startswith("--"):
+            i += 1
+            continue
+        if "=" in arg:
+            key, value = arg[2:].split("=", 1)
+            parsed[key] = value
+        elif i + 1 < len(args) and not str(args[i + 1]).startswith("--"):
+            parsed[arg[2:]] = str(args[i + 1])
+            i += 1
+        else:
+            parsed[arg[2:]] = True
+        i += 1
+    return parsed
+
+
+def _normalize_cli_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _expected_nightly_cli_args(case: dict) -> dict[str, str]:
+    expected = {
+        "width": str(case["width"]),
+        "height": str(case["height"]),
+    }
+
+    for key, flag in (
+        ("num_frames", "num-frames"),
+        ("fps", "fps"),
+        ("num_inference_steps", "num-inference-steps"),
+        ("guidance_scale", "guidance-scale"),
+    ):
+        if key in case:
+            expected[flag] = str(case[key])
+
+    if case.get("num_gpus", 1) > 1:
+        expected["num-gpus"] = str(case["num_gpus"])
+
+    serve_args = shlex.split(case["frameworks"]["sglang"].get("serve_args", ""))
+    parsed_serve_args = _parse_cli_args(serve_args)
+    for flag, value in parsed_serve_args.items():
+        if flag in {"enable-torch-compile", "warmup"}:
+            continue
+        expected[flag] = _normalize_cli_value(value)
+
+    return expected
+
+
+def validate_nightly_alignment() -> int:
+    """Validate nightly presets against diffusion comparison_configs.json."""
+    if not NIGHTLY_CONFIG_PATH.exists():
+        print(f"Missing nightly config: {NIGHTLY_CONFIG_PATH}")
+        return 1
+
+    with open(NIGHTLY_CONFIG_PATH) as f:
+        config = json.load(f)
+
+    cases = {case["id"]: case for case in config["cases"]}
+    errors: list[str] = []
+
+    preset_case_ids = [
+        MODELS[model_key].get("nightly_case_id") for model_key in NIGHTLY_PRESET_ORDER
+    ]
+    if preset_case_ids != list(cases):
+        errors.append(
+            "Nightly preset order differs from comparison_configs.json: "
+            f"skill={preset_case_ids}, ci={list(cases)}"
+        )
+
+    for model_key in NIGHTLY_PRESET_ORDER:
+        preset = MODELS[model_key]
+        case_id = preset["nightly_case_id"]
+        case = cases.get(case_id)
+        if case is None:
+            errors.append(f"{model_key}: missing CI case {case_id}")
+            continue
+
+        if preset["path"] != case["model"]:
+            errors.append(f"{model_key}: model path differs")
+        if preset["prompt"] != case["prompt"]:
+            errors.append(f"{model_key}: prompt differs")
+        if bool(preset.get("image_path")) != bool(case.get("reference_image")):
+            errors.append(f"{model_key}: reference image presence differs")
+        if preset.get("seed", 42) != case.get("seed"):
+            errors.append(f"{model_key}: seed differs")
+
+        actual_args = {
+            key: _normalize_cli_value(value)
+            for key, value in _parse_cli_args(preset["extra_args"]).items()
+        }
+        expected_args = _expected_nightly_cli_args(case)
+        if actual_args != expected_args:
+            errors.append(
+                f"{model_key}: CLI args differ\n"
+                f"  skill={actual_args}\n"
+                f"  ci={expected_args}"
+            )
+
+    if errors:
+        print("Nightly alignment check failed:")
+        for error in errors:
+            print(f"- {error}")
+        return 1
+
+    print(
+        "Nightly alignment check passed: presets match "
+        "scripts/ci/utils/diffusion/comparison_configs.json."
+    )
+    return 0
 
 
 def print_model_catalog():
@@ -455,8 +577,6 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
-        "--backend=sglang",
-        "--log-level=info",
     ]
 
     effective_seed = cfg.get("seed", seed)
@@ -671,11 +791,18 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 19 models")
+    parser.add_argument(
+        "--all", action="store_true", help=f"Benchmark all {len(MODELS)} models"
+    )
     parser.add_argument(
         "--list-models",
         action="store_true",
         help="List preset order, nightly mapping, and exit",
+    )
+    parser.add_argument(
+        "--validate-nightly-alignment",
+        action="store_true",
+        help="Validate nightly presets against scripts/ci/utils/diffusion/comparison_configs.json and exit.",
     )
     parser.add_argument(
         "--label",
@@ -701,6 +828,9 @@ def main():
     if args.list_models:
         print_model_catalog()
         return
+
+    if args.validate_nightly_alignment:
+        raise SystemExit(validate_nightly_alignment())
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
