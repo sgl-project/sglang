@@ -249,29 +249,6 @@ class ViTCudaGraphRunner:
         for B in self.BUCKET_SIZES:
             self._capture(B)
 
-        # Clear dynamo caches polluted by bucket-specific shapes.
-        # apply_rotary_pos_emb_native uses @torch.compile(dynamic=True) which
-        # creates shape guards during warmup.  Without reset, eager fallback
-        # (tokens > max bucket) hits recompilation (~3 s per new shape).
-        torch._dynamo.reset()
-
-        # Warm up the eager fallback path.
-        # CUDA graph capture under @torch._dynamo.disable runs kernels in
-        # eager Python mode.  The first post-capture eager call then triggers
-        # torch.compile + Triton JIT, causing a multi-second stall.
-        # Running one forward pass here absorbs that cost at init time.
-        self._warmup_eager_fallback()
-
-    def _warmup_eager_fallback(self) -> None:
-        """Run one eager forward to absorb first-call JIT costs."""
-        B = self.BUCKET_SIZES[-1]  # use largest bucket's buffers
-        input_buf = self.input_bufs[B]
-        fwd_metadata = self.forward_metadatas[B]
-        rotary_cos = self.rotary_cos_bufs[B]
-        rotary_sin = self.rotary_sin_bufs[B]
-        self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
-        torch.get_device_module(self.device).synchronize()
-
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
@@ -368,13 +345,6 @@ class ViTCudaGraphRunner:
         self.rotary_cos_bufs[B][:S].copy_(rotary_pos_emb_cos)
         self.rotary_sin_bufs[B][:S].copy_(rotary_pos_emb_sin)
 
-        # DEBUG: sync all TP ranks before replay to avoid NCCL desync
-        torch.cuda.synchronize()
-        import torch.distributed as dist
-
-        if dist.is_initialized():
-            dist.barrier()
-
         # Replay
         self.graphs[B].replay()
 
@@ -416,28 +386,23 @@ class ViTCudaGraphRunner:
                 bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
 
-        # Fallback: total tokens exceed max bucket, run eager
-        import logging
-        import time as _time
+        # Fallback: total tokens exceed max bucket, run eager.
+        # Disable dynamo so torch.compile'd functions (e.g.
+        # apply_rotary_pos_emb_native) run in plain eager mode,
+        # avoiding Triton JIT recompilation on novel shapes.
+        return self._eager_fallback(
+            x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
+        )
 
-        logger = logging.getLogger(__name__)
-        t0 = _time.monotonic()
-        torch.cuda.synchronize()
-        t1 = _time.monotonic()
+    @torch._dynamo.disable
+    def _eager_fallback(
+        self,
+        x: torch.Tensor,
+        forward_metadata: VisionAttentionMetadata,
+        rotary_pos_emb_cos: torch.Tensor,
+        rotary_pos_emb_sin: torch.Tensor,
+    ) -> torch.Tensor:
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
-        torch.cuda.synchronize()
-        t2 = _time.monotonic()
-        out = self.vit.run_merger(block_out, ds_outs)
-        torch.cuda.synchronize()
-        t3 = _time.monotonic()
-        logger.info(
-            "[VIT_GRAPH_EAGER] tokens=%d sync=%.1fms blocks=%.1fms merger=%.1fms total=%.1fms",
-            total_tokens,
-            (t1 - t0) * 1000,
-            (t2 - t1) * 1000,
-            (t3 - t2) * 1000,
-            (t3 - t0) * 1000,
-        )
-        return out
+        return self.vit.run_merger(block_out, ds_outs)
