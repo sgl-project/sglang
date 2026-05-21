@@ -1062,12 +1062,8 @@ class CudaGraphRunner:
 
         # Run and capture
         def run_once():
-            # Invalidate SWA loc translation cache so every model invocation
-            # (warmup 1, warmup 2, and capture run) starts clean. Without this,
-            # warmup 1 would cache the translation and the capture run would get a
-            # cache hit — no gather is recorded in the graph, and replay would
-            # reuse stale warmup-1 translations, silently writing KV to wrong
-            # SWA locations.
+            # Without this, warmup-1 caches the translation; the capture run gets
+            # a hit, skips the gather, and replay reuses stale SWA locations.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 

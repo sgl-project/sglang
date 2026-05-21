@@ -3244,9 +3244,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
-        # Invalidate SWA loc translation cache so the first translate call in this
-        # forward computes fresh results. Called here once per batch to close the
-        # allocator-address-reuse window between batches.
         if self.is_hybrid_swa:
             self.token_to_kv_pool.invalidate_loc_cache()
 
