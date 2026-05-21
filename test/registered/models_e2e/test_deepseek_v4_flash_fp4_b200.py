@@ -100,14 +100,41 @@ class TestDSV4FlashFP4B200Balanced(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        _gsm8k_check(self)
+
+
+class TestDSV4FlashFP4NonMTPB200(ServerSanityMixin, CustomTestCase):
+    """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],
