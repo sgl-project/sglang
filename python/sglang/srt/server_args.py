@@ -392,6 +392,7 @@ class ServerArgs:
     # HTTP server
     host: str = "127.0.0.1"
     port: int = 30000
+    uds: Optional[str] = None
     fastapi_root_path: str = ""
     grpc_mode: bool = False
     skip_server_warmup: bool = False
@@ -890,6 +891,33 @@ class ServerArgs:
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
+
+        if self.uds is not None:
+            import sys as _sys
+            if _sys.platform == "win32":
+                raise ValueError(
+                    "--uds is only supported on Linux and macOS; "
+                    f"current platform: {_sys.platform}"
+                )
+            # Compare against dataclass defaults to detect "user explicitly set
+            # --host or --port alongside --uds".
+            uds_field_defaults = {
+                "host": ServerArgs.__dataclass_fields__["host"].default,
+                "port": ServerArgs.__dataclass_fields__["port"].default,
+            }
+            mismatches = []
+            if self.host != uds_field_defaults["host"]:
+                mismatches.append(f"--host={self.host}")
+            if self.port != uds_field_defaults["port"]:
+                mismatches.append(f"--port={self.port}")
+            if mismatches:
+                raise ValueError(
+                    "--uds is mutually exclusive with --host / --port; "
+                    f"received --uds={self.uds} together with "
+                    f"{' '.join(mismatches)}. "
+                    "Drop --host/--port (defaults are kept for internal "
+                    "TCP services) or drop --uds."
+                )
 
         self._maybe_download_model_for_runai()
 
