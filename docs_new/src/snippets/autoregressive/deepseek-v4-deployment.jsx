@@ -615,7 +615,8 @@ export const DeepSeekV4Deployment = () => {
       }
       // allinone H200 gates DEEPEP_LARGE_SMS_FLAG on !multinode — only H200 big
       // is multi-node; all Blackwell cells get the flag unconditionally.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      // Skip when MegaMoE is enabled (uses its own backend, not DeepEP).
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "max-throughput") {
       // allinone max-throughput: TP + DP + DP-attn + DeepEP (NO MTP).
       //   H200 small: cg=128 max-run=256  |  H200 big: cg=128 max-run=256 (same)
@@ -652,7 +653,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --max-running-requests 256");
       }
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "cp") {
       // allinone cp: TP (NO --dp) + DeepEP + _CP_FLAGS (mem-frac 0.78, max-run 1024).
       //   Blackwell big additionally: mem-frac 0.70 (overrides), cg=256, max-run=256.
