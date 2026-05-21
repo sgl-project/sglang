@@ -312,14 +312,25 @@ class SessionController:
         session = self.sessions[session_id]
         req = None
         has_unfinished_request = False
-        if session.streaming and session._inflight:
-            has_unfinished_request = True
-        elif session.streaming and session.req_nodes:
-            assert len(session.req_nodes) == 1
-            [last_node] = session.req_nodes.values()
-            req = last_node.req
-            if not req.finished():
+        if session.streaming:
+            if session._inflight:
                 has_unfinished_request = True
+            elif session.req_nodes:
+                assert len(session.req_nodes) == 1
+                [last_node] = session.req_nodes.values()
+                req = last_node.req
+                if not req.finished():
+                    has_unfinished_request = True
+        else:
+            # Non-streaming sessions also park their active request in
+            # session.req_nodes; if any of them is still decoding, the reaper
+            # must defer close, otherwise it wipes the session's KV state mid
+            # generate and subsequent calls fail with "session id does not
+            # exist" while the in-flight request keeps running on freed slots.
+            for node in session.req_nodes.values():
+                if not node.req.finished():
+                    has_unfinished_request = True
+                    break
 
         if has_unfinished_request:
             # An in-flight request is still decoding on this session's KV
