@@ -9,9 +9,8 @@ sleeps until much later when a prefix happens to match.
 from __future__ import annotations
 
 import logging
+import random
 from typing import TYPE_CHECKING, Optional
-
-import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
@@ -66,7 +65,7 @@ def run(
             slot,
         )
         return
-    source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
+    source_pick = random.randrange(len(group.real_kv_sources_k))
     source = group.real_kv_sources_k[source_pick]
     flip_result = flip_first_byte_in_source(group=group, source=source, slot_idx=slot)
     if flip_result is None:

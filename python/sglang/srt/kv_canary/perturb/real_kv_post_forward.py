@@ -9,9 +9,8 @@ canary write.
 from __future__ import annotations
 
 import logging
+import random
 from typing import TYPE_CHECKING, Optional
-
-import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
@@ -62,7 +61,7 @@ def run(
             slot,
         )
         return
-    source_pick = int(torch.randint(0, len(group.real_kv_sources_k), (1,)).item())
+    source_pick = random.randrange(len(group.real_kv_sources_k))
     source = group.real_kv_sources_k[source_pick]
     # Runs after TAIL launch; relies on same-stream ordering vs the TAIL write.
     flip_result = flip_first_byte_in_source(group=group, source=source, slot_idx=slot)
@@ -102,7 +101,7 @@ def _pick_out_cache_slot(*, forward_batch: "ForwardBatch") -> Optional[int]:
     valid_num_tokens = int(valid_num_tokens)
     if valid_num_tokens <= 0:
         return None
-    pick = int(torch.randint(0, valid_num_tokens, (1,)).item())
+    pick = random.randrange(valid_num_tokens)
     slot = int(out_cache_loc[pick].item())
     if slot < 0:
         return None

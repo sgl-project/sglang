@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import random
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional
 
@@ -106,7 +107,7 @@ def pick_target_group(
     filtered = [group for group in eligible if group.kind == want]
     if not filtered:
         return None
-    pick = int(torch.randint(0, len(filtered), (1,)).item())
+    pick = random.randrange(len(filtered))
     return filtered[pick]
 
 
