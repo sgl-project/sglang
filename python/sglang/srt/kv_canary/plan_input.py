@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -251,8 +252,9 @@ def walk_radix_cache_for_canary(
     the LUT lookup before packing into PlanInput.
 
     Args:
-        unlocked_only: When True, skip nodes whose ``lock_ref > 0`` (i.e. currently referenced by a
-            running req). Used by the perturb path which MUST NOT mutate slots actively in use.
+        unlocked_only: When True, skip nodes whose cache-specific lock ref is positive (i.e.
+            currently referenced by a running req). Used by the perturb path which MUST NOT mutate
+            slots actively in use.
             Default False: sweep emits every radix-tree slot (overlap with per-forward HEAD/TAIL
             coverage is harmless redundancy).
 
@@ -261,6 +263,9 @@ def walk_radix_cache_for_canary(
     but for sweep cadences in the 64..1024 range, host walk is fine.
     """
     cache_type = type(radix_cache)
+    if isinstance(radix_cache, ChunkCache):
+        empty = torch.empty(0, dtype=torch.int32)
+        return empty, empty.clone(), empty.clone()
     if cache_type is not RadixCache and cache_type is not SWARadixCache:
         raise NotImplementedError(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"
@@ -272,6 +277,7 @@ def walk_radix_cache_for_canary(
 
     _walk_radix_subtree(
         node=radix_cache.root_node,
+        radix_cache=radix_cache,
         depth=0,
         parent_last_slot=-1,
         slot_buf=slot_buf,
@@ -290,6 +296,7 @@ def walk_radix_cache_for_canary(
 def _walk_radix_subtree(
     *,
     node: "TreeNode",
+    radix_cache: "BasePrefixCache",
     depth: int,
     parent_last_slot: int,
     slot_buf: list[int],
@@ -304,7 +311,9 @@ def _walk_radix_subtree(
         node_slots = []
 
     if unlocked_only:
-        emit_slots = not is_root and node.lock_ref == 0
+        emit_slots = not is_root and _node_is_unlocked_for_canary(
+            node=node, radix_cache=radix_cache
+        )
     else:
         emit_slots = not is_root
 
@@ -321,6 +330,7 @@ def _walk_radix_subtree(
     for child in node.children.values():
         _walk_radix_subtree(
             node=child,
+            radix_cache=radix_cache,
             depth=child_depth,
             parent_last_slot=chain_last_slot,
             slot_buf=slot_buf,
@@ -329,6 +339,22 @@ def _walk_radix_subtree(
             is_root=False,
             unlocked_only=unlocked_only,
         )
+
+
+def _node_is_unlocked_for_canary(
+    *,
+    node: "TreeNode",
+    radix_cache: "BasePrefixCache",
+) -> bool:
+    if type(radix_cache) is RadixCache:
+        return node.lock_ref == 0
+
+    if type(radix_cache) is SWARadixCache:
+        return node.full_lock_ref == 0
+
+    raise NotImplementedError(
+        f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
+    )
 
 
 def _swa_translate(
