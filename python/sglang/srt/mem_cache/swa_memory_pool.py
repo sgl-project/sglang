@@ -410,14 +410,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def wrap_count(self) -> int:
-        """Number of SWA alloc batches whose min swa_idx fell below the previous high-water mark."""
+        """Total observed SWA pool wraparound events."""
         if self._wrap_count_device is None:
             return 0
         return int(self._wrap_count_device.item())
 
     @property
     def nonidentity_write_count(self) -> int:
-        """Cumulative count of full_to_swa_index_mapping entries written with swa_idx != full_idx."""
+        """Total non-identity full-to-swa mapping writes."""
         if self._nonidentity_write_count_device is None:
             return 0
         return int(self._nonidentity_write_count_device.item())
