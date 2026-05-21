@@ -27,8 +27,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_OVERFLOW_WARN_EVERY_N_STEPS: int = 100
-
 
 class PerForwardOrchestrator:
     """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
@@ -97,8 +95,6 @@ class PerForwardOrchestrator:
 
         self._pending_enable_future: Optional[FutureTensor] = None
         self._overflow_count_total: int = 0
-        self._overflow_count_since_warn: int = 0
-        self._step_count_since_warn: int = 0
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
@@ -207,22 +203,14 @@ class PerForwardOrchestrator:
             return
         self._pending_enable_future = None
         enable_value = int(future.wait().item())
-        self._step_count_since_warn += 1
         if enable_value == 0:
             self._overflow_count_total += 1
-            self._overflow_count_since_warn += 1
-        if self._step_count_since_warn >= _OVERFLOW_WARN_EVERY_N_STEPS:
-            if self._overflow_count_since_warn > 0:
-                logger.warning(
-                    "kv-canary: per-forward verify skipped %d/%d recent steps due to overflow "
-                    "(total=%d, capacity=%d); check ServerArgs / pool sizing",
-                    self._overflow_count_since_warn,
-                    self._step_count_since_warn,
-                    self._overflow_count_total,
-                    self._verify_capacity,
-                )
-            self._overflow_count_since_warn = 0
-            self._step_count_since_warn = 0
+            logger.warning(
+                "kv-canary: per-forward verify skipped this step due to overflow "
+                "(total=%d, capacity=%d); check ServerArgs / pool sizing",
+                self._overflow_count_total,
+                self._verify_capacity,
+            )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
