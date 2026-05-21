@@ -88,6 +88,7 @@ class RadixKey:
             return n - 1 if n > 0 else 0
         return len(self.token_ids)
 
+    # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
         if self.is_bigram:
             t = self.token_ids
@@ -145,6 +146,7 @@ class RadixKey:
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
+    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
