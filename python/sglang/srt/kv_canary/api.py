@@ -31,8 +31,6 @@ def install_canary(
     if config.mode == "off":
         return None
 
-    logger.info("install_canary: starting (mode=%s)", config.mode)
-
     device = torch.device(model_runner.device)
     buffer_groups = attach_canary_buffers(
         pool=model_runner.token_to_kv_pool,
@@ -58,9 +56,8 @@ def install_canary(
     )
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
-    logger.info("install_canary: wrapped model.forward")
 
-    logger.info("install_canary: ready (config=%s)", config)
+    logger.info("install_canary: config=%s", config)
     return runner
 
 
