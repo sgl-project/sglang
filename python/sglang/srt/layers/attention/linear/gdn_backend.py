@@ -34,7 +34,7 @@ if is_cuda():
     causal_conv1d_fn = causal_conv1d_fn_cuda
 elif is_npu():
     from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_npu
-    from sgl_kernel_npu.mamba.causal_conv1d import (
+    from sglang.srt.layers.attention.mamba.causal_conv1d_npu import (
         causal_conv1d_fn_npu,
         causal_conv1d_update_npu,
     )
@@ -403,7 +403,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 retrieve_next_sibling=retrieve_next_sibling,
                 retrieve_parent_token=retrieve_parent_token,
             )
-            mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+            mixed_qkv = mixed_qkv_processed.transpose(1, 2).reshape(seq_len, -1)
         else:
             mixed_qkv = mixed_qkv.transpose(0, 1)
             if forward_metadata.has_mamba_track_mask:

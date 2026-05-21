@@ -34,6 +34,7 @@ from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
+    TREE_GREEDY_VERIFY_AVAILABLE,
     TREE_SPEC_KERNEL_AVAILABLE,
     align_evict_mask_to_page_size,
     assign_req_to_token_pool_func,
@@ -44,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_npu, is_musa, next_power_of_2
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -318,9 +319,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens. Force greedy sampling on AMD
+        # Sample tokens. Force greedy sampling on AMD/non-rejection-sampling platforms
         is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
+        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE) and (not TREE_GREEDY_VERIFY_AVAILABLE):
             logger.warning(
                 "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
                 "Falling back to greedy verification."
