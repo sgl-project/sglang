@@ -86,8 +86,6 @@ class CanaryRunner:
         self._pump_and_allreduce = PumpAndAllreduce(
             config=config,
             device_state=self._device_state,
-            tp_group=tp_group,
-            pp_group=pp_group,
             d2h_stream=self._d2h_stream,
         )
         self._sweep_orchestrator = SweepOrchestrator(

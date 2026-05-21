@@ -141,7 +141,6 @@ def make_base_config() -> CanaryConfig:
         real_kv_hash_mode=consts.RealKvHashMode.OFF,
         input_check_mode=False,
         stats_print_every_n_steps=100,
-        allreduce_violation_signal=False,
     )
 
 
