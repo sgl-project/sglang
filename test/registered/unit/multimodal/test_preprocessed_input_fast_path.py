@@ -10,6 +10,7 @@ from sglang.srt.managers.mm_utils import (
     ShmPointerMMData,
     _get_multimodal_indices_from_offsets,
 )
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -284,6 +285,34 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
 
         self.assertEqual(padded_input_ids, [1, -1001, -1001, 2, -1002, 3])
         self.assertEqual(mm_inputs.padded_input_ids, padded_input_ids)
+
+    def test_scheduler_reuses_precomputed_padded_ids_without_prefix(self):
+        padded_input_ids = [1, -1001, -1001, 2]
+        recv_req = SimpleNamespace(input_ids=[1, 42, 42, 2])
+        req = SimpleNamespace(origin_input_ids=list(recv_req.input_ids))
+        image_inputs = SimpleNamespace(padded_input_ids=padded_input_ids)
+
+        applied = Scheduler._try_apply_padded_mm_input_ids(
+            recv_req, req, image_inputs
+        )
+
+        self.assertTrue(applied)
+        self.assertIs(req.origin_input_ids, padded_input_ids)
+
+    def test_scheduler_keeps_prefix_when_applying_precomputed_padded_ids(self):
+        padded_input_ids = [1, -1001, -1001, 2]
+        prefix = [101, 102]
+        recv_req = SimpleNamespace(input_ids=[1, 42, 42, 2])
+        req = SimpleNamespace(origin_input_ids=prefix + list(recv_req.input_ids))
+        image_inputs = SimpleNamespace(padded_input_ids=padded_input_ids)
+
+        applied = Scheduler._try_apply_padded_mm_input_ids(
+            recv_req, req, image_inputs
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(req.origin_input_ids, prefix + padded_input_ids)
+        self.assertIsNot(req.origin_input_ids, padded_input_ids)
 
     def test_multimodal_token_padding_uses_offsets(self):
         input_ids = [1, 42, 42, 2, 43, 43, 3]

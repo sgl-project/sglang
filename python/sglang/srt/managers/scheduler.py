@@ -1748,7 +1748,7 @@ class Scheduler(
             return False
 
         if prefix_len == 0:
-            req.origin_input_ids = list(padded_input_ids)
+            req.origin_input_ids = padded_input_ids
         else:
             req.origin_input_ids = req.origin_input_ids[:prefix_len] + list(
                 padded_input_ids
