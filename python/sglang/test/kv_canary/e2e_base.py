@@ -236,6 +236,70 @@ class CanaryE2EBase(CustomTestCase):
             f"{log_text[-2000:]}"
         )
 
+    def assert_swa_divergence_observed(
+        self,
+        *,
+        min_mapping_nonidentity: int = 1,
+        min_pool_wrap: int = 1,
+        require_verify_lag: bool = True,
+        flush_wait_seconds: float = 2.0,
+        max_retries: int = 5,
+    ) -> None:
+        """Assert that the SWA path was genuinely exercised: at least one slot
+        recycled, at least one non-identity LUT entry, and (when
+        require_verify_lag=True) SWA verify cumulative count strictly less than
+        FULL verify cumulative count.
+
+        Reads the latest ``kv_canary swa_divergence: ...`` line from the captured
+        server log. If no such line is present yet, sleeps flush_wait_seconds
+        and retries up to max_retries times before raising AssertionError.
+        """
+        line_re = re.compile(
+            r"kv_canary swa_divergence: "
+            r"forward_ct=(\d+) "
+            r"verify_full=(\d+) "
+            r"verify_swa=(\d+) "
+            r"mapping_nonidentity=(\d+) "
+            r"swa_pool_wrap=(\d+)"
+        )
+        last_match: Optional[re.Match] = None
+        for _ in range(max_retries):
+            time.sleep(flush_wait_seconds)
+            log_text = self._captured_log_text()
+            matches = list(line_re.finditer(log_text))
+            if matches:
+                last_match = matches[-1]
+                break
+
+        if last_match is None:
+            raise AssertionError(
+                "No kv_canary swa_divergence line found in server log after "
+                f"{max_retries} retries (wait={flush_wait_seconds}s each). "
+                f"Log tail:\n{self._captured_log_text()[-2000:]}"
+            )
+
+        verify_full = int(last_match.group(2))
+        verify_swa = int(last_match.group(3))
+        mapping_nonidentity = int(last_match.group(4))
+        swa_pool_wrap = int(last_match.group(5))
+
+        if mapping_nonidentity < min_mapping_nonidentity:
+            raise AssertionError(
+                f"SWA divergence not observed: mapping_nonidentity={mapping_nonidentity} "
+                f"< min={min_mapping_nonidentity}. Line: {last_match.group(0)}"
+            )
+        if swa_pool_wrap < min_pool_wrap:
+            raise AssertionError(
+                f"SWA divergence not observed: swa_pool_wrap={swa_pool_wrap} "
+                f"< min={min_pool_wrap}. Line: {last_match.group(0)}"
+            )
+        if require_verify_lag and not (verify_swa < verify_full):
+            raise AssertionError(
+                f"SWA divergence not observed: verify_swa={verify_swa} "
+                f"not strictly less than verify_full={verify_full}. "
+                f"Line: {last_match.group(0)}"
+            )
+
     def assert_no_violation(self, *, wait_seconds: float = 2.0) -> None:
         """Assert no ``kv_canary violation:`` line appears in the captured server log within
         wait_seconds."""
