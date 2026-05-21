@@ -19,13 +19,17 @@ _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
     "SGLANG_DEBUG_REVERT_PR": "25015",
 }
+_CUDA_GRAPH_MAX_BS = 1
+_EAGER_DRAFT_REQUEST_COUNT = 20
+assert _EAGER_DRAFT_REQUEST_COUNT > _CUDA_GRAPH_MAX_BS
+
 _SPEC_EAGLE_SERVER_ARGS = (
     "--sampling-backend",
     "token_oracle",
     "--speculative-algorithm",
     "EAGLE",
     "--cuda-graph-max-bs",
-    "8",
+    str(_CUDA_GRAPH_MAX_BS),
     "--max-running-requests",
     "32",
     "--piecewise-cuda-graph-max-tokens",
@@ -51,7 +55,7 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
     def test_pr_25015_eagle_positions(self) -> None:
         if self.revert_pr:
             self.send_parallel_requests(
-                n=1,
+                n=_EAGER_DRAFT_REQUEST_COUNT,
                 assert_all_success=False,
                 max_new_tokens=32,
                 timeout=60.0,
