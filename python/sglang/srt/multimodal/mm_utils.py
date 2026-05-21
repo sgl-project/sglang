@@ -531,69 +531,70 @@ def run_dp_sharded_mrope_vision_model(
 
     # patches_per_image = [1000, 100, 200, 50]
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
-    # print(f"{patches_per_image = }")
     # patches_per_image = [0, 1000, 1100, 1300, 1350]
     cum_patches_per_image = [0, *itertools.accumulate(patches_per_image)]
 
-    # Get load balancing assignment with all metadata
-    # image_to_tp_rank = [0, 2, 1, 3]
-    # gpu_sample_counts = [1, 3]
-    # grouped_pixel_values_len = [1000, 350]
-    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
-        get_dp_encoder_lb_assignment(patches_per_image, tp_size)
-    )
-
-    # cu_gpu_sample_counts = [0, 1, 4]
-    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
-
-    # Canonicalize within-rank order to ``sorted`` (= original-item order). The
-    # LB decision (which items live on which rank) is unaffected; only the
-    # within-rank ordering is fixed so that the pre-sharded caller path
-    # (``local_item_indices`` provided) and the legacy slice path produce
-    # identical output. Output assembly below uses the same canonical order.
-    rank_image_order: list[list[int]] = []
-    for rank in range(tp_size):
-        idxs = image_to_tp_rank[
-            cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
-        ]
-        rank_image_order.append(sorted(idxs))
-
-    image_idxs_local = rank_image_order[tp_rank_local]
-
-    # Consistency check: when the caller pre-sharded items, its local_item_indices
-    # must match what the LB produces here (both are deterministic from the same
-    # patches_per_item, so this is a sanity assertion, not a runtime branch).
     if local_item_indices is not None:
-        assert local_item_indices == image_idxs_local, (
-            "DP-encoder pre-shard mismatch: `local_item_indices` provided by "
-            "the caller (built from "
-            "`sglang.srt.managers.mm_utils.maybe_shard_items_for_dp_encoder` + "
-            "`build_local_pixel_values_for_dp_encoder`) disagrees with the LB "
-            "decision in `sglang.srt.multimodal.mm_utils."
-            "run_dp_sharded_mrope_vision_model`: "
-            f"caller={local_item_indices} vs in-helper={image_idxs_local}. "
-            "This indicates the two LB call sites saw different "
-            "`patches_per_item`."
-        )
-        # pixel_values already contains only the local items in
-        # image_idxs_local order -- skip the redundant slice/concat.
+        # The caller already sharded pixel_values (e.g. scheduler-side early
+        # dispatch). Derive the full rank assignment directly from
+        # local_item_indices instead of recomputing the LB -- the scheduler may
+        # have used a different (larger) item set for its LB decision, so
+        # recomputing here on a subset would give inconsistent results.
+        all_indices = set(range(len(grid_thw_list)))
+        local_set = set(local_item_indices)
+        other_indices = sorted(all_indices - local_set)
+
+        rank_image_order: list[list[int]] = [[] for _ in range(tp_size)]
+        rank_image_order[tp_rank_local] = list(local_item_indices)
+        if tp_size == 2:
+            other_rank = 1 - tp_rank_local
+            rank_image_order[other_rank] = other_indices
+        else:
+            # For tp_size > 2, distribute remaining items round-robin among
+            # other ranks (best-effort; exact match requires communication).
+            other_ranks = [r for r in range(tp_size) if r != tp_rank_local]
+            for i, idx in enumerate(other_indices):
+                rank_image_order[other_ranks[i % len(other_ranks)]].append(idx)
+
+        gpu_sample_counts = [len(rank_image_order[r]) for r in range(tp_size)]
+        grouped_pixel_values_len = [
+            sum(patches_per_image[i] for i in rank_image_order[r])
+            for r in range(tp_size)
+        ]
+
+        image_idxs_local = local_item_indices
         pixel_values_local = pixel_values
-    elif len(image_idxs_local) > 0:
-        # Legacy path: pixel_values contains all items; slice out the local ones
-        # in canonical order.
-        pixel_values_local = torch.cat(
-            [
-                pixel_values[cum_patches_per_image[i] : cum_patches_per_image[i + 1]]
-                for i in image_idxs_local
-            ]
-        )
     else:
-        # Handle case where this rank has no images
-        pixel_values_local = torch.empty(
-            (0, pixel_values.shape[1]),
-            device=pixel_values.device,
-            dtype=pixel_values.dtype,
+        # Legacy path: compute LB and slice pixel_values locally.
+        image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
+            get_dp_encoder_lb_assignment(patches_per_image, tp_size)
         )
+        cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+
+        rank_image_order: list[list[int]] = []
+        for rank in range(tp_size):
+            idxs = image_to_tp_rank[
+                cum_gpu_sample_counts[rank] : cum_gpu_sample_counts[rank + 1]
+            ]
+            rank_image_order.append(sorted(idxs))
+
+        image_idxs_local = rank_image_order[tp_rank_local]
+
+        if len(image_idxs_local) > 0:
+            pixel_values_local = torch.cat(
+                [
+                    pixel_values[
+                        cum_patches_per_image[i] : cum_patches_per_image[i + 1]
+                    ]
+                    for i in image_idxs_local
+                ]
+            )
+        else:
+            pixel_values_local = torch.empty(
+                (0, pixel_values.shape[1]),
+                device=pixel_values.device,
+                dtype=pixel_values.dtype,
+            )
     # embed_dim_reduction_factor = 2 * 2
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (

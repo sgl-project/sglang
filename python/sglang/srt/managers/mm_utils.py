@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import math
 import pickle
 from abc import abstractmethod
 from collections import defaultdict
@@ -471,9 +472,14 @@ def _move_items_to_device(
 def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
     """Compute the per-item patch count (load metric) for image items.
 
-    Returns the product over the item's ``image_grid_thw`` dims when available,
+    Returns the product of the item's ``image_grid_thw`` values when available,
     or ``None`` when the item does not expose grid metadata suitable for
     per-item DP-encoder sharding.
+
+    The item MUST have exactly one grid_thw row (shape (1, 3)) to be eligible
+    for per-item sharding. Multi-row items signal that the item-to-row mapping
+    is not 1:1 and would cause index mismatches with
+    `run_dp_sharded_mrope_vision_model`.
     """
     grid = getattr(item, "image_grid_thw", None)
     if grid is None:
@@ -481,14 +487,15 @@ def _item_patches_for_dp_encoder(item: MultimodalDataItem) -> Optional[int]:
     if isinstance(grid, torch.Tensor):
         if grid.numel() == 0:
             return None
+        if grid.dim() == 2 and grid.shape[0] != 1:
+            return None
         return int(grid.prod().item())
-    flat = [v for v in flatten_nested_list(grid) if v is not None]
-    if not flat:
-        return None
-    total = 1
-    for v in flat:
-        total *= int(v)
-    return total
+    if isinstance(grid, (list, tuple)):
+        if len(grid) == 1 and isinstance(grid[0], (list, tuple)):
+            return int(math.prod(int(v) for v in grid[0]))
+        elif all(isinstance(v, (int, float)) for v in grid):
+            return int(math.prod(int(v) for v in grid))
+    return None
 
 
 def maybe_shard_items_for_dp_encoder(
@@ -645,7 +652,6 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        maybe_shard_items_for_dp_encoder(embedding_items_per_req)
         _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
@@ -719,7 +725,6 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        maybe_shard_items_for_dp_encoder(miss_item_list)
         _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(

@@ -1743,18 +1743,8 @@ class Scheduler(
         else:
             image_inputs = MultimodalInputs.from_processor_output(mm_inputs_dict)
 
-        # DP-encoder CPU-side sharding: every TP scheduler process currently
-        # holds the full pixel_values dict that arrived over IPC. Under
-        # ``mm_enable_dp_encoder`` the encoder forward is partitioned across
-        # attention-TP ranks via a deterministic load-balancer keyed on the
-        # CPU-resident ``image_grid_thw`` metadata, so each rank can drop the
-        # ``item.feature`` for items it does not own without any communication.
-        # We run this AFTER ``from_processor_output`` (and AFTER the broadcast,
-        # if any) so that ``hash`` / ``pad_value`` / ``image_grid_thw`` are
-        # already populated -- those are required to remain consistent across
-        # ranks for radix caching and embedding-cache keys. The downstream
-        # ``maybe_shard_items_for_dp_encoder`` at H2D time stays idempotent
-        # (same LB → already-None features remain None, local ones are kept).
+        # DP-encoder CPU-side sharding: drop ``item.feature`` for items not
+        # owned by this rank so the subsequent H2D only ships local data.
         if image_inputs is not None and image_inputs.mm_items:
             try:
                 maybe_shard_items_for_dp_encoder(image_inputs.mm_items)
