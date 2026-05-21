@@ -10,10 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
 )
 from sglang.srt.kv_canary.buffer_group import PoolKind
-from sglang.srt.kv_canary.pool_patch.api import (
-    attach_canary_buffers,
-    get_canary_buffer_groups,
-)
+from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -33,8 +30,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
 
     def test_canary_buffer_group_allocate_full_only(self):
         pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        groups = get_canary_buffer_groups(pool)
+        groups_tuple = attach_canary_buffers(
+            pool=pool, config=self.config, device=self.device
+        )
+        groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL})
         group = groups[PoolKind.FULL]
         self.assertEqual(group.k_head.shape, (16, CANARY_SLOT_BYTES))
@@ -45,8 +44,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
 
     def test_canary_buffer_group_allocate_full_and_swa(self):
         pool = make_swa_pool(self.device, full_slots=16, swa_slots=8)
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        groups = get_canary_buffer_groups(pool)
+        groups_tuple = attach_canary_buffers(
+            pool=pool, config=self.config, device=self.device
+        )
+        groups = {g.kind: g for g in groups_tuple}
         self.assertEqual(set(groups.keys()), {PoolKind.FULL, PoolKind.SWA})
         self.assertEqual(groups[PoolKind.FULL].k_head.shape[0], 16)
         self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 8)
@@ -123,8 +124,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
 
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        group = get_canary_buffer_groups(pool)[PoolKind.FULL]
+        groups_tuple = attach_canary_buffers(
+            pool=pool, config=self.config, device=self.device
+        )
+        group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
         ptrs_after, _, _ = pool.get_contiguous_buf_infos()
 
         canary_k_ptrs = [group.k_head.data_ptr(), group.k_tail.data_ptr()]
@@ -143,8 +146,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
         v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
 
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        group = get_canary_buffer_groups(pool)[PoolKind.FULL]
+        groups_tuple = attach_canary_buffers(
+            pool=pool, config=self.config, device=self.device
+        )
+        group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
         ptrs_after, _, _ = pool.get_contiguous_buf_infos()
 
         naive_layout = (
@@ -157,8 +162,10 @@ class TestSelfUnitPoolPatch(CustomTestCase):
 
     def test_canary_buf_per_token_bytes_within_budget(self):
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        group = get_canary_buffer_groups(pool)[PoolKind.FULL]
+        groups_tuple = attach_canary_buffers(
+            pool=pool, config=self.config, device=self.device
+        )
+        group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
 
         slot_stride_bytes = group.k_head.stride(0) * group.k_head.element_size()
         self.assertLessEqual(slot_stride_bytes, CANARY_SLOT_BYTES)

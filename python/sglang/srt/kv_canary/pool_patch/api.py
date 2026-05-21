@@ -4,7 +4,7 @@ from typing import Callable, Dict, Type
 
 import torch
 
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
@@ -19,7 +19,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 PoolAttacher = Callable[..., tuple[CanaryBufferGroup, ...]]
 
 _CANARY_ATTACHED_ATTR = "_kv_canary_attached"
-_CANARY_BUFFER_GROUPS_ATTR = "_kv_canary_buffer_groups"
 
 _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
     MHATokenToKVPool: attach_mha,
@@ -65,14 +64,4 @@ def attach_canary_buffers(
     groups = attacher(pool=pool, device=device, read_bytes=read_bytes)
 
     setattr(pool, _CANARY_ATTACHED_ATTR, True)
-    setattr(pool, _CANARY_BUFFER_GROUPS_ATTR, {group.kind: group for group in groups})
-    return groups
-
-
-def get_canary_buffer_groups(pool: KVCache) -> Dict[PoolKind, CanaryBufferGroup]:
-    groups = getattr(pool, _CANARY_BUFFER_GROUPS_ATTR, None)
-    if groups is None:
-        raise RuntimeError(
-            f"kv-canary: pool {type(pool).__name__} has no canary buffers attached"
-        )
     return groups
