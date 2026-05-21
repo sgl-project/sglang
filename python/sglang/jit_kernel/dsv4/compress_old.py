@@ -530,7 +530,7 @@ def _softmax_weighted_sum(
     Shapes: ``kv``/``score``/``bias`` all ``[..., S, head_dim]``.
     Returns ``[..., head_dim]`` cast to ``out_dtype``.
     """
-    s = (score.float() + bias.float())
+    s = score.float() + bias.float()
     m = s.amax(dim=-2, keepdim=True)
     w = (s - m).exp()
     num = (kv.float() * w).sum(dim=-2)
@@ -619,7 +619,7 @@ def _torch_c4_decode(
     bias = ape.unsqueeze(0).expand(kv_stack.shape[0], -1, -1)  # [F, 8, HD]
 
     # seq_len == 4 special case: zero overlap kv, -inf overlap score.
-    sl4 = (fwd_seq_lens == 4)
+    sl4 = fwd_seq_lens == 4
     if bool(sl4.any()):
         sl4_b = sl4.view(-1, 1, 1)
         zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
@@ -668,7 +668,7 @@ def _torch_c4_prefill(
 
     # ---- compress plan ----------------------------------------------------
     _INVALID_PLAN = 0xFFFFFFFF
-    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
+    valid_c = cplan_cpu[:, 0] != _INVALID_PLAN
     if bool(valid_c.any()):
         cp = cplan_cpu[valid_c].to(device)
         ragged_ids = cp[:, 0]
@@ -695,14 +695,12 @@ def _torch_c4_prefill(
         for i in range(8):
             chunk_kv = 0 if i < 4 else 1
             chunk_score = 2 if i < 4 else 3
-            use_buf = (i < window_lens)  # [N] bool
+            use_buf = i < window_lens  # [N] bool
 
             # Buffer source.
             if paged:
                 if i < 4:
-                    page_idx = torch.where(
-                        wl_le_4, load_second_page, load_first_page
-                    )
+                    page_idx = torch.where(wl_le_4, load_second_page, load_first_page)
                 else:
                     page_idx = load_second_page
                 k_buf = torch.full_like(positions, i % 4)
@@ -727,7 +725,7 @@ def _torch_c4_prefill(
         score_stack = torch.stack(score_chunks, dim=1)
         bias = ape.unsqueeze(0).expand(N, -1, -1)
 
-        sl4 = (seq_lens == 4)
+        sl4 = seq_lens == 4
         if bool(sl4.any()):
             sl4_b = sl4.view(-1, 1, 1)
             zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
@@ -763,7 +761,7 @@ def _torch_c4_prefill_write(
     device: torch.device,
 ) -> None:
     _INVALID_PLAN = 0xFFFFFFFF
-    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
+    valid_w = wplan_cpu[:, 0] != _INVALID_PLAN
     if not bool(valid_w.any()):
         return
     wp = wplan_cpu[valid_w].to(device)
@@ -850,9 +848,7 @@ def _torch_c128_prefill(
     device = kv_score_input.device
     indices_i64 = indices.to(torch.int64)
     # extra is optional load_indices; falls back to indices when absent.
-    load_indices_i64 = (
-        extra.to(torch.int64) if extra is not None else indices_i64
-    )
+    load_indices_i64 = extra.to(torch.int64) if extra is not None else indices_i64
 
     cplan_cpu = _decode_prefill_plan(compress_plan)
     wplan_cpu = _decode_prefill_plan(write_plan)
@@ -863,7 +859,7 @@ def _torch_c128_prefill(
 
     # ---- compress plan (uses `load_indices`) -----------------------------
     _INVALID_PLAN = 0xFFFFFFFF
-    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
+    valid_c = cplan_cpu[:, 0] != _INVALID_PLAN
     if bool(valid_c.any()):
         cp = cplan_cpu[valid_c].to(device)
         ragged_ids = cp[:, 0]
@@ -886,9 +882,7 @@ def _torch_c128_prefill(
         rag_kv = inp2[..., 0, :][rag_off]  # [N, 128, HD]
         rag_score = inp2[..., 1, :][rag_off]
 
-        use_buf = (j.unsqueeze(0) < window_lens.unsqueeze(1)).unsqueeze(
-            -1
-        )  # [N,128,1]
+        use_buf = (j.unsqueeze(0) < window_lens.unsqueeze(1)).unsqueeze(-1)  # [N,128,1]
         kv = torch.where(use_buf, buf_kv, rag_kv)
         score = torch.where(use_buf, buf_score, rag_score)
         bias = ape.unsqueeze(0).expand(N, -1, -1)  # [N, 128, HD]
@@ -896,7 +890,7 @@ def _torch_c128_prefill(
         out[ragged_ids] = _softmax_weighted_sum(kv, score, bias, out.dtype)
 
     # ---- write plan (uses `indices`, must run AFTER compress) ------------
-    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
+    valid_w = wplan_cpu[:, 0] != _INVALID_PLAN
     if bool(valid_w.any()):
         wp = wplan_cpu[valid_w].to(device)
         ragged_ids = wp[:, 0]

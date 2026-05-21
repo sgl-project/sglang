@@ -947,12 +947,12 @@ class MQALayer(nn.Module):
 
 @triton.jit
 def _hc_split_sinkhorn_triton_kernel(
-    mixes_ptr,        # [N, (2 + HC) * HC] float32
-    hc_scale_ptr,     # [3]                float32
-    hc_base_ptr,      # [(2 + HC) * HC]    float32
-    pre_ptr,          # [N, HC]            float32
-    post_ptr,         # [N, HC]            float32
-    comb_ptr,         # [N, HC, HC]        float32
+    mixes_ptr,  # [N, (2 + HC) * HC] float32
+    hc_scale_ptr,  # [3]                float32
+    hc_base_ptr,  # [(2 + HC) * HC]    float32
+    pre_ptr,  # [N, HC]            float32
+    post_ptr,  # [N, HC]            float32
+    comb_ptr,  # [N, HC, HC]        float32
     N,
     HC: tl.constexpr,
     SINKHORN_ITERS: tl.constexpr,

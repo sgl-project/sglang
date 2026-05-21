@@ -64,7 +64,6 @@ from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.utils import ceil_align, is_xpu
 from sglang.srt.utils.common import is_sm120_supported
 
-
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
 

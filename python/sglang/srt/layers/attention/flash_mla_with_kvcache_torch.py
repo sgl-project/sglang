@@ -114,9 +114,13 @@ def _gather_and_dequant(k_cache, indices, page_size):
         scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (n, 7)
 
         result[start:end, :_NOPE_DIM] = (
-            nope_fp8.view(n, _NUM_TILES, _TILE_SIZE).float()
-            * scale_e8m0.view(n, _NUM_TILES, 1).float()
-        ).view(n, _NOPE_DIM).to(torch.bfloat16)
+            (
+                nope_fp8.view(n, _NUM_TILES, _TILE_SIZE).float()
+                * scale_e8m0.view(n, _NUM_TILES, 1).float()
+            )
+            .view(n, _NOPE_DIM)
+            .to(torch.bfloat16)
+        )
         result[start:end, _NOPE_DIM:] = rope_bf16
 
     return result.reshape(*idx_shape, _D)
@@ -153,13 +157,20 @@ def _sm120_sparse_decode_fwd(
     have_extra = extra_k_cache is not None and extra_indices is not None
     if have_extra:
         extra_topk = extra_indices.shape[-1]
-        extra_num_pages, extra_page_size = extra_k_cache.shape[0], extra_k_cache.shape[1]
+        extra_num_pages, extra_page_size = (
+            extra_k_cache.shape[0],
+            extra_k_cache.shape[1],
+        )
         extra_max_valid = extra_num_pages * extra_page_size
         extra_invalid = (extra_indices < 0) | (extra_indices >= extra_max_valid)
         extra_safe = extra_indices.clamp(min=0, max=extra_max_valid - 1)
         if extra_topk_length is not None:
-            extra_range = torch.arange(extra_topk, device=extra_topk_length.device).view(1, 1, extra_topk)
-            extra_invalid = extra_invalid | (extra_range >= extra_topk_length.view(B, 1, 1))
+            extra_range = torch.arange(
+                extra_topk, device=extra_topk_length.device
+            ).view(1, 1, extra_topk)
+            extra_invalid = extra_invalid | (
+                extra_range >= extra_topk_length.view(B, 1, 1)
+            )
     else:
         extra_topk = 0
 
@@ -235,7 +246,17 @@ def _sm120_sparse_decode_fwd(
         out_rows[start:end] = out_chunk.to(torch.bfloat16)
         lse_rows[start:end] = lse
 
-        del kv_chunk, kv_f, q_chunk, scores, weights, out_chunk, lse, lse_for_out, lonely
+        del (
+            kv_chunk,
+            kv_f,
+            q_chunk,
+            scores,
+            weights,
+            out_chunk,
+            lse,
+            lse_for_out,
+            lonely,
+        )
 
     out = out_rows.reshape(B, s_q, H_q, head_dim_v)
     lse = lse_rows.reshape(B, s_q, H_q).permute(0, 2, 1)
