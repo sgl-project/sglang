@@ -144,8 +144,8 @@ class CanaryE2EBase(CustomTestCase):
         self,
         n: int,
         *,
-        assert_all_successs: bool,
-        max_new_tokens: int = 16,
+        assert_all_successs: bool = True,
+        max_new_tokens: int = 200,
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
@@ -177,15 +177,6 @@ class CanaryE2EBase(CustomTestCase):
 
         return results
 
-    def send_successful_perturb_requests(
-        self, *, n: int = 4, max_new_tokens: int = 200
-    ) -> list[dict]:
-        return self.send_parallel_requests(
-            n=n,
-            assert_all_successs=True,
-            max_new_tokens=max_new_tokens,
-        )
-
     def assert_per_forward_violation_reported(
         self,
         *,
@@ -207,40 +198,10 @@ class CanaryE2EBase(CustomTestCase):
         target_group: Literal["full", "swa"],
         flush_wait_seconds: float = 2.0,
     ) -> None:
-        self.assert_violation_logged(
-            launch_tag_pattern=f"SWEEP_*_{target_group.upper()}",
+        self.assert_violation_logged_any(
+            launch_tag_patterns=(f"SWEEP_*_{target_group.upper()}",),
             fail_reason=fail_reason,
             flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_violation_logged(
-        self,
-        *,
-        launch_tag_pattern: str,
-        fail_reason: str,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        """Scan server log for a violation line whose launch_tag matches launch_tag_pattern
-        (fnmatch) and whose fail_reason set contains fail_reason exactly.
-
-        Looks for lines of the form
-            ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
-        emitted by ViolationReporter. Raises AssertionError if no matching line found.
-        """
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text()
-        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
-        for match in line_re.finditer(log_text):
-            tag = match.group(1)
-            reason_field = match.group(2)
-            if not fnmatch.fnmatchcase(tag, launch_tag_pattern):
-                continue
-            if fail_reason in reason_field.split("+"):
-                return
-        raise AssertionError(
-            f"No canary violation matching launch_tag={launch_tag_pattern!r} "
-            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
-            f"{log_text[-2000:]}"
         )
 
     def assert_violation_logged_any(
@@ -250,6 +211,13 @@ class CanaryE2EBase(CustomTestCase):
         fail_reason: str,
         flush_wait_seconds: float = 2.0,
     ) -> None:
+        """Scan server log for a violation line whose launch_tag matches any pattern
+        (fnmatch) and whose fail_reason set contains fail_reason exactly.
+
+        Looks for lines of the form
+            ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
+        emitted by ViolationReporter. Raises AssertionError if no matching line found.
+        """
         time.sleep(flush_wait_seconds)
         log_text = self._captured_log_text()
         line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")

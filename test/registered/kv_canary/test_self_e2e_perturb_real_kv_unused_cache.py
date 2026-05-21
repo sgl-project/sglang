@@ -43,10 +43,10 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
         self,
     ) -> None:
         # Step 1: first batch builds radix entries that will become orphans once finished.
-        self.send_successful_perturb_requests(n=8)
+        self.send_parallel_requests(n=8)
         # Step 2: second batch drives more forward passes so the sweep cadence fires
         # while the orphan slots are still cached.
-        self.send_successful_perturb_requests(n=8)
+        self.send_parallel_requests(n=8)
         self.assert_sweep_violation_reported(
             fail_reason="real_kv_hash",
             target_group=self.target_group,
