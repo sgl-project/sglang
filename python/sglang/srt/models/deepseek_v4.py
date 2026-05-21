@@ -444,15 +444,19 @@ class MQALayer(nn.Module):
         assert len(self.alt_streams) >= 3
 
         current_stream = torch.cuda.current_stream()
+        stream_kv = self.alt_streams[0]
         stream_compressor = self.alt_streams[1]
         stream_indexer = self.alt_streams[2]
 
+        stream_kv.wait_stream(current_stream)
         stream_compressor.wait_stream(current_stream)
         stream_indexer.wait_stream(current_stream)
 
         qkv_a: Optional[torch.Tensor] = None
+        qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
+            qkv_a_ready = current_stream.record_event()
 
         q_lora = self._compute_q_a(x, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
@@ -467,7 +471,11 @@ class MQALayer(nn.Module):
                     q_lora_ready=q_lora_ready,
                 )
 
-        self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+        with torch.cuda.stream(stream_kv):
+            if qkv_a_ready is not None:
+                stream_kv.wait_event(qkv_a_ready)
+            # Fused norm + rope + cache write -- no bf16 KV intermediate.
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
 
@@ -478,6 +486,7 @@ class MQALayer(nn.Module):
                 )
 
         q = self._compute_q_b(q_lora, positions, q_out)
+        current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 

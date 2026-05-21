@@ -294,8 +294,6 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const auto page_ptr = params.kvcache + page * kPageBytes;
   const auto value_ptr = page_ptr + offset * 576;
 
-  PDLTriggerSecondary<kUsePDL>();
-
   // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
   if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
@@ -319,6 +317,8 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     reinterpret_cast<fp8x2_e4m3_t*>(value_ptr)[tx] = result;
     if (lane_id == 0) static_cast<uint8_t*>(scale_ptr)[warp_id] = scale_ue8m0;
   }
+
+  PDLTriggerSecondary<kUsePDL>();
 }
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
