@@ -77,7 +77,7 @@ _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).stri
 
 class CanaryE2EBase(CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``mode`` and optionally
-    ``kv_canary_mode``, ``perturb_env``, ``use_unique_prompts``.
+    ``kv_canary_mode``, ``perturb_env``, ``extra_server_args``, ``use_unique_prompts``.
 
     ``setUpClass`` launches the server with mode-specific args + canary env;
     ``tearDownClass`` kills the server and cleans env vars set in setUpClass.
@@ -90,6 +90,7 @@ class CanaryE2EBase(CustomTestCase):
     mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[Literal["log", "raise"]] = "log"
     perturb_env: ClassVar[dict[str, str]] = {}
+    extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
 
     process: ClassVar[Optional[object]] = None
@@ -115,6 +116,7 @@ class CanaryE2EBase(CustomTestCase):
             cls.kv_canary_mode,
             "--context-length",
             str(_CONTEXT_LENGTH),
+            *cls.extra_server_args,
         ]
         if cls._cfg.json_model_override_args is not None:
             server_args.extend(
