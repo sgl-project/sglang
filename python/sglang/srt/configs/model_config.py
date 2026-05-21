@@ -198,6 +198,7 @@ class ModelConfig:
         kwargs = {}
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
+            print('sssssssaaaaaaaaaaaaa',kwargs["_configuration_file"])
         self.hf_config = get_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
