@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -263,9 +262,6 @@ def walk_radix_cache_for_canary(
     but for sweep cadences in the 64..1024 range, host walk is fine.
     """
     cache_type = type(radix_cache)
-    if isinstance(radix_cache, ChunkCache):
-        empty = torch.empty(0, dtype=torch.int32)
-        return empty, empty.clone(), empty.clone()
     if cache_type is not RadixCache and cache_type is not SWARadixCache:
         raise NotImplementedError(
             f"walk_radix_cache_for_canary does not support {cache_type.__name__}"

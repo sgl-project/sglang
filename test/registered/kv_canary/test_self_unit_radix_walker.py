@@ -5,7 +5,6 @@ import unittest
 import torch
 
 from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
-from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
@@ -84,15 +83,6 @@ class TestSelfUnitRadixWalker(CustomTestCase):
 
         slots, _, _ = walk_radix_cache_for_canary(radix_cache=cache, unlocked_only=True)
         self.assertEqual(slots.tolist(), [3, 4])
-
-    def test_chunk_cache_returns_empty_sweep_entries(self):
-        cache = ChunkCache.__new__(ChunkCache)
-
-        slots, positions, prev_slots = walk_radix_cache_for_canary(radix_cache=cache)
-
-        self.assertEqual(slots.tolist(), [])
-        self.assertEqual(positions.tolist(), [])
-        self.assertEqual(prev_slots.tolist(), [])
 
 
 if __name__ == "__main__":
