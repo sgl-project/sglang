@@ -5,7 +5,7 @@ across the shape envelope. Output is int32 ``[num_sm + 1, 2]`` — a
 deterministic partition table — so equality is strict (``torch.equal``,
 no atol/rtol).
 
-Three test groups:
+Test groups:
 
 1. ``test_matches_pytorch_ref`` — random-input envelope sweep over
    ``bs x max_ctx`` (powers-of-2 + off-by-one for ``bs`` to stress the
@@ -20,6 +20,14 @@ Three test groups:
    ceiling (``bs > 32768``); exercises the multi-block gmem path. Catches
    regressions where a future kernel adds a ``batch_size`` upper bound for
    smem convenience.
+
+4. ``test_matches_pytorch_ref_at_large_num_sm`` — ``num_sm in [1, 1024]``
+   contract; guards against per-block thread-guard truncation across the
+   three dispatch paths.
+
+5. ``test_matches_deep_gemm`` — byte-equality against the production
+   ``deep_gemm`` oracle; auto-skips at ``bs >= 16384`` where deep_gemm
+   exceeds sm_90's smem cap.
 """
 
 import itertools
