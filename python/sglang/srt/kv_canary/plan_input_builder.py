@@ -63,7 +63,7 @@ class PlanInput:
     extra_verify_prev_slot_indices: torch.Tensor
     extra_verify_num_valid: torch.Tensor
 
-    def zero_(self) -> "PlanInput":
+    def zero_(self) -> None:
         self.fb_req_pool_indices.zero_()
         self.fb_prefix_lens.zero_()
         self.fb_extend_seq_lens.zero_()
@@ -71,8 +71,6 @@ class PlanInput:
         self.extra_verify_positions.zero_()
         self.extra_verify_prev_slot_indices.zero_()
         self.extra_verify_num_valid.zero_()
-
-        return self
 
     @classmethod
     def allocate(
