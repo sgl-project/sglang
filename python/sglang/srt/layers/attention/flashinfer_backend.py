@@ -879,6 +879,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
