@@ -150,6 +150,31 @@ def run_canary_verify_torch_reference(
     violation_write_index[0] = violation_write_index[0] + num_new_violations
 
 
+def canary_verify_step_torch_reference(
+    *,
+    canary_buf: torch.Tensor,
+    plan: VerifyPlan,
+    kernel_kind: CanaryLaunchTag,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    slot_run_counter: torch.Tensor,
+    kernel_run_counter: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+) -> None:
+    run_canary_verify_torch_reference(
+        canary_buf=canary_buf,
+        plan=plan,
+        kernel_kind=kernel_kind,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        slot_run_counter=slot_run_counter,
+        kernel_run_counter=kernel_run_counter,
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=real_kv_hash_mode,
+    )
+
+
 def _to_signed_int64(value: int) -> int:
     value &= _U64_MASK
     if value >= _I64_SIGN_BIT:
