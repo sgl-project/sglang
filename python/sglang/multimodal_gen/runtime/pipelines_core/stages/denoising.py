@@ -796,6 +796,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         """Prepare scheduler state before entering the shared denoising loop."""
         self._reset_scheduler_loop_state(ctx.scheduler)
         ctx.scheduler.set_begin_index(0)
+        self._init_cfg_gate_state(ctx, batch, server_args)
 
     def _reset_scheduler_loop_state(self, scheduler) -> None:
         if hasattr(scheduler, "_step_index"):
@@ -815,6 +816,55 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 scheduler.model_outputs = [None] * solver_order
             if hasattr(scheduler, "timestep_list"):
                 scheduler.timestep_list = [None] * solver_order
+
+    def _init_cfg_gate_state(
+        self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
+    ) -> None:
+        """Initialize optional CFG residual reuse for the current denoising loop."""
+        fraction = envs.SGLANG_DIFFUSION_CFG_GATE_STEP
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(
+                "SGLANG_DIFFUSION_CFG_GATE_STEP must be between 0.0 and 1.0, "
+                f"got {fraction}."
+            )
+
+        num_steps = len(ctx.timesteps)
+        requested = fraction < 1.0 and batch.do_classifier_free_guidance
+        active = requested and not server_args.enable_cfg_parallel
+        gate_step = int(num_steps * fraction) if active else num_steps + 1
+        ctx.extra["cfg_gate_state"] = {
+            "fraction": fraction,
+            "requested": requested,
+            "active": active,
+            "gate_step": gate_step,
+            "delta": None,
+            "model_id": None,
+            "fresh_uncond": 0,
+            "reused": 0,
+            "invalidations": 0,
+        }
+
+        if ctx.is_warmup or get_world_group().local_rank != 0:
+            return
+
+        if active:
+            logger.info(
+                "CFG gating enabled: reuse unconditioned residual after step %d/%d "
+                "(fraction=%.3f).",
+                gate_step,
+                num_steps,
+                fraction,
+            )
+            if batch.guidance_rescale > 0:
+                logger.warning(
+                    "CFG gating is enabled with guidance_rescale=%s; benchmark image "
+                    "quality before using this setting in production.",
+                    batch.guidance_rescale,
+                )
+        elif requested:
+            logger.info(
+                "CFG gating requested but skipped because CFG parallel is enabled."
+            )
 
     def _get_transformer_attr(self, name: str) -> Any:
         seen: set[int] = set()
@@ -950,6 +1000,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             target_dtype=ctx.target_dtype,
             current_guidance_scale=step.current_guidance_scale,
             cfg_policy=ctx.cfg_policy,
+            cfg_gate_state=ctx.extra.get("cfg_gate_state"),
             server_args=server_args,
             guidance=ctx.guidance,
             latents=ctx.latents,
@@ -992,6 +1043,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Finalize the shared loop by handing state to post-denoising processing."""
+        self._log_cfg_gate_summary(ctx, batch)
         self._post_denoising_loop(
             batch=batch,
             latents=ctx.latents,
@@ -999,6 +1051,28 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             trajectory_timesteps=ctx.trajectory_timesteps,
             server_args=server_args,
             is_warmup=ctx.is_warmup,
+        )
+
+    def _log_cfg_gate_summary(self, ctx: DenoisingContext, batch: Req) -> None:
+        state = ctx.extra.get("cfg_gate_state")
+        if (
+            not state
+            or not state["requested"]
+            or ctx.is_warmup
+            or get_world_group().local_rank != 0
+        ):
+            return
+
+        logger.info(
+            "CFG gating summary: fraction=%.3f, gate_step=%d/%d, "
+            "fresh_uncond=%d, reused=%d, invalidations=%d, guidance_rescale=%s.",
+            state["fraction"],
+            state["gate_step"],
+            len(ctx.timesteps),
+            state["fresh_uncond"],
+            state["reused"],
+            state["invalidations"],
+            batch.guidance_rescale,
         )
 
     def _post_denoising_loop(
@@ -1390,6 +1464,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         target_dtype,
         current_guidance_scale,
         cfg_policy: CFGPolicy,
+        cfg_gate_state: dict[str, Any] | None,
         server_args: ServerArgs,
         guidance: torch.Tensor,
         latents: torch.Tensor,
@@ -1420,6 +1495,48 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     server_args.pipeline_config.slice_noise_pred(pred_t[0], latents),
                 )
             return _unwrap(pred_t)
+
+        if (
+            cfg_gate_state
+            and cfg_gate_state["active"]
+            and not server_args.enable_cfg_parallel
+            and type(cfg_policy) is CFGPolicy
+            and len(cfg_policy.branches) == 2
+            and cfg_policy.branches[0].is_conditional
+            and not cfg_policy.branches[1].is_conditional
+        ):
+            model_id = id(current_model)
+            if cfg_gate_state["model_id"] not in (None, model_id):
+                cfg_gate_state["delta"] = None
+                cfg_gate_state["invalidations"] += 1
+
+            pos_pred = predict_fn(cfg_policy.branches[0])
+            pos_t = _wrap(pos_pred)
+            delta_t = cfg_gate_state["delta"]
+            can_reuse = (
+                timestep_index >= cfg_gate_state["gate_step"]
+                and delta_t is not None
+                and len(pos_t) == len(delta_t)
+            )
+
+            if can_reuse:
+                neg_pred = _unwrap(tuple(p - d for p, d in zip(pos_t, delta_t)))
+                cfg_gate_state["reused"] += 1
+            else:
+                neg_pred = predict_fn(cfg_policy.branches[1])
+                neg_t = _wrap(neg_pred)
+                cfg_gate_state["delta"] = tuple(
+                    p.detach() - n.detach() for p, n in zip(pos_t, neg_t)
+                )
+                cfg_gate_state["model_id"] = model_id
+                cfg_gate_state["fresh_uncond"] += 1
+
+            return cfg_policy.combine(
+                [pos_pred, neg_pred],
+                batch,
+                cfg_scale,
+                server_args.pipeline_config,
+            )
 
         if server_args.enable_cfg_parallel:
             if (
