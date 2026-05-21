@@ -9,6 +9,7 @@ import triton.language as tl
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -110,8 +111,9 @@ class ForwardBatchDeepSeekMHAMixin:
 
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
-        assert isinstance(
-            self.token_to_kv_pool, MLATokenToKVPool
+        assert isinstance(self.token_to_kv_pool, MLATokenToKVPool) or (
+            isinstance(self.token_to_kv_pool, HybridLinearKVPool)
+            and isinstance(self.token_to_kv_pool.full_kv_pool, MLATokenToKVPool)
         ), "Currently chunked prefix cache can only be used by Deepseek models"
 
         if not any(self.extend_prefix_lens_cpu):

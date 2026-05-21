@@ -779,6 +779,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         return layer_id in self.full_attn_layers
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if forward_batch.forward_mode.is_draft_extend_v2():
+            # DRAFT_EXTEND_V2 only runs full-attn layers in the draft model,
+            # so skip linear/mamba backend metadata which requires query_start_loc.
+            self.full_attn_backend.init_forward_metadata(forward_batch)
+            return
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata(forward_batch)
 
