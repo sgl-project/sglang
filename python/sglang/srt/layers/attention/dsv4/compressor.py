@@ -686,8 +686,14 @@ class Compressor(nn.Module):
             # complex polar(1, theta) tensor built by precompute_freqs_cis;
             # cos=real, sin=imag at the rope_dim/2 frequency pair resolution.
             rope_dim = self.rope_head_dim
-            cos_half = self.freqs_cis.real[pos_out].to(kv_out.dtype)
-            sin_half = self.freqs_cis.imag[pos_out].to(kv_out.dtype)
+            # Use the same module-level contig cache as the outer rope path;
+            # see _get_contig_freqs_real_imag in models/deepseek_v4.py for
+            # why (.real / .imag on a complex tensor are strided views and
+            # aclnnIndex over them triggers StridedSlice materialization).
+            from sglang.srt.models.deepseek_v4 import _get_contig_freqs_real_imag
+            freqs_real, freqs_imag = _get_contig_freqs_real_imag(self.freqs_cis)
+            cos_half = freqs_real[pos_out].to(kv_out.dtype)
+            sin_half = freqs_imag[pos_out].to(kv_out.dtype)
             cos = (
                 cos_half.repeat_interleave(2, dim=-1)
                 .view(-1, 1, 1, rope_dim)

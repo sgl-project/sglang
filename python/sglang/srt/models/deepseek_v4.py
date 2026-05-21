@@ -102,6 +102,26 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _NPU_ROPE_CONTIG_CACHE: dict[int, tuple] = {}
 
 
+def _get_contig_freqs_real_imag(freqs_cis: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return contiguous (real, imag) halves of ``freqs_cis``, cached by id.
+
+    Used by NPU rope paths to avoid the per-call StridedSlice materialization
+    triggered by aclnnIndex over the strided ``.real`` / ``.imag`` views of
+    the complex ``freqs_cis`` buffer. First call per freqs_cis pays the
+    contiguous() once; later calls reuse the cached tensors.
+
+    All callers within a single MQALayer (outer rope, indexer inner rope,
+    compressor epilog rope) get the same freqs_cis instance, so each layer
+    materializes at most one (real, imag) pair.
+    """
+    cache_key = id(freqs_cis)
+    cached = _NPU_ROPE_CONTIG_CACHE.get(cache_key)
+    if cached is None:
+        cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
+        _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
+    return cached
+
+
 def _v4_rope_inplace_npu(
     q_rope: torch.Tensor,
     kv_rope: Optional[torch.Tensor],
@@ -135,14 +155,9 @@ def _v4_rope_inplace_npu(
     ):
         # Build cos/sin caches in the layout the kernel expects:
         # (T, 1, 1, rope_dim) with each freq pair value repeated twice for
-        # the interleaved pairing convention. Use contig views of
-        # freqs_cis.{real,imag} cached by id; see _NPU_ROPE_CONTIG_CACHE.
-        cache_key = id(freqs_cis)
-        cached = _NPU_ROPE_CONTIG_CACHE.get(cache_key)
-        if cached is None:
-            cached = (freqs_cis.real.contiguous(), freqs_cis.imag.contiguous())
-            _NPU_ROPE_CONTIG_CACHE[cache_key] = cached
-        freqs_real_contig, freqs_imag_contig = cached
+        # the interleaved pairing convention. Use contig real/imag views
+        # cached by id(freqs_cis); see _get_contig_freqs_real_imag.
+        freqs_real_contig, freqs_imag_contig = _get_contig_freqs_real_imag(freqs_cis)
         cos_half = freqs_real_contig[positions]  # (T, rope_dim/2)
         sin_half = freqs_imag_contig[positions]
         if inverse:
