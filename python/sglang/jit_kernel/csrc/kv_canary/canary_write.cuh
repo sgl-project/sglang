@@ -291,12 +291,10 @@ inline void canary_write_step_cuda(
   p.positions = static_cast<const int64_t*>(positions.data_ptr());
   p.out_cache_loc = static_cast<const int64_t*>(out_cache_loc.data_ptr());
   p.enable_assert_inputs = enable_assert_inputs_bool;
-  p.expected_input_tokens = enable_assert_inputs_bool
-      ? static_cast<const int64_t*>(expected_input_tokens.value().data_ptr())
-      : nullptr;
-  p.expected_input_positions = enable_assert_inputs_bool
-      ? static_cast<const int64_t*>(expected_input_positions.value().data_ptr())
-      : nullptr;
+  p.expected_input_tokens =
+      enable_assert_inputs_bool ? static_cast<const int64_t*>(expected_input_tokens.value().data_ptr()) : nullptr;
+  p.expected_input_positions =
+      enable_assert_inputs_bool ? static_cast<const int64_t*>(expected_input_positions.value().data_ptr()) : nullptr;
   p.violation_sink.ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_sink.write_index = static_cast<int32_t*>(violation_write_index.data_ptr());
   p.violation_sink.ring_capacity = ring_capacity;

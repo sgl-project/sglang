@@ -84,9 +84,13 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
             req_pool_indices_list.append(rng.randint(1, max_reqs - 1))
             prefix_lens_list.append(rng.randint(0, max_seq_len - 1))
             extend_seq_lens_list.append(rng.randint(1, max(1, max_seq_len // 4)))
-    req_pool_indices = torch.tensor(req_pool_indices_list, dtype=torch.int64, device=_DEVICE)
+    req_pool_indices = torch.tensor(
+        req_pool_indices_list, dtype=torch.int64, device=_DEVICE
+    )
     prefix_lens = torch.tensor(prefix_lens_list, dtype=torch.int64, device=_DEVICE)
-    extend_seq_lens = torch.tensor(extend_seq_lens_list, dtype=torch.int64, device=_DEVICE)
+    extend_seq_lens = torch.tensor(
+        extend_seq_lens_list, dtype=torch.int64, device=_DEVICE
+    )
 
     total_verify = 0
     for rpi, pfx in zip(req_pool_indices_list, prefix_lens_list):

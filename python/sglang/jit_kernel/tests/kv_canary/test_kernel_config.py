@@ -149,8 +149,8 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
 
 def test_write_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
-    plan_cuda, plan_ref, input_ids, positions, out_cache_loc = (
-        _build_write_fixtures(device=_DEVICE)
+    plan_cuda, plan_ref, input_ids, positions, out_cache_loc = _build_write_fixtures(
+        device=_DEVICE
     )
 
     snapshot_bufs: list[torch.Tensor] = []
@@ -204,7 +204,9 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
 
 def test_plan_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
-    req_pool_indices, prefix_lens, extend_seq_lens, req_to_token = _build_plan_fixtures(device=_DEVICE)
+    req_pool_indices, prefix_lens, extend_seq_lens, req_to_token = _build_plan_fixtures(
+        device=_DEVICE
+    )
 
     snapshot_slots: list[torch.Tensor] = []
     snapshot_positions: list[torch.Tensor] = []

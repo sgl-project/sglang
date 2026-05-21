@@ -134,9 +134,7 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         dtype=torch.int64,
         device=_DEVICE,
     )
-    out_cache_loc = torch.tensor(
-        out_cache_loc_list, dtype=torch.int64, device=_DEVICE
-    )
+    out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int64, device=_DEVICE)
     expected_input_tokens = input_ids.clone()
     expected_input_positions = positions.clone()
     if enable_write_verify_inputs:
