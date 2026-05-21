@@ -420,6 +420,57 @@ thread_local! {
     // Long-lived libjpeg-turbo decompressor; init is non-trivial (tj3Init + state
     // setup). Reused across requests on the same thread. Created lazily.
     static DECOMP: RefCell<Option<turbojpeg::Decompressor>> = RefCell::new(None);
+    // Resize x-weights scratch — computed once per image on the main thread,
+    // shared (read-only) across all rayon workers in the fused stage. Grows in
+    // place; never shrinks (per-image dst_w is small enough that this doesn't
+    // matter, and we want zero-alloc on the warm path).
+    static X_WEIGHTS_SCRATCH: RefCell<XWeightsScratch> = RefCell::new(XWeightsScratch::new());
+}
+
+#[derive(Default)]
+struct XWeightsScratch {
+    idx0: Vec<usize>,
+    idx1: Vec<usize>,
+    w0: Vec<f32>,
+    w1: Vec<f32>,
+    // Cache key — if the same (src_w, dst_w) is requested back-to-back, skip
+    // recompute. Lets a server with steady-state image sizes do zero work here.
+    cache_key: Option<(u32, u32)>,
+}
+impl XWeightsScratch {
+    fn new() -> Self {
+        Self::default()
+    }
+    /// Resize the scratch to hold `dst_w` columns; (re)compute weights if the
+    /// cache key changed. Returns the new key for verification.
+    fn ensure(&mut self, src_w: u32, dst_w: u32) {
+        let key = (src_w, dst_w);
+        if self.cache_key == Some(key) && self.idx0.len() == dst_w as usize {
+            return;
+        }
+        self.idx0.clear();
+        self.idx1.clear();
+        self.w0.clear();
+        self.w1.clear();
+        self.idx0.reserve(dst_w as usize);
+        self.idx1.reserve(dst_w as usize);
+        self.w0.reserve(dst_w as usize);
+        self.w1.reserve(dst_w as usize);
+        let sw = src_w as f32;
+        let scale_x = sw / (dst_w as f32);
+        for x_out in 0..dst_w as usize {
+            let fx = (x_out as f32 + 0.5) * scale_x - 0.5;
+            let fx_c = fx.clamp(0.0, sw - 1.0);
+            let x0 = fx_c.floor() as usize;
+            let x1 = (x0 + 1).min(src_w as usize - 1);
+            let dx = (fx_c - x0 as f32).clamp(0.0, 1.0);
+            self.idx0.push(x0);
+            self.idx1.push(x1);
+            self.w0.push(1.0 - dx);
+            self.w1.push(dx);
+        }
+        self.cache_key = Some(key);
+    }
 }
 
 /// Run `f` with a thread-local turbojpeg::Decompressor (lazily constructed).
@@ -836,14 +887,25 @@ fn patch_row_scalar(
 //   dy = (src_y_f - src_y0).clamp(0, 1)
 // Same for x. Out = sum(w_ij * p_ij) where w_00 = (1-dy)(1-dx) etc.
 
+/// Per-column resize weights for a fixed (src_w, dst_w) pair. Computed once per
+/// image on the main thread and shared (read-only) across all rayon workers in
+/// the fused stage.
+struct ResizeXWeights<'a> {
+    idx0: &'a [usize],
+    idx1: &'a [usize],
+    w0: &'a [f32],
+    w1: &'a [f32],
+}
+
 fn fused_resize_normalize_patch_band(
     src: &[u8],
     src_h: u32,
-    src_w: u32,
+    _src_w: u32,
     target: crate::smart_resize::Target,
     cfg: &QwenCfg,
     yb_start_mblock: usize,
     yb_end_mblock: usize,
+    xw: &ResizeXWeights<'_>,
     out: &mut [f32],
 ) {
     let p = cfg.patch_size as usize;
@@ -858,11 +920,8 @@ fn fused_resize_normalize_patch_band(
     let merge_block = m * m;
 
     let sh = src_h as f32;
-    let sw = src_w as f32;
     let dh = dst_h as f32;
-    let dw = dst_w as f32;
     let scale_y = sh / dh;
-    let scale_x = sw / dw;
 
     let s = [
         1.0f32 / (255.0 * cfg.std[0]),
@@ -875,27 +934,17 @@ fn fused_resize_normalize_patch_band(
         -cfg.mean[2] / cfg.std[2],
     ];
 
-    let src_stride = src_w as usize * 3;
+    let src_stride = _src_w as usize * 3;
     let src_h_us = src_h as usize;
-    let src_w_us = src_w as usize;
 
-    // Precompute per-column src indices and weights (shared across all rows / patches).
-    // dst_w is small (typically <= 1148) so this scratch is cheap.
-    let mut col_idx0 = vec![0usize; dst_w];
-    let mut col_idx1 = vec![0usize; dst_w];
-    let mut col_w0 = vec![0f32; dst_w];
-    let mut col_w1 = vec![0f32; dst_w];
-    for x_out in 0..dst_w {
-        let fx = (x_out as f32 + 0.5) * scale_x - 0.5;
-        let fx_c = fx.clamp(0.0, sw - 1.0);
-        let x0 = fx_c.floor() as usize;
-        let x1 = (x0 + 1).min(src_w_us - 1);
-        let dx = (fx_c - x0 as f32).clamp(0.0, 1.0);
-        col_idx0[x_out] = x0;
-        col_idx1[x_out] = x1;
-        col_w0[x_out] = 1.0 - dx;
-        col_w1[x_out] = dx;
-    }
+    let col_idx0 = xw.idx0;
+    let col_idx1 = xw.idx1;
+    let col_w0 = xw.w0;
+    let col_w1 = xw.w1;
+    debug_assert_eq!(col_idx0.len(), dst_w);
+    debug_assert_eq!(col_idx1.len(), dst_w);
+    debug_assert_eq!(col_w0.len(), dst_w);
+    debug_assert_eq!(col_w1.len(), dst_w);
 
     debug_assert!(tp <= 2);
 
@@ -1033,6 +1082,11 @@ fn reserve_uninit_f32(out: &mut Vec<f32>, total: usize) {
 /// Run the fused single-pass pipeline on a pre-decoded RGB buffer that's
 /// currently sitting in `RGB_POOL`. Splits the work across rayon workers along
 /// the merge-block-row dimension.
+///
+/// Resize x-weights are computed *once per image* on the main thread (via the
+/// TLS `X_WEIGHTS_SCRATCH` cache) and shared as a borrow with every worker.
+/// This avoids the previous behavior of every chunk independently recomputing
+/// + allocating `dst_w`-sized vectors.
 fn run_fused_band(
     decoded_h: u32,
     decoded_w: u32,
@@ -1057,12 +1111,26 @@ fn run_fused_band(
 
     // Pull RGB buffer out of TLS for the rayon section, put it back after.
     let rgb_buf: Vec<u8> = RGB_POOL.with(|p| std::mem::take(&mut *p.borrow_mut()));
+
+    // Same dance for the x-weights scratch: take it out so the closures can
+    // borrow it for `'scope`, put it back after. Costs one Vec swap per image.
+    let mut xw_scratch: XWeightsScratch =
+        X_WEIGHTS_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    xw_scratch.ensure(decoded_w, target.w);
+    let xw_owned = xw_scratch;
+    let xw = ResizeXWeights {
+        idx0: &xw_owned.idx0,
+        idx1: &xw_owned.idx1,
+        w0: &xw_owned.w0,
+        w1: &xw_owned.w1,
+    };
     let src_slice: &[u8] = &rgb_buf;
 
     rayon::scope(|s| {
         for chunk_idx in 0..chunks {
             let cfg_copy = *cfg;
             let target_copy = target;
+            let xw_ref = &xw;
             s.spawn(move |_| {
                 let yb_start = chunk_idx * chunk_size;
                 let yb_end = ((chunk_idx + 1) * chunk_size).min(grid_h_mblock);
@@ -1081,6 +1149,7 @@ fn run_fused_band(
                     &cfg_copy,
                     yb_start,
                     yb_end,
+                    xw_ref,
                     out_band,
                 );
             });
@@ -1088,6 +1157,7 @@ fn run_fused_band(
     });
 
     RGB_POOL.with(|p| *p.borrow_mut() = rgb_buf);
+    X_WEIGHTS_SCRATCH.with(|s| *s.borrow_mut() = xw_owned);
 }
 
 /// Single-image fused pipeline. Caller owns `out` (pool-friendly contract:
