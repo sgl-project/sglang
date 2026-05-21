@@ -132,16 +132,16 @@ class SwaDivergenceStats:
             if self._swa_allocator_getter is not None
             else None
         )
-        if (
-            allocator is not None
-            and allocator._nonidentity_write_count_device is not None
-        ):
+        counters = (
+            allocator.divergence_stats_device_tensors() if allocator is not None else None
+        )
+        if counters is not None and counters.nonidentity_write_count is not None:
             self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
-                src_device=allocator._nonidentity_write_count_device,
+                src_device=counters.nonidentity_write_count,
                 stream=self._d2h_stream,
             )
             self._pending_wrap_count_future = FutureTensor.device_to_host(
-                src_device=allocator._wrap_count_device,
+                src_device=counters.wrap_count,
                 stream=self._d2h_stream,
             )
         else:

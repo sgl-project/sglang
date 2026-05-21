@@ -1,4 +1,5 @@
 import logging
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -25,6 +26,12 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DivergenceCounterTensors:
+    wrap_count: Optional[torch.Tensor]
+    nonidentity_write_count: Optional[torch.Tensor]
 
 
 class SWAKVPool(BaseSWAKVPool):
@@ -414,6 +421,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self._nonidentity_write_count_device is None:
             return 0
         return int(self._nonidentity_write_count_device.item())
+
+    def divergence_stats_device_tensors(self) -> _DivergenceCounterTensors:
+        return _DivergenceCounterTensors(
+            wrap_count=self._wrap_count_device,
+            nonidentity_write_count=self._nonidentity_write_count_device,
+        )
 
     def available_size(self):
         return min(
