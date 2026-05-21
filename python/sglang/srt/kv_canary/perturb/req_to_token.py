@@ -49,7 +49,6 @@ def run(
         req_to_token_pool=req_to_token_pool,
         exclude_out_cache_loc=True,
     )
-    # Old req_to_token hook required slot >= 1 (treating 0 as padding sentinel) — preserve.
     active_targets = [t for t in active_targets if t.slot >= 1]
     if not active_targets:
         return
