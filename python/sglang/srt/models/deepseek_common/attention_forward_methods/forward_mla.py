@@ -116,6 +116,7 @@ if _use_aiter_gfx95:
     )
 
     from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
+        batched_gemm_a16wfp4,
         batched_gemm_afp4wfp4_pre_quant,
         fused_flatten_mxfp4_quant,
         fused_rms_mxfp4_quant,
@@ -572,22 +573,30 @@ class DeepseekMLAForwardMixin:
             )
         elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
+            attn_bmm_in_mbn_layout = False
             if _use_aiter_gfx95 and self.w_vc.dtype == torch.uint8:
                 x = attn_output.transpose(0, 1)
+                # Allocate as (M, B, N) so the downstream `transpose(0, 1)` +
+                # `flatten(1, 2)` collapse into a no-copy reshape, eliminating
+                # the per-layer direct_copy_kernel_cuda BFloat16 pass that
+                # otherwise runs on a strided (B, M, N) -> (M, B, N) view.
                 attn_bmm_output = torch.empty(
-                    x.shape[0],
                     x.shape[1],
+                    x.shape[0],
                     self.w_vc.shape[2],
                     device=x.device,
                     dtype=torch.bfloat16,
                 )
-                batched_gemm_afp4wfp4_pre_quant(
+                batched_gemm_a16wfp4(
                     x,
                     self.w_vc.transpose(-2, -1),
                     self.w_scale_v.transpose(-2, -1),
                     torch.bfloat16,
                     attn_bmm_output,
+                    transpose_bm=True,
+                    prequant=True,
                 )
+                attn_bmm_in_mbn_layout = True
             else:
                 if _use_aiter_gfx95 and self.w_kc.dtype == torch.float8_e4m3fn:
                     attn_bmm_output = batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant(
@@ -606,16 +615,19 @@ class DeepseekMLAForwardMixin:
                         self.w_vc.to(torch.bfloat16) * self.w_scale,
                     )
 
-            if self.o_proj.weight.dtype == torch.uint8:
+            # Skip the (B, M, N) -> (M, B, N) transpose if the BMM already
+            # produced data in (M, B, N) layout (currently MXFP4 path with
+            # transpose_bm=True).
+            if not attn_bmm_in_mbn_layout:
                 attn_bmm_output = attn_bmm_output.transpose(0, 1)
+            if self.o_proj.weight.dtype == torch.uint8:
                 attn_bmm_output = fused_flatten_mxfp4_quant(attn_bmm_output)
             elif self.o_proj.weight.dtype == torch.float8_e4m3fn:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1)
                 attn_bmm_output = fused_flatten_fp8_group_quant(
                     attn_bmm_output, group_size=128, dtype_quant=torch.float8_e4m3fn
                 )
             else:
-                attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+                attn_bmm_output = attn_bmm_output.flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
             if _is_cpu:
