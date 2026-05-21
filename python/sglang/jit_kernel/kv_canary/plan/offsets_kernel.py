@@ -424,14 +424,6 @@ def _plan_write_offsets(
         mask=write_offsets_mask & bs_mask,
     )
 
-    # Scatter seed slots (capped to write_req_capacity).
-    seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)  # [BS_BLOCK] bool
-    tl.store(
-        out_write_seed_slot_indices_ptr + bs_offs,
-        seed_slot.to(tl.int64),
-        mask=seed_mask,
-    )
-
     # Store the [bs] slot of out_write_offsets (one element past the last per-req entry).
     # out_write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
     write_tail_in_range = bs < WRITE_OFFSETS_LEN  # scalar bool
@@ -439,6 +431,14 @@ def _plan_write_offsets(
         out_write_offsets_ptr + bs,
         total_write.to(tl.int64),
         mask=write_tail_in_range,
+    )
+
+    # Scatter seed slots (capped to write_req_capacity).
+    seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)  # [BS_BLOCK] bool
+    tl.store(
+        out_write_seed_slot_indices_ptr + bs_offs,
+        seed_slot.to(tl.int64),
+        mask=seed_mask,
     )
 
     tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
