@@ -406,6 +406,10 @@ class ServerArgs:
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
+    dsv4_compress_state_layout: Literal["auto", "speculative", "non-speculative"] = (
+        "auto"
+    )
+    dsv4_pd_decode_speculative_algorithm: Optional[str] = None
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
     enable_prefill_delayer: bool = False
@@ -4632,6 +4636,32 @@ class ServerArgs:
             default=ServerArgs.swa_full_tokens_ratio,
             help="The ratio of SWA layer KV tokens / full layer KV tokens, regardless of the number of swa:full layers. It should be between 0 and 1. "
             "E.g. 0.5 means if each swa layer has 50 tokens, then each full layer has 100 tokens.",
+        )
+        parser.add_argument(
+            "--dsv4-compress-state-layout",
+            type=str,
+            choices=["auto", "speculative", "non-speculative"],
+            default=ServerArgs.dsv4_compress_state_layout,
+            help=(
+                "DeepSeek V4 compress-state ring layout. 'speculative' uses the "
+                "larger MTP-compatible layout without requiring speculative decoding "
+                "to run in this process. In 'auto', the layout follows local "
+                "speculative decoding, --dsv4-pd-decode-speculative-algorithm when "
+                "set, and otherwise falls back to the speculative-compatible layout "
+                "for PD disaggregation."
+            ),
+        )
+        parser.add_argument(
+            "--dsv4-pd-decode-speculative-algorithm",
+            type=str,
+            default=ServerArgs.dsv4_pd_decode_speculative_algorithm,
+            help=(
+                "DeepSeek V4 only. In PD disaggregation, pass the decode server's "
+                "speculative algorithm to the prefill server so DSV4 compress-state "
+                "layout can match decode without starting speculative decoding on "
+                "prefill. Use 'none' if decode does not enable speculative decoding. "
+                "If unset, PD keeps the conservative speculative-compatible layout."
+            ),
         )
         parser.add_argument(
             "--disable-hybrid-swa-memory",

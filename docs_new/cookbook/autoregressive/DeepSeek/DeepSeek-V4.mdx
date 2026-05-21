@@ -115,6 +115,32 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
 
+**PD-Disagg with decode-side MTP**
+
+For DeepSeek-V4 PD disaggregation, the DSV4 compress-state layout must match
+between the prefill and decode servers. If the prefill server does not run
+speculative decoding but the decode server enables EAGLE/MTP, pass the decode
+server's speculative algorithm to the prefill server:
+
+```bash
+# Prefill server: no local speculative decoding.
+--disaggregation-mode prefill \
+--dsv4-pd-decode-speculative-algorithm EAGLE
+
+# Decode server: speculative decoding enabled.
+--disaggregation-mode decode \
+--speculative-algorithm EAGLE \
+--speculative-num-steps 3 \
+--speculative-eagle-topk 1 \
+--speculative-num-draft-tokens 4
+```
+
+This keeps the prefill server's DSV4 compress-state ring layout compatible with
+decode-side MTP without starting speculative decoding on the prefill server. If
+you need to override the automatic layout selection explicitly, use
+`--dsv4-compress-state-layout speculative` or
+`--dsv4-compress-state-layout non-speculative`.
+
 <a id="hopper-note" />
 
 **Hopper (H200) note**

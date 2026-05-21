@@ -43,6 +43,28 @@ def get_compress_state_ring_size(
         return 8 if compress_ratio == 4 else 128
 
 
+def use_speculative_compress_state_layout(server_args) -> bool:
+    """Return whether DSV4 compress state should use MTP-compatible layout."""
+    layout = getattr(server_args, "dsv4_compress_state_layout", "auto")
+    if layout == "speculative":
+        return True
+    if layout == "non-speculative":
+        return False
+    if layout != "auto":
+        raise ValueError(f"Unknown DSV4 compress state layout: {layout}")
+
+    if server_args.speculative_algorithm is not None:
+        return True
+
+    decode_speculative_algorithm = getattr(
+        server_args, "dsv4_pd_decode_speculative_algorithm", None
+    )
+    if decode_speculative_algorithm is not None:
+        return decode_speculative_algorithm.lower() not in ("", "none", "null")
+
+    return server_args.disaggregation_mode != "null"
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -499,7 +521,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
+        is_speculative = use_speculative_compress_state_layout(server_args)
         return get_compress_state_ring_size(compress_ratio, is_speculative)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
