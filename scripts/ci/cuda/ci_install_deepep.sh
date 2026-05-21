@@ -106,9 +106,10 @@ if [ "$GRACE_BLACKWELL" = "1" ]; then
     sed -i 's/#define NUM_CPU_TIMEOUT_SECS 100/#define NUM_CPU_TIMEOUT_SECS 1000/' csrc/kernels/configs.cuh && \
     popd
 else
+    DEEPEP_COMMIT=73b6ea4a439ba03a695563f9fd242c8e4b02b37c
     git clone https://github.com/deepseek-ai/DeepEP.git ${DEEPEP_DIR} && \
     pushd ${DEEPEP_DIR} && \
-    git checkout 9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee && \
+    git checkout ${DEEPEP_COMMIT} && \
     popd
 fi
 

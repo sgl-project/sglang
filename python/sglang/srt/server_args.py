@@ -2390,6 +2390,12 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on sm100 for Glm4MoeForCausalLM"
                     )
 
+        elif model_arch in ["MiniMaxM2ForCausalLM"]:
+            if self.moe_a2a_backend == "deepep":
+                # When using DeepEP, we need to make sure activation dtype is bf16 and not float16
+                # otherwise DeepEP will error due to activation dtype mismatch.
+                self.dtype = "bfloat16"
+
         elif model_arch in [
             "FalconH1ForCausalLM",
             "JetNemotronForCausalLM",
