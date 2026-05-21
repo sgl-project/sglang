@@ -362,7 +362,10 @@ class NPUEnv(BaseEnv):
         else:
             cann_info["CANN"] = "Not Available"
         try:
-            bisheng = os.path.join(CANN_HOME, "compiler/ccec_compiler/bin/bisheng")
+            bisheng = os.path.join(CANN_HOME, "tools/bisheng_compiler/bin/bisheng")
+            if not os.path.isfile(bisheng):
+                # Check path for old CANN version
+                bisheng = os.path.join(CANN_HOME, "compiler/ccec_compiler/bin/bisheng")
             bisheng_output = (
                 subprocess.check_output([bisheng, "--version"]).decode("utf-8").strip()
             )

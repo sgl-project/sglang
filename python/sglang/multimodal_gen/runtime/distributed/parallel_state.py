@@ -1,5 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/parallel_state.py
 # Copyright 2023 The vLLM team.
 # Adapted from
@@ -219,6 +220,7 @@ def init_distributed_environment(
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_cpu()
                 or current_platform.is_xpu()
             )
             else dict(device_id=device_id)
@@ -466,7 +468,7 @@ def get_dp_rank() -> int:
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
-    enable_cfg_parallel: bool,
+    cfg_degree: int = 1,
     ulysses_degree: int = 1,
     ring_degree: int = 1,
     dp_size: int = 1,
@@ -507,7 +509,7 @@ def maybe_init_distributed_environment_and_model_parallel(
     )
     initialize_model_parallel(
         data_parallel_size=dp_size,
-        classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
+        classifier_free_guidance_degree=cfg_degree,
         tensor_parallel_degree=tp_size,
         ulysses_degree=ulysses_degree,
         ring_degree=ring_degree,

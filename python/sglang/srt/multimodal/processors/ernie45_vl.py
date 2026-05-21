@@ -7,7 +7,7 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -302,7 +302,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if not _is_npu:

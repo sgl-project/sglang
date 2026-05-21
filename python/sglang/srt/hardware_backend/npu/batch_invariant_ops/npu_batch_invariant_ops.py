@@ -13,12 +13,6 @@ def npu_matmul_batch_invariant(a, b):
     return torch.ops.batch_invariant_ops.npu_matmul_batch_invariant(a, b)
 
 
-def npu_reduce_sum_batch_invariant(input, dim, keepdim=False, dtype=None):
-    return torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(
-        input, dim, keepdim, dtype
-    )
-
-
 def npu_mean_batch_invariant(
     input, dim, keepdim=False, dtype: torch.dtype | None = None
 ):

@@ -100,7 +100,7 @@ class HttpServerEngineAdapter(EngineBase):
         )
 
     def shutdown(self):
-        kill_process_tree(self.process.pid)
+        kill_process_tree(self.process.pid, wait_timeout=60)
 
     def generate(
         self,

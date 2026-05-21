@@ -17,8 +17,8 @@ import requests
 import torch
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip, kill_process_tree
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -27,10 +27,11 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+
 
 _SEQCLS_MODEL = "Qwen/Qwen3-0.6B"
-_QWEN3_EOT_TOKEN_ID = 151643
 _CAUSAL_LM_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 _NUM_LABELS = 4
 
@@ -184,6 +185,11 @@ class TestPooledHiddenStatesEngine(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
+@unittest.skipIf(
+    is_hip(),
+    "Multi-Item Scoring (enable_mis) requires the flashinfer prefill/decode "
+    "backend, which is NVIDIA-only.",
+)
 class TestPooledHiddenStatesMISEngine(CustomTestCase):
     """Validates return_pooled_hidden_states in MIS (delimiter) scoring mode.
 
@@ -197,7 +203,7 @@ class TestPooledHiddenStatesMISEngine(CustomTestCase):
             model_path=_SEQCLS_MODEL,
             disable_radix_cache=True,
             chunked_prefill_size=-1,
-            multi_item_scoring_delimiter=_QWEN3_EOT_TOKEN_ID,
+            enable_mis=True,
             json_model_override_args=json.dumps(
                 {
                     "architectures": ["Qwen3ForSequenceClassification"],

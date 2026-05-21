@@ -84,6 +84,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
                 ),
             ),
             nunchaku_config=None,
+            quantization=None,
             tp_size=1,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,
@@ -99,6 +100,26 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             )
 
         self.assertEqual(resolved, [f.name])
+
+    @patch(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils.maybe_download_model",
+        side_effect=lambda path, **kw: path,
+    )
+    def test_resolve_transformer_safetensors_to_load_prefers_mixed_export(
+        self, _mock_download
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mixed = f"{tmpdir}/flux2-dev-nvfp4-mixed.safetensors"
+            full = f"{tmpdir}/flux2-dev-nvfp4.safetensors"
+            open(mixed, "a").close()
+            open(full, "a").close()
+
+            server_args = self._make_server_args(transformer_weights_path=tmpdir)
+            resolved = resolve_transformer_safetensors_to_load(
+                server_args, "/unused/component/path"
+            )
+
+        self.assertEqual(resolved, [mixed])
 
     def test_filter_transformer_precision_variants_prefers_canonical_file(self):
         files = [

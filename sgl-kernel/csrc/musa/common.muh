@@ -1,0 +1,42 @@
+ /*
+ * Copyright (c) 2020-2026, Moore Threads Technology Co., Ltd("Moore Threads").
+ * All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+#include "dtype.muh"
+#include <functional>
+#include <iostream>
+#include <musa_runtime.h>
+#include <sstream>
+#include <string>
+
+
+/// Returns the ceiling of (a / b)
+__device__ __host__ __forceinline__ constexpr int ceil_div(int a, int b) {
+  return (a + b - 1) / b;
+}
+
+template <typename T> __device__ __host__ inline T sigmoid(T x) {
+  return 1.f / (1.f + __expf(-x));
+}
+
+#define MUDNN_ATTR_INLINE inline __attribute__((always_inline))
+
+#if defined(__MUSA_ARCH__) && __MUSA_ARCH__ == 310 // MUSIFY_EXCL_LINE
+#define __SYNCTHREADS_LM __syncthreads_lm()
+#else
+#define __SYNCTHREADS_LM __syncthreads()
+#endif

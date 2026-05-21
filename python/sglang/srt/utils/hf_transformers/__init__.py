@@ -14,17 +14,16 @@
 """Hugging Face Transformers utilities.
 
 This package provides HF Transformers helpers, split into submodules
-(common, compat, config, tokenizer, processor, mistral_utils).
+(common, config, tokenizer, processor, mistral_utils).  Compatibility
+monkey-patches live in the sibling ``sglang.srt.utils.hf_transformers_patches``
+module and are applied at sglang import time.
 All public symbols are re-exported here for convenience.  The old import
 path ``sglang.srt.utils.hf_transformers_utils`` is preserved by a
 separate shim module.
 """
 
-from .compat import apply_all as _apply_compat
-
-_apply_compat()
-
-from .common import (  # noqa: E402
+from ..hf_transformers_patches import normalize_rope_scaling_compat
+from .common import (
     CONTEXT_LENGTH_KEYS,
     AutoConfig,
     attach_additional_stop_token_ids,
@@ -37,10 +36,9 @@ from .common import (  # noqa: E402
     get_sparse_attention_config,
     get_tokenizer_from_processor,
 )
-from .compat import normalize_rope_scaling_compat  # noqa: E402
-from .config import get_config  # noqa: E402
-from .processor import get_processor  # noqa: E402
-from .tokenizer import (  # noqa: E402
+from .config import get_config
+from .processor import get_processor
+from .tokenizer import (
     _fix_added_tokens_encoding,
     _fix_v5_add_bos_eos_token,
     get_tokenizer,
