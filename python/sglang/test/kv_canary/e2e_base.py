@@ -20,7 +20,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
 # fixtures (gemma-3-1b sliding_window = 512); short prompts would never exercise
