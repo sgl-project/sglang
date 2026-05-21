@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -67,8 +67,10 @@ class FutureMap:
             # Forward-only bufs are lazy (worker-dependent shape).
             self._forward_buf_initialized = False
 
-        # Fences the schedule-consumed buf fields.
-        self.publish_ready: Optional[torch.cuda.Event] = None
+        # Fences the schedule-consumed buf fields. Created lazily on first
+        # publish via torch.get_device_module(device).Event() to keep the
+        # type cuda/hip-agnostic.
+        self.publish_ready = None
 
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
@@ -141,18 +143,25 @@ class FutureMap:
             self.publish_ready = torch.get_device_module(self.device).Event()
         self.publish_ready.record()
 
-    def stash(self, future_indices: FutureIndices, payload) -> None:
+    def stash(
+        self,
+        future_indices: FutureIndices,
+        payload: Union[torch.Tensor, "EagleDraftInput"],
+    ) -> None:
         """Store forward-only fields for the next forward batch to pick up."""
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            return  # DP idle
+            # DP idle rank: payload (non-spec next_token_ids or spec
+            # draft_input) holds empty stubs whose shape would IndexError the
+            # lazy-init shape peek; defer until a real batch arrives.
+            return
         if self.spec_algo.is_none():
             # next_token_ids is int32; buf is int64. Advanced indexing requires
             # an explicit cast.
             self.token_ids_buf[indices] = payload.to(torch.int64)
             return
 
-        draft_input: EagleDraftInput = payload
+        draft_input: "EagleDraftInput" = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
         self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
