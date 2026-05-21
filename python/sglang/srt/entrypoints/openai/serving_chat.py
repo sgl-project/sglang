@@ -934,8 +934,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 # Spec-decode counters only populate meta_info on the final
                 # chunk (gated by state.finished in TokenizerManager); accumulate
-                # them when present.
-                if "spec_num_proposed_drafts" in content["meta_info"]:
+                # them when --enable-spec-decode-usage is set.
+                if (
+                    self.tokenizer_manager.server_args.enable_spec_decode_usage
+                    and "spec_num_proposed_drafts" in content["meta_info"]
+                ):
                     proposed = content["meta_info"]["spec_num_proposed_drafts"]
                     accepted = content["meta_info"].get("spec_num_correct_drafts", 0)
                     accepted_prediction_tokens[index] = accepted
@@ -1238,6 +1241,7 @@ class OpenAIServingChat(OpenAIServingBase):
             ret,
             n_choices=request.n,
             enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+            enable_spec_decode_usage=self.tokenizer_manager.server_args.enable_spec_decode_usage,
         )
 
         return ChatCompletionResponse(

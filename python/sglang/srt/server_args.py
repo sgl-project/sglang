@@ -489,6 +489,7 @@ class ServerArgs:
     completion_template: Optional[str] = None
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
+    enable_spec_decode_usage: bool = False
     reasoning_parser: Optional[str] = None
     strip_thinking_cache: bool = False
     enable_strict_thinking: bool = False
@@ -5138,6 +5139,16 @@ class ServerArgs:
             "--enable-cache-report",
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--enable-spec-decode-usage",
+            action="store_true",
+            help=(
+                "Return per-request speculative-decoding counters in "
+                "usage.completion_tokens_details.accepted_prediction_tokens / "
+                "rejected_prediction_tokens for each openai request. "
+                "Requires --speculative-algorithm to be set."
+            ),
         )
         reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(

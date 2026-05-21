@@ -45,6 +45,7 @@ class UsageProcessor:
         responses: List[Dict[str, Any]],
         n_choices: int = 1,
         enable_cache_report: bool = False,
+        enable_spec_decode_usage: bool = False,
     ) -> UsageInfo:
         completion_tokens = sum(
             r["meta_info"].get("completion_tokens", 0) for r in responses
@@ -67,8 +68,10 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
-        completion_details = UsageProcessor._details_if_spec(
-            r["meta_info"] for r in responses
+        completion_details = (
+            UsageProcessor._details_if_spec(r["meta_info"] for r in responses)
+            if enable_spec_decode_usage
+            else None
         )
 
         return UsageProcessor.calculate_token_usage(
