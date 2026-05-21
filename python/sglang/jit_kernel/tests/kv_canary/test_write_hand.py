@@ -2,17 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary import consts, write as write_module
 from sglang.jit_kernel.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
+    VerifyOrWriteContext,
     canary_verify_step,
 )
-from sglang.jit_kernel.kv_canary.write import canary_write_step
+from sglang.jit_kernel.kv_canary.write import (
+    canary_write_step,
+    launch_canary_write_kernel,
+)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
@@ -64,6 +70,14 @@ class _WriteSingleSlotInput:
     enable_write_verify_inputs: bool = False
     real_kv_sources: tuple[RealKvSource, ...] = ()
     real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
+
+
+class _RecordingWriteModule:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def canary_write_step_cuda(self, *args: object) -> None:
+        self.calls.append(args)
 
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
@@ -1316,6 +1330,51 @@ class TestMisc:
 
         assert int(cuda_log.write_index[0].item()) == 0
         assert int(ref_log.write_index[0].item()) == 0
+
+    def test_disabled_assert_inputs_passes_none_to_cuda(self) -> None:
+        """Disabled input assertions pass None instead of dummy tensors."""
+        canary_buf = torch.zeros(
+            4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=_DEVICE
+        )
+        plan = make_write_plan(
+            write_offsets=[0, 0],
+            seed_slot_indices=[-1],
+            num_valid_reqs=0,
+            device=_DEVICE,
+        )
+        input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        log = FakeViolationLog.allocate(capacity=2, device=_DEVICE)
+        context = VerifyOrWriteContext(
+            canary_buf=canary_buf,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=log.ring,
+            violation_write_index=log.write_index,
+            slot_run_counter=log.slot_run_counter,
+            kernel_run_counter=log.kernel_run_counter,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+        module = _RecordingWriteModule()
+
+        with patch.object(write_module, "_jit_canary_write_module", lambda: module):
+            launch_canary_write_kernel(
+                context=context,
+                plan=plan,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                enable_assert_inputs=False,
+                expected_input_tokens=None,
+                expected_input_positions=None,
+            )
+
+        assert len(module.calls) == 1
+        call = module.calls[0]
+        assert call[8] == 0
+        assert call[9] is None
+        assert call[10] is None
 
 
 class TestBoundarySweep:
