@@ -771,7 +771,7 @@ class CPUGraphRunner:
 
         raw_bs = forward_batch.batch_size
         if raw_bs in self.graphs:
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self.model_runner.attn_backend.init_forward_data(forward_batch)
             return forward_batch
 
         raw_num_token = raw_bs * self.num_tokens_per_bs
@@ -807,7 +807,7 @@ class CPUGraphRunner:
                 forward_batch.num_token_non_padded
             )
 
-        self.model_runner.attn_backend.init_forward_metadata(captured_forward_batch)
+        self.model_runner.attn_backend.init_forward_data(captured_forward_batch)
         return captured_forward_batch
 
     def replay(
