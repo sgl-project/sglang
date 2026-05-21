@@ -144,7 +144,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.emit_log_if_due(step_counter=10, period=10)
                 stats.emit_log_if_due(step_counter=20, period=10)
 
-            lines = [line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line]
+            lines = [
+                line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line
+            ]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
             self.assertEqual(fields["forward_ct"], 4)
