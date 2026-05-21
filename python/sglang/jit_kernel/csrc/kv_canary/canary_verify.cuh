@@ -28,9 +28,9 @@ struct VerifyKernelParams {
   int64_t slot_stride_bytes;
 
   // Plan tensors.
-  const int32_t* verify_slot_indices;
-  const int32_t* verify_positions;
-  const int32_t* verify_prev_slot_indices;
+  const int64_t* verify_slot_indices;
+  const int64_t* verify_positions;
+  const int64_t* verify_prev_slot_indices;
   const int32_t* verify_num_valid;
   const int32_t* verify_enable;
   int32_t verify_capacity;
@@ -66,9 +66,9 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   for (uint32_t entry_idx = tid; entry_idx < static_cast<uint32_t>(active); entry_idx += stride) {
     ++local_active_count;
 
-    const int64_t slot_idx = static_cast<int64_t>(p.verify_slot_indices[entry_idx]);
-    const int64_t expected_position = static_cast<int64_t>(p.verify_positions[entry_idx]);
-    const int64_t prev_slot_idx = static_cast<int64_t>(p.verify_prev_slot_indices[entry_idx]);
+    const int64_t slot_idx = p.verify_slot_indices[entry_idx];
+    const int64_t expected_position = p.verify_positions[entry_idx];
+    const int64_t prev_slot_idx = p.verify_prev_slot_indices[entry_idx];
 
     if (slot_idx == kCanaryReservedSlot) {
       continue;
@@ -166,7 +166,7 @@ inline void canary_verify_step_cuda(
   TensorMatcher({N_slots, N_stride}).with_dtype<uint8_t>().with_device<kDLCUDA>(device_).verify(canary_buf);
 
   TensorMatcher({N_verify})
-      .with_dtype<int32_t>()
+      .with_dtype<int64_t>()
       .with_device<kDLCUDA>(device_)
       .verify(verify_slot_indices)
       .verify(verify_positions)
@@ -238,9 +238,9 @@ inline void canary_verify_step_cuda(
   VerifyKernelParams p{};
   p.canary_buf = static_cast<const uint8_t*>(canary_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
-  p.verify_slot_indices = static_cast<const int32_t*>(verify_slot_indices.data_ptr());
-  p.verify_positions = static_cast<const int32_t*>(verify_positions.data_ptr());
-  p.verify_prev_slot_indices = static_cast<const int32_t*>(verify_prev_slot_indices.data_ptr());
+  p.verify_slot_indices = static_cast<const int64_t*>(verify_slot_indices.data_ptr());
+  p.verify_positions = static_cast<const int64_t*>(verify_positions.data_ptr());
+  p.verify_prev_slot_indices = static_cast<const int64_t*>(verify_prev_slot_indices.data_ptr());
   p.verify_num_valid = static_cast<const int32_t*>(verify_num_valid.data_ptr());
   p.verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr());
   p.verify_capacity = verify_capacity;

@@ -149,10 +149,10 @@ class VerifyPlan:
     unspecified — kernel skips tid >= verify_num_valid[0].
 
     Fields:
-        verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int32. Already SWA-translated
+        verify_slot_indices: Canary slot index per entry, shape [verify_capacity], int64. Already SWA-translated
             for the SWA group.
-        verify_positions: Expected sequence position per entry, shape [verify_capacity], int32.
-        verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int32. -1 = chain
+        verify_positions: Expected sequence position per entry, shape [verify_capacity], int64.
+        verify_prev_slot_indices: Chain predecessor slot per entry, shape [verify_capacity], int64. -1 = chain
             head (anchor on CANARY_CHAIN_ANCHOR). Explicit (not derived from verify_slot_indices[i-1])
             because chain heads, SWA window starts, cross-req boundaries, and radix-orphan extras break the
             "predecessor == previous array entry" assumption.
@@ -178,13 +178,13 @@ class VerifyPlan:
             )
         return cls(
             verify_slot_indices=torch.zeros(
-                verify_capacity, dtype=torch.int32, device=device
+                verify_capacity, dtype=torch.int64, device=device
             ),
             verify_positions=torch.zeros(
-                verify_capacity, dtype=torch.int32, device=device
+                verify_capacity, dtype=torch.int64, device=device
             ),
             verify_prev_slot_indices=torch.zeros(
-                verify_capacity, dtype=torch.int32, device=device
+                verify_capacity, dtype=torch.int64, device=device
             ),
             verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
             enable=torch.ones(1, dtype=torch.int32, device=device),

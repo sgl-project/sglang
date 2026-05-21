@@ -30,7 +30,7 @@ def make_lut(
     device: torch.device,
     rng: Optional[random.Random] = None,
 ) -> torch.Tensor:
-    base = torch.arange(pool_size + 1, dtype=torch.int32, device=device)
+    base = torch.arange(pool_size + 1, dtype=torch.int64, device=device)
     if kind == "identity":
         return base.contiguous()
     if kind == "shift":
@@ -40,7 +40,7 @@ def make_lut(
             rng = random.Random(0)
         perm = list(range(pool_size + 1))
         rng.shuffle(perm)
-        out = torch.tensor(perm, dtype=torch.int32, device=device)
+        out = torch.tensor(perm, dtype=torch.int64, device=device)
         if kind == "with_oob":
             out[-1] = pool_size + 999
         return out.contiguous()
@@ -225,9 +225,9 @@ def _allocate_plan_pair(
 
 def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
+        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
+        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
+        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
         torch.zeros(1, dtype=torch.int32, device=_DEVICE),
     )
 
@@ -240,19 +240,19 @@ def make_extras_explicit(
     capacity: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     n = len(slot_indices)
-    slots = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    pos = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int32, device=_DEVICE)
+    slots = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
+    pos = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
+    prevs = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
     if n > 0:
-        slots[:n] = torch.tensor(slot_indices, dtype=torch.int32, device=_DEVICE)
-        pos[:n] = torch.tensor(positions, dtype=torch.int32, device=_DEVICE)
-        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int32, device=_DEVICE)
+        slots[:n] = torch.tensor(slot_indices, dtype=torch.int64, device=_DEVICE)
+        pos[:n] = torch.tensor(positions, dtype=torch.int64, device=_DEVICE)
+        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int64, device=_DEVICE)
     num_valid = torch.tensor([n], dtype=torch.int32, device=_DEVICE)
     return slots, pos, prevs, num_valid
 
 
 def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return (
-        torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
-        torch.zeros(num_tokens, dtype=torch.int32, device=_DEVICE),
+        torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
+        torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
     )

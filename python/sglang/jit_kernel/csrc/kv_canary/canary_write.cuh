@@ -25,21 +25,21 @@ struct WriteKernelParams {
   int64_t slot_stride_bytes;
 
   // Plan tensors.
-  const int32_t* write_offsets;
-  const int32_t* write_seed_slot_indices;
+  const int64_t* write_offsets;
+  const int64_t* write_seed_slot_indices;
   const int32_t* write_num_valid_reqs;
   int32_t write_req_capacity;
 
   // ForwardBatch passthroughs. fb_out_cache_loc is caller-pre-translated for SWA groups; the kernel
   // treats it opaquely and skips entries with slot < 0.
-  const int32_t* fb_input_ids;
-  const int32_t* fb_positions;
-  const int32_t* fb_out_cache_loc;
+  const int64_t* fb_input_ids;
+  const int64_t* fb_positions;
+  const int64_t* fb_out_cache_loc;
 
   // Pseudo-mode oracle inputs.
   bool enable_write_verify_inputs;
-  const int32_t* expected_input_tokens;
-  const int32_t* expected_input_positions;
+  const int64_t* expected_input_tokens;
+  const int64_t* expected_input_positions;
 
   // Violation sink (ring + write_index + capacity + kernel_kind bundled in canary_common.cuh).
   ViolationSink violation_sink;
@@ -67,14 +67,14 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     return;
   }
 
-  const int32_t entry_start = p.write_offsets[r];
-  const int32_t entry_end = p.write_offsets[r + 1];
-  const int32_t entry_count = entry_end - entry_start;
+  const int64_t entry_start = p.write_offsets[r];
+  const int64_t entry_end = p.write_offsets[r + 1];
+  const int64_t entry_count = entry_end - entry_start;
   if (entry_count <= 0) {
     return;
   }
 
-  const int32_t seed_slot_idx = p.write_seed_slot_indices[r];
+  const int64_t seed_slot_idx = p.write_seed_slot_indices[r];
 
   // Initialize running_prev_hash by advancing the chain from the seed slot — this keeps the first
   // written slot's stored prev_hash consistent with the chain link the verify kernel will recompute.
@@ -82,16 +82,16 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
-  int32_t entries_written = 0;
-  for (int32_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
-    const int32_t fb_idx = entry_start + entry_offset;
-    const int64_t slot = static_cast<int64_t>(p.fb_out_cache_loc[fb_idx]);
+  int64_t entries_written = 0;
+  for (int64_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
+    const int64_t fb_idx = entry_start + entry_offset;
+    const int64_t slot = p.fb_out_cache_loc[fb_idx];
     if (slot < 0) {
       continue;
     }
     ++entries_written;
-    const int64_t token = static_cast<int64_t>(p.fb_input_ids[fb_idx]);
-    const int64_t position = static_cast<int64_t>(p.fb_positions[fb_idx]);
+    const int64_t token = p.fb_input_ids[fb_idx];
+    const int64_t position = p.fb_positions[fb_idx];
 
     const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
@@ -100,8 +100,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     // values; mismatch records a single violation row carrying both bits OR'd together. Chain still
     // advances on the actual (token, position) below so a downstream verify won't cascade.
     if (p.enable_write_verify_inputs) {
-      const int64_t expected_token = static_cast<int64_t>(p.expected_input_tokens[fb_idx]);
-      const int64_t expected_position = static_cast<int64_t>(p.expected_input_positions[fb_idx]);
+      const int64_t expected_token = p.expected_input_tokens[fb_idx];
+      const int64_t expected_position = p.expected_input_positions[fb_idx];
       FailReason mismatch_bits{};
       if (token != expected_token) {
         mismatch_bits |= FailReason::kWriteTokenMismatch;
@@ -190,12 +190,12 @@ inline void canary_write_step_cuda(
   // write_offsets has shape [write_req_capacity + 1]; the length relationship is pinned by the
   // RuntimeCheck below, this matcher pins dtype + device.
   SymbolicSize N_write_offsets = {"write_offsets_len"};
-  TensorMatcher({N_write_offsets}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_offsets);
-  TensorMatcher({N_write_reqs}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_seed_slot_indices);
+  TensorMatcher({N_write_offsets}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(write_offsets);
+  TensorMatcher({N_write_reqs}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(write_seed_slot_indices);
   TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(write_num_valid_reqs);
 
   TensorMatcher({N_tokens})
-      .with_dtype<int32_t>()
+      .with_dtype<int64_t>()
       .with_device<kDLCUDA>(device_)
       .verify(fb_input_ids)
       .verify(fb_positions)
@@ -271,16 +271,16 @@ inline void canary_write_step_cuda(
   WriteKernelParams p{};
   p.canary_buf = static_cast<uint8_t*>(canary_buf.data_ptr());
   p.slot_stride_bytes = slot_stride_bytes;
-  p.write_offsets = static_cast<const int32_t*>(write_offsets.data_ptr());
-  p.write_seed_slot_indices = static_cast<const int32_t*>(write_seed_slot_indices.data_ptr());
+  p.write_offsets = static_cast<const int64_t*>(write_offsets.data_ptr());
+  p.write_seed_slot_indices = static_cast<const int64_t*>(write_seed_slot_indices.data_ptr());
   p.write_num_valid_reqs = static_cast<const int32_t*>(write_num_valid_reqs.data_ptr());
   p.write_req_capacity = write_req_capacity;
-  p.fb_input_ids = static_cast<const int32_t*>(fb_input_ids.data_ptr());
-  p.fb_positions = static_cast<const int32_t*>(fb_positions.data_ptr());
-  p.fb_out_cache_loc = static_cast<const int32_t*>(fb_out_cache_loc.data_ptr());
+  p.fb_input_ids = static_cast<const int64_t*>(fb_input_ids.data_ptr());
+  p.fb_positions = static_cast<const int64_t*>(fb_positions.data_ptr());
+  p.fb_out_cache_loc = static_cast<const int64_t*>(fb_out_cache_loc.data_ptr());
   p.enable_write_verify_inputs = (enable_write_verify_inputs != 0);
-  p.expected_input_tokens = static_cast<const int32_t*>(expected_input_tokens.data_ptr());
-  p.expected_input_positions = static_cast<const int32_t*>(expected_input_positions.data_ptr());
+  p.expected_input_tokens = static_cast<const int64_t*>(expected_input_tokens.data_ptr());
+  p.expected_input_positions = static_cast<const int64_t*>(expected_input_positions.data_ptr());
   p.violation_sink.ring = static_cast<int64_t*>(violation_ring.data_ptr());
   p.violation_sink.write_index = static_cast<int32_t*>(violation_write_index.data_ptr());
   p.violation_sink.ring_capacity = ring_capacity;

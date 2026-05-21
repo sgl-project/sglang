@@ -38,9 +38,9 @@ class WritePlan:
 
     Fields:
         write_offsets: Exclusive prefix-sum offsets indexing into ForwardBatch's input_ids / positions /
-            out_cache_loc, shape [write_req_capacity + 1], int32. write_offsets[0] == 0;
+            out_cache_loc, shape [write_req_capacity + 1], int64. write_offsets[0] == 0;
             write_offsets[write_num_valid_reqs[0]] == total_write_entries.
-        write_seed_slot_indices: Chain-seed slot per write req, shape [write_req_capacity], int32. Already
+        write_seed_slot_indices: Chain-seed slot per write req, shape [write_req_capacity], int64. Already
             SWA-translated. -1 = no prefix (chain anchors on CANARY_CHAIN_ANCHOR).
         write_num_valid_reqs: Active write-req count, shape [1], int32. canary_write_step skips blocks with
             block_id >= write_num_valid_reqs[0].
@@ -64,10 +64,10 @@ class WritePlan:
             )
         return cls(
             write_offsets=torch.zeros(
-                write_req_capacity + 1, dtype=torch.int32, device=device
+                write_req_capacity + 1, dtype=torch.int64, device=device
             ),
             write_seed_slot_indices=torch.zeros(
-                write_req_capacity, dtype=torch.int32, device=device
+                write_req_capacity, dtype=torch.int64, device=device
             ),
             write_num_valid_reqs=torch.zeros(1, dtype=torch.int32, device=device),
         )
@@ -126,11 +126,11 @@ def canary_write_step(
     Args:
         canary_buf: Canary buffer this launch writes into, shape [num_slots, slot_stride_bytes], uint8.
         plan: Pre-allocated WritePlan.
-        fb_input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int32.
+        fb_input_ids: ForwardBatch.input_ids; token ids being written, shape [num_tokens_padded], int64.
             Flattened across reqs in plan.write_offsets order; tail beyond
             plan.write_offsets[plan.write_num_valid_reqs[0]] is cuda-graph padding.
-        fb_positions: ForwardBatch.positions; sequence positions of fb_input_ids, shape [num_tokens_padded], int32.
-        fb_out_cache_loc: Per-token canary slot index, shape [num_tokens_padded], int32. The caller is
+        fb_positions: ForwardBatch.positions; sequence positions of fb_input_ids, shape [num_tokens_padded], int64.
+        fb_out_cache_loc: Per-token canary slot index, shape [num_tokens_padded], int64. The caller is
             responsible for translating ForwardBatch.out_cache_loc into the canary's index space for SWA
             groups (typically a host-side LUT gather in the endpoint); FULL groups pass it through
             unchanged. A -1 entry signals skip-this-token (used for SWA out-of-window slots or padding).
@@ -139,12 +139,12 @@ def canary_write_step(
             invoke this kernel.
         enable_write_verify_inputs: bool toggle. False = expected_input_* tensors ignored. True = compare
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
-        expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int32. Only read
+        expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int64. Only read
             when enable_write_verify_inputs is True; may be uninitialized / cuda-graph dummy when False.
             Layout mirrors fb_input_ids (flattened across reqs in plan.write_offsets order); padding tail
             is ignored. Filled by the caller from whichever oracle produces expected inputs — the kernel
             knows no oracle.
-        expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int32. Same
+        expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int64. Same
             shape/layout/lifetime rules as expected_input_tokens.
         violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared with
             verify launches.

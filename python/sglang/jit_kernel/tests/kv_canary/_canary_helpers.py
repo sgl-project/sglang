@@ -126,13 +126,13 @@ def make_verify_plan(
     plan = VerifyPlan.allocate(verify_capacity=cap, device=device)
     if n_active > 0:
         plan.verify_slot_indices[:n_active] = torch.tensor(
-            slot_indices, dtype=torch.int32, device=device
+            slot_indices, dtype=torch.int64, device=device
         )
         plan.verify_positions[:n_active] = torch.tensor(
-            positions, dtype=torch.int32, device=device
+            positions, dtype=torch.int64, device=device
         )
         plan.verify_prev_slot_indices[:n_active] = torch.tensor(
-            prev_slot_indices, dtype=torch.int32, device=device
+            prev_slot_indices, dtype=torch.int64, device=device
         )
     plan.verify_num_valid[0] = n_active
     return plan
@@ -185,10 +185,10 @@ def make_write_plan(
     plan = WritePlan.allocate(write_req_capacity=cap, device=device)
     if n_active > 0:
         plan.write_seed_slot_indices[:n_active] = torch.tensor(
-            seed_slot_indices, dtype=torch.int32, device=device
+            seed_slot_indices, dtype=torch.int64, device=device
         )
     plan.write_offsets[: n_active + 1] = torch.tensor(
-        write_offsets, dtype=torch.int32, device=device
+        write_offsets, dtype=torch.int64, device=device
     )
     plan.write_num_valid_reqs[0] = num_valid_reqs
     return plan

@@ -61,9 +61,9 @@ def _make_kernel_args(device):
         verify_plan=verify_plan,
         write_plan=write_plan,
         violation_log=log,
-        fb_input_ids=torch.zeros(1, dtype=torch.int32, device=device),
-        fb_positions=torch.zeros(1, dtype=torch.int32, device=device),
-        fb_out_cache_loc=torch.zeros(1, dtype=torch.int32, device=device),
+        fb_input_ids=torch.zeros(1, dtype=torch.int64, device=device),
+        fb_positions=torch.zeros(1, dtype=torch.int64, device=device),
+        fb_out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
         input_check_mode=False,
         expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
         real_kv_hash_mode=RealKvHashMode.OFF,
@@ -230,10 +230,10 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
         # SWA call: fb_out_cache_loc was rewritten via lut gather (so identity-shifted by +100 here).
-        expected_swa = lut[args.fb_out_cache_loc.to(torch.int64)].to(torch.int32)
+        expected_swa = lut[args.fb_out_cache_loc]
         self.assertTrue(torch.equal(captured[0], expected_swa))
-        # FULL call: fb_out_cache_loc keeps the same values and is normalized to the CUDA ABI dtype.
-        self.assertTrue(torch.equal(captured[1], args.fb_out_cache_loc.to(torch.int32)))
+        # FULL call: fb_out_cache_loc keeps the same values and dtype.
+        self.assertIs(captured[1], args.fb_out_cache_loc)
 
     def test_swa_endpoint_trailing_sentinel_row_yields_skip(self):
         """Verify SWA sentinel cache rows become write-skip markers."""
@@ -274,12 +274,12 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 captured[0],
-                torch.tensor([-1], dtype=torch.int32, device=self.device),
+                torch.tensor([-1], dtype=torch.int64, device=self.device),
             )
         )
 
-    def test_launch_per_forward_casts_write_inputs_to_int32(self):
-        """Verify per-forward launch casts write inputs to int32."""
+    def test_launch_per_forward_preserves_int64_write_inputs(self):
+        """Verify endpoint launch preserves canonical int64 write inputs."""
         captured: List[dict] = []
         with patch.object(
             endpoint_module, "canary_verify_step", lambda **kwargs: None
@@ -293,18 +293,18 @@ class TestSelfUnitEndpoint(CustomTestCase):
             ep.launch_per_forward(
                 verify_plan=args.verify_plan,
                 write_plan=args.write_plan,
-                fb_input_ids=args.fb_input_ids.to(torch.int64),
-                fb_positions=args.fb_positions.to(torch.int64),
-                fb_out_cache_loc=args.fb_out_cache_loc.to(torch.int64),
+                fb_input_ids=args.fb_input_ids,
+                fb_positions=args.fb_positions,
+                fb_out_cache_loc=args.fb_out_cache_loc,
                 input_check_mode=args.input_check_mode,
                 expected_inputs=args.expected_inputs,
                 violation_log=args.violation_log,
                 real_kv_hash_mode=args.real_kv_hash_mode,
             )
 
-        self.assertEqual(captured[0]["fb_input_ids"].dtype, torch.int32)
-        self.assertEqual(captured[0]["fb_positions"].dtype, torch.int32)
-        self.assertEqual(captured[0]["fb_out_cache_loc"].dtype, torch.int32)
+        self.assertEqual(captured[0]["fb_input_ids"].dtype, torch.int64)
+        self.assertEqual(captured[0]["fb_positions"].dtype, torch.int64)
+        self.assertEqual(captured[0]["fb_out_cache_loc"].dtype, torch.int64)
 
 
 if __name__ == "__main__":
