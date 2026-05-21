@@ -85,6 +85,9 @@ use_image_processor_gpu = (
 )
 
 ENCODER_MAX_BATCH_SIZE = int(os.getenv("SGLANG_ENCODER_MAX_BATCH_SIZE", "8"))
+# Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
+# if the batch worker stalls (NCCL hang, dead worker proc, etc.).
+ENCODER_REQ_TIMEOUT = float(os.getenv("SGLANG_ENCODER_REQ_TIMEOUT", "180"))
 
 
 class MMError(Exception):
@@ -1254,12 +1257,7 @@ class MMEncoder:
         """Cross-request encoder fusion (image/audio). Skips local mm_cache."""
         items_per_req, flat_items = [], []
         for req in requests:
-            v = req["mm_items"]
-            if not isinstance(v, (list, tuple)):
-                v = [v]
-            leaves = []
-            for x in v:
-                leaves.extend(x if isinstance(x, (list, tuple)) else [x])
+            leaves = MMEncoder._flatten_nested_items(req["mm_items"])
             items_per_req.append(len(leaves))
             flat_items.extend(leaves)
         total = sum(items_per_req)
@@ -1292,7 +1290,7 @@ class MMEncoder:
                 # Cache path: lookup → encoder forward on miss → prefetch hits →
                 # fallback if prefetch fails. Collectives run once over the
                 # union for TP sync.
-                batch_id = f"batch:{requests[0]['req_id']}:{len(requests)}"
+                batch_id = f"batch:{random_uuid()}"
                 # Concat per-request user-supplied hashes; fall back to compute
                 # if any request lacks them.
                 user_hashes: Optional[List] = []
@@ -1317,8 +1315,9 @@ class MMEncoder:
                     torch.distributed.broadcast(
                         mask, src=0, group=cache.prefetch_tp_group
                     )
-                miss = [i for i, e in enumerate(mask.tolist()) if not e]
-                hit = [i for i, e in enumerate(mask.tolist()) if e]
+                miss, hit = [], []
+                for i, e in enumerate(mask.tolist()):
+                    (hit if e else miss).append(i)
 
                 new_slices = (
                     await self._encode_missing(
@@ -1363,7 +1362,8 @@ class MMEncoder:
 
                 if self.rank != 0:
                     if self.profiler is not None:
-                        self.profiler.step()
+                        for _ in requests:
+                            self.profiler.step()
                     return [(0, 0, 0, None, None) for _ in requests]
 
                 final_slices = [None] * total
@@ -1391,7 +1391,8 @@ class MMEncoder:
                     task.add_done_callback(self.background_tasks.discard)
 
             if self.profiler is not None:
-                self.profiler.step()
+                for _ in requests:
+                    self.profiler.step()
             aux_data = _build_mm_aux_data(mm_inputs, self.model_type)
             results = []
             offset = 0
@@ -1628,10 +1629,12 @@ class EncoderScheduler:
         encoder: "MMEncoder",
         send_sockets: List[zmq.Socket],
         max_batch_size: int,
+        request_timeout: float = ENCODER_REQ_TIMEOUT,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
         self.max_batch_size = max(1, int(max_batch_size))
+        self.request_timeout = max(1.0, float(request_timeout))
         self.pending_queue: "asyncio.Queue[PendingRequest]" = asyncio.Queue()
         self._worker_task: Optional[asyncio.Task] = None
 
@@ -1660,7 +1663,17 @@ class EncoderScheduler:
     async def submit(self, request: dict) -> Tuple:
         pending = PendingRequest(request, asyncio.get_running_loop())
         await self.pending_queue.put(pending)
-        return await pending.future
+        try:
+            return await asyncio.wait_for(pending.future, timeout=self.request_timeout)
+        except asyncio.TimeoutError:
+            if not pending.future.done():
+                pending.future.cancel()
+            req_id = request.get("req_id")
+            logger.error(
+                f"EncoderScheduler.submit timed out after {self.request_timeout}s "
+                f"for req_id={req_id}"
+            )
+            raise
 
     async def _collect_batch(self) -> List[PendingRequest]:
         batch = [await self.pending_queue.get()]
@@ -1726,12 +1739,14 @@ class EncoderScheduler:
                     f"{(time.time() - start) * 1000:.1f}ms"
                 )
         except Exception as e:
-            logger.error(
-                f"batch_encode raised; falling back to per-request: {e}", exc_info=True
-            )
-            # Workers are back in recv loop after their failed batch_encode;
-            # re-broadcast per request to keep TP in sync.
-            await self._dispatch_per_request(group, modality)
+            # batch_encode normally catches and returns errors via _batch_set_error.
+            # If it raised, rank-0 may have skipped a collective broadcast, leaving
+            # TP workers stuck. Don't try to recover — fail every pending future
+            # and let the client retry. Re-broadcasting would risk a deadlock.
+            logger.error(f"batch_encode raised: {e}", exc_info=True)
+            for p in group:
+                if not p.future.done():
+                    p.future.set_exception(e)
             return
 
         if len(results) != len(group):
@@ -1874,9 +1889,19 @@ async def handle_encode_request(request: dict):
         request.update({"enter_time": time.time()})
         modality = Modality.from_str(request["modality"])
         if encoder_scheduler is not None and modality in _BATCHABLE_MODALITIES:
-            nbytes, embedding_len, embedding_dim, error_msg, error_code = (
-                await encoder_scheduler.submit(request)
-            )
+            try:
+                nbytes, embedding_len, embedding_dim, error_msg, error_code = (
+                    await encoder_scheduler.submit(request)
+                )
+            except asyncio.TimeoutError:
+                return ORJSONResponse(
+                    status_code=HTTPStatus.GATEWAY_TIMEOUT,
+                    content={
+                        "status": "error",
+                        "message": "encoder batch timed out",
+                        "req_id": req_id,
+                    },
+                )
         else:
             for socket in send_sockets:
                 socket.send_pyobj(request)
