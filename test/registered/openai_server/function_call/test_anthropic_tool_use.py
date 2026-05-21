@@ -551,5 +551,164 @@ class TestAnthropicToolUse(CustomTestCase):
         )
 
 
+class TestAnthropic47ThinkingWithTools(CustomTestCase):
+    """Anthropic 4.x/4.7: `thinking` combined with tool calling.
+
+    Covers the 3 PR-style acceptance items:
+      1) adaptive thinking format (non-streaming) — protocol-level
+      2) streaming with tools + thinking doesn't break event ordering
+      3) assistant history containing thinking + tool_use round-trips OK
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.messages_url = cls.base_url + "/v1/messages"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _post(self, payload, stream=False):
+        return requests.post(
+            self.messages_url,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            json=payload,
+            stream=stream,
+        )
+
+    def test_thinking_with_tools_non_streaming(self):
+        """Adaptive thinking + tools: request must 200 and response must be
+        a well-formed Anthropic message (with or without a thinking block,
+        depending on model capability)."""
+        payload = {
+            "model": self.model,
+            "max_tokens": 128,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "tools": [ADD_TOOL],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "What is 17 plus 25? Think carefully, then answer.",
+                }
+            ],
+        }
+        r = self._post(payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn("content", body)
+        self.assertIsInstance(body["content"], list)
+        allowed_types = {
+            "text",
+            "thinking",
+            "redacted_thinking",
+            "tool_use",
+        }
+        for block in body["content"]:
+            self.assertIn(block["type"], allowed_types)
+
+    def test_thinking_with_tools_streaming(self):
+        """Streaming thinking + tools. Assert indices don't collide: every
+        `content_block_start` at a given index must have a matching
+        `content_block_stop` at the same index before the next start on
+        that index."""
+        payload = {
+            "model": self.model,
+            "max_tokens": 128,
+            "stream": True,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "tools": [ADD_TOOL],
+            "messages": [{"role": "user", "content": "Compute add(3, 4) for me."}],
+        }
+        r = self._post(payload, stream=True)
+        self.assertEqual(r.status_code, 200, r.text)
+
+        events = []
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(data))
+            except json.JSONDecodeError:
+                pass
+
+        # Walk through content blocks: every start must be followed by
+        # a matching stop on the same index before any next start on the
+        # same index.
+        open_idx = None
+        for e in events:
+            et = e.get("type")
+            if et == "content_block_start":
+                self.assertIsNone(
+                    open_idx,
+                    f"content_block_start at index={e.get('index')} "
+                    f"while index={open_idx} still open",
+                )
+                open_idx = e.get("index")
+            elif et == "content_block_stop":
+                self.assertEqual(
+                    open_idx,
+                    e.get("index"),
+                    f"content_block_stop index mismatch (expected {open_idx}, "
+                    f"got {e.get('index')})",
+                )
+                open_idx = None
+        self.assertIsNone(open_idx, "stream ended with an unclosed content_block")
+
+    def test_thinking_tool_use_round_trip(self):
+        """Assistant history with thinking + tool_use blocks must not
+        cause the server to 400 on the next turn (forward-compat)."""
+        payload = {
+            "model": self.model,
+            "max_tokens": 64,
+            "tools": [ADD_TOOL],
+            "messages": [
+                {"role": "user", "content": "What is 1 + 2?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Let me add 1 and 2.",
+                            "signature": "sig_xyz",
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_prev_1",
+                            "name": "add",
+                            "input": {"a": 1, "b": 2},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_prev_1",
+                            "content": "3",
+                        }
+                    ],
+                },
+            ],
+        }
+        r = self._post(payload)
+        self.assertEqual(r.status_code, 200, r.text)
+
+
 if __name__ == "__main__":
     unittest.main()

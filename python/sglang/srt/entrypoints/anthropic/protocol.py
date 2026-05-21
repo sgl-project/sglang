@@ -3,7 +3,7 @@
 import uuid
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AnthropicError(BaseModel):
@@ -54,6 +54,7 @@ class AnthropicContentBlock(BaseModel):
     # For thinking content
     thinking: Optional[str] = None
     signature: Optional[str] = None
+    data: Optional[str] = None
 
 
 class AnthropicMessage(BaseModel):
@@ -88,6 +89,50 @@ class AnthropicToolChoice(BaseModel):
     name: Optional[str] = None
 
 
+class AnthropicThinking(BaseModel):
+    """Extended/adaptive thinking configuration."""
+
+    type: Literal["enabled", "adaptive", "disabled"]
+    budget_tokens: Optional[int] = None
+    display: Optional[Literal["summarized", "omitted"]] = None
+
+    @field_validator("budget_tokens")
+    @classmethod
+    def validate_budget_tokens(cls, v):
+        if v is not None and v < 1024:
+            raise ValueError("thinking.budget_tokens must be at least 1024")
+        return v
+
+    @model_validator(mode="after")
+    def validate_thinking(self):
+        if self.type == "enabled" and self.budget_tokens is None:
+            raise ValueError("thinking.budget_tokens is required when type is enabled")
+        if self.type == "disabled" and self.display is not None:
+            raise ValueError("thinking.display cannot be used when type is disabled")
+        return self
+
+
+class AnthropicTaskBudget(BaseModel):
+    """Claude 4.7 task budget hint."""
+
+    type: Literal["tokens"]
+    total: int
+
+    @field_validator("total")
+    @classmethod
+    def validate_total(cls, v):
+        if v <= 0:
+            raise ValueError("output_config.task_budget.total must be positive")
+        return v
+
+
+class AnthropicOutputConfig(BaseModel):
+    """Claude 4.7 output configuration."""
+
+    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None
+    task_budget: Optional[AnthropicTaskBudget] = None
+
+
 class AnthropicCountTokensRequest(BaseModel):
     """Anthropic Count Tokens API request"""
 
@@ -96,6 +141,9 @@ class AnthropicCountTokensRequest(BaseModel):
     system: Optional[str | list[AnthropicContentBlock]] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
+    thinking: Optional[AnthropicThinking] = None
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
 
 
 class AnthropicCountTokensResponse(BaseModel):
@@ -119,6 +167,9 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    thinking: Optional[AnthropicThinking] = None
+    output_config: Optional[AnthropicOutputConfig] = None
+    betas: Optional[list[str]] = None
 
     @field_validator("model")
     @classmethod
@@ -138,9 +189,13 @@ class AnthropicMessagesRequest(BaseModel):
 class AnthropicDelta(BaseModel):
     """Delta for streaming responses"""
 
-    type: Optional[Literal["text_delta", "input_json_delta"]] = None
+    type: Optional[
+        Literal["text_delta", "input_json_delta", "thinking_delta", "signature_delta"]
+    ] = None
     text: Optional[str] = None
     partial_json: Optional[str] = None
+    thinking: Optional[str] = None
+    signature: Optional[str] = None
 
     # Message delta fields
     stop_reason: Optional[

@@ -556,5 +556,191 @@ class TestAnthropicServer(CustomTestCase):
         return events
 
 
+class TestAnthropic47ProtocolE2E(CustomTestCase):
+    """End-to-end tests for Anthropic 4.x / 4.7 protocol compatibility.
+
+    These tests only validate that the SGLang Anthropic endpoint accepts
+    the new 4.7-era request fields and preserves streaming event ordering
+    when `thinking` is enabled. They do NOT require a reasoning-capable
+    model — with a plain model the `thinking` block simply won't appear.
+
+    Run:
+        cd test/registered
+        python3 -m unittest openai_server.basic.test_anthropic_server.TestAnthropic47ProtocolE2E -v
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+        )
+        cls.messages_url = cls.base_url + "/v1/messages"
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _post(self, payload, stream=False):
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        return requests.post(
+            self.messages_url, headers=headers, json=payload, stream=stream
+        )
+
+    def _base_payload(self, **overrides):
+        payload = {
+            "model": self.model,
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "Say hi."}],
+        }
+        payload.update(overrides)
+        return payload
+
+    # ---- 4.7 top-level field acceptance ----
+
+    def test_adaptive_thinking_field_accepted(self):
+        r = self._post(
+            self._base_payload(thinking={"type": "adaptive", "display": "summarized"})
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_output_config_and_betas_accepted(self):
+        r = self._post(
+            self._base_payload(
+                output_config={
+                    "effort": "xhigh",
+                    "task_budget": {"type": "tokens", "total": 20000},
+                },
+                betas=["task-budgets-2026-03-13"],
+                service_tier="standard_only",
+            )
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_unknown_future_field_accepted(self):
+        r = self._post(
+            self._base_payload(
+                some_brand_new_2027_field={"foo": "bar"},
+            )
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- new content blocks in history ----
+
+    def test_thinking_block_in_assistant_history_accepted(self):
+        r = self._post(
+            {
+                "model": self.model,
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "let me think...",
+                                "signature": "sig_abc",
+                            },
+                            {"type": "text", "text": "Hello!"},
+                        ],
+                    },
+                    {"role": "user", "content": "Continue."},
+                ],
+            }
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_server_tool_use_block_in_history_accepted(self):
+        r = self._post(
+            {
+                "model": self.model,
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "search"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "server_tool_use",
+                                "id": "srvtoolu_1",
+                                "name": "web_search",
+                                "input": {"query": "x"},
+                            },
+                            {
+                                "type": "web_search_tool_result",
+                                "tool_use_id": "srvtoolu_1",
+                                "content": [{"type": "text", "text": "result"}],
+                            },
+                            {"type": "text", "text": "Done."},
+                        ],
+                    },
+                    {"role": "user", "content": "Thanks"},
+                ],
+            }
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    # ---- streaming event ordering (thinking before text when both appear) ----
+
+    def test_streaming_with_thinking_event_order(self):
+        """If the model emits reasoning_content, thinking block must come
+        strictly before text block; otherwise thinking block is simply
+        absent and text block still works."""
+        payload = self._base_payload(
+            stream=True,
+            thinking={"type": "adaptive", "display": "summarized"},
+            messages=[{"role": "user", "content": "Compute 2+2."}],
+        )
+        r = self._post(payload, stream=True)
+        self.assertEqual(r.status_code, 200, r.text)
+
+        events = []
+        for line in r.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                events.append(json.loads(data))
+            except json.JSONDecodeError:
+                pass
+
+        starts = [
+            (i, e["content_block"]["type"])
+            for i, e in enumerate(events)
+            if e.get("type") == "content_block_start"
+        ]
+        text_starts = [i for i, t in starts if t == "text"]
+        thinking_starts = [i for i, t in starts if t == "thinking"]
+
+        # If a thinking block was emitted at all, it must precede the text.
+        if thinking_starts and text_starts:
+            self.assertLess(thinking_starts[0], text_starts[0])
+            # indices must be distinct.
+            t_idx = [
+                e["index"]
+                for e in events
+                if e.get("type") == "content_block_start"
+                and e["content_block"]["type"] == "thinking"
+            ][0]
+            tx_idx = [
+                e["index"]
+                for e in events
+                if e.get("type") == "content_block_start"
+                and e["content_block"]["type"] == "text"
+            ][0]
+            self.assertNotEqual(t_idx, tx_idx)
+
+
 if __name__ == "__main__":
     unittest.main()
