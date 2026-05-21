@@ -14,7 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     is_allocation_symmetric,
 )
-from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
 

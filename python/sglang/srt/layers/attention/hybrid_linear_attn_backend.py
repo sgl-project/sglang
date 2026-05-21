@@ -143,6 +143,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
+        # Pool ref — captured at construction so ``get_token_to_kv_pool()``
+        # resolves correctly when a ForwardContext publishes this backend
+        # (Pattern A invariant).
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
         self.query_start_loc_list = []
@@ -763,6 +767,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
+        # Pool refs alias to the full-attn backend so ``get_token_to_kv_pool()`` /
+        # ``get_req_to_token_pool()`` resolve correctly when a ForwardContext
+        # publishes the hybrid dispatcher itself (Pattern A invariant).
+        self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
+        self.req_to_token_pool = full_attn_backend.req_to_token_pool
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None

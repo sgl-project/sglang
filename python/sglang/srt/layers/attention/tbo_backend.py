@@ -15,6 +15,11 @@ class TboAttnBackend(AttentionBackend):
         super().__init__()
         self.primary = primary
         self.children = children
+        # Pool refs alias to the primary so ``get_token_to_kv_pool()`` /
+        # ``get_req_to_token_pool()`` resolve correctly when a ForwardContext
+        # publishes the TBO dispatcher itself (Pattern A invariant).
+        self.token_to_kv_pool = primary.token_to_kv_pool
+        self.req_to_token_pool = primary.req_to_token_pool
 
     @classmethod
     def init_new(cls, creator: Callable[[], AttentionBackend]):

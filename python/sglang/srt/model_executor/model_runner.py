@@ -160,7 +160,6 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
 )
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
-from sglang.srt.model_executor.pool_context import set_kv_pools
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -747,8 +746,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
-
-        set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -3238,130 +3235,107 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
-        # Activate this runner's pools + attn_backend for the duration of the
-        # forward so that get_token_to_kv_pool() / get_req_to_token_pool() /
-        # get_attn_backend() resolve to the right objects regardless of which
-        # other ModelRunner instances have been initialized in this process.
-        # Frozen-KV MTP swaps self.token_to_kv_pool itself before calling
-        # forward(), so this pool set picks up that override.
+        # Publish this runner's ``self.attn_backend`` for the duration of the
+        # forward so that ``get_attn_backend()`` / ``get_token_to_kv_pool()``
+        # / ``get_req_to_token_pool()`` resolve to the right objects regardless
+        # of which other ModelRunner instances have been initialized in this
+        # process. Pool refs are derived from ``attn_backend.*`` (Pattern A
+        # invariant — every backend caches both pools at construction).
         #
         # If the caller has already published a ForwardContext (e.g. spec
         # workers wrapping the per-step draft forward with the i-th child
         # backend), honor it — overriding would defeat the per-call control.
-        # Otherwise publish this runner's own ``self.attn_backend``.
-        prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
-        try:
-            if has_forward_context():
-                return self._forward_raw_body(
-                    forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    reinit_attn_backend=reinit_attn_backend,
-                    split_forward_count=split_forward_count,
-                )
-            with forward_context(ForwardContext(attn_backend=self.attn_backend)):
-                return self._forward_raw_body(
-                    forward_batch,
-                    skip_attn_backend_init=skip_attn_backend_init,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                    reinit_attn_backend=reinit_attn_backend,
-                    split_forward_count=split_forward_count,
-                )
-        finally:
-            set_kv_pools(*prev_pools)
-
-    def _forward_raw_body(
-        self,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool = False,
-        split_forward_count: int = 1,
-    ) -> ModelRunnerOutput:
-        # Check whether can run cuda graph
-        mode_check = (
-            forward_batch.forward_mode.is_cpu_graph
-            if self.device == "cpu"
-            else forward_batch.forward_mode.is_cuda_graph
-        )
-        can_run_graph = bool(
-            mode_check()
-            and self.graph_runner
-            and self.graph_runner.can_run(forward_batch)
-        )
-
-        # Hisparse coordinator — backends now read it from self.model_runner.
-        if (
-            forward_batch.forward_mode.is_decode()
-            and self.hisparse_coordinator is not None
-        ):
-            self.hisparse_coordinator.wait_for_pending_backup()
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-
-        # Replay cuda graph if applicable
-        if can_run_graph:
-            ret = self.graph_runner.replay(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
+        if has_forward_context():
+            ctx_mgr = contextlib.nullcontext()
+        else:
+            ctx_mgr = forward_context(ForwardContext(attn_backend=self.attn_backend))
+        with ctx_mgr:
+            # Check whether can run cuda graph
+            mode_check = (
+                forward_batch.forward_mode.is_cpu_graph
+                if self.device == "cpu"
+                else forward_batch.forward_mode.is_cuda_graph
             )
+            can_run_graph = bool(
+                mode_check()
+                and self.graph_runner
+                and self.graph_runner.can_run(forward_batch)
+            )
+
+            # Hisparse coordinator — backends now read it from self.model_runner.
+            if (
+                forward_batch.forward_mode.is_decode()
+                and self.hisparse_coordinator is not None
+            ):
+                self.hisparse_coordinator.wait_for_pending_backup()
+                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+            # Replay cuda graph if applicable
+            if can_run_graph:
+                ret = self.graph_runner.replay(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            # For MLP sync
+            if forward_batch.global_num_tokens_cpu is not None:
+                forward_batch.prepare_mlp_sync_batch(self)
+            else:
+                forward_batch.prepare_attn_tp_scatter_input(self)
+
+            # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+            if (
+                forward_batch.num_token_non_padded is not None
+                and forward_batch.global_num_tokens_gpu is not None
+                and require_gathered_buffer(self.server_args)
+                and not is_dsa_enable_prefill_cp()
+            ):
+                forward_batch.adjust_num_token_non_padded_for_attn_tp(
+                    server_args=self.server_args,
+                )
+
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
+
+            # Hisparse coordinator — backends now read it from self.model_runner.
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+            # Forward without cuda graph
+            if forward_batch.forward_mode.is_decode():
+                ret = self.forward_decode(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_split_prefill():
+                ret = self.forward_split_prefill(
+                    forward_batch,
+                    reinit_attn_backend=reinit_attn_backend,
+                    forward_count=split_forward_count,
+                )
+            elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                ret, can_run_graph = self.forward_extend(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            elif forward_batch.forward_mode.is_idle():
+                ret = self.forward_idle(
+                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                )
+            else:
+                raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
+
+            if (
+                forward_batch.global_num_tokens_cpu is not None
+                and self.pp_group.is_last_rank
+            ):
+                forward_batch.post_forward_mlp_sync_batch(ret)
+
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
-
-        # For MLP sync
-        if forward_batch.global_num_tokens_cpu is not None:
-            forward_batch.prepare_mlp_sync_batch(self)
-        else:
-            forward_batch.prepare_attn_tp_scatter_input(self)
-
-        # Normalize num_token_non_padded to be local to this attention TP rank if needed.
-        if (
-            forward_batch.num_token_non_padded is not None
-            and forward_batch.global_num_tokens_gpu is not None
-            and require_gathered_buffer(self.server_args)
-            and not is_dsa_enable_prefill_cp()
-        ):
-            forward_batch.adjust_num_token_non_padded_for_attn_tp(
-                server_args=self.server_args,
-            )
-
-        if self.is_hybrid_swa:
-            self.token_to_kv_pool.invalidate_loc_cache()
-
-        # Hisparse coordinator — backends now read it from self.model_runner.
-        if self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
-
-        # Forward without cuda graph
-        if forward_batch.forward_mode.is_decode():
-            ret = self.forward_decode(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_split_prefill():
-            ret = self.forward_split_prefill(
-                forward_batch,
-                reinit_attn_backend=reinit_attn_backend,
-                forward_count=split_forward_count,
-            )
-        elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
-            ret, can_run_graph = self.forward_extend(
-                forward_batch,
-                skip_attn_backend_init=skip_attn_backend_init,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-        elif forward_batch.forward_mode.is_idle():
-            ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode}")
-
-        if (
-            forward_batch.global_num_tokens_cpu is not None
-            and self.pp_group.is_last_rank
-        ):
-            forward_batch.post_forward_mlp_sync_batch(ret)
-
-        return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

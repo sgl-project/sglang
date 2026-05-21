@@ -6,8 +6,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
-from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_executor.pool_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:

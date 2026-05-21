@@ -21,10 +21,6 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.pool_context import (
-    get_req_to_token_pool,
-    set_kv_pools,
-)
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftExtendInput,
@@ -33,19 +29,23 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 from sglang.srt.speculative.spec_utils import fast_topk
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 
 @contextmanager
-def frozen_kv_target_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPContext):
+def frozen_kv_target_view(
+    forward_batch: ForwardBatch,
+    kv_context: FrozenKVMTPContext,
+    draft_attn_backend: "AttentionBackend",
+):
     """Build attention metadata against committed target-prefix geometry.
 
-    Mirrors the target KV pool into the ``pool_context`` global so any helper
-    that reads ``get_token_to_kv_pool()`` during metadata init sees the frozen
-    target pool. Backends now hold their own pool ref in ``self.token_to_kv_pool``
-    captured at construction, so we leave that alone — the metadata init path
-    we wrap here only reads pool data via the global / runner / attn_backend
-    chain, not via ForwardBatch.
+    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool
+    so any helper that reads ``get_token_to_kv_pool()`` during metadata init
+    sees the frozen target pool. Pool refs are derived from
+    ``get_attn_backend().token_to_kv_pool`` — the single backend-attribute
+    swap is seen by both readers (``get_token_to_kv_pool()`` and the
+    backend's own ``self.token_to_kv_pool``).
     """
     if kv_context is None:
         raise RuntimeError(
@@ -54,55 +54,40 @@ def frozen_kv_target_view(forward_batch: ForwardBatch, kv_context: FrozenKVMTPCo
         )
     saved_spec_info = forward_batch.spec_info
     forward_batch.spec_info = None
-    prev_pools = set_kv_pools(
-        get_req_to_token_pool(), kv_context.target_token_to_kv_pool
-    )
+    saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
         forward_batch.spec_info = saved_spec_info
-        set_kv_pools(*prev_pools)
+        draft_attn_backend.token_to_kv_pool = saved_backend_pool
 
 
 @contextmanager
 def target_kv_pool_view(
     forward_batch: ForwardBatch,
     kv_context: FrozenKVMTPContext,
-    draft_runner: "ModelRunner",
+    draft_attn_backend: "AttentionBackend",
 ):
     """Run the draft model's forward with the target's frozen KV pool.
 
-    Swaps three things so every reader inside the wrapped ``draft_runner.forward()``
-    sees the frozen target pool:
-      * ``draft_runner.token_to_kv_pool`` — so the runner's ``_forward_raw``
-        publishes the frozen pool into the ``pool_context`` global.
-      * ``draft_attn_backend.token_to_kv_pool`` — backends capture the pool
-        ref statically at construction (Pattern A); swap it so backend body
-        reads (``set_kv_buffer`` / ``get_kv_buffer`` …) hit the target pool.
-      * the ``pool_context`` global itself — paranoia + handles any caller that
-        reads it before entering ``_forward_raw``.
-    All three are restored on exit.
+    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool.
+    The single backend-attribute swap is seen by both readers —
+    ``get_token_to_kv_pool()`` (because it resolves through
+    ``get_attn_backend()``) and the backend's own ``self.token_to_kv_pool``
+    reads (because ``self is draft_attn_backend``).
     """
     if kv_context is None:
         raise RuntimeError(
             "Frozen-KV MTP target KV pool view called before the model was bound; "
             "bind the frozen KV context first."
         )
-    target_pool = kv_context.target_token_to_kv_pool
-    draft_backend = draft_runner.attn_backend
-    saved_runner_pool = draft_runner.token_to_kv_pool
-    saved_backend_pool = getattr(draft_backend, "token_to_kv_pool", None)
-    draft_runner.token_to_kv_pool = target_pool
-    if saved_backend_pool is not None:
-        draft_backend.token_to_kv_pool = target_pool
-    prev_pools = set_kv_pools(get_req_to_token_pool(), target_pool)
+    saved_backend_pool = draft_attn_backend.token_to_kv_pool
+    draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
     try:
         yield
     finally:
-        draft_runner.token_to_kv_pool = saved_runner_pool
-        if saved_backend_pool is not None:
-            draft_backend.token_to_kv_pool = saved_backend_pool
-        set_kv_pools(*prev_pools)
+        draft_attn_backend.token_to_kv_pool = saved_backend_pool
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:

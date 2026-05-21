@@ -1,11 +1,14 @@
 """Per-forward-call control context.
 
 This module owns ``ForwardContext`` — a frozen dataclass holding the
-per-forward-call control configs that the model layer needs to read at depth
-(currently just ``attn_backend``; future fields will include DP attn buffer
-sizes, TBO child index, hybrid layer routing flags, etc.). These fields are
-read via ``get_forward_context()`` rather than being threaded through
-``ForwardBatch`` so they don't pollute the batch dataclass.
+per-forward-call control configs that the model layer needs to read at depth.
+Currently the only mandatory field is ``attn_backend``; pool refs and
+coordinator are derived from ``attn_backend.*`` (Pattern A invariant —
+every backend caches ``req_to_token_pool`` / ``token_to_kv_pool`` at
+``__init__``). Future fields will include DP attn buffer sizes, TBO child
+index, hybrid layer routing flags, etc. These fields are read via
+``get_forward_context()`` rather than being threaded through ``ForwardBatch``
+so they don't pollute the batch dataclass.
 
 ``ModelRunner._forward_raw`` publishes a fresh ``ForwardContext`` for the
 duration of each forward; callers that need a per-call override (e.g. PDmux
@@ -28,15 +31,19 @@ from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 
 
 @dataclass(frozen=True, slots=True)
 class ForwardContext:
     """Per-forward-call control configs.
 
-    Read at depth via ``get_forward_context()``; never threaded through
-    ``ForwardBatch``. Extend by adding fields here — keep the dataclass
-    frozen so accidental mutation is caught at write time.
+    Single mandatory field: the active attention backend. Pool refs and
+    coordinator are derived from ``attn_backend.*`` (Pattern A invariant —
+    every backend caches ``req_to_token_pool`` / ``token_to_kv_pool`` at
+    ``__init__``). Read at depth via ``get_forward_context()``; never
+    threaded through ``ForwardBatch``. Extend by adding fields here — keep
+    the dataclass frozen so accidental mutation is caught at write time.
     """
 
     attn_backend: "AttentionBackend"
@@ -83,6 +90,26 @@ def get_forward_context() -> ForwardContext:
 def get_attn_backend() -> "AttentionBackend":
     """Shortcut for ``get_forward_context().attn_backend``."""
     return get_forward_context().attn_backend
+
+
+def get_token_to_kv_pool() -> "KVCache":
+    """Derived: ``get_attn_backend().token_to_kv_pool``.
+
+    Every attention backend caches ``token_to_kv_pool`` at construction
+    (Pattern A), so a published ``ForwardContext(attn_backend=X)`` is enough
+    to resolve the active KV pool — no separate global needed.
+    """
+    return get_attn_backend().token_to_kv_pool
+
+
+def get_req_to_token_pool() -> "ReqToTokenPool":
+    """Derived: ``get_attn_backend().req_to_token_pool``.
+
+    Every attention backend caches ``req_to_token_pool`` at construction
+    (Pattern A), so a published ``ForwardContext(attn_backend=X)`` is enough
+    to resolve the active req-to-token pool — no separate global needed.
+    """
+    return get_attn_backend().req_to_token_pool
 
 
 @contextmanager

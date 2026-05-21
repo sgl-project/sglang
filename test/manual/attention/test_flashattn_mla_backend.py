@@ -223,12 +223,8 @@ class TestFlashAttentionMLABackend(CustomTestCase):
                 seq_lens_cpu=torch.tensor([total_len] * self.batch_size, device="cpu"),
             )
 
-        # Add token pool from model runner to forward batch
-        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
-
-        # Add KV cache from model runner to forward batch
-        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
-
+        # Pool refs are resolved via the active ForwardContext (published in
+        # setUp); the fixture no longer needs to attach them to forward_batch.
         return forward_batch
 
     def _setup_kv_cache(self, forward_batch, layer, cache_len):
@@ -254,7 +250,7 @@ class TestFlashAttentionMLABackend(CustomTestCase):
         )
 
         # Set the prefix KV cache using MLA-specific method
-        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+        self.model_runner.token_to_kv_pool.set_mla_kv_buffer(
             layer,
             torch.arange(self.batch_size * cache_len, device=self.device),
             cache_k_nope,
