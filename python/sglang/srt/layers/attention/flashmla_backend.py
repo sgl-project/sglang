@@ -184,12 +184,9 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
-        num_tokens = bs
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
         if forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
@@ -269,15 +266,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
         else:
-            super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-            )
+            super().init_forward_data_out_graph(forward_batch)
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
