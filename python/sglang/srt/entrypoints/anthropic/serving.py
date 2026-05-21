@@ -464,6 +464,9 @@ class AnthropicServing:
 
                 # Emit message_delta with stop_reason and usage
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
+                cache_read = (
+                    usage_info.get("cache_read_input_tokens", 0) if usage_info else 0
+                )
                 delta_event = AnthropicStreamEvent(
                     type="message_delta",
                     delta=AnthropicDelta(stop_reason=stop_reason),
@@ -474,6 +477,7 @@ class AnthropicServing:
                         output_tokens=(
                             usage_info.get("output_tokens", 0) if usage_info else 0
                         ),
+                        cache_read_input_tokens=cache_read or None,
                     ),
                 )
                 yield _wrap_sse_event(
@@ -533,9 +537,16 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
+                cache_read = 0
+                if (
+                    chunk.usage.prompt_tokens_details
+                    and chunk.usage.prompt_tokens_details.cached_tokens
+                ):
+                    cache_read = chunk.usage.prompt_tokens_details.cached_tokens
                 usage_info = {
                     "input_tokens": chunk.usage.prompt_tokens,
                     "output_tokens": chunk.usage.completion_tokens or 0,
+                    "cache_read_input_tokens": cache_read,
                 }
                 continue
 
@@ -689,6 +700,17 @@ class AnthropicServing:
         # Map stop reason
         stop_reason = STOP_REASON_MAP.get(choice.finish_reason or "stop", "end_turn")
 
+        # Extract cached tokens from prompt_tokens_details if available
+        cache_read_input_tokens = 0
+        if (
+            response.usage
+            and response.usage.prompt_tokens_details
+            and response.usage.prompt_tokens_details.cached_tokens
+        ):
+            cache_read_input_tokens = (
+                response.usage.prompt_tokens_details.cached_tokens
+            )
+
         return AnthropicMessagesResponse(
             id=f"msg_{uuid.uuid4().hex}",
             content=content,
@@ -697,6 +719,7 @@ class AnthropicServing:
             usage=AnthropicUsage(
                 input_tokens=response.usage.prompt_tokens if response.usage else 0,
                 output_tokens=response.usage.completion_tokens if response.usage else 0,
+                cache_read_input_tokens=cache_read_input_tokens or None,
             ),
         )
 
