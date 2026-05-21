@@ -106,8 +106,6 @@ class ViTCudaGraphRunner:
         self.rotary_cos_bufs: Dict[int, torch.Tensor] = {}
         self.rotary_sin_bufs: Dict[int, torch.Tensor] = {}
 
-        self._eager_warmed_up = False
-
     # ------------------------------------------------------------------
     # Bucket helpers
     # ------------------------------------------------------------------
@@ -261,6 +259,19 @@ class ViTCudaGraphRunner:
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
 
+        # Warm up eager path on the default stream after capture.
+        # Capture warmup runs on a dedicated stream; the default stream
+        # has never executed ViT kernels, so the first eager call would
+        # pay a multi-second CUDA kernel cold-start cost.
+        B = self.BUCKET_SIZES[0]
+        self.vit.run_blocks(
+            self.input_bufs[B],
+            self.forward_metadatas[B],
+            self.rotary_cos_bufs[B],
+            self.rotary_sin_bufs[B],
+        )
+        torch.get_device_module(self.device).synchronize()
+
     # ------------------------------------------------------------------
     # Replay
     # ------------------------------------------------------------------
@@ -398,20 +409,7 @@ class ViTCudaGraphRunner:
                 bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
 
-        # Fallback: total tokens exceed max bucket, run eager.
-        # The first eager call after graph replay is expensive (~3 s) due to
-        # CUDA kernel module cold-start on the default stream.  Absorb this
-        # cost with a dummy forward using the smallest captured buffer.
-        if not self._eager_warmed_up:
-            self._eager_warmed_up = True
-            B = self.BUCKET_SIZES[0]
-            self.vit.run_blocks(
-                self.input_bufs[B],
-                self.forward_metadatas[B],
-                self.rotary_cos_bufs[B],
-                self.rotary_sin_bufs[B],
-            )
-
+        # Fallback: total tokens exceed max bucket, run eager
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
