@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+import unittest
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+
+
+class _BaselineBase(CanaryE2EBase):
+    """No perturb, kv-canary=log, sweep off. Server should run clean with no canary
+    violations and every request must come back 200."""
+
+    kv_canary_mode = "log"
+    perturb_env = {}
+    sweep_interval = 0
+
+    def test_no_violation(self) -> None:
+        results = self.send_parallel_requests(n=4, max_new_tokens=8)
+        for r in results:
+            self.assertEqual(r.get("status_code"), 200, r)
+        self.assert_no_violation(wait_seconds=2.0)
+
+
+class TestBaselineMha(_BaselineBase, unittest.TestCase):
+    mode = "mha"
+
+
+class TestBaselineSwa(_BaselineBase, unittest.TestCase):
+    mode = "swa"
+
+
+if __name__ == "__main__":
+    unittest.main()
