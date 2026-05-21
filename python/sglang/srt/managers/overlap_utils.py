@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -40,6 +40,11 @@ else:
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
+    # Cross-stream barrier event signaling that forward stream has finished
+    # producing this future (i.e., the buf slots at `indices` are written).
+    # Consumers on schedule stream wait on this before reading the buf.
+    # Recorded by Scheduler AFTER store_to_map on the forward stream.
+    done: Optional["torch.cuda.Event"] = None
 
 
 class FutureMap:
@@ -129,18 +134,17 @@ class FutureMap:
         """Schedule-stream counterpart of resolve_future for the CPU mirror.
 
         Reads post-verify seq_lens from new_seq_lens_buf into batch.seq_lens_cpu
-        and recomputes batch.seq_lens_sum. spec_info.verify_done provides the
+        and recomputes batch.seq_lens_sum. future_indices.done provides the
         cross-stream barrier — Scheduler records it AFTER store_to_map, so the
         wait ensures the buf write is visible from schedule stream. No-op for
         paths without future state (first iter / no spec_info).
         """
-        spec_info = batch.spec_info
-        if spec_info is None or spec_info.future_indices is None:
+        fi = batch.spec_info.future_indices if batch.spec_info is not None else None
+        if fi is None:
             return
-        if spec_info.verify_done is not None:
-            spec_info.verify_done.wait()
-        indices = spec_info.future_indices.indices
-        batch.seq_lens_cpu = self.new_seq_lens_buf[indices].cpu()
+        if fi.done is not None:
+            fi.done.wait()
+        batch.seq_lens_cpu = self.new_seq_lens_buf[fi.indices].cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def store_to_map(
