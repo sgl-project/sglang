@@ -710,5 +710,141 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+class TestDeepseekVL2UnderstandsImage(
+    VLMInputTestBase, unittest.IsolatedAsyncioTestCase
+):
+    model_path = "deepseek-ai/deepseek-vl2-tiny"
+    chat_template = "deepseek-vl2"
+
+    @classmethod
+    def setUpClass(cls):
+        assert cls.model_path is not None
+        assert cls.chat_template is not None
+
+        # The base test sends `image_data` to the engine's async_generate, which
+        # accepts List[Union[str, bytes]] — pass URL/path strings, not PIL.
+        cls.image_urls = [IMAGE_MAN_IRONING_URL, IMAGE_SGL_LOGO_URL]
+        cls.main_image = list(cls.image_urls)
+        cls.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # PIL list for the offline DeepseekVLV2Processor.__call__(images=...)
+        cls.pil_images = []
+        for image_url in cls.image_urls:
+            response = requests.get(image_url)
+            cls.pil_images.append(Image.open(BytesIO(response.content)).convert("RGB"))
+
+        # sglang ships its own DeepseekVLV2Processor at sglang.srt.configs.deepseekvl2
+        # (registered with AutoProcessor at import). Import directly so we don't
+        # depend on AutoProcessor registration order.
+        from sglang.srt.configs.deepseekvl2 import DeepseekVLV2Processor
+
+        cls.processor = DeepseekVLV2Processor.from_pretrained(
+            cls.model_path, trust_remote_code=True
+        )
+        cls._init_visual()
+
+    @classmethod
+    def _init_visual(cls):
+        # Build a standalone vision tower + projector and load the matching
+        # weights, then call DeepseekVL2ForCausalLM.build_image_features so the
+        # standalone embeddings match what get_image_feature would have produced
+        # — including per-tile newline / view_seperator additions.
+        import glob
+        import os
+
+        from huggingface_hub import snapshot_download
+        from safetensors.torch import load_file
+
+        from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
+        from sglang.srt.models.deepseek_vl2 import (
+            DeepseekVL2ForCausalLM,
+            DeepseekVL2MlpProjector,
+            _init_vision_module,
+        )
+
+        config = DeepseekVL2Config.from_pretrained(cls.model_path)
+        cls.global_view_pos = config.global_view_pos
+        vision = _init_vision_module(config.vision_config, quant_config=None)
+        cls.vision_model = vision.eval().to(cls.device, dtype=torch.bfloat16)
+        cls.projector_model = (
+            DeepseekVL2MlpProjector(config.projector_config, quant_config=None)
+            .eval()
+            .to(cls.device, dtype=torch.bfloat16)
+        )
+
+        cls.image_newline = None
+        cls.view_seperator = None
+
+        local_dir = snapshot_download(cls.model_path, allow_patterns=["*.safetensors"])
+        for f in sorted(glob.glob(os.path.join(local_dir, "*.safetensors"))):
+            shard = load_file(f)
+            vision_sd = {
+                k.removeprefix("vision."): v
+                for k, v in shard.items()
+                if k.startswith("vision.")
+            }
+            projector_sd = {
+                k.removeprefix("projector."): v
+                for k, v in shard.items()
+                if k.startswith("projector.")
+            }
+            cls.vision_model.load_state_dict(vision_sd, strict=False)
+            cls.projector_model.load_state_dict(projector_sd, strict=False)
+            if "image_newline" in shard:
+                cls.image_newline = shard["image_newline"].to(
+                    cls.device, dtype=torch.bfloat16
+                )
+            if "view_seperator" in shard:
+                cls.view_seperator = shard["view_seperator"].to(
+                    cls.device, dtype=torch.bfloat16
+                )
+            del shard
+
+        assert cls.image_newline is not None
+        assert cls.view_seperator is not None
+
+        def visual_func(processor_output):
+            class _Item:
+                pass
+
+            item = _Item()
+            item.feature = processor_output["pixel_values"].to(
+                cls.device, dtype=torch.bfloat16
+            )
+            item.images_spatial_crop = processor_output["images_spatial_crop"]
+            return DeepseekVL2ForCausalLM.build_image_features(
+                [item],
+                cls.vision_model,
+                cls.projector_model,
+                cls.image_newline,
+                cls.view_seperator,
+                cls.global_view_pos,
+            )
+
+        cls.visual = visual_func
+
+    def get_processor_output(self, req=None):
+        # sglang's DeepseekVLV2Processor takes `conversations` as a STRING with
+        # `<image>` tokens (not List[Dict]) and `images` as a PIL list. The
+        # return is a VLChatProcessorOutput; expose it as a plain dict with the
+        # batch dim added so the base test methods can do
+        # processor_output["input_ids"][0].
+        if req is None:
+            req = self.get_completion_request()
+        conv = generate_chat_conv(req, template_name=self.chat_template)
+        text = conv.get_prompt()
+
+        out = self.processor(conversations=text, images=self.pil_images)
+        return {
+            "input_ids": out.input_ids.unsqueeze(0),
+            "pixel_values": out.pixel_values,
+            "images_seq_mask": out.images_seq_mask,
+            "images_spatial_crop": out.images_spatial_crop,
+        }, text
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
 if __name__ == "__main__":
     unittest.main()
