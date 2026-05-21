@@ -44,3 +44,13 @@ dsr1-fp4-gb200-dynamo-sglang:
         - conc-list: [512, 2048, 4096, 8192]
           # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/1k1k/mid-curve.yaml
           config_file: recipes/gb200-fp4/1k1k/mid-curve.yaml
+
+    # 8k1k is the eval-eligible seq-len. Server context-length is 9600 (vs
+    # mid-curve's 2176), so gsm8k requests with ~1k input + ~1k output fit
+    # comfortably without context-length tuning.
+    - isl: 8192
+      osl: 1024
+      search-space:
+        - conc-list: [2048]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/8k1k/max-tpt.yaml
+          config_file: recipes/gb200-fp4/8k1k/max-tpt.yaml
