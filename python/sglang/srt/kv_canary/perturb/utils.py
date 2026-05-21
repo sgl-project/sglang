@@ -90,15 +90,19 @@ def pick_target_group(
     buffer_groups: tuple[CanaryBufferGroup, ...],
     target_kind: TargetGroupKind,
 ) -> Optional[CanaryBufferGroup]:
-    """Filter buffer_groups by target_kind (FULL / SWA exact, ANY random) restricted to
-    groups with non-empty real_kv_sources_k. Returns None if no group matches."""
+    """Filter buffer_groups by target_kind restricted to groups with non-empty real_kv_sources_k.
+
+    Returns None if no group matches.
+    """
     eligible = [group for group in buffer_groups if group.real_kv_sources_k]
     if not eligible:
         return None
-    if target_kind == TargetGroupKind.ANY:
-        pick = int(torch.randint(0, len(eligible), (1,)).item())
-        return eligible[pick]
-    want = PoolKind(target_kind.value)
+    if target_kind == TargetGroupKind.FULL:
+        want = PoolKind.FULL
+    elif target_kind == TargetGroupKind.SWA:
+        want = PoolKind.SWA
+    else:
+        raise ValueError(f"Unsupported target_group_kind: {target_kind!r}")
     filtered = [group for group in eligible if group.kind == want]
     if not filtered:
         return None

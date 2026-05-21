@@ -290,7 +290,7 @@ class TestSelfUnitRunner(CustomTestCase):
                 req_to_token_prob=1.0,
                 real_kv_used_prob=0.0,
                 real_kv_unused_cache_prob=0.0,
-                target_group_kind=TargetGroupKind.ANY,
+                target_group_kind=TargetGroupKind.FULL,
                 warmup_steps=0,
             ),
             req_to_token_pool=pool,
