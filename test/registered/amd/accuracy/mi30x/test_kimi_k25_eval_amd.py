@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -33,6 +34,7 @@ ACCURACY_THRESHOLD = 0.92
 TP_SIZE = 8
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25EvalAMD(CustomTestCase):
     """Kimi-K2.5 GSM8K Completion Evaluation Test for AMD MI325."""
 
