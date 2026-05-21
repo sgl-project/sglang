@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.kv_canary.plan_input_builder import walk_radix_cache_for_canary
+from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -113,10 +113,11 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
     Returns None if radix_cache is None or no orphan slots exist."""
     if radix_cache is None:
         return None
-    slot_tensor, _, _ = walk_radix_cache_for_canary(
+    walk_result = walk_radix_cache_for_canary(
         radix_cache=radix_cache,
         unlocked_only=True,
     )
+    slot_tensor = walk_result.slot_indices
     if slot_tensor.numel() == 0:
         return None
     valid: list[int] = [
