@@ -8,12 +8,11 @@ Registry: base-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
 """
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -32,23 +31,14 @@ _DEEPEP_ENV = {
 }
 
 
-def _gsm8k_check(test_case):
-    args = SimpleNamespace(
-        base_url=test_case.base_url,
-        model=test_case.model,
-        eval_name="gsm8k",
-        api="completion",
-        max_tokens=512,
-        num_examples=200,
-        num_threads=128,
-    )
-    metrics = run_eval(args)
-    print(f"[{type(test_case).__name__}] GSM8K {metrics=}")
-    test_case.assertGreater(metrics["score"], 0.93)
-
-
-class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4B200(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
     """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
+
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -83,12 +73,15 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
-        _gsm8k_check(self)
 
-
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4B200Balanced(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
     """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -126,8 +119,54 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
-        _gsm8k_check(self)
+
+class TestDSV4FlashFP4B200Balanced_CP(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--attn-cp-size",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
+                "--enable-dsa-prefill-context-parallel",
+                "--dsa-prefill-cp-mode",
+                "round-robin-split",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
 
 if __name__ == "__main__":
