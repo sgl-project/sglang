@@ -10,7 +10,7 @@ from sglang.jit_kernel.set_mla_kv_buffer import (
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 
 DEVICE = "cuda"
 CACHE_SIZE = 4096
@@ -75,7 +75,7 @@ def test_set_mla_kv_buffer_loc_dtypes(loc_dtype):
 
 
 def test_set_mla_kv_buffer_uint8_byte_layout():
-    """FP8 NSA byte-layout: cache_k_nope is uint8 with [fp8(512) | scales(16)] = 528,
+    """FP8 DSA byte-layout: cache_k_nope is uint8 with [fp8(512) | scales(16)] = 528,
     cache_k_rope is uint8 [128]; total payload = 656 bytes."""
     nope_bytes, rope_bytes = 528, 128
     batch_size = 64

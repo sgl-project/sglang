@@ -30,7 +30,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -341,7 +341,7 @@ class Glm4MoeLiteDecoderLayer(DeepseekV2DecoderLayer):
         nn.Module.__init__(self)
         self.hidden_size = config.hidden_size
         self.config = config
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 202752)
         self.layer_id = layer_id
@@ -433,8 +433,8 @@ class Glm4MoeLiteModel(DeepseekV2Model):
         self.pp_group = get_pp_group()
 
         # DeepseekV2Model.forward expects these attributes to exist.
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        self.cp_size = get_attention_tp_size() if self.nsa_enable_prefill_cp else None
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.cp_size = get_attention_tp_size() if self.dsa_enable_prefill_cp else None
         self.gemm_output_zero_allocator_size = 0
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
 
@@ -503,8 +503,8 @@ class Glm4MoeLiteForCausalLM(DeepseekV2ForCausalLM):
         )
         self.capture_aux_hidden_states = False
 
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
             self.cp_rank = get_attention_tp_rank()
             self.cp_size = get_attention_tp_size()
         else:

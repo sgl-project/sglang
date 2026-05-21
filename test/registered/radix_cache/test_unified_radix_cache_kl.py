@@ -35,7 +35,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=760, stage="stage-c", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=760, stage="base-c", runner_config="4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
@@ -49,6 +49,8 @@ class UnifiedRadixTreeTestMixin:
     prefill_cache_assert = None
     decode_cache_assert = None
     sampling_temperature: float = 1
+    decode_hit_request_batch_size: int | None = None
+    decode_hit_inter_batch_delay_s: float = 0
 
     gsm8k_threshold: float = 0.93
     mmlu_threshold: float = 0.8
@@ -163,6 +165,8 @@ class UnifiedRadixTreeTestMixin:
             branches_per_group=branches,
             max_new_tokens=self.max_new_tokens,
             sampling_temperature=self.sampling_temperature,
+            request_batch_size=self.decode_hit_request_batch_size,
+            inter_batch_delay_s=self.decode_hit_inter_batch_delay_s,
         )
 
 

@@ -104,7 +104,8 @@ class AttnForwardMethod(IntEnum):
 
 
 SEPARATE_ROPE_BACKENDS = frozenset(
-    ["fa3", "flashinfer", "nsa", "cutlass_mla", "trtllm_mla"]
+    ["fa3", "flashinfer", "dsa", "nsa", "cutlass_mla", "trtllm_mla"]
+    # "nsa" is a deprecated alias for "dsa"
 )
 CONCAT_ROPE_BACKENDS = frozenset(["flashmla", "triton"])
 
@@ -667,7 +668,6 @@ class SarvamMoEMLAAttention(nn.Module):
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
 
@@ -989,7 +989,6 @@ class SarvamMoEMLAAttention(nn.Module):
 
 
 class SarvamMoEMLADecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1139,7 +1138,6 @@ class SarvamMoEMLADecoderLayer(nn.Module):
 
 
 class SarvamMLAModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1223,7 +1221,6 @@ class SarvamMLAModel(nn.Module):
 
 
 class SarvamMLAForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1475,7 +1472,6 @@ class SarvamMLAForCausalLM(nn.Module):
 
 
 class SarvamMoEForCausalLM(BailingMoEForCausalLM):
-
     @torch.no_grad()
     def forward_split_prefill(
         self,
