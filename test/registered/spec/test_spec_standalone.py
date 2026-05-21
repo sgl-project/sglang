@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.standalone_fixture import StandaloneServerBase
 from sglang.test.test_utils import CustomTestCase
@@ -9,14 +11,17 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=406, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingBase(StandaloneServerBase, CustomTestCase):
     attention_backend = "fa3"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingTriton(StandaloneServerBase, CustomTestCase):
     attention_backend = "triton"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestStandaloneV2SpeculativeDecodingFlashinfer(
     StandaloneServerBase, CustomTestCase
 ):
