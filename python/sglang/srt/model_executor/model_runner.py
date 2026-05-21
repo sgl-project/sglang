@@ -2831,7 +2831,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capturers.append(capture_fn)
 
         if not capturers:
-            logger.info("ViT CUDA graph is enabled, but no capturable ViT module was found.")
+            logger.info(
+                "ViT CUDA graph is enabled, but no capturable ViT module was found."
+            )
             return
 
         tic = time.perf_counter()

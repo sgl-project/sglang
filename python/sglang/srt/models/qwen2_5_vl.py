@@ -47,7 +47,6 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.distributed.parallel_state import get_pp_group
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.layernorm import RMSNorm
@@ -516,9 +515,7 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
 
     def _vision_token_counts(self, grid_thw) -> List[int]:
         grid = self._grid_to_tensor(grid_thw).cpu().tolist()
-        return [
-            int(t) * int(h) * int(w) // self.spatial_merge_unit for t, h, w in grid
-        ]
+        return [int(t) * int(h) * int(w) // self.spatial_merge_unit for t, h, w in grid]
 
     def _raw_token_counts(self, grid_thw) -> List[int]:
         grid = self._grid_to_tensor(grid_thw).cpu().tolist()
@@ -822,7 +819,11 @@ class Qwen2_5_VisionTransformer(nn.Module, RotaryPosMixin):
             runner.vision_token_budgets, runner.raw_token_budgets
         ):
             grid = torch.tensor(
-                [make_image_grid_for_vision_tokens(vision_budget, self.spatial_merge_size)],
+                [
+                    make_image_grid_for_vision_tokens(
+                        vision_budget, self.spatial_merge_size
+                    )
+                ],
                 dtype=torch.int32,
             )
             pixel_values = torch.zeros(

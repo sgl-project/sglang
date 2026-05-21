@@ -327,8 +327,7 @@ class ViTCudaGraphRunner:
             ).contiguous()
             self.cu_window_len[graph_key] = cu_window.clone()
             self.cu_window_len_kk[graph_key] = (
-                self.cu_window_len[graph_key][1:]
-                - self.cu_window_len[graph_key][:-1]
+                self.cu_window_len[graph_key][1:] - self.cu_window_len[graph_key][:-1]
             ).contiguous()
             self.max_window_lens[graph_key] = int(
                 max_window_len
@@ -360,9 +359,7 @@ class ViTCudaGraphRunner:
                     f"got {cu_window.numel()}, expected {self.cu_window_len[graph_key].numel()}"
                 )
             self.cu_window_len[graph_key].copy_(cu_window)
-            self.cu_window_len_kk[graph_key].copy_(
-                cu_window[1:] - cu_window[:-1]
-            )
+            self.cu_window_len_kk[graph_key].copy_(cu_window[1:] - cu_window[:-1])
 
     def _create_graph(
         self,
