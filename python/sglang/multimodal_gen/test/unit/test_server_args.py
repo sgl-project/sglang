@@ -21,6 +21,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     FastWan2_2_TI2V_5B_Config,
     TurboWanT2V480PConfig,
     WanT2V480PConfig,
+    WanT2V720PConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
 from sglang.multimodal_gen.registry import _get_config_info
@@ -512,6 +513,25 @@ class TestOffloadDefaults(unittest.TestCase):
         self.assertEqual(
             args.layerwise_offload_components,
             ["text_encoder", "image_encoder", "vae"],
+        )
+
+    def test_auto_large_wan_layerwise_offload_adds_dit(self):
+        args = self._from_dict_with_pipeline_config(
+            WanT2V720PConfig(),
+            kwargs={
+                "model_path": "Wan-AI/Wan2.1-T2V-14B-Diffusers",
+                "performance_mode": "auto",
+            },
+        )
+
+        self.assertTrue(args.layerwise_offload_components)
+        self.assertFalse(args.use_fsdp_inference)
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertEqual(
+            args.layerwise_offload_components,
+            ["dit", "text_encoder", "image_encoder", "vae"],
         )
 
     def test_memory_wan_layerwise_offload_is_enabled_without_fsdp(self):

@@ -386,7 +386,7 @@ class ServerArgsAutoTuner:
         args = self.server_args
         deployment_config = self._deployment_config()
         return (
-            args.performance_mode == "memory"
+            self._should_use_wan_dit_layerwise_by_mode()
             and deployment_config.auto_dit_layerwise_offload
             and self._is_wan_pipeline_config()
             and args.pipeline_config.dmd_denoising_steps is None
@@ -395,6 +395,18 @@ class ServerArgsAutoTuner:
             and not args.use_fsdp_inference
             and not args.is_arg_explicitly_set("dit_cpu_offload")
         )
+
+    def _should_use_wan_dit_layerwise_by_mode(self) -> bool:
+        args = self.server_args
+        if args.performance_mode == "memory":
+            return True
+        if args.performance_mode != "auto":
+            return False
+        return self._is_large_wan_pipeline_config()
+
+    def _is_large_wan_pipeline_config(self) -> bool:
+        config_name = self.server_args.pipeline_config.__class__.__name__
+        return any(token in config_name for token in ("14B", "720P", "I2V480P"))
 
     def _is_wan_pipeline_config(self) -> bool:
         return any(
