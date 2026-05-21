@@ -220,11 +220,11 @@ class ViTCudaGraphRunner:
         if ViTCudaGraphRunner._graph_memory_pool is None:
             ViTCudaGraphRunner._graph_memory_pool = device_module.graph_pool_handle()
 
-        # Wrap warmup+capture in a dynamo-disabled function to avoid
-        # polluting the dynamo cache with bucket-specific shape guards
+        # Disable dynamo during warmup+capture to avoid polluting the
+        # dynamo cache with bucket-specific shape guards
         # (rotary_embedding uses torch.compile internally).
         @torch._dynamo.disable
-        def _warmup():
+        def _warmup_and_capture():
             for _ in range(2):
                 block_out, ds_outs = self.vit.run_blocks(
                     input_buf, fwd_metadata, rotary_cos, rotary_sin
@@ -232,16 +232,15 @@ class ViTCudaGraphRunner:
                 self.vit.run_merger(block_out, ds_outs)
             device_module.synchronize()
 
-        _warmup()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
+                block_out, ds_outs = self.vit.run_blocks(
+                    input_buf, fwd_metadata, rotary_cos, rotary_sin
+                )
+                output = self.vit.run_merger(block_out, ds_outs)
+            return graph, output
 
-        # Capture (dynamo won't trace into graph capture context anyway)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
-            block_out, ds_outs = self.vit.run_blocks(
-                input_buf, fwd_metadata, rotary_cos, rotary_sin
-            )
-            output = self.vit.run_merger(block_out, ds_outs)
-
+        graph, output = _warmup_and_capture()
         self.graphs[B] = graph
         self.output_bufs[B] = output
 
