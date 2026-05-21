@@ -466,6 +466,10 @@ class WriteInvariants:
             assert (
                 delta == 0
             ), f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
+        else:
+            assert (
+                delta == mismatch_entries
+            ), f"write input mismatch count {mismatch_entries} produced {delta} violations"
 
     @staticmethod
     def _assert_write_slot_run_counter_incremented(
