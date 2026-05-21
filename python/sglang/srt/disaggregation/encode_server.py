@@ -1038,6 +1038,11 @@ class MMEncoder:
                     # Step 5: Rank 0 assembles and stores result
                     if self.rank == 0:
                         mm_embedding = torch.cat(final_slices, dim=0)
+                        # Wait for any pending VIT / cat kernels to finish
+                        # before publishing to /send: mooncake transfer_sync
+                        # is a host-side RDMA read that bypasses CUDA streams
+                        # and would otherwise race with in-flight kernels.
+                        torch.cuda.current_stream(mm_embedding.device).synchronize()
 
                         # Background insert new embeddings into cache
                         all_new_hashes = [mm_hashes[i] for i in missing_indices]
@@ -1664,6 +1669,14 @@ class MMEncoder:
                         emb = get_feature_fn([mm_item])
                         if len(emb.shape) != 2:
                             emb = emb.reshape(-1, emb.shape[-1])
+                        # mooncake's transfer_sync is a host-side
+                        # RDMA read that bypasses the CUDA stream. Without an
+                        # explicit sync here, sibling-TP /send handlers can
+                        # invoke transfer_sync while VIT kernels are still
+                        # writing `emb`, producing partial / garbage data on
+                        # the receiver side
+                        if emb.is_cuda:
+                            torch.cuda.current_stream(emb.device).synchronize()
                     if self.rank == 0:
                         # Register the MR exactly once here so all sibling-TP /send coroutines share a single registration.
                         try:
