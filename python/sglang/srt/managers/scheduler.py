@@ -3530,6 +3530,19 @@ class Scheduler(
             self.running_batch.batch_is_full = False
             self.chunked_req = None
 
+        # Surface the paused state to dashboards immediately. The scheduler
+        # event loop short-circuits before reaching ``on_idle`` while paused,
+        # so without this hop ``gen_throughput`` retains its last non-zero
+        # value and KV events are not flushed for the entire pause window
+        # (e.g. across a weight update). Zero the gauge, force a one-shot
+        # idle log by resetting the rate-limit timestamp, and flush pending
+        # KV events.
+        self.last_gen_throughput = 0.0
+        if self.current_scheduler_metrics_enabled:
+            self.metrics_collector.last_log_time = 0.0
+            self._maybe_log_idle_metrics()
+        self._publish_kv_events()
+
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
             before_mb = torch.cuda.memory_reserved() / (1024 * 1024)
