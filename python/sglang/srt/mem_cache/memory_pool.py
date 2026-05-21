@@ -596,12 +596,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
                 mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
-        assert (
-            len(select_index) == len(mamba_indices)
+        assert len(select_index) == len(
+            mamba_indices
         ), "Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
-            assert (
-                len(select_index) == len(mamba_ping_pong_track_buffers)
+            assert len(select_index) == len(
+                mamba_ping_pong_track_buffers
             ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
         mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
         self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
@@ -649,13 +649,10 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping[req.req_pool_idx]
             )
             if mamba_ping_pong_track_buffer_to_keep is not None:
-                assert (
-                    mamba_ping_pong_track_buffer_to_keep
-                    in [
-                        0,
-                        1,
-                    ]
-                ), f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
+                assert mamba_ping_pong_track_buffer_to_keep in [
+                    0,
+                    1,
+                ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
                 # Avoid Python-list advanced indexing on a device tensor.
                 # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
                 if self.mamba_ping_pong_track_buffer_size == 2:
@@ -820,9 +817,7 @@ class MHATokenToKVPool(KVCache):
         self.v_head_dim = (
             swa_v_head_dim
             if swa_v_head_dim is not None
-            else v_head_dim
-            if v_head_dim is not None
-            else head_dim
+            else v_head_dim if v_head_dim is not None else head_dim
         )
 
         self._create_buffers()

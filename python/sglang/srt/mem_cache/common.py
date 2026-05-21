@@ -11,7 +11,11 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.triton_ops.common import (
     _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_kernel as get_last_loc_kernel,
+)
+from sglang.srt.mem_cache.triton_ops.common import (
     get_last_loc_triton,
     get_last_loc_triton_safe,
     write_req_to_token_pool_triton,

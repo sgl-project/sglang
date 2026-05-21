@@ -3,7 +3,6 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-
 softcap_out_autotune = triton.autotune(
     configs=[
         triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=4),
