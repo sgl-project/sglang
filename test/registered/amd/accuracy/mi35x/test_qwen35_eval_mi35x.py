@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 import requests
+import torch
 import yaml
 
 from sglang.srt.utils import kill_process_tree
@@ -34,6 +35,7 @@ SERVER_LAUNCH_TIMEOUT = 3600
 TP_SIZE = 8
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35EvalMI35x(LMEvalMixin, CustomTestCase):
     """Qwen 3.5 GSM8K lm-eval Test for AMD MI35x."""
 

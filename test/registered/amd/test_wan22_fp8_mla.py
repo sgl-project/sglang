@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import unittest
 
 import pytest
+import torch
 
 pytest.importorskip("sgl_kernel", reason="sgl_kernel is required for FP8 MLA tests")
 
@@ -98,6 +100,7 @@ FP8_MLA_CASES = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestWan22FP8MLA(DiffusionServerBase):
     """AMD test for FP8 MLA attention on Wan2.2-T2V-A14B."""
 
