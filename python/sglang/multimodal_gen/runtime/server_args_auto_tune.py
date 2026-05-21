@@ -388,6 +388,7 @@ class ServerArgsAutoTuner:
         return (
             deployment_config.auto_dit_layerwise_offload
             and self._is_wan_pipeline_config()
+            and args.pipeline_config.dmd_denoising_steps is None
             and current_platform.enable_dit_layerwise_offload_for_wan_by_default()
             and not envs.SGLANG_CACHE_DIT_ENABLED
             and not args.use_fsdp_inference
