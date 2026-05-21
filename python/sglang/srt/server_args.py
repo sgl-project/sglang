@@ -3934,6 +3934,13 @@ class ServerArgs:
                 )
             envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
 
+        if is_cpu() and cpu_has_amx_support():
+            if envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+                logger.warning(
+                    "Disabling SGLANG_OPT_FP8_WO_A_GEMM on CPU path as not supported "
+                )
+            envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
     def _handle_cache_compatibility(self):
         if self.enable_hierarchical_cache and self.disable_radix_cache:
             raise ValueError(

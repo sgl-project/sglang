@@ -11,6 +11,7 @@ from sglang.jit_kernel.deepseek_v4 import (
     compress_forward,
     compress_fused_norm_rope_inplace,
     linear_bf16_fp32,
+    torch_create_paged_compress_data,
     triton_create_paged_compress_data,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
@@ -29,8 +30,10 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 
+_is_cpu = is_cpu()
+_cpu_amx = cpu_has_amx_support()
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
@@ -135,7 +138,18 @@ class CompressorBackendMixin:
             if compressor.ratio == 4
             else core_metadata.c128_out_loc
         )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if _is_cpu and _cpu_amx:
+            from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
+                NopeFp8RopeBf16Pack,
+            )
+
+            pack = NopeFp8RopeBf16Pack(
+                *torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(
+                    new_compressed_kv.bfloat16()
+                )
+            )
+            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
                 loc=out_loc,
@@ -160,7 +174,18 @@ class CompressorBackendMixin:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+
+        if _is_cpu and _cpu_amx:
+            new_compressed_kv_fp8, new_compressed_kv_scale = (
+                torch.ops.sgl_kernel.act_quant_cpu(new_compressed_kv)
+            )
+            token_to_kv_pool.set_index_k_scale_buffer(
+                layer_id=layer_id,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                index_k=new_compressed_kv_fp8,
+                index_k_scale=new_compressed_kv_scale,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
                 loc=self.forward_metadata.core_metadata.c4_out_loc,
@@ -240,7 +265,12 @@ def create_paged_compressor_data(
 
     if is_prefill:
         assert extend_lens is not None
-        write_loc, extra_data = triton_create_paged_compress_data(
+        create_paged_compress_data_func = (
+            triton_create_paged_compress_data
+            if not _is_cpu
+            else torch_create_paged_compress_data
+        )
+        write_loc, extra_data = create_paged_compress_data_func(
             compress_ratio=compress_ratio,
             is_overlap=is_overlap,
             swa_page_size=swa_page_size,
@@ -396,4 +426,9 @@ class Compressor(nn.Module):
 if _is_hip:
     from sglang.srt.layers.attention.dsv4.compress_hip import (  # noqa: F811
         CompressorHip as Compressor,
+    )
+
+if _is_cpu:
+    from sglang.srt.layers.attention.dsv4.compressor_cpu import (  # noqa: F811
+        CompressorCPU as Compressor,
     )

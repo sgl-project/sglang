@@ -199,6 +199,10 @@ class DeepseekMoE(nn.Module):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limi
                 True,  # is_vnni
             )
         else:
