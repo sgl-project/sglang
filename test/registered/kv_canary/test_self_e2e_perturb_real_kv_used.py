@@ -19,6 +19,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
     """
 
     kv_canary_mode = "log"
+    extra_server_args = ("--kv-canary-real-data", "partial")
 
     target_group: ClassVar[Literal["full", "swa"]]
 
