@@ -21,10 +21,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
+from sglang.jit_kernel.dsv4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
+from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
 if TYPE_CHECKING:
@@ -94,7 +95,7 @@ def _get_mega_moe_symm_buffer(
 
 
 def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bool:
-    if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
+    if not get_moe_a2a_backend().is_megamoe():
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
@@ -206,8 +207,8 @@ def _run_mega_routed(
     )
 
     if num_tokens > 0:
-        topk_ids_in = topk_ids
-        topk_weights_in = topk_weights
+        topk_ids_in = topk_ids.to(torch.int32)
+        topk_weights_in = topk_weights.to(torch.float32)
     else:
         topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
         topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
