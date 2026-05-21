@@ -1019,9 +1019,6 @@ def popen_launch_pd_server(
 
     print(f"command={' '.join(command)}")
 
-    # Merge with os.environ so caller-supplied env adds to (not replaces)
-    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
-    # parent's environment automatically.
     if env is not None:
         env = {**os.environ, **env}
 
