@@ -463,6 +463,23 @@ DataEmbeddingFunc = Callable[
 ]
 
 
+def _embedder_handles_feature_device(data_embedding_func: DataEmbeddingFunc) -> bool:
+    owner = getattr(data_embedding_func, "__self__", None)
+    if owner is None:
+        return False
+    if getattr(data_embedding_func, "__name__", None) not in (
+        "get_image_feature",
+        "get_video_feature",
+    ):
+        return False
+    return owner.__class__.__name__ in {
+        "Qwen3VLForConditionalGeneration",
+        "Qwen3VLMoeForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    }
+
+
 def _move_items_to_device(
     items: List[MultimodalDataItem], device: torch.device
 ) -> None:
@@ -490,7 +507,8 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        _move_items_to_device(embedding_items_per_req, device)
+        if not _embedder_handles_feature_device(data_embedding_func):
+            _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
             EmbeddingResult(embedding=embedding)
@@ -563,7 +581,8 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        _move_items_to_device(miss_item_list, device)
+        if not _embedder_handles_feature_device(data_embedding_func):
+            _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
             -1, all_miss_embedding.shape[-1]
