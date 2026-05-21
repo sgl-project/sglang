@@ -1,9 +1,6 @@
 """Perturb point (d): flip the first byte of a slot in forward_batch.out_cache_loc
 AFTER the TAIL kernel has captured its canary hash.
 
-Designed for the PD disagg self-test: when run on the P side, the flip lands in
-the real KV bytes of a slot about to be transferred via send_kv_chunk, so the D
-side's first decode forward HEAD/TAIL kernel catches a real_kv_hash violation.
 The flip is a PyTorch indexed write on the current CUDA stream; because TAIL is
 launched on the same stream, stream ordering guarantees it happens-after TAIL's
 canary write.
