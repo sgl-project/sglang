@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.json_constrained_kit import JSONConstrainedMixin
 from sglang.test.kits.regex_constrained_kit import RegexConstrainedMixin
