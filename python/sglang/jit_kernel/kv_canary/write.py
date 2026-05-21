@@ -196,15 +196,11 @@ def launch_canary_write_kernel(
             )
         _assert_contiguous(expected_input_tokens, "expected_input_tokens")
         _assert_contiguous(expected_input_positions, "expected_input_positions")
-        expected_input_tokens_for_cuda = expected_input_tokens
-        expected_input_positions_for_cuda = expected_input_positions
     else:
         if expected_input_tokens is not None or expected_input_positions is not None:
             raise ValueError(
                 "kv-canary: expected input tensors must be None when enable_assert_inputs=False"
             )
-        expected_input_tokens_for_cuda = None
-        expected_input_positions_for_cuda = None
     _assert_contiguous(context.violation_ring, "violation_ring")
     _assert_contiguous(context.violation_write_index, "violation_write_index")
     _assert_contiguous(context.slot_run_counter, "slot_run_counter")
@@ -225,8 +221,8 @@ def launch_canary_write_kernel(
         fb_out_cache_loc,
         int(context.kernel_kind),
         int(enable_assert_inputs),
-        expected_input_tokens_for_cuda,
-        expected_input_positions_for_cuda,
+        expected_input_tokens,
+        expected_input_positions,
         context.violation_ring,
         context.violation_write_index,
         context.slot_run_counter,
