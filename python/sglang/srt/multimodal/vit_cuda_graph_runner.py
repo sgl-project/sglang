@@ -246,7 +246,12 @@ class ViTCudaGraphRunner:
 
     def capture_all(self) -> None:
         """Eagerly capture graphs for all bucket sizes. Called at model init."""
+        import logging
+        import time as _time
+
         from sglang.srt.distributed.parallel_state import graph_capture
+
+        logger = logging.getLogger(__name__)
 
         # Use a dedicated stream for capture, same as LLM CUDA graph.
         with graph_capture() as graph_capture_context:
@@ -255,6 +260,29 @@ class ViTCudaGraphRunner:
             # is big enough for smaller graphs to reuse.
             for B in reversed(self.BUCKET_SIZES):
                 self._capture(B, stream)
+
+        device_module = torch.get_device_module(self.device)
+
+        # After capture, do one replay + one eager forward to prime
+        # the default-stream execution path.  Graph replay changes
+        # internal CUDA / NCCL state; the first post-replay eager call
+        # on a novel shape pays a one-time initialization cost.
+        B = self.BUCKET_SIZES[0]  # smallest bucket for fast replay
+        self.graphs[B].replay()
+        device_module.synchronize()
+
+        # Now run eager on the largest bucket to warm up default stream
+        B_max = self.BUCKET_SIZES[-1]
+        t0 = _time.monotonic()
+        self.vit.run_blocks(
+            self.input_bufs[B_max],
+            self.forward_metadatas[B_max],
+            self.rotary_cos_bufs[B_max],
+            self.rotary_sin_bufs[B_max],
+        )
+        device_module.synchronize()
+        t1 = _time.monotonic()
+        logger.info("[VIT_GRAPH] post-replay eager warmup: %.1fms", (t1 - t0) * 1000)
 
     # ------------------------------------------------------------------
     # Replay
