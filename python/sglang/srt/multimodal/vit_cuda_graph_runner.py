@@ -252,15 +252,6 @@ class ViTCudaGraphRunner:
         from sglang.srt.distributed.parallel_state import graph_capture
 
         logger = logging.getLogger(__name__)
-
-        # Use a dedicated stream for capture, same as LLM CUDA graph.
-        with graph_capture() as graph_capture_context:
-            stream = graph_capture_context.stream
-            # Capture largest first so the graph pool's initial allocation
-            # is big enough for smaller graphs to reuse.
-            for B in reversed(self.BUCKET_SIZES):
-                self._capture(B, stream)
-
         device_module = torch.get_device_module(self.device)
         B_max = self.BUCKET_SIZES[-1]
 
@@ -276,42 +267,65 @@ class ViTCudaGraphRunner:
             dt = (_time.monotonic() - t0) * 1000
             logger.info("[VIT_GRAPH] %s: %.1fms", label, dt)
 
-        # --- Diagnostic: understand replay → eager interaction ---
+        # --- Diagnostic: isolate what causes the 1.4s first-eager cost ---
 
-        # Test 1: eager BEFORE any replay (baseline after capture)
-        _timed_eager("eager_before_replay")
+        # Allocate buffers for the largest bucket (needed by _timed_eager)
+        self._alloc_buffers(B_max)
 
-        # Test 2: replay smallest graph, then eager
-        B_small = self.BUCKET_SIZES[0]
-        self.graphs[B_small].replay()
+        # Test A: eager baseline BEFORE any capture or stream switch
+        _timed_eager("A_baseline_before_anything")
+
+        # Test B: enter/exit graph_capture() WITHOUT capturing, then eager
+        with graph_capture() as ctx:
+            pass  # just stream switch + NCCL state change, no capture
+        _timed_eager("B_after_graph_capture_ctx_only")
+
+        # Test C: capture on DEFAULT stream (no graph_capture ctx), then eager
+        self._capture_no_stream(B_max)
+        _timed_eager("C_after_capture_default_stream")
+
+        # Now do the real capture
+        with graph_capture() as graph_capture_context:
+            stream = graph_capture_context.stream
+            for B in reversed(self.BUCKET_SIZES):
+                self._capture(B, stream)
+
+        _timed_eager("D_after_full_capture")
+
+    def _capture_no_stream(self, bucket_size: int) -> None:
+        """Capture on default stream (no graph_capture context) for diagnosis."""
+        B = bucket_size
+        if B not in self.input_bufs:
+            self._alloc_buffers(B)
+
+        input_buf = self.input_bufs[B]
+        fwd_metadata = self.forward_metadatas[B]
+        rotary_cos = self.rotary_cos_bufs[B]
+        rotary_sin = self.rotary_sin_bufs[B]
+
+        device_module = torch.get_device_module(self.device)
+
+        if ViTCudaGraphRunner._graph_memory_pool is None:
+            ViTCudaGraphRunner._graph_memory_pool = device_module.graph_pool_handle()
+
+        # Warmup on default stream
+        for _ in range(2):
+            self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
+            self.vit.run_merger(
+                *self.vit.run_blocks(input_buf, fwd_metadata, rotary_cos, rotary_sin)
+            )
         device_module.synchronize()
-        _timed_eager("eager_after_replay_1st")
 
-        # Test 3: eager again (already warmed after replay)
-        _timed_eager("eager_after_replay_2nd")
+        # Capture on default stream
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=ViTCudaGraphRunner._graph_memory_pool):
+            block_out, ds_outs = self.vit.run_blocks(
+                input_buf, fwd_metadata, rotary_cos, rotary_sin
+            )
+            output = self.vit.run_merger(block_out, ds_outs)
 
-        # Test 4: replay again, then eager (repeatable?)
-        self.graphs[B_small].replay()
-        device_module.synchronize()
-        _timed_eager("eager_after_replay2_1st")
-
-        # Test 5: empty_cache then eager
-        self.graphs[B_small].replay()
-        device_module.synchronize()
-        torch.cuda.empty_cache()
-        _timed_eager("eager_after_replay+empty_cache")
-
-        # Test 6: just a large alloc after replay (isolate allocator)
-        self.graphs[B_small].replay()
-        device_module.synchronize()
-        t0 = _time.monotonic()
-        tmp = torch.empty(
-            33600, 1, self.config.hidden_dim, device=self.device, dtype=self.dtype
-        )
-        device_module.synchronize()
-        t1 = _time.monotonic()
-        del tmp
-        logger.info("[VIT_GRAPH] alloc_33600_after_replay: %.1fms", (t1 - t0) * 1000)
+        self.graphs[B] = graph
+        self.output_bufs[B] = output
 
     # ------------------------------------------------------------------
     # Replay
