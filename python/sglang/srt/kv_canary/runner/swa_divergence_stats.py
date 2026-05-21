@@ -112,9 +112,7 @@ class SwaDivergenceStats:
         mapping_nonidentity = (
             int(mapping_future.wait().item()) if mapping_future is not None else 0
         )
-        wrap_count = (
-            int(wrap_future.wait().item()) if wrap_future is not None else 0
-        )
+        wrap_count = int(wrap_future.wait().item()) if wrap_future is not None else 0
 
         self._latest_verify_full = verify_full
         self._latest_verify_swa = verify_swa
@@ -150,7 +148,9 @@ class SwaDivergenceStats:
         )
 
         allocator = (
-            self._swa_allocator_getter() if self._swa_allocator_getter is not None else None
+            self._swa_allocator_getter()
+            if self._swa_allocator_getter is not None
+            else None
         )
         if allocator is not None:
             self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
