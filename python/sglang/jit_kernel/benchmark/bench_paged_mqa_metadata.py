@@ -27,7 +27,7 @@ import triton
 import triton.testing
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
-from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, suite="base-b-kernel-benchmark-1-gpu-large")

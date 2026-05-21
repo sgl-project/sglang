@@ -35,7 +35,7 @@ import itertools
 import pytest
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
+from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
 from sglang.jit_kernel.utils import get_ci_test_range
 from sglang.test.ci.ci_register import register_cuda_ci
 
