@@ -56,10 +56,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import is_cpu, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
+_is_cpu = is_cpu()
 _is_npu = is_npu()
 
 
@@ -539,11 +540,11 @@ class LogitsProcessor(nn.Module):
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
             sample_indices = torch.tensor(
-                sample_indices, dtype=torch.int64, pin_memory=True
-            ).to(pruned_states.device, non_blocking=True)
+                sample_indices, dtype=torch.int64, pin_memory=not _is_cpu
+            ).to(pruned_states.device, non_blocking=not _is_cpu)
             input_logprob_indices = torch.tensor(
-                input_logprob_indices, dtype=torch.int64, pin_memory=True
-            ).to(pruned_states.device, non_blocking=True)
+                input_logprob_indices, dtype=torch.int64, pin_memory=not _is_cpu
+            ).to(pruned_states.device, non_blocking=not _is_cpu)
 
         return (
             pruned_states,
@@ -613,8 +614,8 @@ class LogitsProcessor(nn.Module):
         pruned_lens = torch.tensor(
             logits_metadata.extend_logprob_pruned_lens_cpu,
             dtype=torch.int64,
-            pin_memory=True,
-        ).to(device, non_blocking=True)
+            pin_memory=not _is_cpu,
+        ).to(device, non_blocking=not _is_cpu)
         if logits_metadata.temp_scaled_logprobs:
             logits_metadata.temperature = torch.repeat_interleave(
                 logits_metadata.temperature.view(-1),

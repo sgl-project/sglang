@@ -1809,6 +1809,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
 
+            # fused_topk_torch_native (CPU fallback for models like MiniMax)
+            # returns int64 topk_ids; fused_experts_cpu requires int32.
+            if topk_ids.dtype == torch.int64:
+                topk_ids = topk_ids.to(torch.int32)
+
             output = torch.ops.sgl_kernel.fused_experts_cpu(
                 x,
                 layer.w13_weight,
