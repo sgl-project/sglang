@@ -327,10 +327,11 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
+        # Eager warmup -- no breakable cuda graph capture in progress.
         with forward_context(
             ForwardContext(attn_backend=self.model_runner.attn_backend)
         ):
-            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self.model_runner.attn_backend.init_forward_data(forward_batch)
             self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
@@ -387,9 +388,20 @@ class BreakableCudaGraphRunner:
     def _capture_one(self, num_tokens, pool, stream):
         """Capture a breakable CUDA graph for one token size."""
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Per-iter prep runs OUTSIDE the breakable graph capture scope. The
+        # matching in-graph hook is invoked inside `run_once`, which the
+        # `with BreakableCUDAGraphCapture(...)` block below executes under
+        # the graph capture context.
+        self.model_runner.attn_backend.init_forward_data_out_graph(forward_batch)
 
         def run_once():
+            # Graph-recordable metadata prep -- recorded into the captured
+            # breakable graph and auto-replayed by graph.replay(). Default
+            # impl is no-op for most backends in the initial migration;
+            # also exercised during warmup runs (outside the graph context),
+            # which is safe because no-op is harmless.
+            self.model_runner.attn_backend.init_forward_data_in_graph(forward_batch)
+
             # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
@@ -463,7 +475,13 @@ class BreakableCudaGraphRunner:
             original_layer_forward = self.layer_model.forward
             self.layer_model.forward = replay_layer_forward
             try:
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Replay path: only the out-graph phase runs per replay. The
+                # in-graph ops recorded into the captured breakable graph at
+                # capture time are auto-replayed by ``captured_graph.replay()``
+                # inside ``replay_layer_forward``.
+                self.model_runner.attn_backend.init_forward_data_out_graph(
+                    forward_batch
+                )
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,
