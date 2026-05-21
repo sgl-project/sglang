@@ -31,19 +31,20 @@ from sglang.jit_kernel.hicache import (
     transfer_hicache_one_layer_mla as jit_transfer_hicache_one_layer_mla,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     KVCache,
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-if not (_is_npu or _is_xpu or _is_mps):
+if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
@@ -89,6 +90,69 @@ class HostTensorAllocator(abc.ABC):
         self.dims = dims
         tensor = torch.empty(dims, dtype=dtype, device=device)
         return tensor
+
+
+class HiSparseHostPoolMixin:
+    def _round_up_to_page_size(self, size: int) -> int:
+        return (size + self.page_size - 1) // self.page_size * self.page_size
+
+    def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        return self.alloc(num_pages * self.page_size)
+
+    def alloc_paged_token_slots(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_to_host_pool_allocated_len: torch.Tensor,
+        req_pool_idx: int,
+        start_pos: int,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Allocate request host slots by page and return token-granular slots."""
+        device = req_to_host_pool.device
+        if num_tokens <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=device)
+
+        allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
+        end_pos = start_pos + num_tokens
+        page_end = self._round_up_to_page_size(end_pos)
+        assert start_pos <= allocated_len
+
+        if page_end > allocated_len:
+            num_new_pages = (page_end - allocated_len) // self.page_size
+            host_locs = self.alloc_page(num_new_pages)
+            if host_locs is None:
+                logger.error(
+                    "HiSparse: host mem pool alloc failed for %d host pages "
+                    "(req_pool_idx=%d, start_pos=%d, num_tokens=%d)",
+                    num_new_pages,
+                    req_pool_idx,
+                    start_pos,
+                    num_tokens,
+                )
+                raise RuntimeError(
+                    f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
+                )
+
+            req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
+                device=device, non_blocking=True
+            )
+            req_to_host_pool_allocated_len[req_pool_idx] = page_end
+
+        return req_to_host_pool[req_pool_idx, start_pos:end_pos]
+
+    def allocated_host_indices(
+        self,
+        req_to_host_pool: torch.Tensor,
+        req_pool_idx: int,
+        allocated_len: int,
+    ) -> torch.Tensor:
+        allocated_len = int(allocated_len)
+        host_len = min(
+            self._round_up_to_page_size(allocated_len),
+            req_to_host_pool.shape[1],
+        )
+        host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        return host_indices[host_indices >= 0]
 
 
 def get_allocator_from_storage(allocator_type):
@@ -785,7 +849,7 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
-class MLATokenToKVPoolHost(HostKVCache):
+class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
     def __init__(
@@ -833,7 +897,7 @@ class MLATokenToKVPoolHost(HostKVCache):
         for registering host memory with the disaggregation transfer engine."""
         data_ptrs = [int(self.data_ptrs[i].item()) for i in range(self.layer_num)]
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
-        item_lens = [self.token_stride_size] * self.layer_num
+        item_lens = [self.token_stride_size * self.page_size] * self.layer_num
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
@@ -1656,6 +1720,737 @@ class MambaPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
 
+# ---- V4 Compressed KV Host Pools ----
+
+
+class LogicalHostPool:
+    """Pure-logical anchor pool for V4 HiCache.
+
+    The pool manages page-aligned token slots but holds no KV tensor. V4
+    compressed side pools use these logical FULL indices as stable page anchors.
+    """
+
+    def __init__(self, size: int, page_size: int):
+        if size % page_size != 0:
+            raise ValueError(
+                "LogicalHostPool size must be page-aligned, "
+                f"got size={size}, page_size={page_size}"
+            )
+        self.size = size
+        self.page_size = page_size
+        self.device = "cpu"
+        self.layout = "layer_first"
+        self.dtype = torch.uint8
+        self.layer_num = 0
+        self.start_layer = 0
+        self.end_layer = 0
+        self.kv_buffer = None
+        self.size_per_token = 0
+        self.allocator = None
+        self.lock = threading.RLock()
+        self.clear()
+
+    @synchronized
+    def clear(self):
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size % self.page_size != 0:
+            raise ValueError(
+                "LogicalHostPool allocation must be page-aligned, "
+                f"got need_size={need_size}, page_size={self.page_size}"
+            )
+        if need_size > self.available_size():
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> int:
+        if len(indices) % self.page_size != 0:
+            raise ValueError(
+                "LogicalHostPool free must be page-aligned, "
+                f"got len(indices)={len(indices)}, page_size={self.page_size}"
+            )
+        self.free_slots = torch.cat(
+            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
+        )
+        return len(indices)
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        pass
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        pass
+
+    def get_data_page(self, index, flat=True):
+        return torch.empty(0, dtype=torch.uint8)
+
+    def get_dummy_flat_data_page(self):
+        return torch.empty(0, dtype=torch.uint8)
+
+    def set_from_flat_data_page(self, index, data_page):
+        pass
+
+    def get_page_buffer_meta(self, indices):
+        return None
+
+    def get_ksize_per_token(self):
+        return 0
+
+
+class DeepSeekV4PagedHostPool(HostKVCache):
+    """Host mirror for a DeepSeek V4 paged KV/indexer sub-pool."""
+
+    def __init__(
+        self,
+        pool_name: str,
+        device_buffers: list[torch.Tensor],
+        item_bytes: int,
+        num_host_pages: int,
+        slot_page_size: int,
+        layout: str = "layer_first",
+        device: str = "cpu",
+        pin_memory: bool = True,
+        allocator_type: str = "default",
+    ):
+        self.pool_name = pool_name
+        self.layer_num = len(device_buffers)
+        self.item_bytes = item_bytes
+        self.num_host_pages = num_host_pages
+        self.slot_page_size = slot_page_size
+        self.dtype = torch.uint8
+        self.device = device
+        self.pin_memory = pin_memory
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.page_size = slot_page_size
+        self.size = num_host_pages * slot_page_size
+        self.layout = layout
+        self.size_per_token = item_bytes
+        self.start_layer = 0
+        self.end_layer = self.layer_num
+        self.lock = threading.RLock()
+
+        self.device_buffers = device_buffers
+        self.gpu_device = device_buffers[0].device if device_buffers else device
+
+        requested_bytes = self.layer_num * num_host_pages * self.item_bytes
+        host_mem = psutil.virtual_memory()
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for V4 paged pool {pool_name}. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
+            )
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        self.data_refs = []
+        if self.layout == "layer_first":
+            self.kv_buffer = [
+                alloc_func(
+                    (num_host_pages, self.item_bytes),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        elif self.layout == "page_first":
+            self.kv_buffer = alloc_func(
+                (num_host_pages, self.layer_num, self.item_bytes),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        elif self.layout == "page_first_direct":
+            self.kv_buffer = alloc_func(
+                (num_host_pages, self.layer_num, 1, self.item_bytes),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+        logger.info(
+            "Allocating %.2f GB host memory for V4 paged pool '%s' "
+            "(layers=%d, pages=%d, item_bytes=%d, layout=%s).",
+            requested_bytes / 1e9,
+            self.pool_name,
+            self.layer_num,
+            num_host_pages,
+            self.item_bytes,
+            self.layout,
+        )
+
+        self.device_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.device_buffers],
+            dtype=torch.uint64,
+            device=self.gpu_device,
+        )
+        self.data_ptrs = (
+            torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.gpu_device,
+            )
+            if self.data_refs
+            else None
+        )
+        self.clear()
+
+    def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() % self.slot_page_size != 0:
+            raise ValueError(
+                f"{self.pool_name} transfer indices must be page-aligned, "
+                f"got numel={indices.numel()}, slot_page_size={self.slot_page_size}"
+            )
+        return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
+
+    def get_size_per_token(self):
+        return self.item_bytes
+
+    def get_ksize_per_token(self):
+        return self.item_bytes
+
+    def init_kv_buffer(self):
+        return self.kv_buffer
+
+    def get_hybrid_pool_buffer(self):
+        return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
+
+    def clear(self):
+        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    @synchronized
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        need_size = (
+            (need_size + self.slot_page_size - 1) // self.slot_page_size
+        ) * self.slot_page_size
+        if need_size > self.available_size():
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return select_index
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> int:
+        self.free_slots = torch.cat(
+            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
+        )
+        return len(indices)
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if host_indices is None or device_indices is None:
+            return
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            assert self.data_ptrs is not None
+            transfer_kv_all_layer_mla(
+                src_layers=self.device_ptrs,
+                dst_layers=self.data_ptrs,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                item_size=self.item_bytes,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=self.device_ptrs,
+                dst=self.kv_buffer,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                item_size=self.item_bytes,
+                dst_layout_dim=self.layer_num * self.item_bytes,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct" and self.layout == "layer_first":
+            transfer_kv_direct(
+                src_layers=self.device_buffers,
+                dst_layers=self.data_refs,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                page_size=1,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=self.device_buffers,
+                dst_ptrs=[self.kv_buffer],
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if host_indices is None or device_indices is None:
+            return
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            transfer_kv_per_layer_mla(
+                src=self.data_refs[layer_id],
+                dst=self.device_buffers[layer_id],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                item_size=self.item_bytes,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_per_layer_mla_pf_lf(
+                src=self.kv_buffer,
+                dst=self.device_buffers[layer_id],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                item_size=self.item_bytes,
+                src_layout_dim=self.layer_num * self.item_bytes,
+            )
+        elif io_backend == "direct" and self.layout == "layer_first":
+            transfer_kv_direct(
+                src_layers=[self.data_refs[layer_id]],
+                dst_layers=[self.device_buffers[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                page_size=1,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.kv_buffer],
+                dst_ptrs=[self.device_buffers[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported V4 paged host layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def get_data_page(self, index, flat=True):
+        index = int(index) // self.slot_page_size
+        if self.layout == "layer_first":
+            data_page = torch.stack(
+                [self.kv_buffer[i][index] for i in range(self.layer_num)]
+            )
+        elif self.layout in ["page_first", "page_first_direct"]:
+            data_page = self.kv_buffer[index]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return data_page.flatten() if flat else data_page
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(
+            (self.layer_num, self.item_bytes),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
+    def set_from_flat_data_page(self, index, data_page):
+        index = int(index) // self.slot_page_size
+        if self.layout == "layer_first":
+            data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
+            for i in range(self.layer_num):
+                self.kv_buffer[i][index].copy_(data[i])
+        elif self.layout == "page_first":
+            self.kv_buffer[index].copy_(
+                data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
+            )
+        elif self.layout == "page_first_direct":
+            self.kv_buffer[index].copy_(
+                data_page.view(self.dtype).reshape(self.layer_num, 1, self.item_bytes)
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list = []
+        rows = self._to_page_indices(indices).tolist()
+        if self.layout == "layer_first":
+            for row in rows:
+                page_index = int(row)
+                for layer_id in range(self.layer_num):
+                    ptr = (
+                        self.kv_buffer[layer_id].data_ptr()
+                        + page_index * self.item_bytes * self.dtype.itemsize
+                    )
+                    ptr_list.append(ptr)
+            element_size = self.item_bytes * self.dtype.itemsize
+            return ptr_list, [element_size] * len(ptr_list)
+        if self.layout in ["page_first", "page_first_direct"]:
+            page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
+            for row in rows:
+                ptr_list.append(self.kv_buffer[int(row)].data_ptr())
+            return ptr_list, [page_bytes] * len(ptr_list)
+        raise ValueError(f"Unsupported layout: {self.layout}")
+
+
+class DeepSeekV4StateHostPool(HostKVCache):
+    """Host pool for V4 CompressStatePool page rows."""
+
+    def __init__(
+        self,
+        pool_name: str,
+        state_pools: list,
+        num_host_pages: int,
+        swa_page_size: int,
+        layout: str = "layer_first",
+        device: str = "cpu",
+        pin_memory: bool = True,
+        allocator_type: str = "default",
+    ):
+        if any(pool is None for pool in state_pools):
+            raise ValueError(f"{pool_name} state_pools must not contain None")
+
+        self.pool_name = pool_name
+        self.state_pools = state_pools
+        self.layer_num = len(state_pools)
+        self.num_host_pages = num_host_pages
+        self.swa_page_size = swa_page_size
+        self.dtype = torch.uint8
+        self.device = device
+        self.pin_memory = pin_memory
+        self.allocator = get_allocator_from_storage(allocator_type)
+        self.page_size = swa_page_size
+        self.size = num_host_pages * swa_page_size
+        self.layout = layout
+        self.start_layer = 0
+        self.end_layer = self.layer_num
+        self.lock = threading.RLock()
+
+        self.ring_size = 0
+        self.state_page_bytes = 0
+        self.device_page_views = []
+        self.gpu_device = device
+        self._init_device_page_views()
+        self.size_per_token = self.state_page_bytes
+
+        requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
+        host_mem = psutil.virtual_memory()
+        available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
+        if requested_bytes > available_bytes:
+            raise ValueError(
+                f"Not enough host memory for V4 state pool {pool_name}. "
+                f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
+                f"{available_bytes / 1e9:.2f} GB free."
+            )
+
+        alloc_func = ALLOC_MEMORY_FUNCS[self.gpu_device]
+        self.data_refs = []
+        if self.layout == "layer_first":
+            self.kv_buffer = [
+                alloc_func(
+                    (num_host_pages, self.state_page_bytes),
+                    dtype=self.dtype,
+                    device=self.device,
+                    pin_memory=self.pin_memory,
+                    allocator=self.allocator,
+                )
+                for _ in range(self.layer_num)
+            ]
+            self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        elif self.layout == "page_first":
+            self.kv_buffer = alloc_func(
+                (num_host_pages, self.layer_num, self.state_page_bytes),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        elif self.layout == "page_first_direct":
+            self.kv_buffer = alloc_func(
+                (num_host_pages, self.layer_num, 1, self.state_page_bytes),
+                dtype=self.dtype,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        logger.info(
+            "Allocating %.2f GB host memory for V4 state pool '%s' "
+            "(layers=%d, pages=%d, state_page_bytes=%d, layout=%s).",
+            requested_bytes / 1e9,
+            self.pool_name,
+            self.layer_num,
+            num_host_pages,
+            self.state_page_bytes,
+            self.layout,
+        )
+        self.device_ptrs = torch.tensor(
+            [x.data_ptr() for x in self.device_page_views],
+            dtype=torch.uint64,
+            device=self.gpu_device,
+        )
+        self.data_ptrs = (
+            torch.tensor(
+                [x.data_ptr() for x in self.data_refs],
+                dtype=torch.uint64,
+                device=self.gpu_device,
+            )
+            if self.data_refs
+            else None
+        )
+
+    def _init_device_page_views(self) -> None:
+        expected_ring_size = None
+        expected_state_page_bytes = None
+        for pool in self.state_pools:
+            state_tensor = pool.kv_score_buffer.kv_score
+            if not state_tensor.is_contiguous():
+                raise ValueError(f"{self.pool_name} state tensor must be contiguous")
+            ring_size = pool.ring_size
+            slot_bytes = state_tensor[0].nbytes
+            state_page_bytes = ring_size * slot_bytes
+            if expected_ring_size is None:
+                expected_ring_size = ring_size
+                expected_state_page_bytes = state_page_bytes
+                self.gpu_device = state_tensor.device
+            elif (
+                expected_ring_size != ring_size
+                or expected_state_page_bytes != state_page_bytes
+            ):
+                raise ValueError(
+                    f"{self.pool_name} state pools must share ring size and slot bytes"
+                )
+
+            state_bytes = state_tensor.view(torch.uint8).reshape(
+                state_tensor.shape[0], -1
+            )
+            usable_slots = (state_tensor.shape[0] // ring_size) * ring_size
+            self.device_page_views.append(
+                state_bytes[:usable_slots].reshape(-1, state_page_bytes)
+            )
+
+        self.ring_size = expected_ring_size or 0
+        self.state_page_bytes = expected_state_page_bytes or 0
+
+    def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        if indices.numel() % self.swa_page_size != 0:
+            raise ValueError(
+                f"{self.pool_name} transfer indices must be SWA-page-aligned, "
+                f"got numel={indices.numel()}, swa_page_size={self.swa_page_size}"
+            )
+        return indices.reshape(-1, self.swa_page_size)[:, 0] // self.swa_page_size
+
+    def get_size_per_token(self):
+        return self.state_page_bytes
+
+    def get_ksize_per_token(self):
+        return self.state_page_bytes
+
+    def init_kv_buffer(self):
+        return self.kv_buffer
+
+    def get_hybrid_pool_buffer(self):
+        return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
+
+    def clear(self):
+        pass
+
+    def available_size(self):
+        raise NotImplementedError(
+            f"{self.pool_name} reuses SWA transfer indices and has no allocator"
+        )
+
+    @synchronized
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        raise NotImplementedError(
+            f"{self.pool_name} reuses SWA transfer indices and has no allocator"
+        )
+
+    @synchronized
+    def free(self, indices: torch.Tensor) -> int:
+        raise NotImplementedError(
+            f"{self.pool_name} reuses SWA transfer indices and has no free list"
+        )
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        if host_indices is None or device_indices is None:
+            return
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            assert self.data_ptrs is not None
+            transfer_kv_all_layer_mla(
+                src_layers=self.device_ptrs,
+                dst_layers=self.data_ptrs,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                item_size=self.state_page_bytes,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_all_layer_mla_lf_pf(
+                src_layers=self.device_ptrs,
+                dst=self.kv_buffer,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                item_size=self.state_page_bytes,
+                dst_layout_dim=self.layer_num * self.state_page_bytes,
+                num_layers=self.layer_num,
+            )
+        elif io_backend == "direct" and self.layout == "layer_first":
+            transfer_kv_direct(
+                src_layers=self.device_page_views,
+                dst_layers=self.data_refs,
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                page_size=1,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_all_layer_direct_lf_pf(
+                src_ptrs=self.device_page_views,
+                dst_ptrs=[self.kv_buffer],
+                src_indices=device_rows,
+                dst_indices=host_rows,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        if host_indices is None or device_indices is None:
+            return
+        host_rows = self._to_page_indices(host_indices)
+        device_rows = self._to_page_indices(device_indices)
+        if io_backend == "kernel" and self.layout == "layer_first":
+            transfer_kv_per_layer_mla(
+                src=self.data_refs[layer_id],
+                dst=self.device_page_views[layer_id],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                item_size=self.state_page_bytes,
+            )
+        elif io_backend == "kernel" and self.layout == "page_first":
+            transfer_kv_per_layer_mla_pf_lf(
+                src=self.kv_buffer,
+                dst=self.device_page_views[layer_id],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                item_size=self.state_page_bytes,
+                src_layout_dim=self.layer_num * self.state_page_bytes,
+            )
+        elif io_backend == "direct" and self.layout == "layer_first":
+            transfer_kv_direct(
+                src_layers=[self.data_refs[layer_id]],
+                dst_layers=[self.device_page_views[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                page_size=1,
+            )
+        elif io_backend == "direct" and self.layout == "page_first_direct":
+            transfer_kv_per_layer_direct_pf_lf(
+                src_ptrs=[self.kv_buffer],
+                dst_ptrs=[self.device_page_views[layer_id]],
+                src_indices=host_rows,
+                dst_indices=device_rows,
+                layer_id=layer_id,
+                page_size=1,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported V4 state host layout/backend: {self.layout}/{io_backend}"
+            )
+
+    def get_data_page(self, index, flat=True):
+        index = int(index) // self.swa_page_size
+        if self.layout == "layer_first":
+            data_page = torch.stack(
+                [self.kv_buffer[i][index] for i in range(self.layer_num)]
+            )
+        elif self.layout in ["page_first", "page_first_direct"]:
+            data_page = self.kv_buffer[index]
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+        return data_page.flatten() if flat else data_page
+
+    def get_dummy_flat_data_page(self):
+        return torch.zeros(
+            (self.layer_num, self.state_page_bytes),
+            dtype=self.dtype,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        ).flatten()
+
+    def set_from_flat_data_page(self, index, data_page):
+        index = int(index) // self.swa_page_size
+        if self.layout == "layer_first":
+            data = data_page.view(self.dtype).reshape(
+                self.layer_num, self.state_page_bytes
+            )
+            for i in range(self.layer_num):
+                self.kv_buffer[i][index].copy_(data[i])
+        elif self.layout == "page_first":
+            self.kv_buffer[index].copy_(
+                data_page.view(self.dtype).reshape(
+                    self.layer_num, self.state_page_bytes
+                )
+            )
+        elif self.layout == "page_first_direct":
+            self.kv_buffer[index].copy_(
+                data_page.view(self.dtype).reshape(
+                    self.layer_num, 1, self.state_page_bytes
+                )
+            )
+        else:
+            raise ValueError(f"Unsupported layout: {self.layout}")
+
+    def get_page_buffer_meta(self, indices):
+        ptr_list = []
+        rows = self._to_page_indices(indices).tolist()
+        if self.layout == "layer_first":
+            for row in rows:
+                page_index = int(row)
+                for layer_id in range(self.layer_num):
+                    ptr = (
+                        self.kv_buffer[layer_id].data_ptr()
+                        + page_index * self.state_page_bytes * self.dtype.itemsize
+                    )
+                    ptr_list.append(ptr)
+            element_size = self.state_page_bytes * self.dtype.itemsize
+            return ptr_list, [element_size] * len(ptr_list)
+        if self.layout in ["page_first", "page_first_direct"]:
+            page_bytes = self.layer_num * self.state_page_bytes * self.dtype.itemsize
+            for row in rows:
+                ptr_list.append(self.kv_buffer[int(row)].data_ptr())
+            return ptr_list, [page_bytes] * len(ptr_list)
+        raise ValueError(f"Unsupported layout: {self.layout}")
+
+
 @dataclass
 class PoolEntry:
     name: PoolName
@@ -1663,9 +2458,6 @@ class PoolEntry:
     device_pool: Any
     layer_mapper: Callable[[int], Optional[int]]
     is_primary_index_anchor: bool = False
-    # When True, host_pool uses the same logical slot indices as the anchor pool
-    # (e.g. DSA indexer); HostPoolGroup.free mirrors frees to this pool.
-    share_indices_with_anchor: bool = False
     # Optional eviction callbacks for auto-alloc in HybridCacheController.
     # host_evict_fn(n): evict n slots from the host pool (used by write()).
     # device_evict_fn(n): evict n slots from the device pool (used by load()).
@@ -1816,14 +2608,14 @@ class HostPoolGroup:
             )
 
 
-class NSAIndexerPoolHost(HostKVCache):
-    """Host-side NSA index buffers only. Slot layout matches the anchor MLA host pool."""
+class DSAIndexerPoolHost(HostKVCache):
+    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
 
-    device_pool: NSATokenToKVPool
+    device_pool: DSATokenToKVPool
 
     def __init__(
         self,
-        device_pool: NSATokenToKVPool,
+        device_pool: DSATokenToKVPool,
         anchor_host: MLATokenToKVPoolHost,
         layout: str,
         pin_memory: bool = True,
@@ -1843,7 +2635,7 @@ class NSAIndexerPoolHost(HostKVCache):
 
         self.index_head_dim = device_pool.index_head_dim
         self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
         self.indexer_size_per_token = (
             self.index_head_dim
             + self.index_head_dim // self.indexer_quant_block_size * 4
@@ -1866,12 +2658,12 @@ class NSAIndexerPoolHost(HostKVCache):
         available_bytes = host_mem.available - HICACHE_HOST_MEMORY_RESERVE_BYTES
         if requested_bytes > available_bytes:
             raise ValueError(
-                f"Not enough host memory for NSA indexer hierarchical cache. "
+                f"Not enough host memory for DSA indexer hierarchical cache. "
                 f"Requesting {requested_bytes / 1e9:.2f} GB but only have "
                 f"{available_bytes / 1e9:.2f} GB free."
             )
         logger.info(
-            "Allocating %.2f GB host memory for NSA indexer (layout=%s).",
+            "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
             requested_bytes / 1e9,
             layout,
         )
@@ -1934,7 +2726,7 @@ class NSAIndexerPoolHost(HostKVCache):
             return host_indices, device_indices
         if host_indices.numel() % self.page_size != 0:
             raise ValueError(
-                "Index buffer transfer expects page-aligned indices for NSA."
+                "Index buffer transfer expects page-aligned indices for DSA."
             )
         host_page_indices = (
             host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size

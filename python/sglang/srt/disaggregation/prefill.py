@@ -55,6 +55,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -144,8 +145,10 @@ class PrefillBootstrapQueue:
         kv_args = kv_args_class()
         kv_args.engine_rank = self.tp_rank
         kv_args.pp_rank = self.pp_rank
-        kv_args.system_dp_rank = self.scheduler.dp_rank
+        kv_args.system_dp_rank = self.scheduler.ps.dp_rank
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = getattr(self.token_to_kv_pool, "end_layer", None)
+        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -174,7 +177,7 @@ class PrefillBootstrapQueue:
             self.metadata_buffers.get_buf_infos()
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
-        kv_args.gpu_id = self.scheduler.gpu_id
+        kv_args.gpu_id = self.scheduler.ps.gpu_id
 
         req_to_token_pool = getattr(self.scheduler, "req_to_token_pool", None)
         setup_state_kv_args(
@@ -184,6 +187,13 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=req_to_token_pool,
         )
+
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            # V4's KVCache is organized by compression-ratio
+            # buckets rather than by layer.
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
+            )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
@@ -242,7 +252,7 @@ class PrefillBootstrapQueue:
             logger.error(message)
             req.time_stats.trace_ctx.abort(abort_info={"reason": message})
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
-            self.scheduler.stream_output([req], req.return_logprob)
+            self.scheduler.output_streamer.stream_output([req], req.return_logprob)
             return True
         return False
 
@@ -299,10 +309,10 @@ class PrefillBootstrapQueue:
                 prepare_abort(
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
-                self.scheduler.stream_output([req], req.return_logprob)
+                self.scheduler.output_streamer.stream_output([req], req.return_logprob)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
-                if self.scheduler.enable_metrics:
+                if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
                 if self.scheduler.enable_hicache_storage:
                     # to release prefetch events associated with the request
@@ -371,7 +381,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.process_prefill_chunk()
 
         batch = self.get_new_batch_prefill()
-        batch = self.maybe_prepare_mlp_sync_batch(batch)
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
         if batch:
             set_schedule_time_batch(batch)
@@ -385,7 +395,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -418,7 +428,7 @@ class SchedulerDisaggregationPrefillMixin:
 
         while True:
             # Receive requests
-            recv_reqs = self.recv_requests()
+            recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
@@ -504,7 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.is_chunked <= 0:
+            if req.inflight_middle_chunks <= 0:
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -525,7 +535,7 @@ class SchedulerDisaggregationPrefillMixin:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
                     num_input_logprobs = extend_input_len - extend_logprob_start_len
-                    self.add_logprob_return_values(
+                    self.batch_result_processor.logprob_result_processor.add_logprob_return_values(
                         i,
                         req,
                         logprob_pt,
@@ -554,7 +564,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.is_chunked -= 1
+                req.inflight_middle_chunks -= 1
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -562,7 +572,7 @@ class SchedulerDisaggregationPrefillMixin:
                     if extend_logprob_start_len < extend_input_len:
                         # Update input logprobs.
                         num_input_logprobs = extend_input_len - extend_logprob_start_len
-                        self.add_input_logprob_return_values(
+                        self.batch_result_processor.logprob_result_processor.add_input_logprob_return_values(
                             i,
                             req,
                             logits_output,
@@ -576,8 +586,8 @@ class SchedulerDisaggregationPrefillMixin:
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
-        can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
+        can_run_cuda_graph = result.can_run_cuda_graph
+        self.metrics_reporter.report_prefill_stats(
             batch=batch,
             prefill_stats=batch.prefill_stats,
             can_run_cuda_graph=can_run_cuda_graph,
@@ -620,7 +630,7 @@ class SchedulerDisaggregationPrefillMixin:
                     KVPoll.Failed,
                 ):
                     logger.warning_once(
-                        f"PP rank {self.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
+                        f"PP rank {self.ps.pp_rank}: unexpected poll state {poll} for rid {req.rid} "
                         f"from consensus; treating as undone",
                     )
                     undone_reqs.append(req)
@@ -637,7 +647,7 @@ class SchedulerDisaggregationPrefillMixin:
                 done_reqs.append(req)
                 req.time_stats.set_prefill_kv_transfer_finish_time()
             elif poll == KVPoll.Failed:
-                error_message = f"Prefill transfer failed for request rank={self.tp_rank} {req.rid=} {req.bootstrap_room=}"
+                error_message = f"Prefill transfer failed for request rank={self.ps.tp_rank} {req.rid=} {req.bootstrap_room=}"
                 try:
                     req.disagg_kv_sender.failure_exception()
                 except Exception as e:
@@ -649,7 +659,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req, error_message, status_code=HTTPStatus.INTERNAL_SERVER_ERROR
                 )
                 done_reqs.append(req)
-                if self.enable_metrics:
+                if self.metrics_reporter.enable_metrics:
                     self.metrics_collector.increment_transfer_failed_reqs()
             else:
                 logger.warning_once(
@@ -675,12 +685,12 @@ class SchedulerDisaggregationPrefillMixin:
             if metrics:
                 # Update last-value for REST API
                 if "latency_ms" in metrics:
-                    self.kv_transfer_latency_ms = metrics["latency_ms"]
+                    self.metrics_reporter.kv_transfer_latency_ms = metrics["latency_ms"]
                 if "speed_gb_s" in metrics:
-                    self.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
+                    self.metrics_reporter.kv_transfer_speed_gb_s = metrics["speed_gb_s"]
 
         # Stream requests which have finished transfer
-        self.stream_output(
+        self.output_streamer.stream_output(
             done_reqs,
             any(req.return_logprob for req in done_reqs),
             None,
@@ -808,7 +818,7 @@ class SchedulerDisaggregationPrefillMixin:
                     window_kv_indices_swa.cpu().numpy(), page_size
                 )
 
-            def _nsa_payload():
+            def _dsa_payload():
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     req.req_pool_idx, :seq_len
                 ]
@@ -823,8 +833,8 @@ class SchedulerDisaggregationPrefillMixin:
                     state_indices.append(_mamba_payload())
                 elif st == StateType.SWA:
                     state_indices.append(_swa_payload())
-                elif st == StateType.NSA:
-                    state_indices.append(_nsa_payload())
+                elif st == StateType.DSA:
+                    state_indices.append(_dsa_payload())
                 else:
                     state_indices.append(None)
 

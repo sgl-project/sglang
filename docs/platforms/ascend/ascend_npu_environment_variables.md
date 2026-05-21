@@ -9,7 +9,7 @@ This document provides a list of commonly used environment variables and aims to
 |--------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
 | `SGLANG_NPU_USE_MLAPO`                           | Adopts the `MLAPO` fusion operator in attention <br/> preprocessing stage of the MLA model.                                                                 | `false`       |
 | `SGLANG_USE_FIA_NZ`                              | Reshapes KV Cache for FIA NZ format.<br/> `SGLANG_USE_FIA_NZ` must be enabled with `SGLANG_NPU_USE_MLAPO`                                                   | `false`       |
-| `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer. | `false`       |
+| `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek DSA Indexer. | `false`       |
 | `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`           | Disable cast model weight tensor to a specific NPU <br/> ACL format.                                                                                        | `false`       |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each rank.                                                                                                       | `128`         |
 
@@ -21,7 +21,6 @@ This document provides a list of commonly used environment variables and aims to
 | `DEEPEP_NORMAL_LONG_SEQ_ROUND`            | Enable ant-moving function in dispatch stage. Indicates <br/> the number of rounds transmitted on each rank.           | `1`           |
 | `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`   | Enable ant-moving function in combine stage. <br/> The value `0` means disabled.                                       | `0`           |
 | `MOE_ENABLE_TOPK_NEG_ONE`                 | Needs to be enabled when the expert ID to be processed by <br/> DEEPEP contains -1.                                    | `0`           |
-| `DEEP_NORMAL_MODE_USE_INT8_QUANT`         | Quantizes x to int8 and returns (tensor, scales) in dispatch operator.                                                 | `0`           |
 
 ## Others
 
