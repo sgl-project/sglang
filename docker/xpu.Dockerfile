@@ -51,6 +51,6 @@ RUN echo "Cloning ${SG_LANG_BRANCH} from ${SG_LANG_REPO}" && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install --no-cache-dir . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-cache-dir --no-deps xgrammar==0.1.33 && \
-    pip install triton-xpu --index-url https://download.pytorch.org/whl/test/xpu --force-reinstall
+    pip install triton-xpu==3.7.1 --index-url https://download.pytorch.org/whl/test/xpu --force-reinstall
 
 CMD ["bash", "-c", "source /opt/intel/oneapi/setvars.sh --force && exec bash"]
