@@ -1191,11 +1191,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = (
+            items[0].feature
+            if len(items) == 1
+            else torch.cat([item.feature for item in items], dim=0)
         )
-        image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
+        image_grid_thw = (
+            items[0].image_grid_thw
+            if len(items) == 1
+            else torch.concat([item.image_grid_thw for item in items], dim=0)
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
@@ -1210,11 +1215,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        # in qwen-vl, last dim is the same
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
-            self.visual.dtype
+        pixel_values = (
+            items[0].feature
+            if len(items) == 1
+            else torch.cat([item.feature for item in items], dim=0)
         )
-        video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
+        video_grid_thw = (
+            items[0].video_grid_thw
+            if len(items) == 1
+            else torch.concat([item.video_grid_thw for item in items], dim=0)
+        )
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         if self.use_data_parallel:
