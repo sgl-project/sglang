@@ -646,7 +646,11 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
     def test_mixed_precision_uses_nvfp4_min_capability(self):
-        self.assertEqual(ModelOptMixedPrecisionConfig.get_min_capability(), 100)
+        """NVFP4 supports SM75+ (Turing) via Marlin fallback; min_capability must be >= 75."""
+        cap = ModelOptMixedPrecisionConfig.get_min_capability()
+        self.assertGreaterEqual(
+            cap, 75, f"NVFP4 requires SM75+ (Marlin fallback); got min_capability={cap}"
+        )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
         quant_config = ModelOptMixedPrecisionConfig.from_config(

@@ -69,8 +69,44 @@ class MarlinMoeQuantInfo(MoeQuantInfo):
     w13_qzeros: Optional[torch.Tensor] = None
     w2_qzeros: Optional[torch.Tensor] = None
 
-    # Optional
+    # FP4 Marlin specific (Optional)
+    w13_global_scale: Optional[torch.Tensor] = None
+    w2_global_scale: Optional[torch.Tensor] = None
+
+    # EP support (Optional)
     expert_map: Optional[torch.Tensor] = None
+    global_num_experts: int = -1
+
+
+def build_fp4_marlin_moe_quant_info(
+    layer: torch.nn.Module, num_experts_hint: int
+) -> MarlinMoeQuantInfo:
+    """Build MarlinMoeQuantInfo for an FP4 Marlin fallback MoE layer.
+
+    Shared by ModelOpt and compressed-tensors NVFP4 Marlin MoE methods.
+    """
+    expert_map = None
+    global_num_experts = -1
+    if hasattr(layer, "dispatcher") and hasattr(
+        layer.dispatcher, "local_expert_mapping"
+    ):
+        expert_map = layer.dispatcher.local_expert_mapping
+        if expert_map is not None:
+            global_num_experts = num_experts_hint
+
+    return MarlinMoeQuantInfo(
+        w13_qweight=layer.w13_weight,
+        w2_qweight=layer.w2_weight,
+        w13_scales=layer.w13_weight_scale,
+        w2_scales=layer.w2_weight_scale,
+        w13_g_idx_sort_indices=None,
+        w2_g_idx_sort_indices=None,
+        weight_bits=4,
+        w13_global_scale=layer.w13_weight_scale_2,
+        w2_global_scale=layer.w2_weight_scale_2,
+        expert_map=expert_map,
+        global_num_experts=global_num_experts,
+    )
 
 
 @register_fused_func("none", "marlin")
@@ -124,6 +160,7 @@ def fused_experts_none_to_marlin(
         gating_output=topk_output.router_logits,
         topk_weights=topk_output.topk_weights,
         topk_ids=topk_output.topk_ids,
+        global_num_experts=quant_info.global_num_experts,
         expert_map=quant_info.expert_map,
         g_idx1=quant_info.w13_g_idx,
         g_idx2=quant_info.w2_g_idx,
@@ -136,6 +173,8 @@ def fused_experts_none_to_marlin(
         is_k_full=quant_info.is_k_full,
         inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
+        w1_global_scale=quant_info.w13_global_scale,
+        w2_global_scale=quant_info.w2_global_scale,
         clamp_limit=runner_config.swiglu_limit,
     ).to(hidden_states.dtype)
 

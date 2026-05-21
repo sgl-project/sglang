@@ -453,7 +453,9 @@ MarlinFuncPtr get_marlin_kernel(
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
 
+#ifdef SGL_MOE_MARLIN_FP4
   NVFP4_GET_IF(host::kFE2M1f)
+#endif
 
   BIGGROUP_GET_IF(host::kFE4M3fn)
 
