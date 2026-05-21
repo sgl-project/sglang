@@ -26,7 +26,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -149,7 +149,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
-    get_forward_context,
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
@@ -3020,9 +3019,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         with ctx:
             if pdmux_override:
                 with forward_context(
-                    replace(
-                        get_forward_context(), attn_backend=self.decode_attn_backend
-                    )
+                    ForwardContext(attn_backend=self.decode_attn_backend)
                 ):
                     return _do_forward()
             return _do_forward()

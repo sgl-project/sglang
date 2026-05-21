@@ -37,7 +37,7 @@ class ForwardContext:
     extend by adding fields here. Frozen so accidental mutation raises at
     write time — use ``dataclasses.replace`` for per-call overrides."""
 
-    attn_backend: "AttentionBackend"
+    attn_backend: AttentionBackend
 
 
 _current: Optional[ForwardContext] = None
@@ -63,15 +63,15 @@ def get_forward_context() -> ForwardContext:
     return _current
 
 
-def get_attn_backend() -> "AttentionBackend":
+def get_attn_backend() -> AttentionBackend:
     return get_forward_context().attn_backend
 
 
-def get_token_to_kv_pool() -> "KVCache":
+def get_token_to_kv_pool() -> KVCache:
     return get_attn_backend().token_to_kv_pool
 
 
-def get_req_to_token_pool() -> "ReqToTokenPool":
+def get_req_to_token_pool() -> ReqToTokenPool:
     return get_attn_backend().req_to_token_pool
 
 

@@ -178,9 +178,6 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         self.draft_attn_backend = self._init_draft_attn_backend()
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-        # For topk > 1 the draft backend differs from the runner's main
-        # attn_backend; we publish it per-call via ForwardContext at each
-        # draft forward site below rather than mutating the runner.
         self.cuda_graph_runner = None
 
         with (
@@ -283,8 +280,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-        # Each draft forward call wraps with forward_context to publish
-        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
@@ -299,8 +294,6 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_mode=ForwardMode.DECODE,
                 spec_info=None,
             )
-        # Each draft forward call wraps with forward_context to publish
-        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
@@ -320,8 +313,6 @@ class FrozenKVMTPWorker(TpModelWorker):
                     else None
                 ),
             )
-        # Each draft forward call wraps with forward_context to publish
-        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
