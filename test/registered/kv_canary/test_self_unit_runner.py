@@ -192,6 +192,43 @@ class TestSelfUnitRunner(CustomTestCase):
         with self.assertRaises(TypeError):
             PerturbConfig(req_to_token_prob=0.0)
 
+    def test_perturb_manager_perturb_dispatches_all_points(self):
+        """Verify perturb() runs each perturb point in order."""
+        manager = PerturbManager(
+            config=PerturbConfig(
+                req_to_token_prob=0.0,
+                real_kv_used_prob=0.0,
+                real_kv_unused_cache_prob=0.0,
+                target_group_kind=TargetGroupKind.FULL,
+                warmup_steps=0,
+            ),
+            req_to_token_pool=_make_pool(self.device),
+            buffer_groups=(),
+            pump_and_allreduce=SimpleNamespace(step_counter=10),
+        )
+        forward_batch = _make_forward_batch(self.device)
+        calls: List[str] = []
+
+        with patch.object(
+            manager,
+            "perturb_req_to_token",
+            lambda batch: calls.append("req_to_token"),
+        ), patch.object(
+            manager,
+            "perturb_real_kv_used",
+            lambda batch: calls.append("real_kv_used"),
+        ), patch.object(
+            manager,
+            "perturb_real_kv_unused_cache",
+            lambda batch: calls.append("real_kv_unused_cache"),
+        ):
+            manager.perturb(forward_batch)
+
+        self.assertEqual(
+            calls,
+            ["req_to_token", "real_kv_used", "real_kv_unused_cache"],
+        )
+
     def test_per_forward_orchestrates_plan_head_tail(self):
         """Verify per-forward execution launches plan, head, and tail kernels."""
         calls: List = []
