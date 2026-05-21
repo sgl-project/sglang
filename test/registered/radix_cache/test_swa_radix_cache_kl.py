@@ -19,6 +19,8 @@ class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):
         "--mem-fraction-static",
         "0.70",
         "--disable-piecewise-cuda-graph",
+        # Pin attention reduction order so test measures cache consistency, not bf16 noise.
+        "--enable-deterministic-inference",
     ]
 
 
