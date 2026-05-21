@@ -316,10 +316,9 @@ class DeepseekDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        head_dim = (
-            self.hidden_size // config.num_attention_heads
-            if not _is_cpu
-            else self.hidden_size // config.original_num_attention_heads
+        # CPU uses attr of original_num_attention_heads for padding needs, others stay unchanged.
+        head_dim = self.hidden_size // getattr(
+            config, "original_num_attention_heads", config.num_attention_heads
         )
         self.self_attn = DeepseekAttention(
             hidden_size=self.hidden_size,
