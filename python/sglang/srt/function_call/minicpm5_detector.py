@@ -2,7 +2,7 @@ import ast
 import json
 import logging
 import re
-from typing import List
+from typing import Dict, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -27,37 +27,27 @@ _PARAM_WITH_NAME_REGEX = re.compile(
 )
 _PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
 
-def get_argument_type(func_name: str, arg_key: str, defined_tools: list):
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-    if func_name not in name2tool:
-        return None
-    tool = name2tool[func_name]
-    if arg_key not in tool.function.parameters["properties"]:
-        return None
-    return tool.function.parameters["properties"][arg_key].get("type", None)
 
-
-def get_required_props(func_name: str, defined_tools: list):
-    name2tool = {tool.function.name: tool for tool in defined_tools}
-    tool = name2tool.get(func_name)
+def get_argument_type(
+    func_name: str, arg_key: str, name_to_tool: Dict[str, Tool]
+) -> Optional[str]:
+    tool = name_to_tool.get(func_name)
     if not tool:
-        return set()
+        return None
     params = tool.function.parameters or {}
-    required = params.get("required", []) if isinstance(params, dict) else []
-    try:
-        return set(required)
-    except Exception:
-        return set()
+    if not isinstance(params, dict):
+        return None
+    return params.get("properties", {}).get(arg_key, {}).get("type")
 
 
 def parse_arguments(json_value):
     try:
         try:
             parsed_value = json.loads(json_value)
-        except:
+        except (json.JSONDecodeError, TypeError):
             parsed_value = ast.literal_eval(json_value)
         return parsed_value, True
-    except:
+    except (ValueError, SyntaxError, TypeError):
         return json_value, False
 
 
@@ -159,7 +149,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                             seen_keys.add(key)
                             val_text = (param.text or "")
                             val_text = val_text.strip()
-                            arg_type = get_argument_type(func_name or "", key, tools)
+                            arg_type = get_argument_type(func_name or "", key, name_to_tool)
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
                                 arguments[key] = parsed_val
@@ -178,13 +168,11 @@ class MiniCPM5Detector(BaseFormatDetector):
                         m_fn = _FUNC_NAME_V1_REGEX.search(block)
                         if m_fn:
                             func_name = (m_fn.group(1) or "").strip()
-                        if _PARAM_MISSING_NAME_REGEX.search(block):
-                            has_invalid_param = True
+                        has_invalid_param = _PARAM_MISSING_NAME_REGEX.search(block) is not None
                         seen_keys = set()
                         allowed_props = set()
                         if func_name in tool_names:
                             allowed_props = name_to_allowed_props.get(func_name, set())
-                        has_invalid_param = has_invalid_param
                         for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
                             key = pm.group(1).strip()
                             if allowed_props and key not in allowed_props:
@@ -198,7 +186,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                             if val_text.startswith("<![CDATA[") and val_text.endswith("]]>"):
                                 val_text = val_text[len("<![CDATA[") : -len("]]>")]
                             val_text = val_text.strip()
-                            arg_type = get_argument_type(func_name or "", key, tools)
+                            arg_type = get_argument_type(func_name or "", key, name_to_tool)
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
                                 arguments[key] = parsed_val
@@ -234,44 +222,76 @@ class MiniCPM5Detector(BaseFormatDetector):
             logger.error(f"Error in detect_and_parse: {e}")
             return StreamingParseResult(normal_text=text)
 
+    def _append_tool_call(self, call, all_calls: List) -> None:
+        if self.current_tool_id == -1:
+            self.current_tool_id = 0
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = [""]
+
+        while len(self.prev_tool_call_arr) <= self.current_tool_id:
+            self.prev_tool_call_arr.append({})
+        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+            self.streamed_args_for_tool.append("")
+
+        self.prev_tool_call_arr[self.current_tool_id] = {
+            "name": call.name,
+            "arguments": json.loads(call.parameters),
+        }
+        self.streamed_args_for_tool[self.current_tool_id] = call.parameters
+        call.tool_index = self.current_tool_id
+        self.current_tool_id += 1
+        all_calls.append(call)
+
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         self._buffer += new_text
-        current_text = self._buffer
+        normal_parts = []
+        all_calls = []
 
-        start = current_text.find(self.bot_token)
-        if start == -1:
-            self._buffer = ""
-            if self.current_tool_id > 0:
-                current_text = ""
-            return StreamingParseResult(normal_text=current_text)
-        end = current_text.find(self.eot_token)
-        if end != -1:
-            if self.current_tool_id == -1:
-                self.current_tool_id = 0
-                self.prev_tool_call_arr = []
-                self.streamed_args_for_tool = [""]
-            while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                self.prev_tool_call_arr.append({})
-            while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                self.streamed_args_for_tool.append("")
-            result = self.detect_and_parse(current_text[: end + len(self.eot_token)], tools=tools)
-            if result.calls:
-                self.prev_tool_call_arr[self.current_tool_id] = {
-                    "name": result.calls[0].name,
-                    "arguments": json.loads(result.calls[0].parameters),
-                }
-                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
-                    0
-                ].parameters
-                result.calls[0].tool_index = self.current_tool_id
-                self.current_tool_id += 1
+        while True:
+            current_text = self._buffer
+            start = current_text.find(self.bot_token)
+            if start == -1:
+                partial_len = self._ends_with_partial_token(current_text, self.bot_token)
+                if partial_len > 0:
+                    self._buffer = current_text[-partial_len:]
+                    emit = current_text[:-partial_len]
+                else:
+                    self._buffer = ""
+                    emit = "" if self.current_tool_id > 0 else current_text
+                if emit:
+                    normal_parts.append(emit)
+                break
+
+            if start > 0:
+                normal_parts.append(current_text[:start])
+                current_text = current_text[start:]
+
+            end = current_text.find(self.eot_token)
+            if end == -1:
+                self._buffer = current_text
+                break
+
+            block = current_text[: end + len(self.eot_token)]
             self._buffer = current_text[end + len(self.eot_token) :]
-            return result
-        normal_text = current_text[:start]
-        self._buffer = current_text[start:]
-        return StreamingParseResult(normal_text=normal_text)
+
+            result = self.detect_and_parse(block, tools=tools)
+            for call in result.calls:
+                self._append_tool_call(call, all_calls)
+
+            if self.bot_token not in self._buffer:
+                partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
+                if partial_len == 0:
+                    emit = "" if self.current_tool_id > 0 else self._buffer
+                    if emit:
+                        normal_parts.append(emit)
+                    self._buffer = ""
+                break
+
+        return StreamingParseResult(
+            normal_text="".join(normal_parts), calls=all_calls
+        )
 
     def supports_structural_tag(self) -> bool:
         return False

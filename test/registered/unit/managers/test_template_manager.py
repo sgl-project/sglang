@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from sglang.srt.managers.template_detection import (
     ReasoningToggleConfig,
+    TOOL_CALL_PARSER_RULES,
     detect_reasoning_parser,
     detect_reasoning_pattern,
     detect_tool_call_parser,
@@ -265,6 +266,17 @@ class TestToolCallParserDetection(unittest.TestCase):
                 ["<|tool_calls_section_begin|>"],
                 "kimi_k2",
             ),
+            (
+                "minicpm5",
+                (
+                    '{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}'
+                    '\n<function name="{{ tool.name }}">'
+                    '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+                    "\n</function>"
+                ),
+                ["<function", "<param"],
+                "minicpm5",
+            ),
         ]
         for name, template, vocab, expected in cases:
             with self.subTest(name=name):
@@ -281,6 +293,25 @@ class TestToolCallParserDetection(unittest.TestCase):
         force, config = detect_reasoning_pattern("Hello {{ user }}")
         result = detect_tool_call_parser("Hello {{ user }}", None, config, force)
         self.assertIsNone(result)
+
+    def test_minicpm5_rule_precedes_broad_fallback_rules(self):
+        rule_names = [rule.name for rule in TOOL_CALL_PARSER_RULES]
+        minicpm5_idx = rule_names.index("minicpm5")
+        self.assertLess(minicpm5_idx, rule_names.index("mimo"))
+        self.assertLess(minicpm5_idx, rule_names.index("qwen"))
+
+    def test_minicpm5_not_misclassified_as_qwen(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            '\n<function name="{{ tool.name }}">'
+            '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+            "\n</function>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(
+            template, _DummyTokenizer(["<function", "<param"]), config, force
+        )
+        self.assertEqual(result, "minicpm5")
 
 
 class TestResolveAutoParsers(unittest.TestCase):

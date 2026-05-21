@@ -237,3 +237,50 @@ def test_streaming_increment_v3():
     args = json.loads(r2.calls[0].parameters)
     assert args["city"] == "北京"
     assert args["date"] == "2024-06-27"
+
+
+def test_streaming_split_bot_token():
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    text = (
+        '<function name="get_weather">'
+        '<param name="city">北京</param>'
+        "</function>"
+    )
+
+    r1 = detector.parse_streaming_increment("<", tools)
+    assert r1.normal_text == ""
+    assert len(r1.calls) == 0
+
+    r2 = detector.parse_streaming_increment(text[1:], tools)
+    assert len(r2.calls) == 1
+    args = json.loads(r2.calls[0].parameters)
+    assert args["city"] == "北京"
+
+
+def test_streaming_multiple_complete_blocks_in_one_delta():
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather() + make_tools_sum()
+    text = (
+        '<function name="get_weather"><param name="city">北京</param></function>'
+        '<function name="sum_values"><param name="nums">[1,2]</param></function>'
+    )
+
+    result = detector.parse_streaming_increment(text, tools)
+    assert len(result.calls) == 2
+    assert json.loads(result.calls[0].parameters)["city"] == "北京"
+    assert json.loads(result.calls[1].parameters)["nums"] == [1, 2]
+
+
+def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    text = (
+        '<function name="get_weather">'
+        '<param name="city">A & B</param>'
+        "</function>"
+    )
+
+    result = detector.detect_and_parse(text, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters)["city"] == "A & B"
