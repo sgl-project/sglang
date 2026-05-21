@@ -3045,11 +3045,17 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
+
+    For ``moe_dense_tp_size`` we accept any positive value (or ``None``):
+    when the dense MLP is tensor-parallelized (``>= 1``) the attention input
+    must be gathered. When ``moe_dense_tp_size is None`` the model has no MoE
+    dense layers and the gather path should not be triggered.
     """
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
-    assert server_args.moe_dense_tp_size in [1, None]
-    if not get_moe_a2a_backend().is_none() or server_args.moe_dense_tp_size == 1:
+    if not get_moe_a2a_backend().is_none() or (
+        server_args.moe_dense_tp_size is not None and server_args.moe_dense_tp_size >= 1
+    ):
         if server_args.enable_dp_attention:
             return server_args.dp_size < server_args.tp_size
         else:

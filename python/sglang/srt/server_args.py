@@ -7002,10 +7002,9 @@ class ServerArgs:
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
         assert self.gpu_id_step >= 1, "gpu_id_step must be positive"
 
-        assert self.moe_dense_tp_size in {
-            1,
-            None,
-        }, "moe_dense_tp_size only support 1 and None currently"
+        assert (
+            self.moe_dense_tp_size is None or self.moe_dense_tp_size >= 1
+        ), "moe_dense_tp_size must be a positive integer or None"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         if not is_runai_obj_uri(self.served_model_name):
