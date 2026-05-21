@@ -29,7 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
@@ -458,7 +458,7 @@ class MoEGate(nn.Module):
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
             else:
                 if self.is_deepseek_v4:
-                    from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
+                    from sglang.jit_kernel.dsv4 import linear_bf16_fp32
 
                     logits = linear_bf16_fp32(hidden_states, self.weight)
                 else:
