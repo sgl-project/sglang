@@ -90,7 +90,11 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    return (
+        num_tokens <= 32
+        and not is_batch_invariant_mode_enabled()
+        and not get_global_server_args().enable_deterministic_inference
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
