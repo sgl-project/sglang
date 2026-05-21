@@ -23,8 +23,9 @@ def to_openai_style_logprobs(
     ret_logprobs = LogProbs()
 
     def append_token_logprobs(token_logprobs):
-        for logprob, _, token_text in token_logprobs:
+        for logprob, token_id, token_text in token_logprobs:
             ret_logprobs.tokens.append(token_text)
+            ret_logprobs.token_ids.append(token_id)
             ret_logprobs.token_logprobs.append(logprob)
 
             # Not supported yet

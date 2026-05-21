@@ -242,6 +242,9 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Whether to return prompt token IDs without computing logprobs
+    return_prompt_token_ids: bool = False
+
     # Propagates trace context via Engine.generate/async_generate
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
