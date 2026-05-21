@@ -17,7 +17,7 @@ from __future__ import annotations
 import bisect
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
@@ -407,6 +407,13 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
 
         def run_once():
+            # Graph-recordable metadata prep -- recorded into the captured
+            # graph and auto-replayed by graph.replay(). No-op for most
+            # backends in the initial migration.
+            self.eagle_worker.draft_extend_attn_backend_list[
+                self.step
+            ].init_forward_data_in_graph(forward_batch)
+
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
 
@@ -485,15 +492,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             return ret
 
         with forward_context(ForwardContext(attn_backend=attn_backend)):
-            attn_backend.init_forward_metadata_capture_cuda_graph(
-                bs=bs,
-                num_tokens=num_tokens,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=self.forward_mode,
-                spec_info=forward_batch.spec_info,
-            )
+            # Attention backend: per-iter prep runs OUTSIDE the graph capture
+            # scope. ``forward_batch`` carries the bs-sliced buffer views.
+            attn_backend.init_forward_data_out_graph(forward_batch)
             self.deepep_adapter.capture(is_extend_in_batch=True)
             self._capture_init(run_once)
             out = self._capture_graph(
@@ -572,19 +573,25 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         forward_batch.spec_info.positions = buffers.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
-        self.eagle_worker.draft_extend_attn_backend_list[
-            self.step
-        ].init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=buffers.req_pool_indices,
-            seq_lens=buffers.seq_lens,
+        # Replay path: build a lightweight ForwardBatch view onto the padded
+        # buffers so the backend reads bs-sized fields off ``forward_batch.*``
+        # exactly like at capture time. The in-graph ops recorded into the
+        # captured graph at capture time auto-replay via ``graph.replay()``,
+        # so only the out-graph phase runs here per replay.
+        fb_view = replace(
+            forward_batch,
+            forward_mode=self.forward_mode,
+            batch_size=bs,
+            req_pool_indices=buffers.req_pool_indices[:bs],
+            seq_lens=buffers.seq_lens[:bs],
             seq_lens_sum=forward_batch.seq_lens_sum
             + (bs - raw_bs) * self.seq_len_fill_value,
+            seq_lens_cpu=buffers.seq_lens_cpu[:bs],
             encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-            seq_lens_cpu=buffers.seq_lens_cpu,
         )
+        self.eagle_worker.draft_extend_attn_backend_list[
+            self.step
+        ].init_forward_data_out_graph(fb_view)
 
         # Replay
         self.raw_bs = raw_bs
