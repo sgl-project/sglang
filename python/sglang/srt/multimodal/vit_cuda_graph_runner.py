@@ -83,7 +83,7 @@ class ViTCudaGraphRunner:
     Falls back to eager execution when total tokens exceed the max bucket.
     """
 
-    BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384]
+    BUCKET_SIZES = [32, 64, 128, 256, 512, 1024, 2048, 4096, 6144, 8192, 16384, 40960]
     MAX_IMAGES_PER_BUCKET = 16
 
     _graph_memory_pool = None
