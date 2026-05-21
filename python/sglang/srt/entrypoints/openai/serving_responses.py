@@ -24,9 +24,6 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai.types.responses.response_reasoning_item import (
-    Content as ResponseReasoningTextContent,
-)
 from openai_harmony import Message as OpenAIMessage
 
 from sglang.srt.entrypoints.context import (
@@ -48,14 +45,26 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    Function,
+    LogProbs,
+    OutputTokenUsageInfo,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
     ResponsesRequest,
     ResponsesResponse,
-    UsageInfo,
+    ResponseUsageInfo,
+    Tool,
+    ToolChoice,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
+from sglang.srt.entrypoints.openai.utils import (
+    parse_tool_calls_from_content,
+    to_openai_style_logprobs,
+)
+from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.utils import _is_complete_json
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
@@ -65,6 +74,180 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_responses_input(
+    input_items: list,
+) -> list[ChatCompletionMessageParam]:
+    """Normalize Responses API input messages to Chat Completions format.
+
+    Converts Responses API items (message, reasoning, function_call, function_call_output)
+    to Chat Completions messages format, merging related assistant items.
+    """
+    messages: list[ChatCompletionMessageParam] = []
+    pending_assistant: Optional[dict] = None
+
+    def _flush_pending_assistant():
+        """Add pending assistant message to messages if exists."""
+        nonlocal pending_assistant
+        if pending_assistant is not None:
+            # Clean up empty fields
+            if not pending_assistant.get("content"):
+                pending_assistant["content"] = None
+            if not pending_assistant.get("tool_calls"):
+                del pending_assistant["tool_calls"]
+            messages.append(pending_assistant)  # type: ignore[arg-type]
+            pending_assistant = None
+
+    for raw_item in input_items:
+        # Convert Pydantic models to dicts for uniform handling
+        item = raw_item
+        if hasattr(raw_item, "model_dump"):
+            item = raw_item.model_dump()
+
+        if not isinstance(item, dict):
+            messages.append(raw_item)  # type: ignore[arg-type]
+            continue
+
+        item_type = item.get("type", "message")
+        role = item.get("role")
+
+        if item_type == "message" and role == "user":
+            _flush_pending_assistant()
+            messages.append(
+                {
+                    "role": "user",
+                    "content": _normalize_content(item.get("content")),
+                }
+            )
+
+        elif item_type == "reasoning":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            # Extract reasoning text from summary or content
+            reasoning_text = ""
+            summary = item.get("summary", [])
+            if summary:
+                for s in summary:
+                    if hasattr(s, "model_dump"):
+                        s = s.model_dump()
+                    if isinstance(s, dict) and s.get("type") == "summary_text":
+                        reasoning_text = s.get("text", "")
+                        break
+            if not reasoning_text:
+                content = item.get("content", [])
+                for c in content:
+                    if hasattr(c, "model_dump"):
+                        c = c.model_dump()
+                    if isinstance(c, dict) and c.get("type") == "reasoning_text":
+                        reasoning_text = c.get("text", "")
+                        break
+            pending_assistant["reasoning_content"] = reasoning_text
+
+        elif item_type == "function_call":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            if "tool_calls" not in pending_assistant:
+                pending_assistant["tool_calls"] = []
+            pending_assistant["tool_calls"].append(
+                {
+                    "id": item.get("call_id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+            )
+
+        elif item_type == "message" and role == "assistant":
+            if pending_assistant is None:
+                pending_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": None,
+                    "tool_calls": [],
+                }
+            pending_assistant["content"] = _normalize_content(item.get("content"))
+
+        elif item_type == "function_call_output":
+            _flush_pending_assistant()
+            # Find the corresponding function_call to get the name
+            call_id = item.get("call_id", "")
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": item.get("output", ""),
+                }
+            )
+
+        else:
+            # Pass through other items (e.g., system messages)
+            _flush_pending_assistant()
+            normalized_item = dict(item)
+            if "content" in normalized_item:
+                normalized_item["content"] = _normalize_content(
+                    normalized_item["content"]
+                )
+            messages.append(normalized_item)  # type: ignore[arg-type]
+
+    _flush_pending_assistant()
+    return messages
+
+
+def _normalize_content(content) -> Optional[Union[str, list]]:
+    """Normalize content: convert input_text/output_text to text type."""
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+
+    if hasattr(content, "__iter__") and not isinstance(content, list):
+        try:
+            content = list(content)
+        except Exception as e:
+            logger.warning(f"Failed to convert content iterator: {e}")
+            return str(content)
+
+    if isinstance(content, list):
+        normalized = []
+        for part in content:
+            if hasattr(part, "model_dump"):
+                part = part.model_dump()
+            normalized.append(_normalize_content_part(part))
+        return normalized
+    return content
+
+
+def _normalize_content_part(part: dict) -> dict:
+    """Convert a Responses API content part to Chat Completions format."""
+    if isinstance(part, dict):
+        part_type = part.get("type")
+        if part_type in ("input_text", "output_text"):
+            return {"type": "text", "text": part.get("text", "")}
+        elif part_type == "input_image":
+            return {
+                "type": "image_url",
+                "image_url": {
+                    "url": part.get("image_url", ""),
+                    "detail": part.get("detail", "auto"),
+                },
+            }
+        elif part_type == "input_audio":
+            return {"type": "audio_url", "audio_url": {"url": part.get("data", "")}}
+    return part
 
 
 class OpenAIServingResponses(OpenAIServingChat):
@@ -85,7 +268,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
 
         # Get default sampling params from model config if available
-        self.default_sampling_params = {}
+        self.default_sampling_params = (
+            self.tokenizer_manager.model_config.get_default_sampling_params()
+        )
+        if self.default_sampling_params:
+            logger.info(
+                f"OpenAIServingResponses init,  Using default chat sampling params from model generation config: {self.default_sampling_params}",
+            )
 
         self.supports_browsing = (
             tool_server.has_tool("browser") if tool_server else False
@@ -122,6 +311,29 @@ class OpenAIServingResponses(OpenAIServingChat):
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+
+    def _get_function_tools(self, request: ResponsesRequest) -> list[Tool]:
+        """Extract function tools from request and convert to Tool format."""
+        function_tools = []
+        for tool in request.tools:
+            if tool.type == "function":
+                if not tool.name:
+                    logger.warning(
+                        f"Skipping function tool without function name definition: {tool}"
+                    )
+                    continue
+                function_tools.append(
+                    Tool(
+                        type="function",
+                        function=Function(
+                            name=tool.name,
+                            description=tool.description,
+                            parameters=tool.parameters,
+                            strict=tool.strict or False,
+                        ),
+                    )
+                )
+        return function_tools
 
     # error helpers dedicated for v1/responses
     def create_error_response(
@@ -188,12 +400,12 @@ class OpenAIServingResponses(OpenAIServingChat):
             tokenizer = self.tokenizer_manager.tokenizer
 
             if self.use_harmony:
-                messages, request_prompts, engine_prompts = (
+                messages, request_prompts, engine_prompts, processed_messages = (
                     self._make_request_with_harmony(request, prev_response)
                 )
             else:
-                messages, request_prompts, engine_prompts = await self._make_request(
-                    request, prev_response, tokenizer
+                messages, request_prompts, engine_prompts, processed_messages = (
+                    await self._make_request(request, prev_response, tokenizer)
                 )
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
@@ -263,7 +475,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
                     sampling_params = request.to_sampling_params(
-                        default_max_tokens, self.default_sampling_params
+                        default_max_tokens=default_max_tokens,
+                        default_params=self.default_sampling_params,
+                        tool_call_constraint=(
+                            processed_messages.tool_call_constraint
+                            if processed_messages
+                            else None
+                        ),
                     )
 
                     context: ConversationContext
@@ -275,6 +493,12 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    should_return_logprobs = self._should_return_logprobs(request)
+                    # Extract routed_dp_rank from header (has higher priority than body)
+                    effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+                        raw_request, request.routed_dp_rank
+                    )
+
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
                         input_ids=engine_prompt,
@@ -283,6 +507,25 @@ class OpenAIServingResponses(OpenAIServingChat):
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
                         background=request.background,
+                        require_reasoning=self._get_reasoning_from_request(request),
+                        bootstrap_host=request.bootstrap_host,
+                        bootstrap_port=request.bootstrap_port,
+                        bootstrap_room=request.bootstrap_room,
+                        routed_dp_rank=effective_routed_dp_rank,
+                        disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+                        image_data=processed_messages.image_data,
+                        video_data=processed_messages.video_data,
+                        audio_data=processed_messages.audio_data,
+                        modalities=processed_messages.modalities,
+                        priority=request.priority,
+                        routing_key=self.extract_routing_key(raw_request),
+                        custom_labels=self.extract_custom_labels(raw_request),
+                        return_logprob=should_return_logprobs,
+                        logprob_start_len=-1,
+                        top_logprobs_num=(
+                            request.top_logprobs if should_return_logprobs else 0
+                        ),
+                        return_text_in_logprobs=True,
                     )
 
                     generator = self._generate_with_builtin_tools(
@@ -376,6 +619,7 @@ class OpenAIServingResponses(OpenAIServingChat):
     ):
         # Construct the input messages
         messages = self._construct_input_messages(request, prev_response)
+        function_tools = self._get_function_tools(request)
 
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
@@ -384,6 +628,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 model=request.model,
                 messages=messages,
                 stream=request.stream,
+                tools=function_tools,
+                tool_choice=request.tool_choice,
+                parallel_tool_calls=request.parallel_tool_calls,
+                chat_template_kwargs=request.chat_template_kwargs,
+                reasoning_effort=(
+                    request.reasoning.effort if request.reasoning else None
+                ),
             )
 
             # Follow SGLang's _process_messages pattern
@@ -403,14 +654,19 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Fallback to simple encoding
             prompt_text = ""
             for msg in messages:
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
+                if isinstance(msg, dict):
+                    role = msg.get("role", "user")
+                    content = msg.get("content", "")
+                else:
+                    role = msg.role if hasattr(msg, "role") else "user"
+                    content = msg.content if hasattr(msg, "content") else ""
                 prompt_text += f"{role}: {content}\n"
             prompt_ids = tokenizer.encode(prompt_text)
             request_prompts = [prompt_ids]
             engine_prompts = [prompt_ids]
+            processed_messages = None
 
-        return messages, request_prompts, engine_prompts
+        return messages, request_prompts, engine_prompts, processed_messages
 
     def _make_request_with_harmony(
         self,
@@ -424,7 +680,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages_with_harmony(request, prev_response)
         prompt_token_ids = render_for_completion(messages)
         engine_prompt = prompt_token_ids
-        return messages, [prompt_token_ids], [engine_prompt]
+        return messages, [prompt_token_ids], [engine_prompt], None
 
     async def responses_full_generator(
         self,
@@ -461,44 +717,54 @@ class OpenAIServingResponses(OpenAIServingChat):
             final_res = context.last_output
             assert final_res is not None
 
+            logprobs = None
+            if self._should_return_logprobs(request):
+                logprobs = self._build_response_logprobs(final_res)
+
             output = self._make_response_output_items(
-                request, final_res["text"], tokenizer
+                request, final_res["text"], logprobs, tokenizer
             )
 
+            num_reasoning_tokens = 0
             # Calculate usage from actual output
-            if hasattr(final_res, "meta_info"):
-                num_prompt_tokens = final_res.meta_info.get("prompt_tokens", 0)
-                num_generated_tokens = final_res.meta_info.get("completion_tokens", 0)
-                num_cached_tokens = final_res.meta_info.get("cached_tokens", 0)
-            elif hasattr(final_res, "prompt_token_ids") and hasattr(
-                final_res, "outputs"
-            ):
+            if "meta_info" in final_res:
+                meta_info = final_res.get("meta_info", {})
+                num_prompt_tokens = meta_info.get("prompt_tokens", 0)
+                num_generated_tokens = meta_info.get("completion_tokens", 0)
+                num_cached_tokens = meta_info.get("cached_tokens", 0)
+                num_reasoning_tokens = meta_info.get("reasoning_tokens", 0)
+            elif "prompt_token_ids" in final_res and "outputs" in final_res:
                 # Fallback calculation if meta_info not available
                 num_prompt_tokens = (
-                    len(final_res.prompt_token_ids) if final_res.prompt_token_ids else 0
-                )
-                num_generated_tokens = (
-                    len(final_res.outputs[0].token_ids)
-                    if final_res.outputs and final_res.outputs[0].token_ids
+                    len(final_res["prompt_token_ids"])
+                    if final_res.get("prompt_token_ids")
                     else 0
                 )
-                num_cached_tokens = getattr(final_res, "num_cached_tokens", 0)
-                num_reasoning_tokens = 0
+                num_generated_tokens = (
+                    len(final_res["outputs"][0]["token_ids"])
+                    if (
+                        final_res.get("outputs")
+                        and final_res["outputs"][0].get("token_ids")
+                    )
+                    else 0
+                )
+                num_cached_tokens = final_res.get("num_cached_tokens", 0)
             else:
                 # Final fallback
                 num_prompt_tokens = 0
                 num_generated_tokens = 0
                 num_cached_tokens = 0
-                num_reasoning_tokens = 0
 
-        usage = UsageInfo(
-            prompt_tokens=num_prompt_tokens,
-            completion_tokens=num_generated_tokens,
+        usage = ResponseUsageInfo(
+            input_tokens=num_prompt_tokens,
+            output_tokens=num_generated_tokens,
             total_tokens=num_prompt_tokens + num_generated_tokens,
-            reasoning_tokens=num_reasoning_tokens,
+            output_tokens_details=OutputTokenUsageInfo(
+                reasoning_tokens=num_reasoning_tokens
+            ),
         )
-        if self.enable_prompt_tokens_details and num_cached_tokens:
-            usage.prompt_tokens_details = PromptTokenUsageInfo(
+        if self.enable_prompt_tokens_details:
+            usage.input_tokens_details = PromptTokenUsageInfo(
                 cached_tokens=num_cached_tokens
             )
         request_metadata.final_usage_info = usage
@@ -526,14 +792,20 @@ class OpenAIServingResponses(OpenAIServingChat):
         self,
         request: ResponsesRequest,
         final_output: Any,
+        logprobs: Optional[list[dict]],
         tokenizer: Any,
     ):
         # Handle reasoning parsing if enabled
         if self.reasoning_parser:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_reasoning_from_request(request)
+            )
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
                 model_type=self.reasoning_parser,
                 stream_reasoning=False,
+                force_reasoning=is_force_reasoning,
                 request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
@@ -546,21 +818,40 @@ class OpenAIServingResponses(OpenAIServingChat):
             reasoning_item = ResponseReasoningItem(
                 id=f"rs_{random_uuid()}",
                 type="reasoning",
-                summary=[],
-                content=[
-                    ResponseReasoningTextContent(
-                        type="reasoning_text", text=reasoning_content
+                summary=[
+                    openai_responses_types.response_reasoning_item.Summary(
+                        type="summary_text",
+                        text=reasoning_content,
                     ),
                 ],
-                status=None,
+                content=[],
+                status="completed",
             )
             output_items.append(reasoning_item)
+
+        if (
+            request.tool_choice != "none"
+            and request.tools
+            and self.tool_call_parser
+            and content
+        ):
+            # Check for function tools and parse tool calls
+            function_tools = self._get_function_tools(request)
+            if function_tools:
+                remaining_text, tool_calls = self._parse_tool_calls(
+                    content,
+                    function_tools,
+                    request.tool_choice,
+                )
+                output_items.extend(tool_calls)
+                content = remaining_text
+
         if content:
             output_text = ResponseOutputText(
                 text=content,
                 annotations=[],  # TODO
                 type="output_text",
-                logprobs=None,  # TODO
+                logprobs=logprobs,
             )
             message = ResponseOutputMessage(
                 id=f"msg_{random_uuid()}",
@@ -612,19 +903,20 @@ class OpenAIServingResponses(OpenAIServingChat):
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
                 for content in output_item.content:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": request.instructions,
-                        }
-                    )
+                    if content.type == "output_text":
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": content.text,
+                            }
+                        )
 
         # Append the new input
         # Responses API supports simple text inputs without chat format
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            messages.extend(_normalize_responses_input(request.input))  # type: ignore
         return messages
 
     def _construct_input_messages_with_harmony(
@@ -871,6 +1163,49 @@ class OpenAIServingResponses(OpenAIServingChat):
                 response=initial_response,
             )
         )
+        # Initialize function call parser for streaming if function tools are present
+        function_tools = self._get_function_tools(request)
+        streaming_fc_parser: Optional[Union[FunctionCallParser, JsonArrayParser]] = None
+        if (
+            function_tools
+            and self.tool_call_parser
+            and not self.use_harmony
+            and request.tool_choice != "none"
+        ):
+            if request.tool_choice == "required" or isinstance(
+                request.tool_choice, ToolChoice
+            ):
+                streaming_fc_parser = JsonArrayParser()
+            else:
+                streaming_fc_parser = FunctionCallParser(
+                    function_tools, self.tool_call_parser
+                )
+
+        reasoning_parser: Optional[ReasoningParser] = None
+        if self.reasoning_parser:
+            is_force_reasoning = (
+                self.template_manager.force_reasoning
+                or self._get_reasoning_from_request(request)
+            )
+            reasoning_parser = ReasoningParser(
+                model_type=self.reasoning_parser,
+                stream_reasoning=True,
+                force_reasoning=is_force_reasoning,
+                request=request,
+            )
+
+        # Track state for non-Harmony streaming with function tools
+        simple_ctx_prev_text = ""
+        simple_ctx_sent_message_added = False
+        simple_ctx_accumulated_text = ""
+        simple_ctx_sent_reasoning_added = False
+        simple_ctx_sent_reasoning_done = False
+        simple_ctx_reasoning_text = ""
+        n_prev_token = 0
+        return_logprobs = self._should_return_logprobs(request)
+
+        # store function call state
+        tool_call_states = {}  # tool_index -> state dict
 
         async for ctx in result_generator:
 
@@ -879,6 +1214,374 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Contexts without this method are skipped, as they do not represent a new turn
             # or are not compatible with per-turn handling in the /v1/responses endpoint.
             if not hasattr(ctx, "is_expecting_start"):
+                if hasattr(ctx, "last_output") and ctx.last_output:
+                    current_text = ""
+                    if isinstance(ctx.last_output, dict):
+                        current_text = ctx.last_output.get("text", "")
+                    elif hasattr(ctx.last_output, "text"):
+                        current_text = ctx.last_output.text
+
+                    streaming_logprobs = None
+                    if return_logprobs:
+                        streaming_logprobs = (
+                            self._process_streaming_logprobs_for_responses(
+                                ctx.last_output,
+                                n_prev_token,
+                            )
+                        )
+                        meta_info = ctx.last_output.get("meta_info", {})
+                        if meta_info.get("output_token_logprobs_length"):
+                            n_prev_token = meta_info["output_token_logprobs_length"]
+
+                    # Get new text since last iteration
+                    if current_text and len(current_text) > len(simple_ctx_prev_text):
+                        new_chunk = current_text[len(simple_ctx_prev_text) :]
+                        simple_ctx_prev_text = current_text
+
+                        if reasoning_parser:
+                            reasoning_content, new_chunk = (
+                                reasoning_parser.parse_stream_chunk(new_chunk)
+                            )
+                            if reasoning_content:
+                                if not simple_ctx_sent_reasoning_added:
+                                    simple_ctx_sent_reasoning_added = True
+                                    yield _send_event(
+                                        openai_responses_types.ResponseOutputItemAddedEvent(
+                                            type="response.output_item.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item=openai_responses_types.ResponseReasoningItem(
+                                                id=current_item_id,
+                                                type="reasoning",
+                                                status="in_progress",
+                                                summary=[],
+                                            ),
+                                        )
+                                    )
+                                    yield _send_event(
+                                        openai_responses_types.ResponseReasoningSummaryPartAddedEvent(
+                                            type="response.reasoning_summary_part.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item_id=current_item_id,
+                                            summary_index=0,
+                                            part=openai_responses_types.response_reasoning_summary_part_added_event.Part(
+                                                type="summary_text",
+                                                text="",
+                                            ),
+                                        )
+                                    )
+
+                                yield _send_event(
+                                    openai_responses_types.ResponseReasoningSummaryTextDeltaEvent(
+                                        type="response.reasoning_summary_text.delta",
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        item_id=current_item_id,
+                                        summary_index=0,
+                                        delta=reasoning_content,
+                                    )
+                                )
+                                simple_ctx_reasoning_text += reasoning_content
+
+                            if (
+                                new_chunk
+                                and simple_ctx_sent_reasoning_added
+                                and not simple_ctx_sent_reasoning_done
+                            ):
+                                yield _send_event(
+                                    openai_responses_types.ResponseReasoningSummaryTextDoneEvent(
+                                        type="response.reasoning_summary_text.done",
+                                        item_id=current_item_id,
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        summary_index=0,
+                                        text=simple_ctx_reasoning_text,
+                                    )
+                                )
+                                yield _send_event(
+                                    openai_responses_types.ResponseReasoningSummaryPartDoneEvent(
+                                        type="response.reasoning_summary_part.done",
+                                        item_id=current_item_id,
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        summary_index=0,
+                                        part=openai_responses_types.response_reasoning_summary_part_done_event.Part(
+                                            type="summary_text",
+                                            text=simple_ctx_reasoning_text,
+                                        ),
+                                    )
+                                )
+                                yield _send_event(
+                                    openai_responses_types.ResponseOutputItemDoneEvent(
+                                        type="response.output_item.done",
+                                        sequence_number=-1,
+                                        output_index=current_output_index,
+                                        item=openai_responses_types.ResponseReasoningItem(
+                                            id=current_item_id,
+                                            type="reasoning",
+                                            status="completed",
+                                            summary=[
+                                                openai_responses_types.response_reasoning_item.Summary(
+                                                    type="summary_text",
+                                                    text=simple_ctx_reasoning_text,
+                                                ),
+                                            ],
+                                        ),
+                                    )
+                                )
+                                simple_ctx_sent_reasoning_done = True
+
+                        if new_chunk:
+                            # Parse for function calls if parser is available
+                            if streaming_fc_parser:
+                                if isinstance(streaming_fc_parser, JsonArrayParser):
+                                    result = (
+                                        streaming_fc_parser.parse_streaming_increment(
+                                            new_chunk, function_tools
+                                        )
+                                    )
+                                    normal_text, tool_calls = (
+                                        result.normal_text,
+                                        result.calls,
+                                    )
+                                else:
+                                    normal_text, tool_calls = (
+                                        streaming_fc_parser.parse_stream_chunk(
+                                            new_chunk
+                                        )
+                                    )
+
+                                # Emit text delta for normal text
+                                if normal_text:
+                                    if not simple_ctx_sent_message_added:
+                                        simple_ctx_sent_message_added = True
+                                        current_output_index += 1
+                                        current_item_id = f"item_{random_uuid()}"
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                                type="response.output_item.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=openai_responses_types.ResponseOutputMessage(
+                                                    id=current_item_id,
+                                                    type="message",
+                                                    role="assistant",
+                                                    content=[],
+                                                    status="in_progress",
+                                                ),
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseContentPartAddedEvent(
+                                                type="response.content_part.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item_id=current_item_id,
+                                                content_index=current_content_index,
+                                                part=openai_responses_types.ResponseOutputText(
+                                                    type="output_text",
+                                                    text="",
+                                                    annotations=[],
+                                                    logprobs=None,
+                                                ),
+                                            )
+                                        )
+                                    simple_ctx_accumulated_text += normal_text
+                                    yield _send_event(
+                                        openai_responses_types.ResponseTextDeltaEvent(
+                                            type="response.output_text.delta",
+                                            sequence_number=-1,
+                                            content_index=current_content_index,
+                                            output_index=current_output_index,
+                                            item_id=current_item_id,
+                                            delta=normal_text,
+                                            logprobs=(
+                                                streaming_logprobs
+                                                if streaming_logprobs is not None
+                                                else []
+                                            ),
+                                        )
+                                    )
+                                else:
+                                    if simple_ctx_sent_message_added:
+                                        simple_ctx_sent_message_added = False
+                                        content = (
+                                            openai_responses_types.ResponseOutputText(
+                                                type="output_text",
+                                                text=simple_ctx_accumulated_text,
+                                                annotations=[],
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseContentPartDoneEvent(
+                                                type="response.content_part.done",
+                                                sequence_number=-1,
+                                                item_id=current_item_id,
+                                                output_index=current_output_index,
+                                                content_index=current_content_index,
+                                                part=content,
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                                type="response.output_item.done",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=openai_responses_types.ResponseOutputMessage(
+                                                    id=current_item_id,
+                                                    type="message",
+                                                    role="assistant",
+                                                    content=[content],
+                                                    status="completed",
+                                                ),
+                                            )
+                                        )
+
+                                # Emit function call events for detected tool calls
+                                for call_info in tool_calls:
+                                    tool_index = call_info.tool_index
+
+                                    args_str = call_info.parameters or ""
+                                    if isinstance(args_str, dict):
+                                        args_str = json.dumps(args_str)
+                                    function_name = call_info.name or ""
+
+                                    if tool_index not in tool_call_states:
+                                        fc_item_id = f"fc_{random_uuid()}"
+                                        fc_call_id = f"call_{random_uuid()[:24]}"
+                                        tool_call_states[tool_index] = {
+                                            "item_id": fc_item_id,
+                                            "call_id": fc_call_id,
+                                            "name": function_name,
+                                            "arguments": args_str,
+                                            "emitted_done": False,
+                                        }
+                                        current_output_index += 1
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemAddedEvent(
+                                                type="response.output_item.added",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=ResponseFunctionToolCall(
+                                                    id=fc_item_id,
+                                                    type="function_call",
+                                                    call_id=fc_call_id,
+                                                    name=function_name,
+                                                    arguments="",
+                                                    status="in_progress",
+                                                ),
+                                            )
+                                        )
+                                    else:
+                                        # update existing function calls
+                                        state = tool_call_states[tool_index]
+                                        if function_name and not state["name"]:
+                                            state["name"] = function_name
+                                        if args_str:
+                                            state["arguments"] += args_str
+
+                                    current_state = tool_call_states[tool_index]
+                                    # Emit arguments delta
+                                    if args_str:
+                                        yield _send_event(
+                                            openai_responses_types.ResponseFunctionCallArgumentsDeltaEvent(
+                                                type="response.function_call_arguments.delta",
+                                                sequence_number=-1,
+                                                item_id=current_state["item_id"],
+                                                output_index=current_output_index,
+                                                delta=args_str,
+                                            )
+                                        )
+
+                                    if (
+                                        not current_state["emitted_done"]
+                                        and current_state["arguments"]
+                                        and _is_complete_json(
+                                            current_state["arguments"]
+                                        )
+                                    ):
+                                        # Emit function call done
+                                        yield _send_event(
+                                            openai_responses_types.ResponseFunctionCallArgumentsDoneEvent(
+                                                type="response.function_call_arguments.done",
+                                                sequence_number=-1,
+                                                item_id=current_state["item_id"],
+                                                output_index=current_output_index,
+                                                name=current_state["name"],
+                                                arguments=current_state["arguments"],
+                                            )
+                                        )
+                                        yield _send_event(
+                                            openai_responses_types.ResponseOutputItemDoneEvent(
+                                                type="response.output_item.done",
+                                                sequence_number=-1,
+                                                output_index=current_output_index,
+                                                item=ResponseFunctionToolCall(
+                                                    id=current_state["item_id"],
+                                                    type="function_call",
+                                                    call_id=current_state["call_id"],
+                                                    name=current_state["name"],
+                                                    arguments=current_state[
+                                                        "arguments"
+                                                    ],
+                                                    status="completed",
+                                                ),
+                                            )
+                                        )
+                                        current_state["emitted_done"] = True
+                            else:
+                                # No function call parser, just emit text deltas
+                                if not simple_ctx_sent_message_added:
+                                    current_output_index += 1
+                                    current_item_id = f"item_{random_uuid()}"
+                                    simple_ctx_sent_message_added = True
+                                    yield _send_event(
+                                        openai_responses_types.ResponseOutputItemAddedEvent(
+                                            type="response.output_item.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item=openai_responses_types.ResponseOutputMessage(
+                                                id=current_item_id,
+                                                type="message",
+                                                role="assistant",
+                                                content=[],
+                                                status="in_progress",
+                                            ),
+                                        )
+                                    )
+                                    yield _send_event(
+                                        openai_responses_types.ResponseContentPartAddedEvent(
+                                            type="response.content_part.added",
+                                            sequence_number=-1,
+                                            output_index=current_output_index,
+                                            item_id=current_item_id,
+                                            content_index=current_content_index,
+                                            part=openai_responses_types.ResponseOutputText(
+                                                type="output_text",
+                                                text="",
+                                                annotations=[],
+                                                logprobs=None,
+                                            ),
+                                        )
+                                    )
+                                simple_ctx_accumulated_text += new_chunk
+                                yield _send_event(
+                                    openai_responses_types.ResponseTextDeltaEvent(
+                                        type="response.output_text.delta",
+                                        sequence_number=-1,
+                                        content_index=current_content_index,
+                                        output_index=current_output_index,
+                                        item_id=current_item_id,
+                                        delta=new_chunk,
+                                        logprobs=(
+                                            streaming_logprobs
+                                            if streaming_logprobs is not None
+                                            else []
+                                        ),
+                                    )
+                                )
+
                 continue
 
             if ctx.is_expecting_start():
@@ -894,13 +1597,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                         reasoning_item = ResponseReasoningItem(
                             id=f"rs_{random_uuid()}",
                             type="reasoning",
-                            summary=[],
-                            content=[
-                                ResponseReasoningTextContent(
+                            summary=[
+                                openai_responses_types.response_reasoning_item.Summary(
+                                    type="summary_text",
                                     text=previous_item.content[0].text,
-                                    type="reasoning_text",
                                 ),
                             ],
+                            content=[],
                             status="completed",
                         )
                         yield _send_event(
@@ -1219,6 +1922,37 @@ class OpenAIServingResponses(OpenAIServingChat):
             if False:
                 yield
 
+        if isinstance(context, SimpleContext) and simple_ctx_sent_message_added:
+            content = openai_responses_types.ResponseOutputText(
+                type="output_text",
+                text=simple_ctx_accumulated_text,
+                annotations=[],
+            )
+            yield _send_event(
+                openai_responses_types.ResponseContentPartDoneEvent(
+                    type="response.content_part.done",
+                    sequence_number=-1,
+                    item_id=current_item_id,
+                    output_index=current_output_index,
+                    content_index=current_content_index,
+                    part=content,
+                )
+            )
+            yield _send_event(
+                openai_responses_types.ResponseOutputItemDoneEvent(
+                    type="response.output_item.done",
+                    sequence_number=-1,
+                    output_index=current_output_index,
+                    item=openai_responses_types.ResponseOutputMessage(
+                        id=current_item_id,
+                        type="message",
+                        role="assistant",
+                        content=[content],
+                        status="completed",
+                    ),
+                )
+            )
+
         final_response = await self.responses_full_generator(
             request,
             sampling_params,
@@ -1229,23 +1963,35 @@ class OpenAIServingResponses(OpenAIServingChat):
             request_metadata,
             created_time=created_time,
         )
+
+        # Align the call_id of the tool call item.
+        if tool_call_states:
+            tool_index = 0
+            if isinstance(final_response, ResponsesResponse):
+                for output_item in final_response.output:
+                    if isinstance(output_item, ResponseFunctionToolCall):
+                        if tool_index in tool_call_states:
+                            current_state = tool_call_states[tool_index]
+                            output_item.call_id = current_state["call_id"]
+                            tool_index += 1
+
         # Convert final_response to the format expected by ResponseCompletedEvent
         response_dict = final_response.model_dump()
 
         # Convert UsageInfo to ResponseUsage format
-        if response_dict.get("usage"):
-            usage_info = response_dict["usage"]
-            response_dict["usage"] = {
-                "input_tokens": usage_info.get("prompt_tokens", 0),
-                "input_tokens_details": {
-                    "cached_tokens": usage_info.get("cached_tokens", 0)
-                },
-                "output_tokens": usage_info.get("completion_tokens", 0),
-                "output_tokens_details": {
-                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
-                },
-                "total_tokens": usage_info.get("total_tokens", 0),
-            }
+        # if response_dict.get("usage"):
+        #     usage_info = response_dict["usage"]
+        #     response_dict["usage"] = {
+        #         "input_tokens": usage_info.get("prompt_tokens", 0),
+        #         "input_tokens_details": {
+        #             "cached_tokens": usage_info.get("cached_tokens", 0)
+        #         },
+        #         "output_tokens": usage_info.get("completion_tokens", 0),
+        #         "output_tokens_details": {
+        #             "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+        #         },
+        #         "total_tokens": usage_info.get("total_tokens", 0),
+        #     }
 
         yield _send_event(
             openai_responses_types.ResponseCompletedEvent(
@@ -1305,6 +2051,19 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return_text_in_logprobs=adapted_request.return_text_in_logprobs,
                 return_hidden_states=adapted_request.return_hidden_states,
                 background=adapted_request.background,
+                require_reasoning=adapted_request.require_reasoning,
+                bootstrap_host=adapted_request.bootstrap_host,
+                bootstrap_port=adapted_request.bootstrap_port,
+                bootstrap_room=adapted_request.bootstrap_room,
+                routed_dp_rank=adapted_request.routed_dp_rank,
+                disagg_prefill_dp_rank=adapted_request.disagg_prefill_dp_rank,
+                image_data=adapted_request.image_data,
+                video_data=adapted_request.video_data,
+                audio_data=adapted_request.audio_data,
+                modalities=adapted_request.modalities,
+                priority=adapted_request.priority,
+                routing_key=adapted_request.routing_key,
+                custom_labels=adapted_request.custom_labels,
             )
 
             # Update sampling params with reduced max_tokens
@@ -1326,3 +2085,187 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             # Slightly reduce priority for subsequent tool calls
             priority = orig_priority - 1
+
+    def _get_reasoning_from_request(self, request: ResponsesRequest) -> bool:
+        """Judge whether the request needs reasoning for hybrid reasoning models
+        NOTE: This is predefined based on model's chat template
+        """
+        if not self.reasoning_parser:
+            return False
+        if self.reasoning_parser in ["deepseek-v3"]:
+            # Models that require explicit enable thinking (thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("thinking") is True
+            )
+        if self.reasoning_parser in ["kimi_k2"]:
+            # Models that thinking by default, and can be disabled by setting thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("thinking") is not False
+            )
+        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            return (
+                not request.chat_template_kwargs
+                or request.chat_template_kwargs.get("enable_thinking") is not False
+            )
+        if self.reasoning_parser in ["mistral"]:
+            # Mistral models only reason when reasoning_effort is explicitly
+            # set to a value other than None/"none" (typically "high").
+            return (
+                request.reasoning is not None and request.reasoning.effort is not None
+            )
+        return True  # default
+
+    def _parse_tool_calls(
+        self,
+        content: str,
+        tools: list[Any],
+        tool_choice: Optional[Union[str, ToolChoice]] = None,
+    ) -> tuple[str, Optional[list[ResponseFunctionToolCall]]]:
+        """Process tool calls in the response"""
+
+        # Handle required or named tool choice
+        if tool_choice == "required" or (
+            isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
+        ):
+            try:
+                tool_call_data = orjson.loads(content)
+                tool_calls = []
+                for i, tool in enumerate(tool_call_data):
+                    # Create a ToolCallItem from the JSON data
+                    function_tool_call = ResponseFunctionToolCall(
+                        id=f"fc_{random_uuid()[:32]}",
+                        type="function_call",
+                        call_id=f"call_{random_uuid()[:24]}",
+                        name=tool["name"],
+                        arguments=json.dumps(tool["parameters"], ensure_ascii=False),
+                        status="completed",
+                    )
+                    tool_calls.append(function_tool_call)
+                return "", tool_calls
+            except json.JSONDecodeError as e:
+                logger.error(f"Tool call parsing error: {e}")
+                return content, None
+
+        remaining_text, tool_calls = parse_tool_calls_from_content(
+            content=content,
+            tools=tools,
+            tool_call_parser=self.tool_call_parser,
+            generate_tool_call_id=self._process_tool_call_id,
+        )
+
+        return remaining_text, tool_calls
+
+    def _should_return_logprobs(self, request: ResponsesRequest) -> bool:
+        """Check if logprobs should be returned based on include parameter."""
+        return (
+            request.include is not None
+            and "message.output_text.logprobs" in request.include
+        )
+
+    def _build_response_logprobs(
+        self, ret_item: dict[str, Any]
+    ) -> Optional[list[dict]]:
+        """Convert logprobs for ResponseOutputText format."""
+
+        meta_info = ret_item.get("meta_info", {})
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=meta_info["output_token_logprobs"],
+            output_top_logprobs=meta_info.get("output_top_logprobs", None),
+        )
+
+        # 转换为 ResponseOutputText.logprobs 所需格式
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _process_streaming_logprobs_for_responses(
+        self,
+        output: dict[str, Any],
+        n_prev_token: int,
+    ) -> Optional[list[dict]]:
+        """Process logprobs for streaming response in Responses API format.
+
+        Args:
+            output: The output dict containing meta_info with logprobs data
+            n_prev_token: Number of previously processed tokens
+
+        Returns:
+            List of logprob dicts for ResponseTextDeltaEvent, or None if not available
+        """
+        meta_info = output.get("meta_info", {})
+
+        if "output_token_logprobs" not in meta_info:
+            return None
+
+        output_token_logprobs = meta_info["output_token_logprobs"]
+        output_top_logprobs = meta_info.get("output_top_logprobs", [])
+
+        # 获取已处理的总 token 数
+        total_output_logprobs = meta_info["output_token_logprobs_length"]
+
+        # 只处理新增的 tokens
+        if n_prev_token >= total_output_logprobs:
+            return None
+
+        # 切片获取新增的 logprobs
+        if not self.tokenizer_manager.server_args.incremental_streaming_output:
+            output_token_logprobs = output_token_logprobs[
+                n_prev_token:total_output_logprobs
+            ]
+            output_top_logprobs = (
+                output_top_logprobs[n_prev_token:total_output_logprobs]
+                if output_top_logprobs
+                else []
+            )
+
+        logprobs = to_openai_style_logprobs(
+            output_token_logprobs=output_token_logprobs,
+            output_top_logprobs=output_top_logprobs,
+        )
+
+        # 转换为 ResponseTextDeltaEvent.logprobs 所需格式
+        # 格式: List[Dict] 每个元素包含 token, logprob, bytes, top_logprobs
+        token_logprobs = self._parse_logprobs_tokens(logprobs, use_token_index=True)
+        return token_logprobs
+
+    def _parse_logprobs_tokens(
+        self, logprobs: LogProbs, use_token_index: bool = False
+    ) -> Optional[list[dict]]:
+        """Common helper to process logprobs tokens for both streaming and non-streaming"""
+        token_logprobs = []
+
+        for token_idx, (token, logprob) in enumerate(
+            zip(logprobs.tokens, logprobs.token_logprobs)
+        ):
+            token_bytes = list(token.encode("utf-8"))
+            top_logprobs = []
+            if logprobs.top_logprobs:
+                # - Non-streaming (use_token_index=True): uses token_idx for full data
+                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
+                top_logprobs_idx = token_idx if use_token_index else 0
+                for top_token, top_logprob in logprobs.top_logprobs[
+                    top_logprobs_idx
+                ].items():
+                    top_token_bytes = list(top_token.encode("utf-8"))
+                    top_logprobs.append(
+                        {
+                            "token": top_token,
+                            "bytes": top_token_bytes,
+                            "logprob": top_logprob,
+                        }
+                    )
+            token_logprobs.append(
+                {
+                    "token": token,
+                    "bytes": token_bytes,
+                    "logprob": logprob,
+                    "top_logprobs": top_logprobs,
+                }
+            )
+
+        return token_logprobs

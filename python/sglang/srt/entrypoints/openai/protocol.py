@@ -172,6 +172,23 @@ class StructuresResponseFormat(BaseModel):
     end: str
 
 
+class JSONObjectFormat(BaseModel):
+    type: Literal["json_object"]
+
+
+class JSONSchemaFormat(BaseModel):
+    type: Literal["json_schema"]
+    name: str
+    description: Optional[str] = None
+    # use alias to workaround pydantic conflict
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
+    strict: Optional[bool] = False
+
+
+class ResponseTextFormat(BaseModel):
+    format: Union[JSONSchemaFormat, JSONObjectFormat]
+
+
 # NOTE(dark): keep this for backward compatibility
 class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
@@ -1236,15 +1253,40 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
+    type: Literal["web_search_preview", "code_interpreter", "function"] = Field(
         description="Type of tool to enable"
     )
+    # Function tool fields (required when type="function")
+    name: Optional[str] = Field(
+        default=None,
+        description="Name of the function (required for function type)",
+    )
+    description: Optional[str] = Field(
+        default=None,
+        description="Description of what the function does",
+    )
+    parameters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON Schema for function parameters",
+    )
+    strict: Optional[bool] = Field(
+        default=None,
+        description="Whether to enforce strict schema validation",
+    )
+
+    @model_validator(mode="after")
+    def validate_function_fields(self) -> "ResponseTool":
+        """Validate that function tools have required fields."""
+        if self.type == "function" and not self.name:
+            raise ValueError("Function tools must have a 'name' field")
+        return self
 
 
 ResponseInputOutputItem: TypeAlias = Union[
     ResponseInputItemParam,
     "ResponseReasoningItem",
     ResponseFunctionToolCall,
+    ChatCompletionMessageGenericParam,
 ]
 
 
@@ -1278,12 +1320,13 @@ class ResponsesRequest(BaseModel):
     store: Optional[bool] = True
     stream: Optional[bool] = False
     temperature: Optional[float] = None
-    tool_choice: Literal["auto", "required", "none"] = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
     user: Optional[str] = None
+    text: Optional[ResponseTextFormat] = None
 
     # Extra SGLang parameters
     request_id: str = Field(
@@ -1306,6 +1349,18 @@ class ResponsesRequest(BaseModel):
     top_k: int = -1
     min_p: float = 0.0
     repetition_penalty: float = 1.0
+    chat_template_kwargs: Optional[Dict] = None
+    # For PD disaggregation
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
+    # For DP routing — external router assigns a specific DP worker
+    routed_dp_rank: Optional[int] = None
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1317,11 +1372,22 @@ class ResponsesRequest(BaseModel):
     }
 
     def to_sampling_params(
-        self, default_max_tokens: int, default_params: Optional[Dict] = None
+        self,
+        default_max_tokens: int,
+        default_params: Optional[Dict] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation."""
         if default_params is None:
             default_params = {}
+
+        def get_param(param_name: str):
+            value = getattr(self, param_name)
+            if value is None:
+                return default_params.get(
+                    param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
+                )
+            return value
 
         # Use max_output_tokens if available, otherwise use max_tokens for backwards compatibility
         if self.max_output_tokens is not None:
@@ -1332,33 +1398,45 @@ class ResponsesRequest(BaseModel):
         # Avoid exceed the context length by minus 2 token
         max_tokens -= 2
 
-        # Get parameters with defaults
-        temperature = self.temperature
-        if temperature is None:
-            temperature = default_params.get(
-                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"]
-            )
-
-        top_p = self.top_p
-        if top_p is None:
-            top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
-
         params = {
             "max_new_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
+            "temperature": get_param("temperature"),
+            "top_p": get_param("top_p"),
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
             "stop": self.stop,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "repetition_penalty": self.repetition_penalty,
+            "top_k": get_param("top_k"),
+            "min_p": get_param("min_p"),
+            "repetition_penalty": get_param("repetition_penalty"),
         }
+
+        if self.text and self.text.format:
+            if self.text.format.type == "json_schema":
+                params["json_schema"] = convert_json_schema_to_str(
+                    self.text.format.schema_
+                )
+            elif self.text.format.type == "json_object":
+                params["json_schema"] = '{"type": "object"}'
 
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        if tool_call_constraint and params.get("json_schema"):
+            logger.warning("Constrained decoding is not compatible with tool calls.")
+        elif tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type == "structural_tag":
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                )
+            elif constraint_type == "json_schema":
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value  # type: ignore
+                )
+            else:
+                params[constraint_type] = constraint_value
 
         return params
 
@@ -1367,6 +1445,21 @@ class PromptTokenUsageInfo(BaseModel):
     """Prompt token usage details."""
 
     cached_tokens: int = 0
+
+
+class OutputTokenUsageInfo(BaseModel):
+    """Output token usage details."""
+
+    reasoning_tokens: int = 0
+
+
+class ResponseUsageInfo(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    # only used to return cached tokens when --enable-cache-report is set
+    input_tokens_details: Optional[PromptTokenUsageInfo] = None
+    output_tokens_details: Optional[OutputTokenUsageInfo] = None
 
 
 class ResponsesResponse(BaseModel):
@@ -1381,9 +1474,9 @@ class ResponsesResponse(BaseModel):
         Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
     ] = Field(default_factory=list)
     status: Literal["queued", "in_progress", "completed", "failed", "cancelled"]
-    usage: Optional[UsageInfo] = None
+    usage: Optional[ResponseUsageInfo] = None
     parallel_tool_calls: bool = True
-    tool_choice: str = "auto"
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
 
     # OpenAI compatibility fields. not all are used at the moment.
@@ -1417,7 +1510,7 @@ class ResponsesResponse(BaseModel):
             Union[ResponseOutputItem, ResponseReasoningItem, ResponseFunctionToolCall]
         ],
         status: str,
-        usage: Optional[UsageInfo],
+        usage: Optional[ResponseUsageInfo],
     ) -> "ResponsesResponse":
         """Create a response from a request."""
 
@@ -1489,7 +1582,7 @@ class RequestResponseMetadata(BaseModel):
     """Metadata for request/response tracking."""
 
     request_id: str
-    final_usage_info: Optional[UsageInfo] = None
+    final_usage_info: Optional[ResponseUsageInfo] = None
 
 
 @dataclass
@@ -1533,11 +1626,6 @@ class ToolCallProcessingResult(NamedTuple):
 class ResponseReasoningTextContent(BaseModel):
     text: str
     type: Literal["reasoning_text"] = "reasoning_text"
-
-
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
-]
 
 
 # ================== Transcription API Protocol Definitions ==================
