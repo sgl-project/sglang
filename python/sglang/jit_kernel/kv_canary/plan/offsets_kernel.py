@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.kv_canary.consts import CANARY_RESERVED_SLOT
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
     _require_1d,
@@ -91,6 +92,7 @@ def launch_plan_offsets_kernel(
         WRITE_OFFSETS_LEN=write_offsets_len,
         WRITE_REQ_CAPACITY=write_req_capacity,
         VERIFY_CAPACITY=verify_capacity,
+        RESERVED_SLOT=CANARY_RESERVED_SLOT,
     )
 
 
@@ -254,6 +256,7 @@ def _plan_offsets_kernel(
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
     VERIFY_CAPACITY: tl.constexpr,
+    RESERVED_SLOT: tl.constexpr,
 ):
     """Offsets kernel: per-req counts, seeds, exclusive-prefix-sum offsets, scalar totals.
 
@@ -264,7 +267,9 @@ def _plan_offsets_kernel(
     bs_mask = bs_offs < bs  # [BS_BLOCK] bool
 
     # Per-req inputs (int64 for canary-owned metadata; req_to_token keeps its pool dtype).
-    rpi = tl.load(req_pool_indices_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
+    rpi = tl.load(
+        req_pool_indices_ptr + bs_offs, mask=bs_mask, other=RESERVED_SLOT
+    )  # [BS_BLOCK]
     prefix_lens = tl.load(
         prefix_lens_ptr + bs_offs, mask=bs_mask, other=0
     )  # [BS_BLOCK]
@@ -272,7 +277,8 @@ def _plan_offsets_kernel(
         extend_seq_lens_ptr + bs_offs, mask=bs_mask, other=0
     )  # [BS_BLOCK]
 
-    is_active = (rpi != 0) & bs_mask  # [BS_BLOCK] bool
+    # Req pool idx 0 is the reserved CUDA-graph padding row.
+    is_active = (rpi != RESERVED_SLOT) & bs_mask  # [BS_BLOCK] bool
     has_prefix = is_active & (prefix_lens > 0)  # [BS_BLOCK] bool
 
     window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)  # [BS_BLOCK]

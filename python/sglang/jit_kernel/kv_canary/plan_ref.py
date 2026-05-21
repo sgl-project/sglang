@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 
+from sglang.jit_kernel.kv_canary.consts import CANARY_RESERVED_SLOT
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
@@ -117,7 +118,7 @@ def _materialize_verify_entries(
         rpi = int(req_pool_indices_host[r].item())
         prefix_len = int(prefix_lens_host[r].item())
 
-        if rpi == 0:
+        if rpi == CANARY_RESERVED_SLOT:
             continue
 
         if swa_window_size > 0:
@@ -206,7 +207,7 @@ def _materialize_write_metadata(
         rpi = int(req_pool_indices_host[r].item())
         extend_len = int(extend_seq_lens_host[r].item())
 
-        if rpi == 0 or extend_len <= 0:
+        if rpi == CANARY_RESERVED_SLOT or extend_len <= 0:
             write_len = 0
         else:
             write_len = max(0, extend_len)
@@ -233,7 +234,7 @@ def _materialize_write_metadata(
         prefix_len = int(prefix_lens_host[r].item())
         extend_len = int(extend_seq_lens_host[r].item())
 
-        if rpi == 0 or extend_len <= 0:
+        if rpi == CANARY_RESERVED_SLOT or extend_len <= 0:
             seed_slots_list.append(-1)
             continue
 

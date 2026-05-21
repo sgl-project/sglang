@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.kv_canary.consts import CANARY_RESERVED_SLOT
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
     _require_2d,
@@ -80,6 +81,7 @@ def launch_plan_entries_kernel(
         INNER_BLOCK=_PLAN_VERIFY_INNER_BLOCK,
         SWA_WINDOW=int(swa_window_size),
         HAS_SWA_LUT=has_swa_lut,
+        RESERVED_SLOT=CANARY_RESERVED_SLOT,
     )
 
 
@@ -192,6 +194,7 @@ def _plan_entries_kernel(
     INNER_BLOCK: tl.constexpr,
     SWA_WINDOW: tl.constexpr,
     HAS_SWA_LUT: tl.constexpr,
+    RESERVED_SLOT: tl.constexpr,
 ):
     """Entries kernel: materialize per-req verify entries. Grid = (bs, j_tiles).
 
@@ -204,8 +207,8 @@ def _plan_entries_kernel(
     rpi = tl.load(req_pool_indices_ptr + r)  # scalar
     prefix_lens = tl.load(prefix_lens_ptr + r)  # scalar
 
-    # Skip padding rows entirely.
-    if rpi == 0:
+    # Skip the reserved CUDA-graph padding row entirely.
+    if rpi == RESERVED_SLOT:
         return
 
     window_start = _compute_window_start(prefix_lens, SWA_WINDOW)  # scalar
