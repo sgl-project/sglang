@@ -25,11 +25,11 @@ register_cuda_ci(est_time=30, stage="extra-a", runner_config="1-gpu-large")
 def _make_static_plan_input(*, bs_capacity: int, device) -> PlanInput:
     return PlanInput(
         fb_req_pool_indices=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
-        fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
-        fb_extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int32, device=device),
-        extra_verify_slot_indices=torch.zeros(0, dtype=torch.int32, device=device),
-        extra_verify_positions=torch.zeros(0, dtype=torch.int32, device=device),
-        extra_verify_prev_slot_indices=torch.zeros(0, dtype=torch.int32, device=device),
+        fb_prefix_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        fb_extend_seq_lens=torch.zeros(bs_capacity, dtype=torch.int64, device=device),
+        extra_verify_slot_indices=torch.zeros(0, dtype=torch.int64, device=device),
+        extra_verify_positions=torch.zeros(0, dtype=torch.int64, device=device),
+        extra_verify_prev_slot_indices=torch.zeros(0, dtype=torch.int64, device=device),
         extra_verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
     )
 

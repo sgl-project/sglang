@@ -84,25 +84,25 @@ def canary_plan_step(
         verify_plan_out: Pre-allocated VerifyPlan; filled in-place.
         write_plan_out: Pre-allocated WritePlan; filled in-place. write_num_valid_reqs = 0 for sweep callers.
         fb_req_pool_indices: ForwardBatch.req_pool_indices; per-row ReqToTokenPool row index, shape [bs],
-            int32. 0 is the padding sentinel.
-        fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int32. Caller
+            int64. 0 is the padding sentinel.
+        fb_prefix_lens: Per-req prefix length already written before this step, shape [bs], int64. Caller
             normalizes: extend → ForwardBatch.extend_prefix_lens, decode → ForwardBatch.seq_lens - 1, sweep
             over running → seq_lens.
         fb_extend_seq_lens: ForwardBatch.extend_seq_lens; per-req tokens being written this step, shape [bs],
-            int32. 1 for pure decode; 0 for sweep.
+            int64. 1 for pure decode; 0 for sweep.
         req_to_token: ReqToTokenPool.req_to_token; full-pool slot index table, shape [max_reqs, max_seq_len],
             int32.
-        extra_verify_slot_indices: Pre-walked extra verify slots, shape [extra_verify_capacity], int32.
+        extra_verify_slot_indices: Pre-walked extra verify slots, shape [extra_verify_capacity], int64.
             Caller-translated to the target index space.
-        extra_verify_positions: Same shape, int32. Expected position per extra entry.
-        extra_verify_prev_slot_indices: Same shape, int32. -1 for chain-seed extras.
+        extra_verify_positions: Same shape, int64. Expected position per extra entry.
+        extra_verify_prev_slot_indices: Same shape, int64. -1 for chain-seed extras.
         extra_verify_num_valid: Active extra entry count, shape [1], int32. 0 for per-forward and running-sweep
             callers.
         swa_window_size: 0 for the FULL canary group; positive window length for the SWA group.
         full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. Required (non-None) iff
             swa_window_size > 0. Used to translate verify slot indices and chain-seed slot indices at plan time.
             Loaded element-typed via Triton ``tl.load``; intermediate translated slot values are int64 inside the
-            kernel and narrowed back to int32 at the final ``tl.store``.
+            kernel and stored in the int64 plan schema.
 
     Implementation:
         - Three sub-kernels with action-named identifiers, launched in sequence:
@@ -181,7 +181,7 @@ def canary_plan_step(
 
     device = verify_plan_out.verify_slot_indices.device
     verify_offsets_scratch = torch.zeros(
-        _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int32, device=device
+        _PLAN_BS_BLOCK_SIZE + 1, dtype=torch.int64, device=device
     )
 
     plan_verify_capacity = int(verify_plan_out.verify_slot_indices.shape[0])
@@ -313,7 +313,7 @@ def _plan_offsets_kernel(
     bs_offs = tl.arange(0, BS_BLOCK)  # [BS_BLOCK]
     bs_mask = bs_offs < bs  # [BS_BLOCK] bool
 
-    # Per-req inputs (int32 loads matching the dtype of fb_* / req_to_token).
+    # Per-req inputs (int64 for canary-owned metadata; req_to_token keeps its pool dtype).
     rpi = tl.load(req_pool_indices_ptr + bs_offs, mask=bs_mask, other=0)  # [BS_BLOCK]
     prefix_lens = tl.load(
         prefix_lens_ptr + bs_offs, mask=bs_mask, other=0
@@ -373,13 +373,13 @@ def _plan_offsets_kernel(
     out_offsets_mask = bs_mask  # [BS_BLOCK] bool
     tl.store(
         out_verify_offsets_ptr + bs_offs,
-        verify_exclusive.to(tl.int32),
+        verify_exclusive.to(tl.int64),
         mask=out_offsets_mask,
     )
     write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN  # [BS_BLOCK] bool
     tl.store(
         out_write_offsets_ptr + bs_offs,
-        write_exclusive.to(tl.int32),
+        write_exclusive.to(tl.int64),
         mask=write_offsets_mask & bs_mask,
     )
 
@@ -387,7 +387,7 @@ def _plan_offsets_kernel(
     seed_mask = bs_mask & (bs_offs < WRITE_REQ_CAPACITY)  # [BS_BLOCK] bool
     tl.store(
         out_write_seed_slot_indices_ptr + bs_offs,
-        seed_slot.to(tl.int32),
+        seed_slot.to(tl.int64),
         mask=seed_mask,
     )
 
@@ -397,12 +397,12 @@ def _plan_offsets_kernel(
 
     # Store the [bs] slot of verify_offsets and write_offsets (one element past the last per-req entry).
     # verify_offsets scratch has length BS_BLOCK + 1 so the bs slot is always in range.
-    tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int32))
+    tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int64))
     # write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
     write_tail_in_range = bs < WRITE_OFFSETS_LEN  # scalar bool
     tl.store(
         out_write_offsets_ptr + bs,
-        total_write.to(tl.int32),
+        total_write.to(tl.int64),
         mask=write_tail_in_range,
     )
 
@@ -515,17 +515,17 @@ def _plan_entries_kernel(
 
     tl.store(
         out_verify_slot_indices_ptr + out_offs,
-        slot.to(tl.int32),
+        slot.to(tl.int64),
         mask=write_mask,
     )
     tl.store(
         out_verify_positions_ptr + out_offs,
-        positions.to(tl.int32),
+        positions.to(tl.int64),
         mask=write_mask,
     )
     tl.store(
         out_verify_prev_slot_indices_ptr + out_offs,
-        prev_slot.to(tl.int32),
+        prev_slot.to(tl.int64),
         mask=write_mask,
     )
 
@@ -603,11 +603,11 @@ def _plan_extras_kernel(
     write_mask = in_range_mask & cap_mask  # [INNER_BLOCK] bool
 
     tl.store(
-        out_verify_slot_indices_ptr + out_offs, slots.to(tl.int32), mask=write_mask
+        out_verify_slot_indices_ptr + out_offs, slots.to(tl.int64), mask=write_mask
     )
     tl.store(
-        out_verify_positions_ptr + out_offs, positions.to(tl.int32), mask=write_mask
+        out_verify_positions_ptr + out_offs, positions.to(tl.int64), mask=write_mask
     )
     tl.store(
-        out_verify_prev_slot_indices_ptr + out_offs, prevs.to(tl.int32), mask=write_mask
+        out_verify_prev_slot_indices_ptr + out_offs, prevs.to(tl.int64), mask=write_mask
     )
