@@ -49,11 +49,59 @@ def fp8_paged_mqa_logits_torch(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """CUDA-graph-compatible FP8 paged MQA logits (vectorized, no .item()).
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
 
-    Vectorized across batches using batched gather + bmm instead of
-    per-batch Python loop with .item() calls.
-    """
+    assert head_dim == 128, "torch reference impl hardcodes DSV4 indexer head_dim=128"
+    assert block_size == 64, "torch reference impl hardcodes block_size=64 cache layout"
+    assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert weight.shape == (batch_size, num_heads)
+    assert seq_lens.shape == (batch_size,)
+    assert page_table.shape[0] == batch_size
+    assert clean_logits == False
+
+    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    for i in range(batch_size):
+        q = q_fp8[i, 0]
+        q = q.to(torch.float32)
+        q_scale = weight[i]
+        seq_len = int(seq_lens[i].item())
+        assert seq_len <= max_seq_len
+        num_pages = (seq_len + block_size - 1) // block_size
+        padded_seq_len = num_pages * block_size
+        pages = page_table[i, :num_pages]
+        kvcache_fp8 = kvcache_fp8.view(-1, block_size * (head_dim + 4))
+        kvcache = kvcache_fp8[pages]
+        SCALE_OFFSET = block_size * head_dim
+        kvcache_value = kvcache[..., :SCALE_OFFSET].view(dtype=FP8_DTYPE)
+        kvcache_scale = kvcache[..., SCALE_OFFSET:].view(dtype=torch.float32)
+        kvcache_value = kvcache_value.to(torch.float32)
+        kvcache_scale = kvcache_scale.contiguous()
+        kvcache_value = kvcache_value.view(padded_seq_len, head_dim)
+        kvcache_scale = kvcache_scale.view(padded_seq_len)
+        score = F.linear(kvcache_value, q)
+        score = F.relu(score)
+        score *= q_scale[None, :]
+        score = score.sum(dim=1)
+        score *= kvcache_scale
+        logits[i, :seq_len] = score[:seq_len]
+
+    return logits
+
+
+def fp8_paged_mqa_logits_torch_sm120(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """CUDA-graph-compatible FP8 paged MQA logits for SM120 (vectorized, no .item())."""
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
     block_size = kvcache_fp8.shape[1]
@@ -72,59 +120,40 @@ def fp8_paged_mqa_logits_torch(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
-    # ── Vectorized: no .item(), no per-batch loop ──
     max_pages = (max_seq_len + block_size - 1) // block_size
     max_padded_seq = max_pages * block_size
 
-    # Flatten KV cache for indexing: [total_pages, block_size * (head_dim + 4)]
     kvcache_flat = kvcache_fp8.view(-1, block_size * (head_dim + 4))
     SCALE_OFFSET = block_size * head_dim
 
-    # Gather pages for all batches: [batch, max_pages]
     page_ids = page_table[:, :max_pages]
-    # Gather KV data: [batch, max_pages, block_size * (head_dim + 4)]
     kvcache_gathered = kvcache_flat[page_ids]
 
-    # Split value and scale
-    kv_value_raw = kvcache_gathered[
-        ..., :SCALE_OFFSET
-    ]  # [batch, max_pages, block_size * head_dim]
-    kv_scale_raw = kvcache_gathered[
-        ..., SCALE_OFFSET:
-    ]  # [batch, max_pages, block_size * 4]
+    kv_value_raw = kvcache_gathered[..., :SCALE_OFFSET]
+    kv_scale_raw = kvcache_gathered[..., SCALE_OFFSET:]
 
-    # Dequant value: view as FP8, convert to float32
     kv_value = kv_value_raw.contiguous().view(dtype=FP8_DTYPE).to(torch.float32)
     kv_value = kv_value.view(batch_size, max_padded_seq, head_dim)
 
-    # Dequant scale
     kv_scale = kv_scale_raw.contiguous().view(dtype=torch.float32)
     kv_scale = kv_scale.view(batch_size, max_padded_seq)
 
-    # Q: [batch, num_heads, head_dim]
     q = q_fp8[:, 0].to(torch.float32)
 
-    # Batched matmul: [batch, max_padded_seq, head_dim] @ [batch, head_dim, num_heads]
-    score = torch.bmm(kv_value, q.transpose(1, 2))  # [batch, max_padded_seq, num_heads]
+    score = torch.bmm(kv_value, q.transpose(1, 2))
 
-    # ReLU + scale by weight + sum across heads
     score = F.relu(score)
-    score = score * weight.unsqueeze(1)  # [batch, max_padded_seq, num_heads]
-    score = score.sum(dim=2)  # [batch, max_padded_seq]
+    score = score * weight.unsqueeze(1)
+    score = score.sum(dim=2)
 
-    # Apply KV scale
-    score = score * kv_scale  # [batch, max_padded_seq]
+    score = score * kv_scale
 
-    # Create validity mask and write output — graph-safe (no torch.tensor() calls)
     out_width = min(max_padded_seq, max_seq_len)
     logits = score.new_full((batch_size, max_seq_len), float("-inf"))
     logits[:, :out_width] = score[:, :out_width]
 
-    # Mask invalid positions to -inf
     positions = torch.arange(max_seq_len, device=device)
-    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(
-        1
-    )  # [batch, max_seq_len]
+    invalid_mask = positions.unsqueeze(0) >= seq_lens.unsqueeze(1)
     logits.masked_fill_(invalid_mask, float("-inf"))
 
     return logits
@@ -411,8 +440,11 @@ class C4IndexerBackendMixin:
             from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() or is_sm120_supported():
-            fn = fp8_paged_mqa_logits_torch
+        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+            if is_sm120_supported():
+                fn = fp8_paged_mqa_logits_torch_sm120
+            else:
+                fn = fp8_paged_mqa_logits_torch
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 

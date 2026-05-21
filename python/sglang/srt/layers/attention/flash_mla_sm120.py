@@ -1,19 +1,14 @@
-"""FlashMLA adapter with SM120 fallback.
+"""SM120 FlashMLA sparse decode implementation.
+
+On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
+is not available, so this module provides alternative implementations:
+
+- A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
+- A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
 
 The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
 stride (nope_dim + rope_dim*2) per token, and scales are stored in a
-separate region at the end of each page.  The tensor shape
-``(num_pages, page_size, 1, bytes_per_token)`` is just metadata for the
-FlashMLA CUDA kernel -- it does NOT mean each token occupies
-*bytes_per_token* contiguous bytes.
-
-On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
-is not available, so this module provides a pure-PyTorch fallback that
-reads the raw paged buffer with the correct addressing.
-
-When SGLANG_SM120_TRITON_FLASHMLA=1 (default), a fused Triton kernel is
-used instead of the PyTorch fallback for significantly better performance.
-Set to 0 to fall back to the pure-PyTorch path.
+separate region at the end of each page.
 """
 
 import logging
@@ -21,11 +16,7 @@ import os
 
 import torch
 
-from sglang.srt.utils.common import is_sm120_supported
-
 logger = logging.getLogger(__name__)
-
-_is_sm120 = is_sm120_supported()
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -203,52 +194,36 @@ def _sm120_sparse_decode_fwd(
 
 
 # Default SM120 FlashMLA backend: "triton" (optimized) or "torch" (pure-PyTorch fallback).
-# Controlled by SGLANG_SM120_TRITON_FLASHMLA env var for backward compat (1=triton, 0=torch).
+# Controlled by SGLANG_SM120_TRITON_FLASHMLA env var (1=triton, 0=torch).
 _sm120_default_backend = (
     "triton" if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1" else "torch"
 )
 
 
-def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
-    if _is_sm120:
-        # On SM120, the `backend` parameter selects between "triton" (default,
-        # optimized Triton kernel) and "torch" (pure-PyTorch fallback).
-        # The original flash_mla CUDA "kernel" backend is unavailable on SM120.
-        sm120_backend = _sm120_default_backend if backend == "kernel" else backend
+def flash_mla_with_kvcache_sm120(**kwargs):
+    """SM120 FlashMLA sparse decode entry point.
 
-        q = kwargs["q"]
-        k_cache = kwargs["k_cache"]
-        indices = kwargs["indices"]
-        topk_length = kwargs.get("topk_length")
-        attn_sink = kwargs.get("attn_sink")
-        head_dim_v = kwargs["head_dim_v"]
-        softmax_scale = kwargs.get("softmax_scale")
-        if softmax_scale is None:
-            softmax_scale = q.shape[-1] ** (-0.5)
-        extra_k_cache = kwargs.get("extra_k_cache")
-        extra_indices = kwargs.get("extra_indices_in_kvcache")
-        extra_topk_length = kwargs.get("extra_topk_length")
+    Dispatches to the Triton kernel (default) or PyTorch fallback.
+    """
+    q = kwargs["q"]
+    k_cache = kwargs["k_cache"]
+    indices = kwargs["indices"]
+    topk_length = kwargs.get("topk_length")
+    attn_sink = kwargs.get("attn_sink")
+    head_dim_v = kwargs["head_dim_v"]
+    softmax_scale = kwargs.get("softmax_scale")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    extra_k_cache = kwargs.get("extra_k_cache")
+    extra_indices = kwargs.get("extra_indices_in_kvcache")
+    extra_topk_length = kwargs.get("extra_topk_length")
 
-        if sm120_backend == "triton":
-            from sglang.srt.layers.attention.flash_mla_sm120_triton import (
-                flash_mla_sparse_decode_triton,
-            )
+    if _sm120_default_backend == "triton":
+        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+            flash_mla_sparse_decode_triton,
+        )
 
-            out, lse = flash_mla_sparse_decode_triton(
-                q,
-                k_cache,
-                indices,
-                topk_length,
-                attn_sink,
-                head_dim_v,
-                softmax_scale,
-                extra_k_cache,
-                extra_indices,
-                extra_topk_length,
-            )
-            return (out, lse)
-
-        out, lse = _sm120_sparse_decode_fwd(
+        out, lse = flash_mla_sparse_decode_triton(
             q,
             k_cache,
             indices,
@@ -262,7 +237,16 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
         )
         return (out, lse)
 
-    assert backend == "kernel", f"unsupported backend {backend!r}"
-    import flash_mla
-
-    return flash_mla.flash_mla_with_kvcache(**kwargs)
+    out, lse = _sm120_sparse_decode_fwd(
+        q,
+        k_cache,
+        indices,
+        topk_length,
+        attn_sink,
+        head_dim_v,
+        softmax_scale,
+        extra_k_cache,
+        extra_indices,
+        extra_topk_length,
+    )
+    return (out, lse)

@@ -51,13 +51,6 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             f"Setting swa_full_tokens_ratio to {server_args.swa_full_tokens_ratio} for {model_arch}."
         )
 
-    # SM120: auto-select marlin MoE backend (dispatches to SM120 Triton kernel)
-    from sglang.srt.utils.common import is_sm120_supported
-
-    if is_sm120_supported() and server_args.moe_runner_backend == "auto":
-        server_args.moe_runner_backend = "marlin"
-        logger.info("Use marlin as MoE runner backend on SM120 for DeepSeekV4")
-
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""

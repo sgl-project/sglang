@@ -34,7 +34,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
-from sglang.srt.utils.common import is_sm120_supported
 
 logger = logging.getLogger(__name__)
 
@@ -58,33 +57,8 @@ if _use_aiter and not _use_aiter_preshuffle:
 if _is_cuda:
     try:
         import deep_gemm
-    except (ImportError, AssertionError) as e:
-        # AssertionError: deep_gemm init fails on SM120 (no CUDA_HOME / unsupported arch)
+    except ImportError as e:
         deep_gemm = e
-
-if is_sm120_supported():
-    import os as _os
-
-    if _os.environ.get("SGLANG_SM120_MQA_FALLBACK", "0") == "1":
-        from sglang.srt.layers.attention.dsa.sm120_mqa_fallback import (
-            compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
-        )
-        from sglang.srt.layers.attention.dsa.sm120_mqa_fallback import (
-            sm120_fp8_mqa_logits as _sm120_fp8_mqa_logits,
-        )
-        from sglang.srt.layers.attention.dsa.sm120_mqa_fallback import (
-            sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
-        )
-    else:
-        from sglang.srt.layers.attention.dsa.sm120_mqa_triton import (
-            compute_paged_mqa_schedule_metadata as _sm120_compute_paged_mqa_schedule_metadata,
-        )
-        from sglang.srt.layers.attention.dsa.sm120_mqa_triton import (
-            sm120_fp8_mqa_logits as _sm120_fp8_mqa_logits,
-        )
-        from sglang.srt.layers.attention.dsa.sm120_mqa_triton import (
-            sm120_fp8_paged_mqa_logits as _sm120_fp8_paged_mqa_logits,
-        )
 
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
@@ -244,12 +218,7 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            if is_sm120_supported():
-                # SM120: deep_gemm.get_num_sms() crashes; use torch native API
-                props = torch.cuda.get_device_properties(torch.cuda.current_device())
-                self.sm_count = props.multi_processor_count
-            else:
-                self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -300,7 +269,7 @@ class Indexer(MultiPlatformOp):
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if self.logits_with_pp_recv and not is_sm120_supported():
+        if self.logits_with_pp_recv:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
@@ -524,16 +493,9 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
         if _is_cuda:
             if schedule_metadata is None:
-                if is_sm120_supported():
-                    schedule_metadata = _sm120_compute_paged_mqa_schedule_metadata(
-                        seqlens_32_2d,
-                        blocksize,
-                        self.sm_count,
-                    )
-                else:
-                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                        seqlens_32_2d, blocksize, self.sm_count
-                    )
+                schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, blocksize, self.sm_count
+                )
 
         assert len(q_fp8.shape) == 3
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
@@ -569,17 +531,6 @@ class Indexer(MultiPlatformOp):
                 max_seq_len,
                 Preshuffle=_use_aiter_preshuffle,
                 KVBlockSize=block_kv,
-            )
-        elif is_sm120_supported():
-            logits = _sm120_fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
             )
         else:
             logits = deep_gemm.fp8_paged_mqa_logits(
@@ -756,15 +707,6 @@ class Indexer(MultiPlatformOp):
                     logits = fp8_mqa_logits(
                         q_fp8[:q_offset], kv, scale, weights[:q_offset], ks, ke
                     )
-                elif is_sm120_supported():
-                    logits = _sm120_fp8_mqa_logits(
-                        q_fp8[:q_offset],
-                        kv_fp8,
-                        weights[:q_offset],
-                        ks,
-                        ke,
-                        clean_logits=False,
-                    )
                 else:
                     logits = deep_gemm.fp8_mqa_logits(
                         q_fp8[:q_offset],
@@ -814,15 +756,6 @@ class Indexer(MultiPlatformOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
-                    )
-                elif is_sm120_supported():
-                    logits_chunk = _sm120_fp8_mqa_logits(
-                        q_fp8[start:end],
-                        kv_fp8,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
-                        clean_logits=False,
                     )
                 else:
                     logits_chunk = deep_gemm.fp8_mqa_logits(
@@ -915,11 +848,6 @@ class Indexer(MultiPlatformOp):
         actual_seq_q: int,
         cp_index: List[Tuple[int, int, int]] = None,
     ) -> torch.Tensor:
-        if is_sm120_supported():
-            raise NotImplementedError(
-                "Ragged CP path requires DeepGEMM fp8_mqa_logits which is not "
-                "supported on SM120. Use paged topk_transform instead."
-            )
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, DSATokenToKVPool)
 
