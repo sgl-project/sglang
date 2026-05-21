@@ -75,6 +75,7 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateRelayWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -397,22 +398,6 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        if obj.transfer_mode == "relay":
-            return await self.init_relay_weights_update_group(obj, request)
-        if obj.transfer_mode != "broadcast":
-            return (
-                False,
-                f"Unsupported distributed weight transfer_mode={obj.transfer_mode}.",
-            )
-
-        results = await self.init_weights_update_group_communicator(obj)
-        return FanOutCommunicator.merge_results(results)
-
-    async def init_relay_weights_update_group(
-        self: TokenizerManager,
-        obj: InitWeightsUpdateGroupReqInput,
-        request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
         results = await self.init_weights_update_group_communicator(obj)
         return FanOutCommunicator.merge_results(results)
 
@@ -439,14 +424,6 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        if obj.transfer_mode == "relay":
-            return await self.update_relay_weights_from_distributed(obj, request)
-        if obj.transfer_mode != "broadcast":
-            return (
-                False,
-                f"Unsupported distributed weight transfer_mode={obj.transfer_mode}.",
-            )
-
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
@@ -469,21 +446,13 @@ class TokenizerControlMixin:
 
     async def update_relay_weights_from_distributed(
         self: TokenizerManager,
-        obj: UpdateWeightsFromDistributedReqInput,
+        obj: UpdateRelayWeightsFromDistributedReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        if obj.weight_version is not None:
-            return (
-                False,
-                "relay distributed weight transfer does not accept weight_version. "
-                "The version is committed after relay load, fanout, and post-processing finish.",
-            )
-        if obj.load_format is not None:
-            return (
-                False,
-                "relay distributed weight transfer does not support "
-                f"load_format={obj.load_format}.",
-            )
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         async with self.is_pause_cond:
             if not self.is_pause:
