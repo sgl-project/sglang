@@ -710,5 +710,43 @@ class TestMiniCPMVUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         return dict(processor_output, format="processor_output")
 
 
+class TestPixtralUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTestCase):
+    model_path = "mistral-community/pixtral-12b"
+    chat_template = "mistral"
+
+    @classmethod
+    def _init_visual(cls):
+        # mistral-community/pixtral-12b ships with the HF Llava architecture
+        # (vision_tower = PixtralVisionModel, multi_modal_projector = Llava).
+        from transformers import LlavaForConditionalGeneration
+
+        model = LlavaForConditionalGeneration.from_pretrained(
+            cls.model_path, torch_dtype=torch.bfloat16
+        )
+        cls.vision_tower = model.vision_tower.eval().to(cls.device)
+        cls.mm_projector = model.multi_modal_projector.eval().to(cls.device)
+        del model
+
+        def visual_func(processor_output):
+            pixel_values = processor_output["pixel_values"].to(
+                cls.device, dtype=torch.bfloat16
+            )
+            image_sizes = processor_output["image_sizes"]
+            vision_out = cls.vision_tower(
+                pixel_values=pixel_values, image_sizes=image_sizes
+            )
+            last_hidden = (
+                vision_out.last_hidden_state
+                if hasattr(vision_out, "last_hidden_state")
+                else vision_out
+            )
+            return cls.mm_projector(last_hidden)
+
+        cls.visual = visual_func
+
+    def _processor_output_image_data(self, processor_output):
+        return dict(processor_output, format="processor_output")
+
+
 if __name__ == "__main__":
     unittest.main()
