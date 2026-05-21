@@ -1775,6 +1775,9 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        import time as _ts_time
+
+        _ts_handle_start = _ts_time.time()
         # Route: normal request / session request / session-not-found
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
@@ -1989,6 +1992,13 @@ class Scheduler(
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
+
+        logger.info(
+            "[HANDLE_REQ] rid=%s handle_dur=%.1fms ts=%.6f",
+            recv_req.rid[:8] if hasattr(recv_req, "rid") and recv_req.rid else "?",
+            (_ts_time.time() - _ts_handle_start) * 1000,
+            _ts_time.time(),
+        )
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
@@ -2828,6 +2838,9 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        import time as _ts_time
+
+        _ts_batch_start = _ts_time.time()
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -2938,6 +2951,30 @@ class Scheduler(
                 )
 
         self._maybe_report_active_ranks()
+
+        _batch_dur = (_ts_time.time() - _ts_batch_start) * 1000
+        if _batch_dur > 50:
+            _mode = (
+                batch.forward_mode.name
+                if hasattr(batch.forward_mode, "name")
+                else str(batch.forward_mode)
+            )
+            _has_mm = (
+                any(
+                    getattr(r, "multimodal_inputs", None) is not None
+                    for r in batch.reqs
+                )
+                if hasattr(batch, "reqs")
+                else False
+            )
+            logger.info(
+                "[RUN_BATCH] mode=%s bs=%d has_mm=%s dur=%.1fms ts=%.6f",
+                _mode,
+                len(batch.reqs) if hasattr(batch, "reqs") else 0,
+                _has_mm,
+                _batch_dur,
+                _ts_time.time(),
+            )
 
         return ret
 
