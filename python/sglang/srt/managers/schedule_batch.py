@@ -1329,20 +1329,35 @@ class Req(ReqDllmMixin):
         if self.has_log_time_stats:
             return
 
-        bootstrap_info = (
-            f", bootstrap_room={self.bootstrap_room}"
-            if self.bootstrap_room is not None
-            else ""
-        )
-        prefix = (
-            f"ReqTimeStats("
-            f"rid={self.rid}{bootstrap_info}, "
-            f"input_len={len(self.origin_input_ids)}, "
-            f"cached_input_len={self.cached_tokens}, "
-            f"output_len={len(self.output_ids)}, "
-            f"type={self.time_stats.disagg_mode_str()})"
-        )
-        logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
+        log_stats_format = get_global_server_args().log_stats_format
+        if log_stats_format == "json":
+            log_data = self.time_stats.convert_to_duration_dict()
+            log_data["event"] = "request.time_stats"
+            log_data["rid"] = self.rid
+            log_data["input_len"] = len(self.origin_input_ids)
+            log_data["cached_input_len"] = self.cached_tokens
+            log_data["output_len"] = len(self.output_ids)
+            log_data["type"] = self.time_stats.disagg_mode_str()
+            if self.bootstrap_room is not None:
+                log_data["bootstrap_room"] = self.bootstrap_room
+            import json
+
+            logger.info(json.dumps(log_data, ensure_ascii=False))
+        else:
+            bootstrap_info = (
+                f", bootstrap_room={self.bootstrap_room}"
+                if self.bootstrap_room is not None
+                else ""
+            )
+            prefix = (
+                f"ReqTimeStats("
+                f"rid={self.rid}{bootstrap_info}, "
+                f"input_len={len(self.origin_input_ids)}, "
+                f"cached_input_len={self.cached_tokens}, "
+                f"output_len={len(self.output_ids)}, "
+                f"type={self.time_stats.disagg_mode_str()})"
+            )
+            logger.info(f"{prefix}: {self.time_stats.convert_to_duration()}")
         self.has_log_time_stats = True
 
     def set_extend_input_len(self, extend_input_len: int):
