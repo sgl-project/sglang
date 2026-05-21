@@ -2,6 +2,7 @@ import copy
 import unittest
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -557,6 +558,35 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             req = GenerateReqInput(
                 text="Hello", input_ids=[1, 2, 3], input_embeds=[[0.1, 0.2]]
             )
+            req.normalize_batch_and_arguments()
+
+    def test_sampling_params_rejects_sampling_params_object(self):
+        """GenerateReqInput should reject internal SamplingParams objects."""
+        req = GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "sampling_params must be a dict or list of dicts, got SamplingParams.",
+        ):
+            req.normalize_batch_and_arguments()
+
+    def test_sampling_params_rejects_list_of_sampling_params_objects(self):
+        """GenerateReqInput should reject batched internal SamplingParams objects."""
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params=[
+                SamplingParams(max_new_tokens=1),
+                SamplingParams(max_new_tokens=2),
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            TypeError,
+            "sampling_params must be a dict or list of dicts, got list containing SamplingParams.",
+        ):
             req.normalize_batch_and_arguments()
 
     def test_multiple_input_formats(self):
