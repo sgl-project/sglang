@@ -32,19 +32,12 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
         }
         super().setUpClass()
 
-    def test_real_kv_hash_violation_observed(self) -> None:
-        self.send_parallel_requests(n=4, assert_all_successs=True, max_new_tokens=200)
-        suffix = "FULL" if self.target_group == "full" else "SWA"
-        try:
-            self.assert_violation_logged(
-                launch_tag_pattern=f"HEAD_*_{suffix}",
-                fail_reason="real_kv_hash",
-            )
-        except AssertionError:
-            self.assert_violation_logged(
-                launch_tag_pattern=f"TAIL_*_{suffix}",
-                fail_reason="real_kv_hash",
-            )
+    def test_real_kv_used_perturbation_reports_real_kv_hash_violation(self) -> None:
+        self.send_successful_perturb_requests()
+        self.assert_per_forward_violation_reported(
+            fail_reason="real_kv_hash",
+            target_group=self.target_group,
+        )
 
 
 class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase, unittest.TestCase):

@@ -24,20 +24,9 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
 
-    def test_chain_hash_violation_observed(self) -> None:
-        self.send_parallel_requests(n=4, assert_all_successs=True, max_new_tokens=200)
-        # Per-forward verify emits launch_tag of the form HEAD_<kernel>_<GROUP> or
-        # TAIL_<kernel>_<GROUP>. Try HEAD first; if not present, fall back to TAIL.
-        try:
-            self.assert_violation_logged(
-                launch_tag_pattern="HEAD_*",
-                fail_reason="chain_hash",
-            )
-        except AssertionError:
-            self.assert_violation_logged(
-                launch_tag_pattern="TAIL_*",
-                fail_reason="chain_hash",
-            )
+    def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
+        self.send_successful_perturb_requests()
+        self.assert_per_forward_violation_reported(fail_reason="chain_hash")
 
 
 class TestPerturbReqToTokenMha(_PerturbReqToTokenBase, unittest.TestCase):

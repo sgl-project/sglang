@@ -27,7 +27,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
 
-    def test_server_aborts_on_violation(self) -> None:
+    def test_real_kv_used_perturbation_raises_in_raise_mode(self) -> None:
         try:
             self.send_parallel_requests(
                 n=4,
@@ -37,18 +37,11 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
             )
         except Exception:
             pass
-        try:
-            self.assert_violation_logged(
-                launch_tag_pattern="HEAD_*_FULL",
-                fail_reason="real_kv_hash",
-                flush_wait_seconds=3.0,
-            )
-        except AssertionError:
-            self.assert_violation_logged(
-                launch_tag_pattern="TAIL_*_FULL",
-                fail_reason="real_kv_hash",
-                flush_wait_seconds=3.0,
-            )
+        self.assert_per_forward_violation_reported(
+            fail_reason="real_kv_hash",
+            target_group="full",
+            flush_wait_seconds=3.0,
+        )
 
 
 if __name__ == "__main__":

@@ -177,6 +177,42 @@ class CanaryE2EBase(CustomTestCase):
 
         return results
 
+    def send_successful_perturb_requests(
+        self, *, n: int = 4, max_new_tokens: int = 200
+    ) -> list[dict]:
+        return self.send_parallel_requests(
+            n=n,
+            assert_all_successs=True,
+            max_new_tokens=max_new_tokens,
+        )
+
+    def assert_per_forward_violation_reported(
+        self,
+        *,
+        fail_reason: str,
+        target_group: Optional[Literal["full", "swa"]] = None,
+        flush_wait_seconds: float = 2.0,
+    ) -> None:
+        suffix = "" if target_group is None else f"_{target_group.upper()}"
+        self.assert_violation_logged_any(
+            launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
+            fail_reason=fail_reason,
+            flush_wait_seconds=flush_wait_seconds,
+        )
+
+    def assert_sweep_violation_reported(
+        self,
+        *,
+        fail_reason: str,
+        target_group: Literal["full", "swa"],
+        flush_wait_seconds: float = 2.0,
+    ) -> None:
+        self.assert_violation_logged(
+            launch_tag_pattern=f"SWEEP_*_{target_group.upper()}",
+            fail_reason=fail_reason,
+            flush_wait_seconds=flush_wait_seconds,
+        )
+
     def assert_violation_logged(
         self,
         *,
@@ -203,6 +239,31 @@ class CanaryE2EBase(CustomTestCase):
                 return
         raise AssertionError(
             f"No canary violation matching launch_tag={launch_tag_pattern!r} "
+            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
+            f"{log_text[-2000:]}"
+        )
+
+    def assert_violation_logged_any(
+        self,
+        *,
+        launch_tag_patterns: tuple[str, ...],
+        fail_reason: str,
+        flush_wait_seconds: float = 2.0,
+    ) -> None:
+        time.sleep(flush_wait_seconds)
+        log_text = self._captured_log_text()
+        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
+        for match in line_re.finditer(log_text):
+            tag = match.group(1)
+            reason_field = match.group(2)
+            if fail_reason not in reason_field.split("+"):
+                continue
+            if any(
+                fnmatch.fnmatchcase(tag, pattern) for pattern in launch_tag_patterns
+            ):
+                return
+        raise AssertionError(
+            f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
             f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
             f"{log_text[-2000:]}"
         )
