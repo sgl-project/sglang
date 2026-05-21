@@ -50,18 +50,25 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
         json_model_override_args=json.dumps({"num_hidden_layers": 1}),
         cuda_graph_max_bs=8,
         max_running_requests=32,
-        context_length=2048,
-        max_total_tokens=16384,
+        context_length=8192,
+        max_total_tokens=65536,
     ),
     "swa": _ModeConfig(
         model_path="google/gemma-3-1b-it",
         json_model_override_args=json.dumps({"num_hidden_layers": 6}),
         cuda_graph_max_bs=8,
         max_running_requests=32,
-        context_length=2048,
-        max_total_tokens=16384,
+        context_length=8192,
+        max_total_tokens=65536,
     ),
 }
+
+
+# Long prompt body shared by all canary e2e tests. The repetition count is chosen
+# so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
+# fixtures (gemma-3-1b sliding_window = 512); short prompts would never exercise
+# the SWA-windowed verify path. Token count is roughly 6k after BPE.
+_LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 
 
 class CanaryE2EBase(CustomTestCase):
@@ -135,7 +142,7 @@ class CanaryE2EBase(CustomTestCase):
     def make_prompts(self, n: int) -> list[str]:
         if self.use_unique_prompts:
             return _make_unique_prompts(n)
-        return ["The capital of France is"] * n
+        return [_LONG_PROMPT_BODY] * n
 
     def send_parallel_requests(
         self,
@@ -218,7 +225,9 @@ class CanaryE2EBase(CustomTestCase):
 def _make_unique_prompts(n: int) -> list[str]:
     """Each prompt has a unique high-entropy prefix so no two share a radix prefix path.
     Used by perturb_real_kv_unused_cache tests so orphan slots actually stay orphan
-    (no future request will hit the corrupted KV)."""
+    (no future request will hit the corrupted KV). The body is the shared
+    _LONG_PROMPT_BODY so the prompt still exceeds the SWA sliding window."""
     return [
-        f"<{hex(i * 0x9E3779B1 & 0xFFFFFFFF)[2:]}> Tell me a fact." for i in range(n)
+        f"<{hex(i * 0x9E3779B1 & 0xFFFFFFFF)[2:]}> {_LONG_PROMPT_BODY}"
+        for i in range(n)
     ]
