@@ -599,7 +599,9 @@ def format_report(
 def main():
     parser = argparse.ArgumentParser(description="Generate runner utilization report")
     parser.add_argument("--repo", default="sgl-project/sglang", help="GitHub repo")
-    parser.add_argument("--hours", type=int, default=24, help="Time window in hours")
+    parser.add_argument(
+        "--hours", type=float, default=24, help="Time window in hours (fractional ok)"
+    )
     parser.add_argument(
         "--filter", type=str, help="Filter runner labels (e.g., '5090', 'h200')"
     )
