@@ -989,6 +989,7 @@ def popen_launch_pd_server(
     api_key: Optional[str] = None,
     other_args: list[str] = (),
     env: Optional[dict] = None,
+    return_stdout_stderr: Optional[tuple] = None,
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
@@ -1024,7 +1025,35 @@ def popen_launch_pd_server(
     if env is not None:
         env = {**os.environ, **env}
 
-    process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
+    if return_stdout_stderr:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            bufsize=1,
+        )
+
+        def _dump(src, sinks):
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    sink.write(line)
+                    sink.flush()
+            src.close()
+
+        threading.Thread(
+            target=_dump,
+            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_dump,
+            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+            daemon=True,
+        ).start()
+    else:
+        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
     return process
 
