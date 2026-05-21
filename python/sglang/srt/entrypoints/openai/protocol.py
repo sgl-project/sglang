@@ -13,6 +13,8 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid
@@ -23,10 +25,12 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Protocol,
     Tuple,
     TypeAlias,
     Union,
     get_args,
+    runtime_checkable,
 )
 
 from openai.types.responses import (
@@ -86,6 +90,42 @@ class ErrorResponse(BaseModel):
     type: str
     param: Optional[str] = None
     code: int
+
+
+@runtime_checkable
+class ParsedResponseFields(Protocol):
+    """Protocol for parsed response fields from custom renderers."""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict]]
+    reasoning_content: Optional[str]
+
+
+class ResponseParserProtocol(Protocol):
+    """Protocol for custom response parsers.
+
+    Implementations parse model output tokens into structured OpenAI response fields.
+    """
+
+    def parse_response(
+        self, output_ids: List[int]
+    ) -> Union[ParsedResponseFields, ErrorResponse]:
+        """Parse complete response from output token IDs."""
+        ...
+
+    def build_streaming_sse_chunks(
+        self,
+        output_ids: List[int],
+        index: int,
+        chunk_id: str,
+        model: str,
+        usage: Optional[Dict],
+    ) -> Tuple[List[str], bool, Optional[str]]:
+        """Parse streaming tokens and build SSE chunks.
+
+        Returns: (sse_chunks, has_tool_calls, error_message)
+        """
+        ...
 
 
 class LogProbs(BaseModel):
@@ -302,6 +342,7 @@ class CompletionRequest(BaseModel):
     user: Optional[str] = None
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
@@ -649,14 +690,18 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool = True
     return_hidden_states: bool = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
-        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
+        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path."
+        "'max' is an sglang extension to the OpenAI schema for "
+        "models that expose a maximum-effort tier above 'high'; models that don't "
+        "support it treat it the same as 'high'.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]

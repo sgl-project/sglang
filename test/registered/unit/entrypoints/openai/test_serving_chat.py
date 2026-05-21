@@ -32,7 +32,7 @@ from sglang.srt.managers.template_detection import ReasoningToggleConfig
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _MockTokenizerManager:
@@ -119,9 +119,12 @@ class ServingChatTestCase(unittest.TestCase):
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
-        with patch(
-            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
-        ) as conv_mock, patch.object(self.chat, "_process_messages") as proc_mock:
+        with (
+            patch(
+                "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+            ) as conv_mock,
+            patch.object(self.chat, "_process_messages") as proc_mock,
+        ):
             conv_ins = Mock()
             conv_ins.get_prompt.return_value = "Test prompt"
             conv_ins.image_data = conv_ins.audio_data = None
@@ -1225,6 +1228,37 @@ class ServingChatTestCase(unittest.TestCase):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
+    def test_non_stream_reasoning_response_preserves_payload_whitespace(self):
+        self.chat.reasoning_parser = "qwen3"
+        self.template_manager.force_reasoning = False
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            stream=False,
+            separate_reasoning=True,
+        )
+        ret = [
+            {
+                "text": "<think>\nLet me think\n</think>\n\nThe answer is 42.\n",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 5,
+                    "completion_tokens": 8,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "test",
+                },
+                "index": 0,
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=123)
+
+        message = response.choices[0].message
+        self.assertEqual(message.reasoning_content, "\nLet me think\n")
+        self.assertEqual(message.content, "\n\nThe answer is 42.\n")
+
     # ------------- reasoning config tests -------------
     def test_get_reasoning_from_request_default_true_toggle(self):
         self.tm.server_args.reasoning_parser = "qwen3"
@@ -1393,6 +1427,72 @@ class ServingChatTestCase(unittest.TestCase):
         msg = response.choices[0].message
         self.assertIsNone(msg.content)
         self.assertEqual(msg.reasoning_content, "42")
+
+    # --- poolside_v1 (Laguna-XS.2) regression tests ---
+
+    def test_poolside_v1_enable_thinking_dispatch(self):
+        """Laguna chat template defaults `enable_thinking=false`. Parser must
+        follow that default — must NOT return True via the generic fallback.
+        After the reasoning-config refactor, this is driven by
+        `_PoolsideV1Detector.reasoning_default = "explicit_enable_thinking"`."""
+        self._setup_fallback("poolside_v1")
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, False),  # no chat_template_kwargs → non-thinking (default)
+            ({}, False),  # empty kwargs → non-thinking
+            ({"enable_thinking": False}, False),  # explicit off
+            ({"enable_thinking": True}, True),  # explicit on
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(self.chat._get_reasoning_from_request(req), expected)
+
+    def test_poolside_v1_does_not_double_prepend_think(self):
+        """When `enable_thinking=True` for poolside_v1, the HF chat template
+        already emits `<think>` via add_generation_prompt — server must NOT
+        append a second `<think>`. After the refactor this is guarded by
+        `_PoolsideV1Detector.thinks_internally = True` (inherited from Qwen3Detector).
+        """
+        self._setup_fallback("poolside_v1")
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "BASE_PROMPT"
+            conv_ins.image_data = conv_ins.audio_data = conv_ins.video_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = []
+            conv_mock.return_value = conv_ins
+            result = self.chat._apply_conversation_template(req, is_multimodal=False)
+        self.assertEqual(result.prompt, "BASE_PROMPT")
+
+    # ------------- hook method tests -------------
+    def test_encode_messages_returns_none_by_default(self):
+        """Default _encode_messages returns None (use standard encoding)."""
+        result = self.chat._encode_messages([], Mock(), False)
+        self.assertIsNone(result)
+
+    def test_decode_response_returns_text(self):
+        """Default _decode_response returns ret_item['text']."""
+        ret_item = {"text": "Hello world", "output_ids": [1, 2, 3]}
+        result = self.chat._decode_response(ret_item)
+        self.assertEqual(result, "Hello world")
+
+    def test_get_parsed_response_fields_passthrough(self):
+        """Default _get_parsed_response_fields passes through values."""
+        reasoning = "thinking..."
+        tool_calls = [{"name": "foo"}]
+        r, t = self.chat._get_parsed_response_fields(reasoning, tool_calls)
+        self.assertEqual(r, reasoning)
+        self.assertEqual(t, tool_calls)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):

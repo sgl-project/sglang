@@ -36,7 +36,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
     enable_num_token_non_padded,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     log_info_on_rank0,
     require_attn_tp_gather,
@@ -528,7 +527,7 @@ class CPUGraphRunner:
             not self.require_gathered_buffer
         ), "CPUGraphRunner does not support gathered buffer yet."
         assert (
-            model_runner.spec_algorithm == SpeculativeAlgorithm.NONE
+            model_runner.spec_algorithm.is_none()
         ), "CPUGraphRunner does not support speculative inference yet."
         # TODO add compile support for encoder-decoder models
         assert (
@@ -802,7 +801,7 @@ class CPUGraphRunner:
             captured_forward_batch.encoder_lens[:raw_bs].copy_(
                 forward_batch.encoder_lens
             )
-        if enable_num_token_non_padded(self.model_runner.server_args):
+        if enable_num_token_non_padded():
             captured_forward_batch.num_token_non_padded.copy_(
                 forward_batch.num_token_non_padded
             )

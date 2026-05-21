@@ -5,7 +5,7 @@ import random
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
-from typing import TYPE_CHECKING, Literal, Optional, Tuple, Type, overload
+from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
 
 import numpy as np
 import torch
@@ -15,7 +15,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.base.conn import KVArgs
+    from sglang.srt.disaggregation.base.conn import KVArgs, StateType
     from sglang.srt.disaggregation.common.conn import (
         CommonKVBootstrapServer,
         CommonKVManager,
@@ -263,26 +263,30 @@ class MetadataBuffers:
         self.cached_tokens[req.metadata_buffer_index][2] = req.cached_tokens_host
         self.cached_tokens[req.metadata_buffer_index][3] = req.cached_tokens_storage
         if req.return_logprob:
-            if req.output_token_logprobs_val:  # not none or empty list
+            if req.logprob.output_token_logprobs_val:  # not none or empty list
                 self.output_token_logprobs_val[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_val[0]
+                    req.logprob.output_token_logprobs_val[0]
                 )
-            if req.output_token_logprobs_idx:  # not none or empty list
+            if req.logprob.output_token_logprobs_idx:  # not none or empty list
                 self.output_token_logprobs_idx[req.metadata_buffer_index][0] = (
-                    req.output_token_logprobs_idx[0]
+                    req.logprob.output_token_logprobs_idx[0]
                 )
 
-            if req.output_top_logprobs_val:  # not none or empty list
+            if req.logprob.output_top_logprobs_val:  # not none or empty list
                 self.output_top_logprobs_val[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_val[0])
+                    : len(req.logprob.output_top_logprobs_val[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_val[0], dtype=torch.float32, device="cpu"
+                    req.logprob.output_top_logprobs_val[0],
+                    dtype=torch.float32,
+                    device="cpu",
                 )
-            if req.output_top_logprobs_idx:  # not none or empty list
+            if req.logprob.output_top_logprobs_idx:  # not none or empty list
                 self.output_top_logprobs_idx[req.metadata_buffer_index][
-                    : len(req.output_top_logprobs_idx[0])
+                    : len(req.logprob.output_top_logprobs_idx[0])
                 ] = torch.tensor(
-                    req.output_top_logprobs_idx[0], dtype=torch.int32, device="cpu"
+                    req.logprob.output_top_logprobs_idx[0],
+                    dtype=torch.int32,
+                    device="cpu",
                 )
         # For PD + spec decode
         if req.hidden_states_tensor is not None:
@@ -532,61 +536,100 @@ def is_mla_backend(target_kv_pool) -> bool:
     return isinstance(target_kv_pool, (MLATokenToKVPool, DeepSeekV4TokenToKVPool))
 
 
+def append_state_component(
+    kv_args: KVArgs,
+    state_type: StateType,
+    data_ptrs: List[int],
+    data_lens: List[int],
+    item_lens: List[int],
+    dim_per_tensor: Optional[List[int]] = None,
+) -> None:
+    """Append one state component. Caller orders state_types consistently
+    on prefill and decode sides."""
+    kv_args.state_types.append(state_type)
+    kv_args.state_data_ptrs.append(data_ptrs)
+    kv_args.state_data_lens.append(data_lens)
+    kv_args.state_item_lens.append(item_lens)
+    kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     token_to_kv_pool,
     draft_token_to_kv_pool=None,
+    total_kv_layers: int = None,
+    req_to_token_pool=None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
-
     Shared by prefill and decode bootstrap paths so the state_type dispatch
     lives in one place.
     """
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
 
-    if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
-        kv_args.state_data_ptrs = []
-        kv_args.state_data_lens = []
-        kv_args.state_item_lens = []
-        kv_args.state_type = "none"
-        return
+    kv_args.state_types = []
+    kv_args.state_data_ptrs = []
+    kv_args.state_data_lens = []
+    kv_args.state_item_lens = []
+    kv_args.state_dim_per_tensor = []
 
-    state_data_ptrs, state_data_lens, state_item_lens = (
-        token_to_kv_pool.get_state_buf_infos()
-    )
-    kv_args.state_data_ptrs = state_data_ptrs
-    kv_args.state_data_lens = state_data_lens
-    kv_args.state_item_lens = state_item_lens
+    if hasattr(token_to_kv_pool, "get_state_buf_infos"):
+        data_ptrs, data_lens, item_lens = token_to_kv_pool.get_state_buf_infos()
 
-    # V4 must be checked before BaseSWAKVPool: V4's state pool is a flat
-    # heterogeneous list (SWA + compress + indexer), so the per-layer K/V
-    # transfer path used for "swa"/"nsa" does not apply.
-    if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        kv_args.state_type = "dsv4"
-    elif isinstance(token_to_kv_pool, BaseSWAKVPool):
-        kv_args.state_type = "swa"
-    elif isinstance(token_to_kv_pool, HybridLinearKVPool):
-        kv_args.state_type = "mamba"
-        # Get state dimension info for cross-TP slice transfer
-        if hasattr(token_to_kv_pool, "get_state_dim_per_tensor"):
-            kv_args.state_dim_per_tensor = token_to_kv_pool.get_state_dim_per_tensor()
-    elif isinstance(token_to_kv_pool, NSATokenToKVPool):
-        kv_args.state_type = "nsa"
-        if draft_token_to_kv_pool is not None and isinstance(
-            draft_token_to_kv_pool, NSATokenToKVPool
-        ):
-            (
-                draft_state_data_ptrs,
-                draft_state_data_lens,
-                draft_state_item_lens,
-            ) = draft_token_to_kv_pool.get_state_buf_infos()
-            kv_args.state_data_ptrs += draft_state_data_ptrs
-            kv_args.state_data_lens += draft_state_data_lens
-            kv_args.state_item_lens += draft_state_item_lens
-    else:
-        kv_args.state_type = "none"
+        # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
+        # state list is described per-entry via get_state_buf_infos.
+        if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            append_state_component(
+                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+            )
+        elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+            dim = (
+                token_to_kv_pool.get_state_dim_per_tensor()
+                if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
+                else None
+            )
+            append_state_component(
+                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
+        elif isinstance(token_to_kv_pool, (DSATokenToKVPool, NPUMLATokenToKVPool)):
+            if draft_token_to_kv_pool is not None and isinstance(
+                draft_token_to_kv_pool, DSATokenToKVPool
+            ):
+                (
+                    draft_data_ptrs,
+                    draft_data_lens,
+                    draft_item_lens,
+                ) = draft_token_to_kv_pool.get_state_buf_infos()
+                data_ptrs = data_ptrs + draft_data_ptrs
+                data_lens = data_lens + draft_data_lens
+                item_lens = item_lens + draft_item_lens
+            if isinstance(token_to_kv_pool, NPUMLATokenToKVPool):
+                kv_args.kv_buf_groups = (
+                    len(kv_args.kv_data_ptrs) // token_to_kv_pool.layer_num
+                )
+                kv_args.total_kv_layers = total_kv_layers
+            else:
+                append_state_component(
+                    kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
+                )
+
+    if (
+        StateType.MAMBA not in kv_args.state_types
+        and req_to_token_pool is not None
+        and hasattr(req_to_token_pool, "get_state_buf_infos")
+    ):
+        data_ptrs, data_lens, item_lens = req_to_token_pool.get_state_buf_infos()
+        if data_ptrs:
+            dim = (
+                req_to_token_pool.get_state_dim_per_tensor()
+                if hasattr(req_to_token_pool, "get_state_dim_per_tensor")
+                else None
+            )
+            append_state_component(
+                kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
+            )
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
@@ -596,9 +639,9 @@ def prepare_abort(req: Req, error_message: str, status_code=None):
     req.finished_reason = FINISH_ABORT(error_message, status_code)
 
     if req.return_logprob:
-        req.input_token_logprobs_val = []
-        req.input_token_logprobs_idx = []
-        req.input_top_logprobs_val = []
-        req.input_top_logprobs_idx = []
-        req.input_token_ids_logprobs_val = []
-        req.input_token_ids_logprobs_idx = []
+        req.logprob.input_token_logprobs_val = []
+        req.logprob.input_token_logprobs_idx = []
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
+        req.logprob.input_token_ids_logprobs_val = []
+        req.logprob.input_token_ids_logprobs_idx = []
