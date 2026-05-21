@@ -709,6 +709,15 @@ class LayerCommunicator:
                 return True
             if forward_batch.dp_padding_mode.is_max_len():
                 return True
+        # CP per-layer reduce-scatter path (former dsa_use_prefill_cp branch).
+        # Wiring is detected via the chosen tensor-pair fn rather than a
+        # global predicate so it lights up automatically when the layer is
+        # configured for SCATTERED↔FULL CP transitions.
+        if (
+            self._communicate_summable_tensor_pair_fn
+            is CommunicateSummableTensorPairFn._cp_scatter_after_mlp
+        ):
+            return True
         if dsa_use_prefill_cp(forward_batch):
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
@@ -932,6 +941,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 residual_input_mode=residual_input_mode,
             )
 
+        # CP per-layer SCATTERED→FULL: layernorm on the per-rank shard, then
+        # allgather across the attn_cp group so MLP sees the full sequence.
+        # Active only when the running CP strategy declares per_layer_attn_cp_comm
+        # (currently DSA-style strategies only). Implemented as a dispatch
+        # branch so deleting communicator_dsa_cp.py doesn't introduce a fork.
+        if (
+            (hidden_states_input_mode == ScatterMode.SCATTERED)
+            and (residual_input_mode == ScatterMode.SCATTERED)
+            and (hidden_states_output_mode == ScatterMode.FULL)
+            and (residual_output_mode == ScatterMode.SCATTERED)
+        ):
+            return CommunicateWithAllReduceAndLayerNormFn._cp_layernorm_then_gather
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {hidden_states_output_mode=} {residual_output_mode=}"
         )
@@ -947,6 +969,34 @@ class CommunicateWithAllReduceAndLayerNormFn:
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
             hidden_states, residual = layernorm(hidden_states, residual)
+        return hidden_states, residual
+
+    @staticmethod
+    def _cp_layernorm_then_gather(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layernorm: torch.nn.Module,
+        context: CommunicateContext,
+    ):
+        """Layernorm on the per-rank slice, then optionally allgather across
+        the attn_cp group. Used by DSA-CP layers where attention runs
+        SCATTERED but MLP/MoE wants the FULL sequence layout. Identical to
+        the former ``DSACPCommunicateWithAllReduceAndLayerNormFn``."""
+        from sglang.srt.layers.cp.strategy import (
+            _cp_active_for_per_layer,
+            get_cp_strategy,
+        )
+
+        if hidden_states.shape[0] != 0:
+            hidden_states, residual = layernorm(hidden_states, residual)
+
+        s = get_cp_strategy()
+        if s is not None and _cp_active_for_per_layer(forward_batch):
+            assert (
+                context.attn_dp_size == 1
+            ), "per-layer CP allgather requires attn_dp_size == 1"
+            hidden_states = s.maybe_gather_for_mlp(hidden_states, forward_batch)
         return hidden_states, residual
 
     @staticmethod
@@ -1192,6 +1242,16 @@ class CommunicateSummableTensorPairFn:
         ):
             return CommunicateSummableTensorPairFn._scatter_hidden_states_moe
 
+        # CP per-layer FULL→SCATTERED: reduce-scatter the FULL MLP output back
+        # into per-rank SCATTERED chunks. Mirrors the former
+        # ``DSACPCommunicateSummableTensorPairFn._scatter_hidden_states``.
+        if (
+            (hidden_states_input_mode == ScatterMode.FULL)
+            and (residual_input_mode == ScatterMode.SCATTERED)
+            and (output_mode == ScatterMode.SCATTERED)
+        ):
+            return CommunicateSummableTensorPairFn._cp_scatter_after_mlp
+
         raise NotImplementedError(
             f"{hidden_states_input_mode=} {residual_input_mode=} {output_mode=}"
         )
@@ -1264,6 +1324,29 @@ class CommunicateSummableTensorPairFn:
         assert residual is None, "not yet handled residual!=None"
         tensor_list = list(hidden_states.tensor_split(context.attn_tp_size))
         hidden_states = tensor_list[context.attn_tp_rank]
+        return hidden_states, residual
+
+    @staticmethod
+    def _cp_scatter_after_mlp(
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        context: CommunicateContext,
+        allow_reduce_scatter: bool = False,
+    ):
+        """Reduce-scatter the FULL MLP output back to per-rank SCATTERED
+        chunks via the attn_cp group. Used by DSA-CP layers."""
+        from sglang.srt.layers.cp.strategy import (
+            _cp_active_for_per_layer,
+            get_cp_strategy,
+        )
+
+        s = get_cp_strategy()
+        if s is not None and _cp_active_for_per_layer(forward_batch):
+            assert (
+                context.attn_dp_size == 1
+            ), "per-layer CP reduce-scatter requires attn_dp_size == 1"
+            hidden_states = s.maybe_scatter_after_mlp(hidden_states, forward_batch)
         return hidden_states, residual
 
     @staticmethod

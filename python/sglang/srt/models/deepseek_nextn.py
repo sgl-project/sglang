@@ -28,9 +28,13 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.dsa.utils import (
-    can_dsa_cp_split,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
+)
+from sglang.srt.layers.cp.utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -42,12 +46,6 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import Fp8Config
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.cp_utils import (
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -290,13 +288,14 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     ) -> torch.Tensor:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(
-                len(input_ids), self.cp_size, self.use_dsa, forward_batch
+            from sglang.srt.layers.cp.strategy import get_cp_strategy
+
+            _cp_strategy = get_cp_strategy()
+            if _cp_strategy is not None and _cp_strategy.can_apply(
+                len(input_ids), forward_batch
             ):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
+                forward_batch.attn_cp_metadata = _cp_strategy.build_metadata(
                     len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
         hidden_states = self.model(input_ids, positions, forward_batch)

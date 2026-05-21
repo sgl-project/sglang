@@ -65,34 +65,36 @@ def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
 
 
 def is_dsa_enable_prefill_cp():
-    return get_global_server_args().enable_dsa_prefill_context_parallel
+    """True when *any* CP strategy is bound for this process AND the model is
+    DSA. DSA-only branches inside the indexer / compressor / dsa_backend gate
+    on this — they assume the strategy is interleave-or-zigzag, never None."""
+    sa = get_global_server_args()
+    if not getattr(sa, "enable_prefill_cp", False):
+        return False
+    return bool(getattr(sa, "_is_dsa_model_arch", False))
 
 
 def is_dsa_prefill_cp_in_seq_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
-    )
+    from sglang.srt.layers.cp.strategy import is_zigzag
+
+    return is_dsa_enable_prefill_cp() and is_zigzag()
 
 
 def is_dsa_prefill_cp_round_robin_split():
-    return (
-        is_dsa_enable_prefill_cp()
-        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
-    )
+    from sglang.srt.layers.cp.strategy import is_interleave
+
+    return is_dsa_enable_prefill_cp() and is_interleave()
 
 
 def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
-    if not forward_batch.forward_mode.is_context_parallel_extend():
+    from sglang.srt.layers.cp.strategy import get_cp_strategy, is_interleave
+
+    if not is_dsa_enable_prefill_cp() or not is_interleave():
         return False
-    cp_size = get_attention_cp_size()
-    seq_len = sum(forward_batch.extend_seq_lens_cpu)
-    return (
-        is_dsa_prefill_cp_round_robin_split()
-        and seq_len > 0
-        and seq_len >= cp_size
-        and cp_size > 1
-    )
+    s = get_cp_strategy()
+    if s is None:
+        return False
+    return s.can_apply(sum(forward_batch.extend_seq_lens_cpu), forward_batch)
 
 
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):

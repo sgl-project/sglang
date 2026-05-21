@@ -12,6 +12,11 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
+    # V4 is a DSA architecture; mark it so `is_dsa_enable_prefill_cp()` resolves
+    # correctly downstream (the V3.2 branch in server_args.__post_init__ sets
+    # this flag for V3.2, but V4 takes the v4-specific hook path and would
+    # otherwise stay False — leaving V4's CP code paths silently disabled).
+    server_args._is_dsa_model_arch = True
     server_args.attention_backend = "dsv4"
     server_args.page_size = 256
     logger.info(
@@ -53,27 +58,33 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
 
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
-    """Validate DeepSeek V4 context-parallel configuration."""
-    if not server_args.enable_dsa_prefill_context_parallel:
+    """Validate DeepSeek V4 context-parallel configuration.
+
+    V4 only has interleave-mode kernel paths today (FlashMLA reindex,
+    bf16-KV → fp8-cache split etc.). We enforce that at the strategy level
+    and leave the dp/ep shape up to the user — the older "auto force
+    dp_size=1 / enable_dp_attention=True" behaviour is gone.
+    """
+    if not server_args.enable_prefill_cp:
         return
 
-    if server_args.dsa_prefill_cp_mode != "round-robin-split":
+    if server_args.cp_strategy != "interleave":
         raise ValueError(
-            f"DeepSeekV4 only supports round-robin-split CP mode, "
-            f"got {server_args.dsa_prefill_cp_mode}"
+            "DeepSeek V4 only supports --cp-strategy interleave "
+            "(formerly --dsa-prefill-cp-mode round-robin-split); "
+            f"got cp_strategy={server_args.cp_strategy!r}."
         )
 
-    server_args.enable_dp_attention = True
     server_args.moe_dense_tp_size = 1
-    server_args.attn_cp_size = server_args.tp_size // server_args.dp_size
-    assert (
-        server_args.dp_size == 1
-    ), "For round-robin split mode, dp attention is not supported."
+    # If the user didn't pin attn_cp_size, derive from tp/dp.
+    if server_args.attn_cp_size == 1:
+        server_args.attn_cp_size = server_args.tp_size // max(server_args.dp_size, 1)
     assert (
         server_args.tp_size <= 8
     ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
     logger.warning(
-        f"Enable Context Parallel for DeepSeekV4, "
+        "Enabled DeepSeek V4 CP (interleave): "
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
-        f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
+        f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, "
+        f"tp_size={server_args.tp_size}"
     )

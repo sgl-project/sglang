@@ -63,11 +63,6 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
 from sglang.srt.layers.utils import get_layer_id
-from sglang.srt.layers.utils.cp_utils import (
-    can_cp_split,
-    is_prefill_context_parallel_enabled,
-    prepare_context_parallel_metadata,
-)
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -998,14 +993,19 @@ class Qwen3MoeForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if is_prefill_context_parallel_enabled():
-            if can_cp_split(len(input_ids), self.attn_cp_size, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.attn_cp_rank,
-                    self.attn_cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
-                )
+        # Hand the per-forward CP metadata build off to the active strategy.
+        # ``cp_active``-style predicates elsewhere then gate on whether
+        # ``forward_batch.attn_cp_metadata`` was actually populated.
+        from sglang.srt.layers.cp.strategy import get_cp_strategy
+
+        _cp_strategy = get_cp_strategy()
+        if _cp_strategy is not None and _cp_strategy.can_apply(
+            len(input_ids), forward_batch
+        ):
+            forward_batch.attn_cp_metadata = _cp_strategy.build_metadata(
+                len(input_ids),
+                forward_batch.seq_lens_cpu.tolist(),
+            )
 
         hidden_states = self.model(
             input_ids,
