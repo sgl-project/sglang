@@ -475,6 +475,7 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
+    SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
 
     # sgl-kernel

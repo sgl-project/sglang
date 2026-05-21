@@ -145,6 +145,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -835,7 +836,14 @@ class Scheduler(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
 
-        if hasattr(config_to_check, "num_experts_per_tok"):
+        # Different MoE architectures expose the per-token expert count under
+        # different attribute names (e.g. Gemma4 uses ``top_k_experts``).
+        moe_topk_attrs = (
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+        )
+        if any(hasattr(config_to_check, attr) for attr in moe_topk_attrs):
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.
@@ -1288,10 +1296,8 @@ class Scheduler(
             return
 
         self.future_map = self.spec_algorithm.create_future_map(
-            self.max_running_requests,
-            self.chunked_prefill_size,
-            self.model_config.context_len,
             self.device,
+            self.req_to_token_pool,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -2845,9 +2851,12 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
+                # Refresh BEFORE _overlap_forward_isolation so snapshot
+                # captures fresh values and restore preserves them.
+                batch.refresh_seq_lens_cpu()
+
                 with self._overlap_forward_isolation(batch):
-                    bs = len(batch.seq_lens)
-                    future_indices = self.future_map.alloc_future_indices(bs)
+                    future_indices = FutureIndices(indices=batch.req_pool_indices)
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
