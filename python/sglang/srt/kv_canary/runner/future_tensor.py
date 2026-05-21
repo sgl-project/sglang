@@ -5,10 +5,10 @@ from dataclasses import dataclass
 import torch
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
+@dataclass(slots=True, kw_only=True)
 class FutureTensor:
-    _tensor: torch.Tensor
-    _event: torch.cuda.Event
+    _tensor: torch.Tensor | None
+    _event: torch.cuda.Event | None
 
     @classmethod
     def create(
@@ -27,5 +27,12 @@ class FutureTensor:
         return cls(_tensor=host, _event=event)
 
     def wait(self) -> torch.Tensor:
-        self._event.synchronize()
-        return self._tensor
+        tensor = self._tensor
+        event = self._event
+        if tensor is None or event is None:
+            raise RuntimeError("FutureTensor.wait() was called more than once")
+
+        event.synchronize()
+        self._tensor = None
+        self._event = None
+        return tensor

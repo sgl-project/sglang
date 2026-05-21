@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
-from sglang.srt.kv_canary.plan_input import build_plan_input_radix_sweep
+from sglang.srt.kv_canary.plan_input_builder import build_plan_input_radix_sweep
 from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_sweep,
@@ -56,7 +56,7 @@ class SweepOrchestrator:
         self._radix_cache: Optional["BasePrefixCache"] = None
 
         self._verify_plan_sweep_radix = VerifyPlan.allocate(
-            verify_capacity=max(1, sweep_verify_capacity), device=device
+            verify_capacity=sweep_verify_capacity, device=device
         )
         self._write_plan_sweep = WritePlan.allocate(write_req_capacity=1, device=device)
 

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.kv_canary.plan_input import (
+from sglang.srt.kv_canary.plan_input_builder import (
     PlanInput,
     build_plan_input_radix_sweep,
     fill_plan_input_per_forward,
