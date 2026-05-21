@@ -78,6 +78,16 @@ def _wait_http(url: str, timeout: int = 120) -> None:
 @pytest.fixture(scope="session")
 def sglang_server():
     """Launch a real SGLang server on port 30000 and wait until healthy."""
+    # Stream the server's stdout/stderr to a file rather than capturing
+    # to subprocess.PIPE. The launch_server startup log is verbose (model
+    # download, JIT warmup, NCCL init); once a PIPE'd output fills its
+    # ~64 KB OS buffer with nothing reading it, the SGLang process
+    # blocks on stdout write and never reaches "Server started" — the
+    # health probe then times out at 300 s and we have no visibility
+    # into *why*. A real log file fixes both (no buffer pressure, and
+    # the file is dumped on failure for triage).
+    log_path = Path(tempfile.gettempdir()) / f"sglang-server-{SGLANG_PORT}.log"
+    log_handle = open(log_path, "w", buffering=1)  # line-buffered
     proc = subprocess.Popen(
         [
             "python3",
@@ -90,15 +100,32 @@ def sglang_server():
             "--tp",
             "1",
         ],
-        stdout=subprocess.PIPE,
+        stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
 
     try:
         _wait_http(f"http://localhost:{SGLANG_PORT}/health", timeout=300)
     except Exception:
+        # Dump the server log so the operator can see why startup failed
+        # (model download error, port conflict, OOM, JIT crash, etc.).
         proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=30)
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        log_handle.flush()
+        log_handle.close()
+        try:
+            tail = log_path.read_text(errors="replace").splitlines()[-200:]
+        except OSError:
+            tail = ["(server log unreadable)"]
+        logger.error(
+            "sglang_server fixture failed; last 200 log lines from %s:\n%s",
+            log_path,
+            "\n".join(tail),
+        )
         raise
 
     yield f"http://localhost:{SGLANG_PORT}"
@@ -109,6 +136,8 @@ def sglang_server():
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    log_handle.flush()
+    log_handle.close()
 
 
 def _find_tokenizer_path(model: str) -> str:
