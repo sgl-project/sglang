@@ -504,6 +504,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None:
             batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
+        # Compute orig_seq_lens fresh per-forward from req state instead of
+        # storing it on ScheduleBatch as a persistent GPU tensor (cross-stream
+        # lifetime hazard). Use origin + output_ids directly because fill_ids
+        # is only refreshed in init_next_round_input, not per decode iter.
+        # Consumers: dual_chunk_flashattention_backend.
+        orig_seq_lens = torch.tensor(
+            [len(r.origin_input_ids) + len(r.output_ids) for r in batch.reqs],
+            dtype=torch.int32,
+            device=batch.device,
+        )
+
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -524,7 +535,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
-            orig_seq_lens=batch.orig_seq_lens,
+            orig_seq_lens=orig_seq_lens,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,

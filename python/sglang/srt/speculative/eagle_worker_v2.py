@@ -547,7 +547,6 @@ class EagleDraftWorker(BaseDraftWorker):
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -756,7 +755,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_verify_complete=None):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_forward_complete=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -768,8 +767,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(batch)
 
             # Publish before draft_extend so the fence is at target-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch.seq_lens)
+            if on_forward_complete is not None:
+                on_forward_complete(batch.seq_lens)
 
             # Draft prefill
             with (
@@ -814,8 +813,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch_output.next_draft_input.new_seq_lens)
+            if on_forward_complete is not None:
+                on_forward_complete(batch_output.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1092,9 +1091,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
@@ -1107,6 +1104,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

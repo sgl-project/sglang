@@ -78,9 +78,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         )
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        self.orig_seq_lens = torch.tensor(
-            seq_lens, dtype=torch.int32, device=self.device
-        )
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
 
@@ -173,14 +170,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 bonus_tokens=last_tokens_tensor,
-                new_seq_lens=self.seq_lens,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 from sglang.srt.managers.overlap_utils import FutureIndices
 
                 spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
-                future_map.publish(spec_info.future_indices, spec_info.new_seq_lens)
+                future_map.publish(spec_info.future_indices, self.seq_lens)
                 future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:

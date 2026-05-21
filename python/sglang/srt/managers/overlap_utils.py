@@ -60,12 +60,14 @@ class FutureMap:
         self.output_tokens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
+        # Next-iter seq_lens relay, eager (int64 fixed). Both modes publish to
+        # this buf so ScheduleBatch.seq_lens does not need to survive across
+        # iters as a persistent GPU tensor.
+        self.new_seq_lens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
         if not self.spec_algo.is_none():
-            # Schedule-consumed buf, eager fixed dtype.
-            self.new_seq_lens_buf = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, device=self.device
-            )
-            # Remaining forward-only bufs are lazy (worker-dependent shape).
+            # Remaining spec forward-only bufs are lazy (worker-dependent shape).
             self._forward_buf_initialized = False
 
         # Fences the schedule-consumed buf fields.
@@ -97,6 +99,11 @@ class FutureMap:
     def resolve_future(self, batch: ScheduleBatch):
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
+            if batch.forward_mode.is_decode():
+                # Restore seq_lens published by previous decode forward.
+                # Extend batches already have batch.seq_lens set by
+                # prepare_for_extend.
+                batch.seq_lens = self.new_seq_lens_buf[batch.req_pool_indices]
         else:
             draft_input: EagleDraftInput = batch.spec_info
             if draft_input is None:
@@ -110,9 +117,8 @@ class FutureMap:
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
             # Resolve seq_lens placeholder (-indices) to the post-verify view.
-            batch.seq_lens = draft_input.new_seq_lens
+            batch.seq_lens = self.new_seq_lens_buf[indices]
             if spec_need_hidden_states():
                 draft_input.hidden_states = self.hidden_states_buf[indices]
 
@@ -128,16 +134,23 @@ class FutureMap:
     def publish(
         self, future_indices: FutureIndices, new_seq_lens: torch.Tensor
     ) -> None:
-        """Store schedule-consumed fields and signal publish_ready."""
-        if self.spec_algo.is_none():
-            return
+        """Write next-iter seq_lens to relay.
+
+        Fast path for non-spec: change is deterministic (`+= 1`), schedule
+        stream maintains seq_lens_cpu locally, and there's no cross-stream
+        read of the buf. Skip the publish_ready event entirely — next iter's
+        resolve_future reads on the same stream (FIFO order with this
+        publish). Only spec_v2 needs the event for schedule_stream's
+        resolve_seq_lens_cpu D2H sync.
+        """
         indices = future_indices.indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        if self.publish_ready is None:
-            self.publish_ready = torch.get_device_module(self.device).Event()
-        self.publish_ready.record()
+        if not self.spec_algo.is_none():
+            if self.publish_ready is None:
+                self.publish_ready = torch.get_device_module(self.device).Event()
+            self.publish_ready.record()
 
     def stash(self, future_indices: FutureIndices, payload) -> None:
         """Store forward-only fields for the next forward batch to pick up."""

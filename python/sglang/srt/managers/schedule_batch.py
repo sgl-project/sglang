@@ -1478,8 +1478,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
-    # The original sequence lengths, Qwen-1M related
-    orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
@@ -1757,7 +1755,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
         seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1788,9 +1785,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.device, non_blocking=True
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
-        orig_seq_lens_tensor = torch.tensor(
-            orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
@@ -1965,7 +1959,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.input_ids = input_ids_tensor
         self.req_pool_indices = req_pool_indices_tensor
-        self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
@@ -2333,7 +2326,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_cpu = torch.empty(0, dtype=torch.int64)
-        self.orig_seq_lens = torch.empty(0, dtype=torch.int32, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens_sum = 0
@@ -2411,15 +2403,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update seq_lens after allocation
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
+            # GPU seq_lens flows through FutureMap (forward stream owns the
+            # buf); only update CPU shadow here. resolve_future restores
+            # batch.seq_lens on forward_stream from new_seq_lens_buf.
+            # orig_seq_lens is re-derived per-forward in ForwardBatch.init_new.
             self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
         else:
             # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
@@ -2490,7 +2482,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
         self.seq_lens = self.seq_lens[keep_indices_device]
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
-        self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
@@ -2542,7 +2533,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
