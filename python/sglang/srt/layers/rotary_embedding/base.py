@@ -39,7 +39,11 @@ if _is_cuda:
 
 if _is_npu:
     import torch_npu
-    from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+
+    try:
+        from sgl_kernel_npu.norm.fused_rope_qk_mqa import fused_rope_qk_mqa
+    except ImportError:
+        fused_rope_qk_mqa = None
 
 if _is_hip:
     from sglang.srt.layers.attention.utils import (
@@ -267,7 +271,10 @@ class RotaryEmbedding(MultiPlatformOp):
             else:
                 cos_sin = self.cos_sin_cache.index_select(0, positions)
 
-            if query.shape[0] * query.shape[1] < 65535:
+            if (
+                fused_rope_qk_mqa is not None
+                and query.shape[0] * query.shape[1] < 65535
+            ):
                 return fused_rope_qk_mqa(
                     query,
                     key,
