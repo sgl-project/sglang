@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=690,
-    stage="stage-c",
+    stage="base-c",
     runner_config="4-gpu-b200",
 )
 
@@ -37,7 +37,7 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
             "4",
             "--enable-dp-attention",
             "--attention-backend",
-            "nsa",
+            "dsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
@@ -127,7 +127,7 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
             "--tp",
             "4",
             "--attention-backend",
-            "nsa",
+            "dsa",
             "--moe-runner-backend",
             "flashinfer_trtllm",
             "--quantization",
