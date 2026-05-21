@@ -92,13 +92,16 @@ def launch_endpoints_per_forward(
             f"!= num_tokens {num_tokens}; caller must slice before invoking"
         )
 
-    for endpoint in endpoints:
-        if not _endpoint_belongs_to_group(endpoint, group):
-            continue
-        if not tag_filter(endpoint.kernel_kind):
-            continue
-        if _is_sweep_tag(endpoint.kernel_kind):
-            continue
+    active_endpoints = [
+        endpoint
+        for endpoint in endpoints
+        if _endpoint_belongs_to_group(endpoint, group)
+        and tag_filter(endpoint.kernel_kind)
+        and not _is_sweep_tag(endpoint.kernel_kind)
+    ]
+    assert len(active_endpoints) > 0
+
+    for endpoint in active_endpoints:
         endpoint.launch_per_forward(
             verify_plan=verify_plan,
             write_plan=write_plan,
@@ -120,11 +123,15 @@ def launch_endpoints_sweep(
     violation_log: ViolationLog,
     real_kv_hash_mode: RealKvHashMode,
 ) -> None:
-    for endpoint in endpoints:
-        if not _endpoint_belongs_to_group(endpoint, group):
-            continue
-        if not _is_sweep_tag(endpoint.kernel_kind):
-            continue
+    active_endpoints = [
+        endpoint
+        for endpoint in endpoints
+        if _endpoint_belongs_to_group(endpoint, group)
+        and _is_sweep_tag(endpoint.kernel_kind)
+    ]
+    assert len(active_endpoints) > 0
+
+    for endpoint in active_endpoints:
         endpoint.launch_sweep(
             verify_plan=verify_plan,
             violation_log=violation_log,
