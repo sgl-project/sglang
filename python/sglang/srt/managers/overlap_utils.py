@@ -66,10 +66,10 @@ class FutureMap:
 
         # Forward-stream fence covering all buf writes dispatched so far.
         # Waited on by schedule-stream consumers before reading the buf.
+        # Recorded by store_post_verify at verify-end (both extend and decode
+        # branches fire it); store_to_map only records on the first iter,
+        # where post_verify is a no-op pending lazy buf init.
         self._last_store_done: Optional[torch.cuda.Event] = None
-        # Set by store_post_verify so store_to_map skips its own record and
-        # the fence stays at verify-end (for draft_extend overlap).
-        self._fence_done_by_post_verify: bool = False
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -154,10 +154,12 @@ class FutureMap:
         new_seq_lens: torch.Tensor,
         bonus_tokens: torch.Tensor,
     ) -> None:
-        """Forward stream. Writes verify-end buf fields and records the fence
-        here so schedule consumers unblock at verify-end (before draft_extend).
-        No-op on the first iter (buf not yet allocated); store_to_map handles
-        it then."""
+        """Forward stream. Writes the schedule-consumed buf fields and records
+        the fence at verify-end so schedule consumers unblock before
+        draft_extend. Fired by both extend and decode branches.
+
+        No-op on the first iter (buf not yet allocated). The first iter's
+        store_to_map lazy-inits and catches up the fence."""
         if self.spec_algo.is_none() or not self.buf_initialized:
             return
         indices = future_indices.indices
@@ -166,14 +168,14 @@ class FutureMap:
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         self.bonus_tokens_buf[indices] = bonus_tokens.to(self.bonus_tokens_buf.dtype)
         self._record_store_done()
-        self._fence_done_by_post_verify = True
 
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
     ):
-        """Forward stream. Writes the post-draft_extend buf fields (topk /
-        hidden), plus new_seq_lens / bonus_tokens when post_verify didn't run
-        (extend branch). Records the fence iff post_verify didn't."""
+        """Forward stream. Writes the forward-only buf fields (topk /
+        hidden_states; FIFO covers them, no fence needed). On the first iter
+        — where store_post_verify was a no-op pending lazy init — also writes
+        the schedule-consumed fields and records the fence."""
         if self.spec_algo.is_none():
             indices = future_indices.indices
             if indices.shape[0] == 0:
@@ -181,9 +183,7 @@ class FutureMap:
             # next_token_ids is int32; buf is int64. Advanced indexing requires
             # an explicit cast.
             self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
-            if not self._fence_done_by_post_verify:
-                self._record_store_done()
-            self._fence_done_by_post_verify = False
+            self._record_store_done()
             return
 
         draft_input: EagleDraftInput = batch_result.next_draft_input
@@ -193,11 +193,10 @@ class FutureMap:
             # shape peek would IndexError. Defer init until a real batch.
             return
 
-        if not self.buf_initialized:
+        first_iter = not self.buf_initialized
+        if first_iter:
             self._lazy_init_buf(draft_input)
 
-        # Forward-only fields (next iter's resolve_future reads them on
-        # forward stream — FIFO covers them, no fence needed).
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(
             self.topk_index_buf.dtype
@@ -206,10 +205,8 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        # Schedule-consumed fields: skip when post_verify already wrote them
-        # — a redundant write here would race the schedule-stream read gated
-        # on the verify-end fence.
-        if not self._fence_done_by_post_verify:
+        if first_iter:
+            # Catch up for store_post_verify's no-op (buf wasn't allocated).
             self.new_seq_lens_buf[indices] = draft_input.new_seq_lens.to(
                 self.new_seq_lens_buf.dtype
             )
@@ -217,7 +214,6 @@ class FutureMap:
                 self.bonus_tokens_buf.dtype
             )
             self._record_store_done()
-        self._fence_done_by_post_verify = False
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput

@@ -767,6 +767,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
+            # Same fence point as decode: after target forward + sample, before
+            # draft_extend. new_seq_lens = batch.seq_lens (post-prefill input
+            # length, unchanged by target forward); bonus = next_token_ids.
+            if on_verify_complete is not None:
+                on_verify_complete(batch.seq_lens, batch_output.next_token_ids)
+
             # Draft prefill
             with (
                 self.draft_worker.draft_tp_context(
