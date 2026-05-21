@@ -865,11 +865,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
+        # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_data for attn backends
         # and padding logic in prepare_mlp_sync_batch to avoid this
         batch_size = getattr(metadata, "batch_size", None)
         if batch_size is not None and batch_size < forward_batch.batch_size:
-            self.init_forward_metadata(forward_batch)
+            self.init_forward_data(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
         raw_out = self._run_decode_kernel(
@@ -967,11 +967,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
 
             # Ensure batch_size is sufficient, the batch size increase due to the padding from the forward batch
-            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_metadata for attn backends
+            # FIXME(@rainj-me), refactor the skip_attn_backend_init, init_forward_data for attn backends
             # and padding logic in prepare_mlp_sync_batch to avoid this
             batch_size = getattr(metadata, "batch_size", None)
             if batch_size is not None and batch_size < forward_batch.batch_size:
-                self.init_forward_metadata(forward_batch)
+                self.init_forward_data(forward_batch)
                 metadata = forward_batch.decode_trtllm_mla_metadata
 
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
