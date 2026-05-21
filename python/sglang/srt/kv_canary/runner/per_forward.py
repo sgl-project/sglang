@@ -11,10 +11,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.plan_input_builder import (
-    PlanInput,
-    fill_plan_input_per_forward,
-)
+from sglang.srt.kv_canary.plan_input_builder import PlanInput
 from sglang.srt.kv_canary.runner.enable_warner import _CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
@@ -131,9 +128,8 @@ class PerForwardOrchestrator:
                 expected_inputs_out=self._expected_inputs,
             )
 
-        fill_plan_input_per_forward(
+        self._plan_input_per_forward.fill_from_forward_batch(
             forward_batch=forward_batch,
-            plan_input_out=self._plan_input_per_forward,
         )
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:

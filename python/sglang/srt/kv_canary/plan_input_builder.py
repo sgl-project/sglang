@@ -62,43 +62,39 @@ class PlanInput:
             ),
         )
 
+    def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> int:
+        """Fill static per-forward buffers in place from a ForwardBatch.
 
-def fill_plan_input_per_forward(
-    *,
-    forward_batch: "ForwardBatch",
-    plan_input_out: PlanInput,
-) -> int:
-    """Builder for the per-forward (head + tail) caller. MUTATES plan_input_out's static buffers
-    in place — does NOT return a new PlanInput (see PlanInput Static-buffer contract).
+        This mutates the PlanInput's static buffers and does not allocate a new PlanInput.
 
-    - plan_input_out.fb_req_pool_indices[:bs] ← forward_batch.req_pool_indices; rows beyond bs
-      are zeroed (padding sentinel).
-    - plan_input_out.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
-      forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
-      via req_pool_indices sentinel; the lens value there is irrelevant).
+        - self.fb_req_pool_indices[:bs] <- forward_batch.req_pool_indices; rows beyond bs
+          are zeroed (padding sentinel).
+        - self.fb_prefix_lens[:bs] / fb_extend_seq_lens[:bs] are dispatched per
+          forward_mode (see the per-mode block below). Rows beyond bs are zeroed (padding skipped
+          via req_pool_indices sentinel; the lens value there is irrelevant).
 
-    Returns the current bs (valid prefix length of the per-forward buffers).
-    """
-    req_pool_indices = forward_batch.req_pool_indices
-    bs = int(req_pool_indices.shape[0])
-    capacity = int(plan_input_out.fb_req_pool_indices.shape[0])
-    if bs > capacity:
-        raise RuntimeError(
-            f"kv-canary: per-forward batch size {bs} exceeds static capacity {capacity}; "
-            "raise the buffer size in CanaryRunner.__init__"
+        Returns the current bs (valid prefix length of the per-forward buffers).
+        """
+        req_pool_indices = forward_batch.req_pool_indices
+        bs = int(req_pool_indices.shape[0])
+        capacity = int(self.fb_req_pool_indices.shape[0])
+        if bs > capacity:
+            raise RuntimeError(
+                f"kv-canary: per-forward batch size {bs} exceeds static capacity {capacity}; "
+                "raise the buffer size in CanaryRunner.__init__"
+            )
+
+        self.zero_()
+        self.fb_req_pool_indices[:bs].copy_(req_pool_indices)
+
+        _extract_prefix_lens_and_extend_seq_lens(
+            forward_batch=forward_batch,
+            out_prefix_lens=self.fb_prefix_lens[:bs],
+            out_extend_seq_lens=self.fb_extend_seq_lens[:bs],
+            bs=bs,
         )
 
-    plan_input_out.zero_()
-    plan_input_out.fb_req_pool_indices[:bs].copy_(req_pool_indices)
-
-    _extract_prefix_lens_and_extend_seq_lens(
-        forward_batch=forward_batch,
-        out_prefix_lens=plan_input_out.fb_prefix_lens[:bs],
-        out_extend_seq_lens=plan_input_out.fb_extend_seq_lens[:bs],
-        bs=bs,
-    )
-
-    return bs
+        return bs
 
 
 def _extract_prefix_lens_and_extend_seq_lens(
