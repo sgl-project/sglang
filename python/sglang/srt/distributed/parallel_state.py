@@ -709,7 +709,7 @@ class GroupCoordinator:
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(
-                input_, use_new=get_bool_env_var("SGLANG_USE_AITER_NEW_CA", "true")
+                input_, use_new=_use_aiter_new_ca
             ) if _use_aiter else ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
