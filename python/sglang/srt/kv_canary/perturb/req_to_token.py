@@ -1,7 +1,7 @@
 """Perturb point (a): flip the req_to_token pointer of a currently-active req.
 
 The hook picks a random (req_pool_idx, position, value) from active reqs and
-overwrites table[req_pool_idx, position] with another active req's slot id.
+overwrites req_to_token[req_pool_idx, position] with another active req's slot id.
 KV bytes are not touched.
 
 Modeled after the bug class: req_to_token bookkeeping (out_cache_loc updates,
@@ -68,7 +68,7 @@ def run(
     replacement_pick = int(torch.randint(0, len(replacement_values), (1,)).item())
     new_value = replacement_values[replacement_pick]
 
-    table = req_to_token_pool.req_to_token
+    req_to_token = req_to_token_pool.req_to_token
     logger.info(
         "kv_canary perturb req_to_token: req_pool_idx=%d position=%d original_slot=%d new_slot=%d",
         target.req_pool_idx,
@@ -76,4 +76,4 @@ def run(
         target.value,
         new_value,
     )
-    table[target.req_pool_idx, target.position] = new_value
+    req_to_token[target.req_pool_idx, target.position] = new_value

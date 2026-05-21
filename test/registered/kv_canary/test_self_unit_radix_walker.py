@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from sglang.srt.kv_canary.plan_input import walk_radix_cache_for_canary
+from sglang.srt.kv_canary.plan_input_builder import walk_radix_cache_for_canary
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache, TreeNode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
