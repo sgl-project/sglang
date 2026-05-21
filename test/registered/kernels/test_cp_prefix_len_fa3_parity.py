@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-large")
 
-_NSA_UTILS = "sglang.srt.layers.attention.nsa.utils"
+_DSA_UTILS = "sglang.srt.layers.attention.dsa.utils"
 _DEVICE = "cuda"
 _DTYPE = torch.bfloat16
 _HEAD_NUM = 8
@@ -80,12 +80,12 @@ class TestCPPrefixLenFA3Parity(CustomTestCase):
                 padded_extend, rank, cp_size, seqs_len, extend_lens=extend_lens
             )
 
-        # Exercise the non-NSA branch; the NSA branch uses a separate
+        # Exercise the non-DSA branch; the DSA branch uses a separate
         # `prefix_len` pathway re-added by `_get_topk_ragged_with_cp`.
         with (
-            patch(f"{_NSA_UTILS}.is_nsa_enable_prefill_cp", return_value=False),
+            patch(f"{_DSA_UTILS}.is_dsa_enable_prefill_cp", return_value=False),
             patch(
-                f"{_NSA_UTILS}.is_nsa_prefill_cp_round_robin_split",
+                f"{_DSA_UTILS}.is_dsa_prefill_cp_round_robin_split",
                 return_value=False,
             ),
         ):

@@ -13,6 +13,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
+from prometheus_client import Counter
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -46,6 +47,11 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+FAILED_SESSION_RECOVERIES = Counter(
+    "sglang:failed_session_recoveries_total",
+    "Number of mooncake_session_ids un-blacklisted via probe.",
+)
 
 
 class KVTransferError(Exception):
@@ -129,8 +135,6 @@ class KVArgsRegisterInfo:
     # for mamba state different tp slice transfer
     dst_state_item_lens: List[List[int]]
     dst_state_dim_per_tensor: List[List[int]]
-    # HiSparse: decode host pool stores KV at token granularity
-    enable_hisparse: bool = False
     # Note: always put the staging field at the final (since the staging field is optional and contains multiple inputs)
     staging: Optional[StagingRegisterInfo] = None
 
@@ -153,11 +157,8 @@ class KVArgsRegisterInfo:
             dst_state_dim_per_tensor=(
                 unpack_int_lists(msg[11], "I") if len(msg) > 11 else []
             ),
-            enable_hisparse=(
-                msg[12].decode("ascii") == "1" if len(msg) > 12 else False
-            ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 13),
+            staging=StagingRegisterInfo.from_zmq_fields(msg, 12),
         )
 
 
@@ -241,6 +242,19 @@ class MooncakeKVManager(CommonKVManager):
                             else None
                         ),
                     ),
+                    daemon=True,
+                ).start()
+            self.enable_failed_session_probe = (
+                envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
+            )
+            if self.enable_failed_session_probe:
+                self.failed_session_probe_interval = (
+                    envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
+                )
+                self._failed_session_probe_shutdown = threading.Event()
+                threading.Thread(
+                    target=self._failed_session_probe_loop,
+                    name="MooncakeFailedSessionProbe",
                     daemon=True,
                 ).start()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -704,49 +718,6 @@ class MooncakeKVManager(CommonKVManager):
             executor=executor,
         )
 
-    def send_kvcache_hisparse(
-        self,
-        mooncake_session_id: str,
-        prefill_kv_indices: npt.NDArray[np.int32],
-        dst_kv_ptrs: list[int],
-        dst_kv_indices: npt.NDArray[np.int32],
-        page_index_slice: slice,
-        executor: concurrent.futures.ThreadPoolExecutor,
-    ):
-        """HiSparse transfer: prefill page_size > decode host page_size=1.
-
-        Receives page-level prefill_kv_indices and the full token-level
-        dst_kv_indices.  Expands both to token granularity before transfer.
-        """
-        page_size = self.kv_args.page_size
-        per_token_item_lens = [il // page_size for il in self.kv_args.kv_item_lens]
-
-        # Expand page-level src indices to token-level
-        base = np.repeat(prefill_kv_indices * page_size, page_size)
-        offsets = np.tile(np.arange(page_size, dtype=np.int32), len(prefill_kv_indices))
-        expanded_src = base + offsets
-
-        # Expand page-level index_slice to token-level for dst
-        token_start = page_index_slice.start * page_size
-        token_end = min(page_index_slice.stop * page_size, len(dst_kv_indices))
-        expanded_dst = dst_kv_indices[token_start:token_end]
-
-        # Clip src to match dst length (last page may be partial)
-        expanded_src = expanded_src[: len(expanded_dst)]
-
-        logger.debug(
-            f"Send KVCache for hisparse: {expanded_src.shape} -> {expanded_dst.shape}"
-        )
-        return self._send_kvcache_generic(
-            mooncake_session_id=mooncake_session_id,
-            src_data_ptrs=self.kv_args.kv_data_ptrs,
-            dst_data_ptrs=dst_kv_ptrs,
-            item_lens=per_token_item_lens,
-            prefill_data_indices=expanded_src,
-            dst_data_indices=expanded_dst,
-            executor=executor,
-        )
-
     def send_kvcache_slice(
         self,
         mooncake_session_id: str,
@@ -1041,7 +1012,7 @@ class MooncakeKVManager(CommonKVManager):
                         )
                         or rc
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.DSA):
                 if (
                     target_rank_registration_info is not None
                     and not self.is_mla_backend
@@ -1269,23 +1240,13 @@ class MooncakeKVManager(CommonKVManager):
                             self.attn_tp_size
                             == target_rank_registration_info.dst_attn_tp_size
                         ):
-                            if target_rank_registration_info.enable_hisparse:
-                                ret = self.send_kvcache_hisparse(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    req.dst_kv_indices,
-                                    kv_chunk.index_slice,
-                                    executor,
-                                )
-                            else:
-                                ret = self.send_kvcache(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
-                                    target_rank_registration_info.dst_kv_ptrs,
-                                    chunked_dst_kv_indice,
-                                    executor,
-                                )
+                            ret = self.send_kvcache(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_kv_indices,
+                                target_rank_registration_info.dst_kv_ptrs,
+                                chunked_dst_kv_indice,
+                                executor,
+                            )
                         elif (
                             self.enable_staging
                             and staging_strategy is not None
@@ -1622,6 +1583,43 @@ class MooncakeKVManager(CommonKVManager):
     def get_session_id(self):
         return self.engine.get_session_id()
 
+    def _run_one_probe_pass(self) -> None:
+        with self.session_lock:
+            snapshot = list(self.failed_sessions)
+        for session_id in snapshot:
+            send_probe = getattr(self.engine, "send_probe", None)
+            if send_probe is None:
+                rc = -1
+            else:
+                try:
+                    rc = send_probe(session_id)
+                except Exception as e:
+                    logger.warning("send_probe(%s) raised: %s", session_id, e)
+                    continue
+            if rc == 0:
+                with self.session_lock:
+                    was_blacklisted = session_id in self.failed_sessions
+                    self.failed_sessions.discard(session_id)
+                    self.session_failures.pop(session_id, None)
+                if was_blacklisted:
+                    logger.info(
+                        "Session %s recovered via probe; un-blacklisted",
+                        session_id,
+                    )
+                    FAILED_SESSION_RECOVERIES.inc()
+            else:
+                logger.debug("Probe still failing for %s (rc=%d)", session_id, rc)
+
+    def _failed_session_probe_loop(self) -> None:
+        logger.info(
+            "Starting failed-session probe loop (interval=%.1fs)",
+            self.failed_session_probe_interval,
+        )
+        while not self._failed_session_probe_shutdown.wait(
+            self.failed_session_probe_interval
+        ):
+            self._run_one_probe_pass()
+
     def _handle_node_failure(self, failed_bootstrap_addr):
         with self.connection_lock:
             keys_to_remove = [
@@ -1789,8 +1787,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
             dst_tp_rank = str(tp_rank).encode("ascii")
             dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
             dst_kv_item_len = str(kv_item_len).encode("ascii")
-            enable_hisparse = b"1" if self.kv_mgr.server_args.enable_hisparse else b"0"
-
             if (
                 self.kv_mgr.enable_staging
                 and self.kv_mgr._staging_ctx.allocator is not None
@@ -1818,7 +1814,6 @@ class MooncakeKVReceiver(CommonKVReceiver):
                         dst_kv_item_len,
                         packed_state_item_lens,
                         packed_state_dim_per_tensor,
-                        enable_hisparse,
                         packed_staging_base_ptr,
                         staging_total_size_str,
                     ]

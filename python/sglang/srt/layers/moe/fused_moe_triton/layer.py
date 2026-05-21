@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_hip,
+    print_info_once,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -313,7 +314,7 @@ class FusedMoE(torch.nn.Module):
             or get_moe_runner_backend().is_flashinfer_trtllm()
         ):
             if self.moe_runner_config.inplace:
-                logging.info(
+                print_info_once(
                     "Setting inplace to False for FlashInfer TRTLLM MoE backend."
                 )
             self.moe_runner_config.inplace = False
