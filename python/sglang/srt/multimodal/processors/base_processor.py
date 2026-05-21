@@ -1270,8 +1270,10 @@ class BaseMultimodalProcessor(ABC):
         if ret is None and dict_ret is not None:
             ret = dict_ret
 
-        if input_ids is None and preserve_input_ids_list and isinstance(
-            base_output.input_ids, list
+        if (
+            input_ids is None
+            and preserve_input_ids_list
+            and isinstance(base_output.input_ids, list)
         ):
             input_ids = base_output.input_ids
         elif input_ids is None:
