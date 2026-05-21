@@ -148,6 +148,38 @@ class ServerArgsAutoTuner:
                     ", ".join(changed),
                 )
 
+        self._maybe_keep_ltx23_resident_aux_components_resident()
+
+    def _maybe_keep_ltx23_resident_aux_components_resident(self) -> None:
+        args = self.server_args
+        if not args._uses_ltx23_high_memory_resident_two_stage_mode():
+            return
+
+        changed: list[str] = []
+        if (
+            args.layerwise_offload_components is not None
+            and not args.is_arg_explicitly_set("layerwise_offload_components")
+        ):
+            args.layerwise_offload_components = None
+            changed.append("layerwise_offload_components=None")
+
+        # high-memory resident mode keeps both DiTs on GPU; unset auxiliary
+        # placement should stay resident instead of using default layerwise
+        for arg_name in (
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+        ):
+            if getattr(args, arg_name) and not args.is_arg_explicitly_set(arg_name):
+                setattr(args, arg_name, False)
+                changed.append(f"{arg_name}=False")
+
+        if changed:
+            logger.info(
+                "Keeping LTX2 high-memory two-stage auxiliary components resident: %s",
+                ", ".join(changed),
+            )
+
     def maybe_adjust_auto_fsdp_with_offload_enabled(self) -> None:
         args = self.server_args
         if (

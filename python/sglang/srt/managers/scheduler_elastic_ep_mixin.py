@@ -101,7 +101,7 @@ class SchedulerElasticEPMixin:
                 batch.release_req(idx, 0, self.server_args)
                 if req.retraction_count > max_retraction:
                     req.finished_reason = abort_reason
-                    self.send_to_tokenizer.send_output(
+                    self.ipc_channels.send_to_tokenizer.send_output(
                         AbortReq(
                             finished_reason=abort_reason.to_json(),
                             rid=req.rid,

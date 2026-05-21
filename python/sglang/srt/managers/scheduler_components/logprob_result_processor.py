@@ -31,10 +31,10 @@ class SchedulerLogprobResultProcessor:
         # Process logprob values - handle multi-item scoring vs regular requests
         if is_multi_item_scoring:
             # Multi-item scoring: use all logprobs as-is
-            req.input_token_logprobs_val = input_token_logprobs
+            req.logprob.input_token_logprobs_val = input_token_logprobs
         else:
             # Regular request: add None at start, remove last (sampling token)
-            req.input_token_logprobs_val = [None] + input_token_logprobs[:-1]
+            req.logprob.input_token_logprobs_val = [None] + input_token_logprobs[:-1]
 
         # Process logprob indices based on scoring type
         if is_multi_item_scoring:
@@ -49,21 +49,21 @@ class SchedulerLogprobResultProcessor:
             input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
 
         # Clip padded hash values from image tokens to prevent detokenization errors
-        req.input_token_logprobs_idx = [
+        req.logprob.input_token_logprobs_idx = [
             x if x < self.model_config.vocab_size - 1 else 0
             for x in input_token_logprobs_idx
         ]
 
     def _process_input_top_logprobs(self, req: Req) -> None:
         """Process input top logprobs."""
-        if req.top_logprobs_num <= 0:
+        if req.logprob.top_logprobs_num <= 0:
             return
 
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         # Initialize arrays - multi-item scoring starts empty, others start with None
-        req.input_top_logprobs_val = [] if is_multi_item_scoring else [None]
-        req.input_top_logprobs_idx = [] if is_multi_item_scoring else [None]
+        req.logprob.input_top_logprobs_val = [] if is_multi_item_scoring else [None]
+        req.logprob.input_top_logprobs_idx = [] if is_multi_item_scoring else [None]
 
         # Extend arrays with temp values
         for val, idx in zip(
@@ -71,13 +71,13 @@ class SchedulerLogprobResultProcessor:
             req.temp_input_top_logprobs_idx,
             strict=True,
         ):
-            req.input_top_logprobs_val.extend(val)
-            req.input_top_logprobs_idx.extend(idx)
+            req.logprob.input_top_logprobs_val.extend(val)
+            req.logprob.input_top_logprobs_idx.extend(idx)
 
         # Remove last token (sampling token) for non multi-item scoring requests
         if not is_multi_item_scoring:
-            req.input_top_logprobs_val.pop()
-            req.input_top_logprobs_idx.pop()
+            req.logprob.input_top_logprobs_val.pop()
+            req.logprob.input_top_logprobs_idx.pop()
 
         # Clean up temp storage
         req.temp_input_top_logprobs_idx = None
@@ -85,14 +85,18 @@ class SchedulerLogprobResultProcessor:
 
     def _process_input_token_ids_logprobs(self, req: Req) -> None:
         """Process input token IDs logprobs."""
-        if req.token_ids_logprob is None:
+        if req.logprob.token_ids_logprob is None:
             return
 
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         # Initialize arrays - multi-item scoring starts empty, others start with None
-        req.input_token_ids_logprobs_val = [] if is_multi_item_scoring else [None]
-        req.input_token_ids_logprobs_idx = [] if is_multi_item_scoring else [None]
+        req.logprob.input_token_ids_logprobs_val = (
+            [] if is_multi_item_scoring else [None]
+        )
+        req.logprob.input_token_ids_logprobs_idx = (
+            [] if is_multi_item_scoring else [None]
+        )
 
         # Process temp values - convert tensors to lists and extend arrays
         for val, idx in zip(
@@ -101,15 +105,15 @@ class SchedulerLogprobResultProcessor:
             strict=True,
         ):
             val_list = val.tolist() if isinstance(val, torch.Tensor) else val
-            req.input_token_ids_logprobs_val.extend(
+            req.logprob.input_token_ids_logprobs_val.extend(
                 val_list if isinstance(val_list, list) else [val_list]
             )
-            req.input_token_ids_logprobs_idx.extend(idx)
+            req.logprob.input_token_ids_logprobs_idx.extend(idx)
 
         # Remove last token (sampling token) for non multi-item scoring requests
         if not is_multi_item_scoring:
-            req.input_token_ids_logprobs_val.pop()
-            req.input_token_ids_logprobs_idx.pop()
+            req.logprob.input_token_ids_logprobs_val.pop()
+            req.logprob.input_token_ids_logprobs_idx.pop()
 
         # Clean up temp storage
         req.temp_input_token_ids_logprobs_idx = None
@@ -198,11 +202,11 @@ class SchedulerLogprobResultProcessor:
         if req.temp_input_token_ids_logprobs_idx is None:
             req.temp_input_token_ids_logprobs_idx = []
 
-        if req.input_token_logprobs_val is not None:
+        if req.logprob.input_token_logprobs_val is not None:
             # The input logprob has been already computed. It only happens
             # upon retract.
-            if req.top_logprobs_num > 0:
-                assert req.input_token_logprobs_val is not None
+            if req.logprob.top_logprobs_num > 0:
+                assert req.logprob.input_token_logprobs_val is not None
             return
 
         # Important for the performance.
@@ -213,11 +217,11 @@ class SchedulerLogprobResultProcessor:
         ]
         req.input_token_logprobs.extend(input_token_logprobs)
 
-        if req.top_logprobs_num > 0:
+        if req.logprob.top_logprobs_num > 0:
             req.temp_input_top_logprobs_val.append(output.input_top_logprobs_val[i])
             req.temp_input_top_logprobs_idx.append(output.input_top_logprobs_idx[i])
 
-        if req.token_ids_logprob is not None:
+        if req.logprob.token_ids_logprob is not None:
             req.temp_input_token_ids_logprobs_val.append(
                 output.input_token_ids_logprobs_val[i]
             )
@@ -228,10 +232,10 @@ class SchedulerLogprobResultProcessor:
         if last_prefill_chunk:
             input_token_logprobs = req.input_token_logprobs
             req.input_token_logprobs = None
-            assert req.input_token_logprobs_val is None
-            assert req.input_token_logprobs_idx is None
-            assert req.input_top_logprobs_val is None
-            assert req.input_top_logprobs_idx is None
+            assert req.logprob.input_token_logprobs_val is None
+            assert req.logprob.input_token_logprobs_idx is None
+            assert req.logprob.input_top_logprobs_val is None
+            assert req.logprob.input_top_logprobs_idx is None
 
             # Process all input logprob types using helper functions
             self._process_input_token_logprobs(req, input_token_logprobs)
@@ -241,14 +245,24 @@ class SchedulerLogprobResultProcessor:
 
             if req.return_logprob:
                 relevant_tokens_len = self._calculate_relevant_tokens_len(req)
-                assert len(req.input_token_logprobs_val) == relevant_tokens_len
-                assert len(req.input_token_logprobs_idx) == relevant_tokens_len
-                if req.top_logprobs_num > 0:
-                    assert len(req.input_top_logprobs_val) == relevant_tokens_len
-                    assert len(req.input_top_logprobs_idx) == relevant_tokens_len
-                if req.token_ids_logprob is not None:
-                    assert len(req.input_token_ids_logprobs_val) == relevant_tokens_len
-                    assert len(req.input_token_ids_logprobs_idx) == relevant_tokens_len
+                assert len(req.logprob.input_token_logprobs_val) == relevant_tokens_len
+                assert len(req.logprob.input_token_logprobs_idx) == relevant_tokens_len
+                if req.logprob.top_logprobs_num > 0:
+                    assert (
+                        len(req.logprob.input_top_logprobs_val) == relevant_tokens_len
+                    )
+                    assert (
+                        len(req.logprob.input_top_logprobs_idx) == relevant_tokens_len
+                    )
+                if req.logprob.token_ids_logprob is not None:
+                    assert (
+                        len(req.logprob.input_token_ids_logprobs_val)
+                        == relevant_tokens_len
+                    )
+                    assert (
+                        len(req.logprob.input_token_ids_logprobs_idx)
+                        == relevant_tokens_len
+                    )
 
     def add_logprob_return_values(
         self,
@@ -261,8 +275,8 @@ class SchedulerLogprobResultProcessor:
     ):
         """Attach logprobs to the return values."""
         if output.next_token_logprobs is not None:
-            req.output_token_logprobs_val.append(output.next_token_logprobs[i])
-            req.output_token_logprobs_idx.append(next_token_ids[i])
+            req.logprob.output_token_logprobs_val.append(output.next_token_logprobs[i])
+            req.logprob.output_token_logprobs_idx.append(next_token_ids[i])
 
         # Only add input logprobs if there are input tokens to process
         # Note: For prefill-only requests with default logprob_start_len, this will be 0,
@@ -279,20 +293,24 @@ class SchedulerLogprobResultProcessor:
         else:
             self._initialize_empty_logprob_containers(req)
 
-        if req.top_logprobs_num > 0:
-            req.output_top_logprobs_val.append(output.next_token_top_logprobs_val[i])
-            req.output_top_logprobs_idx.append(output.next_token_top_logprobs_idx[i])
+        if req.logprob.top_logprobs_num > 0:
+            req.logprob.output_top_logprobs_val.append(
+                output.next_token_top_logprobs_val[i]
+            )
+            req.logprob.output_top_logprobs_idx.append(
+                output.next_token_top_logprobs_idx[i]
+            )
 
         if (
-            req.token_ids_logprob is not None
+            req.logprob.token_ids_logprob is not None
             and output.next_token_token_ids_logprobs_val is not None
         ):
             # Convert GPU tensor to list if needed
             logprobs_val = output.next_token_token_ids_logprobs_val[i]
             if isinstance(logprobs_val, torch.Tensor):
                 logprobs_val = logprobs_val.tolist()
-            req.output_token_ids_logprobs_val.append(logprobs_val)
-            req.output_token_ids_logprobs_idx.append(
+            req.logprob.output_token_ids_logprobs_val.append(logprobs_val)
+            req.logprob.output_token_ids_logprobs_idx.append(
                 output.next_token_token_ids_logprobs_idx[i]
             )
 
@@ -305,15 +323,15 @@ class SchedulerLogprobResultProcessor:
         This is needed for prefill-only requests where the normal initialization
         flow might be bypassed, but downstream code expects these fields to be lists.
         """
-        if req.input_token_logprobs_val is None:
-            req.input_token_logprobs_val = []
-        if req.input_token_logprobs_idx is None:
-            req.input_token_logprobs_idx = []
-        if req.input_top_logprobs_val is None:
-            req.input_top_logprobs_val = []
-        if req.input_top_logprobs_idx is None:
-            req.input_top_logprobs_idx = []
-        if req.input_token_ids_logprobs_val is None:
-            req.input_token_ids_logprobs_val = []
-        if req.input_token_ids_logprobs_idx is None:
-            req.input_token_ids_logprobs_idx = []
+        if req.logprob.input_token_logprobs_val is None:
+            req.logprob.input_token_logprobs_val = []
+        if req.logprob.input_token_logprobs_idx is None:
+            req.logprob.input_token_logprobs_idx = []
+        if req.logprob.input_top_logprobs_val is None:
+            req.logprob.input_top_logprobs_val = []
+        if req.logprob.input_top_logprobs_idx is None:
+            req.logprob.input_top_logprobs_idx = []
+        if req.logprob.input_token_ids_logprobs_val is None:
+            req.logprob.input_token_ids_logprobs_val = []
+        if req.logprob.input_token_ids_logprobs_idx is None:
+            req.logprob.input_token_ids_logprobs_idx = []
