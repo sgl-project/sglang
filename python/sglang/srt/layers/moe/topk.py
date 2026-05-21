@@ -939,7 +939,9 @@ def biased_topk_jit_kernel_impl(
             routed_scaling_factor=routed_scaling_factor,
             apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
         )
-        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+        topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(
+            torch.int32
+        )
         return topk_weights, topk_ids
 
 
