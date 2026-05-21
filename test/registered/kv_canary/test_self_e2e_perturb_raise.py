@@ -31,7 +31,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
         try:
             self.send_parallel_requests(
                 n=4,
-                expect_all_success=False,
+                assert_all_successs=False,
                 max_new_tokens=200,
                 timeout=30.0,
             )

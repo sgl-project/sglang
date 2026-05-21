@@ -33,7 +33,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
         super().setUpClass()
 
     def test_real_kv_hash_violation_observed(self) -> None:
-        self.send_parallel_requests(n=4, expect_all_success=True, max_new_tokens=200)
+        self.send_parallel_requests(n=4, assert_all_successs=True, max_new_tokens=200)
         suffix = "FULL" if self.target_group == "full" else "SWA"
         try:
             self.assert_violation_logged(

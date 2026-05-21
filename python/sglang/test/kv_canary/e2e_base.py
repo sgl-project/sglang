@@ -144,7 +144,7 @@ class CanaryE2EBase(CustomTestCase):
         self,
         n: int,
         *,
-        expect_all_success: bool,
+        assert_all_successs: bool,
         max_new_tokens: int = 16,
         timeout: float = 60.0,
     ) -> list[dict]:
@@ -171,7 +171,7 @@ class CanaryE2EBase(CustomTestCase):
         with ThreadPoolExecutor(max_workers=max(1, n)) as pool:
             results = list(pool.map(_send, prompts))
 
-        if expect_all_success:
+        if assert_all_successs:
             for result in results:
                 self.assertEqual(result.get("status_code"), 200, result)
 
