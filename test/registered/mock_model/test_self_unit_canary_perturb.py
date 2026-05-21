@@ -7,6 +7,9 @@ from _pytest.logging import LogCaptureFixture
 from sglang.srt.kv_canary.perturb import real_kv_used
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.slot_picker import ActiveSlotTarget
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(
