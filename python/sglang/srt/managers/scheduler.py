@@ -2849,11 +2849,7 @@ class Scheduler(
                     # draft_extend; publish moves the fence to verify-end so
                     # schedule prep can overlap with draft_extend.
                     fwd_kwargs = (
-                        {
-                            "on_verify_complete": partial(
-                                self.future_map.publish, future_indices
-                            )
-                        }
+                        {"on_publish": partial(self.future_map.publish, future_indices)}
                         if batch.is_spec_v2
                         else {}
                     )
