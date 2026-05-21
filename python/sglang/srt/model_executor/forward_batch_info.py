@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
+    from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
 
 _is_npu = is_npu()
 
@@ -441,6 +442,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # For request time stats
+    time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -551,6 +555,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
+            time_stats=(
+                [req.time_stats for req in batch.reqs]
+                if batch.reqs is not None
+                else None
+            )
         )
 
         device = model_runner.device
