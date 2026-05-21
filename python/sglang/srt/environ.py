@@ -752,11 +752,6 @@ class Envs:
     # random among groups with non-empty real_kv_sources. Used by per-group
     # e2e tests to drive detection deterministically.
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr("any")
-    # Real-KV-byte perturbation. DEPRECATED — retained for one commit so the
-    # old perturb_real_kv_hook keeps compiling; the follow-up commit splits
-    # this into the two used / unused_cache env vars above.
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB = EnvFloat(0.0)
-    SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN = EnvBool(False)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle

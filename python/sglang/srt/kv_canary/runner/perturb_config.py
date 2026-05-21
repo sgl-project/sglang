@@ -23,9 +23,6 @@ class PerturbConfig:
         target_group_kind: which CanaryBufferGroup to target with real_kv_used / real_kv_unused
             perturb. "full" / "swa" exact-match the PoolKind name; "any" picks at random among
             groups with non-empty real_kv_sources.
-        real_kv_prob: DEPRECATED — retained for one commit to keep the old hook compatible until
-            the follow-up commit splits perturb_real_kv into used / unused_cache.
-        real_kv_require_orphan: DEPRECATED — see real_kv_prob.
         warmup_steps: number of initial forward steps to gate off all perturb hooks. Prevents
             perturb from firing during sglang warmup, where a garbage write can trip a CUDA error
             before the canary's deferred D2H violation pump has a chance to log the canary_kind
@@ -36,8 +33,6 @@ class PerturbConfig:
     real_kv_used_prob: float = 0.0
     real_kv_unused_cache_prob: float = 0.0
     target_group_kind: Literal["full", "swa", "any"] = "any"
-    real_kv_prob: float = 0.0
-    real_kv_require_orphan: bool = False
     warmup_steps: int = 50
 
     @classmethod
@@ -49,8 +44,6 @@ class PerturbConfig:
             target_group_kind=_parse_target_group_kind(
                 envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.get()
             ),
-            real_kv_prob=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_PROB.get(),
-            real_kv_require_orphan=envs.SGLANG_KV_CANARY_REAL_PERTURB_BYTES_REQUIRE_ORPHAN.get(),
             warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS.get(),
         )
 
