@@ -94,7 +94,9 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
 class TestSeedSlot:
     def test_seed_slot_idx_negative_uses_anchor(self) -> None:
         """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(consts.CANARY_CHAIN_ANCHOR)``."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -122,7 +124,9 @@ class TestSeedSlot:
 
     def test_seed_slot_idx_loads_predecessor(self) -> None:
         """``seed_slot_idx >= 0`` → load 4 fields from ``canary_buf[seed]`` and splitmix64-advance into prev_hash."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
 
         # Step: pre-stamp slot 7 with a known chain link.
         seed_token, seed_position = 100, 4
@@ -163,7 +167,9 @@ class TestSeedSlot:
         """After write, ``slot[0].prev_hash`` is consistent with verify's chain reconstruction from seed."""
         # Step 1: write a chain from seed slot=7 → newly written slot=2. Then run verify with prev=7 and
         # assert no violation — i.e., slot[2].prev_hash is the correct splitmix64-mix of seed's 4 fields.
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         cuda_buf = buf_pair[0]
         seed_token, seed_position = 11, 0
         seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
@@ -274,7 +280,9 @@ class TestSeedSlot:
 
     def test_seed_continues_existing_chain(self) -> None:
         """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix4(seed.*)."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         seed_slot = 3
         seed_token = 7
         seed_position = 1
@@ -325,7 +333,9 @@ class TestSeedSlot:
 class TestChain:
     def test_chain_link_byte_equal_5_step(self) -> None:
         """5-step chain, buf / ring / counters byte-equal against ref."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 5],
             seed_slot_indices=[-1],
@@ -345,7 +355,9 @@ class TestChain:
 
     def test_chain_link_byte_equal_5_step_hardcoded(self) -> None:
         """5-step write chain with hand-computed splitmix64 expected fields per slot."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 5],
             seed_slot_indices=[-1],
@@ -363,7 +375,9 @@ class TestChain:
         for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
             expected_prev_hashes_u64.append(running)
             running = splitmix64_mix4(running, token, position, real_kv_hash)
-        expected_prev_hashes_signed = [to_signed_int64(h) for h in expected_prev_hashes_u64]
+        expected_prev_hashes_signed = [
+            to_signed_int64(h) for h in expected_prev_hashes_u64
+        ]
 
         pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
         run_write_diff(
@@ -390,7 +404,9 @@ class TestChain:
 
     def test_chain_advances_with_real_kv_hash_all(self) -> None:
         """ALL mode + 2 sources + 5-step chain: stored prev_hash recoverable from seed."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         cuda_buf = buf_pair[0]
         sources_cuda = make_real_kv_sources(
             count=2,
@@ -428,12 +444,16 @@ class TestChain:
         for slot_idx, token, position in zip(slot_indices, tokens, positions):
             rkv = 0
             for src in sources_cuda:
-                row_bytes = src.tensor[slot_idx, : src.read_bytes].detach().cpu().tolist()
+                row_bytes = (
+                    src.tensor[slot_idx, : src.read_bytes].detach().cpu().tolist()
+                )
                 fold = 0
                 for b in row_bytes:
                     fold = splitmix64(fold ^ int(b))
                 rkv = splitmix64(rkv ^ fold)
-            stored_prev_signed = read_slot_fields(canary_buf=cuda_buf, slot_idx=slot_idx)[2]
+            stored_prev_signed = read_slot_fields(
+                canary_buf=cuda_buf, slot_idx=slot_idx
+            )[2]
             assert stored_prev_signed == to_signed_int64(
                 running
             ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
@@ -443,7 +463,9 @@ class TestChain:
 class TestMockMode:
     def test_mock_mode_off_ignores_expected(self) -> None:
         """``enable_write_verify_inputs = OFF`` → expected tensors are ignored (we pass garbage to prove the kernel skips them)."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 3],
             seed_slot_indices=[-1],
@@ -465,7 +487,9 @@ class TestMockMode:
 
     def test_mock_mode_on_match_no_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` and expected matches actual → no violation, chain advances."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 3],
             seed_slot_indices=[-1],
@@ -489,7 +513,9 @@ class TestMockMode:
 
     def test_mock_mode_on_token_mismatch_records_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` token mismatch → violation recorded; chain advances on ACTUAL token."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -507,7 +533,9 @@ class TestMockMode:
             expected_input_positions=_int32_tensor([0]),
         )
 
-        fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+        fail_bits = int(
+            cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
+        )
         assert_only_bits_set(fail_bits, consts.FailReason.WRITE_TOKEN_MISMATCH)
         # Chain advances on actual (42), not expected (99). Stored token should be 42.
         stored_token, _, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=0)
@@ -515,7 +543,9 @@ class TestMockMode:
 
     def test_mock_mode_on_position_mismatch_records_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` position mismatch → violation recorded; chain advances on ACTUAL position."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -533,14 +563,18 @@ class TestMockMode:
             expected_input_positions=_int32_tensor([0]),
         )
 
-        fail_bits = int(cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item())
+        fail_bits = int(
+            cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
+        )
         assert_only_bits_set(fail_bits, consts.FailReason.WRITE_POSITION_MISMATCH)
         _, stored_position, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=0)
         assert stored_position == 7
 
     def test_mock_mode_chain_advances_on_actual_not_expected(self) -> None:
         """Expected differs from actual on every entry → downstream verify must NOT cascade chain errors."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         cuda_buf = buf_pair[0]
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 3],
@@ -586,7 +620,8 @@ class TestMockMode:
 
     @pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
-    def test_mock_violation_bit_injection_position_matrix(self,
+    def test_mock_violation_bit_injection_position_matrix(
+        self,
         bit_to_trigger: str,
         injection_position: str,
     ) -> None:
@@ -603,7 +638,9 @@ class TestMockMode:
             "MOCK_POSITION": consts.FailReason.WRITE_POSITION_MISMATCH,
         }[bit_to_trigger]
 
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, slot_count],
             seed_slot_indices=[-1],
@@ -653,10 +690,12 @@ class TestMockMode:
 class TestSlotHandling:
     def test_negative_slot_skips_entry(self) -> None:
         """``fb_out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
-    slot_run_counter bump. Covers both SWA out-of-window (after caller-side LUT gather) and
-    explicit padding intents.
-    """
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        slot_run_counter bump. Covers both SWA out-of-window (after caller-side LUT gather) and
+        explicit padding intents.
+        """
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         # Two entries: first writes to slot 4 normally; second has slot=-1 and must be skipped.
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 2],
@@ -682,10 +721,12 @@ class TestSlotHandling:
 
     def test_pre_translated_slot_writes_normally(self) -> None:
         """``fb_out_cache_loc[i] >= 0`` → the kernel writes to exactly that slot, with no LUT applied. This
-    confirms the kernel is SWA-agnostic: SWA endpoints feed the same shape of input here after their
-    host-side gather, so the contract is symmetric across FULL / SWA groups.
-    """
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        confirms the kernel is SWA-agnostic: SWA endpoints feed the same shape of input here after their
+        host-side gather, so the contract is symmetric across FULL / SWA groups.
+        """
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -710,7 +751,9 @@ class TestSlotHandling:
 
     def test_padding_block_skipped(self) -> None:
         """``blockIdx.x >= write_num_valid_reqs[0]`` → block early-exits, no write to canary_buf."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         # Allocate plan with req_capacity=4 but only declare 1 active req.
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
@@ -741,7 +784,9 @@ class TestSlotHandling:
 
     def test_write_skip_when_out_cache_loc_is_minus_one(self) -> None:
         """fb_out_cache_loc[i] = -1 → that entry's slot is untouched by write kernel."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         cuda_buf = buf_pair[0]
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 3],
@@ -831,7 +876,9 @@ class TestSlotHandling:
 class TestRealKvHash:
     def test_real_kv_mode_off_writes_zero(self) -> None:
         """``consts.RealKvHashMode.OFF`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         sources = make_real_kv_sources(count=2, device=_DEVICE)
 
         plan_pair = make_write_plan_pair(
@@ -866,7 +913,9 @@ class TestRealKvHash:
     )
     def test_real_kv_mode_byte_equal(self, mode: consts.RealKvHashMode) -> None:
         """PARTIAL / ALL modes both produce CUDA-vs-ref byte-equal write state on a 3-entry chain."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
         sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -892,7 +941,9 @@ class TestRealKvHash:
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         sources_cuda = make_real_kv_sources(count=count, device=_DEVICE)
         sources_ref = clone_real_kv_sources(sources_cuda)
 
@@ -969,7 +1020,8 @@ class TestRealKvHash:
             ),
         ],
     )
-    def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(self,
+    def test_real_kv_hash_fold_mode_writes_expected_hash_hardcoded(
+        self,
         mode: consts.RealKvHashMode,
         fold_fn: Callable[[bytes], int],
         expected_hash: int,
@@ -999,9 +1051,15 @@ class TestRealKvHash:
         # Step 2: verify hand-computed fold matches the hex literal.
         assert fold_fn(_PATTERN) == expected_hash
 
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         source_cuda = make_real_kv_source(
-            num_slots=16, num_bytes_per_token=16, page_size=1, read_bytes=16, device=_DEVICE
+            num_slots=16,
+            num_bytes_per_token=16,
+            page_size=1,
+            read_bytes=16,
+            device=_DEVICE,
         )
         source_cuda.tensor[0, :16] = torch.tensor(list(_PATTERN), dtype=torch.uint8)
         source_ref = RealKvSource(
@@ -1032,14 +1090,18 @@ class TestRealKvHash:
         )
 
         # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
-        _, _, _, stored_real_kv_hash = read_slot_fields(canary_buf=buf_pair[0], slot_idx=0)
+        _, _, _, stored_real_kv_hash = read_slot_fields(
+            canary_buf=buf_pair[0], slot_idx=0
+        )
         assert stored_real_kv_hash == to_signed_int64(
             expected_hash
         ), f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
 
     def test_paged_real_kv_hash_consistent_across_slots(self) -> None:
         """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         sources_cuda = make_real_kv_sources(
             count=1,
             num_bytes_per_token=16,
@@ -1121,7 +1183,9 @@ class TestRealKvHash:
 class TestRunCounter:
     def test_kernel_run_counter_per_call(self) -> None:
         """``kernel_run_counter`` increments by 1 per call (even when ``write_num_valid_reqs == 0``)."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 0],
             seed_slot_indices=[-1],
@@ -1159,7 +1223,9 @@ class TestRunCounter:
 
     def test_slot_run_counter_sums_entries(self) -> None:
         """``slot_run_counter`` += sum(entry_count) across all active reqs in this call."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 2, 5],
             seed_slot_indices=[-1, -1],
@@ -1183,7 +1249,9 @@ class TestRunCounter:
 class TestMisc:
     def test_empty_plan_no_op(self) -> None:
         """``write_num_valid_reqs = 0`` → no buf write, no slot_run_counter bump, only kernel_run_counter += 1."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 0],
             seed_slot_indices=[-1],
@@ -1208,7 +1276,7 @@ class TestMisc:
 
     def test_disabled_input_verify_does_not_deref_expected_inputs(self) -> None:
         """``enable_write_verify_inputs=False`` must short-circuit before any expected_input_* dereference;
-    poison those tensors with 0x7F7F7F7F and assert nothing records a violation."""
+        poison those tensors with 0x7F7F7F7F and assert nothing records a violation."""
         cuda_buf = make_canary_buf(num_slots=8, slot_stride_bytes=32, device=_DEVICE)
         ref_buf = cuda_buf.clone()
         buf_pair = (cuda_buf, ref_buf)
@@ -1263,7 +1331,9 @@ class TestBoundarySweep:
 class TestPseudoMode:
     def test_pseudo_mode_on_catches_token_mismatch(self) -> None:
         """enable_write_verify_inputs=ON + intentional token mismatch → WRITE_TOKEN_MISMATCH bit recorded."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 5],
             seed_slot_indices=[-1],
@@ -1294,7 +1364,9 @@ class TestPseudoMode:
 
     def test_pseudo_mode_off_skips_token_check(self) -> None:
         """enable_write_verify_inputs=False + intentional mismatch in expected_input_* → no violation recorded."""
-        buf_pair = make_canary_buf_pair(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
+        buf_pair = make_canary_buf_pair(
+            num_slots=16, slot_stride_bytes=32, device=_DEVICE
+        )
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 3],
             seed_slot_indices=[-1],
