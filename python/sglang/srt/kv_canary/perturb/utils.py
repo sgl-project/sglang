@@ -66,6 +66,7 @@ class WarmupGate:
 
 def should_run_perturbation(
     *,
+    perturb_name: str,
     probability: float,
     warmup_gate: WarmupGate,
     forward_batch: Optional["ForwardBatch"],
@@ -76,6 +77,10 @@ def should_run_perturbation(
     if warmup_gate.is_in_warmup():
         return False
     if require_forward_batch and forward_batch is None:
+        logger.info(
+            "kv_canary perturb %s: skipped because forward_batch is unavailable",
+            perturb_name,
+        )
         return False
     return torch.rand((), device="cpu").item() < probability
 

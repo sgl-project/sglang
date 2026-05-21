@@ -56,7 +56,7 @@ def collect_active_slots(
     if exclude_out_cache_loc:
         out_cache_loc = forward_batch.out_cache_loc
         if out_cache_loc is not None:
-            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
+            excluded = {int(x) for x in out_cache_loc.detach().to("cpu").tolist()}
 
     req_pool_indices_list = req_pool_indices.detach().to("cpu").tolist()
     seq_lens_list = seq_lens.detach().to("cpu").tolist()
@@ -72,19 +72,15 @@ def collect_active_slots(
         if upper <= 0:
             continue
         row_slots = req_to_token[req_pool_idx_int, :upper].detach().to("cpu").tolist()
-        for pos, raw_slot in enumerate(row_slots):
-            slot = int(raw_slot)
-            if slot < 0:
-                continue
-            if slot in excluded:
-                continue
-            candidates.append(
-                ActiveSlotTarget(
-                    req_pool_idx=req_pool_idx_int,
-                    position=pos,
-                    slot=slot,
-                )
+        candidates.extend(
+            ActiveSlotTarget(
+                req_pool_idx=req_pool_idx_int,
+                position=pos,
+                slot=slot,
             )
+            for pos, raw_slot in enumerate(row_slots)
+            if (slot := int(raw_slot)) >= 0 and slot not in excluded
+        )
     return candidates
 
 
@@ -117,12 +113,9 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
     )
     if slot_tensor.numel() == 0:
         return None
-    valid: list[int] = []
-    for raw_slot in slot_tensor.tolist():
-        slot = int(raw_slot)
-        if slot < 0:
-            continue
-        valid.append(slot)
+    valid: list[int] = [
+        slot for raw_slot in slot_tensor.tolist() if (slot := int(raw_slot)) >= 0
+    ]
     if not valid:
         return None
     pick = int(torch.randint(0, len(valid), (1,)).item())
