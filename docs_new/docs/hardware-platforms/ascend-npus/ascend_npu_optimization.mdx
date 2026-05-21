@@ -390,6 +390,280 @@ The following environment variables are used in other best practice configuratio
   </tbody>
 </table>
 
+## Feature x Feature
+
+The table shows Feature combinations of SGLang capabilities.
+
+The symbols used are defined as follows:
+F = Full compatibility
+P = Partial compatibility
+N = No compatibility
+? = Unknown or TBD
+
+<table>
+  <thead>
+    <tr>
+      <th>Feature</th>
+      <th>Tensor Parallelism</th>
+      <th>Data Parallelism</th>
+      <th>Expert Parallelism</th>
+      <th>Context Parallelism</th>
+      <th>PD Disaggregation</th>
+      <th>Encode Prefill Disaggregation</th>
+      <th>Multimodal</th>
+      <th>Quantization</th>
+      <th>Chunked Prefill</th>
+      <th>LoRA</th>
+      <th>Speculative Decoding</th>
+      <th>Mamba Cache</th>
+      <th>Hierarchical Cache</th>
+      <th>Ngram Speculative Decoding</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Tensor Parallelism</td>
+      <td></td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Data Parallelism</td>
+      <td>F</td>
+      <td></td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Expert Parallelism</td>
+      <td>F</td>
+      <td>F</td>
+      <td></td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Context Parallelism</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td></td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>PD Disaggregation</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td></td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Encode Prefill Disaggregation</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td></td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Multimodal</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td></td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Quantization</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td></td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Chunked Prefill</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td></td>
+      <td>P</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>LoRA</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td></td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Speculative Decoding</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td></td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Mamba Cache</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>F</td>
+      <td>P</td>
+      <td>F</td>
+      <td>P</td>
+      <td>P</td>
+      <td></td>
+      <td>P</td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Hierarchical Cache</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td>P</td>
+      <td></td>
+      <td>?</td>
+    </tr>
+    <tr>
+      <td>Ngram Speculative Decoding</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td>?</td>
+      <td></td>
+    </tr>
+  </tbody>
+</table>
+
+
+
 ## See Also
 
 - [Ascend NPU Best Practice](/docs/hardware-platforms/ascend-npus/ascend_npu_best_practice) — Complete deployment configurations and benchmark results for all supported models
