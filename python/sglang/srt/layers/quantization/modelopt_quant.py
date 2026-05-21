@@ -1787,6 +1787,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             (1 / w2_input_scale).to(torch.float32),
         )
 
+        swiglu_limit = layer.moe_runner_config.swiglu_limit
+        if (
+            swiglu_limit is not None
+            and layer.moe_runner_config.is_gated
+            and self.enable_flashinfer_trtllm_moe
+        ):
+            copy_or_rebind_param(
+                layer,
+                "gemm1_clamp_limit",
+                (swiglu_limit / layer.g1_alphas).to(torch.float32),
+            )
+
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
         layer.dispatcher.set_quant_config(
             {
@@ -2037,6 +2049,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 layer, "routing_method_type", RoutingMethodType.Default
             )
 
+            gemm1_clamp = getattr(layer, "gemm1_clamp_limit", None)
             quant_info = FlashInferTrtllmFp4MoeQuantInfo(
                 w13_weight=layer.w13_weight.data,
                 w2_weight=layer.w2_weight.data,
@@ -2051,6 +2064,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
+                gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
             )
 
             return self.runner.run(dispatch_output, quant_info)
