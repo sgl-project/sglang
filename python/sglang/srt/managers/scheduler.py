@@ -2849,14 +2849,11 @@ class Scheduler(
                 with self._overlap_forward_isolation(batch):
                     future_indices = FutureIndices(indices=batch.req_pool_indices)
 
-                    # Spec_v2 worker fires this between sample-end and
-                    # draft_extend; publish moves the fence to verify-end so
-                    # schedule prep can overlap with draft_extend.
-                    fwd_kwargs = (
-                        {"on_publish": partial(self.future_map.publish, future_indices)}
-                        if batch.is_spec_v2
-                        else {}
-                    )
+                    # Both modes publish next-iter seq_lens via FutureMap;
+                    # spec_v2 fires post-verify (overlaps draft_extend), non-spec post-sample.
+                    fwd_kwargs = {
+                        "on_publish": partial(self.future_map.publish, future_indices)
+                    }
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
@@ -2888,16 +2885,11 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # Placeholder for next iter's resolve_future to look up the
-                # real token from output_tokens_buf via the negated indices.
-                batch.input_ids = -future_indices.indices
+                self.future_map.invalidate(batch, future_indices)
 
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-                    # Schedule-stream sentinel between iters; next iter's
-                    # resolve_future reassigns batch.seq_lens from new_seq_lens_buf.
-                    batch.seq_lens = -future_indices.indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
