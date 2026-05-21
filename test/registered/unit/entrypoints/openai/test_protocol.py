@@ -27,6 +27,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     Function,
     ModelCard,
     ModelList,
+    SglExt,
     Tool,
     UsageInfo,
 )
@@ -370,6 +371,24 @@ class TestModelSerialization(unittest.TestCase):
         data = response.model_dump(exclude_none=True)
         self.assertIn("hidden_states", data["choices"][0])
         self.assertEqual(data["choices"][0]["hidden_states"], [0.1, 0.2, 0.3])
+
+    def test_sglext_actions_serialized_when_present(self):
+        response = ChatCompletionResponse(
+            id="test-id",
+            model="test-model",
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role="assistant", content=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=UsageInfo(prompt_tokens=5, completion_tokens=1, total_tokens=6),
+            sglext=SglExt(actions=[[[0.1, 0.2]]]),
+        )
+
+        data = response.model_dump(exclude_none=True)
+        self.assertEqual(data["sglext"]["actions"], [[[0.1, 0.2]]])
 
 
 class TestFunctionDeferLoading(unittest.TestCase):
