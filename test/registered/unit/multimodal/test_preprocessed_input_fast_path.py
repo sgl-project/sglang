@@ -348,6 +348,21 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
         self.assertTrue(torch.equal(fast_positions.squeeze(1), generic_positions))
         self.assertTrue(torch.equal(fast_delta, generic_delta))
 
+    def test_qwen_uses_precomputed_mrope_from_processor_output(self):
+        processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+        positions = torch.arange(18, dtype=torch.long).reshape(3, 1, 6)
+        delta = torch.tensor([[7]], dtype=torch.long)
+
+        output_positions, output_delta = processor._get_precomputed_mrope_from_output(
+            {
+                "mrope_positions": positions,
+                "mrope_position_delta": delta,
+            }
+        )
+
+        self.assertTrue(torch.equal(output_positions, positions.squeeze(1)))
+        self.assertTrue(torch.equal(output_delta, delta))
+
 
 if __name__ == "__main__":
     unittest.main()
