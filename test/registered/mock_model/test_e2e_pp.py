@@ -11,13 +11,9 @@ register_cuda_ci(est_time=600, suite="extra-a-test-1-gpu-large")
 
 class TestE2EPipelineParallel(CustomTestCase):
     def test_pp_no_canary_violation(self) -> None:
-        bench_result = run_mock_model_bench_serving(
+        run_mock_model_bench_serving(
             extra_server_args=["--pp-size", "2"],
         )
-
-        self.assertEqual(bench_result.result["completed"], 8)
-        self.assertIsNone(bench_result.server_return_code, bench_result.log_tail())
-        self.assertNotIn("kv_canary violation:", bench_result.log_text)
 
 
 if __name__ == "__main__":

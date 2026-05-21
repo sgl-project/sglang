@@ -24,7 +24,7 @@ register_cuda_ci(est_time=600, stage="extra-a", runner_config="2-gpu-large")
 # canary e2e test. The canary kernel must run inside the cuda graph alongside
 # the real attn kernel; disabling the graph silently bypasses the only path
 # that exercises that invariant end-to-end.
-_NUM_PROMPTS = 8
+_NUM_PROMPTS = 32
 _INPUT_LEN = 6144
 _OUTPUT_LEN = 1024
 

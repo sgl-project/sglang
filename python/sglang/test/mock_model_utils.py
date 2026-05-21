@@ -66,7 +66,7 @@ def run_mock_model_bench_serving(
     *,
     extra_server_args: Sequence[str],
     input_check_enabled: bool = True,
-    num_prompts: int = 8,
+    num_prompts: int = 32,
     random_input_len: int = 6144,
     random_output_len: int = 1024,
 ) -> MockModelBenchResult:
@@ -100,13 +100,38 @@ def run_mock_model_bench_serving(
 
         result = run_benchmark(args)
         server_return_code = process.poll()
-
-        return MockModelBenchResult(
+        bench_result = MockModelBenchResult(
             result=result,
             stdout=stdout_buf.getvalue(),
             stderr=stderr_buf.getvalue(),
             server_return_code=server_return_code,
         )
+        _assert_mock_model_bench_succeeded(
+            bench_result=bench_result,
+            expected_completed=num_prompts,
+        )
+
+        return bench_result
     finally:
         if process is not None:
             kill_process_tree(process.pid)
+
+
+def _assert_mock_model_bench_succeeded(
+    *,
+    bench_result: MockModelBenchResult,
+    expected_completed: int,
+) -> None:
+    completed = bench_result.result.get("completed")
+    if completed != expected_completed:
+        raise AssertionError(f"Expected {expected_completed} completed requests, got {completed}")
+
+    if bench_result.server_return_code is not None:
+        raise AssertionError(
+            f"Mock-model server exited with code {bench_result.server_return_code}.\n{bench_result.log_tail()}"
+        )
+
+    if "kv_canary violation:" in bench_result.log_text:
+        raise AssertionError(
+            f"Unexpected kv_canary violation in mock-model server log.\n{bench_result.log_tail()}"
+        )
