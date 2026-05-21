@@ -400,7 +400,27 @@ class ViTCudaGraphRunner:
             )
 
         # Fallback: total tokens exceed max bucket, run eager
+        import logging
+        import time as _time
+
+        logger = logging.getLogger(__name__)
+        t0 = _time.monotonic()
+        torch.cuda.synchronize()
+        t1 = _time.monotonic()
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
-        return self.vit.run_merger(block_out, ds_outs)
+        torch.cuda.synchronize()
+        t2 = _time.monotonic()
+        out = self.vit.run_merger(block_out, ds_outs)
+        torch.cuda.synchronize()
+        t3 = _time.monotonic()
+        logger.info(
+            "[VIT_GRAPH_EAGER] tokens=%d sync=%.1fms blocks=%.1fms merger=%.1fms total=%.1fms",
+            total_tokens,
+            (t1 - t0) * 1000,
+            (t2 - t1) * 1000,
+            (t3 - t2) * 1000,
+            (t3 - t0) * 1000,
+        )
+        return out
