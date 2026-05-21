@@ -243,8 +243,8 @@ export const Qwen3Deployment = () => {
 
   // Generate command
   const generateCommand = () => {
-    const normalizedValues = normalizeValues(values);
-    const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = normalizedValues;
+    const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = values;
+    const displayOptions = getDisplayOptions(values);
 
     // Special error handling
     const commandKey = `${hardware}-${modelsize}-${quantization}-${category}`;
@@ -279,17 +279,14 @@ export const Qwen3Deployment = () => {
 
     let cmd = 'python -m sglang.launch_server \
 ';
-    cmd += `  --model ${modelPath}`;
+    cmd += `  --model ${modelName}`;
 
     if (hardware === 'xeon') {
-      cmd += ` \
-  --device cpu \
-  --disable-overlap-schedule`;
+      cmd += ` \\\n  --device cpu \\\n  --disable-overlap-schedule`;
     }
 
     if (hwConfig.tp > 1) {
-      cmd += ` \
-  --tp ${hwConfig.tp}`;
+      cmd += ` \\\n  --tp ${hwConfig.tp}`;
     }
 
     let ep = hwConfig.ep;
@@ -298,18 +295,17 @@ export const Qwen3Deployment = () => {
     }
 
     if (ep > 0) {
-      cmd += ` \
-  --ep ${ep}`;
+      cmd += ` \\\n  --ep ${ep}`;
     }
 
+    // Add reasoning parser
     if (reasoningParser === 'enabled' && category !== 'instruct') {
-      cmd += ' \
-  --reasoning-parser qwen3';
+      cmd += ' \\\n  --reasoning-parser qwen3';
     }
 
+    // Add tool call parser
     if (toolcall === 'enabled') {
-      cmd += ' \
-  --tool-call-parser qwen25';
+      cmd += ' \\\n  --tool-call-parser qwen25';
     }
 
     return cmd;
