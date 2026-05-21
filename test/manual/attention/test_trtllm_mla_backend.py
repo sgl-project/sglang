@@ -20,6 +20,10 @@ from sglang.srt.layers.attention.utils import get_num_page_per_block_flashmla
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    set_forward_context,
+)
 from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
@@ -434,10 +438,9 @@ class TestTRTLLMMLA(CustomTestCase):
             req_pool_indices=torch.arange(batch_size, device=config["device"]),
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens.cpu(),
-            attn_backend=backend,
         )
-        fb.req_to_token_pool = model_runner.req_to_token_pool
-        fb.token_to_kv_pool = model_runner.token_to_kv_pool
+        # Publish backend for RadixAttention dispatch.
+        set_forward_context(ForwardContext(attn_backend=backend))
 
         # Add position information for RoPE
         fb.positions = torch.arange(batch_size, device=config["device"])
@@ -1167,10 +1170,9 @@ class TestTRTLLMMLA(CustomTestCase):
                         seq_lens_cpu=seq_lens.cpu(),
                         attn_attend_prefix_cache=False,
                         mha_return_lse=False,
-                        attn_backend=backend,
                     )
-                    fb.req_to_token_pool = model_runner.req_to_token_pool
-                    fb.token_to_kv_pool = model_runner.token_to_kv_pool
+                    # Publish backend for RadixAttention dispatch.
+                    set_forward_context(ForwardContext(attn_backend=backend))
 
                     # Add position information for RoPE
                     fb.positions = torch.arange(batch_size, device=config["device"])
