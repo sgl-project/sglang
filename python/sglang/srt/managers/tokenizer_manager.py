@@ -24,6 +24,7 @@ import signal
 import socket
 import sys
 import threading
+import time as _time
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -81,6 +82,8 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.managers.utils import is_health_check_generate_req
+from sglang.srt.managers.vlm_profiler import ENABLED as _VLM_PROFILE
+from sglang.srt.managers.vlm_profiler import log_stage as _vlm_log
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -785,6 +788,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
+                    if _VLM_PROFILE:
+                        _preproc_t0 = _time.monotonic()
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
@@ -792,6 +797,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
+                    if _VLM_PROFILE:
+                        _vlm_log(
+                            "preprocess",
+                            rid=obj.rid,
+                            duration=_time.monotonic() - _preproc_t0,
+                            n_images=len(obj.image_data) if obj.image_data else 0,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -1190,8 +1202,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
+        if _VLM_PROFILE:
+            _wrap_t0 = _time.monotonic()
         tokenized_obj = wrap_shm_features(tokenized_obj)
+        if _VLM_PROFILE:
+            _wrap_dur = _time.monotonic() - _wrap_t0
+            _send_t0 = _time.monotonic()
         self.send_to_scheduler.send_pyobj(tokenized_obj)
+        if _VLM_PROFILE:
+            _vlm_log(
+                "transfer",
+                rid=tokenized_obj.rid,
+                wrap_shm=_wrap_dur,
+                send_pyobj=_time.monotonic() - _send_t0,
+            )
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(
