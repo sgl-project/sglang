@@ -269,8 +269,8 @@ class TestBuildPerBsParams(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
                 {
-                    "1": {"steps": [1, 5], "up_hysteresis": 0.3},
-                    "32": {"steps": [1, 2]},
+                    "1": {"candidate_steps": [1, 5], "up_hysteresis": 0.3},
+                    "32": {"candidate_steps": [1, 2]},
                 },
                 f,
             )
@@ -290,7 +290,7 @@ class TestBuildPerBsParams(unittest.TestCase):
 
     def test_invalid_steps_falls_back_to_default(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"steps": "bad"}}, f)
+            json.dump({"1": {"candidate_steps": "bad"}}, f)
             f.flush()
             bs_list, bs_params = build_per_bs_params(f.name)
         self.assertEqual(bs_list, [1, 8])
@@ -300,7 +300,7 @@ class TestBuildPerBsParams(unittest.TestCase):
             json.dump(
                 {
                     "up_hysteresis": 0.5,
-                    "1": {"steps": [1, 3]},
+                    "1": {"candidate_steps": [1, 3]},
                 },
                 f,
             )
@@ -313,7 +313,7 @@ class TestBuildPerBsParams(unittest.TestCase):
             json.dump(
                 {
                     "up_hysteresis": 0.5,
-                    "1": {"steps": [1, 3], "up_hysteresis": 0.1},
+                    "1": {"candidate_steps": [1, 3], "up_hysteresis": 0.1},
                 },
                 f,
             )
@@ -324,7 +324,7 @@ class TestBuildPerBsParams(unittest.TestCase):
     def test_ceiling_coeff_passthrough(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump(
-                {"1": {"steps": [1, 3], "ceiling_coeff": 2.5}},
+                {"1": {"candidate_steps": [1, 3], "ceiling_coeff": 2.5}},
                 f,
             )
             f.flush()
@@ -345,7 +345,7 @@ class TestResolveCandidateSteps(unittest.TestCase):
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"steps": [2, 4]}}, f)
+            json.dump({"1": {"candidate_steps": [2, 4]}}, f)
             f.flush()
             steps = resolve_candidate_steps_from_config(
                 initial_steps=3, cfg_path=f.name
@@ -365,7 +365,7 @@ class TestResolveCandidateSteps(unittest.TestCase):
 
     def test_empty_steps_falls_back(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"steps": []}}, f)
+            json.dump({"1": {"candidate_steps": []}}, f)
             f.flush()
             steps = resolve_candidate_steps_from_config(
                 initial_steps=3, cfg_path=f.name
@@ -376,7 +376,7 @@ class TestResolveCandidateSteps(unittest.TestCase):
 
     def test_zero_steps_falls_back(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
-            json.dump({"1": {"steps": [0]}}, f)
+            json.dump({"1": {"candidate_steps": [0]}}, f)
             f.flush()
             steps = resolve_candidate_steps_from_config(
                 initial_steps=3, cfg_path=f.name

@@ -30,13 +30,13 @@ logger = logging.getLogger(__name__)
 # on hard workloads, even step=1 loses to nospec at high batch sizes.
 DEFAULT_ADAPTIVE_CONFIG: dict[str, dict] = {
     "1": {
-        "steps": [1, 3, 7],
+        "candidate_steps": [1, 3, 7],
         "up_hysteresis": 0.0,
         "down_hysteresis": -0.25,
         "ceiling_coeff": 0,
     },
     "8": {
-        "steps": [1],
+        "candidate_steps": [1],
         "up_hysteresis": 0.0,
         "down_hysteresis": 0.0,
         "ceiling_coeff": 0,
@@ -84,7 +84,7 @@ def load_adaptive_config(path: str | None) -> dict:
 
     The file is a JSON object with integer-string keys as BS lower bounds::
 
-        {"1": {"steps": [1,3,7], ...}, "64": {"steps": [1,2,5], ...}}
+        {"1": {"candidate_steps": [1,3,7], ...}, "64": {"candidate_steps": [1,2,5], ...}}
 
     Non-integer keys (``ema_alpha``, ``update_interval``, …) are global
     overrides applied to every BS slot.
@@ -142,7 +142,7 @@ def _load_validated_config(
         if bs_config is None:
             raise ValueError("no per-BS entries found")
         for bs, entry in bs_config.items():
-            steps = entry.get("steps")
+            steps = entry.get("candidate_steps")
             if steps is not None and (
                 not isinstance(steps, list)
                 or not steps
@@ -176,7 +176,7 @@ def resolve_candidate_steps_from_config(
     _, bs_config = _load_validated_config(cfg_path)
     all_steps: set[int] = set()
     for entry in bs_config.values():
-        all_steps.update(entry.get("steps", [1, 3, 7]))
+        all_steps.update(entry.get("candidate_steps", [1, 3, 7]))
     all_steps.add(initial_steps)
     return sorted(all_steps)
 
@@ -194,7 +194,7 @@ def build_per_bs_params(
     bs_list = sorted(bs_config.keys())
     bs_params: dict[int, AdaptiveSpeculativeParams] = {}
     for bs, entry in sorted(bs_config.items()):
-        steps = entry.get("steps", [1, 3, 7])
+        steps = entry.get("candidate_steps", [1, 3, 7])
         initial = steps[len(steps) // 2]
         params_cfg = {
             **cfg,
