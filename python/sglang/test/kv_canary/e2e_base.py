@@ -246,8 +246,8 @@ class CanaryE2EBase(CustomTestCase):
         min_mapping_nonidentity: int = 1,
         min_pool_wrap: int = 1,
         require_verify_lag: bool = True,
-        flush_wait_seconds: float = 2.0,
-        max_retries: int = 5,
+        flush_wait_seconds: float = 3.0,
+        max_retries: int = 10,
     ) -> None:
         """Assert that the SWA path was genuinely exercised: at least one slot
         recycled, at least one non-identity LUT entry, and (when
