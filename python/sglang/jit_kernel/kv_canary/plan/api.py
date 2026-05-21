@@ -15,10 +15,7 @@ from sglang.jit_kernel.kv_canary.plan.offsets_kernel import (
     launch_plan_offsets_kernel,
 )
 from sglang.jit_kernel.kv_canary.plan.utils import _resolve_swa_lut
-from sglang.jit_kernel.kv_canary.verify import (
-    VerifyPlan,
-    _assert_contiguous,
-)
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
 
@@ -128,38 +125,6 @@ def canary_plan_step(
         raise ValueError(
             "kv-canary: canary_plan_step requires full_to_swa_index_mapping when swa_window_size > 0"
         )
-
-    _assert_contiguous(
-        verify_plan_out.verify_slot_indices, "verify_plan_out.verify_slot_indices"
-    )
-    _assert_contiguous(
-        verify_plan_out.verify_positions, "verify_plan_out.verify_positions"
-    )
-    _assert_contiguous(
-        verify_plan_out.verify_prev_slot_indices,
-        "verify_plan_out.verify_prev_slot_indices",
-    )
-    _assert_contiguous(
-        verify_plan_out.verify_num_valid, "verify_plan_out.verify_num_valid"
-    )
-    _assert_contiguous(verify_plan_out.enable, "verify_plan_out.enable")
-    _assert_contiguous(write_plan_out.write_offsets, "write_plan_out.write_offsets")
-    _assert_contiguous(
-        write_plan_out.write_seed_slot_indices, "write_plan_out.write_seed_slot_indices"
-    )
-    _assert_contiguous(
-        write_plan_out.write_num_valid_reqs, "write_plan_out.write_num_valid_reqs"
-    )
-    _assert_contiguous(fb_req_pool_indices, "fb_req_pool_indices")
-    _assert_contiguous(fb_prefix_lens, "fb_prefix_lens")
-    _assert_contiguous(fb_extend_seq_lens, "fb_extend_seq_lens")
-    _assert_contiguous(req_to_token, "req_to_token")
-    _assert_contiguous(extra_verify_slot_indices, "extra_verify_slot_indices")
-    _assert_contiguous(extra_verify_positions, "extra_verify_positions")
-    _assert_contiguous(extra_verify_prev_slot_indices, "extra_verify_prev_slot_indices")
-    _assert_contiguous(extra_verify_num_valid, "extra_verify_num_valid")
-    if full_to_swa_index_mapping is not None:
-        _assert_contiguous(full_to_swa_index_mapping, "full_to_swa_index_mapping")
 
     device = verify_plan_out.verify_slot_indices.device
     verify_offsets_scratch = torch.zeros(
