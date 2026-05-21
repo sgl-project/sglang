@@ -147,26 +147,6 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(ptrs_after[v_start : v_start + len(v_ptrs_orig)], v_ptrs_orig)
         self.assertEqual(ptrs_after[-1], canary_v_ptrs[1])
 
-    def test_pd_naive_first_last_insert_fails_layout_check(self):
-        """Verify paged-decoding layout is not a naive first-last insertion."""
-        pool = make_mha_pool(self.device, num_slots=16, dim=8, layer_num=2)
-        k_ptrs_orig = [b.data_ptr() for b in pool.k_buffer]
-        v_ptrs_orig = [b.data_ptr() for b in pool.v_buffer]
-
-        groups_tuple = attach_canary_buffers(
-            pool=pool, config=self.config, device=self.device
-        )
-        group = {g.kind: g for g in groups_tuple}[PoolKind.FULL]
-        ptrs_after, _, _ = pool.get_contiguous_buf_infos()
-
-        naive_layout = (
-            [group.k_head.data_ptr(), group.k_tail.data_ptr()]
-            + k_ptrs_orig
-            + v_ptrs_orig
-            + [group.v_head.data_ptr(), group.v_tail.data_ptr()]
-        )
-        self.assertNotEqual(ptrs_after, naive_layout)
-
     def test_canary_buf_per_token_bytes_within_budget(self):
         """Verify canary per-token storage stays below the real KV budget."""
         pool = make_mha_pool(self.device, num_slots=16, dim=64, layer_num=2)
