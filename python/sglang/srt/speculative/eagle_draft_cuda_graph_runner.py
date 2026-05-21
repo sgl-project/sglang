@@ -355,6 +355,13 @@ class EAGLEDraftCudaGraphRunner:
 
         # Run and capture
         def run_once():
+            # Invalidate SWA loc translation cache — same fix as in
+            # cuda_graph_runner.run_once. draft_forward() calls _forward_raw()
+            # per step so this is redundant in practice, but keeps the pattern
+            # consistent across all CUDA graph runners.
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
