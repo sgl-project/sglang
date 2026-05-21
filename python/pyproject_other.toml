@@ -62,7 +62,7 @@ runtime_common = [
   "transformers==5.8.1",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.2.0",
+  "xgrammar==0.2.1",
   "smg-grpc-servicer>=0.5.0",
 ]
 

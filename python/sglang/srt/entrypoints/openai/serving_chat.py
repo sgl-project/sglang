@@ -417,6 +417,10 @@ class OpenAIServingChat(OpenAIServingBase):
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        require_reasoning = self._get_reasoning_from_request(request)
+        if self._should_skip_default_kimi_reasoning_for_tool_call(request):
+            require_reasoning = False
+
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -440,7 +444,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             rid=request.rid,
             extra_key=self._compute_extra_key(request),
-            require_reasoning=self._get_reasoning_from_request(request),
+            require_reasoning=require_reasoning,
             priority=request.priority,
             routing_key=self.extract_routing_key(raw_request),
             custom_labels=custom_labels,
@@ -463,12 +467,17 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
+        if self._should_skip_default_kimi_reasoning_for_tool_call(request):
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs.setdefault("thinking", False)
+
         thinking_mode = self._get_reasoning_from_request(request)
         # SGLang's ReasonerGrammarBackend owns the reasoning prefix
         # when --reasoning-parser is configured, so builtin xgrammar
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (
-            self.tokenizer_manager.server_args.reasoning_parser is not None
+            self.tokenizer_manager.server_args.reasoning_parser is None
         )
         tool_call_constraint = None
 
@@ -1525,6 +1534,21 @@ class OpenAIServingChat(OpenAIServingBase):
         return (
             request.chat_template_kwargs is not None
             and request.chat_template_kwargs.get(config.toggle_param) is True
+        )
+
+    def _should_skip_default_kimi_reasoning_for_tool_call(
+        self, request: ChatCompletionRequest
+    ) -> bool:
+        if (
+            self.tool_call_parser != "kimi_k2"
+            or not request.tools
+            or request.tool_choice == "none"
+        ):
+            return False
+
+        return not (
+            request.chat_template_kwargs is not None
+            and request.chat_template_kwargs.get("thinking") is True
         )
 
     async def _process_tool_call_stream(
