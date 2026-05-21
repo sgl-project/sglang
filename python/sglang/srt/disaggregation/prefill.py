@@ -531,9 +531,8 @@ class SchedulerDisaggregationPrefillMixin:
                 group_size = self._get_pipeline_group_size(batch)
                 if group_size > 0:
                     result = self.run_batch_pipelined(batch, group_size=group_size)
-                    self.process_batch_result_disagg_prefill(
-                        batch, result, pipelined=True
-                    )
+                    batch._pipelined_kv_sent = True
+                    self.process_batch_result(batch, result)
                 else:
                     result = self.run_batch(batch)
                     self.process_batch_result(batch, result)
@@ -600,10 +599,11 @@ class SchedulerDisaggregationPrefillMixin:
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue.
         Adapted from process_batch_result_prefill.
 
-        When pipelined=True, KV data was already sent per-layer in
-        run_batch_pipelined, so only the metadata buffer is set here
-        instead of calling send_kv_chunk.
+        When pipelined=True (or batch._pipelined_kv_sent is set), KV data was
+        already sent per-layer in run_batch_pipelined, so only the metadata
+        buffer is set here instead of calling send_kv_chunk.
         """
+        pipelined = pipelined or getattr(batch, "_pipelined_kv_sent", False)
         (
             logits_output,
             next_token_ids,
