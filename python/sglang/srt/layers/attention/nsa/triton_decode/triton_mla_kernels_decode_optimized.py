@@ -96,7 +96,16 @@ def _should_use_fused_nosplitk(total_tokens: int, h_q: int, total_topk: int) -> 
 
     For total_tokens < 256, the separate path is faster because the
     fused kernel has insufficient parallelism.
+
+    For extend (total_tokens >= 1024), the fused kernel always wins
+    regardless of h_q or total_topk because:
+    - The grid already has thousands of blocks (good GPU utilization)
+    - It eliminates 1.5-5 GB gathered_kv buffer allocation
+    - It eliminates 2x gather_dequant kernel launches (~414 us)
+    - It avoids chunking that TP>1 configs require with the separate path
     """
+    if total_tokens >= 1024:
+        return True
     if h_q <= 64:
         return False  # Not benchmarked for h_q <= 64
     if total_topk < 200:
