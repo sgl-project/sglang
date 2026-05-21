@@ -9,7 +9,7 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
-from sglang.srt.kv_canary.pool_patch.buffer_alloc import resolve_read_bytes
+from sglang.srt.kv_canary.pool_patch.buffer_alloc import resolve_real_kv_read_bytes
 from sglang.srt.mem_cache.memory_pool import (
     KVCache,
     MHATokenToKVPool,
@@ -54,7 +54,7 @@ def attach_canary_buffers(
             f"supported: {sorted(cls.__name__ for cls in _POOL_ATTACHERS)}"
         )
 
-    read_bytes = resolve_read_bytes(config)
+    read_bytes = resolve_real_kv_read_bytes(config)
     groups = attacher(pool=pool, device=device, read_bytes=read_bytes)
     logger.info(
         "attach_canary_buffers: pool=%s attacher=%s read_bytes=%d n_groups=%d kinds=%s",

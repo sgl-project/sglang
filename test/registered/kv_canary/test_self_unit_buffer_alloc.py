@@ -9,7 +9,7 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
     make_packed_source,
     make_row_source,
-    resolve_read_bytes,
+    resolve_real_kv_read_bytes,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -28,19 +28,19 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
     )
 
 
-def test_resolve_read_bytes_off_returns_zero() -> None:
+def test_resolve_real_kv_read_bytes_off_returns_zero() -> None:
     """Verify OFF mode disables real KV byte reads."""
-    assert resolve_read_bytes(_config(RealKvHashMode.OFF)) == 0
+    assert resolve_real_kv_read_bytes(_config(RealKvHashMode.OFF)) == 0
 
 
-def test_resolve_read_bytes_partial_returns_16() -> None:
+def test_resolve_real_kv_read_bytes_partial_returns_16() -> None:
     """Verify PARTIAL mode reads the fixed byte prefix."""
-    assert resolve_read_bytes(_config(RealKvHashMode.PARTIAL)) == 16
+    assert resolve_real_kv_read_bytes(_config(RealKvHashMode.PARTIAL)) == 16
 
 
-def test_resolve_read_bytes_all_returns_sentinel_so_full_stride_used() -> None:
+def test_resolve_real_kv_read_bytes_all_returns_sentinel_so_full_stride_used() -> None:
     """Verify ALL mode requests the full token stride."""
-    assert resolve_read_bytes(_config(RealKvHashMode.ALL)) == sys.maxsize
+    assert resolve_real_kv_read_bytes(_config(RealKvHashMode.ALL)) == sys.maxsize
 
 
 def test_make_row_source_partial_large_stride_clips_to_32() -> None:

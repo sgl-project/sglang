@@ -16,7 +16,7 @@ _PARTIAL_REAL_KV_READ_BYTES = 16
 _REAL_KV_READ_ALIGN = 16
 
 
-def resolve_read_bytes(config: CanaryConfig) -> int:
+def resolve_real_kv_read_bytes(config: CanaryConfig) -> int:
     if config.real_kv_hash_mode is RealKvHashMode.OFF:
         return 0
     if config.real_kv_hash_mode is RealKvHashMode.ALL:
