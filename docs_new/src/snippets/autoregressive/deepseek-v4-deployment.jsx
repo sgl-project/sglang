@@ -360,22 +360,33 @@ export const DeepSeekV4Deployment = () => {
       return buildPDDisaggCommand(hardware, modelSize);
     }
 
-    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
-    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
-    // or flags with either the FP8 H200 path or the Blackwell paths.
+    // H200 (FP4) path: dedicated branch — Hopper runs the FP4-mixed Instruct
+    // repos through one of two w4a16 MoE runners (Marlin or Flashinfer mxfp4),
+    // so it doesn't share envs or flags with either the FP8 H200 path or the
+    // Blackwell paths.
     //   Flash: TP=4, single node       Pro: TP=8, single node
     //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
     //   balanced:       MTP 1 / 1 / 2
     //   max-throughput: MTP disabled
+    //
+    // MoE runner selection (verified on 2026-05-20):
+    //   - Pro: flashinfer_mxfp4 for all recipes
+    //   - Flash Balanced: flashinfer_mxfp4 (~1.5x faster output throughput vs
+    //     Marlin in the balanced throughput benchmark).
+    //   - Flash Low-Latency / Max-Throughput: Marlin (faster than
+    //     flashinfer_mxfp4 in those benchmarks).
     if (hardware === "h200-fp4") {
       const verifyKey = `${hardware}|${modelSize}|${recipe}`;
       if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
 
+      const useFlashinferMxfp4 = isBig || recipe === "balanced";
       const fp4Flags = [
         "  --trust-remote-code",
         `  --model-path ${slug}`,
         `  --tp ${tp}`,
-        "  --moe-runner-backend marlin",
+        useFlashinferMxfp4
+          ? "  --moe-runner-backend flashinfer_mxfp4"
+          : "  --moe-runner-backend marlin",
       ];
       if (recipe === "low-latency") {
         fp4Flags.push("  --speculative-algo EAGLE");
