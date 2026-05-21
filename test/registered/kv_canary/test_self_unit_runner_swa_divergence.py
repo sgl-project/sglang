@@ -38,6 +38,32 @@ class _FakeAllocator:
         self.wrap_count = wrap_count
 
 
+class _AllocatorWrapObserver:
+    def __init__(self) -> None:
+        self._wrap_count_device = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        self._max_observed_swa_idx_device = torch.zeros(
+            1, dtype=torch.int64, device=_DEVICE
+        )
+
+    @property
+    def wrap_count(self) -> int:
+        return int(self._wrap_count_device.item())
+
+    def observe_swa_alloc(self, alloc_swa_indices: torch.Tensor) -> None:
+        if alloc_swa_indices.numel() == 0:
+            return
+        flat = alloc_swa_indices.reshape(-1).to(torch.int64)
+        batch_min = flat.min().view(1)
+        batch_max = flat.max().view(1)
+        wrapped = (batch_min < self._max_observed_swa_idx_device).to(torch.int64)
+        self._wrap_count_device.add_(wrapped)
+        torch.maximum(
+            self._max_observed_swa_idx_device,
+            batch_max,
+            out=self._max_observed_swa_idx_device,
+        )
+
+
 def _make_verify_plan(value: int) -> VerifyPlan:
     plan = VerifyPlan.allocate(verify_capacity=4, device=_DEVICE)
     plan.verify_num_valid.copy_(torch.tensor([value], dtype=torch.int32))
@@ -292,6 +318,26 @@ class TestSwaDivergenceStats(CustomTestCase):
             self.assertEqual(len(matching), 1, matching)
             fields = _parse_swa_divergence_line(matching[0])
             self.assertEqual(fields["mapping_nonidentity"], 0)
+
+
+class TestSwaPoolWrapCount(CustomTestCase):
+    def test_wrap_count_zero_when_no_wraparound(self) -> None:
+        observer = _AllocatorWrapObserver()
+        observer.observe_swa_alloc(torch.tensor([1, 2, 3], dtype=torch.int64))
+        observer.observe_swa_alloc(torch.tensor([4, 5, 6], dtype=torch.int64))
+        observer.observe_swa_alloc(torch.tensor([7, 8], dtype=torch.int64))
+        self.assertEqual(observer.wrap_count, 0)
+
+    def test_wrap_count_increments_on_pointer_wraparound(self) -> None:
+        observer = _AllocatorWrapObserver()
+        observer.observe_swa_alloc(torch.tensor([10, 11, 12], dtype=torch.int64))
+        observer.observe_swa_alloc(torch.tensor([13, 14], dtype=torch.int64))
+        observer.observe_swa_alloc(torch.tensor([3, 4], dtype=torch.int64))
+        self.assertEqual(observer.wrap_count, 1)
+        observer.observe_swa_alloc(torch.tensor([20], dtype=torch.int64))
+        self.assertEqual(observer.wrap_count, 1)
+        observer.observe_swa_alloc(torch.tensor([5], dtype=torch.int64))
+        self.assertEqual(observer.wrap_count, 2)
 
 
 if __name__ == "__main__":

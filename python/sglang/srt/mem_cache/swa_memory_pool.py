@@ -381,11 +381,19 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        self.wrap_count: int = 0
+        self._wrap_count_device = torch.zeros(1, dtype=torch.int64, device=device)
+        self._max_observed_swa_idx_device = torch.zeros(
+            1, dtype=torch.int64, device=device
+        )
 
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    @property
+    def wrap_count(self) -> int:
+        """Number of SWA alloc batches whose min swa_idx fell below the previous high-water mark."""
+        return int(self._wrap_count_device.item())
 
     def available_size(self):
         return min(
@@ -439,6 +447,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
+        self._observe_swa_alloc(alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -490,6 +499,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
+        self._observe_swa_alloc(alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -560,6 +570,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
+        self._observe_swa_alloc(alloc_swa_indices)
         self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
             alloc_swa_indices
         )
@@ -585,6 +596,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
+        self._observe_swa_alloc(alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -632,7 +644,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.wrap_count += int(swa_indices.numel())
         self.full_to_swa_index_mapping[free_index] = 0
 
     def backup_state(self):
@@ -654,6 +665,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
+        self._wrap_count_device.zero_()
+        self._max_observed_swa_idx_device.zero_()
+
+    def _observe_swa_alloc(self, alloc_swa_indices: torch.Tensor) -> None:
+        if alloc_swa_indices.numel() == 0:
+            return
+        flat = alloc_swa_indices.reshape(-1).to(torch.int64)
+        batch_min = flat.min().view(1)
+        batch_max = flat.max().view(1)
+        wrapped = (batch_min < self._max_observed_swa_idx_device).to(torch.int64)
+        self._wrap_count_device.add_(wrapped)
+        torch.maximum(
+            self._max_observed_swa_idx_device,
+            batch_max,
+            out=self._max_observed_swa_idx_device,
+        )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
