@@ -31,15 +31,12 @@ from test_unified_radix_cache_kl_hicache import (
 from test_unified_radix_cache_kl import UnifiedRadixTreeTestMixin
 
 from sglang.srt.utils import kill_process_tree
-from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import get_input_ids
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-register_cuda_ci(est_time=800, suite="weekly-8-gpu-h200", nightly=True)
 
 
 class TestDSV4HiCacheSWATranslationCache(UnifiedRadixTreeTestMixin, CustomTestCase):
