@@ -358,10 +358,9 @@ class DeepseekV4AttnBackend(
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
-        # Keep a runner ref to read live state set after backend construction
-        # (e.g. hisparse_coordinator is built in model_runner *after*
-        # init_attention_backend()).
+        # Keep a runner ref for other live state that needs runtime reads.
         self.model_runner = model_runner
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
@@ -384,12 +383,6 @@ class DeepseekV4AttnBackend(
             DSV4RawDecodeMetadata,
         ] = None
         self._replay_forward_batch: Optional[ForwardBatch] = None  # FIXME: out-of-band
-
-    @property
-    def hisparse_coordinator(self):
-        # Live read: model_runner builds the coordinator *after*
-        # init_attention_backend(), so we cannot capture at __init__ time.
-        return self.model_runner.hisparse_coordinator
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)

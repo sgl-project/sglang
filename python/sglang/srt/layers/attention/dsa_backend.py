@@ -334,10 +334,9 @@ class DeepseekSparseAttnBackend(
         # corresponding ForwardBatch fields.
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
-        # Keep a runner ref to read live state set after backend construction
-        # (e.g. hisparse_coordinator is built in model_runner *after*
-        # init_attention_backend()).
+        # Keep a runner ref for other live state that needs runtime reads.
         self.model_runner = model_runner
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
@@ -399,12 +398,6 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
-
-    @property
-    def hisparse_coordinator(self):
-        # Live read: model_runner builds the coordinator *after*
-        # init_attention_backend(), so we cannot capture at __init__ time.
-        return self.model_runner.hisparse_coordinator
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
