@@ -252,11 +252,22 @@ class ViTCudaGraphRunner:
         import logging
 
         logger = logging.getLogger(__name__)
-        # DEBUG: capture single large bucket
-        debug_buckets = [1024]
-        for B in debug_buckets:
+        for B in self.BUCKET_SIZES:
             self._capture(B)
-        logger.info("[VIT_GRAPH] capture_all done, buckets=%s", debug_buckets)
+        logger.info("[VIT_GRAPH] capture done, warming up eager fallback")
+
+        # Warm up the eager fallback path through @torch._dynamo.disable.
+        # The first eager call after graph capture incurs a one-time stall
+        # (~3 s) from CUDA lazy initialization.  Absorb that cost here.
+        B = self.BUCKET_SIZES[-1]
+        self._eager_fallback(
+            self.input_bufs[B],
+            self.forward_metadatas[B],
+            self.rotary_cos_bufs[B],
+            self.rotary_sin_bufs[B],
+        )
+        torch.get_device_module(self.device).synchronize()
+        logger.info("[VIT_GRAPH] capture_all done")
 
     # ------------------------------------------------------------------
     # Replay
