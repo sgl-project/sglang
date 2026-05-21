@@ -2782,8 +2782,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
+        warmup = getattr(self.graph_runner, "_first_warmup_elapsed", 0.0)
         logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic - warmup:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 
