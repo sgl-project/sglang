@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import logging
 import unittest
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
-
-logger = logging.getLogger(__name__)
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
@@ -27,17 +24,6 @@ class TestEaglePositionsMisalignRegression(CanaryE2EBase, unittest.TestCase):
         **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
         "SGLANG_DEBUG_REVERT_PR": "25015",
     }
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls._launch_exc = None
-        try:
-            super().setUpClass()
-        except Exception as exc:
-            cls._launch_exc = exc
-            logger.warning(
-                "server launch raised during revert path: %r", exc, exc_info=True
-            )
 
     def test_position_mismatch_in_server_stderr(self) -> None:
         self.assert_violation_logged_any(
