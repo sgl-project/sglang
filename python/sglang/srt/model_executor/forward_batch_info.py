@@ -444,7 +444,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
-    rids_hashed: Optional[torch.Tensor] = None
+    rids_int: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -562,8 +562,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 rids=[req.rid for req in batch.reqs],
                 device=device,
             )
-            batch.sampling_info.rids_hashed = hashed
-            ret.rids_hashed = hashed
+            batch.sampling_info.rids_int = hashed
+            ret.rids_int = hashed
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -1056,10 +1056,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
-        if self.rids_hashed is not None:
-            self.rids_hashed = self._pad_tensor_to_size(self.rids_hashed, bs)
+        if self.rids_int is not None:
+            self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
             if self.sampling_info is not None:
-                self.sampling_info.rids_hashed = self.rids_hashed
+                self.sampling_info.rids_int = self.rids_int
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
