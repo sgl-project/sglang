@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, final
+from typing import Any, Dict, Iterable, List, Mapping, Optional, final
 
-from sglang.srt.entrypoints.openai.protocol import PromptTokensDetails, UsageInfo
+from sglang.srt.entrypoints.openai.protocol import (
+    CompletionTokensDetails,
+    PromptTokensDetails,
+    UsageInfo,
+)
 
 
 @final
@@ -13,6 +17,28 @@ class UsageProcessor:
     def _details_if_cached(count: int) -> Optional[PromptTokensDetails]:
         """Return PromptTokensDetails only when count > 0 (keeps JSON slim)."""
         return PromptTokensDetails(cached_tokens=count) if count > 0 else None
+
+    @staticmethod
+    def _details_if_spec(
+        meta_infos: Iterable[Dict[str, Any]],
+    ) -> Optional[CompletionTokensDetails]:
+        """Aggregate spec-decode counts from meta_info dicts into a
+        CompletionTokensDetails. Returns None when no response carried spec
+        metrics (i.e. speculative decoding was off or never verified)."""
+        accepted = 0
+        proposed = 0
+        saw_any = False
+        for mi in meta_infos:
+            if "spec_num_proposed_drafts" in mi:
+                accepted += mi.get("spec_num_correct_drafts", 0)
+                proposed += mi["spec_num_proposed_drafts"]
+                saw_any = True
+        if not saw_any:
+            return None
+        return CompletionTokensDetails(
+            accepted_prediction_tokens=accepted,
+            rejected_prediction_tokens=max(proposed - accepted, 0),
+        )
 
     @staticmethod
     def calculate_response_usage(
@@ -41,11 +67,16 @@ class UsageProcessor:
             )
             cached_details = UsageProcessor._details_if_cached(cached_total)
 
+        completion_details = UsageProcessor._details_if_spec(
+            r["meta_info"] for r in responses
+        )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=prompt_tokens,
             reasoning_tokens=reasoning_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_details,
+            completion_tokens_details=completion_details,
         )
 
     @staticmethod
@@ -56,6 +87,8 @@ class UsageProcessor:
         cached_tokens: Mapping[int, int],
         n_choices: int,
         enable_cache_report: bool = False,
+        accepted_prediction_tokens: Optional[Mapping[int, int]] = None,
+        rejected_prediction_tokens: Optional[Mapping[int, int]] = None,
     ) -> UsageInfo:
         # index % n_choices == 0 marks the first choice of a prompt
         total_prompt_tokens = sum(
@@ -72,11 +105,23 @@ class UsageProcessor:
             else None
         )
 
+        completion_details: Optional[CompletionTokensDetails] = None
+        if accepted_prediction_tokens or rejected_prediction_tokens:
+            completion_details = CompletionTokensDetails(
+                accepted_prediction_tokens=sum(
+                    (accepted_prediction_tokens or {}).values()
+                ),
+                rejected_prediction_tokens=sum(
+                    (rejected_prediction_tokens or {}).values()
+                ),
+            )
+
         return UsageProcessor.calculate_token_usage(
             prompt_tokens=total_prompt_tokens,
             reasoning_tokens=total_reasoning_tokens,
             completion_tokens=total_completion_tokens,
             cached_tokens=cached_details,
+            completion_tokens_details=completion_details,
         )
 
     @staticmethod
@@ -85,6 +130,7 @@ class UsageProcessor:
         completion_tokens: int,
         reasoning_tokens: Optional[int] = 0,
         cached_tokens: Optional[PromptTokensDetails] = None,
+        completion_tokens_details: Optional[CompletionTokensDetails] = None,
     ) -> UsageInfo:
         """Calculate token usage information"""
         return UsageInfo(
@@ -93,4 +139,5 @@ class UsageProcessor:
             total_tokens=prompt_tokens + completion_tokens,
             prompt_tokens_details=cached_tokens,
             reasoning_tokens=reasoning_tokens,
+            completion_tokens_details=completion_tokens_details,
         )

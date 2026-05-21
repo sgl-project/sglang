@@ -904,6 +904,8 @@ class OpenAIServingChat(OpenAIServingBase):
         hidden_states = {}
         routed_experts = {}
         cached_tokens_details = {}
+        accepted_prediction_tokens: Dict[int, int] = {}
+        rejected_prediction_tokens: Dict[int, int] = {}
 
         stream_started = False
         try:
@@ -930,6 +932,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
+                # Spec-decode counters only populate meta_info on the final
+                # chunk (gated by state.finished in TokenizerManager); accumulate
+                # them when present.
+                if "spec_num_proposed_drafts" in content["meta_info"]:
+                    proposed = content["meta_info"]["spec_num_proposed_drafts"]
+                    accepted = content["meta_info"].get("spec_num_correct_drafts", 0)
+                    accepted_prediction_tokens[index] = accepted
+                    rejected_prediction_tokens[index] = max(proposed - accepted, 0)
 
                 # Handle logprobs
                 choice_logprobs = None
@@ -1079,6 +1089,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=cached_tokens,
                     n_choices=request.n,
                     enable_cache_report=self.tokenizer_manager.server_args.enable_cache_report,
+                    accepted_prediction_tokens=accepted_prediction_tokens,
+                    rejected_prediction_tokens=rejected_prediction_tokens,
                 )
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
