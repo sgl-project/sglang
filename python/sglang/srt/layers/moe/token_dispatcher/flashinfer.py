@@ -106,7 +106,7 @@ class FlashinferDispatcher(BaseDispatcher):
         # which reserves ep_size * max_num_tokens * payload bytes, and the C++
         # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
         self.max_num_tokens = get_int_env_var(
-            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 16384
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
