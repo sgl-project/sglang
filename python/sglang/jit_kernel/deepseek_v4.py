@@ -418,8 +418,17 @@ def hash_topk(
     return topk_weights, topk_ids
 
 
-def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor):
-    return _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+# custom_op: opaque to Dynamo/Inductor; in-place mutation declared.
+@torch.library.custom_op("sglang::mask_topk_ids", mutates_args=("topk_ids",))
+def mask_topk_ids(topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor) -> None:
+    _jit_mask_topk_module().run(topk_ids, num_token_non_padded)
+
+
+@mask_topk_ids.register_fake
+def _mask_topk_ids_fake(
+    topk_ids: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> None:
+    return None
 
 
 class CompressorPrefillPlan(NamedTuple):
