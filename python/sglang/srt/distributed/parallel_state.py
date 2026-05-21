@@ -66,6 +66,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter_new_ca = get_bool_env_var("SGLANG_USE_AITER_NEW_CA", True)
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
