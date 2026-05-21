@@ -874,6 +874,12 @@ class ServerArgs:
         else:
             self._quantization_explicitly_unset = False
 
+        # This is the first import of the platform plugin and will trigger
+        # loading of the plugin and initialization, this needs to be done
+        # before device detection in _handle_missing_default_values so that
+        # OOT devices are visible
+        from sglang.srt.platforms import current_platform
+
         # Set missing default values.
         self._handle_missing_default_values()
 
@@ -885,8 +891,6 @@ class ServerArgs:
         self._handle_xpu_backends()
 
         # Allow OOT platform plugins to apply server args defaults.
-        from sglang.srt.platforms import current_platform
-
         current_platform.apply_server_args_defaults(self)
 
         # Handle piecewise CUDA graph.
