@@ -41,23 +41,6 @@ def make_req(**kwargs):
     return SimpleNamespace(**defaults)
 
 
-def make_forward_req(**kwargs):
-    defaults = {
-        "prompt_embeds": [],
-        "pooled_embeds": [],
-        "prompt_attention_mask": None,
-        "prompt_embeds_mask": None,
-        "prompt_seq_lens": None,
-        "negative_prompt_embeds": [],
-        "neg_pooled_embeds": [],
-        "negative_attention_mask": None,
-        "negative_prompt_embeds_mask": None,
-        "negative_prompt_seq_lens": None,
-    }
-    defaults.update(make_req(**kwargs).__dict__)
-    return SimpleNamespace(**defaults)
-
-
 def make_server_args(**kwargs):
     defaults = {
         "pipeline_class_name": "LTX2TwoStagePipeline",
@@ -117,29 +100,3 @@ def test_negative_text_cache_keeps_default_warmup():
         get_negative_embedding_twice(stage, server_args, make_req(is_warmup=True))
 
     assert stage.calls == 1
-
-
-def test_cfg_text_batch_encodes_positive_and_negative_once():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args()
-    batch = make_forward_req()
-
-    stage.forward(batch, server_args)
-
-    assert stage.calls == 1
-    assert batch.prompt_embeds[0].shape[0] == 1
-    assert batch.negative_prompt_embeds[0].shape[0] == 1
-
-
-def test_cfg_text_batch_skips_dmd_pipeline():
-    stage = DummyTextEncodingStage()
-    server_args = make_server_args(
-        pipeline_config=SimpleNamespace(
-            text_encoder_configs=[],
-            dmd_denoising_steps=1,
-        )
-    )
-
-    stage.forward(make_forward_req(), server_args)
-
-    assert stage.calls == 2
