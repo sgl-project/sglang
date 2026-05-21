@@ -517,6 +517,7 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    SGLANG_SPEC_V2_NO_VERIFY_SYNC = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

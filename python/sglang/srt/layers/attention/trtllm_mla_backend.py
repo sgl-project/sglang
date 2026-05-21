@@ -316,6 +316,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.cuda_graph_custom_mask = None
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -423,7 +424,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
+        if self.num_draft_tokens and not self.skip_prefill:
+            self.cuda_graph_custom_mask = torch.zeros(
+                max_num_tokens * (self.max_context_len + self.num_draft_tokens),
+                dtype=torch.bool,
+                device=self.device,
+            )
+
         super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [self.cuda_graph_custom_mask, None]
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1226,4 +1237,23 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
                 skip_prefill=True,
                 kv_indptr_buf=self.kv_indptr[i],
                 q_indptr_decode_buf=self.q_indptr_decode,
+            )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int
+    ):
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                seq_lens_sum=None,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )

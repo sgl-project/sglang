@@ -255,6 +255,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+        # See eagle_worker_v2.draft for the matching None-safe rationale.
+        if batch.seq_lens_sum is None and tree_mask_buf is None:
+            batch.seq_lens_sum = batch.seq_lens.sum().item()
         (
             tree_mask,
             position,
@@ -268,7 +271,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             top_scores_index,
             draft_tokens,
             batch.seq_lens,
-            batch.seq_lens_sum,
+            batch.seq_lens_sum or 0,
             self.topk,
             self.speculative_num_steps,
             self.speculative_num_draft_tokens,
