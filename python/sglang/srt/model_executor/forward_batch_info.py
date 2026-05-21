@@ -40,6 +40,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -442,6 +443,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    rids_hashed: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -553,6 +555,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         device = model_runner.device
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            from sglang.srt.kv_canary.token_oracle.rid_hash import (
+                _hash_rids_to_i64_tensor,
+            )
+
+            hashed = _hash_rids_to_i64_tensor(
+                rids=[req.rid for req in batch.reqs],
+                device=device,
+            )
+            batch.sampling_info.rids_hashed = hashed
+            ret.rids_hashed = hashed
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (

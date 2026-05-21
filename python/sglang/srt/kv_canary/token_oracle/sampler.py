@@ -37,8 +37,15 @@ class _OracleSampler(Sampler):
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        rids_hashed = sampling_info.rids_hashed
+        if rids_hashed is None:
+            raise RuntimeError(
+                "_OracleSampler.forward: sampling_info.rids_hashed is None; "
+                "token oracle requires the per-forward rids_hashed tensor "
+                "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
+            )
         batch_next_token_ids = self._token_oracle_manager.sample(
-            logits=logits_output.next_token_logits,
+            req_ids=rids_hashed,
             positions=positions,
         )
         return batch_next_token_ids
