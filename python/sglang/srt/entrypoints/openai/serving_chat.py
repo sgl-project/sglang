@@ -247,7 +247,6 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
 
-
     def _handle_last_assistant_message(
         self,
         messages: List[Dict[str, Any]],
