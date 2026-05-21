@@ -100,6 +100,21 @@ def _format_violation(
     is_write = bool(bits_int & int(_WRITE_BITS))
     u64_mask = (1 << 64) - 1
 
+    # Stable single-line key=value summary, parsed by CanaryE2EBase.assert_violation_logged.
+    # Format frozen: do not reorder / rename / change separators without updating the test
+    # helper in python/sglang/test/kv_canary/e2e_base.py.
+    structured_line = (
+        f"kv_canary violation: "
+        f"launch_tag={tag_label} "
+        f"fail_reason={'+'.join(reasons) if reasons else 'none'} "
+        f"slot_idx={int(slot_idx)} "
+        f"position={int(position)} "
+        f"stored_token={int(stored_token)} "
+        f"expected_token={int(expected_token)} "
+        f"stored_chain_hash={int(stored_chain_hash) & u64_mask:#018x} "
+        f"expected_aux={int(expected_aux) & u64_mask:#018x}"
+    )
+
     header = (
         f"KV cache canary violation detected (kernel_kind={tag_label}, "
         f"slot_idx={int(slot_idx)}, position={int(position)})"
@@ -138,4 +153,4 @@ def _format_violation(
             f"  expected: prev_hash={expected_prev_hash:#018x}",
         ]
 
-    return "\n".join([header, kind_line, reasons_line, *body, footer])
+    return "\n".join([structured_line, header, kind_line, reasons_line, *body, footer])
