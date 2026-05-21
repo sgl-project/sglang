@@ -24,6 +24,16 @@ on:
         description: 'Optional. Comma-separated names to run only a subset. Format: {model-prefix}-{precision}-{isl}{osl}-{recipe}. E.g. "dsr1-fp8-1k1k-max-tpt" or "dsr1-fp8-1k1k-max-tpt,dsr1-fp4-1k1k-mid-curve". Leave empty to run all. Available names are listed in the setup job log.'
         required: false
         default: ''
+      run_eval:
+        description: 'Optional. Run perf sweep and eval.'
+        type: boolean
+        required: false
+        default: false
+      eval_only:
+        description: 'Optional. Skip the perf sweep, just run eval.'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: nightly-test-gb200
@@ -296,13 +306,14 @@ jobs:
       AWS_SECRET_ACCESS_KEY: ${{ secrets.NV_S3_SECRET_ACCESS_KEY }}
       S3_BUCKET: ${{ secrets.NV_S3_BUCKET }}
       S3_ENDPOINT_URL: ${{ secrets.NV_S3_ENDPOINT_URL }}
-      # Eval — passed through to srt-slurm's do_sweep.py. RUN_EVAL=true runs
-      # lm-eval after the perf sweep against the same server (single Slurm
-      # job). EVAL_CONC controls the eval-phase concurrency (median of
-      # conc-list keeps GPU memory comfortable). Both are sourced from
-      # matrix entries built by generate_matrix.py.
-      RUN_EVAL: ${{ matrix.config.run_eval }}
-      EVAL_ONLY: ${{ matrix.config.eval_only }}
+      # Eval — passed through to srt-slurm's do_sweep.py. Per-entry defaults
+      # come from generate_matrix.py; workflow_dispatch inputs override them
+      # so a manual run can force eval on a non-marked recipe or switch to
+      # eval-only mode without editing the YAML. EVAL_CONC always uses the
+      # matrix-derived value (upper-median); for entries with no marker,
+      # srt-slurm falls back to max(conc-list).
+      RUN_EVAL: ${{ (inputs.run_eval || inputs.eval_only) && 'true' || matrix.config.run_eval }}
+      EVAL_ONLY: ${{ inputs.eval_only && 'true' || matrix.config.eval_only }}
       EVAL_CONC: ${{ matrix.config.eval_conc }}
 
     steps:
