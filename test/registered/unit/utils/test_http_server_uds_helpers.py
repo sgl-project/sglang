@@ -102,6 +102,41 @@ class TestPrepareUdsPath(unittest.TestCase):
         # Stale file removed.
         self.assertFalse(os.path.exists(self.path))
 
+    def test_timeout_treated_as_live(self):
+        # Create a real stale socket so lstat/S_ISSOCK pass, then mock
+        # socket.socket to return a probe whose connect() raises TimeoutError.
+        # _prepare_uds_path must refuse rather than silently unlink the file
+        # of a possibly-live server we couldn't probe in time.
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()
+
+        original_socket = socket.socket
+        connect_called = []
+
+        class _TimeoutSocket:
+            def __init__(self, *args, **kwargs):
+                self._inner = original_socket(*args, **kwargs)
+
+            def settimeout(self, t):
+                self._inner.settimeout(t)
+
+            def connect(self, addr):
+                connect_called.append(True)
+                raise TimeoutError("simulated probe timeout")
+
+            def close(self):
+                self._inner.close()
+
+        with patch("socket.socket", side_effect=_TimeoutSocket):
+            with self.assertRaises(OSError) as cm:
+                _prepare_uds_path(self.path)
+            self.assertEqual(cm.exception.errno, errno.EADDRINUSE)
+
+        # Socket file preserved (we refused to unlink).
+        self.assertTrue(os.path.exists(self.path))
+        self.assertTrue(connect_called, "probe.connect was not invoked")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2186,7 +2186,12 @@ def _prepare_uds_path(path: str) -> None:
         probe.connect(path)
         is_live = True
     except (ConnectionRefusedError, FileNotFoundError):
+        # Nobody bound; stale or missing file.
         pass
+    except TimeoutError:
+        # Can't determine state in time -- treat as live to be safe; refusing
+        # is preferable to silently unlinking a running server's socket file.
+        is_live = True
     finally:
         probe.close()
     if is_live:
