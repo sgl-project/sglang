@@ -663,7 +663,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
 
   // kvcache
-  m.def("store_cache_cpu(Tensor k, Tensor v, Tensor k_cache, Tensor v_cache, Tensor indices, int? row_dim) -> ()");
+  m.def(
+      "store_cache_cpu(Tensor k, Tensor v, Tensor(a!) k_cache, Tensor(a!) v_cache, Tensor indices, int? row_dim) -> "
+      "()");
   m.impl("store_cache_cpu", torch::kCPU, &store_cache_cpu);
 }
 

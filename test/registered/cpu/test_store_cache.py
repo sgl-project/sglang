@@ -68,10 +68,15 @@ def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
         :batch_size
     ].to(torch.int32)
 
+    k_cache_ref = k_cache.clone()
+    v_cache_ref = v_cache.clone()
+    k_cache_ref[indices.long()] = k
+    v_cache_ref[indices.long()] = v
+
     _store_cache_cpu(k, v, k_cache, v_cache, indices)
 
-    assert torch.equal(k_cache[indices.long()], k)
-    assert torch.equal(v_cache[indices.long()], v)
+    assert torch.equal(k_cache, k_cache_ref)
+    assert torch.equal(v_cache, v_cache_ref)
 
 
 if __name__ == "__main__":

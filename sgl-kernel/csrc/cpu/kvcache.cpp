@@ -92,8 +92,6 @@ void store_cache_cpu(
   int64_t row_dim_value = num_heads * head_size;
   if (row_dim.has_value()) {
     CHECK_EQ(row_dim.value(), row_dim_value);
-  } else {
-    row_dim_value = num_heads * head_size;
   }
   CHECK_EQ(indices.size(0), batch_size);
 
