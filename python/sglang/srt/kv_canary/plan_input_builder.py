@@ -130,7 +130,7 @@ def fill_plan_input_per_forward(
     plan_input_out.zero_()
     plan_input_out.fb_req_pool_indices[:bs].copy_(req_pool_indices)
 
-    _fill_prefix_lens_and_extend_seq_lens(
+    _extract_prefix_lens_and_extend_seq_lens(
         forward_batch=forward_batch,
         out_prefix_lens=plan_input_out.fb_prefix_lens[:bs],
         out_extend_seq_lens=plan_input_out.fb_extend_seq_lens[:bs],
@@ -140,7 +140,7 @@ def fill_plan_input_per_forward(
     return bs
 
 
-def _fill_prefix_lens_and_extend_seq_lens(
+def _extract_prefix_lens_and_extend_seq_lens(
     *,
     forward_batch: "ForwardBatch",
     out_prefix_lens: torch.Tensor,
