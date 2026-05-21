@@ -159,8 +159,8 @@ export const Qwen3Deployment = () => {
   const getDisplayOptions = (values) => {
     const options = { ...baseOptions };
     const currentModelConfig = modelConfigs[values.modelsize];
-    const isXeon = values.hardware === 'xeon';
 
+    // If model doesn't have thinking variants, disable non-base category options
     if (currentModelConfig && !currentModelConfig.hasThinkingVariants) {
       options.category = {
         ...baseOptions.category,
@@ -171,16 +171,18 @@ export const Qwen3Deployment = () => {
       };
     }
 
+    // Only show reasoningParser when category is not 'instruct'
     if (values.category === 'instruct') {
       delete options.reasoningParser;
     }
 
-    if (isXeon) {
-      options.quantization = {
-        ...baseOptions.quantization,
-        items: baseOptions.quantization.items.map(item => ({
+    // Xeon uses TP-only deployment and should not retain stale GPU-only combinations
+    if (values.hardware === 'xeon') {
+      options.hardware = {
+        ...options.hardware,
+        items: options.hardware.items.map(item => ({
           ...item,
-          disabled: false
+          default: item.id === 'xeon'
         }))
       };
     }
@@ -220,6 +222,7 @@ export const Qwen3Deployment = () => {
     setValues(prev => {
       const newValues = { ...prev, [optionName]: value };
 
+      // Auto-switch to 'base' category for models without thinking variants
       if (optionName === 'modelsize') {
         const modelConfig = modelConfigs[value];
         if (modelConfig && !modelConfig.hasThinkingVariants) {
@@ -229,15 +232,9 @@ export const Qwen3Deployment = () => {
         }
       }
 
+      // Reset reasoningParser when switching to 'instruct' category
       if (optionName === 'category' && value === 'instruct') {
         newValues.reasoningParser = 'disabled';
-      }
-
-      if (optionName === 'hardware' && value === 'xeon') {
-        const modelConfig = modelConfigs[newValues.modelsize];
-        if (modelConfig && !modelConfig.hasThinkingVariants && newValues.category !== 'base') {
-          newValues.category = 'base';
-        }
       }
 
       return newValues;
@@ -246,8 +243,10 @@ export const Qwen3Deployment = () => {
 
   // Generate command
   const generateCommand = () => {
-    const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = values;
+    const normalizedValues = normalizeValues(values);
+    const { hardware, modelsize, quantization, category, reasoningParser, toolcall } = normalizedValues;
 
+    // Special error handling
     const commandKey = `${hardware}-${modelsize}-${quantization}-${category}`;
     if (commandKey === 'h100-235b-bf16-instruct' || commandKey === 'h100-235b-bf16-thinking') {
       return '# Error: Model is too large, cannot fit into 8*H100\n# Please use H200 (141GB) or select FP8 quantization';
@@ -278,29 +277,18 @@ export const Qwen3Deployment = () => {
       modelName = `Qwen/Qwen3-${config.baseName}${quantSuffix}`;
     }
 
+    let cmd = 'python -m sglang.launch_server \
+';
+    cmd += `  --model ${modelPath}`;
+
     if (hardware === 'xeon') {
-      let cpuCmd = 'python -m sglang.launch_server \\';
-      cpuCmd += `  --model ${modelName} \\
-  --device cpu \\
-  --tp ${hwConfig.tp} \\
+      cmd += ` \
+  --device cpu \
   --disable-overlap-schedule`;
-
-      if (reasoningParser === 'enabled' && category !== 'instruct') {
-        cpuCmd += ' \\--reasoning-parser qwen3';
-      }
-
-      if (toolcall === 'enabled') {
-        cpuCmd += ' --tool-call-parser qwen25';
-      }
-
-      return cpuCmd;
     }
 
-    let cmd = 'python -m sglang.launch_server \\';
-    cmd += `  --model ${modelName}`;
-
     if (hwConfig.tp > 1) {
-      cmd += ` \\
+      cmd += ` \
   --tp ${hwConfig.tp}`;
     }
 
@@ -310,16 +298,18 @@ export const Qwen3Deployment = () => {
     }
 
     if (ep > 0) {
-      cmd += ` \\
+      cmd += ` \
   --ep ${ep}`;
     }
 
     if (reasoningParser === 'enabled' && category !== 'instruct') {
-      cmd += ' \\--reasoning-parser qwen3';
+      cmd += ' \
+  --reasoning-parser qwen3';
     }
 
     if (toolcall === 'enabled') {
-      cmd += ' \\--tool-call-parser qwen25';
+      cmd += ' \
+  --tool-call-parser qwen25';
     }
 
     return cmd;
@@ -359,7 +349,10 @@ export const Qwen3Deployment = () => {
           </div>
         </div>
       ))}
-      <pre style={commandDisplayStyle}>{generateCommand()}</pre>
+      <div style={cardStyle}>
+        <div style={titleStyle}>Run this Command:</div>
+        <pre style={commandDisplayStyle}>{generateCommand()}</pre>
+      </div>
     </div>
   );
 };
