@@ -392,10 +392,10 @@ class TestSelfUnitRunner(CustomTestCase):
         runner = _make_runner(device=self.device)
         runner._pump_and_allreduce._step_counter = 1000
         runner._device_state.kernel_run_counters.zero_()
-        runner._health_and_stats.health_check_step()
+        runner._health_checker.step()
         runner._pump_and_allreduce._step_counter = 2000
         with self.assertRaises(RuntimeError):
-            runner._health_and_stats.health_check_step()
+            runner._health_checker.step()
 
     def test_kernel_run_counter_watchdog_ignores_sweep_when_sweep_is_disabled(self):
         """Verify the watchdog ignores disabled sweep counters."""
@@ -414,9 +414,9 @@ class TestSelfUnitRunner(CustomTestCase):
             runner._device_state.kernel_run_counters[tag.value] = 1
 
         runner._pump_and_allreduce._step_counter = 1000
-        runner._health_and_stats.health_check_step()
+        runner._health_checker.step()
         runner._pump_and_allreduce._step_counter = 2000
-        runner._health_and_stats.health_check_step()
+        runner._health_checker.step()
 
     def test_periodic_stats_log_every_n_step(self):
         """Verify periodic stats are logged at the configured interval."""
@@ -429,7 +429,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
         with self.assertLogs(runner_module.logger.name, level=logging.INFO) as cm:
             for _ in range(11):
-                runner._health_and_stats.print_periodic_stats()
+                runner._stats_logger.step()
                 runner._pump_and_allreduce._step_counter += 1
         log_text = "\n".join(cm.output)
         self.assertIn("protected_tokens=", log_text)

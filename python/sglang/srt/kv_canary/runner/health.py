@@ -26,29 +26,24 @@ _SWEEP_TAGS: frozenset[CanaryLaunchTag] = frozenset(
 )
 
 
-class HealthAndStats:
+class KernelRunCounterHealthChecker:
     def __init__(
         self,
         *,
         config: CanaryConfig,
-        device: torch.device,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
         pump_and_allreduce: PumpAndAllreduce,
-        sweep_orchestrator: SweepOrchestrator,
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
         self._pump_and_allreduce = pump_and_allreduce
-        self._sweep_orchestrator = sweep_orchestrator
         self._d2h_stream = d2h_stream
         self._previous_health_future: Optional[FutureTensor] = None
-        self._previous_slot_sum_future: Optional[FutureTensor] = None
-        self._previous_write_index_future: Optional[FutureTensor] = None
 
-    def health_check_step(self) -> None:
+    def step(self) -> None:
         step_counter = self._pump_and_allreduce.step_counter
         if step_counter < _HEALTH_CHECK_WARMUP_STEPS:
             return
@@ -78,7 +73,28 @@ class HealthAndStats:
             return self._active_tags
         return tuple(tag for tag in self._active_tags if tag not in _SWEEP_TAGS)
 
-    def print_periodic_stats(self) -> None:
+
+class PeriodicCanaryStatsLogger:
+    def __init__(
+        self,
+        *,
+        config: CanaryConfig,
+        device_state: CanaryDeviceState,
+        active_tags: tuple[CanaryLaunchTag, ...],
+        pump_and_allreduce: PumpAndAllreduce,
+        sweep_orchestrator: SweepOrchestrator,
+        d2h_stream: torch.cuda.Stream,
+    ) -> None:
+        self._config = config
+        self._device_state = device_state
+        self._active_tags = active_tags
+        self._pump_and_allreduce = pump_and_allreduce
+        self._sweep_orchestrator = sweep_orchestrator
+        self._d2h_stream = d2h_stream
+        self._previous_slot_sum_future: Optional[FutureTensor] = None
+        self._previous_write_index_future: Optional[FutureTensor] = None
+
+    def step(self) -> None:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
             return
