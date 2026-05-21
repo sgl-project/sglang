@@ -2641,9 +2641,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             seq_lens_cpu=buffers.seq_lens_cpu,
             next_token_logits_buffer=buffers.next_token_logits_buffer,
             orig_seq_lens=buffers.seq_lens,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool=self.token_to_kv_pool,
-            attn_backend=self.attn_backend,
             out_cache_loc=buffers.out_cache_loc,
             seq_lens_sum=buffers.seq_lens.sum().item(),
             encoder_lens=buffers.encoder_lens,
@@ -2704,8 +2701,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         torch.get_device_module(self.device).synchronize()
         self.tp_group.barrier()
-        with torch.inference_mode(), run_ctx or empty_context():
-            run_once()
+        prev_attn_backend = set_attn_backend(self.attn_backend)
+        try:
+            with torch.inference_mode(), run_ctx or empty_context():
+                run_once()
+        finally:
+            set_attn_backend(prev_attn_backend)
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding

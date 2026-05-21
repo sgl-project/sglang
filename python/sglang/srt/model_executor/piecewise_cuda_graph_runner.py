@@ -59,6 +59,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.utils import (
     get_available_gpu_memory,
     is_musa,
@@ -387,9 +388,6 @@ class PiecewiseCudaGraphRunner:
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=mamba_track_indices,
@@ -425,18 +423,22 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
-        with set_forward_context(
-            forward_batch,
-            self.attention_layers,
-            self.quant_config,
-            self.moe_layers,
-            self.moe_fusions,
-        ):
-            _ = self.model_runner.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
+        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
+        try:
+            with set_forward_context(
                 forward_batch,
-            )
+                self.attention_layers,
+                self.quant_config,
+                self.moe_layers,
+                self.moe_fusions,
+            ):
+                _ = self.model_runner.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                )
+        finally:
+            set_attn_backend(prev_attn_backend)
 
     def _cache_loc_dtype(self):
         return torch.int64 if not is_npu() else torch.int32
@@ -554,9 +556,6 @@ class PiecewiseCudaGraphRunner:
                 next_token_logits_buffer=None,
                 orig_seq_lens=torch.tensor([num_tokens], device=self.device),
                 seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-                req_to_token_pool=self.model_runner.req_to_token_pool,
-                token_to_kv_pool=self.model_runner.token_to_kv_pool,
-                attn_backend=self.model_runner.attn_backend,
                 out_cache_loc=out_cache_loc,
                 seq_lens_sum=num_tokens,
                 mamba_track_indices=mamba_track_indices,
@@ -628,10 +627,14 @@ class PiecewiseCudaGraphRunner:
 
         # run twice for warmup at the first time and cuda graph capture at the second time
         # detail lies in sglang/python/sglang/srt/compilation/cuda_piecewise_backend.py
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
+        try:
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
+        finally:
+            set_attn_backend(prev_attn_backend)
 
         return
 
@@ -733,9 +736,6 @@ class PiecewiseCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             orig_seq_lens=forward_batch.orig_seq_lens,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=forward_batch.seq_lens_sum,
             mamba_track_indices=mamba_track_indices,
