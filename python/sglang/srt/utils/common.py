@@ -2757,9 +2757,11 @@ def has_hf_quant_config(model_path: str) -> bool:
     Returns:
         True if hf_quant_config.json exists, False otherwise.
     """
-    # Check if the model_path is a local path
-    if os.path.exists(os.path.join(model_path, "hf_quant_config.json")):
-        return True
+    # Local directory: return file existence directly without touching HF hub.
+    # Otherwise try_to_load_from_cache below raises HFValidationError on absolute
+    # paths (e.g. unquantized local --speculative-draft-model-path).
+    if os.path.isdir(model_path):
+        return os.path.exists(os.path.join(model_path, "hf_quant_config.json"))
 
     from huggingface_hub import try_to_load_from_cache
 
