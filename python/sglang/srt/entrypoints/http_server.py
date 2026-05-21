@@ -1887,7 +1887,13 @@ def _execute_server_warmup(server_args: ServerArgs):
     # Construct a warmup request
     is_vlm = bool(model_info.get("has_image_understanding", False))
     if model_info["is_generation"]:
-        if is_vlm and not server_args.skip_tokenizer_init:
+        # For PD disaggregation mode, use /generate endpoint to avoid
+        # chat/completions format incompatibility with bootstrap fields
+        if (
+            is_vlm
+            and not server_args.skip_tokenizer_init
+            and server_args.disaggregation_mode == "null"
+        ):
             request_name = "/v1/chat/completions"
         else:
             request_name = "/generate"
