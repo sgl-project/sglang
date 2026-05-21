@@ -20,6 +20,7 @@ def _make_server_args(*, sampling_backend: str) -> SimpleNamespace:
 
 class TestInstallTokenOracleFromEnv(CustomTestCase):
     def test_install_token_oracle_from_env_disabled_returns_none(self) -> None:
+        """Verify disabled token oracle installation returns no sampler hook."""
         server_args = _make_server_args(sampling_backend="auto")
         hook = install_token_oracle_from_env(server_args=server_args, vocab_size=1000)
         self.assertIsNone(hook)
@@ -27,6 +28,7 @@ class TestInstallTokenOracleFromEnv(CustomTestCase):
     def test_install_token_oracle_from_env_enabled_registers_oracle_backend(
         self,
     ) -> None:
+        """Verify enabled token oracle installation registers the oracle backend."""
         server_args = _make_server_args(sampling_backend="token_oracle")
         hook = install_token_oracle_from_env(server_args=server_args, vocab_size=512)
         self.assertIsNotNone(hook)
@@ -35,6 +37,7 @@ class TestInstallTokenOracleFromEnv(CustomTestCase):
     def test_install_token_oracle_from_env_enabled_returns_hook_with_hash_oracle(
         self,
     ) -> None:
+        """Verify enabled token oracle installation returns a hook with HashOracle."""
         from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 
         server_args = _make_server_args(sampling_backend="token_oracle")
