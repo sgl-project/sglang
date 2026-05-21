@@ -510,6 +510,20 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
     && apt install -y --no-install-recommends nsight-systems-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Test-only: MinIO server binary for integration tests that need an
+# S3-compatible endpoint. Intentionally not propagated to the `runtime` stage,
+# which copies only python site-packages, /sgl-workspace, and a small allow-list
+# of binaries from framework_final.
+RUN ARCH=$(uname -m) \
+    && case "$ARCH" in \
+        x86_64) MINIO_ARCH=amd64 ;; \
+        aarch64) MINIO_ARCH=arm64 ;; \
+        *) echo "Unsupported arch for minio: $ARCH" && exit 1 ;; \
+    esac \
+    && curl --retry 3 --retry-delay 2 -fsSL -o /usr/local/bin/minio \
+        https://dl.min.io/server/minio/release/linux-${MINIO_ARCH}/minio \
+    && chmod +x /usr/local/bin/minio
+
 # =============================================================================
 # Python packages and tools (before source copy for better caching)
 # =============================================================================

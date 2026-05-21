@@ -1,0 +1,128 @@
+import ctypes
+import ctypes.util
+import logging
+import math
+import mmap
+import os
+import weakref
+
+import torch
+
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
+# Load libc once at module level so munmap is callable safely at GC/shutdown time.
+# Resolve the SONAME via find_library so the allocator also works on systems
+# whose libc is not named "libc.so.6" (e.g. musl / Alpine).
+try:
+    _libc_name = ctypes.util.find_library("c") or "libc.so.6"
+    _libc = ctypes.CDLL(_libc_name, use_errno=True)
+    _libc.mmap.restype = ctypes.c_void_p
+    _libc.mmap.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
+    ]
+    _libc.munmap.restype = ctypes.c_int
+    _libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+except OSError:
+    _libc = None
+
+# MAP_POPULATE is in Python's mmap module only since 3.11.
+_MAP_POPULATE = getattr(mmap, "MAP_POPULATE", 0x08000)
+# MAP_HUGETLB and MAP_HUGE_* are Linux-specific and not in Python's mmap module.
+_MAP_HUGETLB = 0x40000
+_MAP_HUGE_2MB = 21 << 26  # 0x1400000
+_MAP_HUGE_1GB = 30 << 26  # 0x78000000
+_MAP_FAILED = ctypes.c_void_p(-1).value
+
+
+def _alloc_hugepage(n_bytes: int, alloc_bytes: int, extra_flags: int) -> ctypes.Array:
+    """Call mmap via libc with hugepage flags and return an owning ctypes array.
+
+    munmap fires automatically via weakref.finalize when the array is
+    garbage-collected (i.e. when the tensor that wraps it is freed).
+    """
+    ptr = _libc.mmap(
+        None,
+        alloc_bytes,
+        mmap.PROT_READ | mmap.PROT_WRITE,
+        mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_POPULATE | extra_flags,
+        -1,
+        0,
+    )
+    if ptr is None or ptr == _MAP_FAILED:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    array = (ctypes.c_uint8 * n_bytes).from_address(ptr)
+    weakref.finalize(array, _libc.munmap, ctypes.c_void_p(ptr), alloc_bytes)
+    return array
+
+
+def alloc_mmap(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """Allocate a host tensor via anonymous mmap. Set SGLANG_HUGEPAGE_SIZE=2MB or 1GB for hugepages.
+
+    MAP_POPULATE is mandatory: it pre-faults all pages so the physical backing is
+    established before cudaHostRegister is called. Without it, cudaHostRegister fails
+    on lazily-mapped pages that have not yet been touched.
+
+    The returned tensor owns its backing memory: when the tensor (and all views of
+    it) are freed, the underlying mmap is released automatically.
+    """
+    # Re-read per call (not cached) so that envs.SGLANG_HUGEPAGE_SIZE.override()
+    # works correctly in tests.
+    hugepage_size = (envs.SGLANG_HUGEPAGE_SIZE.get() or "").strip().upper()
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+
+    if hugepage_size == "":
+        page_size, extra_flags = mmap.PAGESIZE, 0
+    elif hugepage_size == "2MB":
+        page_size, extra_flags = 2 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_2MB
+    elif hugepage_size == "1GB":
+        page_size, extra_flags = 1024 * 1024 * 1024, _MAP_HUGETLB | _MAP_HUGE_1GB
+    else:
+        logger.warning(
+            "Unrecognized SGLANG_HUGEPAGE_SIZE=%r; expected '2MB' or '1GB'. "
+            "Falling back to plain page-size mmap.",
+            envs.SGLANG_HUGEPAGE_SIZE.get(),
+        )
+        page_size, extra_flags = mmap.PAGESIZE, 0
+
+    alloc_bytes = math.ceil(n_bytes / page_size) * page_size
+
+    if extra_flags:
+        if _libc is None:
+            logger.error(
+                "Hugepage mmap requested but libc.so.6 could not be loaded; "
+                "falling back to plain mmap. SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
+                hugepage_size,
+            )
+        else:
+            try:
+                array = _alloc_hugepage(n_bytes, alloc_bytes, extra_flags)
+                return torch.frombuffer(
+                    array, dtype=dtype, count=math.prod(dims)
+                ).reshape(dims)
+            except OSError as e:
+                logger.error(
+                    "Hugepage mmap via libc failed (%s); falling back to plain mmap. "
+                    "SGLANG_HUGEPAGE_SIZE=%s will be ignored.",
+                    e,
+                    hugepage_size,
+                )
+        alloc_bytes = math.ceil(n_bytes / mmap.PAGESIZE) * mmap.PAGESIZE
+
+    # Plain mmap path -- used directly when no hugepages requested, or as fallback.
+    # torch.frombuffer keeps a reference to mm inside the tensor storage, so mm
+    # stays alive until the tensor is freed and mmap.mmap.__del__ calls munmap.
+    mm = mmap.mmap(
+        -1,
+        alloc_bytes,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | _MAP_POPULATE,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
