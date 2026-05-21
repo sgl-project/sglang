@@ -13,6 +13,7 @@ from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
@@ -74,26 +75,6 @@ def make_config(
     )
 
 
-class FakeDecodeForwardMode:
-    def is_extend(self) -> bool:
-        return False
-
-    def is_mixed(self) -> bool:
-        return False
-
-    def is_decode_or_idle(self) -> bool:
-        return True
-
-    def is_target_verify(self) -> bool:
-        return False
-
-    def is_draft_extend_v2(self) -> bool:
-        return False
-
-    def is_extend_or_draft_extend_or_mixed(self) -> bool:
-        return False
-
-
 def make_forward_batch(
     device: torch.device,
     bs: int = 2,
@@ -101,7 +82,7 @@ def make_forward_batch(
 ) -> SimpleNamespace:
     seq_lens = list(seq_lens_list[:bs])
     return SimpleNamespace(
-        forward_mode=FakeDecodeForwardMode(),
+        forward_mode=ForwardMode.DECODE,
         spec_info=None,
         batch_size=bs,
         req_pool_indices=torch.tensor([1, 2][:bs], dtype=torch.int64, device=device),
