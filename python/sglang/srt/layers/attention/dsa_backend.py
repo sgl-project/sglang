@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum, IntEnum, auto
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Dict,
     List,
     Literal,
@@ -25,6 +23,10 @@ from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+    DSATopKBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.dsa.transform_index import (
     transform_index_page_table_decode,
@@ -93,46 +95,6 @@ global_workspace_buffer = None
 # Control whether to use fused metadata copy kernel for cuda graph replay (default: enabled)
 # Set SGLANG_USE_FUSED_METADATA_COPY=0 or false to disable
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
-
-
-def _dsa_topk_unfused(
-    score: torch.Tensor,
-    lengths: torch.Tensor,
-    topk: int,
-    row_starts: Optional[torch.Tensor] = None,
-    topk_op: Callable[..., Tuple[torch.Tensor, torch.Tensor]] = torch.topk,
-    topk_op_kwargs: Optional[Dict[str, object]] = None,
-) -> torch.Tensor:
-    batch_size, max_score_len = score.shape
-    topk_indices = score.new_full((batch_size, topk), -1, dtype=torch.int32)
-    if batch_size == 0 or topk == 0 or max_score_len == 0:
-        return topk_indices
-
-    if row_starts is None:
-        row_starts = torch.zeros_like(lengths, dtype=torch.int32, device=score.device)
-    else:
-        row_starts = row_starts.to(dtype=torch.int32, device=score.device)
-    lengths = lengths.to(dtype=torch.int32, device=score.device)
-
-    col_indices = torch.arange(max_score_len, dtype=torch.int32, device=score.device)
-    col_indices = col_indices.unsqueeze(0)
-    row_starts_unsqueezed = row_starts.unsqueeze(1)
-    row_ends_unsqueezed = (row_starts + lengths).unsqueeze(1)
-    valid_mask = (col_indices >= row_starts_unsqueezed) & (
-        col_indices < row_ends_unsqueezed
-    )
-
-    masked_logits = score.masked_fill(~valid_mask, float("-inf"))
-    valid_topk = min(topk, max_score_len)
-    topk_kwargs = topk_op_kwargs or {}
-    topk_scores, topk_col_indices = topk_op(masked_logits, valid_topk, **topk_kwargs)
-    topk_local_indices = topk_col_indices.to(torch.int32) - row_starts_unsqueezed
-    topk_local_indices = topk_local_indices.masked_fill(
-        topk_scores == float("-inf"), -1
-    )
-    topk_indices[:, :valid_topk] = topk_local_indices
-
-    return topk_indices
 
 
 @dataclass(frozen=True)
@@ -207,28 +169,6 @@ class DSAMetadata:
     token_to_batch_idx: Optional[torch.Tensor] = None
 
 
-class TopkTransformMethod(IntEnum):
-    # Transform topk indices to indices to the page table (page_size = 1)
-    PAGED = auto()
-    # Transform topk indices to indices to ragged kv (non-paged)
-    RAGGED = auto()
-
-
-class DSATopKBackend(Enum):
-    SGL_KERNEL = "sgl-kernel"
-    TORCH = "torch"
-    FLASHINFER = "flashinfer"
-
-    def is_sgl_kernel(self) -> bool:
-        return self == DSATopKBackend.SGL_KERNEL
-
-    def is_torch(self) -> bool:
-        return self == DSATopKBackend.TORCH
-
-    def is_flashinfer(self) -> bool:
-        return self == DSATopKBackend.FLASHINFER
-
-
 @torch.compile
 def _compiled_cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return torch.cat(tensors, dim=dim)
@@ -288,53 +228,6 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     def get_token_to_batch_idx(self) -> torch.Tensor:
         return self.attn_metadata.token_to_batch_idx
 
-    def _build_flashinfer_paged_args(
-        self,
-        ks: Optional[torch.Tensor],
-        cu_seqlens_q_topk: Optional[torch.Tensor],
-        batch_idx_list: Optional[List[int]],
-        device: torch.device,
-        num_rows: Optional[int] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        row_to_batch = (
-            torch.as_tensor(batch_idx_list, dtype=torch.int32, device=device)
-            if batch_idx_list is not None
-            else None
-        )
-
-        if (
-            row_to_batch is not None
-            and cu_seqlens_q_topk is not None
-            and num_rows is not None
-            and row_to_batch.shape[0] != num_rows
-        ):
-            q_lens = torch.diff(cu_seqlens_q_topk).to(dtype=torch.int32, device=device)
-            row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
-
-        if row_to_batch is None and cu_seqlens_q_topk is not None:
-            # Decode-like case (one query row per batch) does not need an explicit mapping.
-            # Avoid dynamic tensor construction in this branch to keep CUDA graph capture safe.
-            num_batches = cu_seqlens_q_topk.shape[0] - 1
-            if not (ks is None and num_rows is not None and num_rows == num_batches):
-                q_lens = torch.diff(cu_seqlens_q_topk).to(
-                    dtype=torch.int32, device=device
-                )
-                row_to_batch = torch.repeat_interleave(
-                    torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
-                    q_lens,
-                )
-
-        if ks is not None and row_to_batch is None:
-            raise RuntimeError(
-                "PAGED topk_transform with row_starts requires cu_seqlens_q metadata."
-            )
-
-        row_starts = ks
-        if row_starts is not None and row_to_batch is not None:
-            row_starts = row_starts - self.attn_metadata.cu_seqlens_k[:-1][row_to_batch]
-
-        return row_to_batch, row_starts
-
     def topk_transform(
         self,
         logits: torch.Tensor,
@@ -362,120 +255,18 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
-        if batch_idx_list is not None:
-            page_table_size_1 = self.attn_metadata.page_table_1[batch_idx_list]
-        else:
-            page_table_size_1 = self.attn_metadata.page_table_1
-
-        if not envs.SGLANG_DSA_FUSE_TOPK.get() or self.force_unfused_topk:
-            # Unfused topk
-            if self.topk_backend.is_sgl_kernel():
-                from sgl_kernel import fast_topk_v2
-
-                return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
-            elif self.topk_backend.is_torch():
-                return _dsa_topk_unfused(
-                    logits,
-                    seq_lens_topk,
-                    topk,
-                    row_starts=ks,
-                    topk_op=torch.topk,
-                    topk_op_kwargs={"dim": -1},
-                )
-            elif self.topk_backend.is_flashinfer():
-                import flashinfer
-
-                return _dsa_topk_unfused(
-                    logits,
-                    seq_lens_topk,
-                    topk,
-                    row_starts=ks,
-                    topk_op=flashinfer.top_k,
-                    topk_op_kwargs={
-                        "sorted": False,
-                        "deterministic": envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
-                        "tie_break": envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get(),
-                        "dsa_graph_safe": True,
-                    },
-                )
-        else:
-            # Fused topk
-            if self.topk_backend.is_sgl_kernel():
-                from sgl_kernel import (
-                    fast_topk_transform_fused,
-                    fast_topk_transform_ragged_fused,
-                )
-
-                if self.topk_transform_method == TopkTransformMethod.PAGED:
-                    # NOTE(dark): if fused, we return a transformed page table directly
-                    return fast_topk_transform_fused(
-                        score=logits,
-                        lengths=seq_lens_topk,
-                        page_table_size_1=page_table_size_1,
-                        cu_seqlens_q=cu_seqlens_q_topk,
-                        topk=topk,
-                        row_starts=ks,
-                    )
-                elif self.topk_transform_method == TopkTransformMethod.RAGGED:
-                    if cu_topk_indices_offset is None:
-                        raise RuntimeError(
-                            "RAGGED topk_transform requires topk_indices_offset; "
-                            "expected extend-without-speculative metadata."
-                        )
-                    return fast_topk_transform_ragged_fused(
-                        score=logits,
-                        lengths=seq_lens_topk,
-                        topk_indices_offset=cu_topk_indices_offset,
-                        topk=topk,
-                        row_starts=ks,
-                    )
-                else:
-                    raise RuntimeError(f"Unsupported {self.topk_transform_method = }")
-            elif self.topk_backend.is_flashinfer():
-                import flashinfer
-
-                if self.topk_transform_method == TopkTransformMethod.PAGED:
-                    row_to_batch, row_starts = self._build_flashinfer_paged_args(
-                        ks=ks,
-                        cu_seqlens_q_topk=cu_seqlens_q_topk,
-                        batch_idx_list=batch_idx_list,
-                        device=logits.device,
-                        num_rows=logits.shape[0],
-                    )
-
-                    return flashinfer.top_k_page_table_transform(
-                        logits.contiguous(),
-                        self.attn_metadata.page_table_1.contiguous(),
-                        seq_lens_topk.contiguous(),
-                        topk,
-                        row_to_batch=row_to_batch,
-                        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
-                        tie_break=envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get(),
-                        dsa_graph_safe=True,
-                        row_starts=row_starts,
-                    )
-                elif self.topk_transform_method == TopkTransformMethod.RAGGED:
-                    if cu_topk_indices_offset is None:
-                        raise RuntimeError(
-                            "RAGGED topk_transform requires topk_indices_offset; "
-                            "expected extend-without-speculative metadata."
-                        )
-                    return flashinfer.top_k_ragged_transform(
-                        logits.contiguous(),
-                        cu_topk_indices_offset.contiguous(),
-                        seq_lens_topk.contiguous(),
-                        topk,
-                        deterministic=envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.get(),
-                        tie_break=envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.get(),
-                        dsa_graph_safe=True,
-                        row_starts=ks,
-                    )
-                else:
-                    raise RuntimeError(f"Unsupported {self.topk_transform_method = }")
-            else:
-                raise RuntimeError(
-                    f"Unsupported {self.topk_backend = } for SGLANG_DSA_FUSE_TOPK."
-                )
+        return self.topk_backend.topk_transform(
+            logits=logits,
+            lengths=seq_lens_topk,
+            topk=topk,
+            topk_transform_method=self.topk_transform_method,
+            attn_metadata=self.attn_metadata,
+            cu_seqlens_q_topk=cu_seqlens_q_topk,
+            topk_indices_offset=cu_topk_indices_offset,
+            row_starts=ks,
+            batch_idx_list=batch_idx_list,
+            force_unfused_topk=self.force_unfused_topk,
+        )
 
 
 _DSA_IMPL_T: TypeAlias = Literal[

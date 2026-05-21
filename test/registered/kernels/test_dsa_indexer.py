@@ -908,7 +908,9 @@ class TestDSAIndexer(CustomTestCase):
             DSATopKBackend.FLASHINFER,
         ]:
             tie_break_values = (
-                [0, 1, 2] if topk_backend == DSATopKBackend.FLASHINFER else [0]
+                ["none", "small", "large"]
+                if topk_backend == DSATopKBackend.FLASHINFER
+                else ["none"]
             )
             for tie_break in tie_break_values:
                 for with_row_starts in [False, True]:
@@ -932,7 +934,7 @@ class TestDSAIndexer(CustomTestCase):
         batch_size = 8
         max_score_len = 16 * 1024
         topk = 2048
-        for tie_break in [0, 1, 2]:
+        for tie_break in ["none", "small", "large"]:
             for topk_transform_method in [
                 TopkTransformMethod.PAGED,
                 TopkTransformMethod.RAGGED,
