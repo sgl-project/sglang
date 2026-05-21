@@ -138,7 +138,24 @@ class RealKvSource:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class VerifyOrWriteContext:
-    """Shared launch context for canary verify/write kernels."""
+    """Shared launch context for canary verify/write kernels.
+
+    Fields:
+        canary_buf: Canary buffer this launch verifies or writes, shape [num_slots, slot_stride_bytes], uint8.
+            slot_stride_bytes is read from canary_buf.shape[1].
+        kernel_kind: CanaryLaunchTag identifying which launch fired. Stamped (as int) into every violation row
+            so host can attribute a violation back to its source launch.
+        violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared across
+            all canary launches; fill-once.
+        violation_write_index: Global monotonic violation counter, shape [1], int32.
+        slot_run_counter: Health counter, shape [1], int64. Verify increments by active entries processed;
+            write increments by write entries processed.
+        kernel_run_counter: Health counter, shape [1], int64. Incremented by 1 per call.
+        real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
+            tuple disables the mixin. Multiple sources are folded sequentially via splitmix64 to produce one
+            int64 fingerprint per slot.
+        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
+    """
 
     canary_buf: torch.Tensor
     kernel_kind: CanaryLaunchTag
