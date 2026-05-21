@@ -53,6 +53,20 @@ def main():
             f"{png.name} ({png.stat().st_size/1024:.0f} KB)"
         )
 
+    # XL JPEG variant WITH restart markers, used to exercise the parallel-strip
+    # decode path. Otherwise our fixtures contain zero RST markers and the
+    # parallel path falls back to single-thread (as it does in production for
+    # most natural-image JPEGs).
+    tag, w, h = "xl", 4096, 3072
+    arr = gradient_with_noise(h, w, seed=42 + 3)  # match xl seed
+    pil = Image.fromarray(arr, mode="RGB")
+    out = OUT_DIR / f"{tag}_{w}x{h}_rst16.jpg"
+    pil.save(out, format="JPEG", quality=90, restart_marker_blocks=16)
+    print(
+        f"  wrote {out.name} ({out.stat().st_size/1024:.0f} KB)  "
+        f"[restart markers every 16 MCU blocks]"
+    )
+
     print(f"\nFixtures in: {OUT_DIR}")
 
 

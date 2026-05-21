@@ -7,7 +7,10 @@ use std::time::Instant;
 
 use clap::Parser;
 
-use preprocess::{preprocess_batch, preprocess_image, preprocess_image_into, QwenCfg};
+use preprocess::{
+    preprocess_batch, preprocess_image, preprocess_image_fused_into, preprocess_image_into,
+    QwenCfg,
+};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -89,6 +92,47 @@ fn main() -> anyhow::Result<()> {
             to_us(totals[1]),
             to_us(totals[2]),
             to_us(totals[3]),
+            t.decoded_h,
+            t.decoded_w,
+            t.target_h,
+            t.target_w,
+            np,
+        );
+    }
+
+    // --- Fused (single-pass) variant: u8 RGB -> bilinear+normalize+patch fused,
+    //     rayon-parallelized across merge-block-rows.
+    println!();
+    println!("## Per-image timing — FUSED single-pass + rayon ({} iters)", args.iters);
+    println!(
+        "{:<28} {:>8} {:>10} {:>10}   decoded          target           patches",
+        "fixture", "size_KB", "decode_us", "fused_us"
+    );
+    let mut fused_buf: Vec<f32> = Vec::new();
+    // warmup
+    for (_, b) in &images[..1.min(images.len())] {
+        let _ = preprocess_image_fused_into(b, &cfg, &mut fused_buf)?;
+    }
+    for (name, bytes) in &images {
+        let size_kb = bytes.len() / 1024;
+        let mut totals = [0u64; 3];
+        let mut last_t = None;
+        for _ in 0..args.iters {
+            let (info, t) = preprocess_image_fused_into(bytes, &cfg, &mut fused_buf)?;
+            totals[0] += t.decode_ns;
+            totals[1] += t.normpack_ns; // fused step (resize+norm+patch combined)
+            totals[2] += t.total_ns;
+            last_t = Some((t, info.num_patches));
+        }
+        let (t, np) = last_t.unwrap();
+        let n = args.iters as u64;
+        let to_us = |ns: u64| (ns / 1000) as f64 / n as f64;
+        println!(
+            "{:<28} {:>8} {:>10.1} {:>10.1}   {:>5}x{:<5}     {:>5}x{:<5}     {:>6}",
+            name,
+            size_kb,
+            to_us(totals[0]),
+            to_us(totals[1]),
             t.decoded_h,
             t.decoded_w,
             t.target_h,

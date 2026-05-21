@@ -80,6 +80,200 @@ fn is_png(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[..8] == b"\x89PNG\r\n\x1a\n"
 }
 
+// ---------- JPEG RST-aware parallel decode ----------
+//
+// JPEG restart markers (0xFFD0..0xFFD7) appear between independent entropy-coded
+// segments. When present, the entropy decoder state resets at each marker, so we
+// can decode strips in parallel — each strip's call to libjpeg-turbo starts its
+// entropy decode at the closest RST boundary to the requested crop.y, skipping
+// upstream work it would otherwise have to redo.
+//
+// Most JPEGs DO NOT contain RST markers (Pillow default, cameras). For those we
+// transparently fall back to the existing single-thread decode path. RST-equipped
+// JPEGs (`Pillow.save(..., restart_marker_blocks=N)`, `cjpeg -restart N`) get the
+// fast path.
+
+/// Returns true if the JPEG bytes contain at least one RST marker (0xFFD0..0xFFD7).
+/// Fast scan: just looks for 0xFF followed by 0xD0..0xD7 (mid-stream). Doesn't try
+/// to skip the JPEG header, since RSTs are valid only in entropy-coded data and
+/// don't otherwise appear in headers.
+fn has_rst_markers(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == 0xFF {
+            let m = bytes[i + 1];
+            if (0xD0..=0xD7).contains(&m) {
+                return true;
+            }
+            // 0xFF 0x00 is escaped data; skip both.
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Parallel-decode a JPEG that has RST markers, into the supplied rgb_pool.
+/// Uses raw turbojpeg-sys FFI to call tj3SetCroppingRegion per worker.
+/// Falls back to `decode_jpeg_scaled` if any error occurs (e.g. no RSTs aligned).
+fn decode_jpeg_parallel_rst(
+    bytes: &[u8],
+    target_h: u32,
+    target_w: u32,
+    rgb_pool: &mut Vec<u8>,
+    n_strips: usize,
+) -> Result<(u32, u32)> {
+    use turbojpeg_sys::*;
+
+    // Probe header + pick scaling factor first.
+    let header = turbojpeg::read_header(bytes).context("turbojpeg read_header")?;
+    let factors = turbojpeg::Decompressor::supported_scaling_factors();
+    let mut chosen = turbojpeg::ScalingFactor::new(1, 1);
+    for sf in factors.into_iter().rev() {
+        if sf.num() > sf.denom() {
+            continue;
+        }
+        let h = sf.scale(header.height);
+        let w = sf.scale(header.width);
+        if h >= target_h as usize && w >= target_w as usize {
+            chosen = sf;
+            break;
+        }
+    }
+    let scaled_h = chosen.scale(header.height) as u32;
+    let scaled_w = chosen.scale(header.width) as u32;
+    let needed = (scaled_h as usize) * (scaled_w as usize) * 3;
+    rgb_pool.clear();
+    rgb_pool.resize(needed + NEON_TAIL_PAD, 0u8);
+
+    // Compute MCU height after scaling. For 4:2:0 JPEGs MCU is 16x16 in unscaled
+    // space → 16*num/denom in scaled space. We treat MCU height as a strip
+    // alignment unit; if RSTs aren't aligned, libjpeg-turbo will slow-path.
+    // 16 is the common case; if the JPEG uses other subsampling the strips just
+    // become misaligned and parallelism degrades to sequential, but it still
+    // decodes correctly.
+    let mcu_h_scaled =
+        ((16usize * chosen.num()) as f32 / chosen.denom() as f32).ceil().max(1.0) as u32;
+
+    // Align strip boundaries to MCU height in scaled output.
+    let strip_h = ((scaled_h / n_strips as u32) / mcu_h_scaled).max(1) * mcu_h_scaled;
+    if strip_h * (n_strips as u32 - 1) >= scaled_h || strip_h == 0 {
+        // Strips would overshoot or degenerate; fall back to sequential.
+        return decode_jpeg_scaled(bytes, target_h, target_w, rgb_pool);
+    }
+
+    let row_stride = (scaled_w as usize) * 3;
+    let out_addr = rgb_pool.as_mut_ptr() as usize;
+
+    let strip_ranges: Vec<(u32, u32)> = (0..n_strips)
+        .map(|i| {
+            let y0 = i as u32 * strip_h;
+            let y1 = if i == n_strips - 1 { scaled_h } else { (i as u32 + 1) * strip_h };
+            (y0, y1)
+        })
+        .collect();
+
+    let result = std::sync::Mutex::new(Ok::<(), String>(()));
+
+    rayon::scope(|s| {
+        for &(y0, y1) in &strip_ranges {
+            let res = &result;
+            s.spawn(move |_| {
+                let r = decode_jpeg_strip_ffi(
+                    bytes,
+                    chosen,
+                    scaled_w,
+                    scaled_h,
+                    y0,
+                    y1,
+                    row_stride,
+                    out_addr,
+                );
+                if let Err(e) = r {
+                    let mut g = res.lock().unwrap();
+                    if g.is_ok() {
+                        *g = Err(e);
+                    }
+                }
+            });
+        }
+    });
+
+    if let Err(e) = result.into_inner().unwrap() {
+        // Fall back if any strip failed.
+        return decode_jpeg_scaled(bytes, target_h, target_w, rgb_pool)
+            .context(format!("parallel decode failed ({}); fallback", e));
+    }
+
+    Ok((scaled_h, scaled_w))
+}
+
+/// Single-strip FFI decode. Out-of-strip pixels in the destination row stride
+/// are untouched by this call.
+fn decode_jpeg_strip_ffi(
+    bytes: &[u8],
+    chosen: turbojpeg::ScalingFactor,
+    scaled_w: u32,
+    _scaled_h: u32,
+    y0: u32,
+    y1: u32,
+    row_stride: usize,
+    out_addr: usize,
+) -> Result<(), String> {
+    use turbojpeg_sys::*;
+    unsafe {
+        let handle = tj3Init(TJINIT_TJINIT_DECOMPRESS as i32);
+        if handle.is_null() {
+            return Err("tj3Init".into());
+        }
+
+        // Re-read header on this thread's handle.
+        let hdr_rc = tj3DecompressHeader(handle, bytes.as_ptr(), bytes.len() as _);
+        if hdr_rc != 0 {
+            tj3Destroy(handle);
+            return Err("tj3DecompressHeader".into());
+        }
+
+        let sf = tjscalingfactor {
+            num: chosen.num() as i32,
+            denom: chosen.denom() as i32,
+        };
+        if tj3SetScalingFactor(handle, sf) != 0 {
+            tj3Destroy(handle);
+            return Err("tj3SetScalingFactor".into());
+        }
+
+        let crop = tjregion {
+            x: 0,
+            y: y0 as i32,
+            w: scaled_w as i32,
+            h: (y1 - y0) as i32,
+        };
+        if tj3SetCroppingRegion(handle, crop) != 0 {
+            tj3Destroy(handle);
+            return Err("tj3SetCroppingRegion".into());
+        }
+
+        // Destination pointer to the strip's first row.
+        let strip_ptr = (out_addr as *mut u8).add((y0 as usize) * row_stride);
+
+        let rc = tj3Decompress8(
+            handle,
+            bytes.as_ptr(),
+            bytes.len() as _,
+            strip_ptr,
+            row_stride as i32,
+            TJPF_TJPF_RGB as i32,
+        );
+        tj3Destroy(handle);
+        if rc != 0 {
+            return Err("tj3Decompress8".into());
+        }
+        Ok(())
+    }
+}
+
 // ---------- JPEG decode via libjpeg-turbo ----------
 
 fn decode_jpeg_scaled(
@@ -140,12 +334,13 @@ fn decode_jpeg_scaled(
 const NEON_TAIL_PAD: usize = 48;
 
 // ---------- PNG decode via row-streamed `png` crate ----------
+//
+// Tried zune-png 0.5 with new_fast() options; it was 1.6x slower than `png`+
+// `miniz_oxide` on aarch64-apple-darwin for our fixtures. Keep `png` for now.
 
 fn decode_png(bytes: &[u8], rgb_pool: &mut Vec<u8>) -> Result<(u32, u32)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    decoder.set_transformations(
-        png::Transformations::EXPAND | png::Transformations::STRIP_16,
-    );
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().context("png read_info")?;
     let (w, h, color) = {
         let info = reader.info();
@@ -165,7 +360,6 @@ fn decode_png(bytes: &[u8], rgb_pool: &mut Vec<u8>) -> Result<(u32, u32)> {
                 out_off += r.len();
             }
             png::ColorType::Rgba => {
-                // strip alpha
                 let pixels = r.len() / 4;
                 for i in 0..pixels {
                     rgb_pool[out_off + i * 3] = r[i * 4];
@@ -192,10 +386,7 @@ fn decode_png(bytes: &[u8], rgb_pool: &mut Vec<u8>) -> Result<(u32, u32)> {
                 }
                 out_off += (r.len() / 2) * 3;
             }
-            png::ColorType::Indexed => {
-                // EXPAND transformation should have removed this, but be safe.
-                anyhow::bail!("indexed PNG not handled after EXPAND")
-            }
+            png::ColorType::Indexed => anyhow::bail!("indexed PNG not handled after EXPAND"),
         }
     }
 
@@ -458,6 +649,282 @@ fn patch_row_scalar(
         }
     }
 }
+
+// ---------- fused resize+normalize+patch (single pass) ----------
+//
+// Reads u8 RGB source directly, computes bilinear in f32, applies (scale, bias),
+// writes f32 patch tensor in final [num_patches, C*Tp*P*P] layout. No intermediate
+// u8 resized buffer.
+//
+// Each invocation produces patches for output row band [yb_start*m*p, yb_end*m*p).
+// Caller (rayon) can run multiple invocations concurrently on disjoint output bands;
+// they share the read-only `src` and write to non-overlapping slices of `out`.
+//
+// Bilinear convention: PIL/torchvision default ALIGN_CORNERS=False, no antialias:
+//   src_y_f(y_out) = (y_out + 0.5) * src_h / dst_h - 0.5
+//   src_y0 = floor(src_y_f).clamp(0, src_h - 1)
+//   src_y1 = (src_y0 + 1).clamp(.., src_h - 1)
+//   dy = (src_y_f - src_y0).clamp(0, 1)
+// Same for x. Out = sum(w_ij * p_ij) where w_00 = (1-dy)(1-dx) etc.
+
+fn fused_resize_normalize_patch_band(
+    src: &[u8],
+    src_h: u32,
+    src_w: u32,
+    target: crate::smart_resize::Target,
+    cfg: &QwenCfg,
+    yb_start_mblock: usize,
+    yb_end_mblock: usize,
+    out: &mut [f32],
+) {
+    let p = cfg.patch_size as usize;
+    let m = cfg.merge_size as usize;
+    let tp = cfg.temporal_patch_size as usize;
+    let pps = p * p;
+    let patch_features = 3 * tp * pps;
+
+    let dst_h = target.h as usize;
+    let dst_w = target.w as usize;
+    let grid_w_mblock = dst_w / (m * p);
+    let merge_block = m * m;
+
+    let sh = src_h as f32;
+    let sw = src_w as f32;
+    let dh = dst_h as f32;
+    let dw = dst_w as f32;
+    let scale_y = sh / dh;
+    let scale_x = sw / dw;
+
+    let s = [
+        1.0f32 / (255.0 * cfg.std[0]),
+        1.0f32 / (255.0 * cfg.std[1]),
+        1.0f32 / (255.0 * cfg.std[2]),
+    ];
+    let b = [
+        -cfg.mean[0] / cfg.std[0],
+        -cfg.mean[1] / cfg.std[1],
+        -cfg.mean[2] / cfg.std[2],
+    ];
+
+    let src_stride = src_w as usize * 3;
+    let src_h_us = src_h as usize;
+    let src_w_us = src_w as usize;
+
+    // Precompute per-column src indices and weights (shared across all rows / patches).
+    // dst_w is small (typically <= 1148) so this scratch is cheap.
+    let mut col_idx0 = vec![0usize; dst_w];
+    let mut col_idx1 = vec![0usize; dst_w];
+    let mut col_w0 = vec![0f32; dst_w];
+    let mut col_w1 = vec![0f32; dst_w];
+    for x_out in 0..dst_w {
+        let fx = (x_out as f32 + 0.5) * scale_x - 0.5;
+        let fx_c = fx.clamp(0.0, sw - 1.0);
+        let x0 = fx_c.floor() as usize;
+        let x1 = (x0 + 1).min(src_w_us - 1);
+        let dx = (fx_c - x0 as f32).clamp(0.0, 1.0);
+        col_idx0[x_out] = x0;
+        col_idx1[x_out] = x1;
+        col_w0[x_out] = 1.0 - dx;
+        col_w1[x_out] = dx;
+    }
+
+    debug_assert!(tp <= 2);
+
+    for gh_block in yb_start_mblock..yb_end_mblock {
+        let block_y0 = gh_block * m * p;
+        for mh in 0..m {
+            for py in 0..p {
+                let y_out = block_y0 + mh * p + py;
+                let fy = (y_out as f32 + 0.5) * scale_y - 0.5;
+                let fy_c = fy.clamp(0.0, sh - 1.0);
+                let y0 = fy_c.floor() as usize;
+                let y1 = (y0 + 1).min(src_h_us - 1);
+                let dy = (fy_c - y0 as f32).clamp(0.0, 1.0);
+                let w_y0 = 1.0 - dy;
+                let w_y1 = dy;
+                let row0 = y0 * src_stride;
+                let row1 = y1 * src_stride;
+
+                // Iterate every output column; group by (gw_block, mw, px) for the
+                // patch-slot mapping.
+                for gw_block in 0..grid_w_mblock {
+                    for mw in 0..m {
+                        let patch_idx = gh_block * (grid_w_mblock * merge_block)
+                            + gw_block * merge_block
+                            + mh * m
+                            + mw;
+                        let out_off = patch_idx * patch_features;
+                        let r_row_off = out_off + py * p;
+                        let g_row_off = out_off + tp * pps + py * p;
+                        let b_row_off = out_off + 2 * tp * pps + py * p;
+
+                        let patch_x0 = (gw_block * m + mw) * p;
+                        for px in 0..p {
+                            let x_out = patch_x0 + px;
+                            let x0 = col_idx0[x_out];
+                            let x1 = col_idx1[x_out];
+                            let wx0 = col_w0[x_out];
+                            let wx1 = col_w1[x_out];
+
+                            // Combined weights for the 4 source pixels.
+                            let w00 = w_y0 * wx0;
+                            let w01 = w_y0 * wx1;
+                            let w10 = w_y1 * wx0;
+                            let w11 = w_y1 * wx1;
+
+                            let p00r = src[row0 + x0 * 3] as f32;
+                            let p01r = src[row0 + x1 * 3] as f32;
+                            let p10r = src[row1 + x0 * 3] as f32;
+                            let p11r = src[row1 + x1 * 3] as f32;
+                            let p00g = src[row0 + x0 * 3 + 1] as f32;
+                            let p01g = src[row0 + x1 * 3 + 1] as f32;
+                            let p10g = src[row1 + x0 * 3 + 1] as f32;
+                            let p11g = src[row1 + x1 * 3 + 1] as f32;
+                            let p00b = src[row0 + x0 * 3 + 2] as f32;
+                            let p01b = src[row0 + x1 * 3 + 2] as f32;
+                            let p10b = src[row1 + x0 * 3 + 2] as f32;
+                            let p11b = src[row1 + x1 * 3 + 2] as f32;
+
+                            let r = (p00r * w00 + p01r * w01 + p10r * w10 + p11r * w11) * s[0] + b[0];
+                            let g = (p00g * w00 + p01g * w01 + p10g * w10 + p11g * w11) * s[1] + b[1];
+                            let bb = (p00b * w00 + p01b * w01 + p10b * w10 + p11b * w11) * s[2] + b[2];
+
+                            out[r_row_off + px] = r;
+                            out[g_row_off + px] = g;
+                            out[b_row_off + px] = bb;
+                        }
+                        if tp == 2 {
+                            for ch_off in [out_off, out_off + tp * pps, out_off + 2 * tp * pps] {
+                                let dst0 = ch_off + py * p;
+                                let dst1 = ch_off + py * p + pps;
+                                let (lo, hi) = out.split_at_mut(dst1);
+                                hi[..p].copy_from_slice(&lo[dst0..dst0 + p]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Single-image fused pipeline entry point. Uses rayon for sub-image
+/// parallelism over the merge-block-row dimension.
+pub fn preprocess_image_fused_into(
+    bytes: &[u8],
+    cfg: &QwenCfg,
+    out: &mut Vec<f32>,
+) -> Result<(PreprocessOut, PreprocessTimings)> {
+    use rayon::prelude::*;
+    let t0 = std::time::Instant::now();
+
+    let (decoded_h, decoded_w, target) = if is_jpeg(bytes) {
+        let header = turbojpeg::read_header(bytes).context("read_header")?;
+        let target = smart_resize(header.height as u32, header.width as u32, cfg.resize)?;
+        // RST-aware parallel decode if the JPEG has restart markers; else fall back
+        // to single-thread libjpeg-turbo. Both paths produce bit-identical pixels.
+        let use_parallel = has_rst_markers(bytes);
+        let n_strips = rayon::current_num_threads().min(4).max(2);
+        let (dh, dw) = RGB_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if use_parallel {
+                decode_jpeg_parallel_rst(bytes, target.h, target.w, &mut pool, n_strips)
+            } else {
+                decode_jpeg_scaled(bytes, target.h, target.w, &mut pool)
+            }
+        })?;
+        (dh, dw, target)
+    } else if is_png(bytes) {
+        let (h, w) = RGB_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            decode_png(bytes, &mut pool)
+        })?;
+        let target = smart_resize(h, w, cfg.resize)?;
+        (h, w, target)
+    } else {
+        anyhow::bail!("unsupported image format")
+    };
+
+    let t_decode = t0.elapsed().as_nanos() as u64;
+
+    let num_patches = target.num_patches(cfg.patch_size);
+    let patch_features = 3 * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let total = (num_patches * patch_features) as usize;
+    out.clear();
+    out.resize(total, 0.0f32);
+
+    let t1 = std::time::Instant::now();
+    let p = cfg.patch_size as usize;
+    let m = cfg.merge_size as usize;
+    let grid_h_mblock = (target.h as usize) / (m * p);
+
+    // Split merge-block-rows into chunks for rayon. Aim ~2× chunks per worker so
+    // smaller images don't get pinned to one worker.
+    let workers = rayon::current_num_threads().max(1);
+    let chunks = (workers * 2).min(grid_h_mblock).max(1);
+    let chunk_size = grid_h_mblock.div_ceil(chunks);
+
+    // Pass raw pointer as usize to dodge Send/Sync issues; we re-cast inside each spawn.
+    // SAFETY: every chunk writes only the patches in its band; bands are disjoint by
+    // construction (gh_block ranges are non-overlapping).
+    let out_addr = out.as_mut_ptr() as usize;
+
+    // Pull the decoded RGB out of the thread-local for the duration of the parallel
+    // section (RefCell::borrow() can't escape its closure). We put it back after.
+    let rgb_buf: Vec<u8> = RGB_POOL.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    let src_slice: &[u8] = &rgb_buf;
+
+    rayon::scope(|s| {
+        for chunk_idx in 0..chunks {
+            let cfg_copy = *cfg;
+            let target_copy = target;
+            s.spawn(move |_| {
+                let yb_start = chunk_idx * chunk_size;
+                let yb_end = ((chunk_idx + 1) * chunk_size).min(grid_h_mblock);
+                if yb_end <= yb_start {
+                    return;
+                }
+                let out_band: &mut [f32] = unsafe {
+                    std::slice::from_raw_parts_mut(out_addr as *mut f32, total)
+                };
+                fused_resize_normalize_patch_band(
+                    src_slice,
+                    decoded_h,
+                    decoded_w,
+                    target_copy,
+                    &cfg_copy,
+                    yb_start,
+                    yb_end,
+                    out_band,
+                );
+            });
+        }
+    });
+
+    // Return buffer to the thread-local pool for reuse.
+    RGB_POOL.with(|p| *p.borrow_mut() = rgb_buf);
+    let t_fused = t1.elapsed().as_nanos() as u64;
+
+    let grid_thw = [1, target.grid_h(cfg.patch_size), target.grid_w(cfg.patch_size)];
+    let info = PreprocessOut {
+        num_patches,
+        patch_features,
+        grid_thw,
+    };
+    let timings = PreprocessTimings {
+        decode_ns: t_decode,
+        resize_ns: 0,
+        normpack_ns: t_fused,
+        total_ns: t_decode + t_fused,
+        decoded_h,
+        decoded_w,
+        target_h: target.h,
+        target_w: target.w,
+        num_patches,
+    };
+    Ok((info, timings))
+}
+
 
 // ---------- top-level: pool-aware entry points ----------
 

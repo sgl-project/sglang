@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use preprocess::{preprocess_image, QwenCfg};
+use preprocess::{preprocess_image, preprocess_image_fused_into, QwenCfg};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -20,13 +20,23 @@ struct Args {
     image: PathBuf,
     #[arg(long)]
     out: PathBuf,
+    /// Use the fused single-pass pipeline (resize+normalize+patch in one kernel).
+    #[arg(long, default_value_t = false)]
+    fused: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let bytes = fs::read(&args.image)?;
     let cfg = QwenCfg::default();
-    let (pixel_values, info, _t) = preprocess_image(&bytes, &cfg)?;
+    let (pixel_values, info) = if args.fused {
+        let mut buf = Vec::new();
+        let (info, _t) = preprocess_image_fused_into(&bytes, &cfg, &mut buf)?;
+        (buf, info)
+    } else {
+        let (px, info, _t) = preprocess_image(&bytes, &cfg)?;
+        (px, info)
+    };
 
     let bin_path = args.out.with_extension("f32");
     let json_path = args.out.with_extension("json");

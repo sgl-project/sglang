@@ -117,36 +117,47 @@ Expected output: shape `(3996, 1176)`, `grid_thw [1,54,74]`, `mean abs diff
 `torchvision`; HF processor + Rust patch layout are bit-identical to HF outside
 of the resize step).
 
-## Results (Apple M-series, 14 cores, 48 GB RAM)
+## Results (Apple M-series, 14 cores, 48 GB RAM) — v4
 
-Per-image total time (decode + resize + normalize + patch), µs:
+Per-image total time (decode + fused-resize+normalize+patch), µs:
 
-| fixture                 | **Rust (this) ** | HF Python  | smg        |
-|-------------------------|-----------------:|-----------:|-----------:|
-| small_512×512.jpg       |       **1,698**  |    1,797   |    2,546   |
-| small_512×512.png       |       **2,259**  |    3,703   |    2,988   |
-| medium_1024×768.jpg     |          5,260   | **4,236**  |    8,576   |
-| medium_1024×768.png     |       **7,029**  |   10,142   |    9,673   |
-| large_2048×1536.jpg     |      **12,027**  |   12,791   |   17,031   |
-| large_2048×1536.png     |      **17,857**  |   35,825   |   23,396   |
-| xl_4096×3072.jpg        |      **27,298**  |   43,294   |   44,710   |
-| xl_4096×3072.png        |      **66,402**  |  135,719   |   67,879   |
+| fixture                 | **Rust (this)** | HF Python  | smg        |
+|-------------------------|----------------:|-----------:|-----------:|
+| small_512×512.jpg       |         **823** |    1,874   |    2,496   |
+| small_512×512.png       |       **1,366** |    3,812   |    2,932   |
+| medium_1024×768.jpg     |       **2,108** |    4,161   |    7,875   |
+| medium_1024×768.png     |       **3,740** |    9,979   |    9,149   |
+| large_2048×1536.jpg     |       **7,794** |   12,957   |   15,796   |
+| large_2048×1536.png     |      **14,219** |   34,854   |   21,350   |
+| xl_4096×3072.jpg        |      **23,350** |   41,761   |   44,153   |
+| xl_4096×3072.png        |      **56,941** |  131,916   |   66,270   |
+| xl_4096×3072_rst16.jpg  |      **21,242** |   42,254   |   44,271   |
 
-Rust wins 7/8 single-image fixtures.
+**Rust wins all 9 fixtures.** vs HF Python: 1.66× – 2.79× faster per image.
+vs smg: 1.16× – 3.74× faster.
 
-Batch (8 images, with rayon vs sequential):
+Batch (9 images, rayon vs sequential):
 
-| pipeline                  | wall time | per image |
-|---------------------------|----------:|----------:|
-| **Rust + rayon**          | **70.4 ms** | **8.8 ms** |
-| HF Python (sequential)    |   250.6 ms |  31.3 ms  |
-| smg (sequential)          |  ~177  ms |  ~22  ms  |
+| pipeline                  | wall time   | per image  |
+|---------------------------|------------:|-----------:|
+| **Rust + rayon**          | **69.9 ms** | **7.77 ms** |
+| HF Python (sequential)    |   291.6 ms  |   32.4 ms  |
+| smg (sequential)          |   ~185 ms   |   ~20.5 ms |
 
-**Rust + rayon is 3.56× faster than HF end-to-end.**
+**Rust + rayon is 4.17× faster than HF end-to-end.**
 
-## Stage-by-stage gains over a naive Rust translation (v1 → v3)
+## v4 pipeline additions over v3
 
-| stage          | v1            | v3 (this)        | win source                |
-|----------------|--------------:|-----------------:|---------------------------|
-| JPEG decode    | 3,399 µs (med) | 1,810 µs (med) | libjpeg-turbo SIMD + finer scaled iDCT |
-| patch-write    | 1,175 µs (med) |   451 µs (med) | NEON `vld3q_u8` + parallel-channel `vfmaq_f32` |
+| change | win |
+|---|---|
+| **Fused single-pass kernel** (decode → bilinear+normalize+patch in one pass; no intermediate u8 resized buffer) | post-decode stage **5–7× faster** at all sizes |
+| **Sub-image rayon work-stealing** (split merge-block-rows across workers) | scales the fused kernel across all cores even for single-image |
+| **RST-aware parallel JPEG decode** (when JPEG has `0xFFD0..0xFFD7` markers, decode strips concurrently via `tj3SetCroppingRegion` FFI; falls back to single-thread when no RSTs) | ~10% additional decode win on `*_rst*.jpg`; **bit-identical** to single-thread path |
+
+## Stage gains over a naive Rust translation (v1 → v4)
+
+| stage                          | v1            | v4 (this)        | source                |
+|--------------------------------|--------------:|-----------------:|-----------------------|
+| JPEG decode (medium)           | 3,399 µs      | 1,660 µs (1.9×) | libjpeg-turbo SIMD + finer M/8 scaled iDCT |
+| post-decode (medium)           | 4,044 µs      |   448 µs (9.0×) | fused single-pass kernel + sub-image rayon |
+| **end-to-end total (medium)**  | **7,415 µs**  | **2,108 µs (3.5×)** | combined |
