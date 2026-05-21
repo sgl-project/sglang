@@ -27,7 +27,7 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
-from sglang.srt.kv_canary.perturb.hook import PerturbHook
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
@@ -243,7 +243,7 @@ class TestSelfUnitRunner(CustomTestCase):
         pool.req_to_token[2, :3] = torch.tensor(
             [44, 55, 66], dtype=torch.int32, device=self.device
         )
-        hook = PerturbHook(
+        manager = PerturbManager(
             config=PerturbConfig(req_to_token_prob=1.0, warmup_steps=0),
             req_to_token_pool=pool,
             buffer_groups=(),
@@ -253,7 +253,7 @@ class TestSelfUnitRunner(CustomTestCase):
 
         snapshot = pool.req_to_token.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
-            hook.perturb_req_to_token_hook(forward_batch)
+            manager.perturb_req_to_token(forward_batch)
 
         diff = pool.req_to_token != snapshot
         self.assertEqual(int(diff.sum().item()), 1)

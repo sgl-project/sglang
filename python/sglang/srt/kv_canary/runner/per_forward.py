@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.perturb.hook import PerturbHook
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
@@ -90,7 +90,7 @@ class PerForwardOrchestrator:
         endpoints: tuple[CanaryEndpoint, ...],
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
-        perturb_hook: PerturbHook,
+        perturb_manager: PerturbManager,
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
@@ -103,7 +103,7 @@ class PerForwardOrchestrator:
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._perturb_hook = perturb_hook
+        self._perturb_manager = perturb_manager
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
 
@@ -155,9 +155,9 @@ class PerForwardOrchestrator:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._perturb_hook.perturb_req_to_token_hook(forward_batch)
-        self._perturb_hook.perturb_real_kv_used_hook(forward_batch)
-        self._perturb_hook.perturb_real_kv_unused_cache_hook(forward_batch)
+        self._perturb_manager.perturb_req_to_token(forward_batch)
+        self._perturb_manager.perturb_real_kv_used(forward_batch)
+        self._perturb_manager.perturb_real_kv_unused_cache(forward_batch)
 
         if self._config.input_check_mode:
             manager = self._token_oracle_manager

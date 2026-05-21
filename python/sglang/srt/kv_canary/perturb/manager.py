@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-class PerturbHook:
+class PerturbManager:
     """Thin orchestrator that owns the per-canary-runner state (config, buffer groups,
     req-to-token pool, radix cache handle, warmup gate) and dispatches each per-forward
     invocation to the three perturb-point modules.
@@ -46,7 +46,7 @@ class PerturbHook:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
-    def perturb_req_to_token_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
             forward_batch=forward_batch,
             config=self._config,
@@ -54,7 +54,7 @@ class PerturbHook:
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_used_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_real_kv_used(self, forward_batch: Optional["ForwardBatch"]) -> None:
         real_kv_used.run(
             forward_batch=forward_batch,
             config=self._config,
@@ -63,7 +63,7 @@ class PerturbHook:
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_unused_cache_hook(
+    def perturb_real_kv_unused_cache(
         self, forward_batch: Optional["ForwardBatch"]
     ) -> None:
         real_kv_unused_cache.run(

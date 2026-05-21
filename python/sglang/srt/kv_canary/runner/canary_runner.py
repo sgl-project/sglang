@@ -16,7 +16,7 @@ from sglang.srt.kv_canary.endpoint import (
 )
 from sglang.srt.kv_canary.runner.health import HealthAndStats
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.perturb.hook import PerturbHook
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
@@ -37,7 +37,7 @@ class CanaryRunner:
     """Owns all canary state for one ModelRunner. Constructed once during install_canary, lives
     until server shutdown. The runner itself is a thin facade; per-concern state and behavior
     live on the component classes (PumpAndAllreduce, SweepOrchestrator, ViolationReporter,
-    PerturbHook, PerForwardOrchestrator, HealthAndStats).
+    PerturbManager, PerForwardOrchestrator, HealthAndStats).
     """
 
     def __init__(
@@ -103,7 +103,7 @@ class CanaryRunner:
             device_state=self._device_state,
             pump_and_allreduce=self._pump_and_allreduce,
         )
-        self._perturb_hook = PerturbHook(
+        self._perturb_manager = PerturbManager(
             config=PerturbConfig.from_env(),
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
@@ -117,7 +117,7 @@ class CanaryRunner:
             endpoints=self._endpoints,
             req_to_token_pool=req_to_token_pool,
             swa_window_size=self._swa_window_size,
-            perturb_hook=self._perturb_hook,
+            perturb_manager=self._perturb_manager,
             per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
             per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
@@ -143,7 +143,7 @@ class CanaryRunner:
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
-        self._perturb_hook.attach_radix_cache(radix_cache)
+        self._perturb_manager.attach_radix_cache(radix_cache)
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
