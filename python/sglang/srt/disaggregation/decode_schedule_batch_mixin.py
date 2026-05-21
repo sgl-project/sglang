@@ -185,5 +185,13 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 )
             self.spec_info = spec_info
         else:
-            # Non-spec: input_ids feeds the next decode forward directly.
-            self.input_ids = last_tokens_tensor
+            if self.enable_overlap:
+                # Route via future_map; resolve_future gathers uniformly (mirrors
+                # the spec branch above).
+                future_map.token_ids_buf[self.req_pool_indices] = last_tokens_tensor.to(
+                    torch.int64
+                )
+                self.input_ids = -self.req_pool_indices
+            else:
+                # Non-spec, non-overlap: input_ids feeds the next decode forward.
+                self.input_ids = last_tokens_tensor

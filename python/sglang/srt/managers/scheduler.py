@@ -2244,9 +2244,16 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        batch.input_ids = torch.tensor(
+        last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
+        if self.enable_overlap:
+            # Route via future_map; resolve_future gathers uniformly (matches the
+            # spec V2 disagg arrival path established by #25862).
+            self.future_map.token_ids_buf[batch.req_pool_indices] = last_tokens
+            batch.input_ids = -batch.req_pool_indices
+        else:
+            batch.input_ids = last_tokens
 
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
