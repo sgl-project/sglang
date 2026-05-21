@@ -264,12 +264,14 @@ class DeepseekV4AscendAttnBackend(
             device=device,
         )
 
-        # actual_seq_lengths_kv: KV lengths per request; replay rewrites this in-place.
-        # Allocate max_bs-sized zero buffer at capture so replay can `.fill_(0)` +
-        # `[:bs].copy_(seq_len_for_this_batch)` without reallocating.
-        max_bs = self.graph_metadata["block_tables"].shape[0]
-        metadata.actual_seq_lengths_kv = torch.zeros(
-            max_bs, dtype=torch.int32, device=device,
+        # actual_seq_lengths_kv: KV lengths per request; shape (bs,) to match
+        # eager init_forward_metadata (lines 529/551/555) and the kernel's
+        # expected layout (kernel infers bs from len(cu_seqlens_q) - 1 and
+        # reads seqused_kv with that exact length). Initialized non-zero so the
+        # captured kernel records valid attention work; replay overwrites with
+        # real seq_lens in-place.
+        metadata.actual_seq_lengths_kv = torch.ones(
+            bs, dtype=torch.int32, device=device,
         )
 
         # actual_seq_lengths_q_cmp: same shape as _pa (bs+1). Replay mirrors
@@ -369,8 +371,12 @@ class DeepseekV4AscendAttnBackend(
         # Phase 2: kv lengths (and any spec-decode adjustment matches base).
         # The base class above already adjusted seq_lens in-place for target_verify
         # / decode+spec_info; copy the final adjusted values into fm.actual_seq_lengths_kv.
-        fm.actual_seq_lengths_kv.fill_(0)
-        fm.actual_seq_lengths_kv[:bs].copy_(seq_lens[:bs].to(torch.int32))
+        # fm.actual_seq_lengths_kv has shape (bs,) (bound in capture); clamp to 1 so
+        # padded slots (real seq_lens=0 beyond raw_bs) and capture-time zero seq_lens
+        # don't trip the kernel's seqused_kv >= 1 validation.
+        fm.actual_seq_lengths_kv.copy_(
+            seq_lens[:bs].to(torch.int32).clamp(min=1)
+        )
 
         # actual_seq_lengths_q_cmp mirrors actual_seq_lengths_q_pa (captured already).
         fm.actual_seq_lengths_q_cmp.copy_(fm.actual_seq_lengths_q_pa)
