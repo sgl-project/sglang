@@ -52,11 +52,14 @@ SRT_SLURM_BRANCH="${SRT_SLURM_BRANCH:-sglang-nightly-regression}"
 
 # Eval mode — passed through to srt-slurm's do_sweep.py. srt-slurm's lm-eval
 # runner sources benchmark_lib.sh and reads utils/evals/*.yaml from the eval
-# workspace.
+# workspace, which gets mounted into the Slurm container.
 RUN_EVAL="${RUN_EVAL:-false}"
 EVAL_ONLY="${EVAL_ONLY:-false}"
 EVAL_CONC="${EVAL_CONC:-}"
-INFMAX_WORKSPACE="${GITHUB_WORKSPACE}/scripts/ci/slurm/eval-workspace"
+EVAL_WORKSPACE_LUSTRE="$LUSTRE_WORKSPACE/eval-workspace"
+rm -rf "$EVAL_WORKSPACE_LUSTRE"
+cp -r "${GITHUB_WORKSPACE}/scripts/ci/slurm/eval-workspace" "$EVAL_WORKSPACE_LUSTRE"
+INFMAX_WORKSPACE="$EVAL_WORKSPACE_LUSTRE"
 export RUN_EVAL EVAL_ONLY EVAL_CONC INFMAX_WORKSPACE
 
 # ---------------------------------------------------------------------------

@@ -78,6 +78,13 @@ jobs:
             echo "::error::pr_number must be a positive integer, got '$PR'."
             exit 1
           fi
+          # run_eval and eval_only are mutually exclusive — they request opposite
+          # behaviors (perf+eval vs skip-perf). Cron defaults to neither set (uses
+          # per-entry auto-marking).
+          if [ "${{ inputs.run_eval }}" = "true" ] && [ "${{ inputs.eval_only }}" = "true" ]; then
+            echo "::error::run_eval and eval_only are mutually exclusive — pick one."
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Reads scripts/ci/slurm/nightly-configs.yaml and generates one matrix entry
