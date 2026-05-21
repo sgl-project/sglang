@@ -106,6 +106,8 @@ class ViTCudaGraphRunner:
         self.rotary_cos_bufs: Dict[int, torch.Tensor] = {}
         self.rotary_sin_bufs: Dict[int, torch.Tensor] = {}
 
+        self._eager_warmed_up = False
+
     # ------------------------------------------------------------------
     # Bucket helpers
     # ------------------------------------------------------------------
@@ -396,7 +398,20 @@ class ViTCudaGraphRunner:
                 bucket, x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
             )
 
-        # Fallback: total tokens exceed max bucket, run eager
+        # Fallback: total tokens exceed max bucket, run eager.
+        # The first eager call after graph replay is expensive (~3 s) due to
+        # CUDA kernel module cold-start on the default stream.  Absorb this
+        # cost with a dummy forward using the smallest captured buffer.
+        if not self._eager_warmed_up:
+            self._eager_warmed_up = True
+            B = self.BUCKET_SIZES[0]
+            self.vit.run_blocks(
+                self.input_bufs[B],
+                self.forward_metadatas[B],
+                self.rotary_cos_bufs[B],
+                self.rotary_sin_bufs[B],
+            )
+
         block_out, ds_outs = self.vit.run_blocks(
             x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
         )
