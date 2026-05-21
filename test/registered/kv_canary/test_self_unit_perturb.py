@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from kv_canary_runner_unit_utils import make_forward_batch, make_pool
 from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.perturb.config import (
+    PerturbConfig,
     TargetGroupKind,
     _parse_target_group_kind,
 )
+from sglang.srt.kv_canary.perturb.manager import PerturbManager
+from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
 from sglang.srt.kv_canary.perturb.utils import pick_target_group
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 
 register_cuda_ci(est_time=10, stage="extra-a", runner_config="1-gpu-large")
 
@@ -84,6 +90,97 @@ def test_pick_target_group_ignores_groups_without_real_kv_sources() -> None:
     )
 
     assert group is None
+
+
+def test_perturb_manager_perturb_dispatches_all_points() -> None:
+    """Verify perturb() runs each perturb point in order."""
+    device = DEFAULT_DEVICE
+    manager = PerturbManager(
+        config=PerturbConfig(
+            req_to_token_prob=0.0,
+            real_kv_used_prob=0.0,
+            real_kv_unused_cache_prob=0.0,
+            target_group_kind=TargetGroupKind.FULL,
+            warmup_steps=0,
+        ),
+        req_to_token_pool=make_pool(device),
+        buffer_groups=(),
+        step_counter_getter=lambda: 10,
+    )
+    forward_batch = make_forward_batch(device)
+    calls: list[str] = []
+
+    with patch.object(
+        manager,
+        "perturb_req_to_token",
+        lambda batch: calls.append("req_to_token"),
+    ), patch.object(
+        manager,
+        "perturb_real_kv_used",
+        lambda batch: calls.append("real_kv_used"),
+    ), patch.object(
+        manager,
+        "perturb_real_kv_unused_cache",
+        lambda batch: calls.append("real_kv_unused_cache"),
+    ):
+        manager.perturb(forward_batch)
+
+    assert calls == ["req_to_token", "real_kv_used", "real_kv_unused_cache"]
+
+
+def test_req_to_token_perturb_uses_live_slot_as_replacement() -> None:
+    """Verify req_to_token perturbation replaces a slot with another live slot."""
+    device = DEFAULT_DEVICE
+    pool = make_pool(device, max_reqs=4, max_seq=8)
+    pool.req_to_token[1, :3] = torch.tensor([11, 22, 33], dtype=torch.int32, device=device)
+    pool.req_to_token[2, :3] = torch.tensor([44, 55, 66], dtype=torch.int32, device=device)
+    manager = PerturbManager(
+        config=PerturbConfig(
+            req_to_token_prob=1.0,
+            real_kv_used_prob=0.0,
+            real_kv_unused_cache_prob=0.0,
+            target_group_kind=TargetGroupKind.FULL,
+            warmup_steps=0,
+        ),
+        req_to_token_pool=pool,
+        buffer_groups=(),
+        step_counter_getter=lambda: 10,
+    )
+    forward_batch = make_forward_batch(device, bs=2, seq_lens_list=(3, 3))
+    forward_batch.out_cache_loc = torch.tensor([11], dtype=torch.int32, device=device)
+
+    snapshot = pool.req_to_token.clone()
+    with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
+        manager.perturb_req_to_token(forward_batch)
+
+    diff = pool.req_to_token != snapshot
+    assert int(diff.sum().item()) == 1
+    rows, cols = torch.nonzero(diff, as_tuple=True)
+    row, col = int(rows[0].item()), int(cols[0].item())
+    original = int(snapshot[row, col].item())
+    replacement = int(pool.req_to_token[row, col].item())
+    live_slots = {11, 22, 33, 44, 55, 66}
+    assert original in live_slots
+    assert replacement in live_slots
+    assert replacement != original
+    assert not bool(diff[1, 0].item())
+
+
+def test_collect_active_slots_ignores_padded_out_cache_loc() -> None:
+    """Verify out_cache_loc padding does not exclude a live slot."""
+    device = DEFAULT_DEVICE
+    pool = make_pool(device, max_reqs=4, max_seq=8)
+    pool.req_to_token[1, :2] = torch.tensor([0, 7], dtype=torch.int32, device=device)
+    forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(2,))
+    forward_batch.out_cache_loc = torch.tensor([7, 0, 0], dtype=torch.int32, device=device)
+    forward_batch.num_token_non_padded_cpu = 1
+
+    targets = collect_active_slots(
+        forward_batch=forward_batch,
+        req_to_token_pool=pool,
+    )
+
+    assert [target.value for target in targets] == [0]
 
 
 def _make_group(*, kind: PoolKind, has_real_kv: bool) -> CanaryBufferGroup:
