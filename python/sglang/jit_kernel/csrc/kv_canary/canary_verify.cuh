@@ -75,7 +75,8 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     }
 
     const int64_t stored_token = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldToken);
-    const int64_t stored_position = canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    const int64_t stored_position =
+        canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
     const int64_t stored_chain_hash =
         canary_load_field(p.canary_buf, slot_idx, p.slot_stride_bytes, kCanaryFieldPrevHash);
     const int64_t stored_real_kv_hash =
@@ -120,8 +121,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
   }
   if ((threadIdx.x & 31u) == 0u && warp_active_count != 0u) {
     atomicAdd(
-        reinterpret_cast<unsigned long long*>(p.slot_run_counter),
-        static_cast<unsigned long long>(warp_active_count));
+        reinterpret_cast<unsigned long long*>(p.slot_run_counter), static_cast<unsigned long long>(warp_active_count));
   }
 }
 
