@@ -471,8 +471,18 @@ namespace = "default"
 "#,
         )
         .unwrap_err();
+        // Pin the specific variant: `ConfigError::NoSelector` ("none were
+        // set"). A bare `contains("selector")` would also pass for
+        // EmptyPdSelector / PartialPdSelectors / IdenticalPdSelectors /
+        // UnsupportedSelectorGrammar — variants that have semantically
+        // different error wording but all mention "selector". A future
+        // regression that returned, say, `PartialPdSelectors` for the
+        // all-None input would be caught here.
         let msg = err.to_string().to_lowercase();
-        assert!(msg.contains("selector"), "got: {err}");
+        assert!(
+            msg.contains("none were set"),
+            "expected NoSelector wording (\"none were set\"); got: {err}",
+        );
     }
 
     // Direct `K8sDiscoveryConfig::mode()` unit tests live alongside the

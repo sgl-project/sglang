@@ -80,11 +80,28 @@ fn registry_concurrent_add_remove_keeps_indexes_consistent() {
                 });
                 let snapshot = r.workers_for(&model);
                 for w in &snapshot {
-                    // Every worker present in by_model must resolve via by_id
-                    // to the same Worker we just observed; checking the id
-                    // is enough because by_id.get is the path that returned
-                    // these Arcs.
-                    assert!(w.id.0.starts_with('w'), "stray id: {}", w.id.0);
+                    // Cross-index invariant: an entry surfaced via
+                    // `by_model[m]` must come from a Worker whose own
+                    // `model_ids` includes `m`. An earlier version of
+                    // this assertion checked `w.id.0.starts_with('w')`,
+                    // which is a tautology — every id is `w0..w7` by
+                    // construction — and a regression where `by_model`
+                    // pointed at the wrong Worker (e.g., a stale entry
+                    // left after an upsert that should have cleared its
+                    // by_model membership for the dropped model) would
+                    // pass silently. We can't `re-get by_id and ptr_eq`
+                    // because a concurrent remove can drop the by_id
+                    // entry between the two reads — `Arc` keeps the
+                    // Worker alive on our side but the index map is
+                    // gone. The model-membership claim, however, is a
+                    // property of the Arc itself and stays stable.
+                    assert!(
+                        w.model_ids.contains(&model),
+                        "cross-index drift: by_model[{model:?}] surfaced \
+                         {:?} whose own model_ids = {:?}",
+                        w.id,
+                        w.model_ids,
+                    );
                 }
                 r.remove(&WorkerId(format!("w{i}")));
             }

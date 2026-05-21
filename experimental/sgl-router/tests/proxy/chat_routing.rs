@@ -709,12 +709,20 @@ async fn forward_json_to_records_failure_on_body_drop() {
 #[tokio::test]
 async fn forward_json_to_records_success_only_after_body_completes() {
     // Counterpart of the body-drop regression: clean 2xx + clean body
-    // must record_success exactly once. If the implementation accidentally
-    // records on both the header path AND the body path, a single
-    // successful request would double-record. The test pins the
-    // post-body-only ordering by reading `would_allow` mid-call would be
-    // racy, so we instead assert that a single clean call followed by a
-    // 5xx leaves us at exactly threshold-1 failures.
+    // MUST call `record_success` on the breaker, even if there were
+    // prior failures. Without this, the breaker can never recover from
+    // a transient failure spike — it would open on the threshold-th
+    // failure and stay open until cool_down, ignoring any successful
+    // traffic in between.
+    //
+    // An earlier version of this test only asserted `breaker.would_allow()`
+    // after a single clean call against a fresh breaker, which is true
+    // by default — the test never actually observed the success path
+    // affecting breaker state. We instead seed one prior failure (one
+    // short of threshold), make a clean call, then induce one more
+    // failure. If `record_success` fired on the clean call, the failure
+    // count is back to 1 and the breaker stays closed. If it didn't,
+    // the count is now 2 and the breaker opens.
     use sgl_router::health::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
     use sgl_router::server::error::ApiError;
     use std::sync::Arc;
@@ -730,8 +738,15 @@ async fn forward_json_to_records_success_only_after_body_completes() {
         threshold: std::num::NonZeroU32::new(2).unwrap(),
         cool_down: Duration::from_secs(30),
     }));
+    // Seed one prior failure (threshold-1) — breaker still admits.
+    breaker.record_failure();
+    assert!(
+        breaker.would_allow(),
+        "one failure under threshold=2 keeps the breaker closed (sanity)",
+    );
+
     let headers = axum::http::HeaderMap::new();
-    let _: Result<_, ApiError> = proxy
+    let res: Result<_, ApiError> = proxy
         .forward_json_to(
             &ok_worker.url,
             &breaker,
@@ -740,8 +755,18 @@ async fn forward_json_to_records_success_only_after_body_completes() {
             bytes::Bytes::from_static(b"{}"),
         )
         .await;
-    // After a single clean success, the breaker is Closed and admits.
-    assert!(breaker.would_allow(), "clean success keeps breaker closed");
+    assert!(res.is_ok(), "clean OK call must succeed: {res:?}");
+
+    // The observable side-effect of `record_success` on the OK body
+    // path: failure count is reset to 0. One more failure now must
+    // leave us at 1 (not 2), so the breaker stays closed.
+    breaker.record_failure();
+    assert!(
+        breaker.would_allow(),
+        "clean success on the OK body path must reset the failure count — \
+         if `record_success` was never called, the seed failure would still \
+         be live and this single new failure would trip threshold=2",
+    );
 }
 
 #[tokio::test]

@@ -44,11 +44,16 @@ async fn emits_one_added_per_url_with_plain_seed() {
     );
 }
 
-/// Single-URL list — the common dev deployment shape. Pins the contract
-/// that the producer task exits on its own once fan-out completes
-/// (no watcher to keep alive).
+/// Single-URL list — the common dev deployment shape. The producer
+/// emits exactly one event and then parks until the receiver is
+/// dropped. Earlier versions exited as soon as fan-out completed,
+/// which tripped `server::supervisor::supervise_critical_tasks` →
+/// `mark_unready` → `/readyz` 503; the lib-side
+/// `stays_alive_after_fanout_until_receiver_dropped` pins that
+/// invariant in isolation, while this test pins the same contract
+/// through the public `spawn` entry point used by the binary.
 #[tokio::test]
-async fn emits_one_event_for_single_url_and_exits() {
+async fn emits_one_event_and_parks_until_receiver_dropped() {
     let cfg = StaticUrlsDiscoveryConfig {
         urls: vec!["http://x:30000".into()],
     };
@@ -56,13 +61,17 @@ async fn emits_one_event_for_single_url_and_exits() {
     let h = sgl_router::discovery::static_urls::spawn(cfg, tx)
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), h)
-        .await
-        .expect("static_urls task should exit after fan-out")
-        .expect("join handle should not panic");
     let event = rx.recv().await.unwrap();
     assert!(matches!(event, DiscoveryEvent::Added(_)));
     assert!(rx.try_recv().is_err(), "exactly one event expected");
+
+    // Drop the receiver → producer's `tx.closed()` resolves → task
+    // exits cleanly.
+    drop(rx);
+    tokio::time::timeout(Duration::from_secs(2), h)
+        .await
+        .expect("static_urls task should exit after receiver is dropped")
+        .expect("join handle should not panic");
 }
 
 /// Spin up a fake worker that advertises

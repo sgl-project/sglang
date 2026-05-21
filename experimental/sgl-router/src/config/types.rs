@@ -397,6 +397,62 @@ pub enum ConfigError {
         selector: &'static str,
         value: String,
     },
+    #[error(
+        "discovery.k8s: PD `{selector}_selector` is empty (or only whitespace/commas) — \
+         it would match every EndpointSlice, and since classify_mode checks prefill before \
+         decode, the opposite role's pool would stay empty. Set non-empty equality terms \
+         distinguishing the two roles."
+    )]
+    EmptyPdSelector { selector: &'static str },
+    #[error(
+        "discovery.k8s: `prefill_selector` and `decode_selector` resolve to the same set \
+         of equality terms — classify_mode would tag every matching slice as Prefill and \
+         leave the decode pool empty. The two selectors must differ."
+    )]
+    IdenticalPdSelectors,
+}
+
+/// Returns `true` when `selector` has zero non-empty terms after
+/// trimming and splitting on `,`. `labels_match_selector` then returns
+/// `true` for every label set, which is the "matches everything"
+/// degenerate case PD mode must reject.
+fn is_selector_empty(selector: &str) -> bool {
+    selector.split(',').all(|t| t.trim().is_empty())
+}
+
+/// Canonicalize a comma-separated equality selector to a sorted list of
+/// parsed `(key, value)` tuples. Comparison happens at the parsed-term
+/// level — *not* the raw string level — because `labels_match_selector`
+/// already strips whitespace and treats `key=value` and `key==value` as
+/// the same equality test. Comparing raw strings would let
+/// `"app=sglang"` vs `"app==sglang"` (and `"app = sglang"` vs
+/// `"app=sglang"`) past the identical-selector check, even though
+/// `classify_mode` would treat them identically at runtime — exactly
+/// the silent decode-pool-empty failure mode this check exists to
+/// prevent.
+///
+/// Returns an empty `Vec` for selectors with no parseable terms
+/// (whitespace-only, comma-only, or any term that doesn't match the
+/// `key=value` / `key==value` grammar). Callers must run
+/// [`is_equality_selector`] before this to surface malformed
+/// selectors as `UnsupportedSelectorGrammar`.
+fn canonical_selector(selector: &str) -> Vec<(String, String)> {
+    let mut terms: Vec<(String, String)> = selector
+        .split(',')
+        .filter_map(|raw| {
+            let term = raw.trim();
+            if term.is_empty() {
+                return None;
+            }
+            // Mirror `labels_match_selector`: prefer the `==` alias so a
+            // term like `key==value` parses to `(key, value)` instead of
+            // `(key, =value)`.
+            let (k, v) = term.split_once("==").or_else(|| term.split_once('='))?;
+            Some((k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+    terms.sort();
+    terms
 }
 
 /// Returns `true` when `selector` parses as a comma-separated equality
@@ -440,12 +496,21 @@ impl K8sDiscoveryConfig {
 
         match (plain, prefill, decode) {
             (Some(label), None, None) => {
-                if !is_equality_selector(label) {
-                    return Err(ConfigError::UnsupportedSelectorGrammar {
-                        selector: "label",
-                        value: label.to_string(),
-                    });
-                }
+                // Plain mode pushes `label` to the K8s API as the
+                // server-side `labelSelector` of the EndpointSlice
+                // watcher (`watcher::Config::default().labels(&label)`
+                // in `discovery::k8s::spawn`). K8s itself parses the
+                // full label-selector grammar — equality, set-based
+                // (`in` / `notin`), presence (`key` / `!key`), and
+                // `!=` — and rejects malformed selectors at
+                // watch-start time. So at config-load we don't
+                // grammar-check `label` and let the K8s API be the
+                // syntax authority (README.md:25 and the multi-model
+                // e2e in tests/e2e/k8s_integration/test_multi_model.py
+                // depend on this). PD mode, in contrast, evaluates
+                // selectors client-side via `labels_match_selector`
+                // which only understands equality — so PD selectors
+                // are still grammar-checked below.
                 Ok(K8sDiscoveryMode::Plain {
                     label_selector: label.to_string(),
                 })
@@ -468,6 +533,24 @@ impl K8sDiscoveryConfig {
                         selector: "decode",
                         value: decode.to_string(),
                     });
+                }
+                // Empty PD selector matches every EndpointSlice at
+                // runtime; combined with classify_mode's prefill-first
+                // ordering, an empty selector would silently funnel all
+                // workers into one role. Reject up front.
+                if is_selector_empty(prefill) {
+                    return Err(ConfigError::EmptyPdSelector {
+                        selector: "prefill",
+                    });
+                }
+                if is_selector_empty(decode) {
+                    return Err(ConfigError::EmptyPdSelector { selector: "decode" });
+                }
+                // Identical selectors degrade the same way as an empty
+                // one: every slice matches both, prefill wins, decode
+                // stays empty.
+                if canonical_selector(prefill) == canonical_selector(decode) {
+                    return Err(ConfigError::IdenticalPdSelectors);
                 }
                 Ok(K8sDiscoveryMode::PdDisaggregation {
                     prefill_selector: prefill.to_string(),
@@ -560,36 +643,74 @@ mod k8s_discovery_config_tests {
         );
     }
 
+    /// Plain mode pushes its selector to the K8s API server-side
+    /// (`watcher::Config::default().labels(&selector)` in
+    /// `discovery::k8s::spawn`), so the full K8s label-selector grammar
+    /// — including set-based operators — is supported. README.md:25
+    /// advertises this, and `tests/e2e/k8s_integration/test_multi_model.py`
+    /// relies on it (`label_selector = "app in (sglang,sglang-small)"`).
+    /// Rejecting set-based selectors at config-load broke the documented
+    /// multi-model k8s path.
     #[test]
-    fn mode_rejects_set_based_selector_in_plain_mode() {
-        // labels_match_selector only handles `key=value` / `key==value`;
-        // anything else (presence tests, set-based ops, inequality) silently
-        // returns false at runtime, so zero pods match and discovery emits
-        // an empty worker set with no diagnostic. Validate up front.
-        let err = cfg(Some("app in (sglang, vllm)"), None, None)
+    fn mode_accepts_set_based_selector_in_plain_mode() {
+        let m = cfg(Some("app in (sglang,sglang-small)"), None, None)
+            .mode()
+            .expect("plain mode must accept set-based selectors");
+        assert_eq!(
+            m,
+            K8sDiscoveryMode::Plain {
+                label_selector: "app in (sglang,sglang-small)".to_string(),
+            }
+        );
+    }
+
+    /// `notin`, presence (`key`), absence (`!key`), and inequality (`!=`)
+    /// are all valid K8s server-side selector grammar — plain mode must
+    /// pass them through.
+    #[test]
+    fn mode_accepts_other_set_based_forms_in_plain_mode() {
+        for raw in [
+            "app notin (vllm,trtllm)",
+            "tier",
+            "!deprecated",
+            "tier!=canary",
+        ] {
+            let m = cfg(Some(raw), None, None)
+                .mode()
+                .unwrap_or_else(|e| panic!("plain mode must accept `{raw}`, got {e:?}"));
+            assert_eq!(
+                m,
+                K8sDiscoveryMode::Plain {
+                    label_selector: raw.to_string(),
+                },
+                "selector roundtrip mismatch for `{raw}`",
+            );
+        }
+    }
+
+    /// PD mode evaluates selectors *client-side* via
+    /// `labels_match_selector`, which only handles equality. A set-based
+    /// PD selector would silently match zero pods → fail-fast at load.
+    /// Pins the plain-server-side / PD-client-side asymmetry: relaxing
+    /// the grammar check for plain (see `mode_accepts_set_based_*`
+    /// above) must not accidentally relax it for PD selectors. Uses
+    /// `notin` so this test covers a different set-based form than
+    /// `mode_pd_rejects_set_based_prefill_selector` (which uses `in`)
+    /// — both must keep failing.
+    #[test]
+    fn mode_pd_rejects_notin_prefill_selector() {
+        let err = cfg(None, Some("app notin (vllm, trtllm)"), Some("app=sglang"))
             .mode()
             .unwrap_err();
         assert!(
-            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
-            "expected UnsupportedSelectorGrammar, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn mode_rejects_presence_only_term() {
-        let err = cfg(Some("app"), None, None).mode().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
-            "expected UnsupportedSelectorGrammar, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn mode_rejects_negation_term() {
-        let err = cfg(Some("app!=sglang"), None, None).mode().unwrap_err();
-        assert!(
-            matches!(err, ConfigError::UnsupportedSelectorGrammar { .. }),
-            "expected UnsupportedSelectorGrammar, got {err:?}"
+            matches!(
+                err,
+                ConfigError::UnsupportedSelectorGrammar {
+                    selector: "prefill",
+                    ..
+                },
+            ),
+            "expected UnsupportedSelectorGrammar(prefill), got {err:?}",
         );
     }
 
@@ -651,5 +772,148 @@ mod k8s_discovery_config_tests {
                 label_selector: String::new()
             }
         );
+    }
+
+    /// PD mode is the *opposite* of plain: an empty selector would match
+    /// every EndpointSlice, and since `classify_mode` checks prefill
+    /// before decode, an empty `prefill_selector` would classify
+    /// everything as Prefill — decode pool stays empty and the resolver
+    /// surfaces the wrong `no_decode_workers_available` error. Fail-fast
+    /// at config load.
+    #[test]
+    fn mode_pd_rejects_empty_prefill_selector() {
+        let err = cfg(None, Some(""), Some("role=decode")).mode().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::EmptyPdSelector {
+                    selector: "prefill"
+                },
+            ),
+            "expected EmptyPdSelector(prefill), got {err:?}",
+        );
+    }
+
+    #[test]
+    fn mode_pd_rejects_empty_decode_selector() {
+        let err = cfg(None, Some("role=prefill"), Some(""))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::EmptyPdSelector { selector: "decode" },),
+            "expected EmptyPdSelector(decode), got {err:?}",
+        );
+    }
+
+    /// Whitespace-only / comma-only PD selector parses to zero terms in
+    /// `labels_match_selector` and matches every slice at runtime — same
+    /// failure mode as a literal empty string.
+    #[test]
+    fn mode_pd_rejects_whitespace_only_prefill_selector() {
+        let err = cfg(None, Some("  ,  "), Some("role=decode"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::EmptyPdSelector {
+                    selector: "prefill"
+                },
+            ),
+            "expected EmptyPdSelector(prefill), got {err:?}",
+        );
+    }
+
+    /// Identical prefill and decode selectors degrade silently: every
+    /// slice matches both, but `classify_mode` returns `Prefill` first,
+    /// so the decode pool stays empty.
+    #[test]
+    fn mode_pd_rejects_identical_prefill_and_decode_selectors() {
+        let err = cfg(None, Some("app=sglang"), Some("app=sglang"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::IdenticalPdSelectors),
+            "expected IdenticalPdSelectors, got {err:?}",
+        );
+    }
+
+    /// Trailing whitespace must not be a loophole that bypasses the
+    /// identical-selector check.
+    #[test]
+    fn mode_pd_rejects_identical_selectors_under_whitespace_normalization() {
+        let err = cfg(None, Some("app=sglang"), Some("  app=sglang  "))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::IdenticalPdSelectors),
+            "expected IdenticalPdSelectors, got {err:?}",
+        );
+    }
+
+    /// `labels_match_selector` accepts both `key=value` and `key==value`
+    /// for equality and parses them to the same `(key, value)` tuple.
+    /// Two selectors that differ only in this alias choice are runtime-
+    /// equivalent — they'd match the same EndpointSlices, then
+    /// `classify_mode`'s prefill-first ordering would funnel every slice
+    /// into Prefill, leaving decode empty. The check must canonicalize
+    /// at the term level (parsed `(key, value)` tuples), not the raw
+    /// string level.
+    #[test]
+    fn mode_pd_rejects_identical_selectors_under_eq_alias() {
+        let err = cfg(None, Some("app=sglang"), Some("app==sglang"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::IdenticalPdSelectors),
+            "expected IdenticalPdSelectors, got {err:?}",
+        );
+    }
+
+    /// Inner whitespace inside a term (`"app = sglang"`) is the same
+    /// label as no whitespace (`"app=sglang"`) — the runtime
+    /// `labels_match_selector` trims key and value independently
+    /// (see `key.trim()` / `expected.trim()` in `k8s.rs`). Canonical
+    /// form must agree.
+    #[test]
+    fn mode_pd_rejects_identical_selectors_under_inner_whitespace() {
+        let err = cfg(None, Some("app=sglang"), Some("app =  sglang"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::IdenticalPdSelectors),
+            "expected IdenticalPdSelectors, got {err:?}",
+        );
+    }
+
+    /// Term order doesn't matter for label matching, so `"a=1,b=2"` and
+    /// `"b=2,a=1"` must be treated as identical. (Implied by the sort
+    /// in `canonical_selector`, but pinned explicitly so a future
+    /// "preserve user order for diagnostics" refactor can't silently
+    /// reintroduce the silent-failure bug.)
+    #[test]
+    fn mode_pd_rejects_identical_selectors_under_term_order_permutation() {
+        let err = cfg(None, Some("role=p,app=sglang"), Some("app=sglang,role=p"))
+            .mode()
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::IdenticalPdSelectors),
+            "expected IdenticalPdSelectors, got {err:?}",
+        );
+    }
+
+    /// Sanity: two selectors that genuinely differ at the term level
+    /// must still pass validation — the canonicalizer must not be so
+    /// aggressive that it false-positives on legitimate PD configs.
+    #[test]
+    fn mode_pd_accepts_truly_distinct_selectors() {
+        let m = cfg(
+            None,
+            Some("app=sglang,role=prefill"),
+            Some("app=sglang,role=decode"),
+        )
+        .mode()
+        .expect("distinct selectors must validate");
+        assert!(matches!(m, K8sDiscoveryMode::PdDisaggregation { .. }));
     }
 }

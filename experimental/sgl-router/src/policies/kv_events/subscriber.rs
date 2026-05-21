@@ -202,8 +202,13 @@ impl KvEventSubscriberRegistry {
             };
             let endpoint = format!("tcp://{}:{}", cfg.host, port);
             let cancel = CancellationToken::new();
-            let join =
-                spawn_subscriber_task(id.clone(), endpoint, self.inner.tx.clone(), cancel.clone());
+            let join = spawn_subscriber_task(
+                id.clone(),
+                endpoint,
+                cfg.topic.clone(),
+                self.inner.tx.clone(),
+                cancel.clone(),
+            );
             handles.insert(id, SubscriberHandle { cancel, join });
         }
     }
@@ -280,11 +285,12 @@ impl KvEventSubscriberRegistry {
 fn spawn_subscriber_task(
     id: KvWorkerId,
     endpoint: String,
+    topic: String,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        run_subscriber(id, endpoint, tx, cancel).await;
+        run_subscriber(id, endpoint, topic, tx, cancel).await;
     })
 }
 
@@ -298,6 +304,7 @@ fn spawn_subscriber_task(
 async fn run_subscriber(
     id: KvWorkerId,
     endpoint: String,
+    topic: String,
     tx: mpsc::Sender<WorkerEvent>,
     cancel: CancellationToken,
 ) {
@@ -305,10 +312,11 @@ async fn run_subscriber(
         worker_url = %id.url,
         dp_rank = id.dp_rank,
         endpoint = %endpoint,
+        topic = %topic,
         "starting kv-event subscriber"
     );
 
-    let mut sub = match connect_with_backoff(&id, &endpoint, &cancel).await {
+    let mut sub = match connect_with_backoff(&id, &endpoint, &topic, &cancel).await {
         Some(s) => s,
         None => return,
     };
@@ -373,7 +381,10 @@ async fn run_subscriber(
     }
 }
 
-/// Open a `SubSocket`, connect to `endpoint`, and subscribe to all topics.
+/// Open a `SubSocket`, connect to `endpoint`, and subscribe to the
+/// supplied `topic` prefix (empty string = receive every message,
+/// matching the prior all-topics behavior).
+///
 /// Retries with exponential backoff up to [`CONNECT_MAX_ATTEMPTS`] times
 /// so a worker that just booted (publisher not yet bound) doesn't
 /// permanently disable its KV-event subscriber.
@@ -384,6 +395,7 @@ async fn run_subscriber(
 async fn connect_with_backoff(
     id: &KvWorkerId,
     endpoint: &str,
+    topic: &str,
     cancel: &CancellationToken,
 ) -> Option<SubSocket> {
     let mut delay = CONNECT_BACKOFF_BASE;
@@ -411,7 +423,7 @@ async fn connect_with_backoff(
                     debug!(worker_url = %id.url, dp_rank = id.dp_rank, "cancelled before subscribe");
                     return None;
                 }
-                res = sub.subscribe("") => res,
+                res = sub.subscribe(topic) => res,
             };
             match subscribe_res {
                 Ok(()) => return Some(sub),
@@ -420,8 +432,9 @@ async fn connect_with_backoff(
                     dp_rank = id.dp_rank,
                     endpoint = %endpoint,
                     attempt,
+                    topic = %topic,
                     error = %e,
-                    "kv-events: SUB subscribe('') failed; retrying"
+                    "kv-events: SUB subscribe failed; retrying"
                 ),
             }
         }
@@ -607,10 +620,12 @@ mod tests {
         /// Build a 3-frame multipart with topic="", the given seq (BE i64),
         /// and the given payload bytes.
         pub fn build_multipart(seq: i64, payload: Vec<u8>) -> ZmqMessage {
-            let mut msg = ZmqMessage::from(Bytes::new());
-            // ZmqMessage::from(Bytes::new()) creates a 1-frame message
-            // with an empty frame, which is exactly the topic frame. Now
-            // append seq and payload.
+            build_multipart_with_topic(b"", seq, payload)
+        }
+
+        /// Build a 3-frame multipart with an explicit topic frame.
+        pub fn build_multipart_with_topic(topic: &[u8], seq: i64, payload: Vec<u8>) -> ZmqMessage {
+            let mut msg = ZmqMessage::from(Bytes::copy_from_slice(topic));
             msg.push_back(Bytes::copy_from_slice(&seq.to_be_bytes()));
             msg.push_back(Bytes::from(payload));
             msg
@@ -669,6 +684,80 @@ mod tests {
 
         let shutdown_done = timeout(Duration::from_millis(500), registry.shutdown()).await;
         assert!(shutdown_done.is_ok(), "shutdown should return promptly");
+    }
+
+    /// When the worker advertises a non-empty topic in
+    /// `EventConfig.topic`, the SUB socket must filter on that prefix:
+    /// only messages whose first frame *starts with* the topic bytes
+    /// reach our pump. ZMQ-level filtering is the only way the
+    /// configured topic affects routing — `decode_message` discards
+    /// frame 0 regardless — so a SUB socket that ignores `cfg.topic`
+    /// and subscribes to `""` lets every message on the endpoint
+    /// through, including events from unrelated publishers that
+    /// happen to share the host:port (e.g. a colocated worker
+    /// running a different model on the same machine).
+    ///
+    /// Scenario: subscribe to topic "match". Publish two messages on
+    /// the same PUB socket: topic=`match` first, then topic=`other`.
+    /// The matched message must be delivered AND the unmatched one
+    /// must not. We publish matched-first so the negative assertion
+    /// is the load-bearing check: a broken SUB filter that subscribes
+    /// to `""` (the pre-fix behavior) delivers BOTH messages in send
+    /// order, so the seq=22 assertion would still pass but the
+    /// stray-recv assertion would catch it. This removes a dependency
+    /// on PUB→SUB delivery ordering as the discriminator.
+    #[tokio::test]
+    async fn subscriber_filters_by_configured_topic() {
+        let (mut pub_sock, port) = helpers::make_pub_bound().await;
+
+        let (tx, mut rx) = mpsc::channel::<WorkerEvent>(8);
+        let registry = KvEventSubscriberRegistry::new(tx);
+
+        let worker_url = "http://127.0.0.1:30100";
+        let mut cfg = helpers::cfg_for(worker_url, port, 1);
+        cfg.topic = "match".into();
+        registry.add_worker(worker_url, &cfg).await;
+        helpers::settle().await;
+
+        // Publish matched first, then `other`. A leaky `""` subscription
+        // delivers both in order; the topic filter must drop the second.
+        let payload_matched = helpers::encode_all_blocks_cleared_batch(1.0, Some(0));
+        let payload_other = helpers::encode_all_blocks_cleared_batch(2.0, Some(0));
+        pub_sock
+            .send(helpers::build_multipart_with_topic(
+                b"match",
+                22,
+                payload_matched,
+            ))
+            .await
+            .unwrap();
+        pub_sock
+            .send(helpers::build_multipart_with_topic(
+                b"other",
+                11,
+                payload_other,
+            ))
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("timed out waiting for matched event")
+            .expect("channel closed");
+        let (_, seq, _) = helpers::expect_batch(event);
+        assert_eq!(seq, 22, "matched message must arrive; got seq={seq}");
+
+        // The load-bearing assertion: no second message in 200ms. A
+        // SUB subscribed to `""` would have delivered the `other`
+        // message by now; the topic filter must drop it.
+        let stray = timeout(Duration::from_millis(200), rx.recv()).await;
+        assert!(
+            stray.is_err(),
+            "second message with topic=`other` must NOT pass the filter \
+             (got {stray:?}); cfg.topic is being ignored at subscribe()",
+        );
+
+        registry.shutdown().await;
     }
 
     /// DP rank fan-out: 3 PUB sockets, 3 distinct events, all delivered.
