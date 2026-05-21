@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
@@ -20,7 +21,6 @@ from sglang.srt.kv_canary.runner.health import (
     KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger,
 )
-from sglang.srt.environ import envs
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
