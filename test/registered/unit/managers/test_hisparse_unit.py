@@ -11,6 +11,7 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
@@ -59,6 +60,89 @@ def _make_req(rid="test-req-0", origin_input_ids=None, output_ids=None):
         req, "extend_input_len", extend_input_len
     )
     return req
+
+
+class _FakeMooncakeTransferEngine:
+    def __init__(self):
+        self.calls = []
+
+    def batch_transfer_sync(self, session_id, src_addrs, dst_addrs, lengths):
+        self.calls.append((session_id, src_addrs, dst_addrs, lengths))
+        return 0
+
+
+class TestDSV4HiSparseMooncakeTransfer(unittest.TestCase):
+    def _make_manager(self, gpu_page_bytes):
+        from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+        mgr = object.__new__(MooncakeKVManager)
+        mgr.kv_args = SimpleNamespace(kv_item_lens=[gpu_page_bytes])
+        mgr.engine = _FakeMooncakeTransferEngine()
+        return mgr
+
+    def test_c4_host_transfer_addresses_match_token_layout(self):
+        c4_page_size = 64
+        dst_kv_item_len = 584
+        value_bytes = dst_kv_item_len - 8
+        scale_bytes = 8
+        gpu_page_bytes = value_bytes * c4_page_size + scale_bytes * c4_page_size
+        src_ptrs = [0x100000, 0x200000]
+        dst_ptrs = [0x300000, 0x400000]
+        src_indices = np.array([0, 1, 63, 64, 65, 130], dtype=np.int64)
+        dst_indices = np.array([10, 11, 12, 13, 14, 15], dtype=np.int64)
+
+        mgr = self._make_manager(gpu_page_bytes)
+        ret = mgr._send_dsv4_c4_to_host(
+            "session",
+            src_indices,
+            dst_indices,
+            src_ptrs,
+            dst_ptrs,
+            dst_kv_item_len,
+            c4_page_size,
+        )
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(len(mgr.engine.calls), 1)
+        session_id, src_addrs, dst_addrs, lengths = mgr.engine.calls[0]
+        self.assertEqual(session_id, "session")
+
+        expected_blocks = []
+        gpu_scale_page_offset = value_bytes * c4_page_size
+        for src_ptr, dst_ptr in zip(src_ptrs, dst_ptrs):
+            for src_idx, dst_idx in zip(src_indices, dst_indices):
+                src_page = int(src_idx) // c4_page_size
+                src_offset = int(src_idx) % c4_page_size
+                src_base = src_ptr + src_page * gpu_page_bytes
+                dst_base = dst_ptr + int(dst_idx) * dst_kv_item_len
+                expected_blocks.append(
+                    (src_base + src_offset * value_bytes, dst_base, value_bytes)
+                )
+                expected_blocks.append(
+                    (
+                        src_base + gpu_scale_page_offset + src_offset * scale_bytes,
+                        dst_base + value_bytes,
+                        scale_bytes,
+                    )
+                )
+
+        actual_blocks = list(zip(src_addrs, dst_addrs, lengths))
+        self.assertEqual(sorted(actual_blocks), sorted(expected_blocks))
+
+    def test_c4_host_transfer_skips_empty_input(self):
+        mgr = self._make_manager(gpu_page_bytes=37440)
+        ret = mgr._send_dsv4_c4_to_host(
+            "session",
+            np.array([], dtype=np.int64),
+            np.array([], dtype=np.int64),
+            [0x100000],
+            [0x200000],
+            dst_kv_item_len=584,
+            c4_page_size=64,
+        )
+
+        self.assertEqual(ret, 0)
+        self.assertEqual(mgr.engine.calls, [])
 
 
 class TestHiSparseUnit(unittest.TestCase):
