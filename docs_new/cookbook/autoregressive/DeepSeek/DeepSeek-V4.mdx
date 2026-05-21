@@ -29,7 +29,7 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash">DeepSeek-V4-Flash</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>284B</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>13B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>single-node serving: B200 / GB200 / GB300 / H200 on 4 GPUs; RTX PRO 6000 (SM120) on 4-8 GPUs</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
@@ -127,6 +127,20 @@ PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake
 can discover the IB HCAs; without IB exposure mooncake silently falls back to
 TCP, which can lead to garbled KV transfer on large checkpoints.
+
+<a id="sm120-note" />
+
+**SM120 (RTX PRO 6000 Blackwell Server Edition) note**
+
+DeepSeek-V4-Flash can run on RTX PRO 6000 Blackwell Server Edition (SM120, 96 GB GDDR7) with Tensor Parallelism only. We support two TP configurations:
+- **TP=8 (recommended)**: `--tp 8 --mem-fraction-static 0.70 --cuda-graph-max-bs 32`. Leaves ~20 GB per GPU for KV cache.
+- **TP=4 (memory-constrained)**: `--tp 4 --mem-fraction-static 0.90 --cuda-graph-max-bs 4`. Runs near the 96 GB memory limit (~98.8% usage) with minimal KV cache headroom.
+
+SM120 uses Triton-based MoE and FlashMLA fallback kernels instead of CUTLASS/DeepGEMM (auto-detected, no manual flags needed). Use Docker image `lmsysorg/sglang:dev-cu13` (CUDA 13.0, required for SM120 / CC 12.0).
+
+Performance is memory-bandwidth bound (~1.5 TB/s GDDR7 vs ~8 TB/s HBM3e on B200); expect ~15-17 tok/s at BS=1. Accuracy matches reference (GSM8K 10/10, GPQA Diamond 72.0% vs 71.2% published).
+
+V4-Pro is not supported on SM120 (model does not fit in 8x 96 GB).
 
 **MegaMoE**
 
