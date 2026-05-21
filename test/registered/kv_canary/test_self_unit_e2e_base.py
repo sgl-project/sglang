@@ -52,7 +52,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             )
         return harness, patcher
 
-    def test_assert_swa_divergence_observed_parses_stats_line(self) -> None:
+    def test_assert_swa_divergence_observed_passes_when_above_threshold(self) -> None:
         harness, patcher = self._make_harness(_LATER_LINE + "\n" + _GOOD_LINE + "\n")
         with patcher:
             harness.assert_swa_divergence_observed(

@@ -26,7 +26,7 @@ register_cpu_ci(est_time=5, stage="extra-a", runner_config="cpu-small")
 _DEVICE = torch.device("cpu")
 
 
-@dataclass
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _RecordingFuture:
     value: torch.Tensor
 
@@ -35,6 +35,8 @@ class _RecordingFuture:
 
 
 class _FakeAllocator:
+    __slots__ = ("_wrap_count_device", "_nonidentity_write_count_device")
+
     def __init__(
         self,
         *,
@@ -58,6 +60,12 @@ class _FakeAllocator:
 
 
 class _AllocatorWrapObserver:
+    __slots__ = (
+        "_wrap_count_device",
+        "_max_observed_swa_idx_device",
+        "_nonidentity_write_count_device",
+    )
+
     def __init__(self) -> None:
         self._wrap_count_device = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
         self._max_observed_swa_idx_device = torch.zeros(
@@ -136,6 +144,7 @@ class _LogCapture:
     def __init__(self) -> None:
         self.records: list[logging.LogRecord] = []
         self._handler: Optional[logging.Handler] = None
+        self._previous_level: Optional[int] = None
 
     def __enter__(self) -> "_LogCapture":
         self._handler = logging.Handler()
@@ -150,7 +159,8 @@ class _LogCapture:
         logger = logging.getLogger(swa_div_module.__name__)
         if self._handler is not None:
             logger.removeHandler(self._handler)
-        logger.setLevel(self._previous_level)
+        if self._previous_level is not None:
+            logger.setLevel(self._previous_level)
 
     def lines(self) -> list[str]:
         return [record.getMessage() for record in self.records]
@@ -176,11 +186,6 @@ def _parse_swa_divergence_line(line: str) -> dict[str, int]:
 
 
 class TestSwaDivergenceStats(CustomTestCase):
-    def setUp(self) -> None:
-        self._stream_override = patch.object(
-            swa_div_module, "FutureTensor", swa_div_module.FutureTensor
-        )
-
     def test_swa_divergence_log_emitted(self) -> None:
         allocator = _FakeAllocator(wrap_count=13, nonidentity_write_count=2)
         with _patch_future_tensor():

@@ -73,6 +73,15 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
+_SWA_DIVERGENCE_LINE_RE = re.compile(
+    r"kv_canary swa_divergence: "
+    r"forward_ct=(\d+) "
+    r"verify_full=(\d+) "
+    r"verify_swa=(\d+) "
+    r"mapping_nonidentity=(\d+) "
+    r"swa_pool_wrap=(\d+)"
+)
+
 
 class CanaryE2EBase(CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
@@ -258,19 +267,11 @@ class CanaryE2EBase(CustomTestCase):
         server log. If no such line is present yet, sleeps flush_wait_seconds
         and retries up to max_retries times before raising AssertionError.
         """
-        line_re = re.compile(
-            r"kv_canary swa_divergence: "
-            r"forward_ct=(\d+) "
-            r"verify_full=(\d+) "
-            r"verify_swa=(\d+) "
-            r"mapping_nonidentity=(\d+) "
-            r"swa_pool_wrap=(\d+)"
-        )
         last_match: Optional[re.Match] = None
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
             log_text = self._captured_log_text()
-            matches = list(line_re.finditer(log_text))
+            matches = list(_SWA_DIVERGENCE_LINE_RE.finditer(log_text))
             if matches:
                 last_match = matches[-1]
                 break
