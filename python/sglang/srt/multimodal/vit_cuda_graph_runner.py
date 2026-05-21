@@ -480,12 +480,19 @@ class ViTCudaGraphRunner:
                 sl = torch.tensor([S], dtype=torch.int32, device=self.device).view(
                     1, 1, 1, 1
                 )
+                seq_lens = torch.tensor([S], dtype=torch.int32, device=self.device)
                 metadata = VisionAttentionMetadata(
-                    cu_seqlens=cu, max_seqlen=S, sequence_lengths=sl
+                    cu_seqlens=cu,
+                    seq_lens=seq_lens,
+                    max_seqlen=S,
+                    sequence_lengths=sl,
                 )
             else:
                 cu = torch.tensor([0, S], dtype=torch.int32, device=self.device)
-                metadata = VisionAttentionMetadata(cu_seqlens=cu, max_seqlen=S)
+                seq_lens = torch.tensor([S], dtype=torch.int32, device=self.device)
+                metadata = VisionAttentionMetadata(
+                    cu_seqlens=cu, seq_lens=seq_lens, max_seqlen=S
+                )
 
             cos = per_image_rotary_cos[idx]
             sin = per_image_rotary_sin[idx]
