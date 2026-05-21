@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -74,6 +74,8 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         self.config = text_config
         self.quant_config = quant_config
         self.pp_group = get_pp_group()
+        n_layers = text_config.num_hidden_layers
+        self._assistant_kv_shared_layers: Set[int] = set(range(n_layers))
 
         self.vocab_size = text_config.vocab_size
         self.hidden_size = text_config.hidden_size
@@ -98,6 +100,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
+            kv_shared_layer_indices=self._assistant_kv_shared_layers,
         )
         self.post_projection = ReplicatedLinear(
             self.hidden_size,
