@@ -411,6 +411,10 @@ class ViTCudaGraphRunner:
 
         # Fallback: total tokens exceed max bucket, run eager
         block_out, ds_outs = self.vit.run_blocks(
-            x, forward_metadata, rotary_pos_emb_cos, rotary_pos_emb_sin
+            x,
+            forward_metadata,
+            rotary_pos_emb_cos,
+            rotary_pos_emb_sin,
+            debug_per_block=True,
         )
         return self.vit.run_merger(block_out, ds_outs)
