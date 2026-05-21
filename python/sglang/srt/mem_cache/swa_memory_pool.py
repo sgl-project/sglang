@@ -3,6 +3,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -381,13 +382,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        self._wrap_count_device = torch.zeros(1, dtype=torch.int64, device=device)
-        self._max_observed_swa_idx_device = torch.zeros(
-            1, dtype=torch.int64, device=device
-        )
-        self._nonidentity_write_count_device = torch.zeros(
-            1, dtype=torch.int64, device=device
-        )
+        if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
+            self._wrap_count_device: Optional[torch.Tensor] = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+            self._max_observed_swa_idx_device: Optional[torch.Tensor] = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+            self._nonidentity_write_count_device: Optional[torch.Tensor] = torch.zeros(
+                1, dtype=torch.int64, device=device
+            )
+        else:
+            self._wrap_count_device = None
+            self._max_observed_swa_idx_device = None
+            self._nonidentity_write_count_device = None
 
         self._kvcache = kvcache
         self.clear()
@@ -396,11 +404,15 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     @property
     def wrap_count(self) -> int:
         """Number of SWA alloc batches whose min swa_idx fell below the previous high-water mark."""
+        if self._wrap_count_device is None:
+            return 0
         return int(self._wrap_count_device.item())
 
     @property
     def nonidentity_write_count(self) -> int:
         """Cumulative count of full_to_swa_index_mapping entries written with swa_idx != full_idx."""
+        if self._nonidentity_write_count_device is None:
+            return 0
         return int(self._nonidentity_write_count_device.item())
 
     def available_size(self):
@@ -677,11 +689,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-        self._wrap_count_device.zero_()
-        self._max_observed_swa_idx_device.zero_()
-        self._nonidentity_write_count_device.zero_()
+        if self._wrap_count_device is not None:
+            self._wrap_count_device.zero_()
+            self._max_observed_swa_idx_device.zero_()
+            self._nonidentity_write_count_device.zero_()
 
     def _observe_swa_alloc(self, alloc_swa_indices: torch.Tensor) -> None:
+        if self._wrap_count_device is None:
+            return
         if alloc_swa_indices.numel() == 0:
             return
         flat = alloc_swa_indices.reshape(-1).to(torch.int64)
@@ -700,6 +715,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full_indices: torch.Tensor,
         swa_indices: torch.Tensor,
     ) -> None:
+        if self._nonidentity_write_count_device is None:
+            return
         if full_indices.numel() == 0:
             return
         full_flat = full_indices.reshape(-1).to(torch.int64)

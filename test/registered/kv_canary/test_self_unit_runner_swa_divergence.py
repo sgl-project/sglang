@@ -18,6 +18,7 @@ from sglang.srt.kv_canary.runner.swa_divergence_stats import (
     SWA_DIVERGENCE_LOG_PREFIX,
     SwaDivergenceStats,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -366,6 +367,31 @@ class TestSwaPoolNonidentityWriteCount(CustomTestCase):
             swa_indices=torch.tensor([10, 11, 12], dtype=torch.int64),
         )
         self.assertEqual(observer.nonidentity_write_count, 0)
+
+
+class TestSwaAllocatorObserverNoopWhenEnvDisabled(CustomTestCase):
+    """env-off path must skip all observer device ops (zero overhead)."""
+
+    def _make_env_off_allocator_stub(self) -> SWATokenToKVPoolAllocator:
+        stub = SWATokenToKVPoolAllocator.__new__(SWATokenToKVPoolAllocator)
+        stub._wrap_count_device = None
+        stub._max_observed_swa_idx_device = None
+        stub._nonidentity_write_count_device = None
+        return stub
+
+    def test_observe_swa_alloc_noop_when_env_disabled(self) -> None:
+        stub = self._make_env_off_allocator_stub()
+        stub._observe_swa_alloc(torch.tensor([1, 2, 3], dtype=torch.int64))
+        self.assertIsNone(stub._wrap_count_device)
+        self.assertIsNone(stub._max_observed_swa_idx_device)
+
+    def test_observe_swa_mapping_write_noop_when_env_disabled(self) -> None:
+        stub = self._make_env_off_allocator_stub()
+        stub._observe_swa_mapping_write(
+            full_indices=torch.tensor([5, 6], dtype=torch.int64),
+            swa_indices=torch.tensor([100, 200], dtype=torch.int64),
+        )
+        self.assertIsNone(stub._nonidentity_write_count_device)
 
 
 if __name__ == "__main__":

@@ -132,7 +132,7 @@ class SwaDivergenceStats:
             if self._swa_allocator_getter is not None
             else None
         )
-        if allocator is not None:
+        if allocator is not None and allocator._nonidentity_write_count_device is not None:
             self._pending_mapping_nonidentity_future = FutureTensor.device_to_host(
                 src_device=allocator._nonidentity_write_count_device,
                 stream=self._d2h_stream,
