@@ -47,6 +47,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -801,6 +802,32 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+        # Aiter custom all-gather (ROCm). Gated by SGLANG_USE_AITER_AG (default OFF)
+        # and by Aiter's own should_custom_ag (16B alignment, weak-contiguous,
+        # world==2 or fully-connected, per-rank size <= max_size/(world*2)).
+        # On a hit, writes directly into the caller's pre-allocated `output` via
+        # all_gather_reg during CUDA-graph capture and all_gather_unreg otherwise.
+        ca_comm = self.ca_comm
+        if (
+            is_hip()
+            and get_bool_env_var("SGLANG_USE_AITER_AG", default="false")
+            and ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "should_custom_ag")
+            and hasattr(ca_comm, "all_gather_reg")
+            and hasattr(ca_comm, "all_gather_unreg")
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and ca_comm.should_custom_ag(input)
+        ):
+            if getattr(ca_comm, "_IS_CAPTURING", False):
+                if torch.cuda.is_current_stream_capturing():
+                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    return
+            else:
+                ca_comm.all_gather_unreg(input, out=output, dim=0)
+                return
+
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and (
             not pynccl_comm.disabled or self.is_symmetric_memory_enabled()

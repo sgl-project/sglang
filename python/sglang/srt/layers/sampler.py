@@ -113,6 +113,18 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        # Greedy AG+argmax shortcut: LogitsProcessor has already computed the
+        # greedy token ids via a per-rank local argmax + tiny AG of (val, idx)
+        # pairs, skipping the full-vocab AG + full-vocab argmax. Eligibility is
+        # enforced in LogitsProcessor._try_greedy_argmax_shortcut (decode-only,
+        # all_greedy, no logprobs, no penalties/masks/bias, no softcap, no DP
+        # attn / attn-TP-group gather). All we need here is to consume the ids
+        # and still run the cross-TP sync that the normal greedy path runs.
+        if logits_output.next_token_ids_shortcut is not None:
+            batch_next_token_ids = logits_output.next_token_ids_shortcut
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+            return batch_next_token_ids
+
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)
