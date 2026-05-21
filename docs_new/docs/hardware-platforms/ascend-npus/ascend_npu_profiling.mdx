@@ -136,7 +136,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "./sglang_profile",
-    "start_step": 3,
+    "start_step": 1,
     "activities": ["CPU", "GPU"]
   }'
 
@@ -152,7 +152,9 @@ curl -X POST http://127.0.0.1:30000/stop_profile
 <Note>
 `/stop_profile` returns `"Stop profiling. This will take some time."` — the
 server needs time to flush trace data to disk and parse it. Wait for the
-response to complete.
+response to complete.  
+This method takes a significant amount of time to parse profiling data;
+consider using **Method B** instead to avoid lengthy waits.
 </Note>
 
 #### Method B: API Auto-Stop
@@ -250,15 +252,14 @@ profiler will wait indefinitely).
 python3 -m sglang.profiler \
   --url http://127.0.0.1:30000 \
   --output-dir ./my_profiles \
-  --num-steps 10 \
+  --num-steps 3 \
   --cpu --gpu &
-
+```
+```bash Command
 # Terminal 2: Immediately send inference requests to provide steps for profiling
-for i in $(seq 1 10); do
-  curl -s http://127.0.0.1:30000/generate \
-    -H "Content-Type: application/json" \
-    -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 32}}' > /dev/null
-done
+curl http://127.0.0.1:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 32}}'
 ```
 
 A simpler and more reliable approach is to use `bench_serving --profile`, which
@@ -275,7 +276,7 @@ python3 -m sglang.bench_serving \
   --random-output-len 32 \
   --num-prompts 10 \
   --profile \
-  --profile-steps 10 \
+  --profile-steps 3 \
   --profile-output-dir ./my_profiles
 ```
 
@@ -501,6 +502,9 @@ data automatically. Only use this for re-parsing or handling interrupted data.
   for browsers.
 - **Warmup iterations**: Set `start_step` to skip the first few warmup steps and
   capture performance data under steady state.
+- **Profile step count**: Large values for `num_steps` or `--profile-steps` can
+  lead to lengthy profiling data parsing times. Reduce these values
+  appropriately when you only need a quick overview.
 - **CUDA Graph impact**: To see the full Python call stack → operator mapping in
   traces, add `--disable-cuda-graph` when starting the server. Note that this
   reduces decode performance — only use during profiling. To analyze CUDA Graph
