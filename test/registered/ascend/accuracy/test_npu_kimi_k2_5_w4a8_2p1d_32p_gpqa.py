@@ -51,6 +51,8 @@ KIMI_K2_5_W4A8_PREFILL_ARGS = [
     "prefill",
     "--nnodes",
     "1",
+    "--node-rank",
+    "0",
     "--attention-backend",
     "ascend",
     "--device",
