@@ -78,9 +78,9 @@ def launch_canary_write_kernel(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    enable_write_verify_inputs: bool,
-    expected_input_tokens: torch.Tensor,
-    expected_input_positions: torch.Tensor,
+    enable_assert_inputs: bool,
+    expected_input_tokens: torch.Tensor | None,
+    expected_input_positions: torch.Tensor | None,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -109,7 +109,7 @@ def launch_canary_write_kernel(
     SWA-translated by the plan kernel; ``CANARY_CHAIN_ANCHOR`` is hardcoded module-level (no runtime seed).
 
     Write-time input verification (caller-driven, kernel is oracle-agnostic): when
-    ``enable_write_verify_inputs`` is True the kernel additionally compares ``fb_input_ids[i]`` against
+    ``enable_assert_inputs`` is True the kernel additionally compares ``fb_input_ids[i]`` against
     ``expected_input_tokens[i]`` and ``fb_positions[i]`` against ``expected_input_positions[i]``; mismatch
     on either field records a violation. The chain still advances on the actual values (not the expected
     ones) so a downstream verify won't cascade. Whoever produced the expected tensors is responsible for
@@ -134,15 +134,15 @@ def launch_canary_write_kernel(
             The kernel does not consult any LUT.
         kernel_kind: CanaryLaunchTag stamped into violation rows (see launch_canary_verify_kernel). Sweep callers do not
             invoke this kernel.
-        enable_write_verify_inputs: bool toggle. False = expected_input_* tensors ignored. True = compare
+        enable_assert_inputs: bool toggle. False = expected_input_* tensors must be None. True = compare
             each chain step's actual (token, position) against the caller-supplied expected tensors below.
         expected_input_tokens: Expected token id per write entry, shape [num_tokens_padded], int64. Only read
-            when enable_write_verify_inputs is True; may be uninitialized / cuda-graph dummy when False.
+            when enable_assert_inputs is True; must be None when enable_assert_inputs is False.
             Layout mirrors fb_input_ids (flattened across reqs in plan.write_offsets order); padding tail
             is ignored. Filled by the caller from whichever oracle produces expected inputs — the kernel
             knows no oracle.
-        expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int64. Same
-            shape/layout/lifetime rules as expected_input_tokens.
+        expected_input_positions: Expected position per write entry, shape [num_tokens_padded], int64, or None.
+            Same shape/layout/lifetime rules as expected_input_tokens.
         violation_ring: Global append-only sink, shape [ring_capacity, VIOLATION_FIELDS], int64. Shared with
             verify launches.
         violation_write_index: Global monotonic violation counter, shape [1], int32.
@@ -169,7 +169,7 @@ def launch_canary_write_kernel(
               token = fb_input_ids[i]; position = fb_positions[i];
               real_kv_hash = (real_kv_hash_mode == OFF) ? 0 : real_kv_fold_sources(real_kv_sources, slot);
                   // applies RealKvSource access invariant
-              if enable_write_verify_inputs:
+              if enable_assert_inputs:
                   if token != expected_input_tokens[i] or position != expected_input_positions[i]:
                       record_violation();  // chain still advances on the ACTUAL (token, position) below
               store (token, position, running_prev_hash, real_kv_hash) to canary_buf[slot] as 4 int64 fields;
@@ -204,8 +204,22 @@ def launch_canary_write_kernel(
     _assert_contiguous(fb_input_ids, "fb_input_ids")
     _assert_contiguous(fb_positions, "fb_positions")
     _assert_contiguous(fb_out_cache_loc, "fb_out_cache_loc")
-    _assert_contiguous(expected_input_tokens, "expected_input_tokens")
-    _assert_contiguous(expected_input_positions, "expected_input_positions")
+    if enable_assert_inputs:
+        if expected_input_tokens is None or expected_input_positions is None:
+            raise ValueError(
+                "kv-canary: expected input tensors are required when enable_assert_inputs=True"
+            )
+        _assert_contiguous(expected_input_tokens, "expected_input_tokens")
+        _assert_contiguous(expected_input_positions, "expected_input_positions")
+        expected_input_tokens_for_cuda = expected_input_tokens
+        expected_input_positions_for_cuda = expected_input_positions
+    else:
+        if expected_input_tokens is not None or expected_input_positions is not None:
+            raise ValueError(
+                "kv-canary: expected input tensors must be None when enable_assert_inputs=False"
+            )
+        expected_input_tokens_for_cuda = fb_input_ids
+        expected_input_positions_for_cuda = fb_positions
     _assert_contiguous(violation_ring, "violation_ring")
     _assert_contiguous(violation_write_index, "violation_write_index")
     _assert_contiguous(slot_run_counter, "slot_run_counter")
@@ -225,9 +239,9 @@ def launch_canary_write_kernel(
         fb_positions,
         fb_out_cache_loc,
         int(kernel_kind),
-        int(enable_write_verify_inputs),
-        expected_input_tokens,
-        expected_input_positions,
+        int(enable_assert_inputs),
+        expected_input_tokens_for_cuda,
+        expected_input_positions_for_cuda,
         violation_ring,
         violation_write_index,
         slot_run_counter,

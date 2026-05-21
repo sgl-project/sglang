@@ -24,9 +24,9 @@ def run_canary_write_torch_reference(
     fb_positions: torch.Tensor,
     fb_out_cache_loc: torch.Tensor,
     kernel_kind: CanaryLaunchTag,
-    enable_write_verify_inputs: bool,
-    expected_input_tokens: torch.Tensor,
-    expected_input_positions: torch.Tensor,
+    enable_assert_inputs: bool,
+    expected_input_tokens: torch.Tensor | None,
+    expected_input_positions: torch.Tensor | None,
     violation_ring: torch.Tensor,
     violation_write_index: torch.Tensor,
     slot_run_counter: torch.Tensor,
@@ -73,12 +73,24 @@ def run_canary_write_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    expected_input_tokens_host = expected_input_tokens.detach().to(
-        device=work_device, dtype=torch.int64
-    )
-    expected_input_positions_host = expected_input_positions.detach().to(
-        device=work_device, dtype=torch.int64
-    )
+    if enable_assert_inputs:
+        if expected_input_tokens is None or expected_input_positions is None:
+            raise ValueError(
+                "kv-canary: expected input tensors are required when enable_assert_inputs=True"
+            )
+        expected_input_tokens_host = expected_input_tokens.detach().to(
+            device=work_device, dtype=torch.int64
+        )
+        expected_input_positions_host = expected_input_positions.detach().to(
+            device=work_device, dtype=torch.int64
+        )
+    else:
+        if expected_input_tokens is not None or expected_input_positions is not None:
+            raise ValueError(
+                "kv-canary: expected input tensors must be None when enable_assert_inputs=False"
+            )
+        expected_input_tokens_host = None
+        expected_input_positions_host = None
 
     violation_rows: list[list[int]] = []
     total_slots_written = 0
@@ -108,7 +120,9 @@ def run_canary_write_torch_reference(
                 work_device=work_device,
             )
 
-            if enable_write_verify_inputs:
+            if enable_assert_inputs:
+                assert expected_input_tokens_host is not None
+                assert expected_input_positions_host is not None
                 mismatch_bits = consts.FailReason(0)
                 expected_token = int(expected_input_tokens_host[fb_idx].item())
                 expected_position = int(expected_input_positions_host[fb_idx].item())

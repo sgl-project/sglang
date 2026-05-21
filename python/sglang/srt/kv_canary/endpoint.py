@@ -97,6 +97,12 @@ class CanaryEndpoint:
             ]
         else:
             fb_out_cache_loc_for_canary = fb_out_cache_loc
+        if input_check_mode:
+            expected_input_tokens = expected_inputs.tokens
+            expected_input_positions = expected_inputs.positions
+        else:
+            expected_input_tokens = None
+            expected_input_positions = None
 
         launch_canary_write_kernel(
             canary_buf=self.canary_buf,
@@ -105,9 +111,9 @@ class CanaryEndpoint:
             fb_positions=fb_positions,
             fb_out_cache_loc=fb_out_cache_loc_for_canary,
             kernel_kind=self.kernel_kind,
-            enable_write_verify_inputs=input_check_mode,
-            expected_input_tokens=expected_inputs.tokens,
-            expected_input_positions=expected_inputs.positions,
+            enable_assert_inputs=input_check_mode,
+            expected_input_tokens=expected_input_tokens,
+            expected_input_positions=expected_input_positions,
             violation_ring=violation_log.violation_ring,
             violation_write_index=violation_log.violation_write_index,
             slot_run_counter=self.slot_run_counter_view,

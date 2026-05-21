@@ -309,6 +309,8 @@ class TestSelfUnitEndpoint(CustomTestCase):
         self.assertEqual(captured[0]["fb_input_ids"].dtype, torch.int64)
         self.assertEqual(captured[0]["fb_positions"].dtype, torch.int64)
         self.assertEqual(captured[0]["fb_out_cache_loc"].dtype, torch.int64)
+        self.assertIsNone(captured[0]["expected_input_tokens"])
+        self.assertIsNone(captured[0]["expected_input_positions"])
 
 
 if __name__ == "__main__":
