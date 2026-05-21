@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -107,7 +108,6 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     pipeline_name = "QwenImageLayeredPipeline"
 
     _required_config_modules = [
-        "text_encoder",
         "vae",
         "tokenizer",
         "processor",
@@ -116,10 +116,10 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(
-            QwenImageLayeredBeforeDenoisingStage(
+        def create_before_denoising_stage():
+            return QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
-                text_encoder=self.get_module("text_encoder"),
+                text_encoder=None,
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
@@ -130,6 +130,11 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
                     server_args.pipeline_config.text_encoder_precisions[0]
                 ],
             )
+
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            create_before_denoising_stage,
+            "QwenImageLayeredBeforeDenoisingStage",
         )
 
         self.add_standard_timestep_preparation_stage(

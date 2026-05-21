@@ -245,6 +245,13 @@ class MOVADenoisingStage(PipelineStage):
         """
         if not server_args.enable_torch_compile or not isinstance(module, nn.Module):
             return
+        if current_platform.is_hip():
+            logger.warning(
+                "Skipping torch.compile for %s on ROCm because the current "
+                "HIPRTC/Inductor path can emit invalid bf16 kernels.",
+                module.__class__.__name__,
+            )
+            return
         compile_kwargs: dict[str, object] = {"fullgraph": False, "dynamic": None}
 
         if current_platform.is_npu():
