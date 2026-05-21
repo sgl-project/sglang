@@ -61,6 +61,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.pool_context import set_attn_backend
 from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -292,9 +293,6 @@ class BreakableCudaGraphRunner:
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
@@ -394,14 +392,18 @@ class BreakableCudaGraphRunner:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        prev_attn_backend = set_attn_backend(self.model_runner.attn_backend)
+        try:
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
-        graph = BreakableCUDAGraph()
-        with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
-            output = run_once()
+            graph = BreakableCUDAGraph()
+            with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
+                output = run_once()
+        finally:
+            set_attn_backend(prev_attn_backend)
 
         return graph, output
 
