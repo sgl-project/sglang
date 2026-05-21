@@ -53,8 +53,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             target_group=self.target_group,
             flush_wait_seconds=5.0,
         )
-        if self.model_mode == "swa":
-            self.assert_swa_divergence_observed()
+        self.maybe_assert_swa_divergence_observed()
 
 
 class TestPerturbRealKvUnusedCacheMhaFull(

@@ -39,8 +39,7 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
             fail_reason="real_kv_hash",
             target_group=self.target_group,
         )
-        if self.model_mode == "swa":
-            self.assert_swa_divergence_observed()
+        self.maybe_assert_swa_divergence_observed()
 
 
 class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase, unittest.TestCase):

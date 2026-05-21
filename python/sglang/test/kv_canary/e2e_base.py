@@ -243,6 +243,10 @@ class CanaryE2EBase(CustomTestCase):
             f"{log_text[-2000:]}"
         )
 
+    def maybe_assert_swa_divergence_observed(self) -> None:
+        if self.model_mode == "swa":
+            self.assert_swa_divergence_observed()
+
     def assert_swa_divergence_observed(
         self,
         *,

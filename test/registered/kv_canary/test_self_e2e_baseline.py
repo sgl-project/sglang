@@ -19,8 +19,7 @@ class _BaselineBase(CanaryE2EBase):
         """Verify the baseline canary run completes without violations."""
         self.send_parallel_requests()
         self.assert_no_violation(wait_seconds=2.0)
-        if self.model_mode == "swa":
-            self.assert_swa_divergence_observed()
+        self.maybe_assert_swa_divergence_observed()
 
 
 class TestBaselineMha(_BaselineBase, unittest.TestCase):
