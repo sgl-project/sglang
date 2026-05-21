@@ -187,8 +187,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         if self.use_sliding_window_kv_pool:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                if forward_batch.out_cache_loc_swa is not None:
-                    return forward_batch.out_cache_loc_swa
                 return self._swa_kv_pool.translate_loc_from_full_to_swa(
                     forward_batch.out_cache_loc
                 )
