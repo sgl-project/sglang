@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.template_detection import (
+    TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
     detect_reasoning_parser,
     detect_reasoning_pattern,
@@ -265,6 +266,12 @@ class TestToolCallParserDetection(unittest.TestCase):
                 ["<|tool_calls_section_begin|>"],
                 "kimi_k2",
             ),
+            (
+                "xml_kv_tool_call_via_vocab",
+                "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
+                ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
+                "glm45",
+            ),
         ]
         for name, template, vocab, expected in cases:
             with self.subTest(name=name):
@@ -273,6 +280,23 @@ class TestToolCallParserDetection(unittest.TestCase):
                     template, _DummyTokenizer(vocab), config, force
                 )
                 self.assertEqual(result, expected)
+
+    def test_glm45_rule_precedes_xml_kv_fallback(self):
+        # The specific GLM-4.5 family check must run before the generic
+        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
+        # value-based test above can't catch a swap — assert positions directly.
+        rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(rule_index["glm45"], rule_index["xml_kv_tool_call"])
+
+    def test_xml_kv_requires_both_arg_tokens(self):
+        template = "Hello {{ user }}"
+        force, config = detect_reasoning_pattern(template)
+        for vocab in (["<arg_key>"], ["<arg_value>"], []):
+            with self.subTest(vocab=vocab):
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer(vocab), config, force
+                )
+                self.assertIsNone(result)
 
     def test_none_template_returns_none(self):
         self.assertIsNone(detect_tool_call_parser(None, None))
