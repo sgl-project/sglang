@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.attention.utils import concat_and_cast_mha_k_triton
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -122,10 +122,10 @@ class DeepseekMHAForwardMixin:
                 )
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
+            # DSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
 
-            if self.use_nsa:
-                # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
+            if self.use_dsa:
+                # DSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
                 # tuple.
@@ -220,6 +220,24 @@ class DeepseekMHAForwardMixin:
             kv_a = self.kv_a_layernorm(kv_a)
 
         k_pe = latent_cache[:, :, self.kv_lora_rank :]
+
+        # Backend prefill hook: the backend owns the BF16->FP8 transition
+        # (fused RoPE + quantize for Q/K, direct FP8 KV-cache write) and
+        # returns FP8 tensors ready for its kernel. Backends without the
+        # hook fall through to the BF16 path below.
+        backend = _resolve_attn_backend(forward_batch)
+        if hasattr(backend, "prepare_prefill_qkv"):
+            q_out, k_out, v_out = backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q_pe,
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=positions,
+                layer=self,
+                forward_batch=forward_batch,
+            )
+            return q_out, k_out, v_out, forward_batch
+
         if self.rotary_emb is not None:
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
         q[..., self.qk_nope_head_dim :] = q_pe
@@ -230,15 +248,15 @@ class DeepseekMHAForwardMixin:
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if (
-                self.use_nsa
+                self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_global_server_args().nsa_decode_backend == "trtllm"
-                    or not get_global_server_args().nsa_prefill_backend == "trtllm"
+                    not get_global_server_args().dsa_decode_backend == "trtllm"
+                    or not get_global_server_args().dsa_prefill_backend == "trtllm"
                 )
             ):
-                # FP8 path: dequantize NSA-specific FP8 format to BF16
-                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_nsa(forward_batch)
+                # FP8 path: dequantize DSA-specific FP8 format to BF16
+                kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
                 kv_a, k_pe = self._get_mla_kv_buffer(
@@ -471,12 +489,12 @@ class DeepseekMHAForwardMixin:
             kv_a = kv_a.squeeze(1).contiguous()
         return kv_a, k_pe
 
-    def _get_mla_kv_buffer_from_fp8_for_nsa(
+    def _get_mla_kv_buffer_from_fp8_for_dsa(
         self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
     ):
         """
-        Dequantize FP8 KV cache to BF16 for MLA attention (NSA-specific format).
+        Dequantize FP8 KV cache to BF16 for MLA attention (DSA-specific format).
 
         Returns: (kv_a, k_pe) both in BF16
         """
