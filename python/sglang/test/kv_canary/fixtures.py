@@ -7,16 +7,10 @@ from typing import List, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
-from sglang.srt.kv_canary.pool_patch.buf_info_splice import patch_buf_info_method
-from sglang.srt.kv_canary.pool_patch.buffer_alloc import (
-    alloc_canary_buf,
-    make_row_source,
-)
 
 DEFAULT_DEVICE: torch.device = torch.device("cuda")
 
@@ -72,30 +66,6 @@ class FakeSWAPool:
         )
 
 
-@dataclass
-class FakeDsv4Pool:
-    """DSV4-style packed pool: MLA (no v-half) + SWA dual + page_size 128. Same method-split
-    convention as :class:`FakeSWAPool` to avoid the double-wrap idempotency trap.
-    """
-
-    full_kv_pool: object
-    swa_kv_pool: object
-    full_to_swa_index_mapping: torch.Tensor
-    page_size: int = 128
-
-    def get_contiguous_buf_infos(self):
-        return _kv_only_buf_infos(
-            kv_buffer=self.full_kv_pool.kv_buffer,
-            page_size=self.page_size,
-        )
-
-    def get_state_buf_infos(self):
-        return _kv_only_buf_infos(
-            kv_buffer=self.swa_kv_pool.kv_buffer,
-            page_size=self.page_size,
-        )
-
-
 def _kv_buf_infos(
     *,
     k_buffer: List[torch.Tensor],
@@ -108,22 +78,6 @@ def _kv_buf_infos(
         b[0].nbytes * page_size for b in v_buffer
     ]
     return ptrs, lens, item_lens
-
-
-def _kv_only_buf_infos(
-    *,
-    kv_buffer: List[torch.Tensor],
-    page_size: int,
-) -> tuple:
-    ptrs = [b.data_ptr() for b in kv_buffer]
-    lens = [b.nbytes for b in kv_buffer]
-    item_lens = [b[0].nbytes * page_size for b in kv_buffer]
-    return ptrs, lens, item_lens
-
-
-@dataclass
-class FakeDsv4SubPool:
-    kv_buffer: List[torch.Tensor]
 
 
 def make_mha_pool(
@@ -176,37 +130,6 @@ def make_swa_pool(
     lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
     return FakeSWAPool(
         full_kv_pool=full, swa_kv_pool=swa, full_to_swa_index_mapping=lut
-    )
-
-
-def make_dsv4_pool(
-    device: torch.device = DEFAULT_DEVICE,
-    *,
-    full_slots: int = 16,
-    swa_slots: int = 8,
-    dim: int = 32,
-    layer_num: int = 1,
-    page_size: int = 128,
-) -> FakeDsv4Pool:
-    full = FakeDsv4SubPool(
-        kv_buffer=[
-            torch.zeros(full_slots, dim, dtype=torch.float16, device=device)
-            for _ in range(layer_num)
-        ]
-    )
-    swa = FakeDsv4SubPool(
-        kv_buffer=[
-            torch.zeros(swa_slots, dim, dtype=torch.float16, device=device)
-            for _ in range(layer_num)
-        ]
-    )
-    lut = torch.full((full_slots + 1,), -1, dtype=torch.int64, device=device)
-    lut[:swa_slots] = torch.arange(swa_slots, dtype=torch.int64, device=device)
-    return FakeDsv4Pool(
-        full_kv_pool=full,
-        swa_kv_pool=swa,
-        full_to_swa_index_mapping=lut,
-        page_size=page_size,
     )
 
 
@@ -300,72 +223,5 @@ def make_radix_cache(
     return cache
 
 
-def _attach_fake_dsv4(
-    *,
-    pool: FakeDsv4Pool,
-    device: torch.device,
-    read_bytes: int,
-) -> tuple[CanaryBufferGroup, ...]:
-    """MLA-style packed pool (single ``kv_buffer`` per sub-pool, no V half). Real DSV4's
-    multi-segment c4/indexer/c128 layout isn't replicated in the fake — each sub-pool gets a
-    single K-only splice (FULL -> ``get_contiguous_buf_infos``, SWA -> ``get_state_buf_infos``).
-    """
-    full_group = _build_fake_dsv4_group(
-        sub_pool=pool.full_kv_pool,
-        kind=PoolKind.FULL,
-        device=device,
-        read_bytes=read_bytes,
-        swa_lut=None,
-    )
-    swa_group = _build_fake_dsv4_group(
-        sub_pool=pool.swa_kv_pool,
-        kind=PoolKind.SWA,
-        device=device,
-        read_bytes=read_bytes,
-        swa_lut=pool.full_to_swa_index_mapping,
-    )
-    patch_buf_info_method(
-        pool,
-        method_name="get_contiguous_buf_infos",
-        group=full_group,
-        has_v_half=False,
-        page_size=pool.page_size,
-    )
-    patch_buf_info_method(
-        pool,
-        method_name="get_state_buf_infos",
-        group=swa_group,
-        has_v_half=False,
-        page_size=pool.page_size,
-    )
-    return (full_group, swa_group)
-
-
-def _build_fake_dsv4_group(
-    *,
-    sub_pool: FakeDsv4SubPool,
-    kind: PoolKind,
-    device: torch.device,
-    read_bytes: int,
-    swa_lut: Optional[torch.Tensor],
-) -> CanaryBufferGroup:
-    num_slots = int(sub_pool.kv_buffer[0].shape[0])
-    k_head = alloc_canary_buf(num_slots=num_slots, device=device)
-    k_tail = alloc_canary_buf(num_slots=num_slots, device=device)
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=k_head,
-        k_tail=k_tail,
-        v_head=None,
-        v_tail=None,
-        real_kv_sources_k=make_row_source(
-            layer_buffer=sub_pool.kv_buffer[0], read_bytes=read_bytes
-        ),
-        real_kv_sources_v=(),
-        swa_index_lut=swa_lut,
-    )
-
-
 register_pool_attacher(FakeMHAPool, attach_mha)
 register_pool_attacher(FakeSWAPool, attach_swa)
-register_pool_attacher(FakeDsv4Pool, _attach_fake_dsv4)

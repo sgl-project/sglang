@@ -18,7 +18,6 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_base_config,
-    make_dsv4_pool,
     make_mha_pool,
     make_swa_pool,
 )
@@ -53,14 +52,6 @@ class TestSelfUnitPoolPatch(CustomTestCase):
         self.assertEqual(groups[PoolKind.SWA].k_head.shape[0], 8)
         self.assertIsNotNone(groups[PoolKind.SWA].swa_index_lut)
         self.assertIsNone(groups[PoolKind.FULL].swa_index_lut)
-
-    def test_dsv4_pool_real_kv_sources_count(self):
-        pool = make_dsv4_pool(self.device, full_slots=16, swa_slots=8, page_size=128)
-        attach_canary_buffers(pool=pool, config=self.config, device=self.device)
-        groups = get_canary_buffer_groups(pool)
-        for group in groups.values():
-            self.assertLessEqual(len(group.real_kv_sources_k), MAX_REAL_KV_SOURCES)
-            self.assertLessEqual(len(group.real_kv_sources_v), MAX_REAL_KV_SOURCES)
 
     def test_real_kv_sources_above_4_raises(self):
         from sglang.jit_kernel.kv_canary.verify import (

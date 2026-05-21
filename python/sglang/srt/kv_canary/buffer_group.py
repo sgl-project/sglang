@@ -40,7 +40,7 @@ class CanaryBufferGroup:
         v_head: Same for V-half, or None for MLA-style pools.
         v_tail: Same for V-half, or None.
         real_kv_sources_k: Real KV pieces folded into the K-half canary's real_kv_hash. Tuple length is
-            pool-specific (1 for simple MHA, more for DSV4 / multi-layer / weird-layout pools). Empty tuple =
+            pool-specific (1 for simple MHA, more for multi-layer / weird-layout pools). Empty tuple =
             real-KV mixin disabled for this half.
         real_kv_sources_v: Same for V-half. Empty tuple iff v_head is None or the mixin is disabled.
         swa_index_lut: SWA full-to-swa index mapping LUT, shape [full_pool_size + 1], int64, or None for FULL

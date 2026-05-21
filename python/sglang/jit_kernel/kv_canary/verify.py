@@ -65,7 +65,7 @@ class RealKvSource:
     Note that ``tensor`` may have "holes" in dim 1 — ``tensor.shape[1]`` can exceed ``page_size *
     num_bytes_per_token``. Trailing bytes of each row are ignored by the canary; this is exactly how the
     abstraction accommodates pools whose per-row layout interleaves canary-relevant bytes with other metadata
-    (DSV4-style packed pools, layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
+    (layer-split storage, K/V interleaving, ...). When ``page_size == 1`` the pattern
     collapses to the simple ``tensor[slot_idx, :num_bytes_per_token]`` case.
 
     A pool may expose multiple RealKvSource instances per (canary buffer × K/V half) — canary_*_step iterates
