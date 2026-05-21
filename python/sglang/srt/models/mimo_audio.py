@@ -22,10 +22,57 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_sm90_supported
 
-if is_cuda():
+if is_cuda() and is_sm90_supported():
     from sgl_kernel.flash_attn import flash_attn_varlen_func
+elif is_cuda():
+    # Non-Hopper CUDA: FA3 is unavailable; varlen SDPA fallback.
+    def flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        *args,
+        causal: bool = False,
+        window_size=(-1, -1),
+        **kwargs,
+    ):
+        cs = cu_seqlens_q.tolist()
+        outputs = []
+        for i in range(len(cs) - 1):
+            start, end = cs[i], cs[i + 1]
+            if end <= start:
+                continue
+            sq = q[start:end].transpose(0, 1).unsqueeze(0)
+            sk = k[start:end].transpose(0, 1).unsqueeze(0)
+            sv = v[start:end].transpose(0, 1).unsqueeze(0)
+            seq_len = sq.size(2)
+            attn_mask = None
+            if window_size[0] >= 0 or window_size[1] >= 0:
+                i_idx = torch.arange(seq_len, device=sq.device).unsqueeze(1)
+                j_idx = torch.arange(seq_len, device=sq.device).unsqueeze(0)
+                left = window_size[0] if window_size[0] >= 0 else seq_len
+                right = window_size[1] if window_size[1] >= 0 else seq_len
+                mask_bool = (j_idx >= i_idx - left) & (j_idx <= i_idx + right)
+                if causal:
+                    mask_bool = mask_bool & (j_idx <= i_idx)
+                attn_mask = mask_bool.unsqueeze(0).unsqueeze(0)
+            out = F.scaled_dot_product_attention(
+                sq,
+                sk,
+                sv,
+                attn_mask=attn_mask,
+                is_causal=(causal and attn_mask is None),
+            )
+            outputs.append(out.squeeze(0).transpose(0, 1))
+        if not outputs:
+            return torch.empty_like(q)
+        return torch.cat(outputs, dim=0)
+
 else:
 
     def flash_attn_varlen_func(*args, **kwargs):
