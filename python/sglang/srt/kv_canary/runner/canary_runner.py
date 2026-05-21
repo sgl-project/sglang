@@ -87,6 +87,7 @@ class CanaryRunner:
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
+            step_counter_getter=self._get_step_counter,
         )
         self._sweep_orchestrator = SweepOrchestrator(
             config=config,
@@ -187,6 +188,6 @@ class CanaryRunner:
         self._per_forward_orchestrator.end_of_step()
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
-        self._violation_manager.step(step_counter=self._step_counter)
+        self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
