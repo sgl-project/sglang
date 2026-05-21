@@ -417,7 +417,7 @@ class C4IndexerBackendMixin:
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
-            from sglang.srt.layers.attention.nsa.tilelang_kernel import (
+            from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
         elif envs.SGLANG_OPT_USE_AITER_INDEXER.get():
