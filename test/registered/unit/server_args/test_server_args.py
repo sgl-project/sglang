@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -10,7 +11,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 # Mock get_device() so all tests run on CPU-only CI runners
 _mock_device = patch("sglang.srt.server_args.get_device", return_value="cuda")
@@ -497,21 +498,23 @@ class TestNgramExternalSamArgs(CustomTestCase):
         return args
 
     def test_external_sam_budget_must_fit_draft_budget(self):
+        args = self._make_dummy_ngram_args(
+            speculative_num_draft_tokens=4,
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=4,
+        )
         with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_num_draft_tokens=4,
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=4,
-            )._handle_speculative_decoding()
+            handle_speculative_decoding(args)
         self.assertIn("speculative_num_draft_tokens - 1", str(context.exception))
 
     def test_external_corpus_max_tokens_must_be_positive(self):
+        args = self._make_dummy_ngram_args(
+            speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
+            speculative_ngram_external_sam_budget=2,
+            speculative_ngram_external_corpus_max_tokens=0,
+        )
         with self.assertRaises(ValueError) as context:
-            self._make_dummy_ngram_args(
-                speculative_ngram_external_corpus_path="/tmp/ngram-corpus.jsonl",
-                speculative_ngram_external_sam_budget=2,
-                speculative_ngram_external_corpus_max_tokens=0,
-            )._handle_speculative_decoding()
+            handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
