@@ -88,6 +88,7 @@ from sglang.srt.utils import (
     is_hip,
     is_musa,
     is_npu,
+    is_npu_before_atlas_a5,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -95,6 +96,9 @@ from sglang.srt.utils import (
     print_warning_once,
     set_weight_attrs,
     use_intel_amx_backend,
+)
+from sglang.srt.hardware_backend.npu.quantization.fused_moe_method_npu import (
+    npu_fused_experts_fp8,
 )
 
 if TYPE_CHECKING:
@@ -107,6 +111,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_npu = is_npu()
+_is_npu_before_atlas_a5 = is_npu_before_atlas_a5()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -511,6 +516,20 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
             )
+            return
+        elif _is_npu:
+            if _is_npu_before_atlas_a5:
+                layer.weight.data = (
+                    layer.weight.data.view(torch.uint8).transpose(-1, -2).contiguous()
+                )
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    -1, -2
+                ).contiguous()
+            else:
+                layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
+                layer.weight_scale_inv.data = layer.weight_scale_inv.data.transpose(
+                    -1, -2
+                ).contiguous()
             return
         elif self.use_mxfp8:
             if not self.is_checkpoint_fp8_serialized:
@@ -1280,6 +1299,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 _is_cpu_amx_available
             ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+        elif _is_npu:
+            if _is_npu_before_atlas_a5:
+                layer.w13_weight.data = (
+                    layer.w13_weight.data.view(torch.uint8)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+                layer.w2_weight.data = (
+                    layer.w2_weight.data.view(torch.uint8).transpose(1, 2).contiguous()
+                )
+                layer.w13_weight_scale_inv.data = (
+                    layer.w13_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
+                layer.w2_weight_scale_inv.data = (
+                    layer.w2_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
+            else:
+                layer.w13_weight.data = layer.w13_weight.data.transpose(
+                    1, 2
+                ).contiguous()
+                layer.w2_weight.data = layer.w2_weight.data.transpose(
+                    1, 2
+                ).contiguous()
+                layer.w13_weight_scale_inv.data = (
+                    layer.w13_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
+                layer.w2_weight_scale_inv.data = (
+                    layer.w2_weight_scale_inv.data.transpose(1, 2).contiguous()
+                )
+            return
         elif self.use_mxfp8:
             self._process_mxfp8_moe_weights(
                 layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
@@ -1800,6 +1849,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         moe_runner_config = self.moe_runner_config
+
+        if _is_npu:
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights.to(x.dtype)
+
+            output = npu_fused_experts_fp8(
+                hidden_states=x,
+                w13=layer.w13_weight,
+                w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                w2=layer.w2_weight,
+                w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                top_k=topk_ids.shape[1],
+            )
+            return StandardCombineInput(hidden_states=output)
 
         if use_intel_amx_backend(layer):
             from sglang.srt.layers.moe.topk import apply_topk_weights_cpu
