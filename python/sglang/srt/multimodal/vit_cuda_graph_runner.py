@@ -252,7 +252,9 @@ class ViTCudaGraphRunner:
         import logging
 
         logger = logging.getLogger(__name__)
-        for B in self.BUCKET_SIZES:
+        # Capture largest first so the graph pool's initial allocation is big
+        # enough for smaller graphs to reuse (same strategy as LLM CUDA graph).
+        for B in reversed(self.BUCKET_SIZES):
             self._capture(B)
         logger.info("[VIT_GRAPH] capture done, warming up eager fallback")
 
