@@ -345,16 +345,22 @@ export const config = {
       ],
     },
     {
+      // Verified best for B200 Flash max-throughput: MegaMoE W4A4 (FP4-acts variant).
+      // +66% throughput vs the DeepEP baseline at iso-latency on Blackwell.
       match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -382,6 +388,9 @@ export const config = {
       ],
     },
     {
+      // Verified best for B200 Pro balanced: keeps the flashinfer-mxfp4 runner
+      // but routes A2A through MegaMoE. Throughput bench is still being
+      // re-validated, so the benchmark card surfaces latency-only.
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -392,6 +401,7 @@ export const config = {
         "--dp 8",
         "--enable-dp-attention",
         "--moe-runner-backend flashinfer_mxfp4",
+        "--moe-a2a-backend megamoe",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -407,21 +417,23 @@ export const config = {
       ],
     },
     {
-      // Note: this cell ships with `--moe-a2a-backend deepep` as the verified
-      // default. To run B200/B300 Pro max-throughput with MegaMoE, flip the
-      // MegaMoE chip in the §3.3 Playground — it strips the
-      // SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK env and swaps the moe
-      // backend automatically.
+      // Verified best for B200 Pro max-throughput: MegaMoE W4A4 (FP4-acts).
+      // +124% throughput vs DeepEP on this cell — that is the optimal recipe
+      // and the W4A4-vs-W4A8 gap is within trial noise on B200.
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs 544",
         "--swa-full-tokens-ratio 0.075",
@@ -480,16 +492,21 @@ export const config = {
       ],
     },
     {
+      // Verified best for B300 Flash max-throughput: mirrors B200 — MegaMoE W4A4.
       match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -517,6 +534,9 @@ export const config = {
       ],
     },
     {
+      // Verified best for B300 Pro balanced: mirrors B200 Pro balanced — keep
+      // flashinfer-mxfp4 runner, route A2A through MegaMoE. Throughput is
+      // still pending re-verification.
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -527,6 +547,7 @@ export const config = {
         "--dp 8",
         "--enable-dp-attention",
         "--moe-runner-backend flashinfer_mxfp4",
+        "--moe-a2a-backend megamoe",
         "--disable-flashinfer-autotune",
         "--chunked-prefill-size 32768",
         "--swa-full-tokens-ratio 0.1",
@@ -542,18 +563,19 @@ export const config = {
       ],
     },
     {
-      // Mirrors B200 Pro max-throughput; default is deepep (MegaMoE off).
-      // Use the §3.3 Playground MegaMoE chip to switch to megamoe.
+      // Verified best for B300 Pro max-throughput: MegaMoE W4A8 (B300's
+      // higher-throughput pick — the W4A4 acts variant did not help on B300
+      // Pro within trial noise; W4A8 was the highest measured throughput).
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.835",
         "--cuda-graph-max-bs 544",
         "--swa-full-tokens-ratio 0.075",
@@ -610,16 +632,23 @@ export const config = {
       ],
     },
     {
+      // Verified best for GB200 Flash max-throughput: MegaMoE W4A4.
+      // +66% throughput vs the DeepEP baseline; W4A4 edges W4A8 by 1.4% on
+      // GB200 Flash, both well ahead of DeepEP.
       match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -652,8 +681,12 @@ export const config = {
       ],
     },
     {
+      // Auto-estimated: no GB200 Pro balanced cookbook recipe has both the
+      // latency AND throughput benches pass on 2 nodes (deepep / megamoe-w4a4
+      // timed out; megamoe-w4a8 ran latency but the throughput bench failed).
+      // Command kept as the documented deepep recipe; treat numbers as
+      // unmeasured until the next 2-node round lands.
       match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
-      verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
@@ -678,12 +711,15 @@ export const config = {
       ],
     },
     {
+      // Verified best for GB200 Pro max-throughput: MegaMoE W4A8 (the only
+      // backend whose 2-node cookbook bench completed cleanly — the DeepEP
+      // baseline failed at second-node startup; W4A8 edges W4A4 by +3.3%).
       match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" },
       verified: true,
       env: [
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
       ],
       flags: [
         "--trust-remote-code",
@@ -691,7 +727,7 @@ export const config = {
         "--tp 8",
         "--dp 8",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.78",
         "--cuda-graph-max-bs 64",
         "--max-running-requests 256",
@@ -744,16 +780,19 @@ export const config = {
       ],
     },
     {
+      // Verified best for GB300 Flash max-throughput: MegaMoE W4A8 (on GB300
+      // Flash, W4A8 edged W4A4 by ~2.5%; both are far ahead of the DeepEP
+      // baseline).
       match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--deepep-config '{\"normal_dispatch\":{\"num_sms\":96},\"normal_combine\":{\"num_sms\":96}}'",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -804,16 +843,22 @@ export const config = {
       ],
     },
     {
+      // Verified best for GB300 Pro max-throughput: MegaMoE W4A4 (W4A4 vs
+      // W4A8 within 0.5% — both add +33% throughput over the DeepEP baseline).
       match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
       verified: true,
-      env: ["SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"],
+      env: [
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1",
+        "SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1",
+      ],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
         "--dp 4",
         "--enable-dp-attention",
-        "--moe-a2a-backend deepep",
+        "--moe-a2a-backend megamoe",
         "--mem-fraction-static 0.9",
         "--cuda-graph-max-bs 128",
         "--max-running-requests 256",
@@ -991,7 +1036,13 @@ export const config = {
     },
 
     // ====================================================================
-    // H200 + FP4 (Marlin runner, single-node only)
+    // H200 + FP4 (single-node only)
+    //   Runner choice splits per-strategy on H200 — pick whatever scored
+    //   best in the v0.5.12 sweep:
+    //     low-latency      → marlin            (TPOT −6% vs flashinfer_mxfp4)
+    //     balanced         → flashinfer_mxfp4  (throughput +26% vs marlin)
+    //     max-throughput   → marlin            (throughput +6% vs flashinfer_mxfp4)
+    //   Pro shares the flashinfer_mxfp4 path across all three strategies.
     // ====================================================================
     {
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
@@ -1011,6 +1062,8 @@ export const config = {
       ],
     },
     {
+      // Verified best for H200 Flash balanced: flashinfer_mxfp4 (+26% throughput
+      // vs marlin at the same EAGLE 1-1-2 spec config; TPOT cost is ~+5%).
       match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [],
@@ -1018,7 +1071,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algo EAGLE",
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
@@ -1048,7 +1101,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algo EAGLE",
         "--speculative-num-steps 3",
         "--speculative-eagle-topk 1",
@@ -1066,7 +1119,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--speculative-algo EAGLE",
         "--speculative-num-steps 1",
         "--speculative-eagle-topk 1",
@@ -1084,7 +1137,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp 8",
-        "--moe-runner-backend marlin",
+        "--moe-runner-backend flashinfer_mxfp4",
         "--mem-fraction-static 0.88",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
