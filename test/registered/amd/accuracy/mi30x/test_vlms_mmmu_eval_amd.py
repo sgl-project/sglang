@@ -25,6 +25,8 @@ import unittest
 import warnings
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -152,6 +154,7 @@ def get_active_models():
     return [m for m in AMD_VLM_MODELS if m["model_path"] not in AMD_FAILING_VLM_MODELS]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNightlyVLMMmmuEvalAMD(unittest.TestCase):
     """AMD VLM MMMU Evaluation Test.
 
