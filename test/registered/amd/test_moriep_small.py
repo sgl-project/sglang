@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
@@ -102,6 +103,7 @@ mtp_args = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPureDP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -146,6 +148,7 @@ class TestPureDP(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -196,6 +199,7 @@ class TestMTP(CustomTestCase):
         self.assertGreaterEqual(avg_spec_accept_length, 2.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -243,6 +247,7 @@ class TestNormal(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLowLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -292,6 +297,7 @@ class TestLowLatency(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTBOwithNormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -340,6 +346,7 @@ class TestTBOwithNormal(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTBOwithLowLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -390,6 +397,7 @@ class TestTBOwithLowLatency(CustomTestCase):
         self.assertGreaterEqual(metrics["accuracy"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMTPwithTBONormal(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -449,6 +457,7 @@ class TestMTPwithTBONormal(CustomTestCase):
         self.assertGreaterEqual(avg_spec_accept_length, 2.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMTPwithTBOLowLatency(CustomTestCase):
     @classmethod
     def setUpClass(cls):
