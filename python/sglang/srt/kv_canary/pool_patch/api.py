@@ -18,8 +18,6 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
 PoolAttacher = Callable[..., tuple[CanaryBufferGroup, ...]]
 
-_CANARY_ATTACHED_ATTR = "_kv_canary_attached"
-
 _POOL_ATTACHERS: Dict[Type, PoolAttacher] = {
     MHATokenToKVPool: attach_mha,
     MHATokenToKVPoolFP4: attach_mha,
@@ -45,14 +43,7 @@ def attach_canary_buffers(
 
     Per-pool dispatch is via a small ``type(pool) -> attacher`` table. New pool classes (including
     test fakes) register via :func:`register_pool_attacher`.
-
-    Idempotent: calling twice on the same pool raises. To re-attach, detach first.
     """
-    if getattr(pool, _CANARY_ATTACHED_ATTR, False):
-        raise RuntimeError(
-            f"kv-canary: pool {type(pool).__name__} already has canary buffers attached"
-        )
-
     attacher = _POOL_ATTACHERS.get(type(pool))
     if attacher is None:
         raise NotImplementedError(
@@ -61,7 +52,4 @@ def attach_canary_buffers(
         )
 
     read_bytes = resolve_read_bytes(config)
-    groups = attacher(pool=pool, device=device, read_bytes=read_bytes)
-
-    setattr(pool, _CANARY_ATTACHED_ATTR, True)
-    return groups
+    return attacher(pool=pool, device=device, read_bytes=read_bytes)
