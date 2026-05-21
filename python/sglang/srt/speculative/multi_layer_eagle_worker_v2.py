@@ -680,9 +680,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
-            # Same fence point as decode: after target forward + sample,
-            # before draft_extend. new_seq_lens = batch.seq_lens (post-prefill
-            # input length, unchanged by target forward).
+            # Publish before draft_extend so the fence is at target-end.
             if on_verify_complete is not None:
                 on_verify_complete(batch.seq_lens)
 
@@ -712,10 +710,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
-            # Dispatch the post-verify buf write on forward stream BEFORE
-            # draft_extend, so the cross-stream fence point lands at verify-end
-            # rather than after draft_extend — preserving schedule prep /
-            # draft_extend overlap.
+            # Publish before draft_extend so the fence is at verify-end.
             if on_verify_complete is not None:
                 on_verify_complete(batch_output.next_draft_input.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
