@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -11,6 +11,9 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.runner.pump import PumpAndAllreduce
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class WarmupGate:
@@ -49,6 +52,22 @@ class WarmupGate:
             )
             self._warmup_enable_logged = True
         return False
+
+
+def should_run_perturbation(
+    *,
+    probability: float,
+    warmup_gate: WarmupGate,
+    forward_batch: Optional["ForwardBatch"],
+    require_forward_batch: bool = True,
+) -> bool:
+    if probability <= 0.0:
+        return False
+    if warmup_gate.is_in_warmup():
+        return False
+    if require_forward_batch and forward_batch is None:
+        return False
+    return torch.rand((), device="cpu").item() < probability
 
 
 def pick_target_group(

@@ -20,6 +20,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
     pick_target_group,
+    should_run_perturbation,
 )
 
 if TYPE_CHECKING:
@@ -37,12 +38,12 @@ def run(
     radix_cache: Optional["BasePrefixCache"],
     warmup_gate: WarmupGate,
 ) -> None:
-    del forward_batch  # unused — orphan picks from radix tree, not forward batch
-    if config.real_kv_unused_cache_prob <= 0.0:
-        return
-    if warmup_gate.is_in_warmup():
-        return
-    if torch.rand((), device="cpu").item() >= config.real_kv_unused_cache_prob:
+    if not should_run_perturbation(
+        probability=config.real_kv_unused_cache_prob,
+        warmup_gate=warmup_gate,
+        forward_batch=forward_batch,
+        require_forward_batch=False,
+    ):
         return
 
     slot = pick_orphan_slot(radix_cache=radix_cache)
