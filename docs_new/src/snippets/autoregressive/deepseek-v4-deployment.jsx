@@ -360,7 +360,7 @@ export const DeepSeekV4Deployment = () => {
     //   max-throughput: MTP disabled
     //
     // MoE runner selection (verified on 2026-05-20):
-    //   - Pro: flashinfer_mxfp4 for all recipes 
+    //   - Pro: flashinfer_mxfp4 for all recipes
     //   - Flash Balanced: flashinfer_mxfp4 (~1.5x faster output throughput vs
     //     Marlin in the balanced throughput benchmark).
     //   - Flash Low-Latency / Max-Throughput: Marlin (faster than
