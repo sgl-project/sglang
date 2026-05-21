@@ -1017,11 +1017,23 @@ def general_mm_embed_routine(
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
+    _has_mm = (
+        (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.contains_mm_inputs()
+        )
+        if (
+            not hasattr(language_model, "pp_group")
+            or language_model.pp_group.is_first_rank
+        )
+        else False
+    )
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
         if (
             not forward_batch.forward_mode.is_decode()
             and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
+            and _has_mm
         ):
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
@@ -1106,11 +1118,6 @@ def general_mm_embed_routine(
     else:
         input_embeds = None
 
-    _has_mm = (
-        forward_batch.contains_mm_inputs()
-        if hasattr(forward_batch, "contains_mm_inputs")
-        else False
-    )
     if _has_mm:
         torch.cuda.synchronize()
         _ts_after_vit = _ts_time.time()
