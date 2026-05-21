@@ -87,7 +87,7 @@ class TestDeepEpDeepseek(CustomTestCase):
         metrics = run_eval(args)
         self.assertGreaterEqual(
             metrics["score"],
-            self.accuracy,
+            expect_accuracy,
             f'Accuracy of {self.model} is {str(metrics["score"])}, is lower than {expect_accuracy}',
         )
 
