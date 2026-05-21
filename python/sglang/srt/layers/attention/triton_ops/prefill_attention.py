@@ -177,20 +177,32 @@ def context_attention_fwd(
     out: [b * s, head, head_dim]
     sm_scale: softmax scale, defaults to 1/sqrt(head_dim)
     """
-    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
-        BLOCK = 128
-    else:
-        BLOCK = 64
-
     Lq, Lk, Lv = q.shape[-1], k.shape[-1], v.shape[-1]
+
+    if (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] >= 9:
+        # SM90+ (H100/H200): use smaller BLOCK_M with software pipelining
+        # for better occupancy and overlapping memory/compute via cp.async.
+        BLOCK_M = 64
+        BLOCK_N = 128 if Lk <= 64 else 64
+        num_warps = 4
+        num_stages = 3
+    elif (_is_cuda or _is_hip) and CUDA_CAPABILITY[0] > 8:
+        BLOCK_M = 128
+        BLOCK_N = 128
+        num_warps = 4 if Lk <= 64 else 8
+        num_stages = 1
+    else:
+        BLOCK_M = 64
+        BLOCK_N = 64
+        num_warps = 4 if Lk <= 64 else 8
+        num_stages = 1
 
     if sm_scale is None:
         sm_scale = 1.0 / (Lq**0.5)
     batch, head = b_seq_len.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k.shape[1]
 
-    grid = (batch, head, triton.cdiv(max_input_len, BLOCK))
-    num_warps = 4 if Lk <= 64 else 8
+    grid = (batch, head, triton.cdiv(max_input_len, BLOCK_M))
 
     _fwd_kernel[grid](
         q,
@@ -209,11 +221,11 @@ def context_attention_fwd(
         o.stride(0),
         o.stride(1),
         kv_group_num=kv_group_num,
-        BLOCK_M=BLOCK,
+        BLOCK_M=BLOCK_M,
         BLOCK_DMODEL=triton.next_power_of_2(Lk),
-        BLOCK_N=BLOCK,
+        BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=num_stages,
         Lk=Lk,
     )
