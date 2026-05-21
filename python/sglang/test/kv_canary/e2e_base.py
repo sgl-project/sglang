@@ -61,7 +61,6 @@ _MODE_CONFIGS: dict[str, _ModeConfig] = {
         # --json-model-override-args avoids touching the model source.
         json_model_override_args=json.dumps(
             {
-                "num_hidden_layers": 6,
                 "rope_parameters": {
                     "sliding_attention": {
                         "rope_type": "default",
