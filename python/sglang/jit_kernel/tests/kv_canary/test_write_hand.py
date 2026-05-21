@@ -300,9 +300,8 @@ class TestSeedSlot:
         new_slot = 4
         new_token = 13
         new_position = 2
-        expected_running = splitmix64(
-            (expected_seed_prev_hash ^ seed_token ^ seed_position ^ seed_real_kv)
-            & ((1 << 64) - 1)
+        expected_running = splitmix64_mix4(
+            expected_seed_prev_hash, seed_token, seed_position, seed_real_kv
         )
 
         plan_pair = make_write_plan_pair(
@@ -1182,8 +1181,10 @@ class TestRealKvHash:
 
         fields_a = _run_with(sources_a)
         fields_b = _run_with(sources_b)
+        assert fields_a[3] != 0
+        assert fields_b[3] != 0
         assert (
-            fields_a[3] != fields_b[3] or fields_a[3] == 0
+            fields_a[3] != fields_b[3]
         ), "reversing source order must change real_kv_hash (fold is ordered)"
 
 

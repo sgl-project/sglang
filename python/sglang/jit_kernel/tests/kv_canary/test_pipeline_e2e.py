@@ -723,18 +723,25 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
 )
 def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     """Different CanaryLaunchTag values: violation ring's kernel_kind field matches on both sides."""
-
     max_seq_len = 16
     req_to_token = make_req_to_token(
         kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE
     )
     fb_req_pool_indices = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    fb_prefix_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    fb_extend_seq_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
-    fb_input_ids = torch.tensor([7], dtype=torch.int32, device=_DEVICE)
-    fb_positions = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
-    fb_out_cache_loc = torch.tensor(
-        [1 * max_seq_len + 0], dtype=torch.int32, device=_DEVICE
+    fb_prefix_lens = torch.tensor([1], dtype=torch.int32, device=_DEVICE)
+    fb_extend_seq_lens = torch.tensor([0], dtype=torch.int32, device=_DEVICE)
+    fb_input_ids = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
+    fb_positions = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
+    fb_out_cache_loc = torch.zeros(1, dtype=torch.int32, device=_DEVICE)
+
+    initial_buf = make_canary_buf(num_slots=64, device=_DEVICE)
+    write_slot_fields(
+        canary_buf=initial_buf,
+        slot_idx=1 * max_seq_len,
+        token=7,
+        position=99,
+        prev_hash=0,
+        real_kv_hash=0,
     )
 
     _, _, log_real, log_ref, _, _, _, _ = _run_both_and_assert_pipeline_equal(
@@ -748,7 +755,14 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
         num_slots=64,
         extras=_empty_extras(),
         kernel_kind=kernel_kind,
+        initial_canary_buf=initial_buf,
     )
 
-    assert int(log_real.write_index[0].item()) == 0
-    assert int(log_ref.write_index[0].item()) == 0
+    assert int(log_real.write_index[0].item()) == 1
+    assert int(log_ref.write_index[0].item()) == 1
+    assert int(log_real.ring[0, consts.VIOLATION_FIELD_KERNEL_KIND].item()) == int(
+        kernel_kind
+    )
+    assert int(log_ref.ring[0, consts.VIOLATION_FIELD_KERNEL_KIND].item()) == int(
+        kernel_kind
+    )
