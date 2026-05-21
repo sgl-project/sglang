@@ -25,6 +25,7 @@ class ContiguousMemoryAllocator:
         # List of (offset, size) for free blocks
         self.free_blocks = [(0, total_size_bytes)]
         self.allocated_map = {}  # {offset: size_bytes}
+        self.allocated_size = 0  # Running counter for O(1) get_allocated_size
         self.lock = threading.Lock()
 
     def allocate(self, size_bytes: int) -> Optional[int]:
@@ -39,13 +40,15 @@ class ContiguousMemoryAllocator:
                     else:
                         self.free_blocks.pop(i)
                     self.allocated_map[offset] = size_bytes
+                    self.allocated_size += size_bytes
                     return offset
             return None
 
     def free(self, offset: int, size_bytes: int):
         with self.lock:
-            # Remove from allocated map
+            # Remove from allocated map and update counter
             if offset in self.allocated_map:
+                self.allocated_size -= self.allocated_map[offset]
                 del self.allocated_map[offset]
 
             # Return block and merge adjacent free blocks
@@ -67,9 +70,9 @@ class ContiguousMemoryAllocator:
             self.free_blocks = merged
 
     def get_allocated_size(self) -> int:
-        """Return total allocated bytes."""
+        """Return total allocated bytes. O(1) operation."""
         with self.lock:
-            return sum(self.allocated_map.values())
+            return self.allocated_size
 
     def get_free_size(self) -> int:
         """Return total free bytes."""
