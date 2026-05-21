@@ -3265,12 +3265,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
-        # Hisparse coordinator
+        # Hisparse coordinator — backends now read it from self.model_runner.
         if (
             forward_batch.forward_mode.is_decode()
             and self.hisparse_coordinator is not None
         ):
-            forward_batch.hisparse_coordinator = self.hisparse_coordinator
             self.hisparse_coordinator.wait_for_pending_backup()
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
@@ -3303,8 +3302,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.is_hybrid_swa:
             self.token_to_kv_pool.invalidate_loc_cache()
 
-        # Hisparse coordinator
-        forward_batch.hisparse_coordinator = self.hisparse_coordinator
+        # Hisparse coordinator — backends now read it from self.model_runner.
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 

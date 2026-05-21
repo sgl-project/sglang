@@ -1040,10 +1040,12 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
 
-        # HiSparse: set coordinator so the hisparse code path is captured into the graph
-        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
-        if forward_batch.hisparse_coordinator is not None:
-            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+        # HiSparse: trip the coordinator so the hisparse code path is captured
+        # into the graph. Backends read self.model_runner.hisparse_coordinator
+        # directly now.
+        hisparse_coordinator = self.model_runner.hisparse_coordinator
+        if hisparse_coordinator is not None:
+            hisparse_coordinator.num_real_reqs.fill_(bs)
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
