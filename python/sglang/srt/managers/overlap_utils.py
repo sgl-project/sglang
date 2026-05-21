@@ -64,12 +64,12 @@ class FutureMap:
         else:
             self.buf_initialized = False
 
-        # Forward-stream fence covering all buf writes dispatched so far.
-        # Waited on by schedule-stream consumers before reading the buf.
-        # Recorded by store_post_verify at verify-end (both extend and decode
-        # branches fire it); store_to_map only records on the first iter,
-        # where post_verify is a no-op pending lazy buf init.
-        self._last_store_done: Optional[torch.cuda.Event] = None
+        # Fences the buf fields that schedule stream reads (new_seq_lens_buf,
+        # bonus_tokens_buf). Recorded by store_post_verify at verify-end
+        # (both extend and decode branches fire it); store_to_map records it
+        # only on the first iter, where post_verify is a no-op pending lazy
+        # buf init.
+        self._post_verify_buf_ready: Optional[torch.cuda.Event] = None
 
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
         self.buf_initialized = True
@@ -132,21 +132,21 @@ class FutureMap:
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         """Schedule-stream D2H from new_seq_lens_buf into batch.seq_lens_cpu,
-        gated on _last_store_done. No-op when there's no future state yet."""
+        gated on _post_verify_buf_ready. No-op when there's no future state yet."""
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
-        if self._last_store_done is not None:
-            self._last_store_done.wait()
+        if self._post_verify_buf_ready is not None:
+            self._post_verify_buf_ready.wait()
         batch.seq_lens_cpu = self.new_seq_lens_buf[fi.indices].cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
-    def _record_store_done(self) -> None:
+    def _record_post_verify_buf_ready(self) -> None:
         # Forward-stream only. record() repositions the event to the current
         # stream point; FIFO covers all prior writes on this stream.
-        if self._last_store_done is None:
-            self._last_store_done = torch.get_device_module(self.device).Event()
-        self._last_store_done.record()
+        if self._post_verify_buf_ready is None:
+            self._post_verify_buf_ready = torch.get_device_module(self.device).Event()
+        self._post_verify_buf_ready.record()
 
     def store_post_verify(
         self,
@@ -167,7 +167,7 @@ class FutureMap:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
         self.bonus_tokens_buf[indices] = bonus_tokens.to(self.bonus_tokens_buf.dtype)
-        self._record_store_done()
+        self._record_post_verify_buf_ready()
 
     def store_to_map(
         self, future_indices: FutureIndices, batch_result: GenerationBatchResult
@@ -183,7 +183,7 @@ class FutureMap:
             # next_token_ids is int32; buf is int64. Advanced indexing requires
             # an explicit cast.
             self.token_ids_buf[indices] = batch_result.next_token_ids.to(torch.int64)
-            self._record_store_done()
+            self._record_post_verify_buf_ready()
             return
 
         draft_input: EagleDraftInput = batch_result.next_draft_input
@@ -213,7 +213,7 @@ class FutureMap:
             self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
                 self.bonus_tokens_buf.dtype
             )
-            self._record_store_done()
+            self._record_post_verify_buf_ready()
 
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
@@ -239,4 +239,4 @@ class FutureMap:
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
             )
-        self._record_store_done()
+        self._record_post_verify_buf_ready()
