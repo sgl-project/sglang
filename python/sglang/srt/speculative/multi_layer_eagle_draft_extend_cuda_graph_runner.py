@@ -66,7 +66,6 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     # Sliced from shared parent buffers
     input_ids: torch.Tensor
     out_cache_loc: torch.Tensor
-    swa_out_cache_loc: torch.Tensor
     positions: torch.Tensor
     # Shared from parent
     seq_lens: torch.Tensor
@@ -150,9 +149,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             out_cache_loc = cuda_graph_buffers["out_cache_loc"][
                 offset : offset + self.max_num_token
             ]
-            swa_out_cache_loc = cuda_graph_buffers["swa_out_cache_loc"][
-                offset : offset + self.max_num_token
-            ]
             positions = cuda_graph_buffers["positions"][
                 offset : offset + self.max_num_token
             ]
@@ -229,7 +225,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self.buffers = MultiLayerEagleDraftExtendInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
-            swa_out_cache_loc=swa_out_cache_loc,
             positions=positions,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
@@ -424,6 +419,10 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         # Run and capture
         def run_once():
+            # model.forward() bypasses _forward_raw(), so invalidate manually.
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+
             # Clean intermediate result cache for DP attention
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
@@ -494,12 +493,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
                     forward_batch.req_to_token_pool.req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
-                next_buffers.swa_out_cache_loc.copy_(
-                    self.model_runner.token_to_kv_pool.translate_loc_from_full_to_swa(
-                        next_buffers.out_cache_loc
-                    )
-                )
-
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
@@ -683,9 +676,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.cuda_graph_buffers["out_cache_loc"] = torch.ones(
                 (self.offsets[-1],), dtype=torch.int64
             )
-            self.cuda_graph_buffers["swa_out_cache_loc"] = torch.ones(
-                (self.offsets[-1],), dtype=torch.int64
-            )
             self.cuda_graph_buffers["positions"] = torch.zeros(
                 (self.offsets[-1],), dtype=torch.int64
             )
@@ -733,7 +723,6 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["input_ids"].zero_()
         self.cuda_graph_buffers["seq_lens"].fill_(self.seq_len_fill_value)
         self.cuda_graph_buffers["out_cache_loc"].zero_()
-        self.cuda_graph_buffers["swa_out_cache_loc"].zero_()
         self.cuda_graph_buffers["positions"].zero_()
         # `batch_result.accept_lens` is drafts + bonus.
         bs = forward_batch.batch_size
