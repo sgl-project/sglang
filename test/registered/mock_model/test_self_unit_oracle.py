@@ -1,0 +1,116 @@
+from __future__ import annotations
+
+import random
+import unittest
+
+import torch
+
+from sglang.jit_kernel.kv_canary.consts import splitmix64
+from sglang.srt.kv_canary.token_oracle.oracle import (
+    HashOracle,
+    _splitmix64_tensor,
+)
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
+
+
+_U64_MASK: int = (1 << 64) - 1
+
+
+def _signed_to_unsigned_i64(value: int) -> int:
+    return value & _U64_MASK
+
+
+def _call(oracle: HashOracle, *, req_id: int, position: int) -> int:
+    out = oracle.expected_tokens(
+        req_ids=torch.tensor([req_id], dtype=torch.int64),
+        positions=torch.tensor([position], dtype=torch.int64),
+    )
+    return int(out.tolist()[0])
+
+
+class TestHashOracle(CustomTestCase):
+    def test_hash_oracle_is_deterministic_for_same_inputs(self) -> None:
+        oracle = HashOracle(vocab_size=32000)
+
+        first = _call(oracle, req_id=7, position=42)
+        second = _call(oracle, req_id=7, position=42)
+
+        self.assertEqual(first, second)
+
+    def test_hash_oracle_output_in_vocab_range(self) -> None:
+        vocab_size = 1024
+        oracle = HashOracle(vocab_size=vocab_size)
+
+        req_ids = torch.arange(0, 64, dtype=torch.int64).repeat_interleave(64)
+        positions = torch.arange(0, 64, dtype=torch.int64).repeat(64)
+        tokens = oracle.expected_tokens(req_ids=req_ids, positions=positions).tolist()
+
+        for token in tokens:
+            self.assertTrue(0 <= token < vocab_size)
+
+
+class TestSplitmix64Tensor(CustomTestCase):
+    def test_splitmix64_tensor_matches_scalar_ref_on_random_inputs(self) -> None:
+        rng = random.Random(0)
+        num_cases = 1000
+        unsigned_inputs: list[int] = [
+            rng.randrange(0, 1 << 64) for _ in range(num_cases)
+        ]
+
+        signed_inputs = [
+            value if value < (1 << 63) else value - (1 << 64)
+            for value in unsigned_inputs
+        ]
+        actual = _splitmix64_tensor(torch.tensor(signed_inputs, dtype=torch.int64))
+
+        actual_unsigned = [_signed_to_unsigned_i64(v) for v in actual.tolist()]
+        expected_unsigned = [splitmix64(v) for v in unsigned_inputs]
+
+        self.assertEqual(actual_unsigned, expected_unsigned)
+
+    def test_splitmix64_tensor_known_vectors(self) -> None:
+        inputs = [0, 1, -1, 1 << 32, (1 << 63) - 1, -(1 << 63)]
+        expected_unsigned = [splitmix64(_signed_to_unsigned_i64(v)) for v in inputs]
+
+        actual = _splitmix64_tensor(torch.tensor(inputs, dtype=torch.int64))
+        actual_unsigned = [_signed_to_unsigned_i64(v) for v in actual.tolist()]
+
+        self.assertEqual(actual_unsigned, expected_unsigned)
+
+    def test_splitmix64_tensor_preserves_shape_and_dtype(self) -> None:
+        shape = (3, 4, 5)
+        rng = torch.Generator().manual_seed(42)
+        inputs = torch.randint(
+            low=-(1 << 62),
+            high=(1 << 62),
+            size=shape,
+            dtype=torch.int64,
+            generator=rng,
+        )
+
+        out = _splitmix64_tensor(inputs)
+
+        self.assertEqual(out.shape, inputs.shape)
+        self.assertEqual(out.dtype, torch.int64)
+
+    def test_splitmix64_tensor_is_deterministic(self) -> None:
+        inputs = torch.tensor([0, 1, 2, 3, 1 << 40, -7], dtype=torch.int64)
+
+        first = _splitmix64_tensor(inputs.clone()).tolist()
+        second = _splitmix64_tensor(inputs.clone()).tolist()
+
+        self.assertEqual(first, second)
+
+    def test_splitmix64_tensor_is_injective_on_distinct_inputs(self) -> None:
+        inputs = torch.arange(-1000, 1000, dtype=torch.int64)
+
+        out = _splitmix64_tensor(inputs).tolist()
+
+        self.assertEqual(len(set(out)), len(out))
+
+
+if __name__ == "__main__":
+    unittest.main()

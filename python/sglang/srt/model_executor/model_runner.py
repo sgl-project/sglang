@@ -105,6 +105,8 @@ from sglang.srt.eplb.expert_location import (
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -638,6 +640,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.server_args.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+        self._token_oracle_manager = install_token_oracle_from_env(
+            server_args=server_args,
+            vocab_size=self.model_config.vocab_size,
+        )
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
@@ -740,6 +746,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
+
+        # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
+        # and BEFORE init_device_graphs (so the patched model.forward is what
+        # ``patch_model`` yields and what runs during the warmup forward passes).
+        self.canary_runner = install_canary(
+            server_args=server_args,
+            model_runner=self,
+            token_oracle_manager=self._token_oracle_manager,
+        )
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -3151,12 +3166,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
+        canary_ctx = (
+            self.canary_runner.with_forward_pass(forward_batch)
+            if self.canary_runner is not None
+            else contextlib.nullcontext()
+        )
+
         with (
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
+            canary_ctx,
         ):
             output = self._forward_raw(
                 forward_batch,

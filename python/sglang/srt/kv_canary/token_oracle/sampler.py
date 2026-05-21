@@ -1,0 +1,51 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List
+
+import torch
+
+from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
+from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+from sglang.srt.layers.sampler import Sampler, register_sampler_backend
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+
+
+def install_oracle_sampler(*, oracle: TokenOracle) -> TokenOracleManager:
+    """Calling twice replaces the previously registered manager."""
+    manager = TokenOracleManager(oracle=oracle)
+    register_sampler_backend(
+        "token_oracle",
+        lambda: _OracleSampler(token_oracle_manager=manager),
+    )
+    return manager
+
+
+class _OracleSampler(Sampler):
+    def __init__(self, *, token_oracle_manager: TokenOracleManager) -> None:
+        super().__init__()
+        self._token_oracle_manager = token_oracle_manager
+
+    def forward(
+        self,
+        logits_output: "LogitsProcessorOutput",
+        sampling_info: "SamplingBatchInfo",
+        return_logprob: bool,
+        top_logprobs_nums: List[int],
+        token_ids_logprobs: List[List[int]],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        rids_int = sampling_info.rids_int
+        if rids_int is None:
+            raise RuntimeError(
+                "_OracleSampler.forward: sampling_info.rids_int is None; "
+                "token oracle requires the per-forward rids_int tensor "
+                "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
+            )
+        batch_next_token_ids = self._token_oracle_manager.sample(
+            req_ids=rids_int,
+            positions=positions,
+        )
+        return batch_next_token_ids

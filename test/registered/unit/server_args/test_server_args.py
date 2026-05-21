@@ -617,5 +617,57 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
             ServerArgs(**self._base_kwargs(kv_cache_dtype="fp4_e2m1"))
 
 
+class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
+    """The 'token_oracle' choice is gated on SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.
+
+    The choice set is built once at server_args.py import time, so each subtest
+    reloads the module with the env var set to the desired value.
+    """
+
+    def _reload_server_args_with_env(self, *, enabled: bool):
+        import importlib
+        import os
+
+        import sglang.srt.server_args as server_args_module
+
+        previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
+        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
+        try:
+            return importlib.reload(server_args_module)
+        finally:
+            if previous is None:
+                os.environ.pop("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE", None)
+            else:
+                os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = previous
+
+    def test_token_oracle_rejected_when_env_disabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=False)
+        self.assertNotIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        with self.assertRaises(SystemExit):
+            reloaded.prepare_server_args(
+                [
+                    "--model-path",
+                    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                    "--sampling-backend",
+                    "token_oracle",
+                ]
+            )
+
+    def test_token_oracle_accepted_when_env_enabled(self):
+        reloaded = self._reload_server_args_with_env(enabled=True)
+        self.assertIn("token_oracle", reloaded.SAMPLING_BACKEND_CHOICES)
+
+        parsed = reloaded.prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--sampling-backend",
+                "token_oracle",
+            ]
+        )
+        self.assertEqual(parsed.sampling_backend, "token_oracle")
+
+
 if __name__ == "__main__":
     unittest.main()

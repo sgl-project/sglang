@@ -27,6 +27,7 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
     DeprecatedAliasStoreAction,
@@ -96,6 +97,8 @@ LLAMA4_MODEL_ARCHS = (
 )
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
+if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+    SAMPLING_BACKEND_CHOICES.add("token_oracle")
 
 LOAD_FORMAT_CHOICES = [
     "auto",
@@ -748,6 +751,9 @@ class ServerArgs:
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
+    kv_canary: str = "off"
+    kv_canary_real_data: str = "off"
+    kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
     dsa_prefill_cp_mode: str = "round-robin-split"
@@ -5371,7 +5377,11 @@ class ServerArgs:
             type=str,
             choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
-            help="Choose the kernels for sampling layers.",
+            help=(
+                "Choose the kernels for sampling layers. "
+                "Set SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1 to expose the "
+                "'token_oracle' test backend used by --kv-canary."
+            ),
         )
         parser.add_argument(
             "--grammar-backend",
@@ -6128,6 +6138,54 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--kv-canary",
+            type=str,
+            default=ServerArgs.kv_canary,
+            choices=["off", "log", "raise"],
+            help=(
+                "KV cache canary mode. 'off' disables the canary (default). 'log' "
+                "records mismatches to a violation buffer and logs them while the "
+                "server keeps running (production-safe). 'raise' fails the server "
+                "on the first detected mismatch (CI lane)."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-real-data",
+            type=str,
+            default=ServerArgs.kv_canary_real_data,
+            choices=[m.name.lower() for m in RealKvHashMode],
+            help=(
+                "Mix a fingerprint of the real KV-cache slot into the canary's "
+                "chain hash. 'off' (default) "
+                "leaves the real_kv_hash slot field at zero. 'partial' "
+                "splitmix64-folds the first 16 bytes of "
+                "each real-KV slot; useful when corruption is suspected but "
+                "overhead must stay tiny. 'all' "
+                "splitmix64-folds the full real-KV slot stride for maximum "
+                "coverage at higher cost. Catches "
+                "corruption that the pure-canary path misses because the "
+                "canary slot itself is intact but the real KV got written "
+                "wrong."
+            ),
+        )
+        parser.add_argument(
+            "--kv-canary-sweep-interval",
+            type=int,
+            default=ServerArgs.kv_canary_sweep_interval,
+            help=(
+                "Every N forward steps, run a full-pool sweep that verifies "
+                "real_kv_hash on every slot owned by an alive req in the "
+                "current batch (chain hash check is skipped in this path). "
+                "0 (default) disables the sweep. The per-step head/tail "
+                "canary only covers slots the current forward reads or "
+                "writes; the sweep also catches corruption on slots that "
+                "sit in the KV pool unused by the current forward — "
+                "typically radix-cached slots from completed requests that "
+                "aren't actively being verified per step. Requires "
+                "--kv-canary in {log, raise}."
+            ),
         )
         parser.add_argument(
             "--cuda-graph-max-bs",
@@ -7155,6 +7213,11 @@ class ServerArgs:
                 raise ValueError(
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
+
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "off":
+            raise ValueError(
+                "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
+            )
 
     def check_lora_server_args(self):
         assert self.max_loras_per_batch > 0, "max_loras_per_batch must be positive"

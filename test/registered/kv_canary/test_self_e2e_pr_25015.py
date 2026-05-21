@@ -1,0 +1,75 @@
+"""Regression for PR #25015 EAGLE positions misalign: revert the fix and expect canary fire."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from typing import ClassVar
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+
+register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
+
+_SPEC_EAGLE_TOKEN_ORACLE_ENV = {
+    "SGLANG_KV_CANARY_INPUT_CHECK": "0",
+    "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
+}
+_SPEC_EAGLE_REVERT_PR_ENV = {
+    **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
+    "SGLANG_DEBUG_REVERT_PR": "25015",
+}
+_SPEC_EAGLE_SERVER_ARGS = (
+    "--json-model-override-args",
+    json.dumps({"num_hidden_layers": 1}),
+    "--sampling-backend",
+    "token_oracle",
+    "--speculative-algorithm",
+    "EAGLE",
+    "--cuda-graph-max-bs",
+    "8",
+    "--max-running-requests",
+    "32",
+    "--max-total-tokens",
+    "16384",
+    "--disable-piecewise-cuda-graph",
+)
+
+
+class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
+    model_mode = "mha"
+    kv_canary_mode = "raise"
+    extra_server_args = _SPEC_EAGLE_SERVER_ARGS
+    revert_pr: ClassVar[bool]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.extra_env = (
+            _SPEC_EAGLE_REVERT_PR_ENV if cls.revert_pr else _SPEC_EAGLE_TOKEN_ORACLE_ENV
+        )
+        super().setUpClass()
+
+    def test_pr_25015_eagle_positions(self) -> None:
+        if self.revert_pr:
+            self.assert_violation_logged_any(
+                launch_tag_patterns=("*",),
+                fail_reason="position",
+                flush_wait_seconds=0.0,
+            )
+            return
+
+
+class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
+    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
+
+    revert_pr = True
+
+
+class TestEaglePositionsMatchWithFix(_EaglePositionsBase):
+    """With the PR #25015 fix in place, no canary fires."""
+
+    revert_pr = False
+
+
+if __name__ == "__main__":
+    unittest.main()

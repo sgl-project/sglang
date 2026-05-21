@@ -27,6 +27,7 @@ ScheduleBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -40,6 +41,7 @@ from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_cp_size,
@@ -440,6 +442,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
+    rids_int: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -554,6 +557,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
         device = model_runner.device
+
+        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+            hashed = _hash_rids_to_i64_tensor(
+                rids=[req.rid for req in batch.reqs],
+                device=device,
+            )
+            batch.sampling_info.rids_int = hashed
+            ret.rids_int = hashed
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -1034,6 +1045,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if self.extend_seq_lens is not None:
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
+        if self.rids_int is not None:
+            self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
+            if self.sampling_info is not None:
+                self.sampling_info.rids_int = self.rids_int
+
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
@@ -1267,3 +1283,13 @@ if is_cuda() or is_hip():
     clamp_position = clamp_position_cuda
 else:
     clamp_position = _clamp_position_native
+
+
+def _hash_rids_to_i64_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _stable_hash_rid_i64(rid: str) -> int:
+    digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "little", signed=True)

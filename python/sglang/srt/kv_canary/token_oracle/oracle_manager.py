@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
+from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class TokenOracleManager:
+    def __init__(self, *, oracle: TokenOracle) -> None:
+        self.oracle = oracle
+
+    def fill_expected_inputs(
+        self,
+        *,
+        forward_batch: "ForwardBatch",
+        expected_inputs_out: ExpectedInputs,
+    ) -> None:
+        """Called by CanaryRunner BEFORE its per-forward write launch when
+        CanaryConfig.input_check_mode is ON. Layout of the output tensors mirrors
+        forward_batch.input_ids / forward_batch.positions — flat, indexed by the same
+        write_offsets canary uses. Capacity of the placeholders is sized at CanaryRunner install
+        time to max per-forward write capacity (cuda-graph safe).
+
+        For positions outside [0, current_seq_len) the value is undefined — caller is expected to
+        keep mock-model running such that every (req_id, position) hit by the canary write loop
+        is a valid oracle query.
+        """
+        positions = forward_batch.positions
+        input_ids = forward_batch.input_ids
+        num_tokens = int(input_ids.shape[0])
+
+        rids_int = forward_batch.rids_int
+        if rids_int is None:
+            raise RuntimeError(
+                "fill_expected_inputs: forward_batch.rids_int is None; "
+                "token oracle requires the per-forward rids_int tensor "
+                "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
+            )
+
+        if num_tokens == 0:
+            return
+
+        req_ids = _build_req_id_per_token(
+            forward_batch=forward_batch,
+            num_tokens=num_tokens,
+            rids_per_row=rids_int,
+        )
+        expected_tokens = self.oracle.expected_tokens(
+            req_ids=req_ids, positions=positions.to(torch.int64)
+        )
+        expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
+        expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
+
+    def sample(self, *, req_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return self.oracle.expected_tokens(
+            req_ids=req_ids, positions=positions.to(torch.int64)
+        )
+
+
+def _build_req_id_per_token(
+    *,
+    forward_batch: "ForwardBatch",
+    num_tokens: int,
+    rids_per_row: torch.Tensor,
+) -> torch.Tensor:
+    forward_mode = forward_batch.forward_mode
+    if forward_mode is not None and forward_mode.is_extend():
+        extend_seq_lens = forward_batch.extend_seq_lens
+        if extend_seq_lens is None:
+            raise RuntimeError(
+                "fill_expected_inputs: extend_seq_lens is None in extend mode"
+            )
+        lens = extend_seq_lens.to(torch.int64)
+        result = torch.repeat_interleave(rids_per_row, lens)
+    else:
+        result = rids_per_row
+
+    if int(result.shape[0]) != num_tokens:
+        raise RuntimeError(
+            f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
+        )
+    return result

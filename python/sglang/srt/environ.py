@@ -236,6 +236,7 @@ class Envs:
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
@@ -713,6 +714,47 @@ class Envs:
     # Plugin system
     SGLANG_PLATFORM = EnvStr("")
     SGLANG_PLUGINS = EnvStr("")
+
+    # ===================================================================
+    # KV-Canary / Token-Oracle (testing-only)
+    # ===================================================================
+    SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
+    SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
+    # Input-id / position verification inside canary_write_step. Only useful
+    # when a token_oracle is feeding expected_input_* tensors per forward;
+    # production users never set this. Test harnesses flip it on via
+    # ``token_oracle_engine_kwargs`` (test/registered/token_oracle/utils.py).
+    SGLANG_KV_CANARY_INPUT_CHECK = EnvBool(False)
+    # KV cache canary perturbation. When >0, the canary install hooks corrupt
+    # ``req_to_token_pool`` rows with this per-write probability so the canary
+    # should fire. Combined with ``--kv-canary=raise`` this gives a fault-injection
+    # harness for regression-testing the canary itself.
+    SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
+    # Number of initial forward steps during which all perturb hooks are
+    # gated off. Prevents perturb from firing during sglang warmup, where a
+    # garbage write can trip a CUDA error before the canary's deferred D2H
+    # violation pump has a chance to log the canary_kind line.
+    SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
+    # Real-KV-used perturbation. When >0, the canary self-test flips byte 0 of
+    # an active req's currently-used KV slot with this probability per forward.
+    # Detection routes through the per-forward HEAD/TAIL verify kernel
+    # (real_kv_hash violation). Simulates CUDA-graph-idle-class bugs where a
+    # live slot's KV byte is silently overwritten.
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
+    # Real-KV-unused-cache perturbation. When >0, the canary self-test flips
+    # byte 0 of a radix-cached but currently-unused (orphan) KV slot with this
+    # probability per forward. Detection routes through sweep verify only
+    # (per-forward HEAD/TAIL won't look at this slot). Requires
+    # --kv-canary-sweep-interval > 0.
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    # Which CanaryBufferGroup the real_kv_used / real_kv_unused_cache perturb
+    # targets: "full" / "swa" exact-match the PoolKind name. Used by per-group
+    # e2e tests to drive detection deterministically.
+    SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
+    # ===================================================================
+    # /KV-Canary / Token-Oracle
+    # ===================================================================
 
 
 envs = Envs()

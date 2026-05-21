@@ -39,6 +39,7 @@ from torch.distributed import barrier
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig, ModelImpl
 from sglang.srt.constrained.grammar_manager import GrammarManager
+from sglang.srt.debug_utils.pr_fix_toggle import revert_pr_fix
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeTransferQueue,
@@ -66,6 +67,7 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.kv_canary.api import get_canary_runner
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -450,6 +452,11 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        if (
+            canary_runner := get_canary_runner(self.tp_worker.model_runner)
+        ) is not None:
+            canary_runner.attach_radix_cache(self.tree_cache)
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -697,6 +704,9 @@ class Scheduler(
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
         )
+
+        if pr_num := envs.SGLANG_DEBUG_REVERT_PR.get():
+            revert_pr_fix(pr_num)
 
         self.is_initializing = False
 
