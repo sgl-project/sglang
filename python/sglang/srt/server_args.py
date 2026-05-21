@@ -6960,8 +6960,19 @@ class ServerArgs:
             args.cp_strategy = _LEGACY_MODE_TO_STRATEGY[legacy_generic_mode]
             args.prefill_cp_mode = legacy_generic_mode
 
+        # When a CLI flag has been deprecated to an alias (i.e. its argparse
+        # dest now points at the canonical field), the deprecated field name
+        # is absent from the Namespace. Fall back to the dataclass default
+        # in that case so the deprecated fields keep their resting value.
+        field_defaults = {
+            f.name: f.default
+            for f in dataclasses.fields(cls)
+            if f.default is not dataclasses.MISSING
+        }
         attrs = [attr.name for attr in dataclasses.fields(cls)]
-        return cls(**{attr: getattr(args, attr) for attr in attrs})
+        return cls(
+            **{attr: getattr(args, attr, field_defaults.get(attr)) for attr in attrs}
+        )
 
     def url(self, port: Optional[int] = None):
         scheme = "https" if self.ssl_certfile else "http"
