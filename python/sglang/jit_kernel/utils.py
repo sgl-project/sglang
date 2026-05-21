@@ -309,11 +309,7 @@ def get_jit_cuda_arch() -> ArchInfo:
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime():
         return False
-    arch = get_jit_cuda_arch()
-    # PDL (griddepcontrol) instruction is supported on SM90+ (Hopper, Blackwell).
-    # SM120 (desktop Blackwell) supports PDL despite lacking TMEM/tcgen05 —
-    # PDL uses griddepcontrol for kernel scheduling, independent of TMEM.
-    return arch.major >= 9
+    return get_jit_cuda_arch().major >= 9
 
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:
