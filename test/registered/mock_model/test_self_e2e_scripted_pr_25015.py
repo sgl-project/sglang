@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import unittest
 from typing import List
@@ -18,6 +19,8 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+logger = logging.getLogger(__name__)
 
 register_cuda_ci(est_time=60, suite="extra-a-test-1-gpu-large")
 
@@ -73,6 +76,7 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
 
         env = _spec_eagle_env()
         env["SGLANG_DEBUG_REVERT_PR"] = "25015"
+        cls._launch_exc = None
         try:
             cls.process = popen_launch_server(
                 _MOCK_MODEL,
@@ -82,8 +86,9 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
                 env=env,
                 return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            cls._launch_exc = exc
+            logger.warning("server launch raised during revert path: %r", exc, exc_info=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
