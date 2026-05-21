@@ -781,7 +781,7 @@ class CommonKVSender(BaseKVSender):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
 
-    def _prepare_send(
+    def _prepare_send_indices(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,

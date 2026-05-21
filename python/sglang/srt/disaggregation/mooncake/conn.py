@@ -1591,8 +1591,8 @@ class MooncakeKVSender(CommonKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
-        kv_indices, index_slice, is_last_chunk, should_skip = self._prepare_send(
-            kv_indices, state_indices
+        kv_indices, index_slice, is_last_chunk, should_skip = (
+            self._prepare_send_indices(kv_indices, state_indices)
         )
         if should_skip:
             return
