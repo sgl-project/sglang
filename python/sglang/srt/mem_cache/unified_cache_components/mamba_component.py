@@ -229,8 +229,7 @@ class MambaComponent(TreeComponent):
         value = cd.host_value if lock_host else cd.value
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
         if value is None:
-            if not lock_host:
-                result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
+            result.skip_lock_node_ids.setdefault(ct, set()).add(node.id)
             return result
 
         if lock_host:
@@ -256,16 +255,13 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
-        if not lock_host and node.id in skip_lock_node_ids:
+        if node.id in skip_lock_node_ids:
             return
 
         value = cd.host_value if lock_host else cd.value
-        assert value is not None
         if lock_host:
-            if cd.host_lock_ref == 0:
-                return
             cd.host_lock_ref -= 1
-            if cd.host_lock_ref == 0 and cd.value is None:
+            if cd.host_lock_ref == 0 and cd.value is None and cd.host_value is not None:
                 host_lru = self.cache.host_lru_lists[ct]
                 if not host_lru.in_list(node):
                     host_lru.insert_mru(node)
