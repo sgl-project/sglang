@@ -2159,6 +2159,45 @@ def _format_listen_addr(server_args: ServerArgs) -> str:
     return f"{server_args.host}:{server_args.port}"
 
 
+def _prepare_uds_path(path: str) -> None:
+    """Make `path` safe to bind() against.
+
+    - No-op if nothing exists at `path`.
+    - If a non-socket file exists, refuse (FileExistsError).
+    - If a live UDS is bound, refuse (OSError EADDRINUSE).
+    - Otherwise (stale socket file) unlink it and log a warning.
+    """
+    import errno
+    import socket as _socket
+    import stat
+
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(st.st_mode):
+        raise FileExistsError(
+            f"{path} exists and is not a socket; refusing to overwrite"
+        )
+    probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    probe.settimeout(0.1)
+    is_live = False
+    try:
+        probe.connect(path)
+        is_live = True
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass
+    finally:
+        probe.close()
+    if is_live:
+        raise OSError(
+            errno.EADDRINUSE,
+            f"UDS {path} is already in use by another process",
+        )
+    os.unlink(path)
+    logger.warning("Removed stale UDS file at %s", path)
+
+
 def _run_granian_server(server_args: ServerArgs):
     """Launch Granian with HTTP/2 support"""
     from granian import Granian

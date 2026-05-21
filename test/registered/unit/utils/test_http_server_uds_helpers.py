@@ -4,11 +4,16 @@ Usage:
     python3 -m pytest test/registered/unit/utils/test_http_server_uds_helpers.py -v
 """
 
+import errno
+import os
+import socket
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.entrypoints.http_server import (
     _format_listen_addr,
+    _prepare_uds_path,
     _uvicorn_bind_kwargs,
 )
 from sglang.srt.server_args import ServerArgs
@@ -44,6 +49,58 @@ class TestFormatListenAddr(unittest.TestCase):
     def test_formats_uds(self):
         args = ServerArgs(model_path="dummy", uds="/run/sglang.sock")
         self.assertEqual(_format_listen_addr(args), "unix:/run/sglang.sock")
+
+
+class TestPrepareUdsPath(unittest.TestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp(prefix="sglang-uds-")
+        self.path = os.path.join(self._tmpdir, "test.sock")
+
+    def tearDown(self):
+        # Best-effort cleanup; tests may already have unlinked.
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
+        os.rmdir(self._tmpdir)
+
+    def test_missing_path_is_noop(self):
+        # No file at path -> returns cleanly, nothing created.
+        _prepare_uds_path(self.path)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_regular_file_refused(self):
+        with open(self.path, "w") as f:
+            f.write("not a socket")
+        with self.assertRaises(FileExistsError):
+            _prepare_uds_path(self.path)
+        # File preserved (we refuse to overwrite).
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_live_socket_refused(self):
+        # Bind a real UDS listener at self.path and leave it open.
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.listen(1)
+        try:
+            with self.assertRaises(OSError) as cm:
+                _prepare_uds_path(self.path)
+            self.assertEqual(cm.exception.errno, errno.EADDRINUSE)
+            # Socket file still present.
+            self.assertTrue(os.path.exists(self.path))
+        finally:
+            srv.close()
+
+    def test_stale_socket_unlinked(self):
+        # Create a socket file and then close it WITHOUT unlinking.
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(self.path)
+        srv.close()
+        # The socket file exists but nobody is listening.
+        self.assertTrue(os.path.exists(self.path))
+        _prepare_uds_path(self.path)
+        # Stale file removed.
+        self.assertFalse(os.path.exists(self.path))
 
 
 if __name__ == "__main__":
