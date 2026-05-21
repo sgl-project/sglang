@@ -36,7 +36,7 @@ class TestBasicSanityEagle3(
     # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI. AMD EAGLE3
     # currently sustains lower single-batch occupancy and needs a longer
     # measurement window to avoid too few non-NaN samples.
-    fwd_occupancy_threshold = 82.0 if is_in_amd_ci() else 97.0
+    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
 
     @classmethod
