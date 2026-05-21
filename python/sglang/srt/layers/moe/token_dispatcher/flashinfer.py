@@ -101,9 +101,12 @@ class FlashinferDispatcher(BaseDispatcher):
         self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
-        self.max_num_tokens = (
-            get_int_env_var("SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 1024)
-            * self.ep_size
+        # FlashInfer sizes the workspace from the maximum dispatched tokens per
+        # EP rank. See FlashInfer's moe_a2a_get_workspace_size_per_rank(),
+        # which reserves ep_size * max_num_tokens * payload bytes, and the C++
+        # dispatch op's epSize * runtimeMaxTokensPerRank payload buffer.
+        self.max_num_tokens = get_int_env_var(
+            "SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
         )
 
         # Calculate workspace size. For eagle mode, use the larger workspace size since nextn layer will be unquantized.
