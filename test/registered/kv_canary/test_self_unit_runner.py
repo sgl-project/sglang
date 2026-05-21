@@ -24,11 +24,14 @@ from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
+from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.srt.kv_canary.runner import launch as launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
@@ -122,7 +125,17 @@ def _make_forward_batch(device, bs: int = 2, seq_lens_list=(3, 4)):
         input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
         positions=torch.zeros(bs, dtype=torch.int32, device=device),
         out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=device),
+        num_token_non_padded_cpu=None,
     )
+
+
+class _RecordingEndpoint:
+    def __init__(self, *, kernel_kind: CanaryLaunchTag) -> None:
+        self.kernel_kind = kernel_kind
+        self.calls: list[dict[str, object]] = []
+
+    def launch_per_forward(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
 
 
 def _make_runner(
@@ -304,6 +317,75 @@ class TestSelfUnitRunner(CustomTestCase):
         self.assertIn(replacement, live_slots)
         self.assertNotEqual(replacement, original)
         self.assertFalse(bool(diff[1, 0].item()))
+
+    def test_collect_active_slots_ignores_padded_out_cache_loc(self):
+        """Verify out_cache_loc padding does not exclude a live slot."""
+        pool = _make_pool(self.device, max_reqs=4, max_seq=8)
+        pool.req_to_token[1, :2] = torch.tensor(
+            [0, 7], dtype=torch.int32, device=self.device
+        )
+        forward_batch = _make_forward_batch(self.device, bs=1, seq_lens_list=(2,))
+        forward_batch.out_cache_loc = torch.tensor(
+            [7, 0, 0], dtype=torch.int32, device=self.device
+        )
+        forward_batch.num_token_non_padded_cpu = 1
+
+        targets = collect_active_slots(
+            forward_batch=forward_batch,
+            req_to_token_pool=pool,
+        )
+
+        self.assertEqual([target.slot for target in targets], [0])
+
+    def test_launch_endpoints_per_forward_uses_unpadded_token_tensors(self):
+        """Verify endpoint launch receives tensors sliced to the real token count."""
+        group = _make_group(device=self.device)
+        endpoint = _RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
+        forward_batch = _make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
+        forward_batch.input_ids = torch.tensor(
+            [101, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.positions = torch.tensor(
+            [10, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.out_cache_loc = torch.tensor(
+            [7, 0, 0], dtype=torch.int64, device=self.device
+        )
+        forward_batch.num_token_non_padded_cpu = 1
+
+        launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            input_check_mode=False,
+        )
+
+        self.assertEqual(len(endpoint.calls), 1)
+        call = endpoint.calls[0]
+        self.assertTrue(
+            torch.equal(
+                call["fb_input_ids"],
+                torch.tensor([101], dtype=torch.int32, device=self.device),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                call["fb_positions"],
+                torch.tensor([10], dtype=torch.int32, device=self.device),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                call["fb_out_cache_loc"],
+                torch.tensor([7], dtype=torch.int32, device=self.device),
+            )
+        )
 
     def test_kernel_run_counter_watchdog_raises_on_zero(self):
         """Verify the kernel watchdog raises when counters stop advancing."""

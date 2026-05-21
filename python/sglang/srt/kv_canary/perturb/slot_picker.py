@@ -56,7 +56,13 @@ def collect_active_slots(
     if exclude_out_cache_loc:
         out_cache_loc = forward_batch.out_cache_loc
         if out_cache_loc is not None:
-            excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
+            valid_num_tokens = forward_batch.num_token_non_padded_cpu
+            if valid_num_tokens is None:
+                valid_num_tokens = int(out_cache_loc.shape[0])
+            excluded = set(
+                int(x)
+                for x in out_cache_loc[:valid_num_tokens].detach().to("cpu").tolist()
+            )
 
     req_pool_indices_list = req_pool_indices.detach().to("cpu").tolist()
     seq_lens_list = seq_lens.detach().to("cpu").tolist()
