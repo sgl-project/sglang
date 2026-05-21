@@ -116,6 +116,7 @@ class CanaryE2EBase(CustomTestCase):
         n: int,
         *,
         prompts: Optional[List[str]] = None,
+        expect_all_success: bool,
         max_new_tokens: int = 16,
         max_workers: int = 16,
         timeout: float = 60.0,
@@ -153,6 +154,9 @@ class CanaryE2EBase(CustomTestCase):
             for fut in as_completed(futures):
                 results.append(fut.result())
         results.sort(key=lambda r: r["index"])
+        if expect_all_success:
+            for result in results:
+                self.assertEqual(result.get("status_code"), 200, result)
         return results
 
     def assert_health_ok(self, *, timeout: float = 10.0) -> None:

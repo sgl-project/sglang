@@ -29,7 +29,12 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
 
     def test_server_aborts_on_violation(self) -> None:
         try:
-            self.send_parallel_requests(n=4, max_new_tokens=200, timeout=30.0)
+            self.send_parallel_requests(
+                n=4,
+                expect_all_success=False,
+                max_new_tokens=200,
+                timeout=30.0,
+            )
         except Exception:
             pass
         try:
