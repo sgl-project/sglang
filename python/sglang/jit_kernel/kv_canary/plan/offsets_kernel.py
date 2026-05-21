@@ -283,10 +283,109 @@ def _plan_offsets_kernel(
 
     window_starts = _compute_window_start(prefix_lens, SWA_WINDOW)  # [BS_BLOCK]
 
+    _plan_verify_offsets(
+        prefix_lens,
+        window_starts,
+        is_active,
+        bs_offs,
+        bs_mask,
+        out_verify_offsets_ptr,
+        out_verify_num_valid_ptr,
+        out_verify_enable_ptr,
+        bs,
+        VERIFY_CAPACITY,
+    )
+    _plan_write_offsets(
+        rpi,
+        prefix_lens,
+        extend_lens,
+        has_prefix,
+        is_active,
+        bs_offs,
+        bs_mask,
+        req_to_token_ptr,
+        full_to_swa_lut_ptr,
+        out_write_offsets_ptr,
+        out_write_seed_slot_indices_ptr,
+        out_write_num_valid_reqs_ptr,
+        bs,
+        req_to_token_stride0,
+        swa_lut_len,
+        BS_BLOCK,
+        HAS_SWA_LUT,
+        WRITE_OFFSETS_LEN,
+        WRITE_REQ_CAPACITY,
+    )
+
+
+@triton.jit
+def _plan_verify_offsets(
+    prefix_lens,
+    window_starts,
+    is_active,
+    bs_offs,
+    bs_mask,
+    out_verify_offsets_ptr,
+    out_verify_num_valid_ptr,
+    out_verify_enable_ptr,
+    bs,
+    VERIFY_CAPACITY: tl.constexpr,
+):
     verify_lens = prefix_lens - window_starts  # [BS_BLOCK]
     verify_lens = tl.where(verify_lens > 0, verify_lens, 0)
     verify_lens = tl.where(is_active, verify_lens, 0)
 
+    # Inclusive cumsum → exclusive offsets via subtraction.
+    verify_inclusive = tl.cumsum(verify_lens, axis=0)  # [BS_BLOCK]
+    verify_exclusive = verify_inclusive - verify_lens  # [BS_BLOCK]
+
+    # Scatter exclusive offsets into the [bs+1]-sized output tensor. Positions [0, bs) get the exclusive sum;
+    # position bs gets the total (totals = verify_inclusive at index bs - 1 if bs > 0, else 0).
+    out_offsets_mask = bs_mask  # [BS_BLOCK] bool
+    tl.store(
+        out_verify_offsets_ptr + bs_offs,
+        verify_exclusive.to(tl.int64),
+        mask=out_offsets_mask,
+    )
+
+    # Totals: sum of all per-req lens. Same value as the last inclusive entry but tl.sum is robust to bs == 0.
+    total_verify = tl.sum(verify_lens, axis=0)  # scalar
+
+    # Store the [bs] slot of verify_offsets (one element past the last per-req entry).
+    tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int64))
+
+    # Scalar writes: out_verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
+    # never indexes past the buffer; enable carries the overflow bit (0 when total_verify > capacity) so the
+    # verify kernel skips the whole launch and the host can warn-log this step.
+    overflow = total_verify > VERIFY_CAPACITY  # scalar bool
+    enable = tl.where(overflow, 0, 1)  # scalar
+    clamped = tl.where(overflow, VERIFY_CAPACITY, total_verify)  # scalar
+    tl.store(out_verify_num_valid_ptr, clamped.to(tl.int32))
+    tl.store(out_verify_enable_ptr, tl.full((), enable, tl.int32))
+
+
+@triton.jit
+def _plan_write_offsets(
+    rpi,
+    prefix_lens,
+    extend_lens,
+    has_prefix,
+    is_active,
+    bs_offs,
+    bs_mask,
+    req_to_token_ptr,
+    full_to_swa_lut_ptr,
+    out_write_offsets_ptr,
+    out_write_seed_slot_indices_ptr,
+    out_write_num_valid_reqs_ptr,
+    bs,
+    req_to_token_stride0,
+    swa_lut_len,
+    BS_BLOCK: tl.constexpr,
+    HAS_SWA_LUT: tl.constexpr,
+    WRITE_OFFSETS_LEN: tl.constexpr,
+    WRITE_REQ_CAPACITY: tl.constexpr,
+):
     write_lens = tl.where(extend_lens > 0, extend_lens, 0)  # [BS_BLOCK]
     write_lens = tl.where(is_active, write_lens, 0)
 
@@ -319,19 +418,9 @@ def _plan_offsets_kernel(
     )  # [BS_BLOCK]
 
     # Inclusive cumsum → exclusive offsets via subtraction.
-    verify_inclusive = tl.cumsum(verify_lens, axis=0)  # [BS_BLOCK]
     write_inclusive = tl.cumsum(write_lens, axis=0)  # [BS_BLOCK]
-    verify_exclusive = verify_inclusive - verify_lens  # [BS_BLOCK]
     write_exclusive = write_inclusive - write_lens  # [BS_BLOCK]
 
-    # Scatter exclusive offsets into the [bs+1]-sized output tensor. Positions [0, bs) get the exclusive sum;
-    # position bs gets the total (totals = verify_inclusive at index bs - 1 if bs > 0, else 0).
-    out_offsets_mask = bs_mask  # [BS_BLOCK] bool
-    tl.store(
-        out_verify_offsets_ptr + bs_offs,
-        verify_exclusive.to(tl.int64),
-        mask=out_offsets_mask,
-    )
     write_offsets_mask = bs_offs < WRITE_OFFSETS_LEN  # [BS_BLOCK] bool
     tl.store(
         out_write_offsets_ptr + bs_offs,
@@ -348,12 +437,9 @@ def _plan_offsets_kernel(
     )
 
     # Totals: sum of all per-req lens. Same value as the last inclusive entry but tl.sum is robust to bs == 0.
-    total_verify = tl.sum(verify_lens, axis=0)  # scalar
     total_write = tl.sum(write_lens, axis=0)  # scalar
 
-    # Store the [bs] slot of verify_offsets and out_write_offsets (one element past the last per-req entry).
-    # verify_offsets scratch has length BS_BLOCK + 1 so the bs slot is always in range.
-    tl.store(out_verify_offsets_ptr + bs, total_verify.to(tl.int64))
+    # Store the [bs] slot of out_write_offsets (one element past the last per-req entry).
     # out_write_offsets has length WRITE_OFFSETS_LEN = write_req_capacity + 1; only store if in range.
     write_tail_in_range = bs < WRITE_OFFSETS_LEN  # scalar bool
     tl.store(
@@ -362,12 +448,4 @@ def _plan_offsets_kernel(
         mask=write_tail_in_range,
     )
 
-    # Scalar writes: out_verify_num_valid is clamped to the verify_capacity tensor extent so the verify kernel
-    # never indexes past the buffer; enable carries the overflow bit (0 when total_verify > capacity) so the
-    # verify kernel skips the whole launch and the host can warn-log this step.
-    overflow = total_verify > VERIFY_CAPACITY  # scalar bool
-    enable = tl.where(overflow, 0, 1)  # scalar
-    clamped = tl.where(overflow, VERIFY_CAPACITY, total_verify)  # scalar
-    tl.store(out_verify_num_valid_ptr, clamped.to(tl.int32))
-    tl.store(out_verify_enable_ptr, tl.full((), enable, tl.int32))
     tl.store(out_write_num_valid_reqs_ptr, tl.full((), bs, tl.int32))
