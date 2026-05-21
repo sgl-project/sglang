@@ -172,16 +172,18 @@ class Gateway:
             tokenizer_path: Path or HF ID for the tokenizer the router uses
                             for cache-aware tokenization.
             worker_urls: URLs of already-running ``sglang.launch_server``
-                         instances. The router uses static-file discovery.
+                         instances. The router uses ``static_urls`` discovery;
+                         each worker's mode (plain) and any disaggregation
+                         metadata are learned from ``/server_info``.
             policy: Policy kind — ``round_robin``, ``random``, ``power_of_two``,
                     or ``cache_aware_zmq``.
             timeout: How long to wait for ``/readyz`` before giving up.
         """
         self._launch(
-            self._build_regular_config(
+            self._build_config(
                 model_id=model_id,
                 tokenizer_path=tokenizer_path,
-                worker_urls=worker_urls,
+                urls=list(worker_urls),
                 policy=policy,
                 extra_models=extra_models or [],
             ),
@@ -195,42 +197,27 @@ class Gateway:
         tokenizer_path: str,
         prefill_urls: list[str],
         decode_urls: list[str],
-        prefill_bootstrap_ports: list[int | None] | None = None,
         policy: str = "round_robin",
         timeout: float = 60.0,
     ) -> None:
         """Start the router in PD-disaggregated mode.
 
-        Discovery emits ``WorkerMode::Prefill`` for ``prefill_urls`` and
-        ``WorkerMode::Decode`` for ``decode_urls``; the router's
-        `PdPoolResolver` filters per-pool at request time.
-
-        ``prefill_bootstrap_ports`` carries the SGLang
-        ``--disaggregation-bootstrap-port`` setting for each prefill
-        worker; the router writes this into the workers TOML so the
-        chat handler can inject it as the ``bootstrap_port`` field on
-        PD-disagg request bodies. Length must match ``prefill_urls``
-        when provided; ``None`` entries become ``bootstrap_port = None``
-        in the TOML (the worker will reject the request with a clear
-        error). If the whole arg is ``None``, no entries get a
-        ``bootstrap_port`` and the field defaults to ``None`` — used
-        by tests that don't care about PD bootstrap correctness.
+        All prefill + decode URLs go into one ``static_urls`` list. The
+        router seeds each worker as ``WorkerMode::Plain`` and the
+        manager's ``/server_info`` introspect step overrides mode +
+        ``bootstrap_port`` from the worker's self-disclosure. Workers
+        must have been launched with ``--disaggregation-mode`` and
+        ``--disaggregation-bootstrap-port`` for the PD role to be
+        picked up (see ``model_pool.spawn_worker``); modern SGLang is
+        assumed.
         """
-        if prefill_bootstrap_ports is not None and len(prefill_bootstrap_ports) != len(
-            prefill_urls
-        ):
-            raise ValueError(
-                f"prefill_bootstrap_ports length ({len(prefill_bootstrap_ports)}) "
-                f"must match prefill_urls length ({len(prefill_urls)})"
-            )
         self._launch(
-            self._build_pd_config(
+            self._build_config(
                 model_id=model_id,
                 tokenizer_path=tokenizer_path,
-                prefill_urls=prefill_urls,
-                decode_urls=decode_urls,
-                prefill_bootstrap_ports=prefill_bootstrap_ports,
+                urls=list(prefill_urls) + list(decode_urls),
                 policy=policy,
+                extra_models=[],
             ),
             timeout=timeout,
         )
@@ -295,79 +282,16 @@ class Gateway:
 
     # ----- internals ------------------------------------------------------
 
-    def _build_regular_config(
+    def _build_config(
         self,
         *,
         model_id: str,
         tokenizer_path: str,
-        worker_urls: list[str],
+        urls: list[str],
         policy: str,
         extra_models: list[dict],
     ) -> str:
-        # Static-file discovery: a separate worker-list TOML, polled by
-        # the router. We write that file as well and reference it from the
-        # main config.
-        workers_toml = "\n".join(
-            f'[[workers]]\nid = "w{i}"\nurl = "{u}"\nmode = "plain"\nmodel_ids = ["{model_id}"]'
-            for i, u in enumerate(worker_urls)
-        )
-        return self._compose_main_config(
-            model_id=model_id,
-            tokenizer_path=tokenizer_path,
-            policy=policy,
-            workers_toml=workers_toml,
-            extra_models=extra_models,
-        )
-
-    def _build_pd_config(
-        self,
-        *,
-        model_id: str,
-        tokenizer_path: str,
-        prefill_urls: list[str],
-        decode_urls: list[str],
-        prefill_bootstrap_ports: list[int | None] | None,
-        policy: str,
-    ) -> str:
-        entries = []
-        for i, u in enumerate(prefill_urls):
-            entry = (
-                f'[[workers]]\nid = "p{i}"\nurl = "{u}"\nmode = "prefill"'
-                f'\nmodel_ids = ["{model_id}"]'
-            )
-            if prefill_bootstrap_ports is not None:
-                bp = prefill_bootstrap_ports[i]
-                if bp is not None:
-                    entry += f"\nbootstrap_port = {bp}"
-            entries.append(entry)
-        for i, u in enumerate(decode_urls):
-            entries.append(
-                f'[[workers]]\nid = "d{i}"\nurl = "{u}"\nmode = "decode"\nmodel_ids = ["{model_id}"]'
-            )
-        workers_toml = "\n".join(entries)
-        return self._compose_main_config(
-            model_id=model_id,
-            tokenizer_path=tokenizer_path,
-            policy=policy,
-            workers_toml=workers_toml,
-            extra_models=[],
-        )
-
-    def _compose_main_config(
-        self,
-        *,
-        model_id: str,
-        tokenizer_path: str,
-        policy: str,
-        workers_toml: str,
-        extra_models: list[dict],
-    ) -> str:
-        # Static-file discovery requires a separate worker-list path that
-        # the router polls. We point at a sibling file written next to the
-        # main config.
-        workers_path = self._workers_path()
-        # Write the workers list to that path.
-        workers_path.write_text(workers_toml + "\n", encoding="utf-8")
+        resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
         extra_model_toml = ""
         for em in extra_models:
@@ -376,8 +300,6 @@ class Gateway:
                 f'tokenizer_path = "{_resolve_tokenizer_path(em["tokenizer_path"])}"\n'
                 f'policy = "{em.get("policy", policy)}"\n'
             )
-
-        resolved_tokenizer = _resolve_tokenizer_path(tokenizer_path)
 
         # Optional tunables — only emit the [proxy] and [active_load]
         # sections if a test has overridden them, so production defaults
@@ -394,6 +316,8 @@ class Gateway:
                 f"{self.stale_request_timeout_secs}\n"
             )
 
+        urls_toml = ", ".join(f'"{u}"' for u in urls)
+
         return f"""\
 [server]
 host = "{self.host}"
@@ -406,20 +330,11 @@ policy = "{policy}"
 {extra_model_toml}
 
 [discovery]
-backend = "static_file"
+backend = "static_urls"
 
-[discovery.static_file]
-path = "{workers_path}"
-poll_interval_ms = 200
+[discovery.static_urls]
+urls = [{urls_toml}]
 {proxy_section}{active_load_section}"""
-
-    def _workers_path(self) -> Path:
-        # Persist alongside the main config so cleanup is local.
-        if self._config_path is None:
-            # _launch hasn't allocated the main config yet — use the temp
-            # directory it will write into.
-            return Path(tempfile.gettempdir()) / f"sgl-router-workers-{self.port}.toml"
-        return self._config_path.with_suffix(".workers.toml")
 
     def _launch(self, config_text: str, *, timeout: float) -> None:
         if not self.binary.exists():
