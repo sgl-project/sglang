@@ -372,13 +372,13 @@ def test_convert_vertical_slash_indexes_mergehead(causal):
 
     # column_index is torch.empty-backed; only entries before column_count are valid.
     expected_column_count = torch.zeros((1, 2, 2), dtype=torch.int32, device="cuda")
-    expected_column_index = [[[[[], []], [[], []]]]]
+    expected_column_index = [[[[], []], [[], []]]]
 
     if not causal:
         expected_column_count = torch.tensor(
             [[[1, 2], [1, 1]]], dtype=torch.int32, device="cuda"
         )
-        expected_column_index = [[[[[1], [1, 3]], [[2], [2]]]]]
+        expected_column_index = [[[[1], [1, 3]], [[2], [2]]]]
 
     assert torch.equal(column_count, expected_column_count)
     for batch_idx, batch_expected in enumerate(expected_column_index):
