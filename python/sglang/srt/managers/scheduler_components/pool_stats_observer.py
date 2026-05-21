@@ -153,6 +153,7 @@ class SchedulerPoolStatsObserver:
     max_total_num_tokens: int
     get_last_batch: Callable
     get_running_batch: Callable
+    get_waiting_queue: Callable
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -162,7 +163,8 @@ class SchedulerPoolStatsObserver:
         )
 
     def active_pool_idxs(self) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
+        """Pool idxs currently owned by reqs in last_batch / running_batch or
+        held by chunked-resume reqs sitting in waiting_queue.
 
         Used to decide which session slots' KV is owned by batch reqs
         (and thus counted via uncached_size, not session_held).
@@ -174,6 +176,12 @@ class SchedulerPoolStatsObserver:
             for req in batch.reqs:
                 if req.req_pool_idx is not None:
                     idxs.add(req.req_pool_idx)
+        # Chunked-resume reqs in waiting_queue still own their row across iters
+        # (filter_batch may have just moved them out of last_batch but they
+        # haven't yet been re-admitted to running_batch).
+        for req in self.get_waiting_queue():
+            if req.has_pending_chunk and req.req_pool_idx is not None:
+                idxs.add(req.req_pool_idx)
         return idxs
 
     def session_held_tokens(self) -> int:

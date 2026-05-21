@@ -10,7 +10,7 @@ Uses msgspec.Struct for zero-copy serialization.
 Data flow::
 
     Scheduler process:
-        SchedulerMetricsMixin._emit_forward_pass_metrics()
+        SchedulerMetricsReporter._emit_forward_pass_metrics()
           -> _FpmPublisherThread -> ZMQ PUB (localhost)
 
     External consumer:

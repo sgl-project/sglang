@@ -44,7 +44,6 @@ class SchedulerLoadInquirer:
     get_running_batch: Callable
     get_waiting_queue: Callable
     get_stats: Callable
-    get_chunked_req: Callable
     get_disagg_prefill_bootstrap_queue: Callable
     get_disagg_prefill_inflight_queue: Callable
     get_disagg_decode_prealloc_queue: Callable
@@ -66,11 +65,14 @@ class SchedulerLoadInquirer:
                 time ``prefix_indices`` is already up-to-date, so the default
                 0 is correct.
         """
-        num_pending_tokens = sum(req.seqlen for req in self.get_waiting_queue())
-        if self.get_chunked_req() is not None:
-            req = self.get_chunked_req()
-            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
-        return num_pending_tokens
+        num_pending_tokens = sum(
+            req.seqlen - len(req.prefix_indices) for req in self.get_waiting_queue()
+        )
+        # The chunked-resume req (if any) is now in waiting_queue, so it's
+        # already counted in the sum above. chunk_deduct subtracts the
+        # current chunk's extend that has been planned but not yet reflected
+        # in prefix_indices.
+        return num_pending_tokens - chunk_deduct
 
     def get_loads(self, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """

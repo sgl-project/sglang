@@ -784,10 +784,22 @@ class Req(ReqDllmMixin):
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
-        # Whether or not if it is chunked. It increments whenever
-        # it is chunked, and decrement whenever chunked request is
-        # processed.
-        self.inflight_middle_chunks = 0
+        # Counter of middle-block prefill forwards that have been admitted
+        # but not yet output-processed for this req. Increments at admission
+        # for non-last chunks; decrements at output_processor. In PP, can
+        # exceed 1 because multiple microbatches may hold the same chunked
+        # req in flight concurrently. In non-PP, oscillates 0/1 within each
+        # iter. Used by output_processor to know whether this forward's
+        # sample is real (==0) or garbage (>0).
+        self.pending_middle_outputs = 0
+
+        # Persistent (cross-iter) flag set by admission when this req's
+        # current admission was truncated (more chunks remain). Cleared
+        # when last chunk is admitted (truncated=False) or on retract.
+        # Used by Stage A stash detection, filter_batch exclusion, and
+        # add_one_req's reuse-vs-fresh branch. Independent of pending_middle_outputs
+        # counter (transient) and kv_committed_len (derived).
+        self.has_pending_chunk = False
 
         # For retraction
         self.is_retracted = False
@@ -1280,7 +1292,8 @@ class Req(ReqDllmMixin):
         self.temp_input_top_logprobs_val = None
         self.temp_input_top_logprobs_idx = None
         self.extend_logprob_start_len = 0
-        self.inflight_middle_chunks = 0
+        self.pending_middle_outputs = 0
+        self.has_pending_chunk = False
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
@@ -1296,6 +1309,14 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        # Disagg-prefill send-side bookkeeping. The pre-v2 retract path never
+        # ran against a req that had started sending (retract only touched
+        # running_batch), so these stayed at init values. After v2 added
+        # pause(retract) coverage for waiting chunked-resume reqs, a retracted
+        # disagg-prefill req's stale start_send_idx would index garbage in the
+        # new row on re-prefill.
+        self.start_send_idx = 0
+        self.tmp_end_idx = -1
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1444,9 +1465,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # This is an optimization to reduce the overhead of the prefill check.
     batch_is_full: bool = False
 
-    # For chunked prefill in PP
-    chunked_req: Optional[Req] = None
-
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
@@ -1587,7 +1605,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         model_config: ModelConfig,
         enable_overlap: bool,
         spec_algorithm: SpeculativeAlgorithm,
-        chunked_req: Optional[Req] = None,
         dllm_config: Optional[DllmConfig] = None,
     ):
         return_logprob = any(req.return_logprob for req in reqs)
@@ -1613,7 +1630,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_routed_experts=any(req.return_routed_experts for req in reqs),
             return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
-            chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
         return batch
@@ -1892,6 +1908,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len
+            # Reset host_hit_length after init_load_back consumed it so that
+            # subsequent chunks' admissions skip init_load_back (host KV
+            # already loaded). Runs unconditionally: post-retract reqs have
+            # retracted_stain=True (skipping the outer block) but still
+            # match_prefix + init_load_back on their re-admission, so the
+            # reset must apply to them too.
+            req.host_hit_length = 0
             req.is_retracted = False
 
             if get_global_server_args().enable_mamba_extra_buffer():
@@ -2239,7 +2262,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for idx in range(len(self.reqs)):
             self.release_req(idx, len(self.reqs) - idx, server_args)
 
-        self.filter_batch(retracted_reqs)
+        self.filter_batch(keep_indices=[])
         return retracted_reqs
 
     def retract_decode(
@@ -2468,25 +2491,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def filter_batch(
         self,
-        chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
+        exclude_chunked_req: bool = False,
+        exclude_in_flight_other_mb: Optional[set] = None,
     ):
         # FIXME(lsyin): used here to get the correct seq_lens
         # The batch has been launched but we need it verified to get correct next batch info
         self.maybe_wait_verify_done()
 
         if keep_indices is None:
-            if isinstance(chunked_req_to_exclude, Req):
-                chunked_req_to_exclude = [chunked_req_to_exclude]
-            elif chunked_req_to_exclude is None:
-                chunked_req_to_exclude = []
+            in_flight_rids = exclude_in_flight_other_mb or set()
             keep_indices = [
                 i
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
-                and self.reqs[i] not in chunked_req_to_exclude
+                and not (
+                    exclude_chunked_req
+                    and (
+                        self.reqs[i].has_pending_chunk
+                        or self.reqs[i].pending_middle_outputs > 0
+                        or self.reqs[i].is_dllm()
+                    )
+                )
+                and self.reqs[i].rid not in in_flight_rids
             ]
 
         if keep_indices is None or len(keep_indices) == 0:
@@ -2561,6 +2590,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # filter_batch, so running_batch.seq_lens may still be a forward_stream
         # future. Synchronize here to avoid a cross-stream data race.
         self.maybe_wait_verify_done()
+
+        # Caller must filter_batch(exclude_chunked_req=True) on the other batch
+        # before merging — running_batch runs decode forward and admitting a
+        # prefill-in-progress req there breaks shape + KV accounting. Mirror
+        # the full exclude_chunked_req predicate so PP middle-chunk and DLLM
+        # staging reqs are also caught here.
+        assert not any(
+            r.has_pending_chunk or r.pending_middle_outputs > 0 or r.is_dllm()
+            for r in other.reqs
+        )
 
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it

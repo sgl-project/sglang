@@ -514,7 +514,7 @@ class SchedulerDisaggregationPrefillMixin:
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
-            if req.inflight_middle_chunks <= 0:
+            if req.pending_middle_outputs <= 0:
                 req.time_stats.set_prefill_finished_time()
 
                 # There is no output_ids for prefill
@@ -564,7 +564,7 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
-                req.inflight_middle_chunks -= 1
+                req.pending_middle_outputs -= 1
 
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -725,30 +725,30 @@ class SchedulerDisaggregationPrefillMixin:
         return transferred_rids
 
     def process_prefill_chunk(self: Scheduler) -> None:
-        chunked_req_to_exclude = set()
-        if self.chunked_req:
-            chunked_req_to_exclude.add(self.chunked_req)
-            maybe_cache_unfinished_req(self.chunked_req, self.tree_cache, chunked=True)
-            if self.enable_overlap:
-                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
-                self.chunked_req.tmp_end_idx = min(
-                    len(self.chunked_req.fill_ids),
-                    len(self.chunked_req.origin_input_ids),
-                )
-            else:
-                self.send_kv_chunk(self.chunked_req)
-            self.running_batch.batch_is_full = False
+        # Per-req stash for any in-flight chunked-resume reqs (now sitting in
+        # the waiting_queue with has_pending_chunk == True).
+        for req in self.waiting_queue:
+            if req.has_pending_chunk and not req.is_dllm():
+                maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
+                if self.enable_overlap:
+                    # Delay KV transfer to process_batch_result_disagg_prefill
+                    # when overlap is enabled to ensure results are resolved.
+                    req.tmp_end_idx = min(
+                        len(req.fill_ids),
+                        len(req.origin_input_ids),
+                    )
+                else:
+                    self.send_kv_chunk(req)
+                self.running_batch.batch_is_full = False
 
         if self.last_batch and self.last_batch.forward_mode.is_extend():
-            if self.last_batch.chunked_req:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
-                chunked_req_to_exclude.add(self.last_batch.chunked_req)
-
             last_bs = self.last_batch.batch_size()
-            self.last_batch.filter_batch(
-                chunked_req_to_exclude=list(chunked_req_to_exclude)
-            )
+            # Drop chunked-resume reqs from last_batch — running_batch runs
+            # decode forward and admitting a mid-prefill req there breaks
+            # shape + KV accounting. The dropped reqs stay in
+            # self.waiting_queue (chunked-resume retention) and re-enter via
+            # the next iter's Stage A stash + admission cycle.
+            self.last_batch.filter_batch(exclude_chunked_req=True)
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 

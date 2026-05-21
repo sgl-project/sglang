@@ -486,19 +486,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
+        # Bound the row read by kv_committed_len, not len(fill_ids); see
+        # radix_cache.py:cache_unfinished_req for the rationale (SWA early-
+        # return + init_next_round_input leaves fill_ids longer than the row).
+        assert req.kv_committed_len >= req.cache_protected_len
+        read_len = req.kv_committed_len
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, :read_len
             ]
 
-            # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+            # `req.prefix_indices` will be used by add_one_req reuse branch next iter
             req.prefix_indices = kv_indices
             return
 
-        token_ids = req.fill_ids
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
-        ]
+        token_ids = req.fill_ids[:read_len]
+        kv_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx, :read_len]
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -542,7 +545,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         result = self.inc_lock_ref(new_last_node)
         swa_uuid_for_lock = result.swa_uuid_for_lock
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # `req.prefix_indices` will be used by add_one_req reuse branch next iter
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]

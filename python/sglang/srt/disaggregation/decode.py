@@ -152,9 +152,8 @@ class DecodeReqToTokenPool:
             len(reusing) <= 1
         ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
-            for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].kv_committed_len > 0 for i in reusing
+        ), "reusing request must have committed KV"
 
         need_size = len(reqs) - len(reusing)
         if need_size > len(self.free_slots):
@@ -1655,11 +1654,16 @@ class SchedulerDisaggregationDecodeMixin:
         # Process pending prebuilt batch: output processing + filter + merge
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
-            assert self.chunked_req is None
+            assert not any(r.has_pending_chunk for r in self.waiting_queue)
             self.batch_result_processor.process_batch_result_prebuilt(
                 new_prebuilt_batch
             )
-            new_prebuilt_batch.filter_batch()
+            # Defensive: chunked prefill is a prefill-side concept; decode-side
+            # prebuilt batches shouldn't carry has_pending_chunk reqs. The
+            # assert above already guards waiting_queue; this flag protects
+            # against any future code that would route a chunked req through
+            # the disagg decode path.
+            new_prebuilt_batch.filter_batch(exclude_chunked_req=True)
             if not new_prebuilt_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = new_prebuilt_batch

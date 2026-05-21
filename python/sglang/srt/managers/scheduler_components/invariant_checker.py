@@ -50,6 +50,7 @@ class SchedulerInvariantChecker:
     pool_stats_observer: SchedulerPoolStatsObserver
     get_last_batch: Callable
     get_running_batch: Callable
+    get_waiting_queue: Callable
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
 
@@ -156,17 +157,31 @@ class SchedulerInvariantChecker:
         """
         # After decode: running_batch IS last_batch (same object), count once.
         # After prefill: they differ, both hold uncached tokens.
-        batches = [self.get_last_batch()]
+        req_groups = [list(self.get_last_batch().reqs)]
         if (
             self.get_running_batch() not in (None, self.get_last_batch())
             and not self.get_running_batch().is_empty()
         ):
-            batches.append(self.get_running_batch())
+            req_groups.append(list(self.get_running_batch().reqs))
+        # Chunked-resume reqs in waiting_queue carry uncached tail
+        # (kv_committed_len - cache_protected_len, < page_size) that
+        # filter_batch just removed from last_batch but haven't been
+        # re-admitted to running_batch yet. The leak invariant must count it.
+        seen_ids = {id(req) for group in req_groups for req in group}
+        chunked_in_queue = [
+            req
+            for req in self.get_waiting_queue()
+            if req.has_pending_chunk
+            and req.req_pool_idx is not None
+            and id(req) not in seen_ids
+        ]
+        if chunked_in_queue:
+            req_groups.append(chunked_in_queue)
 
         full_uncached = 0
         swa_uncached = 0
-        for batch in batches:
-            for req in batch.reqs:
+        for group in req_groups:
+            for req in group:
                 assert req.kv_committed_freed == req.kv_overallocated_freed
                 if req.kv_committed_freed or req.req_pool_idx is None:
                     continue
