@@ -42,6 +42,7 @@ class SamplingBatchInfo:
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
     grammars: Optional[List] = None
+    rids_hashed: Optional[torch.Tensor] = None
     vocab_mask: Optional[torch.Tensor] = None
     apply_mask_func: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None
 
