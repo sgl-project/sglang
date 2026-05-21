@@ -124,7 +124,9 @@ def _assert_mock_model_bench_succeeded(
 ) -> None:
     completed = bench_result.result.get("completed")
     if completed != expected_completed:
-        raise AssertionError(f"Expected {expected_completed} completed requests, got {completed}")
+        raise AssertionError(
+            f"Expected {expected_completed} completed requests, got {completed}"
+        )
 
     if bench_result.server_return_code is not None:
         raise AssertionError(
