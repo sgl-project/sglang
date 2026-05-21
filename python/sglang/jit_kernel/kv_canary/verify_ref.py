@@ -148,6 +148,8 @@ def canary_verify_step_torch_reference(
         violation_ring.copy_(ring_host.to(violation_ring.device))
 
     violation_write_index[0] = violation_write_index[0] + num_new_violations
+
+
 def _to_signed_int64(value: int) -> int:
     value &= _U64_MASK
     if value >= _I64_SIGN_BIT:
