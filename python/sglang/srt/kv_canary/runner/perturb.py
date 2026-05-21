@@ -40,7 +40,6 @@ class PerturbHook:
         self._buffer_groups = buffer_groups
         self._pump_and_allreduce = pump_and_allreduce
         self._radix_cache: Optional["BasePrefixCache"] = None
-        self._perturb_undo: Optional[tuple[int, int, int]] = None
         self._warmup_disable_logged: bool = False
         self._warmup_enable_logged: bool = False
 
@@ -70,7 +69,7 @@ class PerturbHook:
             self._warmup_enable_logged = True
         return False
 
-    def perturb_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_req_to_token_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.req_to_token_prob <= 0.0:
             return
         if self._is_in_warmup():
@@ -133,7 +132,6 @@ class PerturbHook:
             new_value,
         )
         table[target.req_pool_idx, target.position] = new_value
-        self._perturb_undo = (target.req_pool_idx, target.position, target.slot)
 
     def perturb_real_kv_hook(self, forward_batch: Optional["ForwardBatch"]) -> None:
         if self._config.real_kv_prob <= 0.0:
@@ -193,18 +191,6 @@ class PerturbHook:
             new_byte,
         )
         flat[row, col] = new_byte
-
-    def undo_after_step(self) -> None:
-        if self._perturb_undo is not None:
-            row, col, original = self._perturb_undo
-            self._req_to_token_pool.req_to_token[row, col] = original
-            logger.info(
-                "kv_canary perturb undo req_to_token: req_pool_idx=%d position=%d restored_slot=%d",
-                row,
-                col,
-                original,
-            )
-            self._perturb_undo = None
 
     def _collect_real_kv_perturb_candidates(
         self, forward_batch: "ForwardBatch"

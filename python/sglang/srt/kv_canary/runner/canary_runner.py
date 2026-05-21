@@ -187,7 +187,6 @@ class CanaryRunner:
         any_rank_errored = self._pump_and_allreduce.pump_and_drain()
         self._health_and_stats.health_check_step()
         self._health_and_stats.print_periodic_stats()
-        self._perturb_hook.undo_after_step()
 
         if any_rank_errored and not self._violation_reporter.is_raised:
             self._violation_reporter.log_or_raise_violation()
