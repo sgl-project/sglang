@@ -96,6 +96,7 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
 
 class DeepGemmKernelType(IntEnum):
     GROUPED_GEMM_NT_F8F8BF16_MASKED = auto()
+    GROUPED_GEMM_NT_F8FP4BF16_MASKED = auto()
     GROUPED_GEMM_NT_F8F8BF16_CONTIG = auto()
     GROUPED_GEMM_NT_BF16_MASKED = auto()
     GROUPED_GEMM_NT_BF16_CONTIG = auto()
@@ -230,6 +231,7 @@ class _BaseWarmupExecutor:
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
+            DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED: _GroupedMaskedFp8Fp4WarmupExecutor,
             DeepGemmKernelType.GEMM_NT_BF16BF16F32: _BF16F32WarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG: _BF16GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED: _BF16GroupedMaskedWarmupExecutor,
@@ -253,6 +255,14 @@ class _BaseWarmupExecutor:
             return (
                 num_groups * max_m * k
                 + num_groups * n * k
+                + num_groups * 4
+                + num_groups * max_m * n * 2
+            ) / _GB
+        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED:
+            return (
+                num_groups * max_m * k
+                + num_groups * n * ceil_div(k, 2)
+                + num_groups * n * ceil_div(k, 32) * 4
                 + num_groups * 4
                 + num_groups * max_m * n * 2
             ) / _GB
@@ -361,6 +371,34 @@ class _GroupedMaskedWarmupExecutor(_BaseWarmupExecutor):
             masked_m=self.masked_m,
             # DeepGEMM uses `expect_m` instead of input shape for `get_best_config`
             expected_m=m,
+        )
+
+
+class _GroupedMaskedFp8Fp4WarmupExecutor(_BaseWarmupExecutor):
+    def __init__(self, max_m: int, n: int, k: int, num_groups: int):
+        self.lhs_q, self.lhs_s = _empty_token_fp8((num_groups, max_m, k))
+        self.rhs_q = torch.empty(
+            (num_groups, n, ceil_div(k, 2)), device="cuda", dtype=torch.int8
+        )
+        self.rhs_s = torch.empty(
+            (num_groups, n, ceil_div(k, 32)), device="cuda", dtype=torch.float32
+        )
+        self.masked_m = torch.zeros((num_groups,), device="cuda", dtype=torch.int32)
+        self.out = torch.empty(
+            (num_groups, max_m, n), device="cuda", dtype=torch.bfloat16
+        )
+
+
+    def execute(self, m):
+        deep_gemm.m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma(
+            (self.lhs_q, self.lhs_s),
+            (self.rhs_q, self.rhs_s),
+            self.out,
+            masked_m=self.masked_m,
+            expected_m=m,
+            gran_k=128,
+            gran_k_a=128,
+            gran_k_b=32,
         )
 
 
