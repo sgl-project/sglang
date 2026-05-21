@@ -755,7 +755,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_verify_complete=None):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_forward_complete=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -767,8 +767,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch_output = self.target_worker.forward_batch_generation(batch)
 
             # Publish before draft_extend so the fence is at target-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch.seq_lens)
+            if on_forward_complete is not None:
+                on_forward_complete(batch.seq_lens)
 
             # Draft prefill
             with (
@@ -813,8 +813,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch_output.new_seq_lens)
+            if on_forward_complete is not None:
+                on_forward_complete(batch_output.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group

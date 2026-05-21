@@ -36,7 +36,6 @@ class _FakeBatch:
         self.reqs = [_FakeReq(finished=all_finished) for _ in range(n)]
         self.seq_lens = torch.ones(n, dtype=torch.int32)
         self.seq_lens_cpu = torch.ones(n, dtype=torch.int32)
-        self.orig_seq_lens = torch.ones(n, dtype=torch.int32)
         self.req_pool_indices = torch.zeros(n, dtype=torch.int64)
         self.output_ids = torch.zeros(n, dtype=torch.int64)
         self.seq_lens_sum = n
@@ -60,7 +59,6 @@ class _FakeBatch:
         idx = torch.tensor(keep_indices, dtype=torch.int64)
         self.seq_lens = self.seq_lens[idx]
         self.seq_lens_cpu = self.seq_lens_cpu[idx]
-        self.orig_seq_lens = self.orig_seq_lens[idx]
         self.req_pool_indices = self.req_pool_indices[idx]
         if self.output_ids is not None:
             self.output_ids = self.output_ids[idx]
@@ -70,7 +68,6 @@ class _FakeBatch:
         """Simplified merge_batch: replicates the tensor-cat logic."""
         self.seq_lens = torch.cat([self.seq_lens, other.seq_lens])
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
-        self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.req_pool_indices = torch.cat(
             [self.req_pool_indices, other.req_pool_indices]
         )
