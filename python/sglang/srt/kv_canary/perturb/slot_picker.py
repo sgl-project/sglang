@@ -58,12 +58,12 @@ def collect_active_slots(
         if out_cache_loc is not None:
             excluded = set(int(x) for x in out_cache_loc.detach().to("cpu").tolist())
 
-    req_pool_indices_cpu = req_pool_indices.detach().to("cpu").tolist()
-    seq_lens_cpu = seq_lens.detach().to("cpu").tolist()
+    req_pool_indices_list = req_pool_indices.detach().to("cpu").tolist()
+    seq_lens_list = seq_lens.detach().to("cpu").tolist()
     rows, cols = int(req_to_token.shape[0]), int(req_to_token.shape[1])
 
     candidates: list[ActiveSlotTarget] = []
-    for req_pool_idx, seq_len in zip(req_pool_indices_cpu, seq_lens_cpu):
+    for req_pool_idx, seq_len in zip(req_pool_indices_list, seq_lens_list):
         req_pool_idx_int = int(req_pool_idx)
         seq_len_int = int(seq_len)
         if req_pool_idx_int < 0 or req_pool_idx_int >= rows:
