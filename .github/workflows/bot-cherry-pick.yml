@@ -44,7 +44,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -131,7 +131,7 @@ jobs:
       - name: Create Pull Request
         if: steps.cherry_pick.outputs.cherry_pick_success == 'true' && github.event.inputs.create_pr == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_PULL_REQUEST }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_CHERRY_PICK }}
           TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
           SHORT_SHA: ${{ steps.commit_info.outputs.short_sha }}
           COMMIT_TITLE: ${{ steps.commit_info.outputs.commit_title }}
