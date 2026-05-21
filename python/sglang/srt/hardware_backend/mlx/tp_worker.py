@@ -13,7 +13,7 @@ normal ``GenerationBatchResult``.
 """
 
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import mlx.core as mx
 import torch
@@ -27,6 +27,9 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+
+if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +57,7 @@ class MlxTpModelWorker(TpModelWorker):
             disable_radix_cache=self.server_args.disable_radix_cache,
             mem_fraction_static=self.server_args.mem_fraction_static,
             quantization=self.server_args.quantization,
+            enable_sampling=self.server_args.mlx_enable_sampling,
         )
         if self.server_args.max_total_tokens is not None:
             init_kwargs["pool_size"] = self.server_args.max_total_tokens
@@ -124,6 +128,49 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             self._mlx_active_rids |= current_rids
 
+    def _decode_with_sampling(
+        self, batch: ScheduleBatch, req_ids: list[str]
+    ) -> tuple[list[int], "LogitsProcessorOutput"]:
+        """Run a pure-decode pass and sample via sglang's Sampler instead of mx.argmax."""
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.model_executor.forward_batch_info import clamp_position
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        pending, lazy_logits = self._mlx_runner.decode_batch_logits(req_ids)
+        logits_cpu = mlx_to_torch(lazy_logits, device="cpu")
+
+        if batch.seq_lens is not None:
+            positions = clamp_position(batch.seq_lens)
+        else:
+            positions = torch.zeros(len(req_ids), dtype=torch.long)
+
+        logits_output = LogitsProcessorOutput(next_token_logits=logits_cpu)
+
+        # Inline the safe parts of ModelRunner._preprocess_logits;
+        # penalizer_orchestrator.apply is torch.compile + Triton, unsupported on MPS.
+        sinfo = batch.sampling_info
+        sinfo.update_regex_vocab_mask()
+        if sinfo.vocab_mask is not None:
+            sinfo.apply_mask_func(
+                logits=logits_output.next_token_logits,
+                vocab_mask=sinfo.vocab_mask,
+            )
+        if sinfo.logit_bias is not None:
+            logits_output.next_token_logits.add_(sinfo.logit_bias)
+        sinfo.vocab_mask = None
+
+        next_token_ids = self._model_runner.sampler(
+            logits_output,
+            batch.sampling_info,
+            batch.return_logprob,
+            batch.top_logprobs_nums or [0] * len(req_ids),
+            batch.token_ids_logprobs or [None] * len(req_ids),
+            positions,
+        )
+        sampled = [int(t) for t in next_token_ids.tolist()]
+        committed = self._mlx_runner.decode_batch_commit(pending, sampled)
+        return committed, logits_output
+
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
@@ -142,6 +189,7 @@ class MlxTpModelWorker(TpModelWorker):
         self._cleanup_stale_rids(forward_mode, {req.rid for req in reqs})
 
         next_token_ids_list: list[int] = []
+        sampled_logits_output: Optional["LogitsProcessorOutput"] = None
 
         if forward_mode.is_extend():
             # Ensure pool is up-to-date before PoolBackedCache reads it
@@ -208,7 +256,16 @@ class MlxTpModelWorker(TpModelWorker):
 
         elif forward_mode.is_decode():
             req_ids = [req.rid for req in reqs]
-            next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
+            if (
+                self.server_args.mlx_enable_sampling
+                and batch.sampling_info is not None
+                and getattr(self._model_runner, "sampler", None) is not None
+            ):
+                next_token_ids_list, sampled_logits_output = self._decode_with_sampling(
+                    batch, req_ids
+                )
+            else:
+                next_token_ids_list = self._mlx_runner.decode_batch(req_ids)
 
         else:
             raise ValueError(
@@ -220,7 +277,11 @@ class MlxTpModelWorker(TpModelWorker):
         )
 
         return GenerationBatchResult(
-            logits_output=LogitsProcessorOutput(next_token_logits=None),
+            logits_output=(
+                sampled_logits_output
+                if sampled_logits_output is not None
+                else LogitsProcessorOutput(next_token_logits=None)
+            ),
             next_token_ids=next_token_ids,
             can_run_cuda_graph=False,
         )

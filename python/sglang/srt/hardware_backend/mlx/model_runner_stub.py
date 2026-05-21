@@ -113,7 +113,12 @@ class MlxModelRunnerStub(ModelRunner):
         )
 
         # Load model (sets metadata only)
-        self.sampler = None
+        if getattr(self.server_args, "mlx_enable_sampling", False):
+            from sglang.srt.layers.sampler import create_sampler
+
+            self.sampler = create_sampler()
+        else:
+            self.sampler = None
         self.load_model()
 
         # Layer metadata
