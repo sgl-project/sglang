@@ -335,58 +335,6 @@ download_flashinfer_cache() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-fix_cutlass_dsl_libs() {
-    # nvidia-cutlass-dsl[cu13] has additive extras on PyPI: both -libs-base AND
-    # -libs-cu13 are installed when [cu13] is requested. They write to the same
-    # site-packages paths with conflicting content. At 4.5.0 the two .so files
-    # expose a compatible Python binding so the conflict is silent; at 4.5.1+
-    # -libs-cu13's binding changed without a wrapper bump and the conflict
-    # surfaces as a GPUModuleOp TypeError at kernel-compile time
-    # (see vllm-project/vllm#40082).
-    #
-    # Independent of the API mismatch, the two .so files target different GPU
-    # families. Pick the right one per runner:
-    #
-    #   Blackwell (IS_BLACKWELL=1, CU13):
-    #     -libs-cu13 must win. It provides the sm_110 arch alias that the
-    #     CUDA-12.9-built -libs-base wheel lacks. Remove -libs-base and
-    #     force-reinstall -libs-cu13 so its files take precedence.
-    #
-    #   Non-Blackwell CU13 (H100, H200, …):
-    #     -libs-base must win. Keeping only -libs-cu13 causes a
-    #     CUDBG_EXCEPTION_WARP_ILLEGAL_ADDRESS regression in LoRA CUDA-graph
-    #     capture on H100 (#25743). Remove -libs-cu13 and force-reinstall
-    #     -libs-base so the original bindings are intact.
-    #
-    #   Non-CU13:
-    #     Only -libs-base is installed (no [cu13] extra) — no conflict.
-    #
-    if [ "$CU_MAJOR" != "13" ]; then
-        return
-    fi
-
-    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    if [ -z "$CUTLASS_DSL_VERSION" ]; then
-        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs fix"
-        return
-    fi
-
-    if [ "$IS_BLACKWELL" = "1" ]; then
-        # Blackwell: -libs-cu13 must win for sm_110 support.
-        echo "fix_cutlass_dsl_libs: Blackwell runner — purging -libs-base, reinstalling -libs-cu13==${CUTLASS_DSL_VERSION}"
-        $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-base $PIP_UNINSTALL_SUFFIX || true
-        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
-    else
-        # Non-Blackwell CU13 (H100, H200): -libs-base must win to avoid LoRA
-        # CUDA-graph regression and GPUModuleOp TypeError.
-        echo "fix_cutlass_dsl_libs: non-Blackwell CU13 runner — purging -libs-cu13, reinstalling -libs-base==${CUTLASS_DSL_VERSION}"
-        $PIP_UNINSTALL_CMD nvidia-cutlass-dsl-libs-cu13 $PIP_UNINSTALL_SUFFIX || true
-        $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
-    fi
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 stabilize_flashinfer_jit_paths() {
     # In venv mode, FlashInfer JIT writes build.ninja with hardcoded -isystem
     # paths. Per-job venvs get unique paths, but the JIT cache is shared on the
@@ -540,7 +488,6 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
-    fix_cutlass_dsl_libs
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
