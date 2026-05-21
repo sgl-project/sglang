@@ -39,6 +39,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
@@ -177,10 +178,9 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         self.draft_attn_backend = self._init_draft_attn_backend()
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-        # Make the runner's attn_backend point at the draft backend so the
-        # global ``get_attn_backend()`` set by _forward_raw resolves to it
-        # during draft forward passes. For topk=1 this is already true.
-        self.draft_model_runner.attn_backend = self.draft_attn_backend
+        # For topk > 1 the draft backend differs from the runner's main
+        # attn_backend; we publish it per-call via ForwardContext at each
+        # draft forward site below rather than mutating the runner.
         self.cuda_graph_runner = None
 
         with (
@@ -281,8 +281,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
-        # draft_model_runner.attn_backend points at draft_attn_backend; the
-        # forward pass publishes it via pool_context.
+        # Each draft forward call wraps with forward_context to publish
+        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
@@ -297,8 +297,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_mode=ForwardMode.DECODE,
                 spec_info=None,
             )
-        # draft_model_runner.attn_backend points at draft_attn_backend; the
-        # forward pass publishes it via pool_context.
+        # Each draft forward call wraps with forward_context to publish
+        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
@@ -318,8 +318,8 @@ class FrozenKVMTPWorker(TpModelWorker):
                     else None
                 ),
             )
-        # draft_model_runner.attn_backend points at draft_attn_backend; the
-        # forward pass publishes it via pool_context.
+        # Each draft forward call wraps with forward_context to publish
+        # self.draft_attn_backend, so no FB or runner mutation is needed.
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
@@ -405,7 +405,9 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch):
+            with self._target_kv_pool_view(forward_batch), forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend)
+            ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
@@ -687,7 +689,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch):
+            with self._target_kv_pool_view(forward_batch), forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend)
+            ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output

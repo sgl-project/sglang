@@ -56,6 +56,16 @@ def set_forward_context(ctx: Optional[ForwardContext]) -> Optional[ForwardContex
     return prev
 
 
+def has_forward_context() -> bool:
+    """Return True if a ``ForwardContext`` is currently active.
+
+    ``ModelRunner._forward_raw`` reads this to detect a caller-supplied
+    outer context (e.g. spec workers wrapping per-step draft forwards
+    with the i-th child backend) and avoid overriding it.
+    """
+    return _current is not None
+
+
 def get_forward_context() -> ForwardContext:
     """Return the active forward context.
 

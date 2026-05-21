@@ -150,6 +150,7 @@ from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
     get_forward_context,
+    has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -3243,8 +3244,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # other ModelRunner instances have been initialized in this process.
         # Frozen-KV MTP swaps self.token_to_kv_pool itself before calling
         # forward(), so this pool set picks up that override.
+        #
+        # If the caller has already published a ForwardContext (e.g. spec
+        # workers wrapping the per-step draft forward with the i-th child
+        # backend), honor it — overriding would defeat the per-call control.
+        # Otherwise publish this runner's own ``self.attn_backend``.
         prev_pools = set_kv_pools(self.req_to_token_pool, self.token_to_kv_pool)
         try:
+            if has_forward_context():
+                return self._forward_raw_body(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    reinit_attn_backend=reinit_attn_backend,
+                    split_forward_count=split_forward_count,
+                )
             with forward_context(ForwardContext(attn_backend=self.attn_backend)):
                 return self._forward_raw_body(
                     forward_batch,
