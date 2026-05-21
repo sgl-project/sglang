@@ -163,7 +163,7 @@ class CanaryRunner:
         try:
             yield
         finally:
-            self._end_of_step()
+            self._end_of_step(forward_batch)
 
     def _before_forward(self, forward_batch: "ForwardBatch") -> None:
         self._per_forward_orchestrator.before_forward(forward_batch)
@@ -178,11 +178,11 @@ class CanaryRunner:
         """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def _end_of_step(self) -> None:
+    def _end_of_step(self, forward_batch: "ForwardBatch") -> None:
         if self.config.mode == "off":
             return
 
-        self._per_forward_orchestrator.end_of_step()
+        self._per_forward_orchestrator.end_of_step(forward_batch)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()
