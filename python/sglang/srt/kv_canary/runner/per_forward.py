@@ -191,6 +191,7 @@ class PerForwardOrchestrator:
             return
         if self._last_forward_batch is not None:
             self._perturb_manager.end_of_forward(self._last_forward_batch)
+        self._last_forward_batch = None
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
 
 
