@@ -88,7 +88,9 @@ class TestEaglePositionsMisalignRegression(CustomTestCase):
             )
         except Exception as exc:
             cls._launch_exc = exc
-            logger.warning("server launch raised during revert path: %r", exc, exc_info=True)
+            logger.warning(
+                "server launch raised during revert path: %r", exc, exc_info=True
+            )
 
     @classmethod
     def tearDownClass(cls) -> None:
