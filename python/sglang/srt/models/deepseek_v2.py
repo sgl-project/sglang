@@ -2450,9 +2450,19 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             # Allow-list of n_routed_experts values that have been validated
             # for shared-experts fusion under this code path. Currently:
             #   256 -> DeepSeek-V3 / R1
-            #   384 -> Kimi-K2.5 (text_config wraps DeepseekV3ForCausalLM)
+            #   384 -> Kimi-K2.5, only when the checkpoint is Quark MXFP4
+            #          (amd/Kimi-K2.5-MXFP4); the standard
+            #          moonshotai/Kimi-K2.5 (compressed-tensors) checkpoint
+            #          stores the shared expert loose and is NOT pre-fused,
+            #          so the fused path silently mis-loads it.
             or self.config.n_routed_experts not in (256, 384)
             or self.config.n_shared_experts != 1
+            or (
+                self.config.n_routed_experts == 384
+                and (
+                    self.quant_config is None or self.quant_config.get_name() != "quark"
+                )
+            )
         ):
             disable_reason = "Config does not support fused shared expert(s)."
         elif (
