@@ -105,32 +105,6 @@ def _patch_future_tensor():
     )
 
 
-class _LogCapture:
-    def __init__(self) -> None:
-        self.records: list[logging.LogRecord] = []
-        self._handler: Optional[logging.Handler] = None
-        self._previous_level: Optional[int] = None
-
-    def __enter__(self) -> "_LogCapture":
-        self._handler = logging.Handler()
-        self._handler.emit = lambda record: self.records.append(record)
-        logger = logging.getLogger(swa_div_module.__name__)
-        self._previous_level = logger.level
-        logger.addHandler(self._handler)
-        logger.setLevel(logging.DEBUG)
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        logger = logging.getLogger(swa_div_module.__name__)
-        if self._handler is not None:
-            logger.removeHandler(self._handler)
-        if self._previous_level is not None:
-            logger.setLevel(self._previous_level)
-
-    def lines(self) -> list[str]:
-        return [record.getMessage() for record in self.records]
-
-
 def _parse_swa_divergence_line(line: str) -> dict[str, int]:
     parsed = parse_swa_divergence_line(line)
     if parsed is None:
@@ -164,13 +138,13 @@ class TestSwaDivergenceStats(CustomTestCase):
                 )
                 stats.on_forward_completed()
 
-            with _LogCapture() as capture:
+            with self.assertLogs(
+                swa_div_module.logger.name, level=logging.INFO
+            ) as captured:
                 stats.emit_log_if_due(step_counter=10, period=10)
                 stats.emit_log_if_due(step_counter=20, period=10)
 
-            lines = [
-                line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
-            ]
+            lines = [line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
             self.assertEqual(fields["forward_ct"], 4)
@@ -191,15 +165,17 @@ class TestSwaDivergenceStats(CustomTestCase):
             snapshots: list[dict[str, int]] = []
 
             def _take_snapshot(step: int) -> None:
-                with _LogCapture() as capture:
+                with self.assertLogs(
+                    swa_div_module.logger.name, level=logging.INFO
+                ) as captured:
                     stats.emit_log_if_due(step_counter=step, period=10)
                     stats.emit_log_if_due(step_counter=step + 10, period=10)
                 matching = [
                     line
-                    for line in capture.lines()
+                    for line in captured.output
                     if SWA_DIVERGENCE_LOG_PREFIX in line
                 ]
-                self.assertTrue(matching, capture.lines())
+                self.assertTrue(matching, captured.output)
                 snapshots.append(_parse_swa_divergence_line(matching[-1]))
 
             for batch in range(3):
@@ -246,12 +222,14 @@ class TestSwaDivergenceStats(CustomTestCase):
             )
             stats.on_forward_completed()
 
-            with _LogCapture() as capture:
+            with self.assertLogs(
+                swa_div_module.logger.name, level=logging.INFO
+            ) as captured:
                 stats.emit_log_if_due(step_counter=10, period=10)
                 stats.emit_log_if_due(step_counter=20, period=10)
 
             matching = [
-                line for line in capture.lines() if SWA_DIVERGENCE_LOG_PREFIX in line
+                line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line
             ]
             self.assertEqual(len(matching), 1, matching)
             fields = _parse_swa_divergence_line(matching[0])
