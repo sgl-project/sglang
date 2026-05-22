@@ -60,7 +60,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
             eval_name="gsm8k",
             num_examples=200,
             num_threads=200,
-            max_tokens=1024,
+            max_tokens=4096,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
