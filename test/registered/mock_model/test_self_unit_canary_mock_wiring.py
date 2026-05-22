@@ -134,9 +134,7 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(
             expected_inputs.tokens[:2].tolist(),
             [
-                _scalar_expected_token(
-                    oracle, generalized_req_id=1234, position=10
-                ),
+                _scalar_expected_token(oracle, generalized_req_id=1234, position=10),
                 _scalar_expected_token(
                     oracle, generalized_req_id=hashed_b, position=20
                 ),

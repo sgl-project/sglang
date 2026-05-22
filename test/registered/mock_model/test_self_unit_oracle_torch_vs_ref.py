@@ -33,7 +33,9 @@ class TestHashOracleTorchVsRef(CustomTestCase):
 
         oracle = HashOracle(vocab_size=vocab_size)
         torch_tokens: list[int] = []
-        generalized_req_ids_tensor = torch.tensor(generalized_req_ids, dtype=torch.int64)
+        generalized_req_ids_tensor = torch.tensor(
+            generalized_req_ids, dtype=torch.int64
+        )
         positions_tensor = torch.tensor(positions, dtype=torch.int64)
         for i in range(num_cases):
             out = oracle.expected_tokens(
