@@ -32,6 +32,15 @@ export const GLM5Deployment = () => {
         ];
       }
     },
+    strategy: {
+      name: 'strategy',
+      title: 'Strategy',
+      items: [
+        { id: 'low-latency',    label: 'Low-Latency',    default: true  },
+        { id: 'balanced',       label: 'Balanced',       default: false },
+        { id: 'max-throughput', label: 'Max-Throughput', default: false }
+      ]
+    },
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
@@ -45,24 +54,6 @@ export const GLM5Deployment = () => {
       name: 'toolcall',
       title: 'Tool Call Parser',
       condition: (values) => values.quantization !== 'nvfp4',
-      items: [
-        { id: 'disabled', label: 'Disabled', default: false },
-        { id: 'enabled',  label: 'Enabled',  default: true  }
-      ]
-    },
-    dpattention: {
-      name: 'dpattention',
-      title: 'DP Attention',
-      condition: (values) => values.quantization !== 'nvfp4',
-      items: [
-        { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',      default: true },
-        { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput',  default: false }
-      ]
-    },
-    speculative: {
-      name: 'speculative',
-      title: 'Speculative Decoding',
-      condition: (values) => values.hardware !== 'mi300x' && values.hardware !== 'mi355x' && values.quantization !== 'nvfp4',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -134,10 +125,9 @@ export const GLM5Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { hardware, quantization } = values;
-    const isAMD = hardware === 'mi300x' || hardware === 'mi355x';
-    const isNVFP4 = quantization === 'nvfp4';
-    const effectiveQuant = isAMD ? 'bf16' : quantization;
+    const isAMD = values.hardware === 'mi300x' || values.hardware === 'mi355x';
+    const isNVFP4 = values.quantization === 'nvfp4';
+    const effectiveQuant = isAMD ? 'bf16' : values.quantization;
 
     let modelName;
     if (isNVFP4) {
@@ -147,8 +137,9 @@ export const GLM5Deployment = () => {
       modelName = `zai-org/GLM-5${suffix}`;
     }
 
-    const hwConfig = modelConfigs[hardware][effectiveQuant];
-    const tpValue = hwConfig.tp;
+    const hwConfig = modelConfigs[values.hardware][effectiveQuant];
+    let tpValue = hwConfig.tp;
+    if (tpValue === 4 && values.strategy === 'low-latency') tpValue *= 2;
     const memFraction = hwConfig.mem;
 
     let cmd = 'sglang serve \\\n';
@@ -171,6 +162,12 @@ export const GLM5Deployment = () => {
       cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
       cmd += ' \\\n  --scheduler-recv-interval 10';
       cmd += ' \\\n  --tokenizer-worker-num 6';
+      if (values.strategy !== 'max-throughput') {
+        cmd += ' \\\n  --speculative-algorithm EAGLE';
+        cmd += ` \\\n  --speculative-num-steps ${values.strategy === 'balanced' ? 1 : 3}`;
+        cmd += ' \\\n  --speculative-eagle-topk 1';
+        cmd += ` \\\n  --speculative-num-draft-tokens ${values.strategy === 'balanced' ? 2 : 4}`;
+      }
       return cmd;
     }
 
@@ -183,20 +180,17 @@ export const GLM5Deployment = () => {
       cmd += ' \\\n  --watchdog-timeout 1200';
     }
 
-    if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
-    }
     if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser glm45';
     if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser glm47';
-    if (values.speculative === 'enabled') {
+    if (!isAMD && values.strategy !== 'max-throughput') {
       cmd += ' \\\n  --speculative-algorithm EAGLE';
-      cmd += ' \\\n  --speculative-num-steps 3';
+      cmd += ` \\\n  --speculative-num-steps ${values.strategy === 'balanced' ? 1 : 3}`;
       cmd += ' \\\n  --speculative-eagle-topk 1';
-      cmd += ' \\\n  --speculative-num-draft-tokens 4';
+      cmd += ` \\\n  --speculative-num-draft-tokens ${values.strategy === 'balanced' ? 2 : 4}`;
     }
 
     // B200 FP8: consolidated optimized flags.
-    if (hardware === 'b200' && effectiveQuant === 'fp8') {
+    if (values.hardware === 'b200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --ep 1';
       cmd += ' \\\n  --quantization fp8';
       cmd += ' \\\n  --attention-backend dsa';
@@ -207,7 +201,7 @@ export const GLM5Deployment = () => {
     }
 
     // H200 FP8: flashinfer allreduce fusion.
-    if (hardware === 'h200' && effectiveQuant === 'fp8') {
+    if (values.hardware === 'h200' && effectiveQuant === 'fp8') {
       cmd += ' \\\n  --enable-flashinfer-allreduce-fusion';
     }
 
