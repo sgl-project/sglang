@@ -4,7 +4,7 @@ from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
-from sglang.test.kv_canary.utils import post_parallel_generate
+from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
 from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -28,20 +28,11 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         cls.model = cls._cfg.model_path
 
-        canary_args = [
-            "--kv-canary",
-            cls.kv_canary_mode.value,
-            "--context-length",
-            "8192",
-            *cls.extra_server_args,
-        ]
-        if cls._cfg.json_model_override_args is not None:
-            canary_args.extend(
-                [
-                    "--json-model-override-args",
-                    cls._cfg.json_model_override_args,
-                ]
-            )
+        canary_args = build_canary_server_args(
+            kv_canary_mode=cls.kv_canary_mode,
+            mode_cfg=cls._cfg,
+            extra_server_args=cls.extra_server_args,
+        )
         cls.extra_prefill_args = list(canary_args)
         cls.extra_decode_args = list(canary_args)
         cls.launch_all()

@@ -4,6 +4,29 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+from sglang.srt.kv_canary.config import CanaryMode
+from sglang.test.kv_canary.mode_config import _ModeConfig
+
+
+def build_canary_server_args(
+    *,
+    kv_canary_mode: CanaryMode,
+    mode_cfg: _ModeConfig,
+    extra_server_args: tuple[str, ...] = (),
+) -> list[str]:
+    args = [
+        "--kv-canary",
+        kv_canary_mode.value,
+        "--context-length",
+        "8192",
+        *extra_server_args,
+    ]
+    if mode_cfg.json_model_override_args is not None:
+        args.extend(
+            ["--json-model-override-args", mode_cfg.json_model_override_args]
+        )
+    return args
+
 
 def post_parallel_generate(
     *,
