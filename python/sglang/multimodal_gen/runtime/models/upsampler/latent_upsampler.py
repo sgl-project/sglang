@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
+
 
 class BlurDownsample(torch.nn.Module):
     """Anti-aliased spatial downsampling by integer stride using a fixed separable binomial kernel."""
@@ -106,8 +108,11 @@ class ResBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.conv1(x)
-        x = self.norm1(x)
-        x = self.activation(x)
+        # Fused GroupNorm + SiLU on the first norm of the block. The second
+        # norm (line below) is followed by `silu(norm + residual)`, which the
+        # current `apply_group_norm_silu` helper does not cover -- left on
+        # the eager path until a `group_norm_add_silu` helper exists.
+        x = apply_group_norm_silu(x, self.norm1, self.activation)
         x = self.conv2(x)
         x = self.norm2(x)
         x = self.activation(x + residual)
@@ -235,8 +240,7 @@ class LatentUpsampler(torch.nn.Module):
         if self.dims == 2:
             x = rearrange(latent, "b c f h w -> (b f) c h w")
             x = self.initial_conv(x)
-            x = self.initial_norm(x)
-            x = self.initial_activation(x)
+            x = apply_group_norm_silu(x, self.initial_norm, self.initial_activation)
             for block in self.res_blocks:
                 x = block(x)
             x = self.upsampler(x)
@@ -246,8 +250,7 @@ class LatentUpsampler(torch.nn.Module):
             x = rearrange(x, "(b f) c h w -> b c f h w", b=b, f=f)
         else:
             x = self.initial_conv(latent)
-            x = self.initial_norm(x)
-            x = self.initial_activation(x)
+            x = apply_group_norm_silu(x, self.initial_norm, self.initial_activation)
             for block in self.res_blocks:
                 x = block(x)
 

@@ -38,6 +38,13 @@ CASES = [
     Case("video_3d_small", (1, 64, 4, 16, 16), 32),
     Case("threshold_3d", (1, 128, 1, 256, 256), 32),
     Case("hunyuan_video_large", (1, 128, 20, 256, 256), 32),
+    # LTX-2 latent upsampler (`LatentUpsampler` + `ResBlock`) operates on
+    # `[B, mid_channels=512, F, H, W]` tensors with num_groups=32. The pre-
+    # and post-upsample variants bracket the production shape range; the
+    # _small case keeps CI memory bounded.
+    Case("ltx2_upsampler_small", (1, 512, 8, 45, 80), 32),
+    Case("ltx2_upsampler_pre_720p", (1, 512, 16, 90, 160), 32),
+    Case("ltx2_upsampler_post_720p", (1, 512, 16, 180, 320), 32),
 ]
 CASE_BY_NAME = {case.name: case for case in CASES}
 
