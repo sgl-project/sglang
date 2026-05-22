@@ -2779,6 +2779,10 @@ class AiterMultiStepDraftBackend:
     def common_template(
         self, forward_batch: ForwardBatch, kv_indices_buffer: torch.Tensor, call_fn: int
     ):
+        # Multi-step wrappers only ever run draft decode -- assert the
+        # invariant up front to match FlashInfer / FlashInferMLA.
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
         seq_lens_sum = forward_batch.seq_lens_sum

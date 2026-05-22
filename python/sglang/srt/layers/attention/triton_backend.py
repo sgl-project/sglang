@@ -1216,6 +1216,10 @@ class TritonMultiStepDraftBackend:
         kv_indices_buffer: Optional[torch.Tensor],
         call_fn: int,
     ):
+        # Multi-step wrappers only ever run draft decode -- assert the
+        # invariant up front to match FlashInfer / FlashInferMLA.
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
         if kv_indices_buffer is None:
             kv_indices_buffer = self.cuda_graph_kv_indices
 
