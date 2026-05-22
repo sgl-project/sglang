@@ -214,7 +214,6 @@ class TestExtendAttention(CustomTestCase):
             b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
         else:
             b_seq_len_extend = torch.as_tensor(b_seq_len_extend, dtype=torch.int32)
-
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
         max_len_in_batch = (
             torch.max(b_seq_len, 0)[0].item() + torch.max(encoder_lens, 0)[0].item()

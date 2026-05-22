@@ -722,7 +722,7 @@ at::Tensor convert_scale_packed(at::Tensor& scale) {
   return packed_scale;
 }
 
-// mat1 : [M, K]
+// mat1 : [*, K]
 // mat2 : [N, K] ([K, N] if use_fma_gemm)
 // bias : [N]
 // out  : [*, N]

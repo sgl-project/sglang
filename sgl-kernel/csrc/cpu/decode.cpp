@@ -1582,7 +1582,7 @@ void decode_attention_grouped_kernel_impl(
 // req_pool_indices: [num_seqs] int64
 // seq_lens:         [num_seqs] int64
 // encoder_lens:     [num_seqs] int64 or None
-// sinks: [num_heads] or None
+// sinks:            [num_heads] or None
 void decode_attention_cpu(
     at::Tensor& query,
     at::Tensor& k_buffer,
