@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from array import array
 from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
@@ -124,6 +125,9 @@ class UnifiedLRUList:
         pt = self._pt
         node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
         node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
+        # Clear self pointers to break reference cycles among evicted nodes.
+        node.lru_prev[pt] = None
+        node.lru_next[pt] = None
 
     def insert_mru(self, node: UnifiedTreeNode):
         assert node.id not in self.cache
@@ -254,7 +258,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
         self.root_node = UnifiedTreeNode(self.tree_components)
-        self.root_node.key = RadixKey([], None)
+        self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         for ct in self.tree_components:
             self.root_node.component_data[ct].lock_ref = 1
@@ -389,6 +393,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
+
+        if (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        ):
+            self.writing_check(write_back=True)
 
         self.update_eviction_metrics(sum(tracker.values()), start_time)
         return EvictResult(
@@ -1653,6 +1663,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.session.any_holding_kv():
             return
 
+        write_back = (
+            self.cache_controller is not None
+            and self.cache_controller.write_policy == "write_back"
+        )
+
         errors: list[str] = []
         E = errors.append
         all_nodes = self._collect_all_nodes()
@@ -1709,7 +1724,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 p_hst = node.parent.component_data[FCT].host_value is not None
                 if full_dev and not p_dev:
                     E(f"node {nid} device present but parent {node.parent.id} evicted")
-                if full_hst and not p_hst:
+                if full_hst and not p_hst and not write_back:
                     E(f"node {nid} backed up but parent {node.parent.id} not backed up")
 
             # Lock hierarchy and counters must stay sane.
