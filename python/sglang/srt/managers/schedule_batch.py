@@ -2159,6 +2159,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
+        if running_batch.enable_overlap:
+            # running_batch.seq_lens (GPU) is the FutureMap sentinel between iters;
+            # restore from CPU shadow before merge so MIXED's seq_lens has real values.
+            # (resolve_future only restores for is_decode(), not is_mixed().)
+            running_batch.seq_lens = running_batch.seq_lens_cpu.to(
+                running_batch.device, non_blocking=True
+            )
+
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
@@ -2411,8 +2419,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update seq_lens after allocation
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
+            # Overlap: GPU seq_lens restored by resolve_future from FutureMap buf.
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
