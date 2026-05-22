@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -18,12 +18,6 @@ class RadixCacheWalkResult:
     slot_indices: torch.Tensor
     positions: torch.Tensor
     prev_slot_indices: torch.Tensor
-
-    def __iter__(self) -> Iterator[torch.Tensor]:
-        yield self.slot_indices
-        yield self.positions
-        yield self.prev_slot_indices
-
 
 def walk_radix_cache_for_canary(
     *,

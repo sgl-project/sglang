@@ -117,11 +117,11 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         resident_child.parent = root
         root.children[resident_child.id] = resident_child
 
-        slots, _, _ = walk_radix_cache_for_canary(
+        result = walk_radix_cache_for_canary(
             radix_cache=cache,
             swa_resident_only=True,
         )
-        self.assertEqual(slots.tolist(), [3, 4])
+        self.assertEqual(result.slot_indices.tolist(), [3, 4])
 
 
 if __name__ == "__main__":
