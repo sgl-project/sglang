@@ -1454,6 +1454,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
+    # Staging for resolve_forward_inputs: prefill pinned CPU + running GPU.
+    prefill_input_ids_cpu: Optional[torch.Tensor] = None
+    mix_running_input_ids: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
@@ -1783,9 +1786,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        input_ids_tensor = torch.tensor(
+        # H2D deferred to resolve_forward_inputs.
+        pinned_input_ids = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        )
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
@@ -1965,7 +1969,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_embeds_tensor = None
             replace_positions_tensor = None
 
-        self.input_ids = input_ids_tensor
+        self.prefill_input_ids_cpu = pinned_input_ids
+        self.input_ids = None
         self.req_pool_indices = req_pool_indices_tensor
         self.orig_seq_lens = orig_seq_lens_tensor
         self.out_cache_loc = out_cache_loc
@@ -2161,11 +2166,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
-        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
+        # input_ids cat deferred to resolve_forward_inputs.
+        self.mix_running_input_ids = running_batch.input_ids
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)
-        self.input_ids = input_ids
+        self.input_ids = None
         self.out_cache_loc = out_cache_loc
 
         # For overlap scheduler, the output_ids has one step delay

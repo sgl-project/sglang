@@ -144,7 +144,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureIndices
+from sglang.srt.managers.overlap_utils import FutureIndices, resolve_forward_inputs
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -2860,7 +2860,7 @@ class Scheduler(
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
-                        self.future_map.resolve_future(batch)
+                        resolve_forward_inputs(batch, self.future_map)
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
@@ -2896,6 +2896,7 @@ class Scheduler(
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                resolve_forward_inputs(batch)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     batch.input_ids = batch_result.next_token_ids.to(torch.int64)
@@ -2905,6 +2906,7 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
+                resolve_forward_inputs(batch)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )

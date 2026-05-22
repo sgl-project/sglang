@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -39,6 +39,33 @@ else:
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
+
+
+def resolve_forward_inputs(
+    batch: ScheduleBatch, future_map: Optional[FutureMap] = None
+) -> None:
+    """Materialize forward-time GPU tensors. Called at forward entry in both
+    overlap (`future_map` set, runs on forward stream) and non-overlap
+    (`future_map=None`, runs on default stream) modes.
+
+    Step 1: H2D pinned prefill + cat with mix running, if staged.
+    Step 2 (overlap only): translate sentinel input_ids / gather spec extras.
+    """
+    if batch.prefill_input_ids_cpu is not None:
+        prefill_dev = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
+        batch.input_ids = (
+            torch.cat([prefill_dev, batch.mix_running_input_ids])
+            if batch.mix_running_input_ids is not None
+            else prefill_dev
+        )
+        batch.prefill_input_ids_cpu = None
+        batch.mix_running_input_ids = None
+    if future_map is None:
+        return
+    if future_map.spec_algo.is_none():
+        _resolve_future_token_ids(batch.input_ids, future_map.output_tokens_buf)
+    else:
+        future_map._resolve_spec_extras(batch)
 
 
 class FutureMap:
@@ -98,15 +125,6 @@ class FutureMap:
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
-
-    def resolve_future(self, batch: ScheduleBatch):
-        # seq_lens is already real on entry (SB +1 for non-spec;
-        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
-        # input_ids tokens / spec extras here.
-        if self.spec_algo.is_none():
-            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
-        else:
-            self._resolve_spec_extras(batch)
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
