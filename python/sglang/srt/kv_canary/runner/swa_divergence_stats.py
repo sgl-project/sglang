@@ -41,9 +41,7 @@ class _PendingSnapshot:
 
 
 def format_swa_divergence_line(parsed: ParsedSwaDivergenceLine) -> str:
-    return SWA_DIVERGENCE_LOG_PREFIX + json.dumps(
-        asdict(parsed), separators=(",", ":")
-    )
+    return SWA_DIVERGENCE_LOG_PREFIX + json.dumps(asdict(parsed), separators=(",", ":"))
 
 
 def parse_swa_divergence_line(line: str) -> Optional[ParsedSwaDivergenceLine]:
