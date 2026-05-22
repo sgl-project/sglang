@@ -19,14 +19,21 @@ class TestGptOssSm120(BaseTestGptOss):
             )
 
     def test_mxfp4_20b(self):
-        self.run_test(
-            model_variant="20b",
-            quantization="mxfp4",
+        # The shared 20B helper captures CUDA graphs up to bs=600, which OOMs
+        # on the 1-gpu-small SM120 runner during startup.
+        self._run_test_raw(
+            model="openai/gpt-oss-20b",
             expected_score_of_reasoning_effort={
                 "low": 0.34,
                 "medium": 0.34,
                 "high": 0.27,
             },
+            other_args=[
+                "--cuda-graph-max-bs",
+                "198",
+                "--max-running-requests",
+                "198",
+            ],
         )
 
 
