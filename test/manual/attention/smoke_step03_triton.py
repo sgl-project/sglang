@@ -17,6 +17,12 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Patch TP size to 1 before any backend imports.  The step-03 branch uses
+# the distributed group system; we bypass it in unit tests.
+from sglang.srt.layers import dp_attention as _dp_attn
+
+_dp_attn.get_attention_tp_size = lambda: 1
+
 from step03_test_utils import (
     build_mha_runner,
     fill_req_to_token,

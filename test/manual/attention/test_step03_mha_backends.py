@@ -43,6 +43,12 @@ from step03_test_utils import (
     make_radix_attention,
 )
 
+# Patch TP size to 1 before any backend import. The step-03 branch uses the
+# distributed group system; we bypass it in unit tests.
+from sglang.srt.layers import dp_attention as _dp_attn
+
+_dp_attn.get_attention_tp_size = lambda: 1
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
