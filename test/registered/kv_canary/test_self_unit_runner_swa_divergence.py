@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import unittest
 from dataclasses import dataclass
@@ -15,8 +16,11 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner import future_tensor as future_tensor_module
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
-from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
-from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
+from sglang.srt.kv_canary.runner.swa_divergence import (
+    SwaDivergenceLog,
+    SwaDivergenceReport,
+    compute_swa_full_idx_divergence,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,6 +61,29 @@ def _make_group(kind: PoolKind) -> CanaryBufferGroup:
     )
 
 
+def _make_allocator_stub(mapping: torch.Tensor) -> SimpleNamespace:
+    return SimpleNamespace(full_to_swa_index_mapping=mapping)
+
+
+def _make_req_to_token_pool_stub(req_to_token: torch.Tensor) -> SimpleNamespace:
+    return SimpleNamespace(req_to_token=req_to_token)
+
+
+def _make_identity_mapping(size: int) -> torch.Tensor:
+    return torch.arange(size, dtype=torch.int64, device=_DEVICE)
+
+
+def _make_identity_req_to_token(num_reqs: int, max_seq_len: int) -> torch.Tensor:
+    base = torch.arange(num_reqs * max_seq_len, dtype=torch.int64, device=_DEVICE)
+    return base.view(num_reqs, max_seq_len)
+
+
+def _make_forward_batch(
+    *, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+) -> SimpleNamespace:
+    return SimpleNamespace(req_pool_indices=req_pool_indices, seq_lens=seq_lens)
+
+
 def _patch_future_tensor():
     def _fake_device_to_host(src_device, *, stream=None) -> _RecordingFuture:
         if isinstance(src_device, dict):
@@ -70,11 +97,33 @@ def _patch_future_tensor():
     )
 
 
+def _patch_cuda_stream_ctx():
+    @contextlib.contextmanager
+    def _noop_stream(_stream):
+        yield
+
+    return patch.object(torch.cuda, "stream", _noop_stream)
+
+
 def _parse_swa_divergence_line(line: str) -> SwaDivergenceLog:
     parsed = SwaDivergenceLog.parse(line)
     if parsed is None:
         raise AssertionError(f"line does not match swa_divergence format: {line!r}")
     return parsed
+
+
+def _run_compute(
+    *,
+    swa_allocator: SimpleNamespace,
+    req_to_token_pool: SimpleNamespace,
+    forward_batch: SimpleNamespace,
+) -> int:
+    count = compute_swa_full_idx_divergence(
+        swa_allocator=swa_allocator,
+        req_to_token_pool=req_to_token_pool,
+        forward_batch=forward_batch,
+    )
+    return int(count.item())
 
 
 class TestSwaDivergenceReport(CustomTestCase):
@@ -160,6 +209,172 @@ class TestSwaDivergenceReport(CustomTestCase):
                 self.assertGreaterEqual(
                     snapshots[idx].verify_swa, snapshots[idx - 1].verify_swa
                 )
+
+
+class TestSwaFullIdxDivergenceCompute(CustomTestCase):
+    def test_compute_returns_zero_when_empty_batch(self) -> None:
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=forward_batch,
+            ),
+            0,
+        )
+
+    def test_compute_returns_zero_when_all_identity(self) -> None:
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8, 5], dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=forward_batch,
+            ),
+            0,
+        )
+
+    def test_compute_counts_swa_full_idx_divergence_in_live_range(self) -> None:
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        mapping[0] = 50
+        mapping[1] = 51
+        mapping[17] = 60
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8, 8], dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=forward_batch,
+            ),
+            3,
+        )
+
+    def test_compute_ignores_writes_outside_seq_lens(self) -> None:
+        mapping = _make_identity_mapping(size=128)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=32)
+
+        mapping[20] = 99
+        mapping[28] = 77
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([10], dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=forward_batch,
+            ),
+            0,
+        )
+
+    def test_compute_reflects_current_forward_batch(self) -> None:
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        mapping[0] = 41
+        mapping[1] = 42
+        mapping[32] = 99
+        mapping[33] = 100
+
+        fb_req0 = _make_forward_batch(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
+        )
+        fb_req2 = _make_forward_batch(
+            req_pool_indices=torch.tensor([2], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=fb_req0,
+            ),
+            2,
+        )
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=fb_req2,
+            ),
+            2,
+        )
+
+
+class TestSwaDivergenceReportWithCompute(CustomTestCase):
+    def test_swa_divergence_report_emits_swa_full_idx_divergence_from_compute(
+        self,
+    ) -> None:
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        mapping[0] = 50
+        mapping[1] = 51
+        mapping[2] = 52
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8], dtype=torch.int64, device=_DEVICE),
+        )
+
+        swa_allocator = _make_allocator_stub(mapping)
+        req_to_token_pool = _make_req_to_token_pool_stub(req_to_token)
+        with _patch_cuda_stream_ctx(), _patch_future_tensor():
+            stats = SwaDivergenceReport(
+                device=_DEVICE,
+                d2h_stream=None,
+                swa_allocator=swa_allocator,
+                req_to_token_pool=req_to_token_pool,
+            )
+            stats.observe_after_invoke_plan(
+                group=_make_group(PoolKind.FULL),
+                verify_plan=_make_verify_plan(11),
+            )
+            stats.observe_after_invoke_plan(
+                group=_make_group(PoolKind.SWA),
+                verify_plan=_make_verify_plan(3),
+            )
+
+            with self.assertLogs(
+                swa_div_module.logger.name, level=logging.INFO
+            ) as captured:
+                stats.step(step_counter=10, period=10, forward_batch=forward_batch)
+
+        matching = [
+            line for line in captured.output if SwaDivergenceLog.parse(line) is not None
+        ]
+        self.assertEqual(len(matching), 1, matching)
+        parsed = SwaDivergenceLog.parse(matching[0])
+        assert parsed is not None
+        self.assertEqual(parsed.swa_full_idx_divergence, 3)
+        self.assertEqual(parsed.verify_full, 11)
+        self.assertEqual(parsed.verify_swa, 3)
 
 
 class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
