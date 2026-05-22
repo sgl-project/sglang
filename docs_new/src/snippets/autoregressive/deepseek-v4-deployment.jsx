@@ -177,6 +177,16 @@ export const DeepSeekV4Deployment = () => {
       ) {
         next.megamoe = "disabled";
       }
+      // Switching to max-throughput on supported hardware: default MegaMoE to
+      // W4A8 if it's currently disabled (best throughput config).
+      if (
+        (optionName === "recipe" || optionName === "hardware") &&
+        next.recipe === "max-throughput" &&
+        next.megamoe === "disabled" &&
+        !isMegamoeUnsupported(next)
+      ) {
+        next.megamoe = "w4a8";
+      }
       return next;
     });
   };
@@ -350,22 +360,33 @@ export const DeepSeekV4Deployment = () => {
       return buildPDDisaggCommand(hardware, modelSize);
     }
 
-    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
-    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
-    // or flags with either the FP8 H200 path or the Blackwell paths.
+    // H200 (FP4) path: dedicated branch — Hopper runs the FP4-mixed Instruct
+    // repos through one of two w4a16 MoE runners (Marlin or Flashinfer mxfp4),
+    // so it doesn't share envs or flags with either the FP8 H200 path or the
+    // Blackwell paths.
     //   Flash: TP=4, single node       Pro: TP=8, single node
     //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
     //   balanced:       MTP 1 / 1 / 2
     //   max-throughput: MTP disabled
+    //
+    // MoE runner selection (verified on 2026-05-20):
+    //   - Pro: flashinfer_mxfp4 for all recipes
+    //   - Flash Balanced: flashinfer_mxfp4 (~1.5x faster output throughput vs
+    //     Marlin in the balanced throughput benchmark).
+    //   - Flash Low-Latency / Max-Throughput: Marlin (faster than
+    //     flashinfer_mxfp4 in those benchmarks).
     if (hardware === "h200-fp4") {
       const verifyKey = `${hardware}|${modelSize}|${recipe}`;
       if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
 
+      const useFlashinferMxfp4 = isBig || recipe === "balanced";
       const fp4Flags = [
         "  --trust-remote-code",
         `  --model-path ${slug}`,
         `  --tp ${tp}`,
-        "  --moe-runner-backend marlin",
+        useFlashinferMxfp4
+          ? "  --moe-runner-backend flashinfer_mxfp4"
+          : "  --moe-runner-backend marlin",
       ];
       if (recipe === "low-latency") {
         fp4Flags.push("  --speculative-algo EAGLE");
@@ -605,7 +626,8 @@ export const DeepSeekV4Deployment = () => {
       }
       // allinone H200 gates DEEPEP_LARGE_SMS_FLAG on !multinode — only H200 big
       // is multi-node; all Blackwell cells get the flag unconditionally.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      // Skip when MegaMoE is enabled (uses its own backend, not DeepEP).
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "max-throughput") {
       // allinone max-throughput: TP + DP + DP-attn + DeepEP (NO MTP).
       //   H200 small: cg=128 max-run=256  |  H200 big: cg=128 max-run=256 (same)
@@ -642,7 +664,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --max-running-requests 256");
       }
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "cp") {
       // allinone cp: TP (NO --dp) + DeepEP + _CP_FLAGS (mem-frac 0.78, max-run 1024).
       //   Blackwell big additionally: mem-frac 0.70 (overrides), cg=256, max-run=256.
