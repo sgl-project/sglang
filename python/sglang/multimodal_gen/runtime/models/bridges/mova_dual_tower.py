@@ -409,7 +409,7 @@ class DualTowerConditionalBridge(
     3. Cross-attention interaction between the hidden states of the two DiTs.
     """
 
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
 
     _fsdp_shard_conditions = MOVADualTowerConfig()._fsdp_shard_conditions
     _compile_conditions = MOVADualTowerConfig()._compile_conditions

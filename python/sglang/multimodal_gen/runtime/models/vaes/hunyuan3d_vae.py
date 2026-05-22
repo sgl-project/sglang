@@ -1105,7 +1105,7 @@ SurfaceExtractors = {
 class VectsetVAE(nn.Module, LayerwiseOffloadableModuleMixin):
     """Base VAE class for vector set encoding."""
 
-    layerwise_offload_default_enabled = False
+    layerwise_offload_dit_group_enabled = False
     layer_names = ["transformer.resblocks"]
 
     def __init__(self, volume_decoder=None, surface_extractor=None):
