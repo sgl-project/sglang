@@ -55,6 +55,8 @@ if _sa_mod._global_server_args is None:
             "disaggregation_mode": "null",
             "enable_dp_attention": False,
             "dllm_algorithm": None,
+            "disable_chunked_prefix_cache": False,
+            "flashinfer_mla_disable_ragged": False,
         },
     )()
     _sa_mod._global_server_args = _stub

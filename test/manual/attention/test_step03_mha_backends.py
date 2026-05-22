@@ -12,7 +12,7 @@ Backends covered (MHA, standard models):
   TritonAttnBackend
   FlashInferAttnBackend   (skipped if flashinfer not installed)
   FlashAttentionBackend   (skipped on SM < 80; FA3 requires Hopper/Blackwell)
-  TRTLLMMHABackend        (skipped if trtllm kernels not installed)
+  TRTLLMHAAttnBackend        (skipped if trtllm kernels not installed)
   TorchNativeAttnBackend  (no CUDA graph; eager-only)
 
 Run on the cluster:
@@ -527,7 +527,7 @@ class TestFlashAttentionInit(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
-# TRTLLMMHABackend
+# TRTLLMHAAttnBackend
 # ---------------------------------------------------------------------------
 
 try:
@@ -540,11 +540,11 @@ except ImportError:
 
 @unittest.skipUnless(_TRTLLM_OK, "sgl_kernel (TRTLLM kernels) not installed")
 class TestTRTLLMMHAInit(CustomTestCase):
-    """init_forward_metadata* coverage for TRTLLMMHABackend."""
+    """init_forward_metadata* coverage for TRTLLMHAAttnBackend."""
 
     @classmethod
     def setUpClass(cls):
-        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMMHABackend
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         cls.mr = build_mha_runner(
             num_heads=_NUM_HEADS,
@@ -553,7 +553,7 @@ class TestTRTLLMMHAInit(CustomTestCase):
             max_context_len=_MAX_CTX,
             dtype=torch.bfloat16,
         )
-        cls.backend = TRTLLMMHABackend(cls.mr)
+        cls.backend = TRTLLMHAAttnBackend(cls.mr)
         cls.layer = make_radix_attention(_NUM_HEADS, _HEAD_DIM)
         set_forward_context(ForwardContext(attn_backend=cls.backend))
 
