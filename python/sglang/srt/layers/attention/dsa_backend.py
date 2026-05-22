@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
@@ -7,6 +8,8 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 import torch
 
 from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+
+logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
@@ -2169,8 +2172,8 @@ class DeepseekSparseAttnBackend(
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
         )
-        # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
-        return out.squeeze(1)
+
+        return out
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
@@ -2201,10 +2204,18 @@ class DeepseekSparseAttnBackend(
         """
         Decide all attention prefill dispatch strategies for this batch.
         """
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
-        if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
+        if is_in_piecewise_cuda_graph():
+            # Can't branch on seq_lens_cpu in PCG, force mha off to guarantee correctness.
+            self.use_mha = False
+        elif (
+            forward_batch and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
