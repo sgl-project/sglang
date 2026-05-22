@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import (
+from runner_test_base import (
     CanaryRunnerTestCase,
     RecordingEndpoint,
     make_runner,

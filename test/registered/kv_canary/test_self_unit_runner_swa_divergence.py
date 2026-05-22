@@ -9,7 +9,7 @@ from typing import Optional
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_runner
+from runner_test_base import CanaryRunnerTestCase, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
