@@ -253,9 +253,7 @@ class TestRunGranianServerKwargs(unittest.TestCase):
     def test_passes_uds_when_set(self):
         from sglang.srt.entrypoints.http_server import _run_granian_server
 
-        args = ServerArgs(
-            model_path="dummy", uds="/tmp/x.sock", enable_http2=True
-        )
+        args = ServerArgs(model_path="dummy", uds="/tmp/x.sock", enable_http2=True)
         with patch("granian.Granian") as MockGranian:
             _run_granian_server(args)
 

@@ -82,9 +82,7 @@ class TestUDSServer(CustomTestCase):
         conn = _UDSConnection(self.uds_path, timeout=120.0)
         try:
             headers = {"Content-Type": "application/json"}
-            body = (
-                json.dumps(payload).encode("utf-8") if payload is not None else None
-            )
+            body = json.dumps(payload).encode("utf-8") if payload is not None else None
             conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
             raw = resp.read()
