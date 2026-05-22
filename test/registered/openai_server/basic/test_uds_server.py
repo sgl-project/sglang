@@ -80,18 +80,22 @@ class TestUDSServer(CustomTestCase):
         self, method: str, path: str, payload: dict | None = None
     ) -> dict:
         conn = _UDSConnection(self.uds_path, timeout=120.0)
-        headers = {"Content-Type": "application/json"}
-        body = json.dumps(payload).encode("utf-8") if payload is not None else None
-        conn.request(method, path, body=body, headers=headers)
-        resp = conn.getresponse()
-        raw = resp.read()
-        conn.close()
-        self.assertEqual(
-            resp.status,
-            200,
-            f"{method} {path} returned {resp.status}: {raw!r}",
-        )
-        return json.loads(raw.decode("utf-8"))
+        try:
+            headers = {"Content-Type": "application/json"}
+            body = (
+                json.dumps(payload).encode("utf-8") if payload is not None else None
+            )
+            conn.request(method, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+            self.assertEqual(
+                resp.status,
+                200,
+                f"{method} {path} returned {resp.status}: {raw!r}",
+            )
+            return json.loads(raw.decode("utf-8"))
+        finally:
+            conn.close()
 
     def test_v1_models(self):
         body = self._request_json("GET", "/v1/models")

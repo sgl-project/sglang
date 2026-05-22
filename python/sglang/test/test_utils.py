@@ -831,8 +831,14 @@ def _uds_health_probe(uds_path: str, headers: dict, timeout: float) -> int:
     import socket as _socket
 
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    sock.connect(uds_path)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(uds_path)
+    except BaseException:
+        # Failure before ownership transfers to HTTPConnection -- close the
+        # fd explicitly rather than rely on CPython refcount timing.
+        sock.close()
+        raise
     conn = http.client.HTTPConnection("localhost", timeout=timeout)
     conn.sock = sock
     try:
