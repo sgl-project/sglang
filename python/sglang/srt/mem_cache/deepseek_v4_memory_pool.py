@@ -544,49 +544,80 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
 
-        # Per-req c4/c128 slab allocator: each req_pool_idx i gets a fixed
-        # slab of `max_pages_c{N}_per_req` pages starting at i * max_per_req,
-        # keyed by compressed-seq position (not raw-kv position) so that the
-        # request's c{N} pages stay contiguous regardless of how the raw-kv
-        # allocator scattered them. Stored INSIDE the V4 token-to-kv pool
-        # rather than the request pool to avoid scheduler-side surgery.
-        # Per-page granularity uses the global page_size (matches the
-        # _forward_compressed cmp_kv reshape view).
-        c4_n_pages_kernel = c4_size // page_size  # kernel-view num pages
+        # Per-req c4/c128 page allocator (dynamic, free-list backed).
+        #
+        # Each request needs a sequence of pages in c{N}_kv_pool to hold its
+        # compressed K state. Pages are allocated on-demand as the request's
+        # compressed sequence position crosses each page_size boundary, and
+        # returned to the free list on release.
+        #
+        # Previous design used a static `arange().view(max_num_reqs, K)` slab
+        # with K = c{N}_n_pages_kernel // max_num_reqs, which silently
+        # corrupted long contexts (writes OOB into neighbour reqs' slabs;
+        # reads truncated by min() clamp). Dynamic allocation lets a single
+        # long-context req hold all free pages, capped only by the c{N}_kv_pool
+        # physical capacity.
+        #
+        # Page index 0 in each c{N}_kv_pool is reserved as a dummy slot.
+        # Stale rows (unused trailing entries for a req, or rows of free
+        # req_pool_idx slots) point at page 0 so OOB reads land on a single
+        # deterministic page rather than scattering across live state.
+        # Usable pages are [1, c{N}_n_pages_kernel).
+        c4_n_pages_kernel = c4_size // page_size
         c128_n_pages_kernel = c128_size // page_size
-        # Cap per-req max pages so all max_num_reqs reqs fit; round down.
-        # NOTE: this is an *average* slab size. A single request whose
-        # compressed token count exceeds max_pages_c{N}_per_req * page_size
-        # will overflow its slab and corrupt or OOB-read neighbour slabs.
-        # This is safe in the current sizing (c4_size / c128_size are
-        # provisioned so that even at max concurrency a max-context req
-        # fits), but low-concurrency long-context workloads (e.g.
-        # max_num_reqs=1 with context_length close to swa_size) need a
-        # real per-req allocator. Logged below + asserted at write time
-        # so the failure mode is loud rather than silent corruption.
-        self.max_pages_c4_per_req = max(1, c4_n_pages_kernel // max_num_reqs)
-        self.max_pages_c128_per_req = max(1, c128_n_pages_kernel // max_num_reqs)
+        self.c4_n_pages_kernel = c4_n_pages_kernel
+        self.c128_n_pages_kernel = c128_n_pages_kernel
+
+        # req_to_token_c{N}_pages[req_idx, k] = page-index in c{N}_kv_pool for
+        # the k-th compressed-token-page of req `req_idx`. Initialised to 0
+        # (dummy). Entries past `pages_held[req_idx]` for any req are stale.
+        # Cols = c{N}_n_pages_kernel so a single req can in principle hold all
+        # usable pages; memory cost is negligible (16 reqs * 128 pages * 4 B).
+        self.req_to_token_c4_pages = torch.zeros(
+            max_num_reqs, max(1, c4_n_pages_kernel),
+            dtype=torch.int32, device=device,
+        )
+        self.req_to_token_c128_pages = torch.zeros(
+            max_num_reqs, max(1, c128_n_pages_kernel),
+            dtype=torch.int32, device=device,
+        )
+
+        # Free-list backing storage + top pointer per ratio. Stack discipline:
+        # pop from top on alloc, push to top on free. CPU-side `_top` keeps
+        # the host able to compute "available" without device sync.
+        # Usable pages are 1..N-1; index 0 reserved as dummy.
+        if c4_n_pages_kernel > 1:
+            self._c4_free_pages = torch.arange(
+                1, c4_n_pages_kernel, dtype=torch.int32, device=device,
+            )
+            self._c4_free_top = c4_n_pages_kernel - 1
+        else:
+            self._c4_free_pages = torch.empty((0,), dtype=torch.int32, device=device)
+            self._c4_free_top = 0
+        if c128_n_pages_kernel > 1:
+            self._c128_free_pages = torch.arange(
+                1, c128_n_pages_kernel, dtype=torch.int32, device=device,
+            )
+            self._c128_free_top = c128_n_pages_kernel - 1
+        else:
+            self._c128_free_pages = torch.empty((0,), dtype=torch.int32, device=device)
+            self._c128_free_top = 0
+
+        # Per-req held-page counts. Plain Python lists (host-only); the
+        # allocator decides diffs without device sync, then writes new page
+        # ids into req_to_token_c{N}_pages in one batched index_put.
+        self._c4_pages_held_cpu = [0] * max_num_reqs
+        self._c128_pages_held_cpu = [0] * max_num_reqs
+
         logger.info(
-            "DeepSeekV4TokenToKVPool per-req compressed-slab caps: "
-            f"c4={self.max_pages_c4_per_req} pages "
-            f"(={self.max_pages_c4_per_req * page_size} c4 tokens, "
-            f"≈{self.max_pages_c4_per_req * page_size * 4} raw tokens), "
-            f"c128={self.max_pages_c128_per_req} pages "
-            f"(={self.max_pages_c128_per_req * page_size} c128 tokens, "
-            f"≈{self.max_pages_c128_per_req * page_size * 128} raw tokens). "
-            "A single request exceeding these limits will overflow its slab."
-        )
-        # req_to_token_c{N}_pages[req_idx, k] = kernel-view page index in
-        # c{N}_kv_pool for the k-th compressed-token-page of request `req_idx`.
-        self.req_to_token_c4_pages = (
-            torch.arange(max_num_reqs * self.max_pages_c4_per_req, dtype=torch.int32)
-            .view(max_num_reqs, self.max_pages_c4_per_req)
-            .to(device)
-        )
-        self.req_to_token_c128_pages = (
-            torch.arange(max_num_reqs * self.max_pages_c128_per_req, dtype=torch.int32)
-            .view(max_num_reqs, self.max_pages_c128_per_req)
-            .to(device)
+            "DeepSeekV4TokenToKVPool dynamic c-page allocator: "
+            f"c4 has {max(0, c4_n_pages_kernel - 1)} usable pages "
+            f"(={max(0, c4_n_pages_kernel - 1) * page_size} c4 tokens, "
+            f"≈{max(0, c4_n_pages_kernel - 1) * page_size * 4} raw tokens total), "
+            f"c128 has {max(0, c128_n_pages_kernel - 1)} usable pages "
+            f"(={max(0, c128_n_pages_kernel - 1) * page_size} c128 tokens, "
+            f"≈{max(0, c128_n_pages_kernel - 1) * page_size * 128} raw tokens total). "
+            f"max_num_reqs={max_num_reqs}; page 0 reserved as dummy."
         )
 
     def get_req_to_token_c_pages(self, compress_ratio: int) -> torch.Tensor:
@@ -595,6 +626,129 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if compress_ratio == 128:
             return self.req_to_token_c128_pages
         raise ValueError(f"unsupported compress_ratio={compress_ratio}")
+
+    # ------------------------------------------------------------------
+    # Dynamic c-page allocator hooks. Called by mem_cache.common from the
+    # scheduler's alloc/free paths. See __init__ for layout & rationale.
+    # ------------------------------------------------------------------
+
+    def _pages_needed_for_seq(self, seq_len: int, ratio: int) -> int:
+        # New compressed token at seq_len arrives when (seq_len % ratio == 0).
+        # The last written compressed-seq position is `seq_len // ratio - 1`.
+        # Each page holds `page_size` compressed tokens, so pages needed =
+        # last_pos // page_size + 1. For seq_len < ratio: 0 pages.
+        if seq_len < ratio:
+            return 0
+        return (seq_len // ratio - 1) // self.page_size + 1
+
+    def alloc_c_pages_for_batch(
+        self,
+        req_pool_indices_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+    ) -> None:
+        """Ensure each req in the batch has enough c4/c128 pages allocated to
+        cover its current (post-extend / post-decode) seq_len. Idempotent: a
+        req already holding enough pages is a no-op.
+
+        Raises RuntimeError if a free list is exhausted. Conversion of the
+        previous silent OOB-into-neighbour-slab to loud failure is intentional
+        — pool sizing or admission control must change for the workload, not
+        the allocator.
+        """
+        req_pool_list = req_pool_indices_cpu.tolist()
+        seq_lens_list = seq_lens_cpu.tolist()
+
+        for ratio, pages_table, pages_held_cpu, free_pages_attr, free_top_attr in (
+            (4, self.req_to_token_c4_pages, self._c4_pages_held_cpu,
+             "_c4_free_pages", "_c4_free_top"),
+            (128, self.req_to_token_c128_pages, self._c128_pages_held_cpu,
+             "_c128_free_pages", "_c128_free_top"),
+        ):
+            # Collect (req_idx, slot_in_row) write coordinates for any new
+            # pages this batch needs. Process pure-Python; batch sizes are
+            # tiny (<= max_num_reqs) and ratios are 2.
+            write_rows: List[int] = []
+            write_cols: List[int] = []
+            for req_idx, s in zip(req_pool_list, seq_lens_list):
+                needed = self._pages_needed_for_seq(s, ratio)
+                current = pages_held_cpu[req_idx]
+                if needed <= current:
+                    continue
+                for k in range(current, needed):
+                    write_rows.append(req_idx)
+                    write_cols.append(k)
+                pages_held_cpu[req_idx] = needed
+            if not write_rows:
+                continue
+
+            n_new = len(write_rows)
+            free_top = getattr(self, free_top_attr)
+            if n_new > free_top:
+                raise RuntimeError(
+                    f"DeepSeekV4TokenToKVPool: c{ratio} page pool exhausted "
+                    f"(need {n_new} new pages, {free_top} free). "
+                    f"Reduce concurrency (--max-running-requests) or raise "
+                    f"max-total-tokens (--mem-fraction-static)."
+                )
+
+            free_pages = getattr(self, free_pages_attr)
+            allocated = free_pages[free_top - n_new : free_top].clone()
+            setattr(self, free_top_attr, free_top - n_new)
+
+            row_idx = torch.tensor(
+                write_rows, dtype=torch.long, device=pages_table.device,
+            )
+            col_idx = torch.tensor(
+                write_cols, dtype=torch.long, device=pages_table.device,
+            )
+            pages_table[row_idx, col_idx] = allocated
+
+    def free_c_pages(self, req_pool_idx: int) -> None:
+        """Return all c4/c128 pages held by `req_pool_idx` to the free lists.
+        Called from release_kv_cache before `req_to_token_pool.free(req)`.
+        Resets the row to 0 (dummy) so a subsequent admission of the same slot
+        starts from a clean state and stale entries can't be confused for
+        valid pages by the consumer."""
+        for pages_table, pages_held_cpu, free_pages_attr, free_top_attr in (
+            (self.req_to_token_c4_pages, self._c4_pages_held_cpu,
+             "_c4_free_pages", "_c4_free_top"),
+            (self.req_to_token_c128_pages, self._c128_pages_held_cpu,
+             "_c128_free_pages", "_c128_free_top"),
+        ):
+            n_held = pages_held_cpu[req_pool_idx]
+            if n_held == 0:
+                continue
+            returned = pages_table[req_pool_idx, :n_held].clone()
+            pages_table[req_pool_idx, :n_held] = 0
+            pages_held_cpu[req_pool_idx] = 0
+            free_pages = getattr(self, free_pages_attr)
+            free_top = getattr(self, free_top_attr)
+            free_pages[free_top : free_top + n_held] = returned
+            setattr(self, free_top_attr, free_top + n_held)
+
+    def clear_c_pages(self) -> None:
+        """Reset all c4/c128 allocator state. Called from
+        SWATokenToKVPoolAllocator.clear() (e.g. on flush_cache)."""
+        for pages_table, free_pages_attr, free_top_attr, n_pages_kernel in (
+            (self.req_to_token_c4_pages, "_c4_free_pages", "_c4_free_top",
+             self.c4_n_pages_kernel),
+            (self.req_to_token_c128_pages, "_c128_free_pages", "_c128_free_top",
+             self.c128_n_pages_kernel),
+        ):
+            pages_table.zero_()
+            if n_pages_kernel > 1:
+                free_pages = getattr(self, free_pages_attr)
+                free_pages.copy_(torch.arange(
+                    1, n_pages_kernel,
+                    dtype=torch.int32, device=free_pages.device,
+                ))
+                setattr(self, free_top_attr, n_pages_kernel - 1)
+            else:
+                setattr(self, free_top_attr, 0)
+        for i in range(len(self._c4_pages_held_cpu)):
+            self._c4_pages_held_cpu[i] = 0
+        for i in range(len(self._c128_pages_held_cpu)):
+            self._c128_pages_held_cpu[i] = 0
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping

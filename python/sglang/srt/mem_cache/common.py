@@ -489,6 +489,12 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
+    # Allocate per-req auxiliary pages (no-op for non-DSV4 pools). seq_lens_cpu
+    # here is already post-extend, which is what the c-page allocator needs.
+    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
+        req_pool_indices_cpu, batch.seq_lens_cpu,
+    )
+
     return out_cache_loc, req_pool_indices_device, req_pool_indices
 
 
@@ -560,6 +566,13 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
+    # Allocate per-req auxiliary pages (no-op for non-DSV4 pools). batch.seq_lens_cpu
+    # here is still the pre-decode value; the post-decode seq_len is needed so
+    # the c-page allocator sees the just-written token position.
+    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
+        batch.req_pool_indices.cpu(), batch.seq_lens_cpu + token_per_req,
+    )
+
     return out_cache_loc
 
 
@@ -616,6 +629,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+    # Free per-req auxiliary pages (no-op for non-DSV4 pools). Must happen
+    # before the req_pool_idx slot itself is released, so the same slot can
+    # be re-admitted with a clean c-page table.
+    tree_cache.token_to_kv_pool_allocator.get_kvcache().free_c_pages(req.req_pool_idx)
     tree_cache.req_to_token_pool.free(req)
 
 
