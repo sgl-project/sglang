@@ -28,6 +28,7 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -1815,9 +1816,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
         self.video_end_token_id = self._require_config_value(
             processor_config, "video_end_token_id"
         )
-        self.use_image_processor_gpu = (
-            int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-        )
+        self.use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
         device = server_args.device if self.use_image_processor_gpu else None
 
         self.mimo_processor = MiMoProcessor(

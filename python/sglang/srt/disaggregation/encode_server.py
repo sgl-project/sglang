@@ -80,14 +80,12 @@ rid_to_err_msg: Dict[str, str] = dict()
 cond_dict_lock = asyncio.Lock()
 rid_to_cond: Dict[str, asyncio.Condition] = {}
 
-use_image_processor_gpu = (
-    int(os.getenv("SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU", "0")) == 1
-)
+use_image_processor_gpu = envs.SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.get()
 
-ENCODER_MAX_BATCH_SIZE = int(os.getenv("SGLANG_ENCODER_MAX_BATCH_SIZE", "8"))
+ENCODER_MAX_BATCH_SIZE = envs.SGLANG_ENCODER_MAX_BATCH_SIZE.get()
 # Watchdog: max time to wait for a batched /encode result. Bounds HTTP latency
 # if the batch worker stalls (NCCL hang, dead worker proc, etc.).
-ENCODER_REQ_TIMEOUT = float(os.getenv("SGLANG_ENCODER_REQ_TIMEOUT", "180"))
+ENCODER_REQ_TIMEOUT = envs.SGLANG_ENCODER_REQ_TIMEOUT.get()
 
 
 class MMError(Exception):
