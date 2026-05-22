@@ -19,6 +19,7 @@ Run on the cluster (mounts sgl-workspace as the code source):
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -40,6 +41,10 @@ from sglang.test.test_utils import (
 )
 
 _CUDA = torch.cuda.is_available()
+
+# Allow overriding the model via env var (e.g. SMALL_MODEL=meta-llama/Llama-3.1-8B-Instruct
+# when Llama-3.2-1B is not accessible but the 8B model is in the HF cache).
+_SMALL_MODEL_OVERRIDE = os.environ.get("SMALL_MODEL", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -114,7 +119,7 @@ def _raw_generate(base_url: str, prompt: str, max_new_tokens: int = 16) -> str:
 class _MHAAccuracyBase(CustomTestCase):
     """Launch a real-weights server, verify factual accuracy and output quality."""
 
-    model: str = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    model: str = _SMALL_MODEL_OVERRIDE
     runner_args: list = []
 
     @classmethod
@@ -307,7 +312,7 @@ class TestTritonConsistency(CustomTestCase):
     text equality.  Requires ~10–15 min on Llama-3.2-1B-Instruct.
     """
 
-    model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+    model = _SMALL_MODEL_OVERRIDE
 
     _RUNNERS = {
         "eager": ["--attention-backend", "triton", "--disable-cuda-graph"],
