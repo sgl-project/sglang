@@ -101,7 +101,7 @@ class SwaDivergenceReport:
         )
         logger.info(
             SwaDivergenceLog(
-                forward_ct=int(host_data["forward_ct"]),
+                forward_ct=host_data["forward_ct"],
                 verify_full=int(verify_totals[_FULL_IDX]),
                 verify_swa=int(verify_totals[_SWA_IDX]),
                 swa_full_idx_divergence=swa_full_idx_divergence,
