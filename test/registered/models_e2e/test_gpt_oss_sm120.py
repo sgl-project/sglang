@@ -33,6 +33,8 @@ class TestGptOssSm120(BaseTestGptOss):
                 "198",
                 "--max-running-requests",
                 "198",
+                "--mem-fraction-static",
+                "0.75",
             ],
         )
 
