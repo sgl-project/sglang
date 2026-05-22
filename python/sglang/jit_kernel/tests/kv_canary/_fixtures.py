@@ -227,25 +227,6 @@ def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
     )
 
 
-def make_extras_explicit(
-    *,
-    slot_indices: list[int],
-    positions: list[int],
-    prev_slot_indices: list[int],
-    capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = len(slot_indices)
-    slots = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    pos = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    if n > 0:
-        slots[:n] = torch.tensor(slot_indices, dtype=torch.int64, device=_DEVICE)
-        pos[:n] = torch.tensor(positions, dtype=torch.int64, device=_DEVICE)
-        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int64, device=_DEVICE)
-    num_valid = torch.tensor([n], dtype=torch.int32, device=_DEVICE)
-    return slots, pos, prevs, num_valid
-
-
 def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
