@@ -207,8 +207,8 @@ class RequestLogger:
                     "audio_data",
                     "video_data",
                     "mm_data_mooncake",
-                    # "lora_path",
-                    # "sampling_params",
+                    "lora_path",
+                    "sampling_params",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
