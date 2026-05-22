@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
   pull_request:
-    branches: [main]
+    branches: [main, release/v0.5.12]
   workflow_dispatch:
     inputs:
       force_continue_on_error:

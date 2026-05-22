@@ -11,7 +11,7 @@ name: PR Test Extra
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, release/v0.5.12]
   workflow_dispatch:
     inputs:
       force_continue_on_error:
