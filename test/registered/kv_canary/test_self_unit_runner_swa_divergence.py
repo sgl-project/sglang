@@ -9,11 +9,11 @@ from typing import Optional
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_runner
+from runner_test_base import CanaryRunnerTestCase, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.runner import future_tensor as future_tensor_module
 from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence import (
@@ -22,6 +22,7 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
     compute_swa_full_idx_divergence,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kv_canary.fixtures import make_buffer_group
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, stage="extra-a", runner_config="cpu-small")
@@ -46,19 +47,6 @@ def _make_verify_plan(value: int) -> VerifyPlan:
     plan = VerifyPlan.allocate(verify_capacity=4, device=_DEVICE)
     plan.verify_num_valid.copy_(torch.tensor([value], dtype=torch.int32))
     return plan
-
-
-def _make_group(kind: PoolKind) -> CanaryBufferGroup:
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=torch.zeros(1, 1, dtype=torch.uint8, device=_DEVICE),
-        k_tail=torch.zeros(1, 1, dtype=torch.uint8, device=_DEVICE),
-        v_head=None,
-        v_tail=None,
-        real_kv_sources_k=(),
-        real_kv_sources_v=(),
-        swa_index_lut=None,
-    )
 
 
 def _make_allocator_stub(mapping: torch.Tensor) -> SimpleNamespace:
@@ -138,11 +126,11 @@ class TestSwaDivergenceReport(CustomTestCase):
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
-                    group=_make_group(PoolKind.FULL),
+                    group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
                     verify_plan=_make_verify_plan(10),
                 )
                 stats.observe_after_invoke_plan(
-                    group=_make_group(PoolKind.SWA),
+                    group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
                     verify_plan=_make_verify_plan(3),
                 )
 
@@ -195,11 +183,11 @@ class TestSwaDivergenceReport(CustomTestCase):
             for batch in range(3):
                 for _ in range(5):
                     stats.observe_after_invoke_plan(
-                        group=_make_group(PoolKind.FULL),
+                        group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
                         verify_plan=_make_verify_plan(7),
                     )
                     stats.observe_after_invoke_plan(
-                        group=_make_group(PoolKind.SWA),
+                        group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
                         verify_plan=_make_verify_plan(2),
                     )
                 _take_snapshot(step=10 + 20 * batch)
@@ -356,11 +344,11 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
                 req_to_token_pool=req_to_token_pool,
             )
             stats.observe_after_invoke_plan(
-                group=_make_group(PoolKind.FULL),
+                group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
                 verify_plan=_make_verify_plan(11),
             )
             stats.observe_after_invoke_plan(
-                group=_make_group(PoolKind.SWA),
+                group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
                 verify_plan=_make_verify_plan(3),
             )
 

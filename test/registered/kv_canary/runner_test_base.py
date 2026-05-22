@@ -6,54 +6,22 @@ from unittest.mock import patch
 import torch
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, CanaryLaunchTag
+from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
+from sglang.test.kv_canary.fixtures import (
+    DEFAULT_DEVICE,
+    make_buffer_group,
+    make_req_to_token_pool,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=1, stage="extra-a", runner_config="1-gpu-large")
-
-
-def make_group(
-    *,
-    device: torch.device,
-    has_v: bool = True,
-    kind: PoolKind = PoolKind.FULL,
-) -> CanaryBufferGroup:
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-        k_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-        v_head=(
-            torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v
-            else None
-        ),
-        v_tail=(
-            torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v
-            else None
-        ),
-        real_kv_sources_k=(),
-        real_kv_sources_v=(),
-        swa_index_lut=None,
-    )
-
-
-def make_pool(
-    device: torch.device,
-    max_reqs: int = 4,
-    max_seq: int = 8,
-) -> SimpleNamespace:
-    req_to_token = torch.zeros(max_reqs, max_seq, dtype=torch.int32, device=device)
-    return SimpleNamespace(req_to_token=req_to_token, size=max_reqs)
 
 
 def make_config(
@@ -72,29 +40,6 @@ def make_config(
         real_kv_hash_mode=real_kv_hash_mode,
         input_check_mode=input_check_mode,
         stats_print_every_n_steps=stats_print_every_n_steps,
-    )
-
-
-def make_forward_batch(
-    device: torch.device,
-    bs: int = 2,
-    seq_lens_list: tuple[int, ...] = (3, 4),
-) -> SimpleNamespace:
-    seq_lens = list(seq_lens_list[:bs])
-    return SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        spec_info=None,
-        batch_size=bs,
-        req_pool_indices=torch.tensor([1, 2][:bs], dtype=torch.int64, device=device),
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-        seq_lens_sum=int(sum(seq_lens)),
-        extend_prefix_lens=None,
-        extend_seq_lens=None,
-        extend_prefix_lens_cpu=None,
-        input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-        positions=torch.zeros(bs, dtype=torch.int32, device=device),
-        out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-        num_token_non_padded_cpu=None,
     )
 
 
@@ -118,9 +63,9 @@ def make_runner(
     if config is None:
         config = make_config()
     if group is None:
-        group = make_group(device=device)
+        group = make_buffer_group(device=device)
     if req_pool is None:
-        req_pool = make_pool(device)
+        req_pool = make_req_to_token_pool(device=device, max_reqs=4, max_seq_len=8)
     return CanaryRunner(
         config=config,
         buffer_groups=(group,),
