@@ -226,7 +226,9 @@ def _build_flashinfer_paged_args(
         and cu_seqlens_q_topk is not None
         and row_to_batch.shape[0] != num_rows
     ):
-        q_lens = torch.diff(cu_seqlens_q_topk).to(dtype=torch.int32, device=device)
+        q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
+            dtype=torch.int32, device=device
+        )
         row_to_batch = torch.repeat_interleave(row_to_batch, q_lens)
 
     if row_to_batch is None and cu_seqlens_q_topk is not None:
@@ -234,7 +236,9 @@ def _build_flashinfer_paged_args(
         # Avoid dynamic tensor construction in this branch to keep CUDA graph capture safe.
         num_batches = cu_seqlens_q_topk.shape[0] - 1
         if not (row_starts is None and num_rows == num_batches):
-            q_lens = torch.diff(cu_seqlens_q_topk).to(dtype=torch.int32, device=device)
+            q_lens = (cu_seqlens_q_topk[1:] - cu_seqlens_q_topk[:-1]).to(
+                dtype=torch.int32, device=device
+            )
             row_to_batch = torch.repeat_interleave(
                 torch.arange(q_lens.shape[0], dtype=torch.int32, device=device),
                 q_lens,
