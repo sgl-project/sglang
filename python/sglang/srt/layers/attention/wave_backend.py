@@ -476,9 +476,7 @@ class WaveAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        # NOTE: encoder_lens expected to be zeros or None
         if forward_mode.is_decode_or_idle():
-            # Update kv_indptr, kv_indices
             kv_indptr = self.kv_indptr
             kv_indices = self.cuda_graph_kv_indices
             num_kv_splits = self.cuda_graph_num_kv_splits
@@ -501,7 +499,6 @@ class WaveAttnBackend(AttentionBackend):
                 num_token = spec_info.kv_indptr.shape[0] - 1
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
         elif forward_mode.is_target_verify():
-            # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(

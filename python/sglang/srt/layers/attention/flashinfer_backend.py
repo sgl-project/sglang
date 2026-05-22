@@ -647,7 +647,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
     ):
         seq_lens_sum = seq_lens.sum().item()
-        seq_lens_cpu = seq_lens.cpu()  # may add a little overhead in capture stage
+        seq_lens_cpu = seq_lens.cpu()
         self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
         self.init_forward_metadata_replay_cuda_graph(
             bs=bs,
