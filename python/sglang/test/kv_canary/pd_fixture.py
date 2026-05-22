@@ -66,7 +66,9 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
                 self.assertEqual(result.get("status_code"), 200, result)
         return results
 
-    def _captured_log_text(self, side: Optional[Literal["prefill", "decode"]] = None) -> str:
+    def _captured_log_text(
+        self, side: Optional[Literal["prefill", "decode"]] = None
+    ) -> str:
         if side == "prefill":
             stdout_buf = type(self)._prefill_stdout_buf
             stderr_buf = type(self)._prefill_stderr_buf

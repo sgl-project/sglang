@@ -116,7 +116,9 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
                 self.assertEqual(result.get("status_code"), 200, result)
         return results
 
-    def _captured_log_text(self, side: Optional[Literal["prefill", "decode"]] = None) -> str:
+    def _captured_log_text(
+        self, side: Optional[Literal["prefill", "decode"]] = None
+    ) -> str:
         stdout_text = (
             self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
         )
