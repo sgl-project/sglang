@@ -37,8 +37,8 @@ class SwaLiveDivergenceObserver:
     def snapshot_nonidentity_future(self, *, stream: torch.cuda.Stream) -> FutureTensor:
         req_pool_indices = self._last_req_pool_indices
         seq_lens = self._last_seq_lens
-        mapping = self._swa_allocator.full_to_swa_index_mapping
-        device = mapping.device
+        full_to_swa_index_mapping = self._swa_allocator.full_to_swa_index_mapping
+        device = full_to_swa_index_mapping.device
 
         if (
             req_pool_indices is None
@@ -53,8 +53,8 @@ class SwaLiveDivergenceObserver:
         with torch.cuda.stream(stream):
             rows = req_to_token[req_pool_indices]
             positions = torch.arange(rows.shape[1], device=rows.device)
-            mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
-            swa_indices = mapping[rows]
+            mask = positions[None, :] < seq_lens[:, None]
+            swa_indices = full_to_swa_index_mapping[rows]
             count = ((swa_indices != rows) & mask).sum().to(torch.int32).view(1)
 
         return FutureTensor.device_to_host(src_device=count, stream=stream)
