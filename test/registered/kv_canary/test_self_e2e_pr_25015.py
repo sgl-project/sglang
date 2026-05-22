@@ -55,7 +55,7 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
     def test_pr_25015_eagle_positions(self) -> None:
         self.send_parallel_requests(
             n=_EAGER_DRAFT_REQUEST_COUNT,
-            assert_all_success=False,
+            assert_all_success=not self.revert_pr,
             max_new_tokens=32,
             timeout=60.0,
         )
