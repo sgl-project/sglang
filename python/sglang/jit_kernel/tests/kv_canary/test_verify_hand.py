@@ -1277,7 +1277,10 @@ class TestLayoutAndScheduling:
 
     @pytest.mark.parametrize(
         "runner",
-        [launch_canary_verify_kernel_from_parts, launch_canary_verify_kernel_torch_reference],
+        [
+            launch_canary_verify_kernel_from_parts,
+            launch_canary_verify_kernel_torch_reference,
+        ],
     )
     def test_disabled_plan_skips_slots_but_counts_kernel(
         self, runner: Callable[..., None]

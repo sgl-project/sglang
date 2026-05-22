@@ -11,8 +11,8 @@ from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
-    VerifyPlan,
     VerifyOrWriteContext,
+    VerifyPlan,
     launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
