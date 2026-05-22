@@ -13,8 +13,8 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.swa_pool_static_observer import (
-        SwaPoolStaticObserver,
+    from sglang.srt.kv_canary.runner.swa_live_divergence_observer import (
+        SwaLiveDivergenceObserver,
     )
 
 logger = logging.getLogger(__name__)
@@ -67,11 +67,11 @@ class SwaDivergenceStats:
         *,
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
-        swa_pool_static_observer: Optional["SwaPoolStaticObserver"] = None,
+        swa_live_divergence_observer: Optional["SwaLiveDivergenceObserver"] = None,
     ) -> None:
         self._device = device
         self._d2h_stream = d2h_stream
-        self._swa_pool_static_observer = swa_pool_static_observer
+        self._swa_live_divergence_observer = swa_live_divergence_observer
         self._forward_ct: int = 0
 
         self._verify_full_total_device: torch.Tensor = torch.zeros(
@@ -155,10 +155,10 @@ class SwaDivergenceStats:
         )
 
         mapping_future: Optional[FutureTensor] = (
-            self._swa_pool_static_observer.snapshot_nonidentity_future(
+            self._swa_live_divergence_observer.snapshot_nonidentity_future(
                 stream=self._d2h_stream
             )
-            if self._swa_pool_static_observer is not None
+            if self._swa_live_divergence_observer is not None
             else None
         )
 

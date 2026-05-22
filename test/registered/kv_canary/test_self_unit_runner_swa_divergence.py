@@ -76,7 +76,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_pool_static_observer=None,
+                swa_live_divergence_observer=None,
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
@@ -96,7 +96,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.emit_log_if_due(step_counter=20, period=10)
 
             lines = [
-                line for line in captured.output if SwaDivergenceLog.parse(line) is not None
+                line
+                for line in captured.output
+                if SwaDivergenceLog.parse(line) is not None
             ]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
@@ -110,7 +112,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_pool_static_observer=None,
+                swa_live_divergence_observer=None,
             )
 
             snapshots: list[SwaDivergenceLog] = []

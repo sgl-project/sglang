@@ -23,7 +23,9 @@ from sglang.srt.kv_canary.runner.health import (
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
-from sglang.srt.kv_canary.runner.swa_pool_static_observer import SwaPoolStaticObserver
+from sglang.srt.kv_canary.runner.swa_live_divergence_observer import (
+    SwaLiveDivergenceObserver,
+)
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -90,8 +92,11 @@ class CanaryRunner:
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
         if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
-            swa_pool_static_observer: Optional[SwaPoolStaticObserver] = (
-                SwaPoolStaticObserver(swa_allocator=self._swa_allocator)
+            self._swa_live_divergence_observer: Optional[SwaLiveDivergenceObserver] = (
+                SwaLiveDivergenceObserver(
+                    swa_allocator=self._swa_allocator,
+                    req_to_token_pool=self._req_to_token_pool,
+                )
                 if self._swa_allocator is not None
                 else None
             )
@@ -99,10 +104,11 @@ class CanaryRunner:
                 SwaDivergenceStats(
                     device=device,
                     d2h_stream=self._d2h_stream,
-                    swa_pool_static_observer=swa_pool_static_observer,
+                    swa_live_divergence_observer=self._swa_live_divergence_observer,
                 )
             )
         else:
+            self._swa_live_divergence_observer = None
             self._swa_divergence_stats = None
 
         self._violation_manager = ViolationManager(
@@ -189,6 +195,11 @@ class CanaryRunner:
             self._end_of_step(forward_batch)
 
     def _before_forward(self, forward_batch: "ForwardBatch") -> None:
+        if self._swa_live_divergence_observer is not None:
+            self._swa_live_divergence_observer.observe_forward_batch(
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+            )
         self._per_forward_orchestrator.before_forward(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
