@@ -727,7 +727,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
-        elif forward_mode.is_extend_or_mixed():
+        elif forward_mode.is_extend_or_draft_extend_or_mixed():
             # Prefill / extend path -- invoked by piecewise / breakable cuda
             # graph capture for non-decode modes. Mirrors the eager body's
             # ``else:`` clause; reads the live ``req_to_token_pool`` view

@@ -730,7 +730,7 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
-        elif forward_mode.is_extend_or_mixed():
+        elif forward_mode.is_extend_or_draft_extend_or_mixed():
             # Prefill / extend path -- invoked by piecewise / breakable cuda
             # graph capture for non-decode modes. Mirrors the eager body's
             # ``else:`` clause: build kv_indices/qo_indptr from the live
