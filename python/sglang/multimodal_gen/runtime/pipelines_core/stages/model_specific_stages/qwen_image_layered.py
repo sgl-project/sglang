@@ -21,6 +21,31 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _resolve_text_encoder_dtype(
+    text_encoder: object, fallback: torch.dtype = torch.bfloat16
+) -> torch.dtype:
+    module_dtype = getattr(text_encoder, "dtype", None)
+    if isinstance(module_dtype, torch.dtype):
+        return module_dtype
+
+    for tensor_source in ("parameters", "buffers"):
+        tensors = getattr(text_encoder, tensor_source, None)
+        if not callable(tensors):
+            continue
+        try:
+            for tensor in tensors():
+                if isinstance(tensor, torch.Tensor) and torch.is_floating_point(tensor):
+                    return tensor.dtype
+        except TypeError as exc:
+            logger.warning(
+                "Failed to inspect text encoder %s() for dtype: %s",
+                tensor_source,
+                exc,
+            )
+
+    return fallback
+
+
 def _seq_lens_from_optional_mask(
     prompt_embeds: torch.Tensor, prompt_embeds_mask: torch.Tensor | None
 ) -> list[int]:
@@ -125,6 +150,7 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
     def __init__(
         self,
         vae,
+        text_encoder,
         tokenizer,
         processor,
         transformer,
@@ -137,14 +163,14 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae = vae.to(dtype=vae_dtype)
         self.vae_dtype = vae_dtype
         self.text_encoder_dtype = text_encoder_dtype
-        from transformers import Qwen2_5_VLForConditionalGeneration
+        if text_encoder is None:
+            from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 model_path, subfolder="text_encoder"
             )
-            .to(get_local_torch_device())
-            .to(dtype=self.text_encoder_dtype)
+        self.text_encoder = text_encoder.to(
+            device=get_local_torch_device(), dtype=self.text_encoder_dtype
         )
         self.tokenizer = tokenizer
         self.processor = processor
@@ -186,9 +212,15 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
-                stage_name, "qwen_layered_text_encoder", target_dtype=torch.bfloat16
+                stage_name,
+                "text_encoder",
+                target_dtype=self.text_encoder_dtype,
             ),
-            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=self.vae_dtype,
+            ),
         ]
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
@@ -232,7 +264,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        dtype = dtype or self.text_encoder.dtype
+        dtype = dtype or _resolve_text_encoder_dtype(self.text_encoder)
 
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
@@ -482,7 +514,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
         prompt = batch.prompt
         with self.use_declared_component(
-            component_name="qwen_layered_text_encoder",
+            component_name="text_encoder",
             module=self.text_encoder,
         ) as text_encoder:
             assert text_encoder is not None

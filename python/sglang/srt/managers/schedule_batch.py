@@ -252,6 +252,8 @@ class MultimodalDataItem:
 
     # the raw features returned by processor, e.g. pixel_values or audio_features
     feature: Union[torch.Tensor, np.ndarray] = None
+    # CPU reference kept during GPU encoding, used to skip GPU->CPU copy on offload
+    _cpu_feature: Optional[torch.Tensor] = None
     # the precomputed embeddings, passed as final encoder embeddings
     # One and only one of the feature and precomputed_embeddings will be empty
     precomputed_embeddings: Optional[Union[torch.Tensor, np.ndarray]] = None
@@ -2159,14 +2161,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
-        if running_batch.enable_overlap:
-            # running_batch.seq_lens (GPU) is the FutureMap sentinel between iters;
-            # restore from CPU shadow before merge so MIXED's seq_lens has real values.
-            # (resolve_future only restores for is_decode(), not is_mixed().)
-            running_batch.seq_lens = running_batch.seq_lens_cpu.to(
-                running_batch.device, non_blocking=True
-            )
-
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
@@ -2417,13 +2411,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
         if self.enable_overlap:
-            # Overlap: GPU seq_lens restored by resolve_future from FutureMap buf.
+            # New-tensor avoids racing model_worker_batch refs queued for
+            # overlap forward.
+            self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
-            # A faster in-place version
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
