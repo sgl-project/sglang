@@ -175,10 +175,36 @@ def _get_mm_feature(mm_inputs, modality):
     )
 
 
+def _normalize_aux_value(val):
+    """Normalize aux values to pickle types compatible with safe_pickle_loads.
+
+    HF multimodal processors (e.g. Qwen3-VL/Omni) emit numpy arrays for
+    fields like ``video_timestamps`` / ``second_per_grid_ts``. ``numpy.*`` is
+    not in SafeUnpickler's allowlist, so the receiver would refuse to load
+    those payloads. Convert numpy values to torch tensors (numeric) or plain
+    Python lists (object dtype) before pickling.
+    """
+    if val is None:
+        return None
+    if isinstance(val, np.ndarray):
+        if val.dtype == object:
+            return val.tolist()
+        return torch.from_numpy(np.ascontiguousarray(val))
+    if isinstance(val, np.generic):
+        return val.item()
+    if isinstance(val, (list, tuple)):
+        return type(val)(_normalize_aux_value(v) for v in val)
+    if isinstance(val, dict):
+        return {k: _normalize_aux_value(v) for k, v in val.items()}
+    return val
+
+
 def _build_mm_aux_data(mm_inputs, model_type=None):
     # Video aux metadata, scoped to model_type's video-meta attrs.
-    return {attr: mm_inputs.get(attr) for attr in video_meta_attrs_for(model_type)}
-
+    return {
+        attr: _normalize_aux_value(mm_inputs.get(attr))
+        for attr in video_meta_attrs_for(model_type)
+    }
 
 class MMEncoder:
     def __init__(
