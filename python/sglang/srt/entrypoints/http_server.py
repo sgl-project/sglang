@@ -2264,6 +2264,13 @@ def _setup_and_run_http_server(
     if server_args.enable_metrics:
         add_prometheus_track_response_middleware(app)
 
+    # Pre-bind UDS cleanup must run for BOTH the uvicorn path (below) and the
+    # Granian --enable-http2 path. Granian's underlying Rust listener
+    # (UnixListenerSpec::as_socket in src/net.rs) calls socket.bind() directly
+    # without removing a stale socket file, so we must do it here.
+    if server_args.uds:
+        _prepare_uds_path(server_args.uds)
+
     # Use Granian for HTTP/2 server
     if server_args.enable_http2:
         # Reuse the multi-tokenizer shared memory mechanism to pass
@@ -2337,7 +2344,6 @@ def _setup_and_run_http_server(
         set_uvicorn_logging_configs(server_args)
 
         if server_args.uds:
-            _prepare_uds_path(server_args.uds)
             logger.info(f"Listening on {_format_listen_addr(server_args)}")
 
         if server_args.ssl_certfile:
