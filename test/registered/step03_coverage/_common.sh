@@ -28,6 +28,15 @@ step03_preamble() {
     export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
     export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
     export HF_HOME=${HF_HOME:-/root/.cache/huggingface}
+
+    # If a HF token is mounted at /nfs_home/.hf_token, use it for any
+    # online fetches that aren't already in the cache (private repos
+    # like lmsys/sglang-ci-dsv3-test). Caller can set HF_HUB_OFFLINE=0
+    # in the test script to enable downloads.
+    if [ -r /nfs_home/.hf_token ]; then
+        export HUGGING_FACE_HUB_TOKEN="$(cat /nfs_home/.hf_token)"
+        export HF_TOKEN="$HUGGING_FACE_HUB_TOKEN"
+    fi
 }
 
 # Wait for server to print readiness banner; returns 0 on success, 1 on timeout / crash.
