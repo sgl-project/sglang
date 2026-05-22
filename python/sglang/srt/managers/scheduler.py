@@ -2897,11 +2897,12 @@ class Scheduler(
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                future_indices = batch.req_pool_indices
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    self.future_map.stash(future_indices, batch_result.next_token_ids)
+                    self.future_map.stash(
+                        batch.req_pool_indices, batch_result.next_token_ids
+                    )
                 batch.input_ids = None
             else:
                 kwargs = (
@@ -2909,14 +2910,15 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                future_indices = batch.req_pool_indices
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
                 # PP intermediate / DLLM return non-tensor; skip relay.
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    self.future_map.stash(future_indices, batch_result.next_token_ids)
+                    self.future_map.stash(
+                        batch.req_pool_indices, batch_result.next_token_ids
+                    )
                 batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
