@@ -712,6 +712,176 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
+
+        Body taken from the old ``init_forward_metadata_capture_cuda_graph`` --
+        capture and replay had structurally different bodies (capture builds
+        a fresh wrapper per bs and stores it in
+        ``decode_cuda_graph_metadata[bs]`` / ``prefill_cuda_graph_metadata[bs]``;
+        replay reused the cached wrapper). Per the initial-stage scope we
+        keep the capture body and accept the wrapper-rebuild cost at each
+        replay; the replay-time fast path may be restored by a follow-up
+        per-backend optimization PR.
+        """
+        bs = forward_batch.batch_size
+        # ``num_tokens == bs * num_tokens_per_bs``. ``positions`` is the only
+        # fb field always sized to ``num_tokens`` across direct (cuda_graph_runner)
+        # and multi-step-wrapper (eagle_draft_cuda_graph_runner) callers --
+        # ``input_ids`` is None in the multi-step wrapper's synthetic fb.
+        num_tokens = (
+            forward_batch.positions.shape[0]
+            if forward_batch.positions is not None
+            else bs
+        )
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        encoder_lens = forward_batch.encoder_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if forward_mode.is_decode_or_idle():
+            decode_wrappers = []
+            for i in range(self.num_wrappers):
+                decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.decode_backend,
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.kv_last_page_len[
+                            :num_tokens
+                        ],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_decode.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                decode_wrappers=decode_wrappers,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+                fixed_split_size=None,
+                disable_split_kv=self.disable_cuda_graph_kv_split,
+            )
+            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.forward_metadata = DecodeMetadata(decode_wrappers)
+            for i in range(self.num_wrappers):
+                decode_wrappers[i].begin_forward = partial(
+                    fast_decode_plan, decode_wrappers[i]
+                )
+        elif forward_mode.is_target_verify():
+            # FlashInfer's prefill wrapper decides mask mode based on whether
+            # `custom_mask_buf` is initialized (not whether a custom mask is provided).
+            # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
+            # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
+            # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+            use_custom_mask = (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            )
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                wrapper_kwargs = {}
+                if use_custom_mask:
+                    wrapper_kwargs = {
+                        "custom_mask_buf": self.cuda_graph_custom_mask,
+                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    }
+
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        backend=self.prefill_backend,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                        **wrapper_kwargs,
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_draft_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.prefill_backend,
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_dllm_extend():
+            prefill_wrappers = []
+            for i in range(self.num_wrappers):
+                prefill_wrappers.append(
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        backend=self.prefill_backend,
+                        use_cuda_graph=True,
+                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    )
+                )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens.cpu(),  # may add a little overhead in capture stage
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=not self.use_paged,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+            )
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -1639,6 +1809,19 @@ class FlashInferMultiStepDraftBackend:
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
             )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Capture + replay path -- merged from old capture/replay variants.
+
+        Both variants dispatched through ``common_template`` to per-step
+        backends' capture/replay variants; after step 03 both recurse into
+        ``init_forward_data_out_graph`` on the per-step backend.
+        """
+
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_data_out_graph(forward_batch)
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
