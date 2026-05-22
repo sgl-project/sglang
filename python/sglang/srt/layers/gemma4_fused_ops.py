@@ -4,6 +4,8 @@ Fuses standard RMSNorm + residual-add (+ optional scalar multiply) into
 a single kernel pass to reduce kernel launch overhead.
 """
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -128,6 +130,119 @@ def _gemma_dual_rmsnorm_residual_kernel(
     out = (norm3 + r) * scalar
 
     tl.store(Out_ptr + row * stride_o + cols, out.to(x1.dtype), mask=mask)
+
+
+@triton.jit
+def _gemma_qkv_rmsnorm_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    Q_w_ptr,
+    K_w_ptr,
+    stride_q_m,
+    stride_k_m,
+    stride_v_m,
+    NUM_Q_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    eps,
+    HAS_KV: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Per-token fused RMSNorm of Q (with q_w), K (with k_w), V (no scale).
+
+    Layout assumption: each tensor's last dim packs (num_heads, head_dim) contiguously
+    so per-head offset is `h * HEAD_DIM`. The token (M) stride is taken from
+    stride_*_m so the kernel works on strided views (e.g. slices of a larger
+    qkv buffer produced by `qkv.split`) without requiring `.contiguous()` copies.
+    V uses `weight=ones` semantics so the multiply-by-weight is omitted.
+    """
+    m = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HEAD_DIM
+
+    qw = tl.load(Q_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # Q heads
+    for h in tl.static_range(NUM_Q_HEADS):
+        off = m * stride_q_m + h * HEAD_DIM + cols
+        x = tl.load(Q_ptr + off, mask=mask, other=0.0).to(tl.float32)
+        rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+        out = x * rrms * qw
+        tl.store(Q_ptr + off, out.to(Q_ptr.dtype.element_ty), mask=mask)
+
+    if HAS_KV:
+        kw = tl.load(K_w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        # K heads
+        for h in tl.static_range(NUM_KV_HEADS):
+            off = m * stride_k_m + h * HEAD_DIM + cols
+            x = tl.load(K_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+            out = x * rrms * kw
+            tl.store(K_ptr + off, out.to(K_ptr.dtype.element_ty), mask=mask)
+
+        # V heads (no scaling: V-norm uses weight=ones)
+        for h in tl.static_range(NUM_KV_HEADS):
+            off = m * stride_v_m + h * HEAD_DIM + cols
+            x = tl.load(V_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            rrms = tl.rsqrt(tl.sum(x * x, axis=0) / HEAD_DIM + eps)
+            out = x * rrms
+            tl.store(V_ptr + off, out.to(V_ptr.dtype.element_ty), mask=mask)
+
+
+def gemma_qkv_rmsnorm(
+    q: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
+    q_weight: torch.Tensor,
+    k_weight: Optional[torch.Tensor],
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    eps: float = 1e-6,
+) -> None:
+    """In-place fused RMSNorm on Q, K, V for Gemma4 attention.
+
+    All three norms compute `x * rsqrt(mean(x^2) + eps)` independently per head.
+    Q is scaled by `q_weight`, K by `k_weight`, V by 1 (Gemma4's V-norm has
+    `with_scale=False`).
+
+    Inputs may be 2D `(M, num_heads * head_dim)` or strided views of a larger
+    buffer (such as q/k/v slices from `qkv.split`). The kernel uses the actual
+    `stride(0)` so no `.contiguous()` copy is required. Within a token, the
+    last dim must be contiguous so heads pack as `h * head_dim` offsets.
+
+    If k and v are both None (KV-shared layer), only Q is normalized.
+    """
+    assert q.is_cuda
+    assert q.stride(-1) == 1, "Q's last dim must be contiguous"
+    assert q_weight.shape[-1] == head_dim
+    M = q.shape[0] if q.dim() >= 2 else 1
+    BLOCK = triton.next_power_of_2(head_dim)
+
+    has_kv = k is not None and v is not None
+    if has_kv:
+        assert k.is_cuda and v.is_cuda
+        assert k.stride(-1) == 1 and v.stride(-1) == 1
+        assert k_weight is not None and k_weight.shape[-1] == head_dim
+
+    _gemma_qkv_rmsnorm_kernel[(M,)](
+        q,
+        k if has_kv else q,
+        v if has_kv else q,
+        q_weight,
+        k_weight if has_kv else q_weight,
+        q.stride(0),
+        k.stride(0) if has_kv else 0,
+        v.stride(0) if has_kv else 0,
+        NUM_Q_HEADS=num_q_heads,
+        NUM_KV_HEADS=num_kv_heads if has_kv else 0,
+        HEAD_DIM=head_dim,
+        eps=eps,
+        HAS_KV=has_kv,
+        BLOCK=BLOCK,
+    )
 
 
 def gemma_dual_rmsnorm_residual_scalar(

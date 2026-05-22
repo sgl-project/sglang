@@ -8,9 +8,12 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler_output_processor_mixin import (
-    SchedulerOutputProcessorMixin,
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
 )
 
 register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
@@ -47,8 +50,10 @@ class TestMambaRadixBackup(CustomTestCase):
         return batch
 
     def _processor(self, mamba_pool: FakeMambaPool):
-        processor = SchedulerOutputProcessorMixin()
-        processor.req_to_token_pool = SimpleNamespace(mamba_pool=mamba_pool)
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        object.__setattr__(
+            processor, "req_to_token_pool", SimpleNamespace(mamba_pool=mamba_pool)
+        )
         return processor
 
     def test_backup_pending_slot_before_overlap_track(self):
@@ -107,6 +112,20 @@ class TestMambaRadixBackup(CustomTestCase):
 
         self.assertIsNone(req.pending_radix_mamba_slot)
         self.assertEqual(pool.freed, [7])
+
+    def test_possible_spec_boundary_uses_backup_and_keeps_tracking_enabled(self):
+        pool = FakeMambaPool()
+        req = FakeReq()
+        batch = self._schedule_batch(pool)
+        batch.device = torch.device("cpu")
+        batch.reqs = [req]
+
+        can_track = batch._maybe_backup_pending_radix_mamba_slot(req)
+        set_mamba_track_indices_from_reqs(batch, [can_track])
+
+        self.assertTrue(bool(batch.mamba_track_mask[0]))
+        self.assertEqual(int(batch.mamba_track_indices[0]), 7)
+        self.assertEqual(int(req.radix_mamba_backup_slot[0]), 1007)
 
 
 if __name__ == "__main__":

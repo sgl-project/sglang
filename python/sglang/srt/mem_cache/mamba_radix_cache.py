@@ -204,6 +204,9 @@ class LRUList:
         setattr(
             getattr(node, self.nxt), self.prv, getattr(node, self.prv)
         )  # node.next.prev = node.prev
+        # Clear self pointers to break reference cycles among evicted nodes.
+        setattr(node, self.prv, None)
+        setattr(node, self.nxt, None)
 
     def _get_lru(self) -> Optional[TreeNode]:
         """
@@ -488,6 +491,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
@@ -648,6 +652,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
+        # Donate the mamba index to the radix cache instead of copying.
+        # This avoids a data copy that would race with the forward stream.
         if self.enable_mamba_extra_buffer:
             if req.pending_radix_mamba_slot is None:
                 return _skip_cache_unfinished_req(req)
@@ -966,6 +972,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        """Allocate one mamba pool slot, evicting if necessary."""
+        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
@@ -1058,25 +1073,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
-        # Copy mamba state to req local space if cow is true
+        # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
-            # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = last_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+            req.mamba_cow_src_index = last_node.mamba_value
+            req.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1088,6 +1097,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 

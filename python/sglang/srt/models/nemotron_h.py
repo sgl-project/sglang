@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2025 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -67,6 +69,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -412,7 +415,7 @@ class NemotronHMambaDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Core Mamba forward logic, called directly or via split op."""
         output = torch.empty_like(hidden_states)
-        attn_backend = forward_batch.attn_backend
+        attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
         assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
@@ -1018,7 +1021,7 @@ def nemotron_mamba2_with_output(
 
     # In piecewise CUDA graph mode, hidden_states may be padded to the
     # captured graph size. Slice to actual token count for Mamba forward.
-    attn_backend = forward_batch.attn_backend
+    attn_backend = get_attn_backend()
     metadata = attn_backend.linear_attn_backend.forward_metadata
     num_actual_tokens = metadata.num_prefill_tokens + (
         metadata.num_decodes * metadata.draft_token_num

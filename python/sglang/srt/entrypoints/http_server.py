@@ -92,7 +92,6 @@ from sglang.srt.entrypoints.openai.protocol import (
     TokenizeRequest,
     V1RerankReqInput,
 )
-from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.serving_classify import OpenAIServingClassify
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
@@ -146,7 +145,6 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     TokenizerWorker,
     get_main_process_id,
-    monkey_patch_uvicorn_multiprocessing,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
@@ -317,8 +315,10 @@ async def lifespan(fast_api_app: FastAPI):
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
-    fast_api_app.state.openai_serving_chat = OpenAIServingChat(
-        _global_state.tokenizer_manager, _global_state.template_manager
+    fast_api_app.state.openai_serving_chat = (
+        _global_state.tokenizer_manager.serving_chat_class(
+            _global_state.tokenizer_manager, _global_state.template_manager
+        )
     )
     fast_api_app.state.openai_serving_embedding = OpenAIServingEmbedding(
         _global_state.tokenizer_manager, _global_state.template_manager
@@ -1966,6 +1966,7 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             logger.info(f"Start of pd disaggregation warmup ...")
+            request_name = "/generate"
             json_data = {
                 "sampling_params": {
                     "temperature": 0.0,
@@ -1998,9 +1999,9 @@ def _execute_server_warmup(server_args: ServerArgs):
                 _global_state.tokenizer_manager.server_status = ServerStatus.Up
             else:
                 logger.info(
-                    "Prefill disaggregation mode warm Up Failed, status code: {}".format(
-                        res.status_code
-                    )
+                    "Disaggregation warmup failed (mode=%s), status code: %s",
+                    server_args.disaggregation_mode,
+                    res.status_code,
                 )
                 _global_state.tokenizer_manager.server_status = ServerStatus.UnHealthy
 
@@ -2282,7 +2283,6 @@ def _setup_and_run_http_server(
                 "level": "INFO",
                 "propagate": False,
             }
-            monkey_patch_uvicorn_multiprocessing()
 
             if server_args.enable_ssl_refresh:
                 logger.warning(
@@ -2298,6 +2298,7 @@ def _setup_and_run_http_server(
                 root_path=server_args.fastapi_root_path,
                 log_level=server_args.log_level_http or server_args.log_level,
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                timeout_worker_healthcheck=envs.SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
                 ssl_keyfile=server_args.ssl_keyfile,

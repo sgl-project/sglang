@@ -52,11 +52,62 @@ TREE_SPEC_KERNEL_AVAILABLE = (
 )  # This kernel is only available for CUDA and MUSA now
 
 
+def record_stream_each(tensors, stream):
+    """Call record_stream(stream) on each cuda tensor in `tensors`, skipping
+    non-tensor / non-cuda entries. Tells the caching allocator that the
+    tensors are also used on `stream`, so memory is not recycled while
+    queued work is still in flight after Python refs drop.
+    """
+    for t in tensors:
+        if isinstance(t, torch.Tensor) and t.is_cuda:
+            t.record_stream(stream)
+
+
+def record_stream_for_v2_verify(batch, verify_input, fwd_stream):
+    """Mark pre-prepare SB / verify_input GPU tensors as used on `fwd_stream`.
+
+    Spec V2 mutates SB mid-forward (`prepare_for_v2_verify` rebinds
+    `batch.input_ids` / `out_cache_loc`; `_draft_extend_for_decode` later
+    replaces `batch.input_ids` again). Each rebind drops the only SB Python
+    ref to the old tensor while the verify forward kernel may still be
+    reading its memory on `fwd_stream`; `record_stream` tells the caching
+    allocator to wait for `fwd_stream` before recycling the block.
+
+    Covers pre-prepare tensors only; caller must also `record_stream_each`
+    the post-prepare rebinds (new `batch.input_ids` / `out_cache_loc`).
+    """
+    candidates = [
+        batch.seq_lens,
+        batch.req_pool_indices,
+        batch.input_ids,
+        batch.out_cache_loc,
+    ]
+    if verify_input is not None:
+        candidates.extend(
+            [
+                getattr(verify_input, attr, None)
+                for attr in (
+                    "draft_token",
+                    "custom_mask",
+                    "positions",
+                    "retrieve_index",
+                    "retrieve_next_token",
+                    "retrieve_next_sibling",
+                )
+            ]
+        )
+    record_stream_each(candidates, fwd_stream)
+
+
 def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
 
-    # TODO(lsyin): also skip when 1) step = 1 or 2) standalone draft model
+    # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
+    # multi_layer_eagle handles hidden_states internally, not via FutureMap.
+    # TODO(lsyin): also skip when step == 1.
+    if server_args.speculative_algorithm == "STANDALONE":
+        return False
     return not server_args.enable_multi_layer_eagle
 
 
@@ -361,7 +412,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    num_accepted_drafts,
+    num_correct_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -373,9 +424,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(num_accepted_drafts + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_correct_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(num_accepted_drafts + bid) + 1
+    copy_len = tl.load(num_correct_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -408,7 +459,7 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    num_accepted_drafts: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
@@ -416,7 +467,7 @@ def get_src_tgt_cache_loc(
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + num_accepted_drafts + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -427,25 +478,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    num_accepted_drafts,
-    num_accepted_drafts_filter,
+    num_correct_drafts,
+    num_accept_tokens_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    num_accepted_drafts_all = tl.load(
-        num_accepted_drafts + bs_offset, mask=bs_offset < bid
+    num_correct_drafts_all = tl.load(
+        num_correct_drafts + bs_offset, mask=bs_offset < bid
     )
-    old_start = tl.sum(num_accepted_drafts_all) + bid
+    old_start = tl.sum(num_correct_drafts_all) + bid
 
-    num_accepted_drafts_filter_all = tl.load(
-        num_accepted_drafts_filter + bs_offset, mask=bs_offset < bid
+    num_accept_tokens_filter_all = tl.load(
+        num_accept_tokens_filter + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(num_accepted_drafts_filter_all)
+    new_start = tl.sum(num_accept_tokens_filter_all)
 
-    copy_len = tl.load(num_accepted_drafts_filter + bid)
+    copy_len = tl.load(num_accept_tokens_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -456,17 +507,17 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_num_accepted_drafts_filter(
-    num_accepted_drafts: torch.Tensor,
+def create_num_accept_tokens_filter(
+    num_correct_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    num_accepted_drafts_filter = torch.zeros_like(num_accepted_drafts)
-    num_accepted_drafts_filter[unfinished_index_device] = (
-        num_accepted_drafts[unfinished_index_device] + 1
+    num_accept_tokens_filter = torch.zeros_like(num_correct_drafts)
+    num_accept_tokens_filter[unfinished_index_device] = (
+        num_correct_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(num_accepted_drafts + 1)
-    return num_accepted_drafts_filter
+    seq_lens.add_(num_correct_drafts + 1)
+    return num_accept_tokens_filter
 
 
 def _select_top_k_tokens_first(
@@ -510,7 +561,7 @@ def _select_top_k_tokens_later(
     topk_index = topk_index.view(-1, topk_sq)
     input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
 
-    if hidden_states.shape[0] > 0:
+    if hidden_states is not None and hidden_states.shape[0] > 0:
         flat_cs = topk_cs_index.flatten()
         batch_offsets = torch.arange(
             0, hidden_states.shape[0], step=topk, device=flat_cs.device
@@ -544,7 +595,7 @@ def select_top_k_tokens(
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    num_accepted_drafts,
+    num_correct_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -589,7 +640,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    num_accepted_drafts.fill_(simulate_acc_len - 1)
+    num_correct_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
@@ -618,19 +669,19 @@ def traverse_tree(
         if curr == 0:
             # the first token generated by the target model, and thus it is always
             # accepted from the previous iteration
-            accepted = True
+            is_accepted = True
         else:
             parent_bitmask = allocate_token_bitmask[parent_pos]
             curr_token_id = draft_tokens[curr]
             if vocab_size and curr_token_id >= vocab_size:
-                accepted = False
+                is_accepted = False
             else:
                 # 32 boolean bitmask values are packed into 32-bit integers
-                accepted = (
+                is_accepted = (
                     parent_bitmask[curr_token_id // 32] & (1 << (curr_token_id % 32))
                 ) != 0
 
-        if accepted:
+        if is_accepted:
             if curr != 0:
                 # Accept the current token
                 grammar.accept_token(int(draft_tokens[curr]))
