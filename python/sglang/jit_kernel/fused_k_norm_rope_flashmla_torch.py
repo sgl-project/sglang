@@ -72,14 +72,14 @@ def _inv_scale_ue8m0_tensor(ue8m0: torch.Tensor) -> torch.Tensor:
 
 
 def fused_k_norm_rope_flashmla_torch(
-    kv: torch.Tensor,        # (B, 512)             input dtype (bf16/fp16/fp32)
-    kv_weight: torch.Tensor, # (512,)               same dtype as kv
-    freqs_cis: torch.Tensor, # (max_pos, 64) fp32   interleaved [re0,im0,re1,im1,…]
-    positions: torch.Tensor, # (B,)                 int32 or int64
-    out_loc: torch.Tensor,   # (B,)                 int32 cache-slot indices
-    kvcache: torch.Tensor,   # (npages, kPageBytes) uint8
+    kv: torch.Tensor,  # (B, 512)             input dtype (bf16/fp16/fp32)
+    kv_weight: torch.Tensor,  # (512,)               same dtype as kv
+    freqs_cis: torch.Tensor,  # (max_pos, 64) fp32   interleaved [re0,im0,re1,im1,…]
+    positions: torch.Tensor,  # (B,)                 int32 or int64
+    out_loc: torch.Tensor,  # (B,)                 int32 cache-slot indices
+    kvcache: torch.Tensor,  # (npages, kPageBytes) uint8
     eps: float,
-    page_size: int,          # must be a power of 2  (e.g. 1, 2, 4, …)
+    page_size: int,  # must be a power of 2  (e.g. 1, 2, 4, …)
 ) -> None:
     """
     Fused K-norm + RoPE + FlashMLA paged cache store.

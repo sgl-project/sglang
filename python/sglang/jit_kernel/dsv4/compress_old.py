@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -11,11 +11,12 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_xpu
 
 from .utils import make_name
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -927,6 +928,7 @@ def _torch_fused_norm_rope(
     rope_dim = freqs_cis.shape[-1]
     device = input_tensor.device
     in_dtype = input_tensor.dtype
+    _INVALID_PLAN = 0xFFFFFFFF
 
     if mode == 0:
         plan = _decode_prefill_plan(handle).to(device)
