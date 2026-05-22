@@ -12,7 +12,7 @@ register_cuda_ci(est_time=600, suite="extra-a-test-1-gpu-large")
 class TestE2ETensorParallel(CustomTestCase):
     def test_tp_no_canary_violation(self) -> None:
         run_mock_model_bench_serving(
-            extra_server_args=["--tp", "2"],
+            extra_server_args=["--tp", "2", "--mem-fraction-static", "0.88"],
         )
 
 

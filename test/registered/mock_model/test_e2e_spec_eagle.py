@@ -23,6 +23,8 @@ class TestE2ESpeculativeEagle(CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "2",
+                "--mem-fraction-static",
+                "0.45",
             ],
             input_check_enabled=False,
         )
