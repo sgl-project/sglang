@@ -8,6 +8,10 @@ import pytest
 
 def multiprocess_test(file: str, nproc: int, timeout: int = 90) -> None:
     """Launch this script as a torchrun worker and assert success."""
+    env = os.environ.copy()
+    # Torch 2.12 bundles NCCL 2.29, which hard-fails NVLS multicast bind
+    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
+    env.setdefault("NCCL_NVLS_ENABLE", "0")
     cmd = [
         "torchrun",
         f"--nproc_per_node={nproc}",
@@ -20,6 +24,7 @@ def multiprocess_test(file: str, nproc: int, timeout: int = 90) -> None:
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
