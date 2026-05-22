@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import time
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.parallel_request import post_parallel_generate
-from sglang.test.kv_canary.violation_log_utils import (
-    assert_no_violation_in_log,
-    find_violation_in_log,
-)
+from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -18,7 +13,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 _SHORT_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 8).strip()
 
 
-class CanaryPDFixture(PDDisaggregationServerBase):
+class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
     """Base for PD disagg canary self-tests."""
 
     model_mode: ClassVar[Literal["mha", "swa"]]
@@ -71,54 +66,7 @@ class CanaryPDFixture(PDDisaggregationServerBase):
                 self.assertEqual(result.get("status_code"), 200, result)
         return results
 
-    def assert_d_per_forward_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        target_group: TargetGroupKind,
-        flush_wait_seconds: float = 4.0,
-    ) -> None:
-        """Assert a HEAD_*/TAIL_* canary violation for target_group appears on the decode side."""
-        suffix = f"_{target_group.name}"
-        self._assert_violation_logged_any(
-            side="decode",
-            launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_no_violation_on(
-        self,
-        side: Literal["prefill", "decode"],
-        *,
-        wait_seconds: float = 2.0,
-    ) -> None:
-        time.sleep(wait_seconds)
-        assert_no_violation_in_log(self._captured_log_text(side))
-
-    def _assert_violation_logged_any(
-        self,
-        *,
-        side: Literal["prefill", "decode"],
-        launch_tag_patterns: tuple[str, ...],
-        fail_reason: str,
-        flush_wait_seconds: float,
-    ) -> None:
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text(side)
-        if find_violation_in_log(
-            log_text,
-            launch_tag_patterns=launch_tag_patterns,
-            fail_reason=fail_reason,
-        ):
-            return
-        raise AssertionError(
-            f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r} on side={side}. Log tail:\n"
-            f"{log_text[-2000:]}"
-        )
-
-    def _captured_log_text(self, side: Literal["prefill", "decode"]) -> str:
+    def _captured_log_text(self, side: Optional[Literal["prefill", "decode"]] = None) -> str:
         if side == "prefill":
             stdout_buf = type(self)._prefill_stdout_buf
             stderr_buf = type(self)._prefill_stderr_buf

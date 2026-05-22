@@ -13,8 +13,8 @@ class TestPDBaselineMha(CanaryPDFixture, unittest.TestCase):
 
     def test_clean_pd_run_produces_no_canary_violation_on_either_side(self) -> None:
         self.send_parallel_short_requests(n=4)
-        self.assert_no_violation_on("prefill")
-        self.assert_no_violation_on("decode")
+        self.assert_no_violation(side="prefill")
+        self.assert_no_violation(side="decode")
 
 
 class TestPDBaselineSwa(CanaryPDFixture, unittest.TestCase):
@@ -22,8 +22,8 @@ class TestPDBaselineSwa(CanaryPDFixture, unittest.TestCase):
 
     def test_clean_pd_run_produces_no_canary_violation_on_either_side(self) -> None:
         self.send_parallel_short_requests(n=4)
-        self.assert_no_violation_on("prefill")
-        self.assert_no_violation_on("decode")
+        self.assert_no_violation(side="prefill")
+        self.assert_no_violation(side="decode")
 
 
 if __name__ == "__main__":

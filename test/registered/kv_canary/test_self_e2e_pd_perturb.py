@@ -28,9 +28,11 @@ class _PDPerturbBase(CanaryPDFixture):
         self,
     ) -> None:
         self.send_parallel_short_requests(n=4)
-        self.assert_d_per_forward_violation_reported(
+        self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",
             target_group=self.target_group,
+            side="decode",
+            flush_wait_seconds=4.0,
         )
 
 

@@ -3,18 +3,13 @@ from __future__ import annotations
 import io
 import os
 import string
-import time
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.parallel_request import post_parallel_generate
-from sglang.test.kv_canary.violation_log_utils import (
-    assert_no_violation_in_log,
-    find_violation_in_log,
-)
+from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -30,7 +25,7 @@ _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).stri
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
-class CanaryE2EBase(CustomTestCase):
+class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
     ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
 
@@ -121,68 +116,7 @@ class CanaryE2EBase(CustomTestCase):
                 self.assertEqual(result.get("status_code"), 200, result)
         return results
 
-    def assert_per_forward_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        target_group: Optional[TargetGroupKind] = None,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        suffix = "" if target_group is None else f"_{target_group.name}"
-        self.assert_violation_logged_any(
-            launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_sweep_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        target_group: TargetGroupKind,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        self.assert_violation_logged_any(
-            launch_tag_patterns=(f"SWEEP_*_{target_group.name}",),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_violation_logged_any(
-        self,
-        *,
-        launch_tag_patterns: tuple[str, ...],
-        fail_reason: str,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        """Scan server log for a violation line whose launch_tag matches any pattern
-        (fnmatch) and whose fail_reason set contains fail_reason exactly.
-
-        Looks for lines of the form
-            ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
-        emitted by ViolationReporter. Raises AssertionError if no matching line found.
-        """
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text()
-        if find_violation_in_log(
-            log_text,
-            launch_tag_patterns=launch_tag_patterns,
-            fail_reason=fail_reason,
-        ):
-            return
-        raise AssertionError(
-            f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
-            f"{log_text[-2000:]}"
-        )
-
-    def assert_no_violation(self, *, wait_seconds: float = 2.0) -> None:
-        """Assert no ``kv_canary violation:`` line appears in the captured server log within
-        wait_seconds."""
-        time.sleep(wait_seconds)
-        assert_no_violation_in_log(self._captured_log_text())
-
-    def _captured_log_text(self) -> str:
+    def _captured_log_text(self, side: Optional[Literal["prefill", "decode"]] = None) -> str:
         stdout_text = (
             self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
         )
