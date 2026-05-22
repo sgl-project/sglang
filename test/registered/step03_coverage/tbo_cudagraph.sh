@@ -20,8 +20,8 @@ LAUNCH_ARGS=(
     --dp-size 4
     --moe-dense-tp-size 1
     --mem-fraction-static 0.7
-    --cuda-graph-max-bs 4
-    --max-running-requests 4
+    --cuda-graph-max-bs 32
+    --max-running-requests 32
     --disable-piecewise-cuda-graph
 )
 

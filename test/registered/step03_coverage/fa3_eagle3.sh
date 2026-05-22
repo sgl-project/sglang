@@ -20,13 +20,18 @@ else
     BACKEND="fa3"
 fi
 
+# Canonical EAGLE3 sglang config uses fp16 + triton, because
+# bf16 + flashinfer cutlass RMSNorm hits a dtype mismatch on the
+# draft model's input_layernorm on Blackwell (SM120).
+# See test/registered/core/test_basic_sanity_eagle3.py for context.
 LAUNCH_ARGS=(
-    --attention-backend "$BACKEND"
+    --dtype float16
+    --attention-backend triton
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B
-    --speculative-num-steps 5
-    --speculative-eagle-topk 4
-    --speculative-num-draft-tokens 8
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
     --mem-fraction-static 0.7
     --cuda-graph-max-bs 4
     --max-running-requests 4

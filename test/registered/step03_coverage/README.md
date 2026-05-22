@@ -86,6 +86,21 @@ The cluster has many GB300 nodes; cap at ~10 in flight.
 - **ngram spec decoding** — orthogonal to attention init; covered by
   the existing `test/registered/spec/test_spec_ngram.py` suite.
 
+## Auto-skip by GPU architecture
+
+Some backends are compiled only for a specific SM version. The scripts
+self-skip (exit 0, last line `SKIP: ...`) when the GPU doesn't match:
+
+- **fa3** (`fa3_cudagraph`, `fa3_pcg`) — requires SM 8.0-9.0 (Hopper);
+  skipped on Blackwell.
+- **flashmla** (`flashmla_cudagraph`) — requires SM 9.0a (Hopper);
+  skipped on Blackwell.
+- **cutlass_mla** (`cutlass_mla_cudagraph`) — only built for SM 10.0
+  exactly (B200); skipped on SM 10.3 (GB300) and elsewhere.
+
+`fa3_eagle3` falls back from fa3 to triton on Blackwell so the EAGLE3
+path is still exercised — it isn't skipped.
+
 ## DSV4 specifics
 
 `dsv4_*` tests need PR #26024 (`fp8.py: route to DEEP_GEMM when
