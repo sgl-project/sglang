@@ -105,6 +105,63 @@ async def whisper_autodetect(
     logger.info("Whisper auto-detect regex FSMs compiled.")
 
 
+@warmup("kda_cache")
+async def kda_cache(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
+    """Pre-populate MambaRadixCache with system prompts for KDA hybrid models.
+
+    Sends each prompt through the full prefill pipeline so that KDA recurrent
+    states and full-attention KV are cached in MambaRadixCache. Subsequent
+    requests with the same prefix will hit the cache and skip recomputation.
+    """
+    import json
+
+    server_args = tokenizer_manager.server_args
+    prompts_file = server_args.warmup_prompts_file
+    if prompts_file is None:
+        logger.warning(
+            "kda_cache warmup enabled but --warmup-prompts-file not specified, skipping"
+        )
+        return
+
+    with open(prompts_file) as f:
+        prompts = json.load(f)
+
+    if not isinstance(prompts, list) or len(prompts) == 0:
+        logger.warning("warmup prompts file is empty or not a list, skipping")
+        return
+
+    logger.info(f"KDA cache warmup: processing {len(prompts)} prompts")
+    for i, prompt in enumerate(prompts):
+        # Support both text strings and token ID lists
+        if isinstance(prompt, str):
+            req = GenerateReqInput(
+                text=prompt,
+                sampling_params={"max_new_tokens": 1, "temperature": 0},
+            )
+        elif isinstance(prompt, list):
+            req = GenerateReqInput(
+                input_ids=prompt,
+                sampling_params={"max_new_tokens": 1, "temperature": 0},
+            )
+        else:
+            logger.warning(
+                f"Skipping warmup prompt {i}: unsupported type {type(prompt)}"
+            )
+            continue
+
+        if disaggregation_mode != "null":
+            req.bootstrap_room = 0
+            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+        # Drain the generator to ensure full processing and caching
+        async for _ in tokenizer_manager.generate_request(req, None):
+            pass
+
+        logger.info(f"KDA cache warmup: cached prompt {i + 1}/{len(prompts)}")
+
+    logger.info("KDA cache warmup completed")
+
+
 @warmup("voice_chat")
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     # this warms up the fused_moe triton kernels and caches them

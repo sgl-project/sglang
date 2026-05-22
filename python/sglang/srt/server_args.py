@@ -363,6 +363,7 @@ class ServerArgs:
     grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
+    warmup_prompts_file: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
@@ -4362,6 +4363,12 @@ class ServerArgs:
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
             "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+        parser.add_argument(
+            "--warmup-prompts-file",
+            type=str,
+            required=False,
+            help="Path to a JSON file containing prompts for cache warmup. Format: list of strings or list of token-id lists.",
         )
         parser.add_argument(
             "--nccl-port",
