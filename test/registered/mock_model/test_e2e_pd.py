@@ -146,6 +146,7 @@ class _MockModelPDBase(PDDisaggregationServerBase):
             cls.bootstrap_port,
             "--tp",
             "1",
+            "--skip-server-warmup",
         ] + list(cls.extra_prefill_args)
         prefill_args += cls.transfer_backend + cls.rdma_devices
         cls.process_prefill = cls._popen_with_capture(cls.prefill_url, prefill_args)
@@ -162,6 +163,7 @@ class _MockModelPDBase(PDDisaggregationServerBase):
             "1",
             "--base-gpu-id",
             "1",
+            "--skip-server-warmup",
         ] + list(cls.extra_decode_args)
         decode_args += cls.transfer_backend + cls.rdma_devices
         cls.process_decode = cls._popen_with_capture(cls.decode_url, decode_args)
