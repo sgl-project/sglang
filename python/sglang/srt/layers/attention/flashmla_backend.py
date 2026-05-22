@@ -187,8 +187,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
+        # OLD replay variant read max via ``seq_lens_cpu.max().item()`` -- no
+        # device->host sync per replay. Use seq_lens_cpu when available;
+        # fall back to the GPU path for capture warmup (no _cpu mirror yet).
+        seq_lens_cpu = forward_batch.seq_lens_cpu
         if forward_mode.is_decode_or_idle():
-            max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+            if seq_lens_cpu is not None:
+                max_seqlen_pad = triton.cdiv(int(seq_lens_cpu.max().item()), PAGE_SIZE)
+            else:
+                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,
@@ -230,7 +237,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
         elif forward_mode.is_target_verify():
             seq_lens = seq_lens + self.num_draft_tokens
-            max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
+            if seq_lens_cpu is not None:
+                max_seqlen_pad = triton.cdiv(
+                    int(seq_lens_cpu.max().item()) + self.num_draft_tokens, PAGE_SIZE
+                )
+            else:
+                max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
             create_flashmla_kv_indices_triton[(bs,)](
                 self.req_to_token,

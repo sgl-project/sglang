@@ -1488,7 +1488,13 @@ class AiterAttnBackend(AttentionBackend):
 
         swa_page_table = None
 
-        max_kv_len = torch.max(seq_lens).item()
+        # OLD replay variant read max via ``seq_lens_cpu.max().item()`` -- no
+        # device->host sync per replay. Use seq_lens_cpu when available;
+        # fall back to the GPU path for capture warmup (no _cpu mirror yet).
+        if forward_batch.seq_lens_cpu is not None:
+            max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
+        else:
+            max_kv_len = torch.max(seq_lens).item()
 
         if forward_mode.is_decode_or_idle():
             qo_indptr = None
