@@ -161,7 +161,7 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
-        
+
         # Only the last host node needs to be protected.
         if lock_host:
             cd = node.component_data[ct]

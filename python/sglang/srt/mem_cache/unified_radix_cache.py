@@ -1517,9 +1517,12 @@ class UnifiedRadixCache(BasePrefixCache):
         if not node.backuped and node.hit_count >= self.write_through_threshold:
             self.write_backup(node)
 
-
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
-        if not self.enable_storage or self.cache_controller is None or not node.backuped:
+        if (
+            not self.enable_storage
+            or self.cache_controller is None
+            or not node.backuped
+        ):
             return
 
         prefix_keys = None
@@ -1723,7 +1726,9 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
-            completed_tokens_tensor = torch.tensor(min_completed_tokens, dtype=torch.int)
+            completed_tokens_tensor = torch.tensor(
+                min_completed_tokens, dtype=torch.int
+            )
             torch.distributed.all_reduce(
                 completed_tokens_tensor,
                 op=torch.distributed.ReduceOp.MIN,
@@ -1931,7 +1936,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.prefetch_revoke_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
-            *[extra_release_queues[pool_name].qsize() for pool_name in extra_pool_names],
+            *[
+                extra_release_queues[pool_name].qsize()
+                for pool_name in extra_pool_names
+            ],
         ]
         qsizes = torch.tensor(
             local_qsize_list,

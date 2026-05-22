@@ -483,8 +483,7 @@ class MambaComponent(TreeComponent):
             pool_storage_result = kw.get("pool_storage_result")
             loaded = (
                 pool_storage_result is not None
-                and pool_storage_result.extra_pool_hit_pages.get(PoolName.MAMBA, 0)
-                >= 1
+                and pool_storage_result.extra_pool_hit_pages.get(PoolName.MAMBA, 0) >= 1
             )
             target_node = (
                 insert_result.inserted_host_node if insert_result is not None else None
