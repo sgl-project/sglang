@@ -1,7 +1,7 @@
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    AISBENCHMARK_DATASET_DEFAULT,
+    AISBENCHMARK_DATASET_MM_CUSTOM_GEN,
     BENCHMARK_TOOL_DEFAULT,
     QWEN3_5_27B_W8A8_MODEL_PATH,
     TestAscendPerformanceTestCaseBase,
@@ -15,7 +15,7 @@ register_npu_ci(
     disabled="performance testcase",
 )
 
-QWEN3_5_27B_16K_1K_LOW_ENVS = {
+QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -26,10 +26,10 @@ QWEN3_5_27B_16K_1K_LOW_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "0",
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
     "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
-    "SGLANG_NPU_PROFILING": "1",
+    "ASCEND_USE_FIA": "1",
 }
 
-QWEN3_5_27B_16K_1K_LOW_OTHER_ARGS = [
+QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_OTHER_ARGS = [
     "--model-path",
     QWEN3_5_27B_W8A8_MODEL_PATH,
     "--tp-size",
@@ -45,20 +45,23 @@ QWEN3_5_27B_16K_1K_LOW_OTHER_ARGS = [
     "--chunked-prefill-size",
     -1,
     "--max-prefill-tokens",
-    65000,
+    81920,
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    8,
+    48,
     "--max-mamba-cache-size",
-    20,
+    80,
     "--mem-fraction-static",
-    0.85,
+    0.6,
     "--cuda-graph-bs",
-    1,
     2,
-    3,
-    4,
+    8,
+    16,
+    24,
+    36,
+    42,
+    48,
     "--enable-multimodal",
     "--quantization",
     "modelslim",
@@ -69,7 +72,7 @@ QWEN3_5_27B_16K_1K_LOW_OTHER_ARGS = [
     "--mamba-ssm-dtype",
     "bfloat16",
     "--max-total-tokens",
-    310000,
+    850000,
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -81,25 +84,29 @@ QWEN3_5_27B_16K_1K_LOW_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_5_27B_1P_In16k_Out1k_Low(TestAscendPerformanceTestCaseBase):
-    """Test NPU performance for Qwen3.5-27B-W8A8 1p in16k out1k low latency"""
+class TestNPUQwen3_5_27B_W8A8_1P_In1024x1024_30_Out1024_50ms(
+    TestAscendPerformanceTestCaseBase
+):
+    """Test NPU performance for Qwen3.5-27B-W8A8 1p in1024x1024 30 out1024 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    aisbench_dataset_type = AISBENCHMARK_DATASET_DEFAULT
+    aisbench_dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
     model = QWEN3_5_27B_W8A8_MODEL_PATH
-    other_args = QWEN3_5_27B_16K_1K_LOW_OTHER_ARGS
-    envs = QWEN3_5_27B_16K_1K_LOW_ENVS
-    dataset_name = "random"
-    max_concurrency = 4
+    other_args = QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_OTHER_ARGS
+    envs = QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_ENVS
+    dataset_name = "image"
+    image_resolution = "1024x1024"
+    image_count = 1
+    max_concurrency = 16
     num_prompts = 16
-    input_len = 16384
+    input_len = 30
     output_len = 1024
     random_range_ratio = 1
-    tpot = 20
-    output_token_throughput = 167
+    tpot = 50
+    output_token_throughput = 30
 
-    def test_npu_qwen3_5_27b_1p_in16k_out1k_low(self):
-        """Run NPU performance test for Qwen3.5-27B-W8A8 in16k out1k low latency"""
+    def test_npu_qwen3_5_27b_w8a8_1p_in1024x1024_30_out1024_50ms(self):
+        """Run NPU performance test for Qwen3.5-27B-W8A8 1p in1024x1024 30 out1024 50ms"""
         self.run_throughput()
 
 
