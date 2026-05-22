@@ -102,8 +102,6 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
@@ -115,10 +113,16 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        if get_is_capture_mode():
+        # Distinguish capture from replay by whether this bs has been captured yet.
+        # On capture (first call per bs), _capture_metadata populates the pre-allocated
+        # buffer lists; on replay, _replay_metadata updates those same buffers in-place
+        # so the CUDA graph's recorded GPU buffer pointers stay valid.
+        if self.decode_cuda_graph_metadata.get(bs) is None:
             metadata = self._capture_metadata(
                 bs, req_pool_indices, forward_mode, spec_info
             )
+            # Mark this bs as captured so future calls take the replay path.
+            self.decode_cuda_graph_metadata[bs] = True
         else:
             metadata = self._replay_metadata(
                 bs,
