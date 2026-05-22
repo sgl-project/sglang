@@ -123,9 +123,12 @@ class FutureMap:
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
-    def invalidate(self, batch: ScheduleBatch, future_indices: FutureIndices) -> None:
-        # input_ids sentinel: forward populates output_tokens_buf; next iter's
-        # resolve_future translates negative entries back to real tokens.
+    def set_input_ids_sentinel(
+        self, batch: ScheduleBatch, future_indices: FutureIndices
+    ) -> None:
+        # Sentinel for the decode portion so mixed batches can cat extend
+        # (positive real tokens) + decode (negative sentinels) into one
+        # input_ids; resolve_future translates negatives via output_tokens_buf.
         batch.input_ids = -future_indices.indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
