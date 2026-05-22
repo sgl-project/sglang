@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
