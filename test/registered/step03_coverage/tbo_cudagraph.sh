@@ -3,6 +3,13 @@
 # DSV4 is the model the production TBO workload targets, and dsv4-mode
 # already wires up the right MoE A2A + cuda graph configuration.
 # Stresses the tbo_backend wrapper around dsv4 attention init.
+#
+# NOTE: as of 2026-05-22, TBO is broken on origin/main HEAD with:
+#   AttributeError: 'TboAttnBackend' object has no attribute
+#   '_maybe_upgrade_forward_metadata'
+# Once that lands, this test should pass. Until then the test is
+# expected to FAIL on a clean main checkout — keep it in the suite so
+# the regression is visible.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

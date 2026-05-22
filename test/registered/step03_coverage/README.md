@@ -101,6 +101,13 @@ self-skip (exit 0, last line `SKIP: ...`) when the GPU doesn't match:
 `fa3_eagle3` falls back from fa3 to triton on Blackwell so the EAGLE3
 path is still exercised — it isn't skipped.
 
+## Known broken on main (as of 2026-05-22)
+
+- **`tbo_cudagraph`** — `TboAttnBackend` is missing
+  `_maybe_upgrade_forward_metadata` on `origin/main` HEAD; the scheduler
+  dies during init. The test stays in the suite to surface when TBO is
+  re-enabled. Skip or expect-fail until a fix lands.
+
 ## DSV4 specifics
 
 `dsv4_*` tests need PR #26024 (`fp8.py: route to DEEP_GEMM when
