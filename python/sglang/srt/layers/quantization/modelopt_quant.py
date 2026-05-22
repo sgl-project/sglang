@@ -16,7 +16,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs, temp_set_env
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -2472,10 +2472,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     """Online per-token NVFP4 MoE method for BF16/FP16/FP8 checkpoints."""
 
-    _quant_fast_math_env_lock = threading.Lock()
-
-    def __init__(self, quant_config: PerTokenNvFp4Config):
+    def __init__(self, quant_config: PerTokenNvFp4Config, layer_prefix: str):
         super().__init__(quant_config)
+        self.layer_prefix = layer_prefix
+        layer_match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_prefix)
+        self.layer_log_name = (
+            f"layer {layer_match.group(1)} ({layer_prefix})"
+            if layer_match is not None
+            else layer_prefix
+        )
         if not self.enable_flashinfer_trtllm_moe:
             raise ValueError(
                 "--quantization per_token_nvfp4 supports only "
@@ -2484,27 +2489,11 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
     @staticmethod
-    def _weight_amax(weight: torch.Tensor) -> float:
-        return float(weight.abs().nan_to_num().amax().item())
-
-    @staticmethod
-    def _weight_scale_2_from_amax(
-        weight_amax: float, device: torch.device
-    ) -> torch.Tensor:
-        # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
-        # reciprocal as the global encode scale, matching 448 * 6 / amax.
-        fp8_fp4_max = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
-        weight_scale_2 = weight_amax / fp8_fp4_max if weight_amax > 0 else 1.0
-        return torch.tensor(weight_scale_2, device=device, dtype=torch.float32)
-
-    @staticmethod
     def _quantize_weight_nvfp4(
         weight: torch.Tensor,
         weight_scale_2: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         from flashinfer import SfLayout, nvfp4_quantize
-
-        logger.info_once("Running online NVFP4 quantization for MoE expert weights.")
 
         if weight.ndim != 2:
             raise ValueError(
@@ -2518,27 +2507,30 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
         if weight_scale_2 is None:
-            weight_scale_2 = (
-                ModelOptPerTokenNvFp4FusedMoEMethod._weight_scale_2_from_amax(
-                    ModelOptPerTokenNvFp4FusedMoEMethod._weight_amax(weight),
-                    weight.device,
-                )
+            # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
+            # reciprocal as the global encode scale, matching 448 * 6 / amax.
+            weight_amax = (
+                weight.abs()
+                .nan_to_num()
+                .amax()
+                .to(device=weight.device, dtype=torch.float32)
+            )
+            fp8_fp4_max = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+            weight_scale_2 = torch.where(
+                weight_amax > 0,
+                weight_amax / fp8_fp4_max,
+                torch.ones_like(weight_amax),
             )
         else:
             weight_scale_2 = weight_scale_2.to(
                 device=weight.device, dtype=torch.float32
             )
-        with ModelOptPerTokenNvFp4FusedMoEMethod._quant_fast_math_env_lock:
-            # FlashInfer exposes this quantizer fast-math switch only as an env
-            # knob. Online weight quantization happens during model load; keep
-            # the env change scoped and serialized across loader threads.
-            with temp_set_env(TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1"):
-                fp4_weight, weight_sf = nvfp4_quantize(
-                    weight.contiguous(),
-                    1.0 / weight_scale_2,
-                    sfLayout=SfLayout.layout_linear,
-                    backend="cuda",
-                )
+        fp4_weight, weight_sf = nvfp4_quantize(
+            weight.contiguous(),
+            1.0 / weight_scale_2,
+            sfLayout=SfLayout.layout_linear,
+            backend="cuda",
+        )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
         return (
@@ -2636,20 +2628,31 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         pending_fp8_weights = {}
         pending_fp8_weight_scales = {}
         pending_fp8_lock = threading.Lock()
+        quantization_log_lock = threading.Lock()
+        did_log_quantization = False
 
-        def load_quantized_weight(
+        def log_quantization_start() -> None:
+            nonlocal did_log_quantization
+            if did_log_quantization:
+                return
+            with quantization_log_lock:
+                if did_log_quantization:
+                    return
+                logger.info(
+                    "Running online NVFP4 quantization for MoE expert weights in %s.",
+                    self.layer_log_name,
+                )
+                did_log_quantization = True
+
+        def store_quantized_weight(
             param: torch.nn.Parameter,
-            loaded_weight: torch.Tensor,
+            fp4_weight: torch.Tensor,
+            weight_scale: torch.Tensor,
+            weight_scale_2: torch.Tensor,
             weight_name: str,
             shard_id: str,
             expert_id: Optional[int],
-            weight_scale_2: Optional[torch.Tensor] = None,
         ) -> None:
-            loaded_weight = loaded_weight.to(param.device).contiguous()
-            fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
-                loaded_weight, weight_scale_2
-            )
-
             original_weight_loader(
                 param,
                 fp4_weight,
@@ -2690,16 +2693,27 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             shard_id: str,
             expert_id: Optional[int],
         ) -> None:
+            log_quantization_start()
             if shard_id == "w2":
-                load_quantized_weight(
-                    param, loaded_weight, weight_name, shard_id, expert_id
+                loaded_weight = loaded_weight.to(param.device)
+                fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
+                    loaded_weight
+                )
+                store_quantized_weight(
+                    param,
+                    fp4_weight,
+                    weight_scale,
+                    weight_scale_2,
+                    weight_name,
+                    shard_id,
+                    expert_id,
                 )
                 return
 
             pending_key = expert_id
             current = (
                 param,
-                loaded_weight.contiguous(),
+                loaded_weight,
                 weight_name,
                 shard_id,
                 expert_id,
@@ -2722,25 +2736,36 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                     "--quantization per_token_nvfp4 expects paired w1/w3 expert "
                     f"weights, got two {shard_id} tensors for expert {expert_id}."
                 )
-            common_amax = max(
-                self._weight_amax(pending_weight), self._weight_amax(loaded_weight)
+            pending_weight = pending_weight.to(param.device)
+            loaded_weight = loaded_weight.to(param.device)
+            pending_rows = pending_weight.shape[0]
+            loaded_rows = loaded_weight.shape[0]
+            fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
+                torch.cat([pending_weight, loaded_weight], dim=0)
             )
-            weight_scale_2 = self._weight_scale_2_from_amax(common_amax, param.device)
-            load_quantized_weight(
+            pending_fp4_weight, loaded_fp4_weight = fp4_weight.split(
+                [pending_rows, loaded_rows], dim=0
+            )
+            pending_weight_scale, loaded_weight_scale = weight_scale.split(
+                [pending_rows, loaded_rows], dim=0
+            )
+            store_quantized_weight(
                 pending_param,
-                pending_weight,
+                pending_fp4_weight.contiguous(),
+                pending_weight_scale.contiguous(),
+                weight_scale_2,
                 pending_name,
                 pending_shard_id,
                 pending_eid,
-                weight_scale_2,
             )
-            load_quantized_weight(
+            store_quantized_weight(
                 param,
-                loaded_weight,
+                loaded_fp4_weight.contiguous(),
+                loaded_weight_scale.contiguous(),
+                weight_scale_2,
                 weight_name,
                 shard_id,
                 expert_id,
-                weight_scale_2,
             )
 
         def process_fp8_weight(
@@ -2768,13 +2793,14 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 if weight_scale is None:
                     pending_fp8_weights[key] = (
                         param,
-                        loaded_weight.contiguous(),
+                        loaded_weight,
                         weight_name,
                         shard_id,
                         expert_id,
                     )
                     return
 
+            log_quantization_start()
             loaded_weight = self._dequantize_fp8_weight(
                 loaded_weight, weight_scale, param.device
             )
@@ -2793,9 +2819,10 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             with pending_fp8_lock:
                 pending = pending_fp8_weights.pop(key, None)
                 if pending is None:
-                    pending_fp8_weight_scales[key] = loaded_weight.contiguous()
+                    pending_fp8_weight_scales[key] = loaded_weight
                     return
 
+            log_quantization_start()
             (
                 pending_param,
                 pending_weight,
@@ -2966,5 +2993,5 @@ class PerTokenNvFp4Config(ModelOptQuantConfig):
                 if self.is_checkpoint_fp8_serialized:
                     return Fp8MoEMethod(self)
                 return None
-            return ModelOptPerTokenNvFp4FusedMoEMethod(self)
+            return ModelOptPerTokenNvFp4FusedMoEMethod(self, prefix)
         return None
