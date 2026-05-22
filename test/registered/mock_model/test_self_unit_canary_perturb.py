@@ -1,10 +1,9 @@
 import logging
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 from sglang.srt.kv_canary.perturb import real_kv_used
 from sglang.srt.kv_canary.perturb.config import PerturbConfig, TargetGroupKind
-from sglang.srt.kv_canary.perturb.slot_picker import ReqToTokenEntry
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,22 +24,21 @@ class TestCanaryPerturb(CustomTestCase):
         warmup_gate = Mock()
         warmup_gate.is_in_warmup.return_value = False
 
-        with patch.object(
-            real_kv_used,
-            "pick_active_slot",
-            lambda **_: ReqToTokenEntry(req_pool_idx=0, position=0, value=7),
-        ), self.assertLogs(real_kv_used.logger.name, level=logging.INFO) as logs:
+        # Empty buffer_groups means pick_target_group returns None, so run() takes
+        # the early-return branch before any slot is picked.
+        with self.assertLogs(real_kv_used.logger.name, level=logging.INFO) as logs:
             real_kv_used.run(
                 forward_batch=Mock(),
                 config=config,
                 req_to_token_pool=Mock(),
                 buffer_groups=(),
+                swa_window_size=0,
                 warmup_gate=warmup_gate,
             )
 
         self.assertIn(
             "kv_canary perturb real_kv_used: skipped because no target group with "
-            "real_kv_sources_k matched target_group_kind=full slot=7",
+            "real_kv_sources_k matched target_group_kind=full",
             "\n".join(logs.output),
         )
 
