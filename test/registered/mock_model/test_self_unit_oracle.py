@@ -23,9 +23,9 @@ def _signed_to_unsigned_i64(value: int) -> int:
     return value & _U64_MASK
 
 
-def _call(oracle: HashOracle, *, req_id: int, position: int) -> int:
+def _call(oracle: HashOracle, *, generalized_req_id: int, position: int) -> int:
     out = oracle.expected_tokens(
-        req_ids=torch.tensor([req_id], dtype=torch.int64),
+        generalized_req_ids=torch.tensor([generalized_req_id], dtype=torch.int64),
         positions=torch.tensor([position], dtype=torch.int64),
     )
     return int(out.tolist()[0])
@@ -36,8 +36,8 @@ class TestHashOracle(CustomTestCase):
         """Verify HashOracle returns the same token for identical inputs."""
         oracle = HashOracle(vocab_size=32000)
 
-        first = _call(oracle, req_id=7, position=42)
-        second = _call(oracle, req_id=7, position=42)
+        first = _call(oracle, generalized_req_id=7, position=42)
+        second = _call(oracle, generalized_req_id=7, position=42)
 
         self.assertEqual(first, second)
 
@@ -46,9 +46,13 @@ class TestHashOracle(CustomTestCase):
         vocab_size = 1024
         oracle = HashOracle(vocab_size=vocab_size)
 
-        req_ids = torch.arange(0, 64, dtype=torch.int64).repeat_interleave(64)
+        generalized_req_ids = torch.arange(0, 64, dtype=torch.int64).repeat_interleave(
+            64
+        )
         positions = torch.arange(0, 64, dtype=torch.int64).repeat(64)
-        tokens = oracle.expected_tokens(req_ids=req_ids, positions=positions).tolist()
+        tokens = oracle.expected_tokens(
+            generalized_req_ids=generalized_req_ids, positions=positions
+        ).tolist()
 
         for token in tokens:
             self.assertTrue(0 <= token < vocab_size)

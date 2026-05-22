@@ -7,7 +7,7 @@ import torch
 from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
 from sglang.srt.kv_canary.token_oracle.oracle_manager import (
     TokenOracleManager,
-    select_oracle_req_ids,
+    select_generalized_req_ids,
 )
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 
@@ -40,16 +40,16 @@ class _OracleSampler(Sampler):
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        rids_int = sampling_info.rids_int
-        if rids_int is None:
+        vanilla_req_ids = sampling_info.rids_int
+        if vanilla_req_ids is None:
             raise RuntimeError(
-                "_OracleSampler.forward: sampling_info.rids_int is None; "
-                "token oracle requires the per-forward rids_int tensor "
+                "_OracleSampler.forward: generalized_req_id source tensor is None; "
+                "token oracle requires a per-forward generalized_req_id source tensor "
                 "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
             )
         batch_next_token_ids = self._token_oracle_manager.sample_next_tokens(
-            req_ids=select_oracle_req_ids(
-                rids_int=rids_int,
+            generalized_req_ids=select_generalized_req_ids(
+                vanilla_req_ids=vanilla_req_ids,
                 bootstrap_room_ids_int=sampling_info.bootstrap_room_ids_int,
             ),
             logits_positions=positions,
