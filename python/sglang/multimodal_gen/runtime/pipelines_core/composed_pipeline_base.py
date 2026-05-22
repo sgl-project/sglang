@@ -502,6 +502,12 @@ class ComposedPipelineBase(ABC):
     def _infer_stage_name(stage: PipelineStage) -> str:
         return stage.__class__.__name__
 
+    def _profile_stage_name(self, stage: PipelineStage, stage_name: str) -> str:
+        class_name = stage.__class__.__name__
+        if any(existing.__class__.__name__ == class_name for existing in self._stages):
+            return stage_name
+        return class_name
+
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None
     ) -> "ComposedPipelineBase":
@@ -526,6 +532,8 @@ class ComposedPipelineBase(ABC):
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
+        stage.set_registered_stage_name(stage_name)
+        stage.set_profile_stage_name(self._profile_stage_name(stage, stage_name))
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
