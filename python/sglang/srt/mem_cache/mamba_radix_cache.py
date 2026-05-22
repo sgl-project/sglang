@@ -665,16 +665,13 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             mamba_value = self.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-            # no_buffer mode: fork from working slot (old behavior)
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
+            # no_buffer mode: copy from working slot (old behavior)
+            mamba_value_forked = self.req_to_token_pool.mamba_pool.alloc(1)
             if mamba_value_forked is None:
                 self.evict(EvictParams(num_tokens=0, mamba_num=1))
-                mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                    mamba_value
-                )
+                mamba_value_forked = self.req_to_token_pool.mamba_pool.alloc(1)
                 assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            self.req_to_token_pool.mamba_pool.copy_from(mamba_value, mamba_value_forked)
             mamba_value = mamba_value_forked
 
         result = self.insert(

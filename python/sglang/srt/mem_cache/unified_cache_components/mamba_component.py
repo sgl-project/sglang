@@ -302,24 +302,23 @@ class MambaComponent(TreeComponent):
                     return 0
                 # The track kernel already wrote the snapshot into the
                 # pending slot; transfer ownership to the tree (zero-copy,
-                # in contrast to the fork_from path below).
+                # in contrast to the copy-from-working-slot path below).
                 mamba_value = req.pending_radix_mamba_slot.clone()
                 req.pending_radix_mamba_slot = None
                 insert_params.mamba_value = mamba_value
                 return cache_len
-            # enable_mamba_extra_buffer=False: legacy fork_from path.
+            # enable_mamba_extra_buffer=False: legacy copy-from-working-slot path.
             mamba_value = self.cache.req_to_token_pool.get_mamba_indices(
                 req.req_pool_idx
             ).unsqueeze(-1)
-            mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
-            )
+            mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.alloc(1)
             if mamba_value_forked is None:
                 self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.fork_from(
-                    mamba_value
-                )
+                mamba_value_forked = self.cache.req_to_token_pool.mamba_pool.alloc(1)
                 assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            self.cache.req_to_token_pool.mamba_pool.copy_from(
+                mamba_value, mamba_value_forked
+            )
             insert_params.mamba_value = mamba_value_forked
             return cache_len
 

@@ -2512,11 +2512,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ):
             return True
 
-        backup = self.req_to_token_pool.mamba_pool.fork_from(
-            req.pending_radix_mamba_slot
-        )
+        backup = self.req_to_token_pool.mamba_pool.alloc(1)
         if backup is None:
             return False
+        self.req_to_token_pool.mamba_pool.copy_from(
+            req.pending_radix_mamba_slot, backup
+        )
 
         req.radix_mamba_backup_slot = backup
         req.radix_mamba_backup_seqlen = req.mamba_last_track_seqlen

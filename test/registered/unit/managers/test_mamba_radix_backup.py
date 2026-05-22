@@ -22,9 +22,14 @@ register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 class FakeMambaPool:
     def __init__(self):
         self.freed = []
+        self.copied = []
 
-    def fork_from(self, src_index: torch.Tensor) -> torch.Tensor:
-        return torch.tensor([int(src_index[0]) + 1000], dtype=torch.int64)
+    def alloc(self, size: int) -> torch.Tensor:
+        assert size == 1
+        return torch.tensor([1007], dtype=torch.int64)
+
+    def copy_from(self, src_index: torch.Tensor, dst_index: torch.Tensor) -> None:
+        self.copied.append((int(src_index[0]), int(dst_index[0])))
 
     def free(self, index: torch.Tensor) -> None:
         self.freed.append(int(index[0]))
@@ -66,6 +71,7 @@ class TestMambaRadixBackup(CustomTestCase):
         self.assertEqual(int(req.pending_radix_mamba_slot[0]), 7)
         self.assertEqual(int(req.radix_mamba_backup_slot[0]), 1007)
         self.assertEqual(req.radix_mamba_backup_seqlen, 128)
+        self.assertEqual(pool.copied, [(7, 1007)])
 
     def test_stale_finished_batch_uses_backup_and_releases_track_slot(self):
         pool = FakeMambaPool()
