@@ -827,27 +827,32 @@ class DeepseekSparseAttnBackend(
 
         Merged from the old ``init_forward_metadata_capture_cuda_graph`` and
         ``init_forward_metadata_replay_cuda_graph`` variants. The merged
-        body branches on ``self._replay_forward_batch`` (set out-of-band
-        by the caller before replay; cleared after) because the two paths
-        differ structurally:
+        body distinguishes the two paths by checking whether metadata for
+        this ``bs`` already exists in ``self.decode_cuda_graph_metadata``:
 
-          * **Capture**: build a fresh ``DSAMetadata`` from
-            ``forward_batch`` fields, store it in
+          * **Capture** (metadata absent): build a fresh ``DSAMetadata``
+            from ``forward_batch`` fields, store it in
             ``self.decode_cuda_graph_metadata[bs]``, and publish it as
             ``self.forward_metadata``. The captured CUDA graph holds
             pointers to this metadata's internal tensors.
-          * **Replay**: look up the stored ``DSAMetadata[bs]`` and refresh
-            its internal tensors **in-place** via ``copy_``/``copy_``;
-            the cuda graph re-runs against the same pointers.
+          * **Replay** (metadata present): look up the stored
+            ``DSAMetadata[bs]`` and refresh its internal tensors
+            **in-place** via ``copy_``; the cuda graph re-runs against
+            the same pointers.
+
+        ``_replay_forward_batch`` is still set by cuda_graph_runner (step
+        04 removes it), but the gate no longer depends on it, so spec
+        runners that skip the side channel now correctly take the replay
+        branch.
 
         ``num_tokens`` (formerly a positional capture arg) is derived
         from ``forward_batch.positions.shape[0]``.
         """
-        if self._replay_forward_batch is not None:
+        bs = forward_batch.batch_size
+        if bs in self.decode_cuda_graph_metadata:
             self._init_forward_data_out_graph_replay(forward_batch)
             return
 
-        bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
         seq_lens = forward_batch.seq_lens[:bs]
@@ -2412,8 +2417,8 @@ class DeepseekSparseAttnMultiStepBackend:
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         """Capture + replay path -- merged from old capture/replay variants.
 
-        Distinguishes capture vs replay via ``self._replay_forward_batch``
-        (set by the spec runner before replay and cleared after).
+        Distinguishes capture vs replay by checking whether metadata for
+        ``bs`` already exists in ``attn_backends[0].decode_cuda_graph_metadata``.
 
         On capture, each inner backend builds and stores its own
         ``DSAMetadata``. On replay, the multi-step precompute optimization
@@ -2423,14 +2428,14 @@ class DeepseekSparseAttnMultiStepBackend:
         with ``SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA=0``, each backend
         recomputes via its own ``_out_graph`` replay branch.
         """
-        if self._replay_forward_batch is None:
+        bs = forward_batch.batch_size
+        if bs not in self.attn_backends[0].decode_cuda_graph_metadata:
             # ---- capture path ----
             for i in range(self.speculative_num_steps - 1):
                 self.attn_backends[i].init_forward_data_out_graph(forward_batch)
             return
 
         # ---- replay path ----
-        bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
         seq_lens = forward_batch.seq_lens[:bs]
@@ -2592,12 +2597,11 @@ class DeepseekSparseAttnMultiStepBackend:
                     )
         else:
             # Fallback: each backend recomputes via its own _out_graph replay
-            # branch. Propagate the replay signal to each inner backend so its
-            # merged _out_graph body takes the replay branch.
+            # branch. forward_batch already carries the actual fields so each
+            # inner backend's metadata-existence gate routes to replay correctly;
+            # no side-channel propagation needed.
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i]._replay_forward_batch = self._replay_forward_batch
                 self.attn_backends[i].init_forward_data_out_graph(forward_batch)
-                self.attn_backends[i]._replay_forward_batch = None
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
         self.init_forward_data_out_graph(forward_batch)
