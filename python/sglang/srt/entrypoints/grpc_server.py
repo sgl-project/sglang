@@ -10,17 +10,126 @@ once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
+import copy
 import inspect
 import json
 import logging
+import os
 import time
 
 from aiohttp import web
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
+from sglang.srt.managers.io_struct import (
+    ProfileReq,
+    ProfileReqType,
+    TokenizedGenerateReqInput,
+)
+from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.server_args import set_global_server_args_for_tokenizer
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_GRPC_MAX_MESSAGE_MB = 512
+
+
+def _grpc_max_message_bytes() -> int:
+    raw = os.environ.get("SGLANG_GRPC_MAX_MESSAGE_MB")
+    if raw is None:
+        return _DEFAULT_GRPC_MAX_MESSAGE_MB * 1024 * 1024
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid SGLANG_GRPC_MAX_MESSAGE_MB=%r; falling back to %dMB",
+            raw,
+            _DEFAULT_GRPC_MAX_MESSAGE_MB,
+        )
+        value = _DEFAULT_GRPC_MAX_MESSAGE_MB
+    return max(value, 1) * 1024 * 1024
+
+
+def _with_grpc_message_size_options(options, max_message_bytes: int):
+    keys = {"grpc.max_send_message_length", "grpc.max_receive_message_length"}
+    merged = [(k, v) for k, v in (options or []) if k not in keys]
+    merged.extend(
+        [
+            ("grpc.max_send_message_length", max_message_bytes),
+            ("grpc.max_receive_message_length", max_message_bytes),
+        ]
+    )
+    return merged
+
+
+def _patch_grpc_message_size_options() -> None:
+    import grpc
+
+    if getattr(grpc, "_sglang_message_size_options_patched", False):
+        return
+
+    max_message_bytes = _grpc_max_message_bytes()
+    original_aio_server = grpc.aio.server
+    original_insecure_channel = grpc.insecure_channel
+
+    def aio_server_with_message_size(*args, **kwargs):
+        if "options" in kwargs:
+            kwargs["options"] = _with_grpc_message_size_options(
+                kwargs["options"], max_message_bytes
+            )
+        elif len(args) >= 4:
+            args = list(args)
+            args[3] = _with_grpc_message_size_options(args[3], max_message_bytes)
+        else:
+            kwargs["options"] = _with_grpc_message_size_options(
+                None, max_message_bytes
+            )
+        return original_aio_server(*args, **kwargs)
+
+    def insecure_channel_with_message_size(target, options=None, *args, **kwargs):
+        options = _with_grpc_message_size_options(options, max_message_bytes)
+        return original_insecure_channel(target, options, *args, **kwargs)
+
+    grpc.aio.server = aio_server_with_message_size
+    grpc.insecure_channel = insecure_channel_with_message_size
+    grpc._sglang_message_size_options_patched = True
+
+
+def _patch_grpc_request_manager_shm_transport() -> None:
+    from smg_grpc_servicer.sglang import request_manager as grpc_request_manager
+
+    cls = grpc_request_manager.GrpcRequestManager
+    original_send = cls._send_to_scheduler
+    if getattr(original_send, "_sglang_wraps_shm_features", False):
+        return
+
+    from sglang.srt.managers.mm_utils import wrap_shm_features
+
+    def copy_multimodal_request(obj):
+        if not isinstance(obj, TokenizedGenerateReqInput) or obj.mm_inputs is None:
+            return obj
+
+        copied = copy.copy(obj)
+        copied.mm_inputs = copy.copy(obj.mm_inputs)
+        copied.mm_inputs.mm_items = [
+            copy.copy(item) for item in copied.mm_inputs.mm_items
+        ]
+        for item in copied.mm_inputs.mm_items:
+            item.set_pad_value()
+        copied.mm_inputs.padded_input_ids = (
+            MultimodalProcessorOutput.build_padded_input_ids(
+                copied.input_ids, copied.mm_inputs.mm_items
+            )
+        )
+        return copied
+
+    async def send_to_scheduler_with_shm(self, obj):
+        if obj is not None:
+            obj = copy_multimodal_request(obj)
+            obj = wrap_shm_features(obj)
+        return await original_send(self, obj)
+
+    send_to_scheduler_with_shm._sglang_wraps_shm_features = True
+    cls._send_to_scheduler = send_to_scheduler_with_shm
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -164,6 +273,10 @@ async def serve_grpc(server_args, model_info=None):
             "If already installed, there may be a broken import due to a "
             "version mismatch — see the chained exception above for details."
         ) from e
+
+    set_global_server_args_for_tokenizer(server_args)
+    _patch_grpc_message_size_options()
+    _patch_grpc_request_manager_shm_transport()
 
     sidecar_app = web.Application()
     sidecar_runner = None
