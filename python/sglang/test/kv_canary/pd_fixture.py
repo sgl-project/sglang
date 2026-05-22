@@ -4,7 +4,7 @@ from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
-from sglang.test.kv_canary.parallel_request import post_parallel_generate
+from sglang.test.kv_canary.utils import post_parallel_generate
 from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
