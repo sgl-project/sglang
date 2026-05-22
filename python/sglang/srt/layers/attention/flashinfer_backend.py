@@ -699,9 +699,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info is not None
                 and getattr(spec_info, "custom_mask", None) is not None
             )
-            if bs in self.prefill_cuda_graph_metadata:
+            if (forward_mode, bs) in self.prefill_cuda_graph_metadata:
                 # Replay: reuse cached wrappers.
-                prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
+                prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
                 seq_lens_sum = (
                     forward_batch.seq_lens_sum
                     if hasattr(forward_batch, "seq_lens_sum")
@@ -756,12 +756,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     encoder_lens=encoder_lens,
                     spec_info=spec_info,
                 )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+                self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
-            if bs in self.prefill_cuda_graph_metadata:
+            if (forward_mode, bs) in self.prefill_cuda_graph_metadata:
                 # Replay: reuse cached wrappers.
-                prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
+                prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
                 seq_lens_sum = (
                     forward_batch.seq_lens_sum
                     if hasattr(forward_batch, "seq_lens_sum")
@@ -808,12 +808,12 @@ class FlashInferAttnBackend(AttentionBackend):
                     encoder_lens=encoder_lens,
                     spec_info=spec_info,
                 )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+                self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_dllm_extend():
-            if bs in self.prefill_cuda_graph_metadata:
+            if (forward_mode, bs) in self.prefill_cuda_graph_metadata:
                 # Replay: reuse cached wrappers.
-                prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
+                prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
                 seq_lens_sum = (
                     forward_batch.seq_lens_sum
                     if hasattr(forward_batch, "seq_lens_sum")
@@ -860,7 +860,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     encoder_lens=encoder_lens,
                     spec_info=None,
                 )
-                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+                self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")

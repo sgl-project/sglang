@@ -486,9 +486,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
             self.forward_metadata = DecodeMetadata(decode_wrapper)
         elif forward_mode.is_target_verify():
-            if bs in self.prefill_cuda_graph_metadata:
+            if (forward_mode, bs) in self.prefill_cuda_graph_metadata:
                 # Replay: reuse cached wrapper.
-                verify_wrapper = self.prefill_cuda_graph_metadata[bs]
+                verify_wrapper = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
                 seq_lens_sum = (
                     forward_batch.seq_lens_sum
                     if hasattr(forward_batch, "seq_lens_sum")
@@ -524,12 +524,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     use_ragged=False,
                     spec_info=spec_info,
                 )
-                self.prefill_cuda_graph_metadata[bs] = verify_wrapper
+                self.prefill_cuda_graph_metadata[(forward_mode, bs)] = verify_wrapper
             self.forward_metadata = PrefillMetadata(verify_wrapper, False)
         elif forward_mode.is_draft_extend():
-            if bs in self.prefill_cuda_graph_metadata:
+            if (forward_mode, bs) in self.prefill_cuda_graph_metadata:
                 # Replay: reuse cached wrapper.
-                draft_extend_wrapper = self.prefill_cuda_graph_metadata[bs]
+                draft_extend_wrapper = self.prefill_cuda_graph_metadata[
+                    (forward_mode, bs)
+                ]
                 seq_lens_sum = (
                     forward_batch.seq_lens_sum
                     if hasattr(forward_batch, "seq_lens_sum")
@@ -565,7 +567,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     use_ragged=False,
                     spec_info=spec_info,
                 )
-                self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
+                self.prefill_cuda_graph_metadata[(forward_mode, bs)] = (
+                    draft_extend_wrapper
+                )
             self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
