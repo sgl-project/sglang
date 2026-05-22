@@ -18,6 +18,7 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
+_QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
@@ -72,9 +73,18 @@ def _run_one_canary_setting(
     return results[0]
 
 
-def _measure_overhead(
-    *, scenario_key: str, batch_size: int, input_len: int, output_len: int
-) -> None:
+def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> str:
+    workload = "prefill" if output_len == 1 else "decode"
+    return (
+        f"{_QWEN3_SCENARIO_MODEL}/{workload}_bs{batch_size}"
+        f"_isl{input_len}_osl{output_len}"
+    )
+
+
+def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> None:
+    scenario_key = _make_scenario_key(
+        batch_size=batch_size, input_len=input_len, output_len=output_len
+    )
     off = _run_one_canary_setting(
         canary_on=False,
         batch_size=batch_size,
@@ -105,7 +115,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
         """Verify canary prefill overhead stays within the expected bound."""
         _measure_overhead(
-            scenario_key="qwen3-0.6b/prefill_bs32_isl16384_osl1",
             batch_size=32,
             input_len=16384,
             output_len=1,
@@ -114,7 +123,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
         """Verify canary decode overhead stays within the expected bound."""
         _measure_overhead(
-            scenario_key="qwen3-0.6b/decode_bs128_isl512_osl1024",
             batch_size=128,
             input_len=512,
             output_len=1024,
@@ -123,7 +131,6 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
     def test_qwen3_decode_overhead_bs1_isl512_osl1024(self) -> None:
         """Verify canary decode overhead stays within the expected bound."""
         _measure_overhead(
-            scenario_key="qwen3-0.6b/decode_bs1_isl512_osl1024",
             batch_size=1,
             input_len=512,
             output_len=1024,
