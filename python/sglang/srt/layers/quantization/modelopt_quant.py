@@ -102,7 +102,9 @@ except ImportError:
     # Define a minimal ActivationType enum if flashinfer is not available
     class ActivationType(IntEnum):
         Swiglu = 3
+        Geglu = 4
         Relu2 = 6
+        Identity = 7
 
 
 # Initialize logger for the module
@@ -263,10 +265,8 @@ MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
 # Supported activation schemes for the current configuration
 ACTIVATION_SCHEMES = ["static"]
 
-ACT_STR_TO_TYPE_MAP = {
-    "silu": ActivationType.Swiglu,  # This is the default
-    "relu2": ActivationType.Relu2,
-}
+
+_SUPPORTED_ACT_STRS = ("silu", "relu2", "gelu")
 
 
 class ModelOptQuantConfig(QuantizationConfig):
@@ -1028,7 +1028,10 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
                 output2_scales_scalar=layer.output2_scales_scalar,
                 use_routing_scales_on_input=True,
-                activation_type=get_activation_type(self.moe_runner_config.activation),
+                activation_type=get_activation_type(
+                    self.moe_runner_config.activation,
+                    is_gated=self.moe_runner_config.is_gated,
+                ),
             )
 
             return fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -1036,15 +1039,33 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
 
         if get_moe_runner_backend().is_flashinfer_cutlass():
-            activation = ACT_STR_TO_TYPE_MAP[self.moe_runner_config.activation]
-            assert (
-                (
-                    activation is ActivationType.Relu2
-                    and not self.moe_runner_config.is_gated
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+
+            activation_str = self.moe_runner_config.activation
+            assert activation_str in _SUPPORTED_ACT_STRS, (
+                f"Activation {activation_str!r} is not supported for "
+                f"flashinfer cutlass fp8 moe (supported: {_SUPPORTED_ACT_STRS})."
+            )
+            activation = ActivationType(
+                get_activation_type(
+                    activation_str, is_gated=self.moe_runner_config.is_gated
                 )
-                or activation is ActivationType.Swiglu
-                and self.moe_runner_config.is_gated
-            ), "Only Relu2 non-gated or Swiglu gated are supported for flashinfer cutlass fp8 moe"
+            )
+            # FlashInfer CUTLASS MoE supports gated Swiglu/Geglu and non-gated
+            # Relu2/Identity. Non-gated Silu/Gelu are not implemented.
+            _CUTLASS_SUPPORTED = {
+                ActivationType.Swiglu,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+                ActivationType.Identity,
+            }
+            assert activation in _CUTLASS_SUPPORTED, (
+                f"Activation {activation_str!r} (is_gated="
+                f"{self.moe_runner_config.is_gated}) maps to {activation.name}, "
+                "which is not supported by flashinfer cutlass fp8 moe."
+            )
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
             x_fp8, _ = scaled_fp8_quant(x, layer.w13_input_scale)
             output_dtype = x.dtype
@@ -1310,7 +1331,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = output_size_per_partition
         if input_size_per_partition % 16 != 0:
             raise ValueError(
-                "Unsupported model when in features size is " "not multiple of 16"
+                "Unsupported model when in features size is not multiple of 16"
             )
 
         weight_dtype = (
@@ -2021,8 +2042,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         activation = self.moe_runner_config.activation
 
         assert (
-            activation in ACT_STR_TO_TYPE_MAP
-        ), f"{activation=} missing from {ACT_STR_TO_TYPE_MAP.keys()=}"
+            activation in _SUPPORTED_ACT_STRS
+        ), f"{activation=} not in supported {_SUPPORTED_ACT_STRS}"
         moe_runner_config = self.moe_runner_config
 
         # FlashInfer TRTLLM FP4 path
@@ -2102,11 +2123,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             return self.runner.run(dispatch_output, quant_info)
 
         if self.enable_flashinfer_cutlass_moe:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
             assert (
                 not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
+            # Resolve the FlashInfer ActivationType honoring the gated flag,
+            # then verify the CUTLASS FP4 kernel supports it.
+            fi_activation = ActivationType(
+                get_activation_type(activation, is_gated=moe_runner_config.is_gated)
+            )
+            _CUTLASS_FP4_SUPPORTED = {
+                ActivationType.Swiglu,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+                ActivationType.Identity,
+            }
+            assert fi_activation in _CUTLASS_FP4_SUPPORTED, (
+                f"Activation {activation!r} (is_gated={moe_runner_config.is_gated}) "
+                f"maps to {fi_activation.name}, which is not supported by the "
+                "flashinfer cutlass fp4 moe kernel."
+            )
             # TRTLLM Cutlass moe takes in activations in BF16/Half/nvfp4 precision
             # and fp4 quantized weights loaded from the checkpoint
             x = dispatch_output.hidden_states
@@ -2157,7 +2197,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=layer.moe_tp_size,
                 tp_rank=layer.moe_tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-                activation_type=ACT_STR_TO_TYPE_MAP[activation],
+                activation_type=fi_activation,
                 enable_alltoall=get_moe_a2a_backend().is_flashinfer(),
             )[0]
 

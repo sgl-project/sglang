@@ -29,6 +29,7 @@ from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import 
 from sglang.srt.model_executor.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -135,7 +136,7 @@ class RadixAttention(nn.Module):
                 )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 q,
                 k,
                 v,
@@ -179,23 +180,16 @@ def unified_attention_with_output(
         kwargs["sinks"] = sinks
 
     original_out_cache_loc = forward_batch.out_cache_loc
-    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
-    token_to_kv_pool = forward_batch.token_to_kv_pool
-    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
     # Keep the original ForwardBatch object and only narrow cache locations for
     # this backend call so model/backend state is still written to the same batch.
     forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
-    if original_out_cache_loc_swa is not None:
-        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
-        if hasattr(token_to_kv_pool, "set_swa_loc"):
-            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
     # Store pre-allocated output for FA backend to write directly into.
     # Must slice to real_num_tokens to match the narrowed query shape —
     # the FA kernel validates out.size(0) == q.size(0).
     forward_batch._attn_output = output[:real_num_tokens]
 
-    ret = forward_batch.attn_backend.forward(
+    ret = get_attn_backend().forward(
         query,
         key,
         value,
@@ -205,11 +199,6 @@ def unified_attention_with_output(
         **kwargs,
     )
     forward_batch.out_cache_loc = original_out_cache_loc
-    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
-    if original_out_cache_loc_swa is not None and hasattr(
-        token_to_kv_pool, "set_swa_loc"
-    ):
-        token_to_kv_pool.set_swa_loc(original_swa_loc)
 
     if ret.data_ptr() != output.data_ptr():
         output[:real_num_tokens].view(ret.shape).copy_(ret)
