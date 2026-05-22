@@ -104,7 +104,7 @@ class CanaryRunner:
                 SwaDivergenceStats(
                     device=device,
                     d2h_stream=self._d2h_stream,
-                    swa_pool_static_observer=self._swa_live_divergence_observer,
+                    swa_live_divergence_observer=self._swa_live_divergence_observer,
                 )
             )
         else:
