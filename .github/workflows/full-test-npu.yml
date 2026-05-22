@@ -493,9 +493,9 @@ jobs:
             runner: linux-aarch64-a3-2
             test_case: test/registered/ascend/performance/test_npu_qwen3_5_27b_w8a8_1p_in64k_out1k_20ms.py
             test_type: 'perf'
-          - name: test_npu_qwen3_5_27b_w8a8_1p_in64k_90prefix_20ms
+          - name: test_npu_qwen3_5_27b_w8a8_1p_in1024x1024_30_out1024_50ms
             runner: linux-aarch64-a3-2
-            test_case: test/registered/ascend/performance/test_npu_qwen3_5_27b_w8a8_1p_in64k_90prefix_20ms.py
+            test_case: test/registered/ascend/performance/test_npu_qwen3_5_27b_w8a8_1p_in1024x1024_30_out1024_50ms.py
             test_type: 'perf'
           - name: test_npu_kimi_k2_5_w4a8_8p_in3k5_out1k5_50ms
             runner: linux-aarch64-a3-16

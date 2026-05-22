@@ -15,7 +15,7 @@ register_npu_ci(
     disabled="performance testcase",
 )
 
-QWEN3_5_27B_MM_1024_1024_HIGH_ENVS = {
+QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -29,7 +29,7 @@ QWEN3_5_27B_MM_1024_1024_HIGH_ENVS = {
     "ASCEND_USE_FIA": "1",
 }
 
-QWEN3_5_27B_MM_1024_1024_HIGH_OTHER_ARGS = [
+QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_OTHER_ARGS = [
     "--model-path",
     QWEN3_5_27B_W8A8_MODEL_PATH,
     "--tp-size",
@@ -84,14 +84,14 @@ QWEN3_5_27B_MM_1024_1024_HIGH_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_5_27B_1P_MM_In1k_Out1k_High(TestAscendPerformanceTestCaseBase):
-    """Test NPU performance for Qwen3.5-27B-W8A8 1p multimodal in1k out1k"""
+class TestNPUQwen3_5_27B_W8A8_1P_In1024x1024_30_Out1024_50ms(TestAscendPerformanceTestCaseBase):
+    """Test NPU performance for Qwen3.5-27B-W8A8 1p in1024x1024 30 out1024 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     aisbench_dataset_type = AISBENCHMARK_DATASET_MM_CUSTOM_GEN
     model = QWEN3_5_27B_W8A8_MODEL_PATH
-    other_args = QWEN3_5_27B_MM_1024_1024_HIGH_OTHER_ARGS
-    envs = QWEN3_5_27B_MM_1024_1024_HIGH_ENVS
+    other_args = QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_OTHER_ARGS
+    envs = QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_ENVS
     dataset_name = "image"
     image_resolution = "1024x1024"
     image_count = 1
@@ -103,8 +103,8 @@ class TestNPUQwen3_5_27B_1P_MM_In1k_Out1k_High(TestAscendPerformanceTestCaseBase
     tpot = 50
     output_token_throughput = 30
 
-    def test_npu_qwen3_5_27b_1p_mm_in1k_out1k_high(self):
-        """Run NPU performance test for Qwen3.5-27B-W8A8 multimodal in1k out1k"""
+    def test_npu_qwen3_5_27b_w8a8_1p_in1024x1024_30_out1024_50ms(self):
+        """Run NPU performance test for Qwen3.5-27B-W8A8 1p in1024x1024 30 out1024 50ms"""
         self.run_throughput()
 
 
