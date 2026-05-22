@@ -251,13 +251,12 @@ class CanaryE2EBase(CustomTestCase):
         self,
         *,
         min_mapping_nonidentity: int = 1,
-        min_pool_wrap: int = 1,
         require_verify_lag: bool = True,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
-        """Assert that the SWA path was genuinely exercised: at least one slot
-        recycled, at least one non-identity LUT entry, and (when
+        """Assert that the SWA path was genuinely exercised: at least one
+        non-identity LUT entry (vs install-time baseline) and (when
         require_verify_lag=True) SWA verify cumulative count strictly less than
         FULL verify cumulative count.
 
@@ -286,11 +285,6 @@ class CanaryE2EBase(CustomTestCase):
             raise AssertionError(
                 f"SWA divergence not observed: mapping_nonidentity={last_parsed.mapping_nonidentity} "
                 f"< min={min_mapping_nonidentity}. Line: {last_line}"
-            )
-        if last_parsed.swa_pool_wrap < min_pool_wrap:
-            raise AssertionError(
-                f"SWA divergence not observed: swa_pool_wrap={last_parsed.swa_pool_wrap} "
-                f"< min={min_pool_wrap}. Line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full

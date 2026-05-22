@@ -73,7 +73,6 @@ def _parse_swa_divergence_line(line: str) -> dict[str, int]:
         "verify_full": parsed.verify_full,
         "verify_swa": parsed.verify_swa,
         "mapping_nonidentity": parsed.mapping_nonidentity,
-        "swa_pool_wrap": parsed.swa_pool_wrap,
     }
 
 
@@ -111,7 +110,6 @@ class TestSwaDivergenceStats(CustomTestCase):
             self.assertEqual(fields["verify_full"], 40)
             self.assertEqual(fields["verify_swa"], 12)
             self.assertEqual(fields["mapping_nonidentity"], 0)
-            self.assertEqual(fields["swa_pool_wrap"], 0)
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         with _patch_future_tensor():

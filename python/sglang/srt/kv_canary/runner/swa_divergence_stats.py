@@ -28,7 +28,6 @@ class ParsedSwaDivergenceLine:
     verify_full: int
     verify_swa: int
     mapping_nonidentity: int
-    swa_pool_wrap: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -37,7 +36,6 @@ class _PendingSnapshot:
     verify_full: FutureTensor
     verify_swa: FutureTensor
     mapping_nonidentity: Optional[FutureTensor]
-    wrap_count: Optional[FutureTensor]
 
 
 def format_swa_divergence_line(parsed: ParsedSwaDivergenceLine) -> str:
@@ -130,11 +128,6 @@ class SwaDivergenceStats:
             if pending.mapping_nonidentity is not None
             else 0
         )
-        wrap_count = (
-            int(pending.wrap_count.wait().item())
-            if pending.wrap_count is not None
-            else 0
-        )
 
         self._latest_verify_full = verify_full
         self._latest_verify_swa = verify_swa
@@ -147,7 +140,6 @@ class SwaDivergenceStats:
                     verify_full=verify_full,
                     verify_swa=verify_swa,
                     mapping_nonidentity=mapping_nonidentity,
-                    swa_pool_wrap=wrap_count,
                 )
             )
         )
@@ -169,5 +161,4 @@ class SwaDivergenceStats:
             verify_full=verify_full_future,
             verify_swa=verify_swa_future,
             mapping_nonidentity=None,
-            wrap_count=None,
         )
