@@ -14,9 +14,8 @@ from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner import swa_divergence_stats as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence_stats import (
-    SWA_DIVERGENCE_LOG_PREFIX,
+    SwaDivergenceLog,
     SwaDivergenceStats,
-    parse_swa_divergence_line,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -64,16 +63,11 @@ def _patch_future_tensor():
     )
 
 
-def _parse_swa_divergence_line(line: str) -> dict[str, int]:
-    parsed = parse_swa_divergence_line(line)
+def _parse_swa_divergence_line(line: str) -> SwaDivergenceLog:
+    parsed = SwaDivergenceLog.parse(line)
     if parsed is None:
         raise AssertionError(f"line does not match swa_divergence format: {line!r}")
-    return {
-        "forward_ct": parsed.forward_ct,
-        "verify_full": parsed.verify_full,
-        "verify_swa": parsed.verify_swa,
-        "mapping_nonidentity": parsed.mapping_nonidentity,
-    }
+    return parsed
 
 
 class TestSwaDivergenceStats(CustomTestCase):
@@ -82,7 +76,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator=None,
+                swa_pool_static_observer=None,
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
@@ -102,24 +96,24 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.emit_log_if_due(step_counter=20, period=10)
 
             lines = [
-                line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line
+                line for line in captured.output if SwaDivergenceLog.parse(line) is not None
             ]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
-            self.assertEqual(fields["forward_ct"], 4)
-            self.assertEqual(fields["verify_full"], 40)
-            self.assertEqual(fields["verify_swa"], 12)
-            self.assertEqual(fields["mapping_nonidentity"], 0)
+            self.assertEqual(fields.forward_ct, 4)
+            self.assertEqual(fields.verify_full, 40)
+            self.assertEqual(fields.verify_swa, 12)
+            self.assertEqual(fields.mapping_nonidentity, 0)
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         with _patch_future_tensor():
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator=None,
+                swa_pool_static_observer=None,
             )
 
-            snapshots: list[dict[str, int]] = []
+            snapshots: list[SwaDivergenceLog] = []
 
             def _take_snapshot(step: int) -> None:
                 with self.assertLogs(
@@ -130,7 +124,7 @@ class TestSwaDivergenceStats(CustomTestCase):
                 matching = [
                     line
                     for line in captured.output
-                    if SWA_DIVERGENCE_LOG_PREFIX in line
+                    if SwaDivergenceLog.parse(line) is not None
                 ]
                 self.assertTrue(matching, captured.output)
                 snapshots.append(_parse_swa_divergence_line(matching[-1]))
@@ -150,10 +144,10 @@ class TestSwaDivergenceStats(CustomTestCase):
 
             for idx in range(1, len(snapshots)):
                 self.assertGreaterEqual(
-                    snapshots[idx]["verify_full"], snapshots[idx - 1]["verify_full"]
+                    snapshots[idx].verify_full, snapshots[idx - 1].verify_full
                 )
                 self.assertGreaterEqual(
-                    snapshots[idx]["verify_swa"], snapshots[idx - 1]["verify_swa"]
+                    snapshots[idx].verify_swa, snapshots[idx - 1].verify_swa
                 )
 
 

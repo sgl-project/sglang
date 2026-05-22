@@ -7,9 +7,7 @@ import time
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.runner.swa_divergence_stats import (
-    find_last_swa_divergence_line,
-)
+from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceLog
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
@@ -139,7 +137,7 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
             log_text = self._captured_log_text()
-            found = find_last_swa_divergence_line(log_text)
+            found = SwaDivergenceLog.find_last(log_text)
             if found is not None:
                 last_parsed, last_line = found
                 break

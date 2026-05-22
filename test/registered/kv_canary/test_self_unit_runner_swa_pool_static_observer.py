@@ -16,9 +16,8 @@ from sglang.srt.kv_canary.runner import (
     swa_pool_static_observer as swa_pool_observer_module,
 )
 from sglang.srt.kv_canary.runner.swa_divergence_stats import (
-    SWA_DIVERGENCE_LOG_PREFIX,
+    SwaDivergenceLog,
     SwaDivergenceStats,
-    parse_swa_divergence_line,
 )
 from sglang.srt.kv_canary.runner.swa_pool_static_observer import SwaPoolStaticObserver
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -185,10 +184,10 @@ class TestSwaDivergenceStatsWithObserver(CustomTestCase):
                 stats.emit_log_if_due(step_counter=20, period=10)
 
         matching = [
-            line for line in captured.output if SWA_DIVERGENCE_LOG_PREFIX in line
+            line for line in captured.output if SwaDivergenceLog.parse(line) is not None
         ]
         self.assertEqual(len(matching), 1, matching)
-        parsed = parse_swa_divergence_line(matching[0])
+        parsed = SwaDivergenceLog.parse(matching[0])
         assert parsed is not None
         self.assertEqual(parsed.mapping_nonidentity, 3)
         self.assertEqual(parsed.verify_full, 11)
