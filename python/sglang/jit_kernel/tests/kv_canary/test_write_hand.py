@@ -14,6 +14,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
+    launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import _compute_real_kv_hash_scalar
 from sglang.jit_kernel.kv_canary.write import (
@@ -24,8 +25,6 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,
-    launch_canary_verify_kernel_from_parts,
-    launch_canary_write_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -220,16 +219,18 @@ class TestSeedSlot:
             slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=verify_log.ring,
+                violation_write_index=verify_log.write_index,
+                slot_run_counter=verify_log.slot_run_counter,
+                kernel_run_counter=verify_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=verify_plan,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=verify_log.ring,
-            violation_write_index=verify_log.write_index,
-            slot_run_counter=verify_log.slot_run_counter,
-            kernel_run_counter=verify_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -616,16 +617,18 @@ class TestMockMode:
             device=_DEVICE,
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=verify_log.ring,
+                violation_write_index=verify_log.write_index,
+                slot_run_counter=verify_log.slot_run_counter,
+                kernel_run_counter=verify_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=verify_plan,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=verify_log.ring,
-            violation_write_index=verify_log.write_index,
-            slot_run_counter=verify_log.slot_run_counter,
-            kernel_run_counter=verify_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -995,22 +998,24 @@ class TestRealKvHash:
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_write_kernel_from_parts(
-                canary_buf=cuda_buf,
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=cuda_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=too_many,
+                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                ),
                 plan=plan,
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                enable_write_verify_inputs=False,
+                enable_assert_inputs=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=too_many,
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
             )
 
     @pytest.mark.parametrize(
@@ -1170,22 +1175,24 @@ class TestRealKvHash:
                 device=_DEVICE,
             )
             log = FakeViolationLog.allocate(device=_DEVICE)
-            launch_canary_write_kernel_from_parts(
-                canary_buf=buf,
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=srcs,
+                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                ),
                 plan=plan,
                 input_ids=_int32_tensor([1]),
                 positions=_int32_tensor([0]),
                 out_cache_loc=_int32_tensor([2]),
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                enable_write_verify_inputs=False,
+                enable_assert_inputs=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=srcs,
-                real_kv_hash_mode=consts.RealKvHashMode.ALL,
             )
             torch.cuda.synchronize()
             return read_slot_fields(canary_buf=buf, slot_idx=2)

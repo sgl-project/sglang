@@ -6,14 +6,15 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
+    VerifyOrWriteContext,
     VerifyPlan,
+    launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
-    launch_canary_verify_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -276,16 +277,18 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
 
     for _ in range(num_launches):
         cuda_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=cuda_log.ring,
+                violation_write_index=cuda_log.write_index,
+                slot_run_counter=cuda_log.slot_run_counter,
+                kernel_run_counter=cuda_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=plan_cuda,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=cuda_log.ring,
-            violation_write_index=cuda_log.write_index,
-            slot_run_counter=cuda_log.slot_run_counter,
-            kernel_run_counter=cuda_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     torch.cuda.synchronize()
