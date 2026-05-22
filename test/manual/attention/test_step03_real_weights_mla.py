@@ -63,6 +63,18 @@ _MLA_MODEL = os.environ.get("MLA_MODEL", _MLA_MODEL_DEFAULT)
 # DeepSeek-V2-Lite-Chat is 16B; needs TP=4 to fit on GB300 (128GB HBM)
 _MLA_TP_SIZE = "1" if "sglang-ci-dsv3-test" in _MLA_MODEL else "4"
 
+# Eager and PCG modes crash during PCG warmup for 16B+ models even when
+# --disable-cuda-graph is passed (PCG runs by default and OOM-kills the
+# process). Skip those tests when not using the tiny CI model.
+_MLA_LARGE_MODEL = _MLA_TP_SIZE != "1"
+_SKIP_EAGER_PCG = (
+    "Eager/PCG modes OOM-crash during PCG warmup for large MLA models "
+    "(only sglang-ci-dsv3-test supports eager mode). "
+    "Set MLA_MODEL=lmsys/sglang-ci-dsv3-test to enable."
+    if _MLA_LARGE_MODEL
+    else None
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -132,9 +144,12 @@ def _raw_generate(base_url: str, prompt: str, max_new_tokens: int = 16) -> str:
 class _MLAAccuracyBase(CustomTestCase):
     model: str = _MLA_MODEL
     runner_args: list = []
+    skip_reason: str = None  # set by subclasses to skip at setUpClass
 
     @classmethod
     def setUpClass(cls):
+        if cls.skip_reason:
+            raise unittest.SkipTest(cls.skip_reason)
         if not _CUDA:
             raise unittest.SkipTest("CUDA required")
         if not _model_exists(cls.model):
@@ -192,6 +207,7 @@ class _MLAAccuracyBase(CustomTestCase):
 class TestFlashInferMLAEagerAccuracy(_MLAAccuracyBase):
     """FlashInfer MLA + eager."""
 
+    skip_reason = _SKIP_EAGER_PCG
     runner_args = ["--attention-backend", "flashinfer", "--disable-cuda-graph"]
 
 
@@ -210,6 +226,7 @@ class TestFlashInferMLACudaGraphAccuracy(_MLAAccuracyBase):
 class TestFlashInferMLAPCGAccuracy(_MLAAccuracyBase):
     """FlashInfer MLA + PCG — exercises extend-mode capture for MLA."""
 
+    skip_reason = _SKIP_EAGER_PCG
     runner_args = [
         "--attention-backend",
         "flashinfer",
@@ -225,6 +242,7 @@ class TestFlashInferMLAPCGAccuracy(_MLAAccuracyBase):
 class TestTRTLLMMLAEagerAccuracy(_MLAAccuracyBase):
     """TRTLLM MLA + eager."""
 
+    skip_reason = _SKIP_EAGER_PCG
     runner_args = ["--attention-backend", "trtllm_mla", "--disable-cuda-graph"]
 
 
@@ -243,6 +261,7 @@ class TestTRTLLMMLACudaGraphAccuracy(_MLAAccuracyBase):
 class TestTRTLLMMLAPCGAccuracy(_MLAAccuracyBase):
     """TRTLLM MLA + PCG."""
 
+    skip_reason = _SKIP_EAGER_PCG
     runner_args = [
         "--attention-backend",
         "trtllm_mla",
@@ -264,9 +283,11 @@ class TestMLABackendConsistency(CustomTestCase):
     indicates a kernel correctness issue.
 
     Launches two servers (flashinfer_mla eager, trtllm_mla eager) sequentially
-    and compares raw-completion outputs.
+    and compares raw-completion outputs.  Skipped when using large model since
+    the eager servers crash on PCG warmup.
     """
 
+    skip_reason = _SKIP_EAGER_PCG
     model = _MLA_MODEL
 
     _BACKENDS = {
@@ -280,6 +301,8 @@ class TestMLABackendConsistency(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if cls.skip_reason:
+            raise unittest.SkipTest(cls.skip_reason)
         if not _CUDA:
             raise unittest.SkipTest("CUDA required")
         if not _model_exists(cls.model):
@@ -324,8 +347,10 @@ class TestMLABackendConsistency(CustomTestCase):
 class _MLAConsistencyBase(CustomTestCase):
     """
     Base: verify that eager / full-CG / PCG produce identical greedy outputs
-    for a given MLA backend.
+    for a given MLA backend.  Skipped with large models (eager OOM-crashes).
     """
+
+    skip_reason = _SKIP_EAGER_PCG
 
     model = _MLA_MODEL
     backend_flag: str = "flashinfer"
@@ -357,6 +382,8 @@ class _MLAConsistencyBase(CustomTestCase):
 
     @classmethod
     def setUpClass(cls):
+        if cls.skip_reason:
+            raise unittest.SkipTest(cls.skip_reason)
         if not _CUDA:
             raise unittest.SkipTest("CUDA required")
         if not _model_exists(cls.model):

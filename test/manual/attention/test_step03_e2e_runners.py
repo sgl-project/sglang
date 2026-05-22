@@ -538,6 +538,11 @@ class TestDSV4CudaGraph(_ServerSmokeBase):
     Requires PR #26024 cherry-picked onto the branch (NVFP4 routing fix).
     """
 
+    skip_reason = (
+        "DSV4 requires cherry-pick #26024 (fp8.py: route to DEEP_GEMM when "
+        "is_fp4_expert and DeepGEMM available). Cherry-pick before running: "
+        "git fetch origin be24b5c4b1 && git cherry-pick be24b5c4b1"
+    )
     model = _DSV4_MODEL
     timeout = 2400
     launch_args = [
@@ -646,6 +651,7 @@ class TestTritonEAGLE(_ServerSmokeBase):
 class TestDSV4EAGLE(_ServerSmokeBase):
     """DSV4 + full CUDA graph + EAGLE speculative decoding (motivating workload)."""
 
+    skip_reason = "DSV4 requires cherry-pick #26024 (same as TestDSV4CudaGraph)."
     model = _DSV4_MODEL
     timeout = 2400
     launch_args = [
@@ -674,6 +680,12 @@ class TestDSV4EAGLE(_ServerSmokeBase):
 class TestFA3EAGLE3(_ServerSmokeBase):
     """FA3 (or triton fallback on Blackwell) + full CG + EAGLE3 multi-layer draft."""
 
+    skip_reason = (
+        None
+        if _model_exists(_EAGLE3_TARGET)
+        else f"EAGLE3 target model not accessible: {_EAGLE3_TARGET} "
+        "(requires Llama license acceptance on huggingface.co/meta-llama)"
+    )
     model = _EAGLE3_TARGET
     timeout = 1800
     # On Blackwell (SM100+), FA3 is unavailable so we fall back to triton
