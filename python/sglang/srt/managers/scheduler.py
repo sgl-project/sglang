@@ -2890,7 +2890,7 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                self.future_map.invalidate(batch, future_indices)
+                self.future_map.set_input_ids_sentinel(batch, future_indices)
 
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input

@@ -531,12 +531,7 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    if batch.enable_overlap:
-        # batch.seq_lens (GPU) is a sentinel between iters (FutureMap.invalidate);
-        # materialize from CPU shadow for the allocator. Tensor stays local.
-        seq_lens_gpu = batch.seq_lens_cpu.to(batch.device, non_blocking=True)
-    else:
-        seq_lens_gpu = batch.seq_lens
+    seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
 
     if batch.tree_cache.page_size == 1:
