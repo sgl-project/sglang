@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0/vllm/compilation/pass_manager.py
 
 import logging
+from typing import Optional
 
 from torch import fx as fx
 
@@ -12,6 +13,7 @@ from sglang.srt.compilation.inductor_pass import (
     get_pass_context,
 )
 from sglang.srt.compilation.replace_scaled_mm import ReplaceScaledMMWithCutlassPass
+from sglang.srt.layers.quantization.fp8_utils import get_fp8_gemm_runner_backend
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,8 @@ class PostGradPassManager(CustomGraphPass):
             if pass_.is_applicable_for_shape(shape):
                 pass_(graph)
 
-        self.replace_scaled_mm(graph)
+        if self.replace_scaled_mm is not None:
+            self.replace_scaled_mm(graph)
 
         # always run fix_functionalization last
         self.fix_functionalization(graph)
@@ -49,7 +52,19 @@ class PostGradPassManager(CustomGraphPass):
         self,
     ):
         self.pass_config = dict()
-        self.replace_scaled_mm = ReplaceScaledMMWithCutlassPass()
+        # Gate the CUTLASS replacement on --fp8-gemm-backend cutlass. When the
+        # user hasn't opted in, leave aten::_scaled_mm alone (cuBLASLt nvjet
+        # path, status quo). The pass is a runtime no-op on graphs without
+        # eligible _scaled_mm nodes, but we still skip registration so the
+        # inductor cache key for non-cutlass backends is unchanged.
+        self.replace_scaled_mm: Optional[ReplaceScaledMMWithCutlassPass] = None
+        if get_fp8_gemm_runner_backend().is_cutlass():
+            self.replace_scaled_mm = ReplaceScaledMMWithCutlassPass()
+            logger.info(
+                "fp8-gemm-backend=cutlass: registering "
+                "ReplaceScaledMMWithCutlassPass to rewrite eligible "
+                "aten::_scaled_mm nodes to sgl_kernel.fp8_scaled_mm."
+            )
         self.fix_functionalization = FixFunctionalizationPass()
 
     def add(self, pass_: InductorPass):
@@ -66,6 +81,7 @@ class PostGradPassManager(CustomGraphPass):
         state = {"pass_config": pass_manager_uuid, "passes": []}
         for pass_ in self.passes:
             state["passes"].append(pass_.uuid())
-        state["passes"].append(self.replace_scaled_mm.uuid())
+        if self.replace_scaled_mm is not None:
+            state["passes"].append(self.replace_scaled_mm.uuid())
         state["passes"].append(self.fix_functionalization.uuid())
         return InductorPass.hash_dict(state)
