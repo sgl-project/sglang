@@ -2063,12 +2063,12 @@ class AscendAttnBackend(AttentionBackend):
                     paged_seq_lens_cpu_list,
                 ) = self._get_paged_attention_inputs(layer, forward_batch)
                 paged_attn_mask = None
-            k_cache = self.token_to_kv_pool.get_key_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim)
-            v_cache = self.token_to_kv_pool.get_value_buffer(
-                layer.layer_id
-            ).view(-1, self.page_size, layer.tp_v_head_num * layer.v_head_dim)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_k_head_num * layer.qk_head_dim
+            )
+            v_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+                -1, self.page_size, layer.tp_v_head_num * layer.v_head_dim
+            )
             query = q.reshape(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
             if paged_seq_lens_cpu_int is None:
                 actual_seq_len_kv = paged_seq_lens_cpu_list
