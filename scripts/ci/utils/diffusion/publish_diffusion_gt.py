@@ -298,9 +298,9 @@ def _format_old_new_metrics(metrics):
     return f"ssim={metrics.ssim:.4f}, mean_abs_diff={metrics.mean_abs_diff:.2f}"
 
 
-def validate_changed_files(changed_files, remote_image_entries, token):
+def validate_gt_files(files_to_upload, changed_files, remote_image_entries, token):
     failures = []
-    for path, content in changed_files:
+    for path, content in files_to_upload:
         quality_metrics = compute_image_quality_metrics(content)
         quality_reasons = get_quality_failure_reasons(quality_metrics)
         if quality_reasons:
@@ -309,6 +309,7 @@ def validate_changed_files(changed_files, remote_image_entries, token):
                 f"({_format_quality_metrics(quality_metrics)})"
             )
 
+    for path, content in changed_files:
         remote_entry = remote_image_entries.get(path)
         if not remote_entry:
             continue
@@ -337,13 +338,38 @@ def validate_changed_files(changed_files, remote_image_entries, token):
             )
 
     if not failures:
-        print(f"GT quality gate passed for {len(changed_files)} changed image(s).")
+        print(
+            f"GT quality gate passed for {len(files_to_upload)} generated image(s) "
+            f"and {len(changed_files)} changed image(s)."
+        )
         return
 
     print("GT quality gate failed; refusing to publish suspicious image updates:")
     for failure in failures:
         print(f"  - {failure}")
     sys.exit(1)
+
+
+def check_quality(source_dir, target_dir=None):
+    target_dir = target_dir or DEFAULT_TARGET_DIR
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        print("Error: GITHUB_TOKEN environment variable not set")
+        sys.exit(1)
+
+    files_to_upload = collect_images(source_dir, target_dir)
+    if not files_to_upload:
+        print(f"No image files found in {source_dir}")
+        return
+
+    remote_image_entries = get_remote_image_entries(
+        REPO_OWNER, REPO_NAME, target_dir, token
+    )
+    remote_blob_shas = {
+        path: item["sha"] for path, item in remote_image_entries.items()
+    }
+    changed_files = filter_changed_files(files_to_upload, remote_blob_shas)
+    validate_gt_files(files_to_upload, changed_files, remote_image_entries, token)
 
 
 def publish(source_dir, target_dir=None):
@@ -384,10 +410,12 @@ def publish(source_dir, target_dir=None):
                 path: item["sha"] for path, item in remote_image_entries.items()
             }
             changed_files = filter_changed_files(files_to_upload, remote_blob_shas)
+            validate_gt_files(
+                files_to_upload, changed_files, remote_image_entries, token
+            )
             if not changed_files:
                 print("No image changes to publish.")
                 return
-            validate_changed_files(changed_files, remote_image_entries, token)
 
             try:
                 tree_items = create_blobs(REPO_OWNER, REPO_NAME, changed_files, token)
@@ -463,8 +491,16 @@ def main():
         default=None,
         help=f"Target directory in the remote repo (default: {DEFAULT_TARGET_DIR})",
     )
+    parser.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate generated GT images without publishing them",
+    )
     args = parser.parse_args()
-    publish(args.source_dir, args.target_dir)
+    if args.check_only:
+        check_quality(args.source_dir, args.target_dir)
+    else:
+        publish(args.source_dir, args.target_dir)
 
 
 if __name__ == "__main__":

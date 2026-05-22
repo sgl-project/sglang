@@ -67,7 +67,7 @@ def test_old_new_metrics_flags_large_drift():
     assert metrics.mean_abs_diff > publish_gt.OLD_NEW_MAX_MEAN_ABS_DIFF
 
 
-def test_changed_file_validation_rejects_suspicious_update(monkeypatch):
+def test_gt_file_validation_rejects_suspicious_update(monkeypatch):
     monkeypatch.setattr(
         publish_gt,
         "get_remote_blob_content",
@@ -75,13 +75,15 @@ def test_changed_file_validation_rejects_suspicious_update(monkeypatch):
     )
 
     with pytest.raises(SystemExit):
-        publish_gt.validate_changed_files(
-            [
-                (
-                    "diffusion-ci/consistency_gt/sglang_generated/example.png",
-                    _low_detail_noise(),
-                )
-            ],
+        files_to_upload = [
+            (
+                "diffusion-ci/consistency_gt/sglang_generated/example.png",
+                _low_detail_noise(),
+            )
+        ]
+        publish_gt.validate_gt_files(
+            files_to_upload,
+            files_to_upload,
             {
                 "diffusion-ci/consistency_gt/sglang_generated/example.png": {
                     "sha": "old"
@@ -91,20 +93,44 @@ def test_changed_file_validation_rejects_suspicious_update(monkeypatch):
         )
 
 
-def test_changed_file_validation_allows_replacing_suspicious_old_gt(monkeypatch):
+def test_gt_file_validation_rejects_suspicious_unchanged_output():
+    files_to_upload = [
+        (
+            "diffusion-ci/consistency_gt/sglang_generated/example.png",
+            _low_detail_noise(),
+        )
+    ]
+
+    with pytest.raises(SystemExit):
+        publish_gt.validate_gt_files(
+            files_to_upload,
+            [],
+            {
+                "diffusion-ci/consistency_gt/sglang_generated/example.png": {
+                    "sha": "old"
+                }
+            },
+            "token",
+        )
+
+
+def test_gt_file_validation_allows_replacing_suspicious_old_gt(monkeypatch):
     monkeypatch.setattr(
         publish_gt,
         "get_remote_blob_content",
         lambda repo_owner, repo_name, blob_sha, token: _low_detail_noise(),
     )
 
-    publish_gt.validate_changed_files(
-        [
-            (
-                "diffusion-ci/consistency_gt/sglang_generated/example.png",
-                _structured_image(),
-            )
-        ],
+    files_to_upload = [
+        (
+            "diffusion-ci/consistency_gt/sglang_generated/example.png",
+            _structured_image(),
+        )
+    ]
+
+    publish_gt.validate_gt_files(
+        files_to_upload,
+        files_to_upload,
         {"diffusion-ci/consistency_gt/sglang_generated/example.png": {"sha": "old"}},
         "token",
     )
