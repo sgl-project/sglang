@@ -1502,6 +1502,10 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
+        import gc
+
+        gc.disable()
+        logger.info("[GC] disabled auto GC, will collect between batches")
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1517,9 +1521,13 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
+                # Collect GC between batches (not during forward)
+                # to avoid cudaFree stalls on TP0
+                gc.collect()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
+                gc.collect()
 
             # Update last_batch
             self.last_batch = batch
@@ -1529,10 +1537,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
-        import gc
-
-        gc.disable()
-        logger.info("[GC] disabled for event_loop_overlap")
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
