@@ -316,6 +316,16 @@ def validate_changed_files(changed_files, remote_image_entries, token):
         old_content = get_remote_blob_content(
             REPO_OWNER, REPO_NAME, remote_entry["sha"], token
         )
+        old_quality_metrics = compute_image_quality_metrics(old_content)
+        old_quality_reasons = get_quality_failure_reasons(old_quality_metrics)
+        if old_quality_reasons:
+            print(
+                f"Skipping old/new drift check for {path} because existing GT is "
+                f"already suspicious: {', '.join(old_quality_reasons)} "
+                f"({_format_quality_metrics(old_quality_metrics)})"
+            )
+            continue
+
         old_new_metrics = compute_old_new_metrics(old_content, content)
         if (
             old_new_metrics.ssim < OLD_NEW_MIN_SSIM

@@ -89,3 +89,22 @@ def test_changed_file_validation_rejects_suspicious_update(monkeypatch):
             },
             "token",
         )
+
+
+def test_changed_file_validation_allows_replacing_suspicious_old_gt(monkeypatch):
+    monkeypatch.setattr(
+        publish_gt,
+        "get_remote_blob_content",
+        lambda repo_owner, repo_name, blob_sha, token: _low_detail_noise(),
+    )
+
+    publish_gt.validate_changed_files(
+        [
+            (
+                "diffusion-ci/consistency_gt/sglang_generated/example.png",
+                _structured_image(),
+            )
+        ],
+        {"diffusion-ci/consistency_gt/sglang_generated/example.png": {"sha": "old"}},
+        "token",
+    )
