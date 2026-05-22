@@ -147,25 +147,28 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
-        spec_info = forward_batch.spec_info
         if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
-
-                create_flashmla_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    None,
-                    self.cuda_graph_kv_indices,
-                    self.req_to_token.stride(0),
-                    self.cuda_graph_kv_indices.stride(0),
-                    PAGED_SIZE=PAGE_SIZE,
-                )
-                self.forward_metadata = CutlassMLADecodeMetadata(
-                    self.cuda_graph_mla_workspace,
-                    self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
-                )
+            # OLD ``init_forward_metadata_replay_cuda_graph`` ran the KV-indices
+            # refresh UNCONDITIONALLY for decode_or_idle. The merged body had
+            # gated it on ``spec_info is None`` (inherited from the OLD capture
+            # body), making the branch a no-op at replay when ``spec_info is
+            # not None`` (DSA-style draft decode / any spec-info-set decode)
+            # -- captured graph reads stale KV indices.
+            max_seqlen_pad = self.cuda_graph_kv_indices.shape[1]
+            create_flashmla_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                None,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                self.cuda_graph_kv_indices.stride(0),
+                PAGED_SIZE=PAGE_SIZE,
+            )
+            self.forward_metadata = CutlassMLADecodeMetadata(
+                self.cuda_graph_mla_workspace,
+                self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
+            )
         else:
             super().init_forward_data_out_graph(forward_batch)
 
