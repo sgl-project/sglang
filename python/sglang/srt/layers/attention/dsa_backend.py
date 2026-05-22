@@ -848,9 +848,10 @@ class DeepseekSparseAttnBackend(
             return
 
         bs = forward_batch.batch_size
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         num_tokens = forward_batch.positions.shape[0]
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         self.set_dsa_prefill_impl(forward_batch=None)
 
@@ -1006,18 +1007,16 @@ class DeepseekSparseAttnBackend(
         passes a padded buffer view via the cuda graph runner).
         """
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
+        seq_lens_cpu = seq_lens_cpu[:bs]
 
         self.set_dsa_prefill_impl(forward_batch=None)
-
-        seq_lens = seq_lens[:bs]
-        seq_lens_cpu = seq_lens_cpu[:bs]
-        req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
         metadata: DSAMetadata = self.decode_cuda_graph_metadata[bs]
@@ -2432,12 +2431,15 @@ class DeepseekSparseAttnMultiStepBackend:
 
         # ---- replay path ----
         bs = forward_batch.batch_size
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
                 seq_lens_cpu=forward_batch.seq_lens_cpu,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
