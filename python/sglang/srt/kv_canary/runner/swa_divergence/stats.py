@@ -9,10 +9,10 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
-from sglang.srt.kv_canary.runner.swa_divergence.snapshot import (
-    snapshot_swa_live_divergence_future,
+from sglang.srt.kv_canary.runner.swa_divergence.compute import (
+    compute_swa_live_divergence,
 )
+from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -130,16 +130,17 @@ class SwaDivergenceStats:
             stream=self._d2h_stream,
         )
 
-        mapping_future: Optional[FutureTensor] = (
-            snapshot_swa_live_divergence_future(
-                swa_allocator=self._swa_allocator,
-                req_to_token_pool=self._req_to_token_pool,
-                forward_batch=forward_batch,
-                stream=self._d2h_stream,
+        mapping_future: Optional[FutureTensor] = None
+        if self._swa_allocator is not None:
+            with torch.cuda.stream(self._d2h_stream):
+                count_device = compute_swa_live_divergence(
+                    swa_allocator=self._swa_allocator,
+                    req_to_token_pool=self._req_to_token_pool,
+                    forward_batch=forward_batch,
+                )
+            mapping_future = FutureTensor.device_to_host(
+                src_device=count_device, stream=self._d2h_stream
             )
-            if self._swa_allocator is not None
-            else None
-        )
 
         self._pending = _PendingSnapshot(
             step_counter=step_counter,
