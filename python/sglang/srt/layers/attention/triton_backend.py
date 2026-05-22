@@ -617,8 +617,11 @@ class TritonAttnBackend(AttentionBackend):
         data via stable pointers.
         """
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers (e.g. eagle_draft_extend) may
+        # pass full padded buffers; capture callers pre-slice.  [:bs] is safe
+        # in both cases.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
