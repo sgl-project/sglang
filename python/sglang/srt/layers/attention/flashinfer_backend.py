@@ -598,6 +598,10 @@ class FlashInferAttnBackend(AttentionBackend):
         per-backend optimization PR.
         """
         bs = forward_batch.batch_size
+        # Normalize to bs-length: replay callers may pass full padded buffers;
+        # capture callers pre-slice. [:bs] is safe in both cases.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         # ``num_tokens == bs * num_tokens_per_bs``. ``positions`` is the only
         # fb field always sized to ``num_tokens`` across direct (cuda_graph_runner)
         # and multi-step-wrapper (eagle_draft_cuda_graph_runner) callers --
@@ -607,8 +611,6 @@ class FlashInferAttnBackend(AttentionBackend):
             if forward_batch.positions is not None
             else bs
         )
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
