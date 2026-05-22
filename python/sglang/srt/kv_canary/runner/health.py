@@ -92,7 +92,6 @@ class PeriodicCanaryStatsLogger:
         self._step_counter_getter = step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
-        self._staged_step: int = 0
 
     def step(self) -> None:
         self._handler.step(
@@ -100,7 +99,7 @@ class PeriodicCanaryStatsLogger:
             postprocess_on_host=self._postprocess_on_host,
         )
 
-    def _compute_on_device(self) -> Optional[dict[str, torch.Tensor]]:
+    def _compute_on_device(self) -> Optional[dict[str, Any]]:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
             return None
@@ -108,20 +107,21 @@ class PeriodicCanaryStatsLogger:
         if step_counter == 0 or step_counter % period != 0:
             return None
         device_state = self._device_state
-        # Snapshot the step at compute time so the host log line reports the step
-        # that produced the stats, not the step at which the drain happens (which
-        # is one DelayedDeviceHostHandler tick later).
-        self._staged_step = step_counter
+        # Snapshot the step in the staged payload so the host log line reports the
+        # step that produced the stats, not the step at which the drain happens
+        # (which is one DelayedDeviceHostHandler tick later). The "step" key is a
+        # plain int and rides along via the pass-through path in FutureTensors.
         return {
+            "step": step_counter,
             "slot_sum": device_state.slot_run_counters.sum().view(1),
             "write_index": device_state.violation_log.violation_write_index,
         }
 
-    def _postprocess_on_host(self, host_data: dict[str, torch.Tensor]) -> None:
+    def _postprocess_on_host(self, host_data: dict[str, Any]) -> None:
         logger.info(
             "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
             "launch_tags_active=%d/%d",
-            self._staged_step,
+            int(host_data["step"]),
             int(host_data["slot_sum"].item()),
             self._sweep_orchestrator.sweep_passes,
             int(host_data["write_index"].item()),

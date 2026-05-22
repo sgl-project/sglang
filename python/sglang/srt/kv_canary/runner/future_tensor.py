@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 
-_TensorOrDict = Union[torch.Tensor, dict[str, torch.Tensor]]
+_PayloadDict = dict[str, Any]
+_TensorOrDict = Union[torch.Tensor, _PayloadDict]
 
 
 @dataclass(slots=True, kw_only=True)
@@ -19,11 +20,26 @@ class FutureTensors:
         cls, src_device: _TensorOrDict, *, stream: torch.cuda.Stream
     ) -> "FutureTensors":
         if isinstance(src_device, dict):
-            host: _TensorOrDict = {
-                key: torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
-                for key, t in src_device.items()
-            }
-            ref_device = next(iter(src_device.values())).device
+            host: _PayloadDict = {}
+            ref_device: Optional[torch.device] = None
+            for key, value in src_device.items():
+                if isinstance(value, torch.Tensor):
+                    host[key] = torch.empty(
+                        value.shape, dtype=value.dtype, pin_memory=True
+                    )
+                    if ref_device is None:
+                        ref_device = value.device
+                else:
+                    # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
+                    # can bundle host metadata (e.g. the step at which the snapshot was
+                    # staged) alongside the device tensors and recover that context in
+                    # postprocess without reaching back into the producer.
+                    host[key] = value
+            if ref_device is None:
+                raise ValueError(
+                    "FutureTensors.device_to_host requires at least one torch.Tensor in "
+                    "the source dict to anchor the d2h stream sync"
+                )
         else:
             host = torch.empty(
                 src_device.shape, dtype=src_device.dtype, pin_memory=True
@@ -33,8 +49,9 @@ class FutureTensors:
         stream.wait_stream(torch.cuda.current_stream(ref_device))
         with torch.cuda.stream(stream):
             if isinstance(src_device, dict):
-                for key, t in src_device.items():
-                    host[key].copy_(t, non_blocking=True)
+                for key, value in src_device.items():
+                    if isinstance(value, torch.Tensor):
+                        host[key].copy_(value, non_blocking=True)
             else:
                 host.copy_(src_device, non_blocking=True)
             event = torch.cuda.Event()
