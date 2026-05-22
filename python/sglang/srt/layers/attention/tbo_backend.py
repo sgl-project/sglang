@@ -52,25 +52,20 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
     ):
-        self.primary.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-        )
+        import types
 
-        self._init_forward_metadata_cuda_graph_children(
-            fn_name="init_forward_metadata_capture_cuda_graph",
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            capture_num_tokens=num_tokens,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=int(seq_lens.sum()),
+                seq_lens_cpu=None,
+                positions=req_pool_indices.new_empty(num_tokens),
+            )
         )
 
     def init_forward_data_out_graph(self, forward_batch: "ForwardBatch") -> None:
@@ -89,27 +84,20 @@ class TboAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        self.primary.init_forward_metadata_replay_cuda_graph(
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            seq_lens_sum=seq_lens_sum,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            seq_lens_cpu=seq_lens_cpu,
-        )
+        import types
 
-        self._init_forward_metadata_cuda_graph_children(
-            fn_name="init_forward_metadata_replay_cuda_graph",
-            bs=bs,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=encoder_lens,
-            forward_mode=forward_mode,
-            spec_info=spec_info,
-            replay_seq_lens_sum=seq_lens_sum,
-            replay_seq_lens_cpu=seq_lens_cpu,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=req_pool_indices.new_empty(bs),
+            )
         )
 
     def _init_forward_metadata_cuda_graph_children(
