@@ -1454,9 +1454,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Batched arguments to model runner
     input_ids: torch.Tensor = None  # shape: [b], int64
-    # Staging for resolve_forward_inputs: prefill pinned CPU + running GPU.
+    # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
-    mix_running_input_ids: Optional[torch.Tensor] = None
+    mix_running_indices: Optional[torch.Tensor] = None
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     # Token replacement embeddings and absolute positions (optional).
     replace_embeds: Optional[torch.Tensor] = None
@@ -1786,7 +1786,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
-        # H2D deferred to resolve_forward_inputs.
         pinned_input_ids = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
         )
@@ -2166,8 +2165,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
-        # input_ids cat deferred to resolve_forward_inputs.
-        self.mix_running_input_ids = running_batch.input_ids
+        # Decode tokens of the running portion live in future_map.output_tokens_buf.
+        self.mix_running_indices = running_batch.req_pool_indices
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
         self.merge_batch(running_batch)

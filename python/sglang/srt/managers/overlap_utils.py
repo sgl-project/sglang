@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
 
 from sglang.srt.speculative.spec_utils import spec_need_hidden_states
-from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -14,70 +13,36 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-
-
-def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
-    input_ids[:] = torch.where(
-        input_ids < 0,
-        future_token_ids_map[torch.clamp(-input_ids, min=0)],
-        input_ids,
-    )
-
-
-if _is_cuda or _is_hip:
-    from sglang.jit_kernel.resolve_future_token_ids import (
-        resolve_future_token_ids_cuda,
-    )
-
-    _resolve_future_token_ids = resolve_future_token_ids_cuda
-else:
-    _resolve_future_token_ids = _resolve_future_token_ids_native
-
 
 @dataclass
 class FutureIndices:
     indices: torch.Tensor
 
 
-def resolve_forward_inputs(
-    batch: ScheduleBatch, future_map: Optional[FutureMap] = None
-) -> None:
-    """Materialize forward-time GPU tensors. Called at forward entry in both
-    overlap (`future_map` set, runs on forward stream) and non-overlap
-    (`future_map=None`, runs on default stream) modes.
-
-    Step 1: H2D pinned prefill + cat with mix running, if staged.
-    Step 2 (overlap only): translate sentinel input_ids / gather spec extras.
+def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
+    """Materialize input_ids at forward entry. Prefill H2D from pinned CPU
+    staging; decode gather from future_map.output_tokens_buf. Spec_v2 sets
+    input_ids inside the worker (draft tokens); only extras are gathered here.
     """
     if batch.prefill_input_ids_cpu is not None:
         prefill_dev = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
-        batch.input_ids = (
-            torch.cat([prefill_dev, batch.mix_running_input_ids])
-            if batch.mix_running_input_ids is not None
-            else prefill_dev
-        )
+        if batch.mix_running_indices is not None:
+            decode_dev = future_map.output_tokens_buf[batch.mix_running_indices]
+            batch.input_ids = torch.cat([prefill_dev, decode_dev])
+        else:
+            batch.input_ids = prefill_dev
         batch.prefill_input_ids_cpu = None
-        batch.mix_running_input_ids = None
-    if future_map is None:
-        return
-    if future_map.spec_algo.is_none():
-        _resolve_future_token_ids(batch.input_ids, future_map.output_tokens_buf)
-    else:
+        batch.mix_running_indices = None
+    elif batch.input_ids is None and future_map.spec_algo.is_none():
+        batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+
+    if future_map.spec_algo.is_some():
         future_map._resolve_spec_extras(batch)
 
 
 class FutureMap:
-    """Cross-iter relay buffer for values the next iter's schedule cannot
-    compute locally (e.g. spec_v2 seq_lens after accept_lens, sampled tokens).
-
-    Forward stream publishes into a buf; next iter's schedule pulls lazily.
-    Schedule-deterministic values (e.g. non-spec seq_lens via +1) stay
-    maintained by SB directly and do not need the relay.
-
-    SB.seq_lens GPU is always a faithful seq_lens_cpu mirror; forward path
-    treats it as read-only, spec mutations land on forward_batch.seq_lens.
+    """Always-on pool-indexed relay for cross-iter values. Forward writes via
+    publish/stash; next iter reads via resolve_forward_inputs / resolve_seq_lens_cpu.
     """
 
     def __init__(
@@ -140,14 +105,6 @@ class FutureMap:
         draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
-
-    def set_input_ids_sentinel(
-        self, batch: ScheduleBatch, future_indices: FutureIndices
-    ) -> None:
-        # Sentinel for the decode portion so mixed batches can cat extend
-        # (positive real tokens) + decode (negative sentinels) into one
-        # input_ids; resolve_future translates negatives via output_tokens_buf.
-        batch.input_ids = -future_indices.indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to

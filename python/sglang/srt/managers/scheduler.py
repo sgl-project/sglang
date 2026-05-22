@@ -1266,12 +1266,18 @@ class Scheduler(
         self.device_module = torch.get_device_module(self.device)
 
         if use_mlx():
-            # MLX overlap scheduling uses mx.async_eval / mx.eval for
-            # synchronisation so no CUDA/MPS streams or FutureMap needed.
+            # MLX: no CUDA streams / FutureMap.
             self.future_map = None
-            # Empty result_queue is needed because idle-check references it
-            # when enable_overlap is True.
             self.result_queue: Deque = deque()
+            return
+
+        # FutureMap is always-on: input_ids relay used in both modes.
+        self.future_map = self.spec_algorithm.create_future_map(
+            self.device,
+            self.req_to_token_pool,
+        )
+
+        if not self.enable_overlap:
             return
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
@@ -1280,15 +1286,6 @@ class Scheduler(
         self.copy_stream: CudaStream = self.device_module.Stream()
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
-        )
-
-        if not self.enable_overlap:
-            self.future_map = None
-            return
-
-        self.future_map = self.spec_algorithm.create_future_map(
-            self.device,
-            self.req_to_token_pool,
         )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
@@ -2890,30 +2887,34 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                self.future_map.set_input_ids_sentinel(batch, future_indices)
+                # Next-iter input_ids relayed via future_map.
+                batch.input_ids = None
 
                 if batch.is_spec_v2:
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch)
+                future_indices = FutureIndices(indices=batch.req_pool_indices)
+                resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    self.future_map.stash(future_indices, batch_result.next_token_ids)
+                batch.input_ids = None
             else:
                 kwargs = (
                     {"pp_proxy_tensors": pp_proxy_tensors}
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                resolve_forward_inputs(batch)
+                future_indices = FutureIndices(indices=batch.req_pool_indices)
+                resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                # PP intermediate ranks return None; DLLM returns a per-req list.
-                # Only the tensor case maps onto batch.input_ids as next-iter input.
+                # PP intermediate / DLLM return non-tensor; skip relay.
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                    self.future_map.stash(future_indices, batch_result.next_token_ids)
+                batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
