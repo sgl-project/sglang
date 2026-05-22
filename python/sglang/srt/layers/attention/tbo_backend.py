@@ -70,8 +70,74 @@ class TboAttnBackend(AttentionBackend):
 
     def init_forward_data_out_graph(self, forward_batch: "ForwardBatch") -> None:
         self.primary.init_forward_data_out_graph(forward_batch)
-        for child in self.children:
-            child.init_forward_data_out_graph(forward_batch)
+        self._init_forward_data_out_graph_children(forward_batch)
+
+    def _init_forward_data_out_graph_children(
+        self, forward_batch: "ForwardBatch"
+    ) -> None:
+        import types
+
+        bs = forward_batch.batch_size
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        seq_lens_cpu = forward_batch.seq_lens_cpu  # None for capture, tensor for replay
+
+        token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
+            forward_mode=forward_mode, spec_info=spec_info
+        )
+        num_tokens = bs * token_num_per_seq
+
+        tbo_split_seq_index, _ = (
+            two_batch_overlap.compute_split_indices_for_cuda_graph_replay(
+                forward_mode=forward_mode,
+                cuda_graph_num_tokens=num_tokens,
+                spec_info=spec_info,
+            )
+        )
+
+        bs_child_left = tbo_split_seq_index
+        bs_child_right = bs - bs_child_left
+
+        for child, child_bs, seq_slice in (
+            (self.children[0], bs_child_left, slice(None, tbo_split_seq_index)),
+            (self.children[1], bs_child_right, slice(tbo_split_seq_index, None)),
+        ):
+            if spec_info is not None:
+                child_spec_info = two_batch_overlap.split_spec_info(
+                    spec_info=spec_info,
+                    start_seq_index=(
+                        seq_slice.start if seq_slice.start is not None else 0
+                    ),
+                    end_seq_index=seq_slice.stop if seq_slice.stop is not None else bs,
+                    start_token_index=((seq_slice.start or 0) * token_num_per_seq),
+                    end_token_index=((seq_slice.stop or bs) * token_num_per_seq),
+                )
+            else:
+                child_spec_info = None
+
+            child_seq_lens_cpu = (
+                seq_lens_cpu[seq_slice] if seq_lens_cpu is not None else None
+            )
+            child_fb = types.SimpleNamespace(
+                batch_size=child_bs,
+                req_pool_indices=req_pool_indices[seq_slice],
+                seq_lens=seq_lens[seq_slice],
+                encoder_lens=None,
+                forward_mode=forward_mode,
+                spec_info=child_spec_info,
+                seq_lens_sum=(
+                    int(child_seq_lens_cpu.sum())
+                    if child_seq_lens_cpu is not None
+                    else int(seq_lens[seq_slice].sum())
+                ),
+                seq_lens_cpu=child_seq_lens_cpu,
+                positions=req_pool_indices[seq_slice].new_empty(
+                    child_bs * token_num_per_seq
+                ),
+            )
+            child.init_forward_data_out_graph(child_fb)
 
     def init_forward_metadata_replay_cuda_graph(
         self,

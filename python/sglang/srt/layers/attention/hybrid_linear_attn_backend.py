@@ -405,8 +405,6 @@ class MambaAttnBackendBase(AttentionBackend):
         )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
@@ -417,7 +415,9 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        if get_is_capture_mode():
+        # Capture path: seq_lens_cpu is None (capture callers pass None).
+        # Replay path: seq_lens_cpu is a real tensor.
+        if seq_lens_cpu is None:
             self.forward_metadata = self._capture_metadata(
                 bs, req_pool_indices, forward_mode, spec_info
             )
@@ -732,8 +732,6 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
         bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
@@ -745,7 +743,9 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        if get_is_capture_mode():
+        # Capture path: seq_lens_cpu is None (capture callers pass None).
+        # Replay path: seq_lens_cpu is a real tensor.
+        if seq_lens_cpu is None:
             metadata = self._capture_metadata(
                 bs, req_pool_indices, forward_mode, spec_info
             )
