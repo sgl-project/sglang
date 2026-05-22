@@ -170,7 +170,6 @@ class KimiK2Detector(BaseFormatDetector):
 
             logger.debug("function_call_tuples: %s", function_call_tuples)
 
-            tool_indices = self._get_tool_indices(tools)
             tool_calls = []
             for match in function_call_tuples:
                 function_id, function_args = match
@@ -264,13 +263,10 @@ class KimiK2Detector(BaseFormatDetector):
                         "arguments": {},
                     }
                 else:
-                    # Strip <|tool_call_end|> from function_args before diff calculation
-                    clean_args = function_args.split("<|tool_call_end|>", 1)[0]
-
                     argument_diff = (
-                        clean_args[len(self._last_arguments) :]
-                        if clean_args.startswith(self._last_arguments)
-                        else clean_args
+                        function_args[len(self._last_arguments) :]
+                        if function_args.startswith(self._last_arguments)
+                        else function_args
                     )
 
                     parsed_args_diff = argument_diff.split(self.tool_call_end_token, 1)[
@@ -282,18 +278,18 @@ class KimiK2Detector(BaseFormatDetector):
                             ToolCallItem(
                                 tool_index=self.current_tool_id,
                                 name=None,
-                                parameters=argument_diff,
+                                parameters=parsed_args_diff,
                             )
                         )
                         self._last_arguments += parsed_args_diff
                         self.streamed_args_for_tool[
                             self.current_tool_id
-                        ] += argument_diff
+                        ] += parsed_args_diff
 
                     parsed_args = function_args.split(self.tool_call_end_token, 1)[0]
                     if _is_complete_json(parsed_args):
                         try:
-                            parsed_args = json.loads(clean_args)
+                            parsed_args = json.loads(parsed_args)
                             self.prev_tool_call_arr[self.current_tool_id][
                                 "arguments"
                             ] = parsed_args
@@ -310,9 +306,7 @@ class KimiK2Detector(BaseFormatDetector):
                         if end_match:
                             self._buffer = current_text[end_match.end() :]
                         else:
-                            # <|tool_call_end|> hasn't arrived yet; keep buffer intact
-                            # and wait for more data before advancing to the next tool call
-                            return StreamingParseResult(normal_text="", calls=calls)
+                            self._buffer = ""
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
