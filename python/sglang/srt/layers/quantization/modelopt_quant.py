@@ -2491,21 +2491,11 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     def _weight_scale_2_from_amax(
         weight_amax: float, device: torch.device
     ) -> torch.Tensor:
-        weight_amax_tensor = torch.tensor(
-            weight_amax, device=device, dtype=torch.float32
-        )
         # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
         # reciprocal as the global encode scale, matching 448 * 6 / amax.
-        fp8_fp4_max = torch.tensor(
-            float(torch.finfo(torch.float8_e4m3fn).max) * 6.0,
-            device=device,
-            dtype=torch.float32,
-        )
-        return torch.where(
-            weight_amax_tensor > 0,
-            weight_amax_tensor / fp8_fp4_max,
-            torch.ones_like(weight_amax_tensor, dtype=torch.float32),
-        )
+        fp8_fp4_max = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+        weight_scale_2 = weight_amax / fp8_fp4_max if weight_amax > 0 else 1.0
+        return torch.tensor(weight_scale_2, device=device, dtype=torch.float32)
 
     @staticmethod
     def _quantize_weight_nvfp4(
