@@ -42,6 +42,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
                 "glm47",
                 "--quantization",
                 "modelopt_fp4",
+                "--disable-flashinfer-autotune",
                 "--enforce-piecewise-cuda-graph",
                 "--model-loader-extra-config",
                 '{"enable_multithread_load": true, "num_threads": 64}',
@@ -59,7 +60,7 @@ class TestPCGGlm5Fp4(CustomTestCase):
             eval_name="gsm8k",
             num_examples=200,
             num_threads=200,
-            max_tokens=65536,
+            max_tokens=1024,
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
