@@ -1,9 +1,0 @@
-{
-    "local_hostname": "localhost",
-    "metadata_server": "http://127.0.0.1:8080/metadata",
-    "master_server_address": "127.0.0.1:50051",
-    "protocol": "rdma",
-    "device_name": "",
-    "global_segment_size": "4gb",
-    "local_buffer_size": 0
-}

@@ -286,7 +286,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.dec_lock_ref(ancestor_node)
             return None
 
-        logger.info(
+        logger.debug(
             f"Init load back from cpu -> gpu, kv hit length: {len(full_host_indices)}, mamba host hit length: {len(mamba_restore_nodes)}"
         )
         mamba_pools = self.mamba_restore_transfers(
