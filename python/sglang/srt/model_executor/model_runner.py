@@ -152,6 +152,8 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_req_to_token_pool,
+    get_token_to_kv_pool,
     has_forward_context,
 )
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
@@ -3081,9 +3083,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.extend_prefix_lens_cpu,
                 forward_batch.extend_seq_lens,
                 forward_batch.req_pool_indices,
-                forward_batch.req_to_token_pool.req_to_token,
+                get_req_to_token_pool().req_to_token,
                 forward_batch.seq_lens_sum,
-                forward_batch.token_to_kv_pool.get_key_buffer(0).shape,
+                get_token_to_kv_pool().get_key_buffer(0).shape,
                 self.kv_cache_dtype,
                 self.device,
             )

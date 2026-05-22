@@ -409,7 +409,7 @@ class DeepseekMLAForwardMixin:
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
                 all_gather_kv_cache_for_mla_extend(
-                    forward_batch.token_to_kv_pool,
+                    get_token_to_kv_pool(),
                     self.attn_mqa,
                     forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices,
                     forward_batch.attn_dcp_metadata.dcp_extend_prefix_lens_sum,
