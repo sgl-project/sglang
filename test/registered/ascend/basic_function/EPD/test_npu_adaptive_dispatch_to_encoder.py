@@ -14,6 +14,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+
 register_npu_ci(est_time=800, suite="nightly-8-npu-a3", nightly=True)
 
 
@@ -54,6 +56,7 @@ class TestAdaptiveDispatchToEncoder(CustomTestCase):
         # Setting this variable replaces hash computation with a random UUID.
         env = os.environ.copy()
         env["SGLANG_MM_SKIP_COMPUTE_HASH"] = "True"
+        env["TRANSFORMERS_VERBOSITY"] = "error"
 
         cls.process = popen_launch_server(
             cls.model,
@@ -149,6 +152,7 @@ class TestAdaptiveDispatchToEncoderMultiImage(CustomTestCase):
 
         env = os.environ.copy()
         env["SGLANG_MM_SKIP_COMPUTE_HASH"] = "True"
+        env["TRANSFORMERS_VERBOSITY"] = "error"
 
         # Start encoder-only server (with zmq_to_scheduler backend)
         encoder_args = [

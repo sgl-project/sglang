@@ -43,7 +43,7 @@ class TestDeepepLowlatencyQwen3(CustomTestCase):
                 "low_latency",
                 "--disable-cuda-graph",
                 "--chunked-prefill-size",
-                "1024",
+                "512",
             ],
             env={
                 "SGLANG_ENABLE_JIT_DEEPGEMM": "0",

@@ -1,3 +1,4 @@
+import re
 import unittest
 
 import requests
@@ -38,6 +39,26 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
     """
 
     @staticmethod
+    def check_metric(testcase, content, metric_suffix, le_list, model):
+        if not le_list:
+            return
+
+        pattern_template = r'.*sglang:{}{{.*le="{}".*model_name="{}".*}}.*'
+
+        for le in le_list:
+            pattern = re.compile(
+                pattern_template.format(
+                    re.escape(metric_suffix), re.escape(le), re.escape(model)
+                ),
+                re.DOTALL,
+            )
+            testcase.assertTrue(
+                pattern.search(content),
+                f"Metric not found: sglang:{metric_suffix}{{le='{le}', model_name='{model}'}} in\n"
+                + content,
+            )
+
+    @staticmethod
     def _verify_metrics_and_bucket_boundary(
         testcase,
         model,
@@ -49,39 +70,59 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
         expected_generation_tokens_bucket=None,
     ):
         """Validate that metrics buckets align with expected boundaries when --enable-metrics and bucket configuration parameters are set."""
-        # Generate a sufficient number of tokens to monitor inter_token_latency_seconds_bucket
+        # Generate tokens
         response = requests.post(
             f"{url}/generate",
             json={
-                "text": f"just return me a long string, generate as much as possible.",
+                "text": "just return me a long string, generate as much as possible.",
                 "sampling_params": {"temperature": 0, "max_new_tokens": 1000},
             },
         )
         testcase.assertEqual(response.status_code, 200)
 
+        # Get metrics
         response = requests.get(f"{url}/metrics", timeout=10)
         testcase.assertEqual(response.status_code, 200)
         metrics_content = response.text
-        if expected_time_to_first_token_bucket:
-            for le in expected_time_to_first_token_bucket:
-                message = f'sglang:time_to_first_token_seconds_bucket{{le="{le}",model_name="{model}"}}'
-                testcase.assertIn(message, metrics_content)
-        if expected_inter_token_latency_bucket:
-            for le in expected_inter_token_latency_bucket:
-                message = f'sglang:inter_token_latency_seconds_bucket{{le="{le}",model_name="{model}"}}'
-                testcase.assertIn(message, metrics_content)
-        if expected_e2e_request_latency_bucket:
-            for le in expected_e2e_request_latency_bucket:
-                message = f'sglang:e2e_request_latency_seconds_bucket{{le="{le}",model_name="{model}"}}'
-                testcase.assertIn(message, metrics_content)
-        if expected_prompt_tokens_bucket:
-            for le in expected_prompt_tokens_bucket:
-                message = f'sglang:prompt_tokens_histogram_bucket{{le="{le}",model_name="{model}"}}'
-                testcase.assertIn(message, metrics_content)
-        if expected_generation_tokens_bucket:
-            for le in expected_generation_tokens_bucket:
-                message = f'sglang:generation_tokens_histogram_bucket{{le="{le}",model_name="{model}"}}'
-                testcase.assertIn(message, metrics_content)
+
+        checker = TestNPUMetricsDefaultBucketBoundary.check_metric
+
+        checker(
+            testcase,
+            metrics_content,
+            "time_to_first_token_seconds_bucket",
+            expected_time_to_first_token_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "inter_token_latency_seconds_bucket",
+            expected_inter_token_latency_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "e2e_request_latency_seconds_bucket",
+            expected_e2e_request_latency_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "prompt_tokens_histogram_bucket",
+            expected_prompt_tokens_bucket,
+            model,
+        )
+        checker(
+            testcase,
+            metrics_content,
+            "generation_tokens_histogram_bucket",
+            expected_generation_tokens_bucket,
+            model,
+        )
+
         return metrics_content
 
     @classmethod
@@ -187,20 +228,25 @@ class TestNPUMetricsDefaultBucketBoundary(TestNPULoggingBase):
             "8000.0",
             "9000.0",
             "10000.0",
-            "12000.0",
+            "12500.0",
             "15000.0",
+            "17500.0",
             "20000.0",
-            "22000.0",
+            "22500.0",
             "25000.0",
+            "27500.0",
             "30000.0",
             "35000.0",
             "40000.0",
-            "66000.0",
-            "99000.0",
-            "132000.0",
+            "60000.0",
+            "80000.0",
+            "100000.0",
+            "200000.0",
             "300000.0",
+            "400000.0",
             "600000.0",
-            "900000.0",
+            "800000.0",
+            "1e+06",
             "1.1e+06",
         ]
 

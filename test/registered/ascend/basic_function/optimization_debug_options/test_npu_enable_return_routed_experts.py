@@ -47,6 +47,9 @@ class TestEnableReturnRoutedExperts(CustomTestCase):
             cls.base_url,
             timeout=3000,
             other_args=cls.other_args,
+            env={
+                "TRANSFORMERS_VERBOSITY": "error",
+            },
         )
 
     @classmethod
