@@ -124,7 +124,12 @@ class FutureMap:
             return
         if self.publish_ready is not None:
             self.publish_ready.wait()
-        batch.seq_lens_cpu = self.new_seq_lens_buf[fi.indices].cpu()
+        # Spec_v2: prepare_for_decode's +1 assumption is wrong (accept_lens != 1).
+        # Overwrite both CPU and GPU shadows with the published truth so SB
+        # maintains seq_lens GPU == seq_lens_cpu mirror.
+        new_seq_lens = self.new_seq_lens_buf[fi.indices]
+        batch.seq_lens = new_seq_lens
+        batch.seq_lens_cpu = new_seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
     def publish(

@@ -2417,16 +2417,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation
-        if self.enable_overlap:
-            # Overlap: GPU seq_lens restored by resolve_future from FutureMap buf.
-            self.seq_lens_cpu = self.seq_lens_cpu + 1
-            self.orig_seq_lens = self.orig_seq_lens + 1
-        else:
-            # A faster in-place version
-            self.seq_lens.add_(1)
-            self.seq_lens_cpu.add_(1)
-            self.orig_seq_lens.add_(1)
+        # Update seq_lens after allocation. SB.seq_lens GPU is maintained as a
+        # faithful mirror of seq_lens_cpu; forward path does not mutate it.
+        # New-tensor (vs in-place) avoids racing model_worker_batch references
+        # queued for overlap forward.
+        self.seq_lens = self.seq_lens + 1
+        self.seq_lens_cpu = self.seq_lens_cpu + 1
+        self.orig_seq_lens = self.orig_seq_lens + 1
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
