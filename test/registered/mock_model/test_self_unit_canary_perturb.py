@@ -18,6 +18,7 @@ class TestCanaryPerturb(CustomTestCase):
             req_to_token_prob=0.0,
             real_kv_used_prob=1.0,
             real_kv_unused_cache_prob=0.0,
+            real_kv_post_forward_prob=0.0,
             target_group_kind=TargetGroupKind.FULL,
             warmup_steps=0,
         )

@@ -182,9 +182,10 @@ class PerForwardOrchestrator:
                 input_check_mode=self._config.input_check_mode,
             )
 
-    def end_of_step(self) -> None:
+    def end_of_step(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
+        self._perturb_manager.end_of_forward(forward_batch)
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
 
 

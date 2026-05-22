@@ -1,70 +1,21 @@
 from __future__ import annotations
 
-import fnmatch
 import io
-import json
 import os
-import re
 import string
-import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import ClassVar, Literal, Optional
 
-import requests
-
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.utils import kill_process_tree
+from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
+from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
+from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
 )
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class _ModeConfig:
-    """Mode-specific server launch config so per-mode test classes only set
-    `model_mode = "mha"` / `"swa"`, not individual flags. All flags collected here.
-
-    Fields:
-        model_path: HF model id used by popen_launch_server.
-        json_model_override_args: JSON string passed to --json-model-override-args, or
-            None to omit the flag entirely.
-    """
-
-    model_path: str
-    json_model_override_args: Optional[str] = None
-
-
-_MODE_CONFIGS: dict[str, _ModeConfig] = {
-    "mha": _ModeConfig(
-        model_path="Qwen/Qwen3-0.6B",
-    ),
-    "swa": _ModeConfig(
-        model_path="google/gemma-3-1b-it",
-        # Gemma 3 1B-it's HF config carries layer-typed rope params; SGLang's
-        # parser also needs an explicit rope_type / factor on full_attention,
-        # otherwise the swa-mode server fails to launch. Passing these via
-        # --json-model-override-args avoids touching the model source.
-        json_model_override_args=json.dumps(
-            {
-                "rope_parameters": {
-                    "sliding_attention": {
-                        "rope_type": "default",
-                        "rope_theta": 10000,
-                    },
-                    "full_attention": {
-                        "rope_type": "default",
-                        "rope_theta": 1000000,
-                        "factor": 8.0,
-                    },
-                },
-            }
-        ),
-    ),
-}
-
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
@@ -74,7 +25,7 @@ _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).stri
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
-class CanaryE2EBase(CustomTestCase):
+class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
     ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
 
@@ -87,7 +38,7 @@ class CanaryE2EBase(CustomTestCase):
     """
 
     model_mode: ClassVar[Literal["mha", "swa"]]
-    kv_canary_mode: ClassVar[Literal["off", "log", "raise"]]
+    kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
@@ -107,20 +58,11 @@ class CanaryE2EBase(CustomTestCase):
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
 
-        server_args = [
-            "--kv-canary",
-            cls.kv_canary_mode,
-            "--context-length",
-            "8192",
-            *cls.extra_server_args,
-        ]
-        if cls._cfg.json_model_override_args is not None:
-            server_args.extend(
-                [
-                    "--json-model-override-args",
-                    cls._cfg.json_model_override_args,
-                ]
-            )
+        server_args = build_canary_server_args(
+            kv_canary_mode=cls.kv_canary_mode,
+            mode_cfg=cls._cfg,
+            extra_server_args=cls.extra_server_args,
+        )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
             cls.base_url,
@@ -134,6 +76,11 @@ class CanaryE2EBase(CustomTestCase):
     def tearDownClass(cls) -> None:
         if cls.process is not None:
             kill_process_tree(cls.process.pid)
+        for buf in (cls._stdout_buf, cls._stderr_buf):
+            if buf is not None:
+                buf.close()
+        cls._stdout_buf = None
+        cls._stderr_buf = None
 
     def make_prompts(self, n: int) -> list[str]:
         if self.use_unique_prompts:
@@ -144,109 +91,25 @@ class CanaryE2EBase(CustomTestCase):
         self,
         n: int,
         *,
-        assert_all_successs: bool = True,
+        assert_all_success: bool = True,
         max_new_tokens: int = 200,
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
-        prompts = self.make_prompts(n)
-
-        def _send(prompt: str) -> dict:
-            try:
-                resp = requests.post(
-                    self.base_url + "/generate",
-                    json={
-                        "text": prompt,
-                        "sampling_params": {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": 0.0,
-                        },
-                    },
-                    timeout=timeout,
-                )
-                return {"status_code": resp.status_code, "body": resp.text}
-            except requests.RequestException as exc:
-                return {"status_code": -1, "error": repr(exc)}
-
-        with ThreadPoolExecutor(max_workers=max(1, n)) as pool:
-            results = list(pool.map(_send, prompts))
-
-        if assert_all_successs:
+        results = post_parallel_generate(
+            url=self.base_url + "/generate",
+            prompts=self.make_prompts(n),
+            max_new_tokens=max_new_tokens,
+            timeout=timeout,
+        )
+        if assert_all_success:
             for result in results:
                 self.assertEqual(result.get("status_code"), 200, result)
-
         return results
 
-    def assert_per_forward_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        target_group: Optional[Literal["full", "swa"]] = None,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        suffix = "" if target_group is None else f"_{target_group.upper()}"
-        self.assert_violation_logged_any(
-            launch_tag_patterns=(f"HEAD_*{suffix}", f"TAIL_*{suffix}"),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_sweep_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        target_group: Literal["full", "swa"],
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        self.assert_violation_logged_any(
-            launch_tag_patterns=(f"SWEEP_*_{target_group.upper()}",),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-        )
-
-    def assert_violation_logged_any(
-        self,
-        *,
-        launch_tag_patterns: tuple[str, ...],
-        fail_reason: str,
-        flush_wait_seconds: float = 2.0,
-    ) -> None:
-        """Scan server log for a violation line whose launch_tag matches any pattern
-        (fnmatch) and whose fail_reason set contains fail_reason exactly.
-
-        Looks for lines of the form
-            ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
-        emitted by ViolationReporter. Raises AssertionError if no matching line found.
-        """
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text()
-        line_re = re.compile(r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)")
-        for match in line_re.finditer(log_text):
-            tag = match.group(1)
-            reason_field = match.group(2)
-            if fail_reason not in reason_field.split("+"):
-                continue
-            if any(
-                fnmatch.fnmatchcase(tag, pattern) for pattern in launch_tag_patterns
-            ):
-                return
-        raise AssertionError(
-            f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r} found in server log. Log tail:\n"
-            f"{log_text[-2000:]}"
-        )
-
-    def assert_no_violation(self, *, wait_seconds: float = 2.0) -> None:
-        """Assert no ``kv_canary violation:`` line appears in the captured server log within
-        wait_seconds."""
-        time.sleep(wait_seconds)
-        log_text = self._captured_log_text()
-        if "kv_canary violation:" in log_text:
-            raise AssertionError(
-                f"Unexpected canary violation found. Log tail:\n{log_text[-2000:]}"
-            )
-
-    def _captured_log_text(self) -> str:
+    def _captured_log_text(
+        self, side: Optional[Literal["prefill", "decode"]] = None
+    ) -> str:
         stdout_text = (
             self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
         )

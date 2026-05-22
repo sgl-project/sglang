@@ -1,8 +1,10 @@
+import io
 import logging
 import os
 import shlex
 import time
 import warnings
+from typing import ClassVar, Optional
 from urllib.parse import urlparse
 
 from sglang.srt.environ import envs
@@ -21,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    capture_per_side_logs: ClassVar[bool] = False
+    extra_prefill_env: ClassVar[dict[str, str]] = {}
+    extra_decode_env: ClassVar[dict[str, str]] = {}
+    _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _prefill_stderr_buf: ClassVar[Optional[io.StringIO]] = None
+    _decode_stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _decode_stderr_buf: ClassVar[Optional[io.StringIO]] = None
+
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
@@ -39,6 +49,11 @@ class PDDisaggregationServerBase(CustomTestCase):
             f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
+        if cls.capture_per_side_logs:
+            cls._prefill_stdout_buf = io.StringIO()
+            cls._prefill_stderr_buf = io.StringIO()
+            cls._decode_stdout_buf = io.StringIO()
+            cls._decode_stderr_buf = io.StringIO()
 
         # config transfer backend and rdma devices
         if is_in_ci():
@@ -79,6 +94,12 @@ class PDDisaggregationServerBase(CustomTestCase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
+            env=dict(cls.extra_prefill_env),
+            return_stdout_stderr=(
+                (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
         )
 
     @classmethod
@@ -100,6 +121,12 @@ class PDDisaggregationServerBase(CustomTestCase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
+            env=dict(cls.extra_decode_env),
+            return_stdout_stderr=(
+                (cls._decode_stdout_buf, cls._decode_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
         )
 
     @classmethod
@@ -148,6 +175,20 @@ class PDDisaggregationServerBase(CustomTestCase):
                     kill_process_tree(process.pid, wait_timeout=60)
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
+
+        if cls.capture_per_side_logs:
+            for buf in (
+                cls._prefill_stdout_buf,
+                cls._prefill_stderr_buf,
+                cls._decode_stdout_buf,
+                cls._decode_stderr_buf,
+            ):
+                if buf is not None:
+                    buf.close()
+            cls._prefill_stdout_buf = None
+            cls._prefill_stderr_buf = None
+            cls._decode_stdout_buf = None
+            cls._decode_stderr_buf = None
 
         # wait for 5 seconds
         time.sleep(5)
