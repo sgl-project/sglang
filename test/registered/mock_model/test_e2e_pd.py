@@ -68,8 +68,12 @@ class _MockModelPDBase(PDDisaggregationServerBase):
 
     capture_per_side_logs = True
     model: ClassVar[str] = MOCK_MODEL_PATH
-    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args()
-    extra_decode_args: ClassVar[List[str]] = mock_model_server_args()
+    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup"
+    )
+    extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup"
+    )
     extra_prefill_env: ClassVar[Dict[str, str]] = mock_model_server_env(
         input_check_enabled=True
     )
@@ -124,12 +128,14 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
         "1",
     )
     extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
