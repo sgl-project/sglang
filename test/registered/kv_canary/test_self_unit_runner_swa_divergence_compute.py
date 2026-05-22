@@ -13,12 +13,10 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner import future_tensor as future_tensor_module
-from sglang.srt.kv_canary.runner.swa_divergence import report as swa_div_module
-from sglang.srt.kv_canary.runner.swa_divergence.compute import (
-    compute_swa_full_idx_divergence,
-)
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
-from sglang.srt.kv_canary.runner.swa_divergence.report import SwaDivergenceReport
+from sglang.srt.kv_canary.runner import swa_divergence as swa_div_module
+from sglang.srt.kv_canary.runner.swa_divergence import compute_swa_full_idx_divergence
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

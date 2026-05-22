@@ -22,7 +22,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.runner.swa_divergence.report import SwaDivergenceReport
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState

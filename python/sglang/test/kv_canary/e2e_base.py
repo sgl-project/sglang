@@ -7,7 +7,7 @@ import time
 from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate

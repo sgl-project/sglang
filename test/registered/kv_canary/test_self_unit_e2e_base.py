@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 from sglang.test.test_utils import CustomTestCase

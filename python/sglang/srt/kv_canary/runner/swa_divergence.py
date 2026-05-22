@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -8,10 +11,6 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
-from sglang.srt.kv_canary.runner.swa_divergence.compute import (
-    compute_swa_full_idx_divergence,
-)
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -20,6 +19,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary_swa_divergence="
+_SWA_DIVERGENCE_LINE_RE = re.compile(re.escape(_SWA_DIVERGENCE_LOG_PREFIX) + r"(\S+)")
 _FULL_IDX = 0
 _SWA_IDX = 1
 
@@ -98,3 +99,55 @@ class SwaDivergenceReport:
                 swa_full_idx_divergence=swa_full_idx_divergence,
             ).format()
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SwaDivergenceLog:
+    forward_ct: int
+    verify_full: int
+    verify_swa: int
+    swa_full_idx_divergence: int
+
+    def format(self) -> str:
+        return _SWA_DIVERGENCE_LOG_PREFIX + json.dumps(
+            asdict(self), separators=(",", ":")
+        )
+
+    @classmethod
+    def parse(cls, line: str) -> Optional["SwaDivergenceLog"]:
+        match = _SWA_DIVERGENCE_LINE_RE.search(line)
+        if match is None:
+            return None
+        return cls(**json.loads(match.group(1)))
+
+    @classmethod
+    def find_last(cls, text: str) -> Optional[tuple["SwaDivergenceLog", str]]:
+        last_match: Optional[re.Match] = None
+        for match in _SWA_DIVERGENCE_LINE_RE.finditer(text):
+            last_match = match
+        if last_match is None:
+            return None
+        return cls(**json.loads(last_match.group(1))), last_match.group(0)
+
+
+def compute_swa_full_idx_divergence(
+    *,
+    swa_allocator: "SWATokenToKVPoolAllocator",
+    req_to_token_pool: "ReqToTokenPool",
+    forward_batch: "ForwardBatch",
+) -> torch.Tensor:
+    """Count non-identity (full, swa) index pairs in the live req_to_token range."""
+    full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
+    device = full_to_swa_index_mapping.device
+    req_pool_indices = forward_batch.req_pool_indices
+    seq_lens = forward_batch.seq_lens
+
+    if req_pool_indices.numel() == 0:
+        return torch.zeros(1, dtype=torch.int32, device=device)
+
+    req_to_token = req_to_token_pool.req_to_token
+    rows = req_to_token[req_pool_indices]
+    positions = torch.arange(rows.shape[1], device=rows.device)
+    mask = positions[None, :] < seq_lens[:, None]
+    swa_indices = full_to_swa_index_mapping[rows]
+    return ((swa_indices != rows) & mask).sum().to(torch.int32).view(1)
