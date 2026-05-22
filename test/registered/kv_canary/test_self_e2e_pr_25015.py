@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import unittest
 from typing import ClassVar
 
@@ -21,8 +20,6 @@ _SPEC_EAGLE_REVERT_PR_ENV = {
     "SGLANG_DEBUG_REVERT_PR": "25015",
 }
 _SPEC_EAGLE_SERVER_ARGS = (
-    "--json-model-override-args",
-    json.dumps({"num_hidden_layers": 1}),
     "--sampling-backend",
     "token_oracle",
     "--speculative-algorithm",
@@ -31,9 +28,10 @@ _SPEC_EAGLE_SERVER_ARGS = (
     "8",
     "--max-running-requests",
     "32",
+    "--piecewise-cuda-graph-max-tokens",
+    "2048",
     "--max-total-tokens",
     "16384",
-    "--disable-piecewise-cuda-graph",
 )
 
 

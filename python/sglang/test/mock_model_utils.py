@@ -7,7 +7,6 @@ main code (server_args) does not have to know about it.
 from __future__ import annotations
 
 import io
-import json
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -26,8 +25,6 @@ MOCK_MODEL_PATH = "Qwen/Qwen3-0.6B"
 _MOCK_MODEL_SERVER_ARGS: list[str] = [
     "--load-format",
     "dummy",
-    "--json-model-override-args",
-    json.dumps({"num_hidden_layers": 1}),
     "--sampling-backend",
     "token_oracle",
     "--kv-canary",
