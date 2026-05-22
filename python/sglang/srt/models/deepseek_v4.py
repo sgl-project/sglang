@@ -577,7 +577,7 @@ class MQALayer(nn.Module):
                 fused_qk_norm_rope_swa_store,
             )
 
-            token_to_kv_pool = forward_batch.token_to_kv_pool
+            token_to_kv_pool = get_token_to_kv_pool()
             swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(
                 forward_batch.out_cache_loc
             )
