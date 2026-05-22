@@ -135,7 +135,7 @@ inline void v_to_pool_impl(
 }
 
 // ----------------------------------------------------------------------
-//   Single-dispatch rectangular kernel.
+// Experimental single-dispatch rectangular kernel.
 //   grid: (HEAD_DIM, num_tokens, max(NUM_QO_HEADS, NUM_KV_HEADS) / HPT)
 //   - dim < HALF_DIM lanes rotate Q for Q heads
 //   - dim < HALF_DIM lanes rotate K and write K pool for KV heads
@@ -220,39 +220,39 @@ inline void rope_pool_fused_rect_impl(
 // ----------------------------------------------------------------------
 #define INSTANTIATE(NAME, T)                                                     \
     [[host_name("rope_pool_rect_" #NAME)]] [[kernel]] void rope_pool_rect_##NAME(\
-        const device T*       q_in       [[buffer(0)]],                         \
-        const device T*       k_in       [[buffer(1)]],                         \
-        const device T*       v_in       [[buffer(2)]],                         \
-        device T*             q_out      [[buffer(3)]],                         \
-        device T*             k_out      [[buffer(4)]],                         \
-        device T*             k_pool     [[buffer(5)]],                         \
-        device T*             v_pool     [[buffer(6)]],                         \
-        const device int32_t* positions  [[buffer(7)]],                         \
-        const device int32_t* slots      [[buffer(8)]],                         \
+        const device T*       q_in       [[buffer(0)]],                          \
+        const device T*       k_in       [[buffer(1)]],                          \
+        const device T*       v_in       [[buffer(2)]],                          \
+        device T*             q_out      [[buffer(3)]],                          \
+        device T*             k_out      [[buffer(4)]],                          \
+        device T*             k_pool     [[buffer(5)]],                          \
+        device T*             v_pool     [[buffer(6)]],                          \
+        const device int32_t* positions  [[buffer(7)]],                          \
+        const device int32_t* slots      [[buffer(8)]],                          \
         uint3 pos [[thread_position_in_grid]]) {                                 \
         rope_pool_fused_rect_impl<T>(q_in, k_in, v_in, q_out, k_out, k_pool,     \
                                      v_pool, positions, slots, pos);             \
     }                                                                            \
     [[host_name("rope_q_" #NAME)]] [[kernel]] void rope_q_##NAME(                \
-        const device T*       q_in       [[buffer(0)]],                         \
-        device T*             q_out      [[buffer(1)]],                         \
-        const device int32_t* positions  [[buffer(2)]],                         \
+        const device T*       q_in       [[buffer(0)]],                          \
+        device T*             q_out      [[buffer(1)]],                          \
+        const device int32_t* positions  [[buffer(2)]],                          \
         uint3 pos [[thread_position_in_grid]]) {                                 \
         rope_q_impl<T>(q_in, q_out, positions, pos);                             \
     }                                                                            \
     [[host_name("rope_k_pool_" #NAME)]] [[kernel]] void rope_k_pool_##NAME(      \
-        const device T*       k_in       [[buffer(0)]],                         \
-        device T*             k_out      [[buffer(1)]],                         \
-        device T*             k_pool     [[buffer(2)]],                         \
-        const device int32_t* positions  [[buffer(3)]],                         \
-        const device int32_t* slots      [[buffer(4)]],                         \
+        const device T*       k_in       [[buffer(0)]],                          \
+        device T*             k_out      [[buffer(1)]],                          \
+        device T*             k_pool     [[buffer(2)]],                          \
+        const device int32_t* positions  [[buffer(3)]],                          \
+        const device int32_t* slots      [[buffer(4)]],                          \
         uint3 pos [[thread_position_in_grid]]) {                                 \
         rope_k_pool_impl<T>(k_in, k_out, k_pool, positions, slots, pos);         \
     }                                                                            \
     [[host_name("v_to_pool_" #NAME)]] [[kernel]] void v_to_pool_##NAME(          \
-        const device T*       v_in       [[buffer(0)]],                         \
-        device T*             v_pool     [[buffer(1)]],                         \
-        const device int32_t* slots      [[buffer(2)]],                         \
+        const device T*       v_in       [[buffer(0)]],                          \
+        device T*             v_pool     [[buffer(1)]],                          \
+        const device int32_t* slots      [[buffer(2)]],                          \
         uint3 pos [[thread_position_in_grid]]) {                                 \
         v_to_pool_impl<T>(v_in, v_pool, slots, pos);                             \
     }
