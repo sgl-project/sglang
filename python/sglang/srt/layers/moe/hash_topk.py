@@ -41,8 +41,26 @@ class HashTopK(nn.Module):
             torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
             requires_grad=False,
         )
+        self._init_default_tid2eid()
 
         assert not apply_routed_scaling_factor_on_output, "not implemented"
+
+    def _init_default_tid2eid(self) -> None:
+        topk = self.tid2eid.shape[1]
+        if topk == 0:
+            return
+
+        # DummyModelLoader only initializes floating tensors, so keep this int
+        # lookup table valid until real checkpoints overwrite it.
+        token_ids = torch.arange(
+            self.tid2eid.shape[0], dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(1)
+        expert_offsets = torch.arange(
+            topk, dtype=self.tid2eid.dtype, device=self.tid2eid.device
+        ).unsqueeze(0)
+        tid2eid = (token_ids + expert_offsets) % self.num_experts
+        with torch.no_grad():
+            self.tid2eid.copy_(tid2eid.to(self.tid2eid.dtype))
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
@@ -109,7 +127,7 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.deepseek_v4 import hash_topk
+            from sglang.jit_kernel.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
