@@ -573,8 +573,9 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
         pointers stay valid, copying refreshed data into the bound buffers.
         """
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         forward_mode = forward_batch.forward_mode
 
         if not forward_mode.is_decode_or_idle():
@@ -619,8 +620,6 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             self.decode_metadata[bs] = metadata
 
         # Populate the bound buffers with per-iter data.
-        seq_lens = seq_lens[:bs]
-        req_pool_indices = req_pool_indices[:bs]
         metadata = self.decode_metadata[bs]
 
         metadata.seq_lens_tensor.copy_(seq_lens.to(torch.int32))
