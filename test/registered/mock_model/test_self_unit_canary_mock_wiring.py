@@ -32,6 +32,8 @@ class _StubForwardBatch:
     forward_mode: _StubForwardMode
     extend_seq_lens: object
     rids_int: torch.Tensor
+    spec_info: object | None = None
+    seq_lens: torch.Tensor | None = None
 
 
 def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) -> int:
