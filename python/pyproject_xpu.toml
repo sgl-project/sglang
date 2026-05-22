@@ -24,6 +24,7 @@ dependencies = [
   "IPython",
   "aiohttp",
   "anthropic>=0.20.0",
+  "apache-tvm-ffi>=0.0.1",
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
@@ -68,7 +69,6 @@ dependencies = [
   "uvloop",
   # "xgrammar==0.2.0", xgrammar depends on CUDA PyTorch and Triton only
   "smg-grpc-servicer>=0.5.0",
-  "apache-tvm-ffi",
 ]
 
 [project.optional-dependencies]
