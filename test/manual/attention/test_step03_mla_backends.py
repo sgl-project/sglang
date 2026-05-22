@@ -135,11 +135,17 @@ def _mla_qkv(num_tokens: int):
 
 
 def _trtllm_mla_qkv(num_tokens: int):
-    """Split k_nope / k_rope for TRTLLMMLABackend (TRTLLM-supported dims)."""
+    """Q/K/V for TRTLLMMLABackend.
+
+    TRTLLM MLA expects q in "absorbed" form where the W_UK weight is
+    pre-multiplied into q: q_head_dim = kv_lora_rank + qk_rope_head_dim
+    (not qk_nope + qk_rope as in the non-absorbed path).
+    k is the nope component (kv_lora_rank), k_rope is the rope component.
+    """
     q = torch.randn(
         num_tokens,
         _TRTLLM_NUM_HEADS,
-        _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+        _TRTLLM_KV_LORA + _TRTLLM_QK_ROPE,  # absorbed form
         dtype=_DTYPE,
         device="cuda",
     )
