@@ -22,9 +22,12 @@ import sys
 
 import yaml
 
-# Concurrencies below this are skipped when picking the eval candidate — too
-# few in-flight requests to keep the model warm for a meaningful eval pass.
-MIN_EVAL_CONC = 16
+MIN_EVAL_CONC = 8
+
+# Only this (ISL, OSL) is eligible for eval auto-marking. 1k1k recipes have
+# context budgets too small for gsm8k's chain-of-thought outputs to fit; 8k1k
+# server context (~9600) gives comfortable headroom.
+EVAL_SEQ_LEN = (8192, 1024)
 
 
 def seq_len_str(isl, osl):
@@ -93,7 +96,11 @@ def main():
             # Auto-select one entry per (exp, isl, osl) group to also run
             # lm-eval after the perf sweep. Picks the recipe with the highest
             # max-conc; lm-eval then runs at the upper-median of its concs.
-            eval_idx, eval_conc = _pick_eval_entry(search_space)
+            # Only the 8k1k seq-len is eval-eligible.
+            if (isl, osl) == EVAL_SEQ_LEN:
+                eval_idx, eval_conc = _pick_eval_entry(search_space)
+            else:
+                eval_idx, eval_conc = -1, None
 
             for i, entry in enumerate(search_space):
                 config_file = entry["config_file"]
