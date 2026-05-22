@@ -35,14 +35,6 @@ class TokenOracleManager:
         input_ids = forward_batch.input_ids
         num_tokens = int(input_ids.shape[0])
 
-        fallback_generalized_req_ids_int = forward_batch.rids_int
-        if fallback_generalized_req_ids_int is None:
-            raise RuntimeError(
-                "fill_expected_inputs: generalized_req_id source tensor is None; "
-                "token oracle requires a per-forward generalized_req_id source tensor "
-                "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
-            )
-
         if num_tokens == 0:
             return
 
@@ -50,7 +42,7 @@ class TokenOracleManager:
             forward_batch=forward_batch,
             num_tokens=num_tokens,
             generalized_req_ids_per_row=select_generalized_req_ids(
-                fallback_generalized_req_ids_int=fallback_generalized_req_ids_int,
+                fallback_generalized_req_ids_int=forward_batch.rids_int,
                 bootstrap_room_ids_int=forward_batch.bootstrap_room_ids_int,
             ),
         )
