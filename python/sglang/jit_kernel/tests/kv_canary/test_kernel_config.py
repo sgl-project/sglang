@@ -6,14 +6,15 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
+    VerifyOrWriteContext,
     VerifyPlan,
+    launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
-    launch_canary_verify_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -28,8 +29,8 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     _run_both_write,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _dummy_pseudo_tensors,
-    _empty_extras,
+    dummy_pseudo_tensors,
+    empty_extras,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -162,7 +163,7 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
         cuda_log, ref_log = make_log_pair(capacity=64, device=_DEVICE)
-        pseudo_tok, pseudo_pos = _dummy_pseudo_tensors(input_ids.shape[0])
+        pseudo_tok, pseudo_pos = dummy_pseudo_tensors(input_ids.shape[0])
 
         _run_both_write(
             cuda_canary_buf=cuda_buf,
@@ -228,7 +229,7 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
             prefix_lens=prefix_lens,
             extend_seq_lens=extend_seq_lens,
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
         )
@@ -276,16 +277,18 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
 
     for _ in range(num_launches):
         cuda_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=cuda_log.ring,
+                violation_write_index=cuda_log.write_index,
+                slot_run_counter=cuda_log.slot_run_counter,
+                kernel_run_counter=cuda_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=plan_cuda,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=cuda_log.ring,
-            violation_write_index=cuda_log.write_index,
-            slot_run_counter=cuda_log.slot_run_counter,
-            kernel_run_counter=cuda_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
 
     torch.cuda.synchronize()
@@ -330,7 +333,7 @@ def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
         prefix_lens=prefix_lens,
         extend_seq_lens=extend_seq_lens,
         req_to_token=req_to_token,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         swa_window_size=0,
         full_to_swa_index_mapping=None,
     )

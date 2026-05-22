@@ -4,11 +4,9 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import (
+from sglang.test.kv_canary.runner_test_base import (
     CanaryRunnerTestCase,
     RecordingEndpoint,
-    make_forward_batch,
-    make_group,
     make_runner,
 )
 
@@ -20,6 +18,7 @@ from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
@@ -71,7 +70,7 @@ class TestRunnerPerForward(CanaryRunnerTestCase):
 class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
     def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self) -> None:
         """Verify endpoint launch preserves CUDA graph-stable tensor shapes."""
-        group = make_group(device=self.device)
+        group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
         forward_batch.input_ids = torch.tensor(
@@ -121,7 +120,7 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
 
     def test_launch_endpoints_per_forward_accepts_int32_boundary_tensors(self) -> None:
         """Verify int32 ForwardBatch tensors are promoted at the canary boundary."""
-        group = make_group(device=self.device)
+        group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
         forward_batch.input_ids = torch.tensor(
@@ -156,7 +155,7 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
         self,
     ) -> None:
         """Verify strided ForwardBatch views are copied at the canary boundary."""
-        group = make_group(device=self.device)
+        group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
         forward_batch.input_ids = torch.tensor(

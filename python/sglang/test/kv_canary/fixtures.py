@@ -7,6 +7,8 @@ from typing import List, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
@@ -157,6 +159,8 @@ def make_req_to_token_pool(
 def make_forward_batch(
     device: torch.device = DEFAULT_DEVICE,
     *,
+    bs: int = 2,
+    seq_lens_list: tuple[int, ...] = (3, 4),
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     seq_lens_sum: Optional[int] = None,
@@ -171,18 +175,39 @@ def make_forward_batch(
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
+    num_token_non_padded_cpu: Optional[int] = None,
 ) -> SimpleNamespace:
+    seq_lens_default = list(seq_lens_list[:bs])
+    if req_pool_indices is None:
+        req_pool_indices = torch.tensor(
+            [1, 2][:bs], dtype=torch.int64, device=device
+        )
+    if seq_lens is None:
+        seq_lens = torch.tensor(seq_lens_default, dtype=torch.int32, device=device)
+    if seq_lens_sum is None:
+        seq_lens_sum = int(sum(seq_lens_default))
+    if input_ids is None:
+        input_ids = torch.zeros(bs, dtype=torch.int32, device=device)
+    if positions is None:
+        positions = torch.zeros(bs, dtype=torch.int32, device=device)
+    if out_cache_loc is None:
+        out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=device)
+
     is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
     mode = SimpleNamespace(
         is_extend=lambda include_draft_extend_v2=False: is_extend
         or (include_draft_extend_v2 and is_draft_extend_v2),
+        is_extend_or_draft_extend_or_mixed=lambda include_draft_extend_v2=False: is_extend
+        or (include_draft_extend_v2 and is_draft_extend_v2),
         is_mixed=lambda: False,
+        is_decode=lambda: is_decode_or_idle,
         is_decode_or_idle=lambda: is_decode_or_idle,
         is_target_verify=lambda: is_target_verify,
         is_draft_extend_v2=lambda: is_draft_extend_v2,
     )
     return SimpleNamespace(
         forward_mode=mode,
+        batch_size=bs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_sum=seq_lens_sum,
@@ -194,6 +219,43 @@ def make_forward_batch(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
+        num_token_non_padded_cpu=num_token_non_padded_cpu,
+    )
+
+
+def make_buffer_group(
+    *,
+    device: torch.device = DEFAULT_DEVICE,
+    kind: PoolKind = PoolKind.FULL,
+    has_v: bool = True,
+    has_real_kv: bool = False,
+    real_kv_source: Optional[RealKvSource] = None,
+    swa_index_lut: Optional[torch.Tensor] = None,
+    num_slots: int = 4,
+) -> CanaryBufferGroup:
+    def _zero() -> torch.Tensor:
+        return torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+
+    if has_real_kv:
+        source = real_kv_source or RealKvSource(
+            tensor=torch.zeros(num_slots, 16, dtype=torch.uint8, device=device),
+            page_size=1,
+            num_bytes_per_token=16,
+            read_bytes=16,
+        )
+        real_kv_sources = (source,)
+    else:
+        real_kv_sources = ()
+
+    return CanaryBufferGroup(
+        kind=kind,
+        k_head=_zero(),
+        k_tail=_zero(),
+        v_head=_zero() if has_v else None,
+        v_tail=_zero() if has_v else None,
+        real_kv_sources_k=real_kv_sources,
+        real_kv_sources_v=real_kv_sources if has_v else (),
+        swa_index_lut=swa_index_lut,
     )
 
 

@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import io
-import os
-import subprocess
-import sys
-import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import ClassVar, Dict, List, Optional
+from typing import ClassVar, Dict, List
 
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.mock_model_utils import MOCK_MODEL_PATH, mock_model_server_args
+from sglang.test.kv_canary.violation_log_utils import assert_no_violation_in_log
+from sglang.test.mock_model_utils import (
+    MOCK_MODEL_PATH,
+    mock_model_server_args,
+    mock_model_server_env,
+)
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -63,138 +63,42 @@ def _make_input_ids(*, seed: int, length: int) -> List[int]:
     return [((seed + i) % 2048) + 1 for i in range(length)]
 
 
-def _tee_stream(src: object, sinks: List[object]) -> None:
-    """Read lines from src and write to all sinks (thread target)."""
-    for line in iter(src.readline, ""):
-        for sink in sinks:
-            sink.write(line)
-            sink.flush()
-    src.close()
-
-
-def _popen_pd_with_capture(
-    model: str,
-    base_url: str,
-    other_args: List[str],
-    env: Optional[dict],
-    stdout_buf: io.StringIO,
-    stderr_buf: io.StringIO,
-) -> subprocess.Popen:
-    """Launch a PD server process with tee'd stdout/stderr capture."""
-    _, host, port = base_url.split(":")
-    host = host[2:]
-    command = [
-        "python3",
-        "-m",
-        "sglang.launch_server",
-        "--model-path",
-        model,
-        *[str(x) for x in other_args],
-        "--host",
-        host,
-        "--port",
-        port,
-    ]
-    print(f"command={' '.join(command)}")
-    child_env = {**os.environ, **(env or {})}
-    proc = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=child_env,
-        text=True,
-        bufsize=1,
-    )
-    threading.Thread(
-        target=_tee_stream,
-        args=(proc.stdout, [stdout_buf, sys.stdout]),
-        daemon=True,
-    ).start()
-    threading.Thread(
-        target=_tee_stream,
-        args=(proc.stderr, [stderr_buf, sys.stderr]),
-        daemon=True,
-    ).start()
-    return proc
-
-
 class _MockModelPDBase(PDDisaggregationServerBase):
     """PD fixture for mock-model + canary e2e tests."""
 
+    capture_per_side_logs = True
     model: ClassVar[str] = MOCK_MODEL_PATH
-    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args()
-    extra_decode_args: ClassVar[List[str]] = mock_model_server_args()
-    _stdout_bufs: ClassVar[List[io.StringIO]]
-    _stderr_bufs: ClassVar[List[io.StringIO]]
+    extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup"
+    )
+    extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup"
+    )
+    extra_prefill_env: ClassVar[Dict[str, str]] = mock_model_server_env(
+        input_check_enabled=True
+    )
+    extra_decode_env: ClassVar[Dict[str, str]] = mock_model_server_env(
+        input_check_enabled=True
+    )
 
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ["SGLANG_KV_CANARY_INPUT_CHECK"] = "1"
-        os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1"
-        cls._stdout_bufs = []
-        cls._stderr_bufs = []
         super().setUpClass()
         cls.launch_all()
 
-    @classmethod
-    def start_prefill(cls) -> None:
-        prefill_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "1",
-            "--skip-server-warmup",
-        ] + list(cls.extra_prefill_args)
-        prefill_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_prefill = cls._popen_with_capture(cls.prefill_url, prefill_args)
-
-    @classmethod
-    def start_decode(cls) -> None:
-        decode_args = [
-            "--trust-remote-code",
-            "--disaggregation-mode",
-            "decode",
-            "--disaggregation-bootstrap-port",
-            cls.bootstrap_port,
-            "--tp",
-            "1",
-            "--base-gpu-id",
-            "1",
-            "--skip-server-warmup",
-        ] + list(cls.extra_decode_args)
-        decode_args += cls.transfer_backend + cls.rdma_devices
-        cls.process_decode = cls._popen_with_capture(cls.decode_url, decode_args)
-
-    @classmethod
-    def _popen_with_capture(
-        cls, base_url: str, other_args: List[str]
-    ) -> subprocess.Popen:
-        stdout_buf = io.StringIO()
-        stderr_buf = io.StringIO()
-        cls._stdout_bufs.append(stdout_buf)
-        cls._stderr_bufs.append(stderr_buf)
-        env = {
-            "SGLANG_KV_CANARY_INPUT_CHECK": "1",
-            "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
-        }
-        return _popen_pd_with_capture(
-            cls.model,
-            base_url,
-            other_args,
-            env,
-            stdout_buf,
-            stderr_buf,
-        )
-
     def assert_no_canary_violation(self) -> None:
         time.sleep(2)
-        log_text = "".join(buf.getvalue() for buf in self._stdout_bufs) + "".join(
-            buf.getvalue() for buf in self._stderr_bufs
+        log_text = "".join(
+            buf.getvalue()
+            for buf in (
+                self._prefill_stdout_buf,
+                self._prefill_stderr_buf,
+                self._decode_stdout_buf,
+                self._decode_stderr_buf,
+            )
+            if buf is not None
         )
-        self.assertNotIn("kv_canary violation:", log_text)
+        assert_no_violation_in_log(log_text)
 
 
 class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
@@ -224,12 +128,14 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     """--kv-canary-real-data=all + sweep every step, no perturb, no violation."""
 
     extra_prefill_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",
         "1",
     )
     extra_decode_args: ClassVar[List[str]] = mock_model_server_args(
+        "--skip-server-warmup",
         "--kv-canary-real-data",
         "all",
         "--kv-canary-sweep-interval",

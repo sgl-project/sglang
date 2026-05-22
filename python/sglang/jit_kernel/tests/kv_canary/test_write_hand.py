@@ -9,11 +9,13 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary import write as write_module
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
+    launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import (
     launch_canary_write_kernel,
@@ -23,8 +25,6 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,
-    launch_canary_verify_kernel_from_parts,
-    launch_canary_write_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -34,8 +34,6 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_write_plan,
     make_write_plan_pair,
     read_slot_fields,
-    splitmix64,
-    splitmix64_mix4,
     stamp_pair,
     to_signed_int64,
 )
@@ -44,7 +42,7 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     run_write_diff,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _dummy_pseudo_tensors,
+    dummy_pseudo_tensors,
     clone_real_kv_sources,
 )
 from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
@@ -89,7 +87,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
         num_valid_reqs=1,
         device=_DEVICE,
     )
-    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
     sources_cuda = case.real_kv_sources
     sources_ref = clone_real_kv_sources(sources_cuda)
     run_write_diff(
@@ -118,7 +116,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
 
         run_write_diff(
             buf_pair=buf_pair,
@@ -160,7 +158,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
 
         run_write_diff(
             buf_pair=buf_pair,
@@ -202,7 +200,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -219,16 +217,18 @@ class TestSeedSlot:
             slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=verify_log.ring,
+                violation_write_index=verify_log.write_index,
+                slot_run_counter=verify_log.slot_run_counter,
+                kernel_run_counter=verify_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=verify_plan,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=verify_log.ring,
-            violation_write_index=verify_log.write_index,
-            slot_run_counter=verify_log.slot_run_counter,
-            kernel_run_counter=verify_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -269,7 +269,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -325,7 +325,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -356,7 +356,7 @@ class TestChain:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -393,7 +393,7 @@ class TestChain:
             to_signed_int64(h) for h in expected_prev_hashes_u64
         ]
 
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -441,7 +441,7 @@ class TestChain:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -609,16 +609,18 @@ class TestMockMode:
             device=_DEVICE,
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        launch_canary_verify_kernel_from_parts(
-            canary_buf=cuda_buf,
+        launch_canary_verify_kernel(
+            context=VerifyOrWriteContext(
+                canary_buf=cuda_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=verify_log.ring,
+                violation_write_index=verify_log.write_index,
+                slot_run_counter=verify_log.slot_run_counter,
+                kernel_run_counter=verify_log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
             plan=verify_plan,
-            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-            violation_ring=verify_log.ring,
-            violation_write_index=verify_log.write_index,
-            slot_run_counter=verify_log.slot_run_counter,
-            kernel_run_counter=verify_log.kernel_run_counter,
-            real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
@@ -708,7 +710,7 @@ class TestSlotHandling:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -739,7 +741,7 @@ class TestSlotHandling:
         )
         # Slot 4 here could equally be a FULL-group raw out_cache_loc value, or the result of an SWA
         # endpoint's host gather. The kernel can't tell the difference and that's the point.
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -766,7 +768,7 @@ class TestSlotHandling:
             req_capacity=4,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -798,7 +800,7 @@ class TestSlotHandling:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(3)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(3)
 
         cuda_buf_before_slot_view = cuda_buf.view(torch.int64).clone()
 
@@ -835,7 +837,7 @@ class TestSlotHandling:
             num_valid_reqs=8,
             device=_DEVICE,
         )
-        pseudo_tokens_big, pseudo_positions_big = _dummy_pseudo_tensors(8)
+        pseudo_tokens_big, pseudo_positions_big = dummy_pseudo_tensors(8)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_big,
@@ -858,7 +860,7 @@ class TestSlotHandling:
             num_valid_reqs=3,
             device=_DEVICE,
         )
-        pseudo_tokens_small, pseudo_positions_small = _dummy_pseudo_tensors(3)
+        pseudo_tokens_small, pseudo_positions_small = dummy_pseudo_tensors(3)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_small,
@@ -891,7 +893,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -929,7 +931,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(3)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(3)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -957,7 +959,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -988,22 +990,24 @@ class TestRealKvHash:
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_write_kernel_from_parts(
-                canary_buf=cuda_buf,
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=cuda_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=too_many,
+                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                ),
                 plan=plan,
                 input_ids=input_ids,
                 positions=positions,
                 out_cache_loc=out_cache_loc,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                enable_write_verify_inputs=False,
+                enable_assert_inputs=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=too_many,
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
             )
 
     @pytest.mark.parametrize(
@@ -1079,7 +1083,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1128,7 +1132,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1163,22 +1167,24 @@ class TestRealKvHash:
                 device=_DEVICE,
             )
             log = FakeViolationLog.allocate(device=_DEVICE)
-            launch_canary_write_kernel_from_parts(
-                canary_buf=buf,
+            launch_canary_write_kernel(
+                context=VerifyOrWriteContext(
+                    canary_buf=buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=srcs,
+                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                ),
                 plan=plan,
                 input_ids=_int32_tensor([1]),
                 positions=_int32_tensor([0]),
                 out_cache_loc=_int32_tensor([2]),
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                enable_write_verify_inputs=False,
+                enable_assert_inputs=False,
                 expected_input_tokens=None,
                 expected_input_positions=None,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=srcs,
-                real_kv_hash_mode=consts.RealKvHashMode.ALL,
             )
             torch.cuda.synchronize()
             return read_slot_fields(canary_buf=buf, slot_idx=2)
@@ -1207,7 +1213,7 @@ class TestRunCounter:
         input_ids = _int32_tensor([0])
         positions = _int32_tensor([0])
         out_cache_loc = _int32_tensor([0])
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
         for _ in range(3):
@@ -1244,7 +1250,7 @@ class TestRunCounter:
             num_valid_reqs=2,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1271,7 +1277,7 @@ class TestMisc:
             req_capacity=4,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,

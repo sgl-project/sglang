@@ -8,7 +8,7 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     shrink_inputs,
 )
 
-FUZZ_SEEDS_PR: list[int] = [0]
+FUZZ_SEEDS_PR: tuple[int, ...] = (0,)
 
 
 def check_repro(inputs: Any, *, run_one_fn: Callable[[Any], Any]) -> bool:

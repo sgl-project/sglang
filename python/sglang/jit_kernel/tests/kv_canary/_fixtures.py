@@ -10,12 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyPlan,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
-
-# Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
-# stay realistic without bloating the assertion surface.
-DEFAULT_NUM_SLOTS: int = 32
-
-_U64_MASK: int = (1 << 64) - 1
+from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
 
 _DEVICE = torch.device("cuda")
 
@@ -210,7 +205,7 @@ def derive_plan_capacity(
     raise ValueError(f"unknown CapacityKind: {kind}")
 
 
-def _allocate_plan_pair(
+def allocate_plan_pair(
     *,
     verify_capacity: int,
     write_req_capacity: int,
@@ -223,7 +218,7 @@ def _allocate_plan_pair(
     )
 
 
-def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(1, dtype=torch.int64, device=_DEVICE),
         torch.zeros(1, dtype=torch.int64, device=_DEVICE),
@@ -232,26 +227,7 @@ def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
     )
 
 
-def make_extras_explicit(
-    *,
-    slot_indices: list[int],
-    positions: list[int],
-    prev_slot_indices: list[int],
-    capacity: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    n = len(slot_indices)
-    slots = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    pos = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    prevs = torch.zeros(capacity, dtype=torch.int64, device=_DEVICE)
-    if n > 0:
-        slots[:n] = torch.tensor(slot_indices, dtype=torch.int64, device=_DEVICE)
-        pos[:n] = torch.tensor(positions, dtype=torch.int64, device=_DEVICE)
-        prevs[:n] = torch.tensor(prev_slot_indices, dtype=torch.int64, device=_DEVICE)
-    num_valid = torch.tensor([n], dtype=torch.int32, device=_DEVICE)
-    return slots, pos, prevs, num_valid
-
-
-def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+def dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
         torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),

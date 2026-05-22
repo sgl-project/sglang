@@ -332,34 +332,17 @@ class WriteInvariants:
             plan=plan,
             out_cache_loc=out_cache_loc,
         )
-        if (
-            enable_write_verify_inputs
-            and expected_input_tokens is not None
-            and expected_input_positions is not None
-        ):
-            WriteInvariants._assert_pseudo_violation_only_on_mismatch(
-                enable_write_verify_inputs=enable_write_verify_inputs,
-                log_before=log_before,
-                log_after=log_after,
-                expected_input_tokens=expected_input_tokens,
-                expected_input_positions=expected_input_positions,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                plan=plan,
-            )
-        elif not enable_write_verify_inputs:
-            WriteInvariants._assert_pseudo_violation_only_on_mismatch(
-                enable_write_verify_inputs=enable_write_verify_inputs,
-                log_before=log_before,
-                log_after=log_after,
-                expected_input_tokens=input_ids,
-                expected_input_positions=positions,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                plan=plan,
-            )
+        WriteInvariants._assert_pseudo_violation_only_on_mismatch(
+            enable_write_verify_inputs=enable_write_verify_inputs,
+            log_before=log_before,
+            log_after=log_after,
+            expected_input_tokens=expected_input_tokens,
+            expected_input_positions=expected_input_positions,
+            input_ids=input_ids,
+            positions=positions,
+            out_cache_loc=out_cache_loc,
+            plan=plan,
+        )
         WriteInvariants._assert_write_slot_run_counter_incremented(
             log_before=log_before,
             log_after=log_after,
@@ -431,8 +414,8 @@ class WriteInvariants:
         enable_write_verify_inputs: bool,
         log_before: FakeViolationLog,
         log_after: FakeViolationLog,
-        expected_input_tokens: torch.Tensor,
-        expected_input_positions: torch.Tensor,
+        expected_input_tokens: Optional[torch.Tensor],
+        expected_input_positions: Optional[torch.Tensor],
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         out_cache_loc: torch.Tensor,
@@ -445,6 +428,8 @@ class WriteInvariants:
             assert (
                 delta == 0
             ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
+            return
+        if expected_input_tokens is None or expected_input_positions is None:
             return
         n_active = int(plan.write_num_valid_reqs[0].item())
         if n_active == 0:
