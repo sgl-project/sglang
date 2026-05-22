@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 import torch
 
@@ -19,11 +19,17 @@ class RadixCacheWalkResult:
     positions: torch.Tensor
     prev_slot_indices: torch.Tensor
 
+    def __iter__(self) -> Iterator[torch.Tensor]:
+        yield self.slot_indices
+        yield self.positions
+        yield self.prev_slot_indices
+
 
 def walk_radix_cache_for_canary(
     *,
     radix_cache: "BasePrefixCache",
     unlocked_only: bool = False,
+    swa_resident_only: bool = False,
 ) -> RadixCacheWalkResult:
     """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors for
     EVERY slot held by the radix cache (including slots whose tokens are also referenced by a
@@ -72,6 +78,7 @@ def walk_radix_cache_for_canary(
         prev_slot_buf=prev_slot_buf,
         is_root=True,
         unlocked_only=unlocked_only,
+        swa_resident_only=swa_resident_only,
     )
 
     slot_tensor = torch.tensor(slot_buf, dtype=torch.int64)
@@ -95,6 +102,7 @@ def _walk_radix_subtree(
     prev_slot_buf: list[int],
     is_root: bool,
     unlocked_only: bool,
+    swa_resident_only: bool,
 ) -> None:
     if isinstance(node.value, torch.Tensor):
         node_slots = [int(s) for s in node.value.tolist()]
@@ -107,6 +115,11 @@ def _walk_radix_subtree(
         )
     else:
         emit_slots = not is_root
+    if swa_resident_only:
+        emit_slots = emit_slots and _node_is_swa_resident_for_canary(
+            node=node,
+            radix_cache=radix_cache,
+        )
 
     chain_last_slot = parent_last_slot
     for j, slot in enumerate(node_slots):
@@ -129,6 +142,7 @@ def _walk_radix_subtree(
             prev_slot_buf=prev_slot_buf,
             is_root=False,
             unlocked_only=unlocked_only,
+            swa_resident_only=swa_resident_only,
         )
 
 
@@ -146,3 +160,14 @@ def _node_is_unlocked_for_canary(
     raise NotImplementedError(
         f"walk_radix_cache_for_canary does not support {type(radix_cache).__name__}"
     )
+
+
+def _node_is_swa_resident_for_canary(
+    *,
+    node: "TreeNode",
+    radix_cache: "BasePrefixCache",
+) -> bool:
+    if type(radix_cache) is not SWARadixCache:
+        return True
+
+    return not node.swa_tombstone
