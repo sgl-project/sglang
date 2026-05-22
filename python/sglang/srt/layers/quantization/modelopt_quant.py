@@ -2485,7 +2485,7 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
 
     @staticmethod
     def _weight_amax(weight: torch.Tensor) -> float:
-        return float(weight.float().abs().nan_to_num().amax().item())
+        return float(weight.abs().nan_to_num().amax().item())
 
     @staticmethod
     def _weight_scale_2_from_amax(
@@ -2494,14 +2494,16 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         weight_amax_tensor = torch.tensor(
             weight_amax, device=device, dtype=torch.float32
         )
-        nvfp4_max = torch.tensor(
+        # weight_scale_2 is the NVFP4 decode scale. FlashInfer consumes its
+        # reciprocal as the global encode scale, matching 448 * 6 / amax.
+        fp8_fp4_max = torch.tensor(
             float(torch.finfo(torch.float8_e4m3fn).max) * 6.0,
             device=device,
             dtype=torch.float32,
         )
         return torch.where(
             weight_amax_tensor > 0,
-            weight_amax_tensor / nvfp4_max,
+            weight_amax_tensor / fp8_fp4_max,
             torch.ones_like(weight_amax_tensor, dtype=torch.float32),
         )
 
@@ -2537,11 +2539,15 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 device=weight.device, dtype=torch.float32
             )
         with ModelOptPerTokenNvFp4FusedMoEMethod._quant_fast_math_env_lock:
+            # FlashInfer exposes this quantizer fast-math switch only as an env
+            # knob. Online weight quantization happens during model load; keep
+            # the env change scoped and serialized across loader threads.
             with temp_set_env(TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1"):
                 fp4_weight, weight_sf = nvfp4_quantize(
                     weight.contiguous(),
                     1.0 / weight_scale_2,
                     sfLayout=SfLayout.layout_linear,
+                    backend="cuda",
                 )
         rows, cols = weight.shape
         weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
