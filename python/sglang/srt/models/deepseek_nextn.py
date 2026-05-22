@@ -139,18 +139,6 @@ class DeepseekModelNextN(nn.Module):
             layer_name = "layers." + str(config.num_hidden_layers)
 
         self.quant_config = quant_config
-        self.decoder = DeepseekV2DecoderLayer(
-            config,
-            0,
-            quant_config=quant_config,
-            moe_quant_config_override=moe_quant_config_override,
-            is_nextn=True,
-            prefix=add_prefix(layer_name, prefix),
-            alt_stream=self.alt_stream,
-        )
-
-        self.shared_head = nn.Module()
-        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.mla_enable_prefill_cp = (
             is_mla_prefill_cp_enabled() and not is_deepseek_dsa(config)
@@ -159,6 +147,20 @@ class DeepseekModelNextN(nn.Module):
             self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
+        self.decoder = DeepseekV2DecoderLayer(
+            config,
+            0,
+            quant_config=quant_config,
+            moe_quant_config_override=moe_quant_config_override,
+            is_nextn=True,
+            prefix=add_prefix(layer_name, prefix),
+            alt_stream=self.alt_stream,
+            dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
+            mla_enable_prefill_cp=self.mla_enable_prefill_cp,
+        )
+
+        self.shared_head = nn.Module()
+        self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

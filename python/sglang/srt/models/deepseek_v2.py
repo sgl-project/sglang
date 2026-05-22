@@ -342,6 +342,8 @@ class MoEGate(nn.Module):
         is_nextn: bool = False,
         is_hash_moe: bool = False,
         is_deepseek_v4: bool = False,
+        dsa_enable_prefill_cp: bool = False,
+        mla_enable_prefill_cp: bool = False,
     ):
         super().__init__()
         self.is_nextn = is_nextn
@@ -372,10 +374,8 @@ class MoEGate(nn.Module):
         if _is_cpu and _is_cpu_amx_available:
             self.quant_method = PackWeightMethod(weight_names=["weight"])
         self.use_dsa = is_deepseek_dsa(config)
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not self.use_dsa
-        )
+        self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp
 
     def forward(
         self,
@@ -451,6 +451,8 @@ class DeepseekV2MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        dsa_enable_prefill_cp: bool = False,
+        mla_enable_prefill_cp: bool = False,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -512,6 +514,8 @@ class DeepseekV2MoE(nn.Module):
             is_nextn=is_nextn,
             is_hash_moe=self.is_hash,
             is_deepseek_v4=is_deepseek_v4,
+            dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+            mla_enable_prefill_cp=mla_enable_prefill_cp,
         )
 
         # scaling factor for fused shared experts on AMD-platform.
@@ -1349,6 +1353,8 @@ class DeepseekV2AttentionMLA(
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
         is_nextn: bool = False,
+        dsa_enable_prefill_cp: bool = False,
+        mla_enable_prefill_cp: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1363,10 +1369,8 @@ class DeepseekV2AttentionMLA(
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_dsa = is_deepseek_dsa(config)
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not self.use_dsa
-        )
+        self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp
         if self.dsa_enable_prefill_cp:
             assert self.use_dsa, "CP currently only supports deepseek v3.2 model"
         # cp reuses the attn_tp comm group but needs to duplicate the weights;
@@ -1807,6 +1811,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        dsa_enable_prefill_cp: bool = False,
+        mla_enable_prefill_cp: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1823,10 +1829,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
-        self.mla_enable_prefill_cp = (
-            is_prefill_context_parallel_enabled() and not is_deepseek_dsa(config)
-        )
+        self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
+        self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.self_attn = DeepseekV2AttentionMLA(
@@ -1849,6 +1853,8 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
             is_nextn=is_nextn,
+            dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+            mla_enable_prefill_cp=mla_enable_prefill_cp,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1875,6 +1881,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                dsa_enable_prefill_cp=dsa_enable_prefill_cp,
+                mla_enable_prefill_cp=mla_enable_prefill_cp,
             )
         else:
             if enable_moe_dense_fully_dp():
@@ -2154,6 +2162,8 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=self.alt_stream,
+                dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
+                mla_enable_prefill_cp=self.mla_enable_prefill_cp,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
