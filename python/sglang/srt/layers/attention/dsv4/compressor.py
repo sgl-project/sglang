@@ -5,13 +5,12 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
+from sglang.jit_kernel.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-    linear_bf16_fp32,
-    triton_create_paged_compress_data,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
@@ -32,6 +31,7 @@ from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.utils import add_prefix
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -124,11 +124,11 @@ class CompressorBackendMixin:
         # attn_backend.forward(), so Raw -> DSV4Metadata must happen here too
         # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch)
+        new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -155,11 +155,11 @@ class CompressorBackendMixin:
         assert is_overlap_compress(compressor.ratio)
         # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch)
+        new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
@@ -340,20 +340,16 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    # NOTE: used by v2 compressor backend
-    def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+    def get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
+        token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
             ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
-    # NOTE: used by v2 compressor backend
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
 
@@ -367,19 +363,22 @@ class Compressor(nn.Module):
             )
         return kv_score
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+    ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
         kv_score = self.compute_kv_score(x, forward_batch)
 
-        backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4AttnBackend)
-        kv_score_buffer = self.get_state_pool(forward_batch)
-        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
-        return backend.forward_compress(
+            assert isinstance(attn_backend, DeepseekV4AttnBackend)
+        kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
+        return attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
             ape=self.ape.view(-1, self.head_dim),
