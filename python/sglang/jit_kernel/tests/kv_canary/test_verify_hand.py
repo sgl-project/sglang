@@ -119,21 +119,23 @@ def _stamp_clean_kv_chain(
     pseudo_positions = torch.zeros(n, dtype=torch.int64, device=_DEVICE)
     log = FakeViolationLog.allocate(device=_DEVICE)
     launch_canary_write_kernel_torch_reference(
-        canary_buf=cuda_buf,
+        context=VerifyOrWriteContext(
+            canary_buf=cuda_buf,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=log.ring,
+            violation_write_index=log.write_index,
+            slot_run_counter=log.slot_run_counter,
+            kernel_run_counter=log.kernel_run_counter,
+            real_kv_sources=sources_cuda,
+            real_kv_hash_mode=real_kv_hash_mode,
+        ),
         plan=write_plan,
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        enable_write_verify_inputs=False,
+        enable_assert_inputs=False,
         expected_input_tokens=pseudo_tokens,
         expected_input_positions=pseudo_positions,
-        violation_ring=log.ring,
-        violation_write_index=log.write_index,
-        slot_run_counter=log.slot_run_counter,
-        kernel_run_counter=log.kernel_run_counter,
-        real_kv_sources=sources_cuda,
-        real_kv_hash_mode=real_kv_hash_mode,
     )
     ref_buf.copy_(cuda_buf)
 
@@ -1327,15 +1329,17 @@ class TestLayoutAndScheduling:
             torch.cuda.synchronize()
         else:
             launch_canary_verify_kernel_torch_reference(
-                canary_buf=canary_buf,
+                context=VerifyOrWriteContext(
+                    canary_buf=canary_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=(),
+                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                ),
                 plan=plan,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
             )
 
         assert torch.equal(log.ring, ring_before)
