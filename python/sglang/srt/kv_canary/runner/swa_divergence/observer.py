@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -9,6 +9,7 @@ from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 class SwaLiveDivergenceObserver:
@@ -22,29 +23,19 @@ class SwaLiveDivergenceObserver:
     ) -> None:
         self._swa_allocator = swa_allocator
         self._req_to_token_pool = req_to_token_pool
-        self._last_req_pool_indices: Optional[torch.Tensor] = None
-        self._last_seq_lens: Optional[torch.Tensor] = None
 
-    def observe_forward_batch(
+    def snapshot_nonidentity_future(
         self,
         *,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> None:
-        self._last_req_pool_indices = req_pool_indices
-        self._last_seq_lens = seq_lens
-
-    def snapshot_nonidentity_future(self, *, stream: torch.cuda.Stream) -> FutureTensor:
-        req_pool_indices = self._last_req_pool_indices
-        seq_lens = self._last_seq_lens
+        forward_batch: "ForwardBatch",
+        stream: torch.cuda.Stream,
+    ) -> FutureTensor:
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
         full_to_swa_index_mapping = self._swa_allocator.full_to_swa_index_mapping
         device = full_to_swa_index_mapping.device
 
-        if (
-            req_pool_indices is None
-            or seq_lens is None
-            or req_pool_indices.numel() == 0
-        ):
+        if req_pool_indices.numel() == 0:
             zero = torch.zeros(1, dtype=torch.int32, device=device)
             return FutureTensor.device_to_host(src_device=zero, stream=stream)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 from unittest.mock import patch
 
@@ -21,6 +22,11 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, stage="extra-a", runner_config="cpu-small")
 
 _DEVICE = torch.device("cpu")
+
+_EMPTY_FORWARD_BATCH = SimpleNamespace(
+    req_pool_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+    seq_lens=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -90,8 +96,8 @@ class TestSwaDivergenceStats(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.emit_log_if_due(step_counter=10, period=10)
-                stats.emit_log_if_due(step_counter=20, period=10)
+                stats.emit_log_if_due(step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
+                stats.emit_log_if_due(step_counter=20, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
 
             lines = [
                 line
@@ -119,8 +125,8 @@ class TestSwaDivergenceStats(CustomTestCase):
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
-                    stats.emit_log_if_due(step_counter=step, period=10)
-                    stats.emit_log_if_due(step_counter=step + 10, period=10)
+                    stats.emit_log_if_due(step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
+                    stats.emit_log_if_due(step_counter=step + 10, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
                 matching = [
                     line
                     for line in captured.output

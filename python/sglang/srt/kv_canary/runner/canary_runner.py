@@ -193,11 +193,6 @@ class CanaryRunner:
             self._end_of_step(forward_batch)
 
     def _before_forward(self, forward_batch: "ForwardBatch") -> None:
-        if self._swa_live_divergence_observer is not None:
-            self._swa_live_divergence_observer.observe_forward_batch(
-                req_pool_indices=forward_batch.req_pool_indices,
-                seq_lens=forward_batch.seq_lens,
-            )
         self._per_forward_orchestrator.before_forward(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
@@ -224,4 +219,5 @@ class CanaryRunner:
             self._swa_divergence_stats.emit_log_if_due(
                 step_counter=self._step_counter,
                 period=self.config.stats_print_every_n_steps,
+                forward_batch=forward_batch,
             )

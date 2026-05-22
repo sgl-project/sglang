@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from sglang.srt.kv_canary.runner.swa_divergence.observer import (
         SwaLiveDivergenceObserver,
     )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class SwaDivergenceStats:
         *,
         step_counter: int,
         period: int,
+        forward_batch: "ForwardBatch",
     ) -> None:
         if period <= 0:
             return
@@ -80,7 +82,9 @@ class SwaDivergenceStats:
             return
 
         self._drain_pending_futures()
-        self._stage_async_snapshots(step_counter=step_counter)
+        self._stage_async_snapshots(
+            step_counter=step_counter, forward_batch=forward_batch
+        )
 
     def _drain_pending_futures(self) -> None:
         pending = self._pending
@@ -110,7 +114,9 @@ class SwaDivergenceStats:
 
         self._pending = None
 
-    def _stage_async_snapshots(self, *, step_counter: int) -> None:
+    def _stage_async_snapshots(
+        self, *, step_counter: int, forward_batch: "ForwardBatch"
+    ) -> None:
         verify_full_future = FutureTensor.device_to_host(
             src_device=self._verify_full_total_device,
             stream=self._d2h_stream,
@@ -122,7 +128,8 @@ class SwaDivergenceStats:
 
         mapping_future: Optional[FutureTensor] = (
             self._swa_live_divergence_observer.snapshot_nonidentity_future(
-                stream=self._d2h_stream
+                forward_batch=forward_batch,
+                stream=self._d2h_stream,
             )
             if self._swa_live_divergence_observer is not None
             else None

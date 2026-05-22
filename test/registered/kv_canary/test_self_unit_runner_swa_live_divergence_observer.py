@@ -95,15 +95,25 @@ def _make_group(kind: PoolKind) -> CanaryBufferGroup:
     )
 
 
-def _run_snapshot(observer: SwaLiveDivergenceObserver) -> int:
+def _make_forward_batch(
+    *, req_pool_indices: torch.Tensor, seq_lens: torch.Tensor
+) -> SimpleNamespace:
+    return SimpleNamespace(req_pool_indices=req_pool_indices, seq_lens=seq_lens)
+
+
+def _run_snapshot(
+    observer: SwaLiveDivergenceObserver, *, forward_batch: SimpleNamespace
+) -> int:
     patchers = _patch_future_tensor()
     with _patch_cuda_stream_ctx(), patchers[0], patchers[1]:
-        future = observer.snapshot_nonidentity_future(stream=None)
+        future = observer.snapshot_nonidentity_future(
+            forward_batch=forward_batch, stream=None
+        )
     return int(future.wait().item())
 
 
 class TestSwaLiveDivergenceObserver(CustomTestCase):
-    def test_snapshot_returns_zero_when_no_observe(self) -> None:
+    def test_snapshot_returns_zero_when_empty_batch(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
         observer = SwaLiveDivergenceObserver(
@@ -111,7 +121,12 @@ class TestSwaLiveDivergenceObserver(CustomTestCase):
             req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
         )
 
-        self.assertEqual(_run_snapshot(observer), 0)
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.empty(0, dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(_run_snapshot(observer, forward_batch=forward_batch), 0)
 
     def test_snapshot_returns_zero_when_all_identity(self) -> None:
         mapping = _make_identity_mapping(size=64)
@@ -121,12 +136,12 @@ class TestSwaLiveDivergenceObserver(CustomTestCase):
             req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
         )
 
-        observer.observe_forward_batch(
+        forward_batch = _make_forward_batch(
             req_pool_indices=torch.tensor([0, 2], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([8, 5], dtype=torch.int64, device=_DEVICE),
         )
 
-        self.assertEqual(_run_snapshot(observer), 0)
+        self.assertEqual(_run_snapshot(observer, forward_batch=forward_batch), 0)
 
     def test_snapshot_counts_nonidentity_in_live_range(self) -> None:
         mapping = _make_identity_mapping(size=64)
@@ -140,12 +155,12 @@ class TestSwaLiveDivergenceObserver(CustomTestCase):
         mapping[1] = 51
         mapping[17] = 60
 
-        observer.observe_forward_batch(
+        forward_batch = _make_forward_batch(
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([8, 8], dtype=torch.int64, device=_DEVICE),
         )
 
-        self.assertEqual(_run_snapshot(observer), 3)
+        self.assertEqual(_run_snapshot(observer, forward_batch=forward_batch), 3)
 
     def test_snapshot_ignores_writes_outside_seq_lens(self) -> None:
         mapping = _make_identity_mapping(size=128)
@@ -158,14 +173,14 @@ class TestSwaLiveDivergenceObserver(CustomTestCase):
         mapping[20] = 99
         mapping[28] = 77
 
-        observer.observe_forward_batch(
+        forward_batch = _make_forward_batch(
             req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([10], dtype=torch.int64, device=_DEVICE),
         )
 
-        self.assertEqual(_run_snapshot(observer), 0)
+        self.assertEqual(_run_snapshot(observer, forward_batch=forward_batch), 0)
 
-    def test_snapshot_uses_latest_observe(self) -> None:
+    def test_snapshot_reflects_current_forward_batch(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
         observer = SwaLiveDivergenceObserver(
@@ -178,16 +193,17 @@ class TestSwaLiveDivergenceObserver(CustomTestCase):
         mapping[32] = 99
         mapping[33] = 100
 
-        observer.observe_forward_batch(
+        fb_req0 = _make_forward_batch(
             req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
         )
-        observer.observe_forward_batch(
+        fb_req2 = _make_forward_batch(
             req_pool_indices=torch.tensor([2], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([4], dtype=torch.int64, device=_DEVICE),
         )
 
-        self.assertEqual(_run_snapshot(observer), 2)
+        self.assertEqual(_run_snapshot(observer, forward_batch=fb_req0), 2)
+        self.assertEqual(_run_snapshot(observer, forward_batch=fb_req2), 2)
 
 
 class TestSwaDivergenceStatsWithObserver(CustomTestCase):
@@ -205,7 +221,7 @@ class TestSwaDivergenceStatsWithObserver(CustomTestCase):
         mapping[1] = 51
         mapping[2] = 52
 
-        observer.observe_forward_batch(
+        forward_batch = _make_forward_batch(
             req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
             seq_lens=torch.tensor([8], dtype=torch.int64, device=_DEVICE),
         )
@@ -230,8 +246,12 @@ class TestSwaDivergenceStatsWithObserver(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.emit_log_if_due(step_counter=10, period=10)
-                stats.emit_log_if_due(step_counter=20, period=10)
+                stats.emit_log_if_due(
+                    step_counter=10, period=10, forward_batch=forward_batch
+                )
+                stats.emit_log_if_due(
+                    step_counter=20, period=10, forward_batch=forward_batch
+                )
 
         matching = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None
