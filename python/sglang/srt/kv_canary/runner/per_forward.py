@@ -67,7 +67,9 @@ class PerForwardOrchestrator:
         self._perturb_manager = perturb_manager
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
-        self._swa_divergence_report: Optional[SwaDivergenceReport] = swa_divergence_report
+        self._swa_divergence_report: Optional[SwaDivergenceReport] = (
+            swa_divergence_report
+        )
 
         self._verify_plan_per_forward = VerifyPlan.allocate(
             verify_capacity=per_forward_verify_capacity, device=device

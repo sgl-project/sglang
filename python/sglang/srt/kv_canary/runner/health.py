@@ -8,7 +8,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
+from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
@@ -40,33 +40,35 @@ class KernelRunCounterHealthChecker:
         self._device_state = device_state
         self._active_tags = active_tags
         self._step_counter_getter = step_counter_getter
-        self._d2h_stream = d2h_stream
-        self._previous_health_future: Optional[FutureTensors] = None
+        self._handler = DelayedDeviceHostHandler(
+            compute_on_device=self._compute_on_device,
+            postprocess_on_host=self._postprocess_on_host,
+            d2h_stream=d2h_stream,
+        )
 
     def step(self) -> None:
+        self._handler.step()
+
+    def _compute_on_device(self) -> Optional[torch.Tensor]:
         step_counter = self._step_counter_getter()
         if step_counter < _HEALTH_CHECK_WARMUP_STEPS:
-            return
+            return None
         if step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
-            return
+            return None
         if not self._active_tags:
-            return
+            return None
+        return self._device_state.kernel_run_counters
 
-        device_state = self._device_state
-        if self._previous_health_future is not None:
-            counters = self._previous_health_future.wait().tolist()
-            expected_tags = self._expected_active_tags_for_health_check()
-            zero_tags = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
-            if zero_tags:
-                names = ", ".join(tag.name for tag in zero_tags)
-                raise RuntimeError(
-                    f"kv-canary: kernel_run_counter is zero after warmup for tags=[{names}] "
-                    f"at step={step_counter}; canary path is not executing"
-                )
-
-        self._previous_health_future = FutureTensors.device_to_host(
-            src_device=device_state.kernel_run_counters, stream=self._d2h_stream
-        )
+    def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
+        counters = host_tensor.tolist()
+        expected_tags = self._expected_active_tags_for_health_check()
+        zero_tags = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
+        if zero_tags:
+            names = ", ".join(tag.name for tag in zero_tags)
+            raise RuntimeError(
+                f"kv-canary: kernel_run_counter is zero after warmup for tags=[{names}] "
+                f"at step={self._step_counter_getter()}; canary path is not executing"
+            )
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
         if self._config.sweep_interval > 0:
@@ -90,41 +92,36 @@ class PeriodicCanaryStatsLogger:
         self._active_tags = active_tags
         self._step_counter_getter = step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
-        self._d2h_stream = d2h_stream
-        self._previous_slot_sum_future: Optional[FutureTensors] = None
-        self._previous_write_index_future: Optional[FutureTensors] = None
+        self._handler = DelayedDeviceHostHandler(
+            compute_on_device=self._compute_on_device,
+            postprocess_on_host=self._postprocess_on_host,
+            d2h_stream=d2h_stream,
+        )
 
     def step(self) -> None:
+        self._handler.step()
+
+    def _compute_on_device(self) -> Optional[dict[str, torch.Tensor]]:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
-            return
+            return None
         step_counter = self._step_counter_getter()
         if step_counter == 0 or step_counter % period != 0:
-            return
-
+            return None
         device_state = self._device_state
-        prev_slot_sum = self._previous_slot_sum_future
-        prev_write_index = self._previous_write_index_future
-        if prev_slot_sum is not None and prev_write_index is not None:
-            protected = int(prev_slot_sum.wait().item())
-            violations = int(prev_write_index.wait().item())
-            active = len(self._active_tags)
-            logger.info(
-                "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
-                "launch_tags_active=%d/%d",
-                step_counter,
-                protected,
-                self._sweep_orchestrator.sweep_passes,
-                violations,
-                active,
-                len(CanaryLaunchTag),
-            )
+        return {
+            "slot_sum": device_state.slot_run_counters.sum().view(1),
+            "write_index": device_state.violation_log.violation_write_index,
+        }
 
-        slot_sum_device = device_state.slot_run_counters.sum().view(1)
-        self._previous_slot_sum_future = FutureTensors.device_to_host(
-            src_device=slot_sum_device, stream=self._d2h_stream
-        )
-        self._previous_write_index_future = FutureTensors.device_to_host(
-            src_device=device_state.violation_log.violation_write_index,
-            stream=self._d2h_stream,
+    def _postprocess_on_host(self, host_data: dict[str, torch.Tensor]) -> None:
+        logger.info(
+            "[canary] step=%d protected_tokens=%d sweep_passes=%d violations=%d "
+            "launch_tags_active=%d/%d",
+            self._step_counter_getter(),
+            int(host_data["slot_sum"].item()),
+            self._sweep_orchestrator.sweep_passes,
+            int(host_data["write_index"].item()),
+            len(self._active_tags),
+            len(CanaryLaunchTag),
         )
