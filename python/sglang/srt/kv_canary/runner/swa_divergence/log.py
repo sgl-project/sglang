@@ -16,7 +16,7 @@ class SwaDivergenceLog:
     forward_ct: int
     verify_full: int
     verify_swa: int
-    mapping_nonidentity: int
+    swa_full_idx_divergence: int
 
     def format(self) -> str:
         return _SWA_DIVERGENCE_LOG_PREFIX + json.dumps(

@@ -15,13 +15,13 @@ _GOOD_LINE: str = SwaDivergenceLog(
     forward_ct=120,
     verify_full=10000,
     verify_swa=4200,
-    mapping_nonidentity=512,
+    swa_full_idx_divergence=512,
 ).format()
 _LATER_LINE: str = SwaDivergenceLog(
     forward_ct=240,
     verify_full=20000,
     verify_swa=8400,
-    mapping_nonidentity=1024,
+    swa_full_idx_divergence=1024,
 ).format()
 
 
@@ -61,7 +61,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
         harness, patcher = self._make_harness(_LATER_LINE + "\n" + _GOOD_LINE + "\n")
         with patcher:
             harness.assert_swa_divergence_observed(
-                min_mapping_nonidentity=100,
+                min_swa_full_idx_divergence=100,
                 require_verify_lag=True,
                 flush_wait_seconds=0.0,
                 max_retries=1,
@@ -72,7 +72,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
         harness, patcher = self._make_harness(log)
         with patcher:
             harness.assert_swa_divergence_observed(
-                min_mapping_nonidentity=1000,
+                min_swa_full_idx_divergence=1000,
                 require_verify_lag=True,
                 flush_wait_seconds=0.0,
                 max_retries=1,
@@ -83,13 +83,13 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             forward_ct=100,
             verify_full=5000,
             verify_swa=2000,
-            mapping_nonidentity=0,
+            swa_full_idx_divergence=0,
         ).format()
         harness, patcher = self._make_harness(zero_mapping_line + "\n")
         with patcher:
-            with self.assertRaisesRegex(AssertionError, "mapping_nonidentity=0"):
+            with self.assertRaisesRegex(AssertionError, "swa_full_idx_divergence=0"):
                 harness.assert_swa_divergence_observed(
-                    min_mapping_nonidentity=1,
+                    min_swa_full_idx_divergence=1,
                     require_verify_lag=False,
                     flush_wait_seconds=0.0,
                     max_retries=1,
@@ -100,13 +100,13 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
             forward_ct=100,
             verify_full=5000,
             verify_swa=5000,
-            mapping_nonidentity=200,
+            swa_full_idx_divergence=200,
         ).format()
         harness, patcher = self._make_harness(equal_verify_line + "\n")
         with patcher:
             with self.assertRaisesRegex(AssertionError, "verify_swa=5000"):
                 harness.assert_swa_divergence_observed(
-                    min_mapping_nonidentity=1,
+                    min_swa_full_idx_divergence=1,
                     require_verify_lag=True,
                     flush_wait_seconds=0.0,
                     max_retries=1,
@@ -117,7 +117,7 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
         harness, patcher = self._make_harness(sequence)
         with patcher:
             harness.assert_swa_divergence_observed(
-                min_mapping_nonidentity=1,
+                min_swa_full_idx_divergence=1,
                 require_verify_lag=True,
                 flush_wait_seconds=0.0,
                 max_retries=5,
@@ -128,24 +128,24 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
         with patcher:
             with self.assertRaisesRegex(AssertionError, "No kv_canary swa_divergence"):
                 harness.assert_swa_divergence_observed(
-                    min_mapping_nonidentity=1,
+                    min_swa_full_idx_divergence=1,
                     require_verify_lag=True,
                     flush_wait_seconds=0.0,
                     max_retries=2,
                 )
 
-    def test_assert_swa_divergence_observed_catches_identity_mapping(self) -> None:
-        identity_only_line = SwaDivergenceLog(
+    def test_assert_swa_divergence_observed_catches_zero_swa_full_idx_divergence(self) -> None:
+        zero_divergence_line = SwaDivergenceLog(
             forward_ct=200,
             verify_full=10000,
             verify_swa=2000,
-            mapping_nonidentity=0,
+            swa_full_idx_divergence=0,
         ).format()
-        harness, patcher = self._make_harness(identity_only_line + "\n")
+        harness, patcher = self._make_harness(zero_divergence_line + "\n")
         with patcher:
-            with self.assertRaisesRegex(AssertionError, "mapping_nonidentity=0"):
+            with self.assertRaisesRegex(AssertionError, "swa_full_idx_divergence=0"):
                 harness.assert_swa_divergence_observed(
-                    min_mapping_nonidentity=1,
+                    min_swa_full_idx_divergence=1,
                     require_verify_lag=True,
                     flush_wait_seconds=0.0,
                     max_retries=1,

@@ -118,7 +118,7 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     def assert_swa_divergence_observed(
         self,
         *,
-        min_mapping_nonidentity: int = 1,
+        min_swa_full_idx_divergence: int = 1,
         require_verify_lag: bool = True,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
@@ -149,10 +149,10 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
                 f"Log tail:\n{self._captured_log_text()[-2000:]}"
             )
 
-        if last_parsed.mapping_nonidentity < min_mapping_nonidentity:
+        if last_parsed.swa_full_idx_divergence < min_swa_full_idx_divergence:
             raise AssertionError(
-                f"SWA divergence not observed: mapping_nonidentity={last_parsed.mapping_nonidentity} "
-                f"< min={min_mapping_nonidentity}. Line: {last_line}"
+                f"SWA divergence not observed: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
+                f"< min={min_swa_full_idx_divergence}. Line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full

@@ -14,7 +14,7 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.swa_divergence import stats as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence.compute import (
-    compute_swa_live_divergence,
+    compute_swa_full_idx_divergence,
 )
 from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
@@ -95,13 +95,13 @@ def _make_forward_batch(
     return SimpleNamespace(req_pool_indices=req_pool_indices, seq_lens=seq_lens)
 
 
-def _run_snapshot(
+def _run_compute(
     *,
     swa_allocator: SimpleNamespace,
     req_to_token_pool: SimpleNamespace,
     forward_batch: SimpleNamespace,
 ) -> int:
-    count = compute_swa_live_divergence(
+    count = compute_swa_full_idx_divergence(
         swa_allocator=swa_allocator,
         req_to_token_pool=req_to_token_pool,
         forward_batch=forward_batch,
@@ -109,8 +109,8 @@ def _run_snapshot(
     return int(count.item())
 
 
-class TestSwaLiveDivergenceCompute(CustomTestCase):
-    def test_snapshot_returns_zero_when_empty_batch(self) -> None:
+class TestSwaFullIdxDivergenceCompute(CustomTestCase):
+    def test_compute_returns_zero_when_empty_batch(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
@@ -120,7 +120,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
         )
 
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=forward_batch,
@@ -128,7 +128,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
             0,
         )
 
-    def test_snapshot_returns_zero_when_all_identity(self) -> None:
+    def test_compute_returns_zero_when_all_identity(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
@@ -138,7 +138,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
         )
 
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=forward_batch,
@@ -146,7 +146,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
             0,
         )
 
-    def test_snapshot_counts_nonidentity_in_live_range(self) -> None:
+    def test_compute_counts_swa_full_idx_divergence_in_live_range(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
@@ -160,7 +160,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
         )
 
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=forward_batch,
@@ -168,7 +168,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
             3,
         )
 
-    def test_snapshot_ignores_writes_outside_seq_lens(self) -> None:
+    def test_compute_ignores_writes_outside_seq_lens(self) -> None:
         mapping = _make_identity_mapping(size=128)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=32)
 
@@ -181,7 +181,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
         )
 
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=forward_batch,
@@ -189,7 +189,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
             0,
         )
 
-    def test_snapshot_reflects_current_forward_batch(self) -> None:
+    def test_compute_reflects_current_forward_batch(self) -> None:
         mapping = _make_identity_mapping(size=64)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
 
@@ -208,7 +208,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
         )
 
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=fb_req0,
@@ -216,7 +216,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
             2,
         )
         self.assertEqual(
-            _run_snapshot(
+            _run_compute(
                 swa_allocator=_make_allocator_stub(mapping),
                 req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
                 forward_batch=fb_req2,
@@ -226,7 +226,7 @@ class TestSwaLiveDivergenceCompute(CustomTestCase):
 
 
 class TestSwaDivergenceStatsWithCompute(CustomTestCase):
-    def test_swa_divergence_stats_emits_mapping_nonidentity_from_observer(
+    def test_swa_divergence_stats_emits_swa_full_idx_divergence_from_compute(
         self,
     ) -> None:
         mapping = _make_identity_mapping(size=64)
@@ -273,7 +273,7 @@ class TestSwaDivergenceStatsWithCompute(CustomTestCase):
         self.assertEqual(len(matching), 1, matching)
         parsed = SwaDivergenceLog.parse(matching[0])
         assert parsed is not None
-        self.assertEqual(parsed.mapping_nonidentity, 3)
+        self.assertEqual(parsed.swa_full_idx_divergence, 3)
         self.assertEqual(parsed.verify_full, 11)
         self.assertEqual(parsed.verify_swa, 3)
 

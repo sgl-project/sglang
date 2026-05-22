@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_swa_live_divergence(
+def compute_swa_full_idx_divergence(
     *,
     swa_allocator: "SWATokenToKVPoolAllocator",
     req_to_token_pool: "ReqToTokenPool",

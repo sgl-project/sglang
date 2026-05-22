@@ -111,7 +111,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             self.assertEqual(fields.forward_ct, 4)
             self.assertEqual(fields.verify_full, 40)
             self.assertEqual(fields.verify_swa, 12)
-            self.assertEqual(fields.mapping_nonidentity, 0)
+            self.assertEqual(fields.swa_full_idx_divergence, 0)
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         with _patch_future_tensor():
