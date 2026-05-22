@@ -34,13 +34,13 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestPerturbReqToTokenMha(_PerturbReqToTokenBase, unittest.TestCase):
+class TestPerturbReqToTokenMha(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "mha"
 
 
-class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase, unittest.TestCase):
+class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"

@@ -36,17 +36,17 @@ class _PDPerturbBase(CanaryPDFixture):
         )
 
 
-class TestPDPerturbMhaFull(_PDPerturbBase, unittest.TestCase):
+class TestPDPerturbMhaFull(_PDPerturbBase):
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
-class TestPDPerturbSwaFull(_PDPerturbBase, unittest.TestCase):
+class TestPDPerturbSwaFull(_PDPerturbBase):
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
-class TestPDPerturbSwaSwa(_PDPerturbBase, unittest.TestCase):
+class TestPDPerturbSwaSwa(_PDPerturbBase):
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
 

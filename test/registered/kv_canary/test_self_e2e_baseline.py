@@ -25,13 +25,13 @@ class _BaselineBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestBaselineMha(_BaselineBase, unittest.TestCase):
+class TestBaselineMha(_BaselineBase):
     __test__ = True
 
     model_mode = "mha"
 
 
-class TestBaselineSwa(_BaselineBase, unittest.TestCase):
+class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"

@@ -61,7 +61,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
 
 
 class TestPerturbRealKvUnusedCacheMhaFull(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
+    _PerturbRealKvUnusedCacheBase
 ):
     __test__ = True
 
@@ -70,7 +70,7 @@ class TestPerturbRealKvUnusedCacheMhaFull(
 
 
 class TestPerturbRealKvUnusedCacheSwaFull(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
+    _PerturbRealKvUnusedCacheBase
 ):
     __test__ = True
 
@@ -79,7 +79,7 @@ class TestPerturbRealKvUnusedCacheSwaFull(
 
 
 class TestPerturbRealKvUnusedCacheSwaSwa(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
+    _PerturbRealKvUnusedCacheBase
 ):
     __test__ = True
 

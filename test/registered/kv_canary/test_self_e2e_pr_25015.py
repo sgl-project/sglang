@@ -39,7 +39,7 @@ _SPEC_EAGLE_SERVER_ARGS = (
 )
 
 
-class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
+class _EaglePositionsBase(CanaryE2EBase):
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
     extra_server_args = _SPEC_EAGLE_SERVER_ARGS
