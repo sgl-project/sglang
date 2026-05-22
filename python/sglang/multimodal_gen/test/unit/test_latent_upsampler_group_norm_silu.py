@@ -219,3 +219,146 @@ def test_latent_upsampler_fuses_expected_sites(
 def test_latent_upsampler_module_wires_fused_helper():
     """latent_upsampler.py imports apply_group_norm_silu at module scope."""
     assert hasattr(lu_mod, "apply_group_norm_silu")
+
+
+# -- CUDA production fast path (Triton fused kernel) ----------------------
+#
+# The CPU/fp32 tests above prove the wiring is structurally correct and the
+# helper's eager fallback matches an explicit reference exactly. They do
+# *not* exercise the Triton fused path, because ``apply_group_norm_silu``
+# gates the fused kernel on ``x.is_cuda`` and bf16/fp16 dtypes.
+#
+# The tests below run the same ``ResBlock.forward`` / ``LatentUpsampler.forward``
+# wired modules on CUDA with bf16 and fp16, so the helper actually invokes
+# ``triton_group_norm_silu``. Parity is against an explicit eager reference
+# that uses the same module instance but bypasses the helper, so any
+# numerical gap is purely fused-vs-eager. Tolerances match the kernel-side
+# test (`jit_kernel/tests/diffusion/test_group_norm_silu.py::_tol`).
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="Triton fused group_norm_silu requires CUDA",
+)
+
+# Tolerances. ResBlock isolates exactly one fused site (norm1 + activation)
+# from the output by 1 conv layer, so the kernel-side tolerance suffices.
+# LatentUpsampler wraps the fused site(s) behind 8+ conv2d/conv3d layers
+# (initial_conv -> 4 pre-upsample ResBlocks -> upsampler -> 4 post-upsample
+# ResBlocks -> final_conv with default num_blocks_per_stage=4), and each
+# downstream conv amplifies fp16 quantization differences from the
+# fused-vs-eager path. bf16 has fp32-equivalent exponent range so multi-layer
+# amplification stays tight; fp16 needs an intentionally looser tolerance.
+_BF16_TOL_KERNEL = (7e-2, 2e-2)
+_FP16_TOL_KERNEL = (3e-3, 3e-3)
+_BF16_TOL_MULTI_LAYER = (7e-2, 2e-2)
+_FP16_TOL_MULTI_LAYER = (2e-2, 1e-1)
+
+_RESBLOCK_TOL = {
+    torch.bfloat16: _BF16_TOL_KERNEL,
+    torch.float16: _FP16_TOL_KERNEL,
+}
+_UPSAMPLER_TOL = {
+    torch.bfloat16: _BF16_TOL_MULTI_LAYER,
+    torch.float16: _FP16_TOL_MULTI_LAYER,
+}
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "batch,channels,dims,spatial",
+    [
+        (1, 64, 2, (16, 16)),
+        (1, 128, 3, (2, 8, 8)),
+    ],
+)
+def test_resblock_forward_parity_cuda(dtype, batch, channels, dims, spatial):
+    """ResBlock.forward on CUDA bf16/fp16 fires the Triton kernel via the
+    helper and matches the eager reference within bf16/fp16 tolerance."""
+    _seed(0)
+    device = torch.device("cuda")
+    block = ResBlock(channels=channels, dims=dims).to(device=device, dtype=dtype).eval()
+
+    _seed(1)
+    x = torch.randn(batch, channels, *spatial, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        out_wired = block(x)
+        out_ref = _resblock_eager_reference(block, x)
+
+    atol, rtol = _RESBLOCK_TOL[dtype]
+    torch.testing.assert_close(out_wired, out_ref, atol=atol, rtol=rtol)
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "dims,latent_shape,mid_channels,num_blocks_per_stage",
+    [
+        # 2D conv path
+        (2, (1, 32, 2, 16, 16), 64, 2),
+        # 3D conv path with spatial upsample (the production LTX-2 path)
+        (3, (1, 32, 2, 16, 16), 64, 2),
+    ],
+)
+def test_latent_upsampler_forward_parity_cuda(
+    dtype, dims, latent_shape, mid_channels, num_blocks_per_stage
+):
+    """LatentUpsampler.forward on CUDA bf16/fp16 end-to-end parity. Each
+    forward fires the Triton kernel 1 + 2 * num_blocks_per_stage times
+    (initial + pre/post-upsample ResBlocks). The fp16 tolerance is looser
+    than ResBlock's because 8+ conv layers downstream amplify fp16
+    quantization (see _UPSAMPLER_TOL comment above)."""
+    _seed(2)
+    device = torch.device("cuda")
+    upsampler = (
+        LatentUpsampler(
+            in_channels=latent_shape[1],
+            mid_channels=mid_channels,
+            num_blocks_per_stage=num_blocks_per_stage,
+            dims=dims,
+            spatial_upsample=True,
+            temporal_upsample=False,
+            spatial_scale=2.0,
+            rational_resampler=False,
+        )
+        .to(device=device, dtype=dtype)
+        .eval()
+    )
+
+    _seed(3)
+    latent = torch.randn(*latent_shape, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        out_wired = upsampler(latent)
+        out_ref = _latent_upsampler_eager_reference(upsampler, latent)
+
+    atol, rtol = _UPSAMPLER_TOL[dtype]
+    torch.testing.assert_close(out_wired, out_ref, atol=atol, rtol=rtol)
+
+
+@requires_cuda
+def test_resblock_actually_uses_triton_kernel_cuda():
+    """Verify the helper truly routes to the Triton path on CUDA bf16 (not
+    just falls back to eager). Asserts ``triton_group_norm_silu`` is invoked
+    by patching the import the helper does lazily."""
+    from unittest.mock import patch
+
+    from sglang.jit_kernel.diffusion.triton import group_norm_silu as triton_mod
+
+    _seed(0)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    block = ResBlock(channels=64, dims=2).to(device=device, dtype=dtype).eval()
+    x = torch.randn(1, 64, 16, 16, device=device, dtype=dtype)
+
+    real = triton_mod.triton_group_norm_silu
+    with patch.object(
+        triton_mod, "triton_group_norm_silu", wraps=real
+    ) as mock_triton:
+        with torch.no_grad():
+            _ = block(x)
+    assert mock_triton.call_count >= 1, (
+        "Expected the Triton fused kernel to fire at least once on CUDA bf16; "
+        f"got call_count={mock_triton.call_count} (helper fell back to eager?)"
+    )

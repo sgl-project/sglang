@@ -40,8 +40,13 @@ CASES = [
     Case("hunyuan_video_large", (1, 128, 20, 256, 256), 32),
     # LTX-2 latent upsampler (`LatentUpsampler` + `ResBlock`) operates on
     # `[B, mid_channels=512, F, H, W]` tensors with num_groups=32. The pre-
-    # and post-upsample variants bracket the production shape range; the
-    # _small case keeps CI memory bounded.
+    # and post-upsample variants bracket the production shape range Lightricks
+    # ships in the LTX-2.3 spatial upscaler checkpoints. The `post_720p` case
+    # is ~471M bf16 elements (~940 MB) — big enough to be HBM-bandwidth-bound
+    # on H100 / H200 (where it surfaces ~14x kernel speedup vs eager). It only
+    # runs in standalone perf verification: this bench is registered with
+    # `disabled="standalone benchmark"` (see register_cuda_ci above), so the
+    # large tensor never appears in the regular CI memory budget.
     Case("ltx2_upsampler_small", (1, 512, 8, 45, 80), 32),
     Case("ltx2_upsampler_pre_720p", (1, 512, 16, 90, 160), 32),
     Case("ltx2_upsampler_post_720p", (1, 512, 16, 180, 320), 32),
