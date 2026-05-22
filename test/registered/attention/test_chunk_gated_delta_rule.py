@@ -211,6 +211,21 @@ class TestChunkGatedDeltaRule(unittest.TestCase):
         self._check_shape(B=4, T_per_seq=128, H=16, K=128, V=128, pool_size=512)
 
     # ------------------------------------------------------------------
+    # Long prompts (many chunks; regression test for cross-chunk errors)
+    # ------------------------------------------------------------------
+    def test_long_prompt_1024(self):
+        self._check_shape(B=1, T_per_seq=1024, H=16, K=128, V=128, pool_size=32)
+
+    def test_long_prompt_1536(self):
+        self._check_shape(B=1, T_per_seq=1536, H=16, K=128, V=128, pool_size=32)
+
+    def test_long_prompt_2048(self):
+        self._check_shape(B=1, T_per_seq=2048, H=16, K=128, V=128, pool_size=32)
+
+    def test_long_prompt_batch(self):
+        self._check_shape(B=2, T_per_seq=1024, H=16, K=128, V=128, pool_size=32)
+
+    # ------------------------------------------------------------------
     # Combined stress
     # ------------------------------------------------------------------
     def test_stress(self):
