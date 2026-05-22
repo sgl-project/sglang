@@ -93,7 +93,7 @@ class CanaryRunner:
                 SwaDivergenceStats(
                     device=device,
                     d2h_stream=self._d2h_stream,
-                    swa_allocator_getter=self._get_swa_allocator,
+                    swa_allocator=self._swa_allocator,
                 )
             )
         else:
@@ -157,9 +157,6 @@ class CanaryRunner:
 
     def _get_step_counter(self) -> int:
         return self._step_counter
-
-    def _get_swa_allocator(self) -> Optional["SWATokenToKVPoolAllocator"]:
-        return self._swa_allocator
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)

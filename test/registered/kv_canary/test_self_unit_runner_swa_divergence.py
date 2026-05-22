@@ -136,7 +136,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator_getter=lambda: allocator,
+                swa_allocator=allocator,
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
@@ -172,7 +172,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator_getter=lambda: allocator,
+                swa_allocator=allocator,
             )
 
             snapshots: list[dict[str, int]] = []
@@ -223,7 +223,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_allocator_getter=lambda: allocator,
+                swa_allocator=allocator,
             )
             stats.observe_after_invoke_plan(
                 group=_make_group(PoolKind.FULL),

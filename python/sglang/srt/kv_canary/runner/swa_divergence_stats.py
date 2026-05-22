@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -102,13 +101,11 @@ class SwaDivergenceStats:
         *,
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
-        swa_allocator_getter: Optional[
-            Callable[[], Optional["SWATokenToKVPoolAllocator"]]
-        ] = None,
+        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
     ) -> None:
         self._device = device
         self._d2h_stream = d2h_stream
-        self._swa_allocator_getter = swa_allocator_getter
+        self._swa_allocator = swa_allocator
         self._forward_ct: int = 0
 
         self._verify_full_total_device: torch.Tensor = torch.zeros(
@@ -196,14 +193,9 @@ class SwaDivergenceStats:
             stream=self._d2h_stream,
         )
 
-        allocator = (
-            self._swa_allocator_getter()
-            if self._swa_allocator_getter is not None
-            else None
-        )
         counters = (
-            allocator.divergence_stats_device_tensors()
-            if allocator is not None
+            self._swa_allocator.divergence_stats_device_tensors()
+            if self._swa_allocator is not None
             else None
         )
         if counters is not None and counters.nonidentity_write_count is not None:
