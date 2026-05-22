@@ -80,7 +80,8 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_live_divergence_observer=None,
+                swa_allocator=None,
+                req_to_token_pool=None,
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
@@ -96,8 +97,12 @@ class TestSwaDivergenceStats(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.emit_log_if_due(step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
-                stats.emit_log_if_due(step_counter=20, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
+                stats.emit_log_if_due(
+                    step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH
+                )
+                stats.emit_log_if_due(
+                    step_counter=20, period=10, forward_batch=_EMPTY_FORWARD_BATCH
+                )
 
             lines = [
                 line
@@ -116,7 +121,8 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_live_divergence_observer=None,
+                swa_allocator=None,
+                req_to_token_pool=None,
             )
 
             snapshots: list[SwaDivergenceLog] = []
@@ -125,8 +131,14 @@ class TestSwaDivergenceStats(CustomTestCase):
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
-                    stats.emit_log_if_due(step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
-                    stats.emit_log_if_due(step_counter=step + 10, period=10, forward_batch=_EMPTY_FORWARD_BATCH)
+                    stats.emit_log_if_due(
+                        step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH
+                    )
+                    stats.emit_log_if_due(
+                        step_counter=step + 10,
+                        period=10,
+                        forward_batch=_EMPTY_FORWARD_BATCH,
+                    )
                 matching = [
                     line
                     for line in captured.output

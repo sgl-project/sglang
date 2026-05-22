@@ -10,11 +10,13 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
+from sglang.srt.kv_canary.runner.swa_divergence.snapshot import (
+    snapshot_swa_live_divergence_future,
+)
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.swa_divergence.observer import (
-        SwaLiveDivergenceObserver,
-    )
+    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -34,11 +36,13 @@ class SwaDivergenceStats:
         *,
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
-        swa_live_divergence_observer: Optional["SwaLiveDivergenceObserver"] = None,
+        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
+        req_to_token_pool: Optional["ReqToTokenPool"] = None,
     ) -> None:
         self._device = device
         self._d2h_stream = d2h_stream
-        self._swa_live_divergence_observer = swa_live_divergence_observer
+        self._swa_allocator = swa_allocator
+        self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
 
         self._verify_full_total_device: torch.Tensor = torch.zeros(
@@ -127,11 +131,13 @@ class SwaDivergenceStats:
         )
 
         mapping_future: Optional[FutureTensor] = (
-            self._swa_live_divergence_observer.snapshot_nonidentity_future(
+            snapshot_swa_live_divergence_future(
+                swa_allocator=self._swa_allocator,
+                req_to_token_pool=self._req_to_token_pool,
                 forward_batch=forward_batch,
                 stream=self._d2h_stream,
             )
-            if self._swa_live_divergence_observer is not None
+            if self._swa_allocator is not None
             else None
         )
 
