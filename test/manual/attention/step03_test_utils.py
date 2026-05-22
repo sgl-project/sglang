@@ -59,9 +59,16 @@ def build_mha_runner(
         enable_memory_saver=False,
     )
 
+    # Capture before class bodies to avoid name-shadowing inside the class scope.
+    # Python class bodies pre-scan assignments: `head_dim = head_dim` inside a
+    # class makes `head_dim` look "local" to the class, breaking earlier reads.
+    _hd = head_dim
+    _nh = num_heads
+    _nkv = _num_kv_heads
+    _ctx = max_context_len
+
     class _HFTextConfig:
-        # Fields FA3 reads (others default to None via getattr)
-        num_attention_heads = num_heads
+        num_attention_heads = _nh
         attn_logit_softcapping = None
 
     class _HFConfig:
@@ -70,23 +77,21 @@ def build_mha_runner(
 
     class _ModelConfig:
         attention_arch = AttentionArch.MHA
-        context_len = max_context_len
+        context_len = _ctx
         is_multimodal = False
         is_encoder_decoder = False
         is_local_attention_model = False
         is_hybrid_swa_model = False
-        v_head_dim = head_dim
+        v_head_dim = _hd
         swa_v_head_dim = None
-        num_attention_heads = num_heads
-        hidden_size = num_heads * head_dim
-        head_dim = head_dim  # FA3 reads model_config.head_dim
+        num_attention_heads = _nh
+        hidden_size = _nh * _hd
+        head_dim = _hd  # FA3 reads model_config.head_dim
         hf_config = _HFConfig()
-        hf_text_config = (
-            _HFTextConfig()
-        )  # FA3 reads model_runner.model_config.hf_text_config
+        hf_text_config = _HFTextConfig()
 
         def get_num_kv_heads(self, tp_size: int = 1) -> int:
-            return _num_kv_heads // tp_size
+            return _nkv // tp_size
 
     class _ServerArgs:
         kv_cache_dtype = "auto"
@@ -186,24 +191,31 @@ def build_mla_runner(
         }
         rope_theta = 10000.0
 
+    # Capture before class body to avoid class-scope shadowing.
+    _klr = kv_lora_rank
+    _qkr = qk_rope_head_dim
+    _qkn = qk_nope_head_dim
+    _vhd = v_head_dim
+    _nh_mla = num_heads
+    _ctx_mla = max_context_len
+
     class _ModelConfig:
         attention_arch = AttentionArch.MLA
-        context_len = max_context_len
+        context_len = _ctx_mla
         is_multimodal = False
         is_encoder_decoder = False
         is_local_attention_model = False
         is_hybrid_swa_model = False
-        kv_lora_rank = kv_lora_rank
-        qk_rope_head_dim = qk_rope_head_dim
-        qk_nope_head_dim = qk_nope_head_dim
-        v_head_dim = v_head_dim
+        kv_lora_rank = _klr
+        qk_rope_head_dim = _qkr
+        qk_nope_head_dim = _qkn
+        v_head_dim = _vhd
         swa_v_head_dim = None
-        num_attention_heads = num_heads
+        num_attention_heads = _nh_mla
         num_kv_heads = 1
-        tp_q_head_num = num_heads
-        hidden_size = num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-        # FlashInferMLA reads model_config.scaling (attention softmax scale)
-        scaling = qk_rope_head_dim**-0.5
+        tp_q_head_num = _nh_mla
+        hidden_size = _nh_mla * (_qkn + _qkr)
+        scaling = _qkr**-0.5  # FlashInferMLA reads model_config.scaling
         hf_config = _HFConfig()
 
         def get_num_kv_heads(self, tp_size: int = 1) -> int:
