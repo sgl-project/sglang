@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -43,10 +44,18 @@ class _UDSConnection(http.client.HTTPConnection):
         self.sock.connect(self._uds_path)
 
 
-def _wait_for_uds_health(uds_path: str, timeout: float) -> None:
+def _wait_for_uds_health(
+    uds_path: str, process: subprocess.Popen, timeout: float
+) -> None:
     deadline = time.time() + timeout
     last_err: Exception | None = None
     while time.time() < deadline:
+        return_code = process.poll()
+        if return_code is not None:
+            raise RuntimeError(
+                f"Server process exited with code {return_code} before becoming "
+                f"healthy on {uds_path}; last probe error: {last_err}"
+            )
         conn = _UDSConnection(uds_path, timeout=5.0)
         try:
             conn.request("GET", "/health")
@@ -109,7 +118,9 @@ class TestUDSServer(CustomTestCase):
             print(f"UDS test CI cache validation failed (non-fatal): {e}")
 
         cls.process = popen_with_error_check(command)
-        _wait_for_uds_health(cls.uds_path, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH)
+        _wait_for_uds_health(
+            cls.uds_path, cls.process, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        )
 
     @classmethod
     def tearDownClass(cls):
