@@ -36,7 +36,8 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     elif batch.input_ids is None and future_map.spec_algo.is_none():
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
 
-    if future_map.spec_algo.is_some():
+    # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
+    if batch.is_spec_v2:
         future_map._resolve_spec_extras(batch)
 
 
@@ -57,8 +58,11 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        # -1 sentinel: token ids are non-negative, so a -1 read means "no
+        # producer since last consume". `gather_output_tokens` asserts and
+        # resets to -1 after read.
+        self.output_tokens_buf = torch.full(
+            (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
         )
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
@@ -142,7 +146,9 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
-        if self.spec_algo.is_none():
+        # Dispatch by payload type, not spec_algo: spec_v1 (non-overlap spec)
+        # also passes a token Tensor here.
+        if isinstance(payload, torch.Tensor):
             self.output_tokens_buf[indices] = payload.to(torch.int64)
             return
 
