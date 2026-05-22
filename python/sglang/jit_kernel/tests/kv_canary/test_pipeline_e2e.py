@@ -14,12 +14,11 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
-    canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     launch_canary_verify_kernel_torch_reference,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
@@ -27,6 +26,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
+    launch_canary_verify_kernel_from_parts,
+    launch_canary_write_kernel_from_parts,
     make_canary_buf,
     make_real_kv_sources,
     stamp_clean_chain,
@@ -197,8 +198,8 @@ def _run_both_and_assert_pipeline_equal(
 
     plan_v_real, plan_w_real = _run_pipeline(
         plan_fn=canary_plan_step,
-        write_fn=canary_write_step,
-        verify_fn=canary_verify_step,
+        write_fn=launch_canary_write_kernel_from_parts,
+        verify_fn=launch_canary_verify_kernel_from_parts,
         synchronize=True,
         canary_buf=buf_real,
         log=log_real,
@@ -679,7 +680,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
         verify_capacity=int(plan_v_ref.verify_slot_indices.shape[0]),
     )
 
-    canary_verify_step(
+    launch_canary_verify_kernel_from_parts(
         canary_buf=buf_real,
         plan=plan_v_real,
         kernel_kind=CanaryLaunchTag.HEAD_K_FULL,

@@ -9,9 +9,13 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
+    CanaryLaunchTag,
+    RealKvSource,
     VerifyPlan,
+    VerifyOrWriteContext,
+    launch_canary_verify_kernel,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
@@ -28,6 +32,8 @@ __all__ = [
     "make_log_pair",
     "make_real_kv_source",
     "make_real_kv_sources",
+    "launch_canary_verify_kernel_from_parts",
+    "launch_canary_write_kernel_from_parts",
     "make_verify_plan",
     "make_verify_plan_pair",
     "make_write_plan",
@@ -70,6 +76,72 @@ class FakeViolationLog:
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
         )
+
+
+def launch_canary_verify_kernel_from_parts(
+    *,
+    canary_buf: torch.Tensor,
+    plan: VerifyPlan,
+    kernel_kind: CanaryLaunchTag,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    slot_run_counter: torch.Tensor,
+    kernel_run_counter: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+) -> None:
+    launch_canary_verify_kernel(
+        context=VerifyOrWriteContext(
+            canary_buf=canary_buf,
+            kernel_kind=kernel_kind,
+            violation_ring=violation_ring,
+            violation_write_index=violation_write_index,
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            real_kv_sources=real_kv_sources,
+            real_kv_hash_mode=real_kv_hash_mode,
+        ),
+        plan=plan,
+    )
+
+
+def launch_canary_write_kernel_from_parts(
+    *,
+    canary_buf: torch.Tensor,
+    plan: WritePlan,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    kernel_kind: CanaryLaunchTag,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: torch.Tensor | None,
+    expected_input_positions: torch.Tensor | None,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    slot_run_counter: torch.Tensor,
+    kernel_run_counter: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    real_kv_hash_mode: consts.RealKvHashMode,
+) -> None:
+    launch_canary_write_kernel(
+        context=VerifyOrWriteContext(
+            canary_buf=canary_buf,
+            kernel_kind=kernel_kind,
+            violation_ring=violation_ring,
+            violation_write_index=violation_write_index,
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            real_kv_sources=real_kv_sources,
+            real_kv_hash_mode=real_kv_hash_mode,
+        ),
+        plan=plan,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        enable_assert_inputs=enable_write_verify_inputs,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
+    )
 
 
 def make_canary_buf(

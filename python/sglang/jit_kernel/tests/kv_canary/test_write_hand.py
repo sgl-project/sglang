@@ -14,10 +14,8 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
-    canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.write import (
-    canary_write_step,
     launch_canary_write_kernel,
 )
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
@@ -25,6 +23,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,
+    launch_canary_verify_kernel_from_parts,
+    launch_canary_write_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -219,7 +219,7 @@ class TestSeedSlot:
             slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=cuda_buf,
             plan=verify_plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -618,7 +618,7 @@ class TestMockMode:
             device=_DEVICE,
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=cuda_buf,
             plan=verify_plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -991,14 +991,13 @@ class TestRealKvHash:
         input_ids = _int32_tensor([1])
         positions = _int32_tensor([0])
         out_cache_loc = _int32_tensor([0])
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
         log = FakeViolationLog.allocate(device=_DEVICE)
         sources = make_real_kv_sources(count=4, device=_DEVICE)
         extra = make_real_kv_source(device=_DEVICE)
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            canary_write_step(
+            launch_canary_write_kernel_from_parts(
                 canary_buf=cuda_buf,
                 plan=plan,
                 input_ids=input_ids,
@@ -1006,8 +1005,8 @@ class TestRealKvHash:
                 out_cache_loc=out_cache_loc,
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
                 enable_write_verify_inputs=False,
-                expected_input_tokens=pseudo_tokens,
-                expected_input_positions=pseudo_positions,
+                expected_input_tokens=None,
+                expected_input_positions=None,
                 violation_ring=log.ring,
                 violation_write_index=log.write_index,
                 slot_run_counter=log.slot_run_counter,
@@ -1172,9 +1171,8 @@ class TestRealKvHash:
                 num_valid_reqs=1,
                 device=_DEVICE,
             )
-            pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
             log = FakeViolationLog.allocate(device=_DEVICE)
-            canary_write_step(
+            launch_canary_write_kernel_from_parts(
                 canary_buf=buf,
                 plan=plan,
                 input_ids=_int32_tensor([1]),
@@ -1182,8 +1180,8 @@ class TestRealKvHash:
                 out_cache_loc=_int32_tensor([2]),
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
                 enable_write_verify_inputs=False,
-                expected_input_tokens=pseudo_tokens,
-                expected_input_positions=pseudo_positions,
+                expected_input_tokens=None,
+                expected_input_positions=None,
                 violation_ring=log.ring,
                 violation_write_index=log.write_index,
                 slot_run_counter=log.slot_run_counter,
@@ -1431,7 +1429,7 @@ class TestPseudoMode:
         ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
 
     def test_pseudo_mode_off_skips_token_check(self) -> None:
-        """enable_write_verify_inputs=False + intentional mismatch in expected_input_* → no violation recorded."""
+        """enable_write_verify_inputs=False makes the caller pass no expected-input tensors."""
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )

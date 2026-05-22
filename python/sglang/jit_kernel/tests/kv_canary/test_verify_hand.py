@@ -11,7 +11,6 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
-    canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     launch_canary_verify_kernel_torch_reference,
@@ -23,6 +22,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
     chain_anchor_signed,
+    launch_canary_verify_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -1101,7 +1101,7 @@ class TestRealKvSource:
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            canary_verify_step(
+            launch_canary_verify_kernel_from_parts(
                 canary_buf=canary_buf,
                 plan=plan,
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1264,7 +1264,7 @@ class TestLayoutAndScheduling:
         )
         log = FakeViolationLog.allocate(capacity=8, device=_DEVICE)
 
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=canary_buf,
             plan=plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1283,7 +1283,7 @@ class TestLayoutAndScheduling:
 
     @pytest.mark.parametrize(
         "runner",
-        [canary_verify_step, launch_canary_verify_kernel_torch_reference],
+        [launch_canary_verify_kernel_from_parts, launch_canary_verify_kernel_torch_reference],
     )
     def test_disabled_plan_skips_slots_but_counts_kernel(
         self, runner: Callable[..., None]
@@ -1328,7 +1328,7 @@ class TestLayoutAndScheduling:
             real_kv_sources=(),
             real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
-        if runner is canary_verify_step:
+        if runner is launch_canary_verify_kernel_from_parts:
             torch.cuda.synchronize()
 
         assert torch.equal(log.ring, ring_before)
