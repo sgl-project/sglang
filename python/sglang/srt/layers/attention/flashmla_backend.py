@@ -478,7 +478,23 @@ class FlashMLAMultiStepDraftBackend:
             )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        assert (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.encoder_lens is None
+        )
+
         def call_fn(i, forward_batch):
             self.attn_backends[i].init_forward_data_out_graph(forward_batch)
 
         self.common_template(forward_batch, call_fn)
+
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Multi-step wrapper has no in-graph prep -- explicit no-op.
+
+        Required because this class doesn't inherit from ``AttentionBackend``
+        (the ABC's default no-op is therefore not picked up). Without this
+        override, ``EAGLEDraftCudaGraphRunner.capture_one_batch_size``'s call
+        to ``init_forward_data_in_graph`` would AttributeError on first
+        capture.
+        """
+        return

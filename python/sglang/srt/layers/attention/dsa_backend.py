@@ -2369,6 +2369,10 @@ class DeepseekSparseAttnMultiStepBackend:
         with ``SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA=0``, each backend
         recomputes via its own ``_out_graph`` replay branch.
         """
+        assert (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.encoder_lens is None
+        )
         if self._replay_forward_batch is None:
             # ---- capture path ----
             for i in range(self.speculative_num_steps - 1):
@@ -2541,6 +2545,17 @@ class DeepseekSparseAttnMultiStepBackend:
                 self.attn_backends[i]._replay_forward_batch = self._replay_forward_batch
                 self.attn_backends[i].init_forward_data_out_graph(forward_batch)
                 self.attn_backends[i]._replay_forward_batch = None
+
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Multi-step wrapper has no in-graph prep -- explicit no-op.
+
+        Required because this class doesn't inherit from ``AttentionBackend``
+        (the ABC's default no-op is therefore not picked up). Without this
+        override, ``EAGLEDraftCudaGraphRunner.capture_one_batch_size``'s call
+        to ``init_forward_data_in_graph`` would AttributeError on first
+        capture.
+        """
+        return
 
 
 # Backward-compat aliases (deprecated: use DSA class names)
