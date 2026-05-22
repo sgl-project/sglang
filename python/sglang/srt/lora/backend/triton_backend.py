@@ -203,7 +203,7 @@ class TritonLoRABackend(BaseLoRABackend):
                 return
             sgemm.permutation[:bs] = perm
             sgemm.seg_lens[:] = seg_lens
-            sgemm.seg_indptr[0] = 0
+            sgemm.seg_indptr[0:1].zero_()
             torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
             sgemm.max_len = bs
             sgemm.lora_ranks[:mlpb] = bi.lora_ranks[:mlpb]

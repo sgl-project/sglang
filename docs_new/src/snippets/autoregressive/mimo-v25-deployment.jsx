@@ -230,6 +230,12 @@ export const MiMoV25Deployment = () => {
       // Recipe sources:
       //   v7x: tp=ep=32, dp=4, omits --attention-backend, mem-frac 0.95, swa 0.25
       //   v6e: tp=ep=64, dp=8, --attention-backend fa,    mem-frac 0.92, swa 0.15
+      //
+      // sgl-jax conventions:
+      //   - `--tp-size` is always the total JAX device count; per-DP TP is
+      //     derived automatically as tp/dp.
+      //   - No `--enable-dp-attention` flag — DP attention is the default
+      //     (FFN layers auto-pick EP-split for MoE, attn-TP-split for dense).
       const isV7x = hardware === "tpu-v7x";
       const useEp = expertParallelism === "enabled";
       const useDpAttn = dpAttention === "enabled";
@@ -239,7 +245,7 @@ export const MiMoV25Deployment = () => {
       flags.push("  --trust-remote-code");
       flags.push(`  --tp-size ${tp}`);
       if (useEp) flags.push(`  --ep-size ${tp}`);
-      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`, "  --enable-dp-attention");
+      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`);
       flags.push("  --moe-backend fused");
       if (!isV7x) flags.push("  --attention-backend fa");
       flags.push("  --host 0.0.0.0");
@@ -322,7 +328,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --max-running-requests 128");
         flags.push("  --chunked-prefill-size 16384");
         if (hardware === "b200") flags.push("  --swa-full-tokens-ratio 0.1");
-        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'`);
+        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       } else {
         flags.push("  --mem-fraction-static 0.7");
         flags.push("  --max-running-requests 128");
@@ -330,7 +336,7 @@ export const MiMoV25Deployment = () => {
         flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --page-size 64");
         flags.push("  --swa-full-tokens-ratio 0.3");
-        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}'`);
+        flags.push(`  --model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 64}'`);
       }
     } else {
       flags.push("  --mem-fraction-static 0.65");
@@ -342,7 +348,7 @@ export const MiMoV25Deployment = () => {
       flags.push("  --speculative-num-steps 3");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 4");
-      if (!blackwell) flags.push("  --enable-multi-layer-eagle");
+      flags.push("  --enable-multi-layer-eagle");
     }
 
     if (reasoningParser === "enabled") flags.push("  --reasoning-parser mimo");

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/parallel_state.py
 
 # Copyright 2023 The vLLM team.
@@ -629,6 +631,20 @@ class GroupCoordinator:
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
+        else:
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
+
+    def quant_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        """
+        User-facing quant-all-reduce function similar to all-reduce. (NPU support only)
+        """
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            return self.npu_communicator.quant_all_reduce(input_)
         else:
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
@@ -1545,9 +1561,10 @@ def graph_capture(stream: Optional[torch.cuda.Stream] = None):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    with get_tp_group().graph_capture(
-        stream=stream
-    ) as context, get_pp_group().graph_capture(context):
+    with (
+        get_tp_group().graph_capture(stream=stream) as context,
+        get_pp_group().graph_capture(context),
+    ):
         with contextlib.ExitStack() as stack:
             seen = {id(_TP)}
             for group in (_MOE_EP, _MOE_TP):
@@ -1584,7 +1601,7 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
     "xpu": "xccl",
     "hpu": "hccl",
     "cpu": "gloo",
-    "npu": "hccl",
+    "npu": "hccl" if not envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0 else "zbal",
     "musa": "mccl",
 }
 

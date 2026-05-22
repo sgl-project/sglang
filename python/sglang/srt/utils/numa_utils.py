@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 import psutil
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
@@ -30,6 +31,11 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
             numactl_args = f"--cpunodebind={numa_node} --membind={numa_node}"
             executable, debug_str = _create_numactl_executable(
                 numactl_args=numactl_args
+            )
+            debug_str += (
+                f", logical_gpu_id={gpu_id}, "
+                f"physical_gpu_id={_get_nvml_device_index(gpu_id)}, "
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
             )
             with _mp_set_executable(executable=executable, debug_str=debug_str):
                 yield
@@ -65,6 +71,21 @@ def _mp_set_executable(executable: str, debug_str: str):
         ), f"{multiprocessing.spawn.get_executable()=}"
         multiprocessing.spawn.set_executable(old_executable)
         logger.debug(f"mp.set_executable revert to {old_executable}")
+
+
+def _get_nvml_device_index(device_id: int) -> int:
+    # _get_nvml_device_index is an internal PyTorch helper, so fall back to
+    # device_id directly if the helper is unavailable.
+    get_nvml_device_index = getattr(torch.cuda, "_get_nvml_device_index", None)
+    if get_nvml_device_index is None:
+        logger.warning(
+            "torch.cuda._get_nvml_device_index is unavailable; falling back to "
+            f"device_id={device_id} as the NVML device index. This may select "
+            "the wrong physical GPU when CUDA_VISIBLE_DEVICES reorders devices "
+            f"(CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')})."
+        )
+        return device_id
+    return get_nvml_device_index(device_id)
 
 
 def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
@@ -177,7 +198,7 @@ def _query_numa_node_for_gpu(device_id: int):
     Get the NUMA node affinity list for a GPU device.
 
     Args:
-        device_id: GPU device index.
+        device_id: CUDA logical device index (post-CUDA_VISIBLE_DEVICES).
     Returns:
         List of NUMA node IDs that have affinity with the device.
     """
@@ -190,7 +211,11 @@ def _query_numa_node_for_gpu(device_id: int):
     try:
         pynvml.nvmlInit()
 
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        # device_id is a CUDA logical index. Convert it to the corresponding
+        # NVML index so reordered CUDA_VISIBLE_DEVICES maps to the right GPU.
+        # _get_nvml_device_index takes CUDA_VISIBLE_DEVICES into account.
+        nvml_device_id = _get_nvml_device_index(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         numa_node_count = len(glob.glob("/sys/devices/system/node/node[0-9]*"))
 
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
