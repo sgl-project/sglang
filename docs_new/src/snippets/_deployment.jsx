@@ -739,6 +739,17 @@ export const Deployment = ({ config, benchmarks }) => {
       // (stale share link, manual edit, catalog changes). The hash mirror
       // useEffect below rewrites the URL to match the validated state.
       setSel(validateSelection(config.cells, parsed));
+      // Deep-link UX: when the hash explicitly carries a selection (shared
+      // link, or an in-page anchor like "command panel above" pointing at a
+      // specific combo), scroll the Deploy section into view so the reader
+      // lands on the prefilled panel. We target the auto-slug id of the
+      // `## Deploy` heading by convention; if a cookbook MDX uses a
+      // different heading the lookup silently no-ops. NOTE: this only fires
+      // for hash navigations (link click, manual URL, back/forward) — chip
+      // clicks inside the panel mirror via `history.replaceState`, which
+      // does NOT trigger `hashchange`, so the page never self-scrolls.
+      const el = document.getElementById("deploy");
+      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
     };
     hydrate();
     window.addEventListener("hashchange", hydrate);
