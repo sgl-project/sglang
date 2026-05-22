@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
@@ -36,6 +37,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
+from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
 
@@ -46,6 +48,7 @@ class SetLoraReq:
     lora_path: Optional[Union[str, List[Optional[str]]]] = None
     target: Union[str, List[str]] = "all"
     strength: Union[float, List[float]] = 1.0
+    merge_mode: Optional[str] = None
 
 
 @dataclass
@@ -66,6 +69,13 @@ class ListLorasReq:
 
 @dataclass
 class ShutdownReq:
+    pass
+
+
+@dataclass
+class GetDisaggStatsReq:
+    """Request to get disagg pipeline metrics from the scheduler."""
+
     pass
 
 
@@ -108,9 +118,128 @@ class GenerationResult:
     metrics: dict = field(default_factory=dict)
     trajectory_latents: Any = None
     trajectory_timesteps: Any = None
+    rollout_trajectory_data: Any = None
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
+
+
+def normalize_output_seeds(
+    seed: int | list[int],
+    *,
+    num_outputs_per_prompt: int,
+    num_prompts: int = 1,
+    prompt_index: int = 0,
+) -> list[int]:
+    """
+    return a list of seed with size equal to `num_outputs_per_prompt`
+    """
+    if num_outputs_per_prompt <= 0:
+        raise ValueError(
+            f"num_outputs_per_prompt must be positive, got {num_outputs_per_prompt}"
+        )
+
+    if isinstance(seed, list):
+        seeds = [int(item) for item in seed]
+        total_outputs = num_outputs_per_prompt * num_prompts
+        if len(seeds) == num_outputs_per_prompt:
+            return seeds
+        if len(seeds) == total_outputs:
+            start = prompt_index * num_outputs_per_prompt
+            return seeds[start : start + num_outputs_per_prompt]
+        raise ValueError(
+            "seed list length must match num_outputs_per_prompt "
+            f"({num_outputs_per_prompt}) or total outputs ({total_outputs}), "
+            f"got {len(seeds)}"
+        )
+
+    base_seed = int(seed)
+    return [base_seed + i for i in range(num_outputs_per_prompt)]
+
+
+def _with_output_index_suffix(output_file_name: str, output_index: int) -> str:
+    base, ext = os.path.splitext(output_file_name)
+    return f"{base}_{output_index}{ext}"
+
+
+def _copy_trace_ctx_for_output(req: Req, request_id: str | None, output_index: int):
+    trace_ctx = req.trace_ctx
+    if output_index == 0 or not trace_ctx.tracing_enable:
+        return trace_ctx
+
+    output_trace_ctx = TraceReqContext(
+        rid=request_id,
+        module_name=trace_ctx.module_name,
+        external_trace_header=trace_ctx.external_trace_header,
+    )
+    output_trace_ctx.trace_req_start()
+    return output_trace_ctx
+
+
+def _copy_req_for_output(
+    req: Req,
+    *,
+    request_id: str | None,
+    output_index: int,
+) -> Req:
+    """Create a lightweight per-output ``Req`` without deep-copying tensors."""
+    output_req = copy(req)
+    output_req.sampling_params = copy(req.sampling_params)
+    output_req.extra = dict(req.extra)
+    output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
+    return output_req
+
+
+def expand_request_outputs(
+    req: Req,
+    *,
+    num_prompts: int = 1,
+    prompt_index: int = 0,
+) -> list[Req]:
+    """
+    Expand a req to a list with size equal to `num_prompts`
+    """
+    num_outputs = int(req.num_outputs_per_prompt)
+    # each req must has different seed
+    seeds = normalize_output_seeds(
+        req.seed,
+        num_outputs_per_prompt=num_outputs,
+        num_prompts=num_prompts,
+        prompt_index=prompt_index,
+    )
+
+    if num_outputs == 1:
+        req.seed = seeds[0]
+        req.seeds = None
+        req.generator = None
+        return [req]
+
+    expanded: list[Req] = []
+    for output_index, seed in enumerate(seeds):
+        output_request_id = (
+            f"{req.request_id}:{output_index}" if req.request_id is not None else None
+        )
+        output_req = _copy_req_for_output(
+            req, request_id=output_request_id, output_index=output_index
+        )
+        output_req.seed = seed
+        output_req.num_outputs_per_prompt = 1
+        output_req.seeds = None
+        output_req.generator = None
+        output_req.extra["parent_request_id"] = req.request_id
+        output_req.extra["output_index"] = output_index
+
+        if output_request_id is not None:
+            output_req.request_id = output_request_id
+
+        if req.output_file_name:
+            output_req.output_file_name = _with_output_index_suffix(
+                req.output_file_name, output_index
+            )
+        output_req.validate()
+        expanded.append(output_req)
+
+    return expanded
 
 
 def _normalize_audio_to_numpy(audio: Any) -> np.ndarray | None:
@@ -270,7 +399,6 @@ def _maybe_mux_audio_into_mp4(
             sample_rate=selected_sr,
             ffmpeg_exe=ffmpeg_exe,
         )
-        logger.info(f"Merged video saved to {CYAN}{save_file_path}{RESET}")
     except Exception as e:
         logger.warning(
             "Failed to mux audio into mp4 (saved silent video): %s",
@@ -281,6 +409,7 @@ def _maybe_mux_audio_into_mp4(
 def prepare_request(
     server_args: ServerArgs,
     sampling_params: SamplingParams,
+    external_trace_header: dict[str, str] | None = None,
 ) -> Req:
     """
     Create a Req object with sampling_params as a parameter.
@@ -289,14 +418,15 @@ def prepare_request(
         sampling_params=sampling_params,
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
-    try:
-        diffusers_kwargs = sampling_params.diffusers_kwargs
-    except AttributeError:
-        diffusers_kwargs = None
-    if diffusers_kwargs:
-        req.extra["diffusers_kwargs"] = diffusers_kwargs
+    sampling_params.apply_request_extra(req)
+    diffusers_kwargs = getattr(sampling_params, "diffusers_kwargs", None)
+    if diffusers_kwargs and "max_sequence_length" in diffusers_kwargs:
+        req.max_sequence_length = diffusers_kwargs["max_sequence_length"]
 
     req.adjust_size(server_args)
+
+    if not isinstance(req.prompt, str):
+        raise TypeError(f"`prompt` must be a string, but got {type(req.prompt)}")
 
     if (req.width is not None and req.width <= 0) or (
         req.height is not None and req.height <= 0
@@ -304,6 +434,15 @@ def prepare_request(
         raise ValueError(
             f"Height and width must be positive, got height={req.height}, width={req.width}"
         )
+
+    if server_args.enable_trace:
+        trace_ctx = TraceReqContext(
+            rid=sampling_params.request_id,
+            module_name="diffusion",
+            external_trace_header=external_trace_header,
+        )
+        trace_ctx.trace_req_start()
+        req.trace_ctx = trace_ctx
 
     return req
 
@@ -341,6 +480,13 @@ def save_outputs(
     audios_out: Optional[list[Any]] = None,
     frames_out: Optional[list[Any]] = None,
     output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
 ) -> list[str]:
     """Save outputs to files and return the list of file paths."""
     output_paths: list[str] = []
@@ -349,6 +495,7 @@ def save_outputs(
         sample = output
         if data_type == DataType.VIDEO:
             sample = attach_audio_to_video_sample(sample, audio, idx)
+
         frames = post_process_sample(
             sample,
             data_type,
@@ -357,7 +504,15 @@ def save_outputs(
             save_file_path,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
+            enable_frame_interpolation=enable_frame_interpolation,
+            frame_interpolation_exp=frame_interpolation_exp,
+            frame_interpolation_scale=frame_interpolation_scale,
+            frame_interpolation_model_path=frame_interpolation_model_path,
+            enable_upscaling=enable_upscaling,
+            upscaling_model_path=upscaling_model_path,
+            upscaling_scale=upscaling_scale,
         )
+
         if samples_out is not None:
             samples_out.append(sample)
         if audios_out is not None:
@@ -384,14 +539,22 @@ def post_process_sample(
     save_file_path: Optional[str] = None,
     audio_sample_rate: Optional[int] = None,
     output_compression: Optional[int] = None,
+    enable_frame_interpolation: bool = False,
+    frame_interpolation_exp: int = 1,
+    frame_interpolation_scale: float = 1.0,
+    frame_interpolation_model_path: Optional[str] = None,
+    enable_upscaling: bool = False,
+    upscaling_model_path: Optional[str] = None,
+    upscaling_scale: int = 4,
 ):
     """
-    Process sample output and save video if necessary
+    Process sample output, optionally interpolate video frames, and save.
     """
     audio = None
     if isinstance(sample, (tuple, list)) and len(sample) == 2:
         sample, audio = sample
 
+    # 1. Convert tensor / array to list of uint8 HWC frames
     frames = None
     if isinstance(sample, torch.Tensor):
         if sample.dim() == 3:
@@ -424,7 +587,31 @@ def post_process_sample(
                 arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
             frames = list(arr)
 
-    # 2. Save outputs if requested
+    # 2. Frame interpolation (video only)
+    if enable_frame_interpolation and data_type == DataType.VIDEO and len(frames) > 1:
+        from sglang.multimodal_gen.runtime.postprocess import (
+            interpolate_video_frames,
+        )
+
+        frames, multiplier = interpolate_video_frames(
+            frames,
+            exp=frame_interpolation_exp,
+            scale=frame_interpolation_scale,
+            model_path=frame_interpolation_model_path,
+        )
+        fps = fps * multiplier
+
+    # 3. Upscaling (images and videos)
+    if enable_upscaling and frames:
+        from sglang.multimodal_gen.runtime.postprocess import upscale_frames
+
+        frames = upscale_frames(
+            frames,
+            model_path=upscaling_model_path,
+            scale=upscaling_scale,
+        )
+
+    # 4. Save outputs if requested
     if save_output:
         if save_file_path:
             os.makedirs(os.path.dirname(save_file_path), exist_ok=True)

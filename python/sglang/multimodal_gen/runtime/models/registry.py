@@ -37,10 +37,27 @@ _IMAGE_ENCODER_MODELS: dict[str, tuple] = {
     "CLIPVisionModelWithProjection": ("encoders", "clip", "CLIPVisionModel"),
 }
 
+# Global alias mapping: external_path -> canonical_class_name
+_ALIAS_TO_MODEL: dict[str, str] = {}
+
+
+def _parse_aliases_from_ast(value_node: ast.expr) -> list[str]:
+    """Parse _aliases list from AST node."""
+    aliases = []
+    if isinstance(value_node, (ast.List, ast.Tuple)):
+        for elt in value_node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                aliases.append(elt.value)
+    return aliases
+
 
 @lru_cache(maxsize=None)
 def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
-    discovered_models = _IMAGE_ENCODER_MODELS
+    discovered_models = dict(_IMAGE_ENCODER_MODELS)
+
+    # Collect class definitions with their _aliases
+    class_aliases: dict[str, list[str]] = {}
+
     for component in COMPONENT_DIRS:
         component_path = os.path.join(MODELS_PATH, component)
         for filename in os.listdir(component_path):
@@ -57,7 +74,25 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                 entry_class_node = None
                 first_class_def = None
 
+                # Collect all class definitions and their _aliases
+                file_class_aliases: dict[str, list[str]] = {}
                 for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef):
+                        if first_class_def is None:
+                            first_class_def = node
+                        # Look for _aliases in the class body
+                        for class_body_node in node.body:
+                            if isinstance(class_body_node, ast.Assign):
+                                for target in class_body_node.targets:
+                                    if (
+                                        isinstance(target, ast.Name)
+                                        and target.id == "_aliases"
+                                    ):
+                                        aliases = _parse_aliases_from_ast(
+                                            class_body_node.value
+                                        )
+                                        if aliases:
+                                            file_class_aliases[node.name] = aliases
                     if isinstance(node, ast.Assign):
                         for target in node.targets:
                             if (
@@ -66,8 +101,7 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                             ):
                                 entry_class_node = node
                                 break
-                    if first_class_def is None and isinstance(node, ast.ClassDef):
-                        first_class_def = node
+
                 if entry_class_node and first_class_def:
                     model_cls_name_list = []
                     value_node = entry_class_node.value
@@ -95,9 +129,24 @@ def _discover_and_register_models() -> dict[str, tuple[str, str, str]]:
                                 mod_relname,
                                 model_cls_str,
                             )
+                            # Collect aliases for this class
+                            if model_cls_str in file_class_aliases:
+                                class_aliases[model_cls_str] = file_class_aliases[
+                                    model_cls_str
+                                ]
 
             except Exception as e:
                 logger.warning(f"Could not parse {filepath} to find models: {e}")
+
+    # Build alias -> canonical class name mapping
+    for class_name, aliases in class_aliases.items():
+        for alias in aliases:
+            if alias in _ALIAS_TO_MODEL:
+                logger.warning(
+                    f"Alias '{alias}' already registered for '{_ALIAS_TO_MODEL[alias]}', "
+                    f"will be overwritten by '{class_name}'"
+                )
+            _ALIAS_TO_MODEL[alias] = class_name
 
     return discovered_models
 
@@ -241,6 +290,13 @@ class _ModelRegistry:
 
     def get_supported_archs(self) -> Set[str]:
         return self.registered_models.keys()
+
+    def resolve_by_alias(self, alias: str) -> type[nn.Module] | None:
+        """Resolve a model class by its alias (external module path)."""
+        if alias in _ALIAS_TO_MODEL:
+            canonical_name = _ALIAS_TO_MODEL[alias]
+            return self._try_load_model_cls(canonical_name)
+        return None
 
     def register_model(
         self,

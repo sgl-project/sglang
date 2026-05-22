@@ -2,6 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.lora.triton_ops.lora_tuning_config import get_lora_shrink_config
 from sglang.srt.lora.utils import LoRABatchInfo
 from sglang.srt.utils import cached_triton_kernel
 
@@ -137,11 +138,15 @@ def chunked_sgmv_lora_shrink_forward(
     assert len(x.shape) == 2
     assert len(weights.shape) == 3
 
-    # Block shapes
-    # TODO (lifuhuang): experiment with split-k
+    # Block shapes — use auto-tuned config if available, else defaults
     BLOCK_M = batch_info.max_len
-    BLOCK_N = 16
-    BLOCK_K = 256
+    # weights shape is (num_lora, num_slices * rank, input_dim)
+    MAX_RANK = weights.shape[1] // num_slices
+    config = get_lora_shrink_config(
+        K=weights.shape[2], R=MAX_RANK, num_slices=num_slices, chunk_size=BLOCK_M
+    )
+    BLOCK_N = config["BLOCK_N"]
+    BLOCK_K = config["BLOCK_K"]
 
     S = x.shape[0]
     N = weights.shape[1]
@@ -153,6 +158,13 @@ def chunked_sgmv_lora_shrink_forward(
         triton.cdiv(N, BLOCK_N),
         batch_info.bs if batch_info.use_cuda_graph else num_segments,
     )
+
+    # Optional launch params from tuned config
+    extra_kwargs = {}
+    if "num_warps" in config:
+        extra_kwargs["num_warps"] = config["num_warps"]
+    if "num_stages" in config:
+        extra_kwargs["num_stages"] = config["num_stages"]
 
     output = torch.empty((S, N), device=x.device, dtype=x.dtype)
     _chunked_lora_shrink_kernel[grid](
@@ -171,6 +183,7 @@ def chunked_sgmv_lora_shrink_forward(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        **extra_kwargs,
     )
 
     return output

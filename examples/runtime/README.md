@@ -5,7 +5,7 @@ The below examples will mostly need you to start a server in a separate terminal
 ## Native API
 
 * `lora.py`: An example how to use LoRA adapters.
-* `multimodal_embedding.py`: An example how perform [multi modal embedding](Alibaba-NLP/gme-Qwen2-VL-2B-Instruct).
+* `multimodal_embedding.py`: An example how perform [multi modal embedding](https://huggingface.co/Alibaba-NLP/gme-Qwen2-VL-2B-Instruct).
 * `openai_batch_chat.py`: An example how to process batch requests for chat completions.
 * `openai_batch_complete.py`: An example how to process batch requests for text completions.
 * **`openai_chat_with_response_prefill.py`**:

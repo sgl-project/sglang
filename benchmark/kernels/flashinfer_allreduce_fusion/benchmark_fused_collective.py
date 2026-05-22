@@ -42,7 +42,8 @@ from sglang.srt.layers.quantization.fp8_kernel import static_quant_fp8
 try:
     from sgl_kernel import fused_add_rmsnorm as SGL_FUSED_ADD_RMS_NORM
     from sgl_kernel import rmsnorm as SGL_RMS_NORM
-    from sgl_kernel import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
+
+    from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as SGL_SCALED_FP4_QUANT
 except Exception:  # pragma: no cover - fallback on non-supported platforms
     SGL_FUSED_ADD_RMS_NORM = None
     SGL_RMS_NORM = None

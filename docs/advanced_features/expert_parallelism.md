@@ -15,13 +15,14 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
 | **`none` (default)** | Disables all-to-all for EP. Uses All-Reduce or All-Gather for token dispatch. | Hybrid EP and TP setups.           |
 | `deepep`     | DeepEP, a communication library for efficient token shuffling in MoE models. | Large-scale EP deployments.        |
 | `mooncake`   | An extension of DeepEP for elastic inference, leveraging RDMA for high-performance data transfers. | Elastic EP serving. |
+| `nixl`       | [NIXL-EP](https://github.com/ai-dynamo/nixl/tree/main/examples/device/ep), an elastic EP communication library built on NVIDIA's [NIXL](https://github.com/ai-dynamo/nixl) framework with native RDMA and NVLink support. | Elastic EP serving with fault tolerance and dynamic scaling. |
 | `mori` | MORI-EP, AMD's native all-to-all communication implementation optimized for ROCm. | AMD GPU deployments. |
 | `flashinfer` | Flashinfer implementation of all-to-all. | Large-scale EP deployments. |
 | `ascend_fuseep` | Ascend NPU native fused all-to-all communication. | Ascend NPU deployments. |
 
-DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
+DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. NIXL-EP currently operates in low-latency mode with CUDA Graph support. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-Currently, DeepEP, Mooncake, `ascend_fuseep` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
+Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
 
 ### Backends for MoE Computation
 
@@ -32,6 +33,7 @@ Currently, DeepEP, Mooncake, `ascend_fuseep` and MORI only support cases where `
 | `deep_gemm`              | DeepGEMM backend optimized for MoE matrix multiplications, supporting contiguous layouts for prefill and masked layouts for decode; often JIT-compiled for performance. | Large-scale EP deployments with FP8 block-wise quantization. |
 | `cutlass`                | CUTLASS-based backend for efficient GEMMs. | NVIDIA architectures with CUTLASS support. |
 | `flashinfer_trtllm`      | FlashInfer integrated with TensorRT-LLM for accelerated MoE computations, supporting FP4 communication operators and high-performance GEMMs. | Blackwell with TRT-LLM. |
+| `flashinfer_trtllm_routed` | FlashInfer integrated with TensorRT-LLM for accelerated routed MoE computations, consuming SGLang-computed top-k expert assignments and weights. | Blackwell with TRT-LLM. |
 | `flashinfer_cutlass`     | FlashInfer combined with CUTLASS for high-performance grouped GEMMs in MoE layers, handling FP4/FP8 quantization efficiently. | Blackwell with FP4/FP8 models. |
 | `flashinfer_mxfp4`       | FlashInfer variant optimized for MXFP4 (mixed FP4) quantization in MoE runners, focusing on memory-efficient low-precision inference. | Low-precision models with MXFP4. |
 | `flashinfer_cutedsl`     | FlashInfer with a custom DSL for flexible and efficient MoE kernel generation, integrated with ModelOpt FP4 quantization. | Low-precision models with NVFP4. |

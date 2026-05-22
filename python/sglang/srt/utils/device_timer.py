@@ -1,7 +1,7 @@
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Deque, Dict, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 import torch
 
@@ -9,7 +9,10 @@ import torch
 class DeviceTimer:
     def __init__(self, reporter: Callable):
         self._intervals: Deque[_TimingInterval] = deque()
-        self._reporter = reporter
+        self._reporters: List[Callable] = [reporter]
+
+    def add_reporter(self, reporter: Callable):
+        self._reporters.append(reporter)
 
     @contextmanager
     def wrap(self, metadata: Dict):
@@ -27,7 +30,38 @@ class DeviceTimer:
                 break
 
             self._intervals.popleft()
-            self._reporter(t=interval.elapsed_time() / 1000.0, **interval.metadata)
+            elapsed = interval.elapsed_time() / 1000.0
+            for reporter in self._reporters:
+                reporter(t=elapsed, **interval.metadata)
+
+
+class GapTimer(DeviceTimer):
+    """Measures GPU idle gaps between consecutive uses of a stream.
+
+    Where DeviceTimer.wrap() measures the duration *inside* a block,
+    GapTimer.wrap() measures the time *between* consecutive blocks
+    (gap = next_block_start - last_block_end).
+    """
+
+    def __init__(self, reporter: Callable):
+        super().__init__(reporter)
+        self._pending: Optional[_TimingInterval] = None
+
+    @contextmanager
+    def wrap(self, metadata: Dict):
+        if self._pending is not None:
+            self._pending.end(metadata=metadata)
+            self._intervals.append(self._pending)
+            self._pending = None
+            self._report()
+        try:
+            yield
+        finally:
+            self._pending = _TimingInterval.create()
+
+    def cancel(self):
+        """Discard a pending gap (e.g. server went idle)."""
+        self._pending = None
 
 
 @dataclass

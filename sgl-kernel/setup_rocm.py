@@ -118,7 +118,7 @@ ext_modules = [
 ]
 
 setup(
-    name="sgl-kernel",
+    name="sglang-kernel",
     version=_get_version(),
     packages=find_packages(where="python"),
     package_dir={"": "python"},

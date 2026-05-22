@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 from sgl_kernel import apply_token_bitmask_inplace_cuda
@@ -20,4 +22,4 @@ def test_apply_token_bitmask_inplace_kernel():
 
 if __name__ == "__main__":
     test_apply_token_bitmask_inplace_kernel()
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

@@ -1,10 +1,11 @@
 import json
 import logging
 import re
+from typing import List, Literal, Optional, Union
 
 from partial_json_parser.core.options import Allow
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -14,7 +15,29 @@ from sglang.srt.function_call.core_types import (
 )
 from sglang.srt.function_call.utils import _find_common_prefix, _partial_json_loads
 
+try:
+    from xgrammar import StructuralTag
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        ConstStringFormat,
+        JSONSchemaFormat,
+        SequenceFormat,
+        TagFormat,
+        TagsWithSeparatorFormat,
+        TriggeredTagsFormat,
+    )
+except ImportError:
+    StructuralTag = None  # type: ignore
+
 logger = logging.getLogger(__name__)
+
+# Names mirror the DeepSeek-V3.2 official chat template tokens
+# (see encoding_dsv32.TOOLS_SYSTEM_TEMPLATE).
+_INVOKE_BEGIN_PREFIX = '<｜DSML｜invoke name="'
+_INVOKE_BEGIN_SUFFIX = '">\n'
+_THINK_TAG_END = "</think>"
+_THINK_EXCLUDE_TOKENS = ["<think>", "</think>"]
+_XML_STYLE = "deepseek_xml"
 
 
 class DeepSeekV32Detector(BaseFormatDetector):
@@ -81,21 +104,41 @@ class DeepSeekV32Detector(BaseFormatDetector):
         self.function_calls_regex = (
             r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>"
         )
+        # Long-form `<｜DSML｜invoke name="x">...</｜DSML｜invoke>` and the
+        # self-closing `<｜DSML｜invoke name="x"/>` shape V4 emits for zero-arg
+        # tools. The `end` group is empty when the closer hasn't streamed in.
         self.invoke_regex = (
-            r'<｜DSML｜invoke\s+name="([^"]+)"\s*>(.*?)(</｜DSML｜invoke>|$)'
+            r'<｜DSML｜invoke\s+name="(?P<name>[^"]+)"\s*'
+            r"(?:(?P<self_close>/>)"
+            r"|>(?P<body>.*?)(?P<end>(?:</｜DSML｜invoke>|$)))"
         )
         self.prefix_parameter_end_call = ["</", "｜DSML｜", "parameter"]
+        self.prefix_invoke_end_call = ["</", "｜DSML｜", "inv", "oke"]
         self.current_tool_id = -1
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
         return self.bot_token in text or "<｜DSML｜invoke" in text
 
+    @staticmethod
+    def _unpack_invoke_match(m: "re.Match[str]") -> tuple[str, str, bool]:
+        """Returns (name, body, is_complete) for an invoke_regex match.
+
+        Self-closing invokes have empty body and are always complete.
+        Long-form bodies are always strings (possibly empty); they're
+        incomplete when matched against `$` because the closing tag
+        hasn't streamed in yet.
+        """
+        name = m.group("name").strip()
+        if m.group("self_close"):
+            return name, "", True
+        return name, m.group("body"), bool(m.group("end"))
+
     def _parse_parameters_from_xml(
         self, invoke_content: str, allow_partial: bool = False
-    ) -> dict:
+    ) -> str:
         """
-        Parse parameters from either XML-like format or JSON format to dict.
+        Parse parameters from either XML-like format or JSON format to str.
 
         Supports two formats:
         1. XML parameter tags: <｜DSML｜parameter name="..." string="...">value</｜DSML｜parameter>
@@ -103,17 +146,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         # First, try to parse as direct JSON (new format)
         invoke_content_stripped = invoke_content.strip()
-
-        if invoke_content_stripped.startswith("{") and invoke_content_stripped.endswith(
-            "}"
-        ):
-            try:
-                parameters = json.loads(invoke_content_stripped)
-                if isinstance(parameters, dict):
-                    return parameters
-            except (json.JSONDecodeError, ValueError):
-                # If JSON parsing fails, fall through to XML parsing
-                pass
+        if invoke_content_stripped.startswith("{"):
+            if allow_partial:
+                # Remove incomplete invoke end call prefix in case they are captured by param
+                for token in reversed(self.prefix_invoke_end_call):
+                    invoke_content_stripped = invoke_content_stripped.rstrip(token)
+                return invoke_content_stripped
+            elif invoke_content_stripped.endswith("}"):
+                return invoke_content_stripped
 
         # Fall back to XML parameter tag parsing (original format)
         parameters = {}
@@ -158,11 +198,14 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if partial_match.group(2) == "true":
                     parameters[param_name] = param_value.strip()
                 else:
-                    parameters[param_name] = _partial_json_loads(
-                        param_value, Allow.ALL
-                    )[0]
+                    try:
+                        parameters[param_name] = _partial_json_loads(
+                            param_value, Allow.ALL
+                        )[0]
+                    except json.JSONDecodeError:
+                        parameters[param_name] = param_value.strip()
 
-        return parameters
+        return json.dumps(parameters, ensure_ascii=False)
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
         """
@@ -173,7 +216,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
         idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
+        normal_text = text[:idx].removesuffix("\n\n") if idx != -1 else text
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
@@ -191,15 +234,13 @@ class DeepSeekV32Detector(BaseFormatDetector):
             function_calls_content = function_calls_match.group(1)
 
             # Find all invoke blocks
-            invoke_matches = re.findall(
+            for invoke_match in re.finditer(
                 self.invoke_regex, function_calls_content, re.DOTALL
-            )
-
-            for func_name, invoke_content, _ in invoke_matches:
-                # Parse parameters from XML format
+            ):
+                func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
                 func_args = self._parse_parameters_from_xml(invoke_content)
                 # construct match_result for parse_base_json
-                match_result = {"name": func_name, "parameters": func_args}
+                match_result = {"name": func_name, "parameters": json.loads(func_args)}
                 calls.extend(self.parse_base_json(match_result, tools))
 
             return StreamingParseResult(normal_text=normal_text, calls=calls)
@@ -253,10 +294,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 if not invoke_match:
                     break
 
-                func_name = invoke_match.group(1).strip()
-                invoke_content = invoke_match.group(2)
-                # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
-                is_tool_end = bool(invoke_match.group(3))
+                func_name, invoke_content, is_tool_end = self._unpack_invoke_match(
+                    invoke_match
+                )
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
@@ -285,7 +325,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 current_params = self._parse_parameters_from_xml(
                     invoke_content, allow_partial=not is_tool_end
                 )
-                current_args_json = json.dumps(current_params, ensure_ascii=False)
 
                 # 3. Calculate and send incremental arguments
                 sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
@@ -297,12 +336,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
                 if is_tool_end:
                     # If complete, send everything remaining
-                    argument_diff = current_args_json[sent_len:]
+                    argument_diff = current_params[sent_len:]
                 elif prev_params is not None:
                     # If partial, send stable prefix diff
-                    prev_args_json = json.dumps(prev_params, ensure_ascii=False)
-                    if current_args_json != prev_args_json:
-                        prefix = _find_common_prefix(prev_args_json, current_args_json)
+                    if current_params != prev_params:
+                        prefix = _find_common_prefix(current_params, prev_params)
                         if len(prefix) > sent_len:
                             argument_diff = prefix[sent_len:]
 
@@ -350,5 +388,97 @@ class DeepSeekV32Detector(BaseFormatDetector):
         return lambda name: StructureInfo(
             begin=f'<｜DSML｜invoke name="{name}">',
             end="</｜DSML｜invoke>",
-            trigger=f"<｜DSML｜invoke",
+            trigger="<｜DSML｜invoke",
         )
+
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = False,
+    ) -> Optional["StructuralTag"]:
+        """
+        Build an xgrammar StructuralTag locally for DeepSeek-V3.2.
+
+        Both layers — the outer `<｜DSML｜function_calls｜>...` wrapper and
+        the inner `<｜DSML｜invoke>...</｜DSML｜invoke>` blocks — are encoded
+        directly in the grammar with a single-newline join between
+        consecutive invokes, matching DeepSeek-V3.2's official chat
+        template. This avoids two layered defects that surfaced with the
+        prior `xgrammar.get_model_structural_tag("deepseek_v3_2")` path:
+
+        - the xgrammar builtin template (pre mlc-ai/xgrammar#638) forced
+          a double-newline join, which deterministically collapsed
+          parallel tool calls to one at greedy decoding.
+        - falling back to the legacy structural tag (built from
+          `structure_info()`) only constrains the inner invoke block;
+          the outer wrapper is off-grammar and the model can skip it
+          under `at_least_one=True`, leaving `detect_and_parse` with no
+          `<｜DSML｜function_calls>` marker to anchor on.
+
+        Returning a fully-formed StructuralTag from the detector keeps
+        both fixes local to sglang and decoupled from the xgrammar
+        release cadence.
+        """
+        if not tools or StructuralTag is None:
+            return None
+
+        # `INVOKE_END` and the empty separator together yield a single `\n`
+        # between consecutive invokes — matching DeepSeek-V3.2's chat template
+        # `"\n".join(invoke_blocks)`.
+        function_calls_begin = self.bot_token + "\n"
+        invoke_end = self.invoke_end_token + "\n"
+
+        def _invoke_tag(tool: Tool) -> TagFormat:
+            return TagFormat(
+                begin=_INVOKE_BEGIN_PREFIX + tool.function.name + _INVOKE_BEGIN_SUFFIX,
+                content=JSONSchemaFormat(
+                    json_schema=tool.function.parameters or {},
+                    style=_XML_STYLE,
+                ),
+                end=invoke_end,
+            )
+
+        if isinstance(tool_choice, ToolChoice):
+            target = next(
+                (t for t in tools if t.function.name == tool_choice.function.name),
+                None,
+            )
+            if target is None:
+                return None
+            invoke_tags = [_invoke_tag(target)]
+            is_required = True
+        else:
+            invoke_tags = [_invoke_tag(t) for t in tools]
+            is_required = tool_choice == "required"
+
+        inner_tool_calls = TagsWithSeparatorFormat(
+            tags=invoke_tags, separator="", at_least_one=True
+        )
+
+        if is_required:
+            suffix_tag = SequenceFormat(
+                elements=[
+                    ConstStringFormat(value=function_calls_begin),
+                    inner_tool_calls,
+                    ConstStringFormat(value=self.eot_token),
+                ]
+            )
+        else:
+            suffix_tag = TriggeredTagsFormat(
+                triggers=[self.bot_token],
+                tags=[
+                    TagFormat(
+                        begin=function_calls_begin,
+                        content=inner_tool_calls,
+                        end=self.eot_token,
+                    )
+                ],
+                excludes=_THINK_EXCLUDE_TOKENS,
+            )
+
+        if not thinking_mode:
+            return StructuralTag(format=suffix_tag)
+
+        prefix_tag = TagFormat(begin="", content=AnyTextFormat(), end=_THINK_TAG_END)
+        return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))

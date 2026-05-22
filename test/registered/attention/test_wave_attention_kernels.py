@@ -25,7 +25,7 @@ from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci
 
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
-register_amd_ci(est_time=60, suite="stage-a-test-1-amd")
+register_amd_ci(est_time=60, suite="stage-a-test-1-gpu-small-amd")
 
 
 class TestWaveAttention(unittest.TestCase):
@@ -155,6 +155,8 @@ class TestWaveAttention(unittest.TestCase):
             is_causal,
             mask_indptr,
             max_len_extend,
+            1.0,
+            1.0,
         )
 
         o_wave = torch.empty(
@@ -240,6 +242,7 @@ class TestWaveAttention(unittest.TestCase):
             num_kv_splits,
             max_kv_splits,
             sm_scale,
+            1.0,
             logit_cap,
         )
 

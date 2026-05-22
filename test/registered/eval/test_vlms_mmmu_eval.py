@@ -33,8 +33,13 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings("Efficient-Large-Model/NVILA-Lite-2B-hf"): ModelEvalMetrics(
         0.270, 23.8
     ),
-    ModelLaunchSettings("google/gemma-3-4b-it"): ModelEvalMetrics(0.360, 10.9),
-    ModelLaunchSettings("google/gemma-3n-E4B-it"): ModelEvalMetrics(0.270, 17.7),
+    ModelLaunchSettings("google/gemma-4-E4B-it"): ModelEvalMetrics(0.26, 15.0),
+    ModelLaunchSettings(
+        "google/gemma-4-26B-A4B-it", extra_args=["--tp=2"]
+    ): ModelEvalMetrics(0.27, 22.3),
+    ModelLaunchSettings(
+        "google/gemma-4-31B-it", extra_args=["--tp=2"]
+    ): ModelEvalMetrics(0.28, 25.5),
     ModelLaunchSettings("mistral-community/pixtral-12b"): ModelEvalMetrics(0.360, 16.6),
     ModelLaunchSettings("moonshotai/Kimi-VL-A3B-Instruct"): ModelEvalMetrics(
         0.330, 23.5
@@ -50,7 +55,7 @@ MODEL_THRESHOLDS = {
     ModelLaunchSettings(
         "unsloth/Mistral-Small-3.1-24B-Instruct-2503"
     ): ModelEvalMetrics(0.30, 16.7),
-    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 32.0),
+    ModelLaunchSettings("XiaomiMiMo/MiMo-VL-7B-RL"): ModelEvalMetrics(0.28, 40.0),
     ModelLaunchSettings("zai-org/GLM-4.1V-9B-Thinking"): ModelEvalMetrics(0.280, 30.4),
     ModelLaunchSettings(
         "zai-org/GLM-4.5V-FP8", extra_args=["--tp=2"]

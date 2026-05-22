@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
 )
 from sglang.srt.layers.quantization.utils import get_scalar_types
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -39,6 +40,22 @@ def fp8_fused_exponent_bias_into_scales(scales):
     return scales * s
 
 
+def fake_apply_fp8_marlin_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    out_shape = input.shape[:-1] + (size_n,)
+    fake_output = torch.empty(out_shape, dtype=input.dtype, device=input.device)
+    return fake_output
+
+
+@register_custom_op(fake_impl=fake_apply_fp8_marlin_linear)
 def apply_fp8_marlin_linear(
     input: torch.Tensor,
     weight: torch.Tensor,

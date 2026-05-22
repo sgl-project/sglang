@@ -17,6 +17,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ModelTaskType,
     PipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_text
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -27,7 +30,7 @@ logger = init_logger(__name__)
 class MOVAPipelineConfig(PipelineConfig):
     """Configuration for MOVA (text+image -> video+audio) pipelines."""
 
-    task_type: ModelTaskType = ModelTaskType.T2V
+    task_type: ModelTaskType = ModelTaskType.I2V
 
     # Model configs
     dit_config: MOVAVideoConfig = field(default_factory=MOVAVideoConfig)
@@ -35,8 +38,9 @@ class MOVAPipelineConfig(PipelineConfig):
 
     # Video VAE (Wan) + Audio VAE (DAC)
     vae_config: WanVAEConfig = field(default_factory=WanVAEConfig)
+    vae_precision: str = "bf16"
     audio_vae_config: DacVAEConfig = field(default_factory=DacVAEConfig)
-    audio_vae_precision: str = "fp32"
+    audio_vae_precision: str = "bf16"
 
     # Text encoder (UMT5 compatible)
     text_encoder_configs: tuple = field(default_factory=lambda: (T5Config(),))
@@ -51,6 +55,12 @@ class MOVAPipelineConfig(PipelineConfig):
     # temporal alignment: MOVA expects (num_frames - 1) % 4 == 0
     time_division_factor: int = 4
     time_division_remainder: int = 1
+
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        return ModelDeploymentConfig(
+            auto_dit_layerwise_offload=True,
+            auto_dit_layerwise_offload_high_memory_disable_gb=130,
+        )
 
     def _center_crop_and_resize(
         self, image: torch.Tensor | Image.Image, target_height: int, target_width: int

@@ -8,6 +8,7 @@ from typing import Any
 
 import torch.nn as nn
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -25,6 +26,7 @@ class CustomOp(nn.Module):
         super().__init__()
         self._forward_method = self.dispatch_forward()
 
+    @debug_kernel_api
     def forward(self, *args, **kwargs) -> Any:
         return self._forward_method(*args, **kwargs)
 
@@ -54,10 +56,8 @@ class CustomOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs) -> Any:
-        # XXX (MUSA): MUSA kernels follow the CUDA path by default.
-        # At this stage, sgl-kernel support for MUSA is still under active
-        # development, so we fall back to the PyTorch-native implementation.
-        return self.forward_native(*args, **kwargs)
+        # MUSA kernels follow the CUDA path by default.
+        return self.forward_cuda(*args, **kwargs)
 
     def forward_oot(self, *args, **kwargs) -> Any:
         # By default, we assume that OOT ops are compatible with the

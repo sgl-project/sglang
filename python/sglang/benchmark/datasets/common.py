@@ -54,6 +54,9 @@ class BaseDataset(ABC):
 
 
 def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int]:
+    # full_len=0 is valid for embedding benchmarks where no output tokens are generated
+    if full_len <= 0:
+        return [0] * num
     return np.random.randint(
         max(int(full_len * range_ratio), 1),
         full_len + 1,
@@ -63,8 +66,12 @@ def compute_random_lens(full_len: int, range_ratio: float, num: int) -> List[int
 
 @lru_cache(maxsize=1)
 def get_available_tokens(tokenizer):
-    """Get all available token ids from the tokenizer vocabulary."""
-    return list(tokenizer.get_vocab().values())
+    """Get valid token ids from the tokenizer vocabulary."""
+    return [
+        token_id
+        for token_id in tokenizer.get_vocab().values()
+        if isinstance(token_id, int)
+    ]
 
 
 def gen_prompt(tokenizer, token_num):

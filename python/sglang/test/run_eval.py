@@ -10,6 +10,7 @@ import time
 
 from sglang.test.simple_eval_common import (
     ChatCompletionSampler,
+    CompletionSampler,
     Eval,
     make_report,
     set_ulimit,
@@ -19,36 +20,69 @@ from sglang.test.simple_eval_common import (
 def get_thinking_kwargs(args):
     thinking_mode = getattr(args, "thinking_mode", None)
     if thinking_mode in THINKING_MODE_CHOICES:
-        if thinking_mode == "deepseek-v3":
+        if thinking_mode in ["deepseek-v3", "kimi-k2"]:
             thinking_param = "thinking"
         else:
-            # Qwen3
+            # All models other than dpsk v3/kimi_k2
             thinking_param = "enable_thinking"
-        return {
-            "chat_template_kwargs": {thinking_param: True},
-        }
+        return {thinking_param: True}
     return {}
 
 
+def parse_json_object(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError("must be a valid JSON object string") from e
+
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+
+    return parsed
+
+
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
-    # Get thinking kwargs based on user's choice
-    thinking_kwargs = get_thinking_kwargs(args)
+    chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+    if isinstance(chat_template_kwargs, str):
+        chat_template_kwargs = parse_json_object(chat_template_kwargs)
+    elif chat_template_kwargs is None:
+        chat_template_kwargs = {}
+    elif not isinstance(chat_template_kwargs, dict):
+        raise ValueError("chat_template_kwargs must be a dict or a JSON object string")
 
-    # Build extra_body with thinking kwargs and top_k if specified
-    extra_body = thinking_kwargs.copy() if thinking_kwargs else {}
-    top_k = getattr(args, "top_k", None)
-    if top_k is not None:
-        extra_body["top_k"] = top_k
+    chat_template_kwargs = {**get_thinking_kwargs(args), **chat_template_kwargs}
 
-    sampler = ChatCompletionSampler(
-        model=args.model,
+    extra_body = {}
+    if chat_template_kwargs:
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
+
+    for param_name in ("top_k", "min_p"):
+        value = getattr(args, param_name, None)
+        if value is not None:
+            extra_body[param_name] = value
+
+    common_kwargs = dict(
+        model=getattr(args, "model", None),
         max_tokens=getattr(args, "max_tokens", 2048),
         top_p=getattr(args, "top_p", 1.0),
         base_url=base_url,
         temperature=getattr(args, "temperature", 0.0),
-        reasoning_effort=getattr(args, "reasoning_effort", None),
-        extra_body=extra_body if extra_body else None,
     )
+
+    api_mode = getattr(args, "api", "chat")
+    if api_mode == "completion":
+        # Default stop tokens for completion API (matches few_shot_gsm8k behavior)
+        stop = getattr(args, "stop", ["Question", "Assistant:", "<|separator|>"])
+        sampler = CompletionSampler(
+            **common_kwargs,
+            stop=stop,
+        )
+    else:
+        sampler = ChatCompletionSampler(
+            **common_kwargs,
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            extra_body=extra_body if extra_body else None,
+        )
 
     # Run eval
     tic = time.perf_counter()
@@ -114,7 +148,7 @@ def run_eval(args):
         categories = args.categories.split(",") if args.categories else None
 
         eval_obj = LongBenchV2Eval(
-            model=args.model,
+            model=getattr(args, "model", None),
             data_source=data_source,
             num_examples=args.num_examples,
             num_threads=args.num_threads,
@@ -150,8 +184,15 @@ def run_eval(args):
     if getattr(args, "repeat", 1) == 1:
         result, latency, sampler = run_eval_once(args, base_url, eval_obj)
         metrics = result.metrics | {"score": result.score}
+        metrics["latency"] = latency
         print(f"Total latency: {latency:.3f} s")
         print(f"Score: {metrics['score']:.3f}")
+
+        # Compute output throughput from accumulated completion tokens
+        total_completion_tokens = sum(sampler._completion_tokens)
+        if total_completion_tokens > 0 and latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -175,19 +216,31 @@ def run_eval(args):
         ]
 
         scores_repeat = []
+        latencies = []
+        total_completion_tokens = 0
 
         for f in futures:
             result, latency, sampler = f.result()
             scores_repeat.append(result.score)
+            latencies.append(latency)
+            total_completion_tokens += sum(sampler._completion_tokens)
 
         mean_score = sum(scores_repeat) / len(scores_repeat)
+        mean_latency = sum(latencies) / len(latencies)
+        total_latency = sum(latencies)
         scores_repeat = [f"{s:.3f}" for s in scores_repeat]
         print("=" * 20)
         print(f"Repeat: {args.repeat}, mean: {mean_score:.3f}")
         print(f"Scores: {scores_repeat}")
+        print(f"Mean latency: {mean_latency:.3f} s")
         print("=" * 20)
         metrics = result.metrics | {"scores": scores_repeat}
         metrics = metrics | {"mean_score": mean_score}
+        metrics["latency"] = mean_latency
+
+        if total_completion_tokens > 0 and total_latency > 0:
+            metrics["output_throughput"] = total_completion_tokens / total_latency
+            print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
 
         # Report metrics to unified collection framework
         dump_metric(
@@ -219,7 +272,7 @@ def run_eval(args):
     return metrics
 
 
-THINKING_MODE_CHOICES = ["deepseek-v3", "qwen3"]
+THINKING_MODE_CHOICES = ["deepseek-v3", "qwen-3", "glm-45", "kimi-k2"]
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -246,6 +299,13 @@ if __name__ == "__main__":
         "--repeat", type=int, default=1, help="repeat the evaluation n times"
     )
     parser.add_argument("--eval-name", type=str, default="mmlu")
+    parser.add_argument(
+        "--api",
+        type=str,
+        default="chat",
+        choices=["chat", "completion"],
+        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions",
+    )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
@@ -253,6 +313,15 @@ if __name__ == "__main__":
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
+    )
+    parser.add_argument(
+        "--min-p", type=float, default=None, help="Min-p sampling parameter"
+    )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=parse_json_object,
+        default=None,
+        help="JSON object string for chat_template_kwargs, e.g. '{\"enable_thinking\": true}'",
     )
     parser.add_argument("--reasoning-effort", type=str)
     parser.add_argument(

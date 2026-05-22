@@ -205,13 +205,16 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
 
 
 def get_json_schema_constraint(
-    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+    tools: List[Tool],
+    tool_choice: Union[ToolChoice, Literal["required"]],
+    parallel_tool_calls: bool = True,
 ) -> Optional[dict]:
     """
     Get the JSON schema constraint for the specified tool choice.
 
     Args:
         tool_choice: The tool choice specification
+        parallel_tool_calls: If False, constrain to exactly one tool call (maxItems=1)
 
     Returns:
         JSON schema dict, or None if no valid tools found
@@ -222,12 +225,14 @@ def get_json_schema_constraint(
         fn_name = tool_choice.function.name
         for tool in tools:
             if tool.function.name == fn_name:
-                return {
+                schema = {
                     "type": "array",
                     "minItems": 1,
-                    "maxItems": 1,
                     "items": _get_tool_schema(tool),
                 }
+                if not parallel_tool_calls:
+                    schema["maxItems"] = 1
+                return schema
         return None
     elif tool_choice == "required":
         json_schema = {
@@ -238,6 +243,8 @@ def get_json_schema_constraint(
                 "anyOf": [_get_tool_schema(tool) for tool in tools],
             },
         }
+        if not parallel_tool_calls:
+            json_schema["maxItems"] = 1
         json_schema_defs = _get_tool_schema_defs(tools)
         if json_schema_defs:
             json_schema["$defs"] = json_schema_defs

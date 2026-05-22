@@ -17,7 +17,7 @@ class AttnForwardMethod(IntEnum):
     MHA_ONE_SHOT = auto()
 
     # Use MLA but with fused RoPE
-    MLA_FUSED_ROPE = auto()
+    MLA_FUSED_ROPE_ROCM = auto()
 
     # Use MLA with fused RoPE kernel for CPU
     MLA_FUSED_ROPE_CPU = auto()

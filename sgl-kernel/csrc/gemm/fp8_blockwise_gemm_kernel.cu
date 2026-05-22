@@ -256,7 +256,66 @@ void launch_sm120_fp8_blockwise_scaled_mm(
   using LayoutSFA = decltype(ScaleConfig::deduce_layoutSFA());  // Layout type for SFA matrix operand
   using LayoutSFB = decltype(ScaleConfig::deduce_layoutSFB());  // Layout type for SFB matrix operand
 
-  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+  constexpr bool kCanUsePingpong = (64 % ScaleGranularityM == 0);
+
+  int m = a.size(0);
+  int k = a.size(1);
+  int n = b.size(1);
+
+  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
+  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
+  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+
+  auto scales_a_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
+  auto scales_b_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
+
+  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+
+  auto run_gemm = [&](auto tag) -> cutlass::Status {
+    using GemmKernel = decltype(tag);
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+    Gemm gemm_op;
+
+    using StrideA = typename GemmKernel::StrideA;
+    using StrideB = typename GemmKernel::StrideB;
+    using StrideC = typename GemmKernel::StrideD;
+
+    StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
+    StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
+    StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
+
+    typename GemmKernel::MainloopArguments mainloop_args{
+        a_ptr, stride_a, b_ptr, stride_b, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
+
+    typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
+    epilogue_args.thread.alpha = 1.0f;
+
+    typename Gemm::Arguments args = {
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {m, n, k, 1},
+        mainloop_args,
+        epilogue_args,
+    };
+
+    auto can_implement = gemm_op.can_implement(args);
+    if (can_implement != cutlass::Status::kSuccess) {
+      return can_implement;
+    }
+
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+    auto init_status = gemm_op.initialize(args, workspace.get());
+    if (init_status != cutlass::Status::kSuccess) {
+      return init_status;
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+    return gemm_op.run(stream);
+  };
+
+  using CooperativeCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
       PerSmTileShape,
@@ -270,10 +329,12 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       ElementD,
       LayoutDTag,
       AlignmentD,
-      cutlass::epilogue::collective::EpilogueScheduleAuto  // Epilogue schedule policy
-      >::CollectiveOp;
+      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+  using CooperativeStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+      sizeof(typename CooperativeCollectiveEpilogue::SharedStorage))>;
+
+  using CooperativeCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       ArchTag,
       OperatorClass,
       ElementA,
@@ -285,69 +346,65 @@ void launch_sm120_fp8_blockwise_scaled_mm(
       ElementAccumulator,
       MmaTileShape,
       ClusterShape,
-      cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-          sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::collective::KernelScheduleAuto  // Kernel schedule policy. Auto defaults to cooperative kernel
-                                                     // schedule
-      >::CollectiveOp;
+      CooperativeStageCount,
+      cutlass::gemm::KernelScheduleSm120Blockwise>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int, int>,  // Indicates ProblemShape
-      CollectiveMainloop,
-      CollectiveEpilogue,
-      void>;
+  using CooperativeGemmKernel = cutlass::gemm::kernel::
+      GemmUniversal<Shape<int, int, int, int>, CooperativeCollectiveMainloop, CooperativeCollectiveEpilogue, void>;
 
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  cutlass::Status status = cutlass::Status::kSuccess;
+  if constexpr (kCanUsePingpong) {
+    using PingpongMmaTileShape_MNK = Shape<_64, _128, _128>;
+    using PingpongCollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        ArchTag,
+        OperatorClass,
+        PerSmTileShape,
+        ClusterShape,
+        cutlass::epilogue::collective::EpilogueTileAuto,
+        ElementAccumulator,
+        ElementAccumulator,
+        ElementC,
+        LayoutCTag,
+        AlignmentC,
+        ElementD,
+        LayoutDTag,
+        AlignmentD,
+        cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-  Gemm gemm_op;
+    using PingpongStageCount = cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
+        sizeof(typename PingpongCollectiveEpilogue::SharedStorage))>;
 
-  int m = a.size(0);
-  int k = a.size(1);
-  int n = b.size(1);
+    using PingpongCollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        ArchTag,
+        OperatorClass,
+        ElementA,
+        cute::tuple<LayoutATag, LayoutSFA>,
+        AlignmentA,
+        ElementB,
+        cute::tuple<LayoutBTag, LayoutSFB>,
+        AlignmentB,
+        ElementAccumulator,
+        PingpongMmaTileShape_MNK,
+        ClusterShape,
+        PingpongStageCount,
+        cutlass::gemm::KernelTmaWarpSpecializedBlockwisePingpongSm120>::CollectiveOp;
 
-  auto a_ptr = static_cast<ElementA*>(a.data_ptr());
-  auto b_ptr = static_cast<ElementB*>(b.data_ptr());
-  auto c_ptr = static_cast<ElementD*>(out.data_ptr());
+    using PingpongGemmKernel = cutlass::gemm::kernel::
+        GemmUniversal<Shape<int, int, int, int>, PingpongCollectiveMainloop, PingpongCollectiveEpilogue, void>;
 
-  auto scales_a_ptr = static_cast<ElementBlockScale*>(scales_a.data_ptr());
-  auto scales_b_ptr = static_cast<ElementBlockScale*>(scales_b.data_ptr());
+    if (m <= 64) {
+      status = run_gemm(PingpongGemmKernel{});
+      if (status != cutlass::Status::kSuccess) {
+        status = run_gemm(CooperativeGemmKernel{});
+      }
+    } else {
+      status = run_gemm(CooperativeGemmKernel{});
+    }
+  } else {
+    status = run_gemm(CooperativeGemmKernel{});
+  }
 
-  using StrideA = typename Gemm::GemmKernel::StrideA;
-  using StrideB = typename Gemm::GemmKernel::StrideB;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
-  using StrideC = typename Gemm::GemmKernel::StrideD;
-
-  StrideA stride_a = cutlass::make_cute_packed_stride(StrideA{}, cute::make_shape(m, k, 1));
-  StrideB stride_b = cutlass::make_cute_packed_stride(StrideB{}, cute::make_shape(n, k, 1));
-  StrideC stride_c = cutlass::make_cute_packed_stride(StrideC{}, cute::make_shape(m, n, 1));
-  LayoutSFA layout_SFA = ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-  LayoutSFB layout_SFB = ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-
-  typename GemmKernel::MainloopArguments mainloop_args{
-      a_ptr, stride_a, b_ptr, stride_b, scales_a_ptr, layout_SFA, scales_b_ptr, layout_SFB};
-
-  typename GemmKernel::EpilogueArguments epilogue_args{{}, c_ptr, stride_c, c_ptr, stride_c};
-  epilogue_args.thread.alpha = 1.0f;
-
-  typename Gemm::Arguments args = {
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k, 1},
-      mainloop_args,
-      epilogue_args,
-  };
-
-  auto can_implement = gemm_op.can_implement(args);
-  TORCH_CHECK(can_implement == cutlass::Status::kSuccess, cutlassGetStatusString(can_implement))
-
-  size_t workspace_size = gemm_op.get_workspace_size(args);
-  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
-
-  auto init_status = gemm_op.initialize(args, workspace.get());
-  TORCH_CHECK(init_status == cutlass::Status::kSuccess, cutlassGetStatusString(init_status));
-
-  auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
-  auto status = gemm_op.run(stream);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status))
+  TORCH_CHECK(status == cutlass::Status::kSuccess, cutlassGetStatusString(status));
 }
 
 template <typename OutType>

@@ -25,7 +25,9 @@ def load_engine_model():
     json_files = glob.glob(os.path.join(os.path.dirname(__file__) or ".", "*.json"))
     for fname in json_files:
         with open(fname, encoding="utf-8") as f:
-            engine_model.update(json.load(f))
+            file_engine_model = json.load(f)
+        for engine, models in file_engine_model.items():
+            engine_model.setdefault(engine, {}).update(models)
     return engine_model
 
 
@@ -38,7 +40,6 @@ class GPUTrace2Graph:
         import pandas as pd  # avoid importing till needed
 
         self.pd = pd
-        self.pd.options.mode.copy_on_write = True
 
     # helper functions for generating trace->summary csvs
     def gen_nonoverlapped_sum_from_gputrace(self, in_file, out_file):

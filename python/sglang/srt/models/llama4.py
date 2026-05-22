@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,6 +41,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,16 +54,19 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
     add_prefix,
     fast_topk,
     get_compiler_backend,
     is_cuda,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.common import get_current_device_stream_fast
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +149,10 @@ class Llama4MoE(nn.Module):
 
         out_aD = routed_out + shared_out
 
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+        ):
             out_aD = tensor_model_parallel_all_reduce(out_aD)
 
         return out_aD
@@ -329,15 +338,31 @@ class Llama4Attention(nn.Module):
         if self.rotary_emb is not None:
             q_view, k_view = qk.split([self.q_size, self.kv_size], dim=-1)
             q_out_unused, k_out_unused = self.rotary_emb(positions, q_view, k_view)
+            if _is_npu:
+                qk = torch.cat([q_out_unused, k_out_unused], dim=-1)
             del q_view, k_view, q_out_unused, k_out_unused
 
-        if self.qk_norm is not None:
-            # TODO there are still 2 redundant direct_copy_kernel_cuda for this `reshape` and (in attn backend) q.contiguous(), maybe we can fuse them later
-            qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
-            qk = self.qk_norm(qk).to(torch.bfloat16)
-            qk = qk.reshape(-1, self.q_size + self.kv_size)
-
-        q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+        if self.qk_norm is not None and _is_cuda:
+            # Strided in-place fused QK RMSNorm reads/writes the qkv buffer
+            # directly via the split q/k views, so the reshape-to-(N, head_dim)
+            # copy is no longer needed. The remaining redundant copy
+            # (`q.contiguous()` inside the attention backend) is unrelated.
+            q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.qk_norm,
+                k_norm=self.qk_norm,
+                head_dim=self.head_dim,
+            )
+        else:
+            if self.qk_norm is not None:
+                # NPU/other: qk has been rebuilt via torch.cat after RoPE, so
+                # this reshape is a free view; keep the previous path.
+                qk = qk.reshape(-1, self.head_dim).contiguous().bfloat16()
+                qk = self.qk_norm(qk).to(torch.bfloat16)
+                qk = qk.reshape(-1, self.q_size + self.kv_size)
+            q, k = qk.split([self.q_size, self.kv_size], dim=-1)
 
         # We are applying temperature tuning (https://arxiv.org/abs/2501.19399) to NoPE layers, where
         # the inference-time temperature tuning function is customized to not affect short context
@@ -362,8 +387,8 @@ class Llama4DecoderLayer(nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_theta
-        rope_scaling = config.rope_scaling
+        rope_theta = config.rope_parameters["rope_theta"]
+        rope_scaling = config.rope_parameters
         max_position_embeddings = config.max_position_embeddings
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
