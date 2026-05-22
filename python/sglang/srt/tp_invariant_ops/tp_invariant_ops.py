@@ -768,7 +768,7 @@ def stable_topk_softmax(
     return topk_values / topk_values.sum(dim=-1, keepdim=True), topk_ids
 
 
-def _tree_all_reduce_sum_reference(x: torch.Tensor, device_group=None) -> torch.Tensor:
+def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
     if not dist.is_initialized():
         return x.clone()
 
@@ -790,154 +790,9 @@ def _tree_all_reduce_sum_reference(x: torch.Tensor, device_group=None) -> torch.
     return result[0]
 
 
-def _tree_sum_dtype_code(dtype: torch.dtype) -> int:
-    if dtype == torch.float32:
-        return 0
-    if dtype == torch.bfloat16:
-        return 1
-    if dtype == torch.float16:
-        return 2
-    raise TypeError(f"Unsupported tree all-reduce dtype: {dtype}")
-
-
-@triton.jit
-def _round_tree_sum_value(value, DTYPE_CODE: tl.constexpr):
-    if DTYPE_CODE == 1:
-        return value.to(tl.bfloat16).to(tl.float32)
-    if DTYPE_CODE == 2:
-        return value.to(tl.float16).to(tl.float32)
-    return value
-
-
-@triton.jit
-def _load_tree_sum_row(gather_ptr, offsets, n_elements, row: tl.constexpr, mask):
-    return tl.load(gather_ptr + row * n_elements + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-
-
-@triton.jit
-def _tree_sum_pair(
-    gather_ptr,
-    offsets,
-    n_elements,
-    left: tl.constexpr,
-    right: tl.constexpr,
-    mask,
-    DTYPE_CODE: tl.constexpr,
-):
-    value = _load_tree_sum_row(gather_ptr, offsets, n_elements, left, mask)
-    value += _load_tree_sum_row(gather_ptr, offsets, n_elements, right, mask)
-    return _round_tree_sum_value(value, DTYPE_CODE)
-
-
-@triton.jit
-def _tree_sum_gathered_rank0_kernel(
-    gather_ptr,
-    output_ptr,
-    n_elements: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    DTYPE_CODE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    if WORLD_SIZE == 1:
-        value = _load_tree_sum_row(gather_ptr, offsets, n_elements, 0, mask)
-    elif WORLD_SIZE == 2:
-        value = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
-        )
-    elif WORLD_SIZE == 4:
-        left = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
-        )
-        right = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 2, 3, mask, DTYPE_CODE
-        )
-        value = _round_tree_sum_value(left + right, DTYPE_CODE)
-    elif WORLD_SIZE == 8:
-        left_01 = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 0, 1, mask, DTYPE_CODE
-        )
-        left_23 = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 2, 3, mask, DTYPE_CODE
-        )
-        right_45 = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 4, 5, mask, DTYPE_CODE
-        )
-        right_67 = _tree_sum_pair(
-            gather_ptr, offsets, n_elements, 6, 7, mask, DTYPE_CODE
-        )
-        left = _round_tree_sum_value(left_01 + left_23, DTYPE_CODE)
-        right = _round_tree_sum_value(right_45 + right_67, DTYPE_CODE)
-        value = _round_tree_sum_value(left + right, DTYPE_CODE)
-    else:
-        value = _load_tree_sum_row(gather_ptr, offsets, n_elements, 0, mask)
-
-    tl.store(output_ptr + offsets, value, mask=mask)
-
-
-def _tree_sum_gathered_rank0(
-    gather: torch.Tensor, output_shape: torch.Size
-) -> torch.Tensor:
-    world_size = gather.shape[0]
-    if world_size not in (1, 2, 4, 8):
-        raise ValueError("fused tree sum supports world_size in {1, 2, 4, 8}")
-    if not gather.is_cuda or not gather.is_contiguous():
-        raise ValueError("fused tree sum requires a contiguous CUDA gather buffer")
-
-    output = torch.empty(output_shape, device=gather.device, dtype=gather.dtype)
-    n_elements = output.numel()
-    if n_elements == 0:
-        return output
-
-    block_size = 1024
-    grid = (triton.cdiv(n_elements, block_size),)
-    _tree_sum_gathered_rank0_kernel[grid](
-        gather,
-        output,
-        n_elements,
-        WORLD_SIZE=world_size,
-        DTYPE_CODE=_tree_sum_dtype_code(gather.dtype),
-        BLOCK_SIZE=block_size,
-    )
-    return output
-
-
-def _tree_sum_gathered_rank0_inplace(gather: torch.Tensor) -> torch.Tensor:
-    world_size = gather.shape[0]
-    if world_size not in (1, 2, 4, 8):
-        raise ValueError("fused tree sum supports world_size in {1, 2, 4, 8}")
-    if not gather.is_cuda or not gather.is_contiguous():
-        raise ValueError("fused tree sum requires a contiguous CUDA gather buffer")
-
-    output = gather[0]
-    n_elements = output.numel()
-    if n_elements == 0:
-        return output
-
-    block_size = 1024
-    grid = (triton.cdiv(n_elements, block_size),)
-    _tree_sum_gathered_rank0_kernel[grid](
-        gather,
-        gather,
-        n_elements,
-        WORLD_SIZE=world_size,
-        DTYPE_CODE=_tree_sum_dtype_code(gather.dtype),
-        BLOCK_SIZE=block_size,
-    )
-    return output
-
-
 def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tensor:
-    if not dist.is_initialized():
-        return x.clone()
-
     if not x.is_cuda:
-        return _tree_all_reduce_sum_reference(x, device_group=device_group)
+        raise ValueError("x must be a CUDA tensor.")
     if not x.is_contiguous():
         raise ValueError(
             "x must be contiguous. Call x = x.contiguous() OUTSIDE graph capture."
@@ -947,48 +802,22 @@ def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tenso
     if world_size & (world_size - 1) != 0:
         raise ValueError("world_size must be a power of 2.")
 
-    cache_enabled = os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE", "1") != "0"
-    cache_max_bytes = int(
-        os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE_MAX_BYTES", str(64 * 1024 * 1024))
-    )
-    cache_max_entries = int(os.getenv("TREE_ALL_REDUCE_SCRATCH_CACHE_MAX_ENTRIES", "64"))
-    gather_num_bytes = x.numel() * world_size * x.element_size()
-    gather = None
+    if not hasattr(tree_all_reduce_sum, "_cache"):
+        tree_all_reduce_sum._cache = {}
 
-    if cache_enabled and gather_num_bytes <= cache_max_bytes:
-        if not hasattr(tree_all_reduce_sum_optim, "_scratch_cache"):
-            tree_all_reduce_sum_optim._scratch_cache = {}
-
-        key = (id(device_group), x.device.index, tuple(x.shape), x.dtype, world_size)
-        cache = tree_all_reduce_sum_optim._scratch_cache
-        gather = cache.get(key)
-        if gather is None:
-            gather = torch.empty(
-                (world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype
-            )
-            cache[key] = gather
-            if len(cache) > cache_max_entries:
-                cache.pop(next(iter(cache)))
-
-    if gather is None:
+    key = (id(device_group), x.device.index, tuple(x.shape), x.dtype, world_size)
+    st = tree_all_reduce_sum._cache.get(key)
+    if st is None:
         gather = torch.empty(
             (world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype
         )
+        out = torch.empty_like(x)
+        st = tree_all_reduce_sum._cache[key] = (gather, out)
+
+    gather, out = st
 
     # 1) all_gather into one contiguous buffer
     dist.all_gather_into_tensor(gather, x, group=device_group)
-
-    if os.getenv("TREE_ALL_REDUCE_FUSED_INPLACE_SUM", "0") != "0":
-        result = _tree_sum_gathered_rank0_inplace(gather)
-        if (
-            os.getenv("TREE_ALL_REDUCE_RETURN_VIEW_NO_GRAD", "0") != "0"
-            and not torch.is_grad_enabled()
-        ):
-            return result
-        return result.clone()
-
-    if os.getenv("TREE_ALL_REDUCE_FUSED_SUM", "0") != "0":
-        return _tree_sum_gathered_rank0(gather, x.shape)
 
     # 2) deterministic tree pairing EXACTLY like your original:
     # for level in range(1, bit_length):
@@ -1004,25 +833,9 @@ def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tenso
         # Views only (no alloc); one add_ kernel per level
         gather[0:world_size:step].add_(gather[half:world_size:step])
 
-    if (
-        os.getenv("TREE_ALL_REDUCE_RETURN_VIEW_NO_GRAD", "0") != "0"
-        and not torch.is_grad_enabled()
-    ):
-        return gather[0]
-    return gather[0].clone()
-
-
-def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
-    """All-reduce by gathering ranks and summing them in a fixed binary tree order.
-
-    The optimized CUDA path uses a contiguous ``all_gather_into_tensor`` buffer
-    and the same pairwise tree order as the reference implementation. Keep
-    ``TREE_ALL_REDUCE_OPTIM=0`` as an escape hatch while the path continues to
-    serve true-on-policy parity gates.
-    """
-    if os.getenv("TREE_ALL_REDUCE_OPTIM", "1") == "0":
-        return _tree_all_reduce_sum_reference(x, device_group=device_group)
-    return tree_all_reduce_sum_optim(x, device_group=device_group)
+    out.copy_(gather[0])
+    tree_all_reduce_sum._cache.clear()
+    return out
 
 
 _tp_inv_MODE = False

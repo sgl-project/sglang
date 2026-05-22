@@ -374,7 +374,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
             repo_root / "python" / "sglang" / "srt" / "models" / "qwen3_moe.py"
         ).read_text()
 
-        self.assertIn("should_use_deterministic_moe_combine", qwen3_moe_source)
+        self.assertIn("is_true_on_policy_enabled", qwen3_moe_source)
         self.assertIn("moe_expert_parallel_tree_all_reduce", qwen3_moe_source)
 
     def test_true_on_policy_dp_attention_uses_max_len_padding(self):

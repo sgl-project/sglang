@@ -36,8 +36,6 @@ from sglang.srt.tp_invariant_ops.tp_invariant_ops import (
     _MATMUL_K_BLOCK,
     _fixed_tree_sum_tensors,
     _is_power_of_two,
-    _tree_sum_gathered_rank0,
-    _tree_sum_gathered_rank0_inplace,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
@@ -595,15 +593,6 @@ class TestTreeAllReduceNonDistributed(unittest.TestCase):
         self.assertTrue(torch.equal(x, result))
         self.assertFalse(x.data_ptr() == result.data_ptr())
 
-    def test_reference_escape_hatch_returns_clone_when_dist_not_initialized(self):
-        if dist.is_initialized():
-            self.skipTest("dist already initialized")
-        x = torch.tensor([1.0, 2.0, 3.0])
-        with patch.dict(os.environ, {"TREE_ALL_REDUCE_OPTIM": "0"}):
-            result = tree_all_reduce_sum(x)
-        self.assertTrue(torch.equal(x, result))
-        self.assertFalse(x.data_ptr() == result.data_ptr())
-
     def test_fixed_tree_sum_is_order_deterministic(self):
         torch.manual_seed(50)
         world_size = 8
@@ -618,54 +607,6 @@ class TestTreeAllReduceNonDistributed(unittest.TestCase):
             shards = [torch.tensor([float(i + 1)]) for i in range(n)]
             result = _fixed_tree_sum_tensors(shards)
             self.assertAlmostEqual(result.item(), n * (n + 1) / 2, places=5)
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_fused_tree_sum_matches_reference_buffer(self):
-        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-            for world_size in [1, 2, 4, 8]:
-                torch.manual_seed(20260515 + world_size)
-                gather = torch.randn(
-                    world_size,
-                    7,
-                    513,
-                    device="cuda",
-                    dtype=dtype,
-                )
-
-                expected = _fixed_tree_sum_tensors(
-                    [gather[rank].clone() for rank in range(world_size)]
-                )
-                actual = _tree_sum_gathered_rank0(gather.contiguous(), gather.shape[1:])
-
-                self.assertTrue(
-                    torch.equal(actual, expected),
-                    f"dtype={dtype} world_size={world_size}",
-                )
-
-    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
-    def test_fused_tree_sum_inplace_matches_reference_buffer(self):
-        for dtype in [torch.float32, torch.bfloat16, torch.float16]:
-            for world_size in [1, 2, 4, 8]:
-                torch.manual_seed(20260516 + world_size)
-                gather = torch.randn(
-                    world_size,
-                    7,
-                    513,
-                    device="cuda",
-                    dtype=dtype,
-                ).contiguous()
-
-                expected = _fixed_tree_sum_tensors(
-                    [gather[rank].clone() for rank in range(world_size)]
-                )
-                actual = _tree_sum_gathered_rank0_inplace(gather)
-
-                self.assertEqual(actual.data_ptr(), gather.data_ptr())
-                self.assertTrue(
-                    torch.equal(actual, expected),
-                    f"dtype={dtype} world_size={world_size}",
-                )
-
 
 # ---------------------------------------------------------------------------
 # MoE reduce: order-matters proof
