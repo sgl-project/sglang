@@ -694,7 +694,12 @@ class TestFA3EAGLE3(_ServerSmokeBase):
 
 
 class TestDPIdleRank(_ServerSmokeBase):
-    """DP=4 TP=4 with idle DP rank path — exercises IDLE forward mode."""
+    """DP=4 TP=1 with idle DP rank path — exercises IDLE forward mode.
+
+    Uses DP=4 TP=1 (4 GPUs total) instead of DP=4 TP=4 (16 GPUs).
+    The IDLE path fires when some DP ranks have no requests; any DP>1
+    configuration exercises it.
+    """
 
     model = os.environ.get("DP_MODEL", "Qwen/Qwen3-30B-A3B")
     timeout = 2400
@@ -702,7 +707,7 @@ class TestDPIdleRank(_ServerSmokeBase):
         "--attention-backend",
         "triton",
         "--tp-size",
-        "4",
+        "1",
         "--dp-size",
         "4",
         "--disable-piecewise-cuda-graph",
