@@ -151,8 +151,9 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
-        # indices = batch.req_pool_indices is pinned 2 iters via
-        # record_batch_in_overlap; explicit record_stream is unnecessary.
+        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
+        # record_batch_in_overlap; record_stream here is redundant.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
         hidden_states_buf = (
             self.hidden_states_buf if spec_need_hidden_states() else None
         )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -178,22 +178,16 @@ class EagleDraftInputV2Mixin:
         draft_model_runner: ModelRunner,
         topk: int,
         num_steps: int,
-        out_cache_loc_buf: Optional[torch.Tensor] = None,
     ):
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
 
-            # Assign cache locations. Caller may pass a pre-allocated upper-
-            # bound buffer to avoid the per-iter `torch.empty` dispatch.
-            extent = bs * topk * num_steps
-            if out_cache_loc_buf is not None:
-                batch.out_cache_loc = out_cache_loc_buf[:extent]
-            else:
-                batch.out_cache_loc = torch.empty(
-                    (extent,),
-                    dtype=torch.int64,
-                    device=batch.input_ids.device,
-                )
+            # Assign cache locations
+            batch.out_cache_loc = torch.empty(
+                (bs * topk * num_steps,),
+                dtype=torch.int64,
+                device=batch.input_ids.device,
+            )
             # FIXME(lsyin): align with the default code path
             assign_draft_cache_locs_page_size_1[(bs,)](
                 batch.req_pool_indices,
