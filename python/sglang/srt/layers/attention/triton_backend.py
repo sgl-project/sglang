@@ -1296,18 +1296,7 @@ class TritonMultiStepDraftBackend:
             )
 
     def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, None, call_fn)
+        self.init_forward_data_out_graph(forward_batch)
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         """Capture + replay path -- merged from old capture/replay variants.
@@ -1335,19 +1324,7 @@ class TritonMultiStepDraftBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        self.common_template(forward_batch, None, None)
-
-        # NOTE: Multi-step's attention backends use the slice of
-        # - kv_indptr buffer (cuda graph and non-cuda graph)
-        # - kv_indices buffer (cuda graph only)
-        # So we don't need to assign the KV indices inside the attention backend.
-
-        # Compute num_kv_splits only once
-        num_token = forward_batch.batch_size * self.topk
-        self.attn_backends[-1].get_num_kv_splits(
-            self.attn_backends[-1].cuda_graph_num_kv_splits[:num_token],
-            forward_batch.seq_lens[:bs],
-        )
+        self.init_forward_data_out_graph(forward_batch)
 
 
 @triton.jit
