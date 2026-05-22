@@ -58,9 +58,9 @@ from sglang.test.test_utils import CustomTestCase
 
 _CUDA = torch.cuda.is_available()
 
-# Shared geometry — small enough for fast tests on any GPU
+# Shared geometry.  head_dim=64: FlashInfer prefill kernel requires >=64.
 _NUM_HEADS = 4
-_HEAD_DIM = 32
+_HEAD_DIM = 64
 _MAX_BS = 8
 _MAX_CTX = 64
 _SEQ_LEN = 32
@@ -121,7 +121,7 @@ class TestTritonInit(CustomTestCase):
         self.backend.init_forward_metadata(fb)
         out = self.backend.forward_extend(q, k, v, self.layer, fb)
         assert_no_nan_inf(self, out, "triton eager extend")
-        self.assertEqual(out.shape, (bs * _EXTEND_LEN, _NUM_HEADS * _HEAD_DIM))
+        self.assertEqual(out.numel(), bs * _EXTEND_LEN * _NUM_HEADS * _HEAD_DIM)
 
     def test_eager_decode_batch_size_1(self):
         fb, q, k, v = self._decode_fwd(bs=1, seq_len=_SEQ_LEN)

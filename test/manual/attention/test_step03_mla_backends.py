@@ -43,6 +43,22 @@ from sglang.srt.layers import dp_attention as _dp_attn
 # TP=1 patch — all MLA backends read get_attention_tp_size() at construction.
 _dp_attn.get_attention_tp_size = lambda: 1
 
+# Global server args stub — FlashInferMLAAttnBackend calls get_global_server_args()
+# in __init__. Set a minimal stub before any backend is constructed.
+import sglang.srt.server_args as _sa_mod
+
+if _sa_mod._global_server_args is None:
+    _stub = type(
+        "_StubServerArgs",
+        (),
+        {
+            "disaggregation_mode": "null",
+            "enable_dp_attention": False,
+            "dllm_algorithm": None,
+        },
+    )()
+    _sa_mod._global_server_args = _stub
+
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
