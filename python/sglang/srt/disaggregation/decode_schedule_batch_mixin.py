@@ -183,15 +183,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
-            # Non-spec: input_ids feeds the next decode forward directly.
+            # Non-spec: positive last token feeds next decode directly.
+            # SB.seq_lens GPU is self-maintained (no sentinel), so no FutureMap
+            # bootstrap needed. resolve_future is a no-op on positive input_ids.
             self.input_ids = last_tokens_tensor
-            if self.enable_overlap:
-                from sglang.srt.managers.overlap_utils import FutureIndices
-
-                future_indices = FutureIndices(indices=self.req_pool_indices)
-                # Bootstrap FutureMap so the first DECODE after PREBUILT can
-                # resolve_future from buf. Non-spec convention: batch.seq_lens
-                # at decode forward INCLUDES this iter's new token, so publish
-                # current + 1.
-                future_map.publish(future_indices, self.seq_lens + 1)
-                future_map.stash(future_indices, last_tokens_tensor)
