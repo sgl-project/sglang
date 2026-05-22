@@ -1904,7 +1904,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             # read both dsa_use_prefill_cp and mla_use_prefill_cp. The rename
             # to CPLayerCommunicator is deferred to a cleanup PR.
             self.layer_communicator = DSACPLayerCommunicator(
-
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
