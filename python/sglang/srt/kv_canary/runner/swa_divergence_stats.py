@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -16,16 +17,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary swa_divergence:"
+SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary_swa_divergence="
 
-_SWA_DIVERGENCE_LINE_RE = re.compile(
-    re.escape(SWA_DIVERGENCE_LOG_PREFIX)
-    + r" forward_ct=(?P<forward_ct>\d+)"
-    + r" verify_full=(?P<verify_full>\d+)"
-    + r" verify_swa=(?P<verify_swa>\d+)"
-    + r" mapping_nonidentity=(?P<mapping_nonidentity>\d+)"
-    + r" swa_pool_wrap=(?P<swa_pool_wrap>\d+)"
-)
+_SWA_DIVERGENCE_LINE_RE = re.compile(re.escape(SWA_DIVERGENCE_LOG_PREFIX) + r"(\S+)")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -54,27 +48,23 @@ def format_swa_divergence_line(
     mapping_nonidentity: int,
     swa_pool_wrap: int,
 ) -> str:
-    return (
-        f"{SWA_DIVERGENCE_LOG_PREFIX} "
-        f"forward_ct={forward_ct} "
-        f"verify_full={verify_full} "
-        f"verify_swa={verify_swa} "
-        f"mapping_nonidentity={mapping_nonidentity} "
-        f"swa_pool_wrap={swa_pool_wrap}"
+    payload = asdict(
+        ParsedSwaDivergenceLine(
+            forward_ct=forward_ct,
+            verify_full=verify_full,
+            verify_swa=verify_swa,
+            mapping_nonidentity=mapping_nonidentity,
+            swa_pool_wrap=swa_pool_wrap,
+        )
     )
+    return SWA_DIVERGENCE_LOG_PREFIX + json.dumps(payload, separators=(",", ":"))
 
 
 def parse_swa_divergence_line(line: str) -> Optional[ParsedSwaDivergenceLine]:
     match = _SWA_DIVERGENCE_LINE_RE.search(line)
     if match is None:
         return None
-    return ParsedSwaDivergenceLine(
-        forward_ct=int(match.group("forward_ct")),
-        verify_full=int(match.group("verify_full")),
-        verify_swa=int(match.group("verify_swa")),
-        mapping_nonidentity=int(match.group("mapping_nonidentity")),
-        swa_pool_wrap=int(match.group("swa_pool_wrap")),
-    )
+    return ParsedSwaDivergenceLine(**json.loads(match.group(1)))
 
 
 def find_last_swa_divergence_line(
@@ -85,13 +75,7 @@ def find_last_swa_divergence_line(
         last_match = match
     if last_match is None:
         return None
-    parsed = ParsedSwaDivergenceLine(
-        forward_ct=int(last_match.group("forward_ct")),
-        verify_full=int(last_match.group("verify_full")),
-        verify_swa=int(last_match.group("verify_swa")),
-        mapping_nonidentity=int(last_match.group("mapping_nonidentity")),
-        swa_pool_wrap=int(last_match.group("swa_pool_wrap")),
-    )
+    parsed = ParsedSwaDivergenceLine(**json.loads(last_match.group(1)))
     return parsed, last_match.group(0)
 
 
