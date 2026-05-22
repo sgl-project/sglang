@@ -329,7 +329,6 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or is_deepseek_dsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -1556,11 +1555,9 @@ multimodal_model_archs = [
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [
-    "DeepseekV32ForCausalLM",
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "Qwen3NextForCausalLM",
-    "GlmMoeDsaForCausalLM",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]

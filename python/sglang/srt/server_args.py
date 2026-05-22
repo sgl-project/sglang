@@ -1397,6 +1397,10 @@ class ServerArgs:
             ),
             ("context parallel (attn_cp_size > 1)", lambda: self.attn_cp_size > 1),
             ("CUDA graph debug mode", lambda: self.debug_cuda_graph),
+            (
+                "DSA prefill context parallelism",
+                lambda: self.enable_dsa_prefill_context_parallel,
+            ),
         ]
         for _name, predicate in rules:
             if predicate():
