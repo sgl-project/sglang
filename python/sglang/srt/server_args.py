@@ -536,6 +536,10 @@ class ServerArgs:
     prefill_attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
     grammar_backend: Optional[str] = None
+    # Name of a custom radix-cache factory registered via
+    # register_radix_cache_backend. Leave unset (by default) to use the
+    # built-in default cache selection chain.
+    radix_cache_backend: Optional[str] = None
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
@@ -2226,6 +2230,13 @@ class ServerArgs:
                 "Gemma4 only supports trtllm_mha or triton attention backend, "
                 f"got prefill={prefill_backend}, decode={decode_backend}"
             )
+
+            if is_sm100_supported() and self.moe_runner_backend == "auto":
+
+                self.moe_runner_backend = "flashinfer_trtllm"
+                logger.info(
+                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
+                )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
@@ -3739,11 +3750,7 @@ class ServerArgs:
                 self.disaggregation_transfer_backend != "fake"
             ), "Prefill server does not support 'fake' as the transfer backend"
 
-            if self.disable_piecewise_cuda_graph:
-                self.disable_cuda_graph = True
-                logger.warning(
-                    "Cuda graph is disabled for prefill server when piecewise cuda graph is not enabled."
-                )
+            self.disable_cuda_graph = True
 
         if self.disaggregation_mode in ("prefill", "decode"):
             if (
@@ -5372,6 +5379,16 @@ class ServerArgs:
             choices=GRAMMAR_BACKEND_CHOICES,
             default=ServerArgs.grammar_backend,
             help="Choose the backend for grammar-guided decoding.",
+        )
+        parser.add_argument(
+            "--radix-cache-backend",
+            type=str,
+            default=ServerArgs.radix_cache_backend,
+            help=(
+                "Name of a radix-cache backend previously registered via "
+                "register_radix_cache_backend. Omit this flag to use the "
+                "built-in default cache selection chain."
+            ),
         )
         parser.add_argument(
             "--mm-attention-backend",
@@ -7412,6 +7429,92 @@ class ServerArgs:
             return True
         else:
             return False
+
+    def describe_kv_events_publisher(self) -> Optional[dict]:
+        """Return a structured description of this server's KV-event
+        publisher, or `None` if publishing is disabled / misconfigured.
+
+        This is the wire contract surfaced under the `kv_events` key on
+        `/server_info` so KV-aware routers (e.g. the SGLang model
+        gateway) can subscribe per-worker without operator-supplied port
+        coordination. The router constructs the per-DP-rank SUB endpoint
+        as ``tcp://<worker_host>:<endpoint_port_base + dp_rank>`` for
+        every rank reported in ``dp_size``.
+
+        Returned descriptor shape:
+
+            {
+                "publisher": "zmq",
+                "endpoint_host": "*",             # may be a ZMQ wildcard
+                                                  # ("*", "0.0.0.0", "::");
+                                                  # subscribers MUST substitute
+                                                  # the worker URL's host when
+                                                  # dialing
+                "endpoint_port_base": 5557,       # base TCP port; per-rank
+                                                  # port = base + dp_rank
+                "topic": "",                      # ZMQ topic prefix on the
+                                                  # SUB filter (empty =
+                                                  # subscribe-all)
+                "block_size": <page_size>,        # subscribers MUST hash
+                                                  # prompts at this size
+                "dp_size": <dp_size>,             # number of SUB sockets
+                                                  # to open
+            }
+
+        Returns ``None`` (i.e. "no publisher to describe") when any of:
+
+        * ``--kv-events-config`` is unset / empty / malformed JSON,
+        * the configured publisher is ``"null"``,
+        * ``page_size`` is missing or non-positive (a placeholder
+          ``block_size`` would cause silent KV-cache misses by hashing
+          prompts at the wrong granularity on the router side),
+        * the endpoint is not a routable TCP address (``inproc://`` /
+          ``ipc://``, missing port, non-integer port, or port outside
+          ``1..65535``).
+
+        Reuses ``KVEventsConfig.from_cli`` for JSON parsing; the inline
+        ``rfind(":")`` endpoint split mirrors
+        ``ZmqEventPublisher.offset_endpoint_port`` rather than adding a
+        new module-level helper.
+        """
+        # Lazy import so loading ``server_args`` doesn't pull in
+        # disaggregation / msgspec / zmq at module top level.
+        from sglang.srt.disaggregation.kv_events import KVEventsConfig
+
+        raw = self.kv_events_config
+        page_size = self.page_size
+        if not raw or page_size is None or page_size <= 0:
+            return None
+        try:
+            cfg = KVEventsConfig.from_cli(raw)
+        except Exception:
+            # Malformed JSON / schema mismatch. The publisher would
+            # have failed at server startup; ``/server_info`` must
+            # keep working, so just report "no publisher" to consumers.
+            return None
+        if cfg.publisher == "null" or not cfg.endpoint:
+            return None
+        if not cfg.endpoint.startswith("tcp://"):
+            return None
+        body = cfg.endpoint[len("tcp://") :]
+        last_colon = body.rfind(":")
+        if last_colon < 0:
+            return None
+        host = body[:last_colon]
+        try:
+            port = int(body[last_colon + 1 :])
+        except ValueError:
+            return None
+        if not host or not (0 < port < 65536):
+            return None
+        return {
+            "publisher": cfg.publisher,
+            "endpoint_host": host,
+            "endpoint_port_base": port,
+            "topic": cfg.topic,
+            "block_size": page_size,
+            "dp_size": self.dp_size,
+        }
 
 
 # NOTE: This is a global variable to hold the server args for scheduler.
