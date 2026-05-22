@@ -6,6 +6,7 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
+    VerifyOrWriteContext,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
@@ -18,22 +19,24 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 
 def launch_canary_write_kernel_torch_reference(
     *,
-    canary_buf: torch.Tensor,
+    context: VerifyOrWriteContext,
     plan: WritePlan,
     input_ids: torch.Tensor,
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
-    kernel_kind: CanaryLaunchTag,
-    enable_write_verify_inputs: bool,
+    enable_assert_inputs: bool,
     expected_input_tokens: torch.Tensor | None,
     expected_input_positions: torch.Tensor | None,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
+    canary_buf = context.canary_buf
+    kernel_kind = context.kernel_kind
+    violation_ring = context.violation_ring
+    violation_write_index = context.violation_write_index
+    slot_run_counter = context.slot_run_counter
+    kernel_run_counter = context.kernel_run_counter
+    real_kv_sources = context.real_kv_sources
+    real_kv_hash_mode = context.real_kv_hash_mode
+
     work_device = torch.device("cpu")
 
     kernel_run_counter.add_(1)
@@ -73,10 +76,10 @@ def launch_canary_write_kernel_torch_reference(
             f"kv-canary: canary_buf slot stride must hold at least 4 int64 fields, got {slot_stride_i64}"
         )
 
-    if enable_write_verify_inputs:
+    if enable_assert_inputs:
         if expected_input_tokens is None or expected_input_positions is None:
             raise ValueError(
-                "kv-canary: expected input tensors are required when enable_write_verify_inputs=True"
+                "kv-canary: expected input tensors are required when enable_assert_inputs=True"
             )
         expected_input_tokens_host = expected_input_tokens.detach().to(
             device=work_device, dtype=torch.int64
@@ -87,7 +90,7 @@ def launch_canary_write_kernel_torch_reference(
     else:
         if expected_input_tokens is not None or expected_input_positions is not None:
             raise ValueError(
-                "kv-canary: expected input tensors must be None when enable_write_verify_inputs=False"
+                "kv-canary: expected input tensors must be None when enable_assert_inputs=False"
             )
         expected_input_tokens_host = None
         expected_input_positions_host = None
@@ -120,7 +123,7 @@ def launch_canary_write_kernel_torch_reference(
                 work_device=work_device,
             )
 
-            if enable_write_verify_inputs:
+            if enable_assert_inputs:
                 assert expected_input_tokens_host is not None
                 assert expected_input_positions_host is not None
                 mismatch_bits = consts.FailReason(0)

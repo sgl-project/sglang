@@ -113,21 +113,23 @@ def _run_pipeline(
         torch.cuda.synchronize()
     else:
         launch_canary_write_kernel_torch_reference(
-            canary_buf=canary_buf,
+            context=VerifyOrWriteContext(
+                canary_buf=canary_buf,
+                kernel_kind=kernel_kind,
+                violation_ring=log.ring,
+                violation_write_index=log.write_index,
+                slot_run_counter=log.slot_run_counter,
+                kernel_run_counter=log.kernel_run_counter,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=real_kv_hash_mode,
+            ),
             plan=plan_w,
             input_ids=input_ids,
             positions=positions,
             out_cache_loc=out_cache_loc,
-            kernel_kind=kernel_kind,
-            enable_write_verify_inputs=enable_write_verify_inputs,
+            enable_assert_inputs=enable_write_verify_inputs,
             expected_input_tokens=expected_input_tokens,
             expected_input_positions=expected_input_positions,
-            violation_ring=log.ring,
-            violation_write_index=log.write_index,
-            slot_run_counter=log.slot_run_counter,
-            kernel_run_counter=log.kernel_run_counter,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
         )
         launch_canary_verify_kernel_torch_reference(
             context=VerifyOrWriteContext(
