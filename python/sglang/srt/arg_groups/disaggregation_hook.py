@@ -136,3 +136,11 @@ def validate_mooncake_ib_device(server_args: "ServerArgs") -> None:
         server_args.disaggregation_ib_device = validate_ib_devices(
             server_args.disaggregation_ib_device
         )
+
+
+def validate_elastic_ep_mooncake_ib_device(server_args: "ServerArgs") -> None:
+    """Validate Elastic EP IB devices when Mooncake is used."""
+    if server_args.elastic_ep_backend == "mooncake":
+        server_args.mooncake_ib_device = validate_ib_devices(
+            server_args.mooncake_ib_device
+        )
