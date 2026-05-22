@@ -117,11 +117,23 @@ def _make_mla_layer(
 
 
 def _mla_qkv(num_tokens: int):
+    """Combined k for FlashInferMLA (absorbs rope into latent)."""
     head_dim = _KV_LORA + _QK_ROPE
     q = torch.randn(num_tokens, _NUM_HEADS, head_dim, dtype=_DTYPE, device="cuda")
     k = torch.randn(num_tokens, 1, head_dim, dtype=_DTYPE, device="cuda")
     v = torch.randn(num_tokens, 1, _KV_LORA + _QK_ROPE, dtype=_DTYPE, device="cuda")
     return q, k, v
+
+
+def _trtllm_mla_qkv(num_tokens: int):
+    """Split k_nope / k_rope for TRTLLMMLABackend which stores them separately."""
+    q = torch.randn(
+        num_tokens, _NUM_HEADS, _QK_NOPE + _QK_ROPE, dtype=_DTYPE, device="cuda"
+    )
+    k_nope = torch.randn(num_tokens, 1, _KV_LORA, dtype=_DTYPE, device="cuda")
+    v = torch.randn(num_tokens, 1, _KV_LORA, dtype=_DTYPE, device="cuda")
+    k_rope = torch.randn(num_tokens, 1, _QK_ROPE, dtype=_DTYPE, device="cuda")
+    return q, k_nope, v, k_rope
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +163,10 @@ class TestFlashInferMLAInit(CustomTestCase):
         cls.backend = FlashInferMLAAttnBackend(cls.mr)
         cls.layer = _make_mla_layer()
         set_forward_context(ForwardContext(attn_backend=cls.backend))
+
+    @classmethod
+    def tearDownClass(cls):
+        set_forward_context(None)
 
     def _fill(self, bs: int, seq_len: int):
         fill_req_to_token(self.mr, bs, seq_len)
@@ -375,6 +391,7 @@ class TestCutlassMLAInit(CustomTestCase):
 
 @unittest.skipUnless(_TRTLLM_OK, "sgl_kernel not installed")
 class TestTRTLLMMLAInit(CustomTestCase):
+    """TRTLLM MLA backend — uses split k_nope / k_rope via _trtllm_mla_qkv."""
 
     @classmethod
     def setUpClass(cls):
@@ -389,10 +406,16 @@ class TestTRTLLMMLAInit(CustomTestCase):
             max_bs=_MAX_BS,
             max_context_len=_MAX_CTX,
             dtype=_DTYPE,
+            page_size=16,  # TRTLLM kernel requires numTokensPerPage >= 16
         )
         cls.backend = TRTLLMMLABackend(cls.mr)
         cls.layer = _make_mla_layer()
         set_forward_context(ForwardContext(attn_backend=cls.backend))
+
+    @classmethod
+    def tearDownClass(cls):
+        # Reset forward context so other classes get a clean slate.
+        set_forward_context(None)
 
     def _fill(self, bs: int, seq_len: int):
         fill_req_to_token(self.mr, bs, seq_len)
@@ -401,18 +424,18 @@ class TestTRTLLMMLAInit(CustomTestCase):
         bs = 2
         self._fill(bs, _SEQ_LEN)
         fb = make_decode_batch(bs, _SEQ_LEN)
-        q, k, v = _mla_qkv(bs)
+        q, k_nope, v, k_rope = _trtllm_mla_qkv(bs)
         self.backend.init_forward_metadata(fb)
-        out = self.backend.forward_decode(q, k, v, self.layer, fb)
+        out = self.backend.forward_decode(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla eager decode")
 
     def test_eager_extend_no_nan(self):
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
-        q, k, v = _mla_qkv(bs * _EXTEND_LEN)
+        q, k_nope, v, k_rope = _trtllm_mla_qkv(bs * _EXTEND_LEN)
         self.backend.init_forward_metadata(fb)
-        out = self.backend.forward_extend(q, k, v, self.layer, fb)
+        out = self.backend.forward_extend(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla eager extend")
 
     def test_graph_decode_replay_no_nan(self):
@@ -436,8 +459,8 @@ class TestTRTLLMMLAInit(CustomTestCase):
             ForwardMode.DECODE,
             seq_lens_cpu,
         )
-        q, k, v = _mla_qkv(_MAX_BS)
-        out = self.backend.forward_decode(q, k, v, self.layer, fb)
+        q, k_nope, v, k_rope = _trtllm_mla_qkv(_MAX_BS)
+        out = self.backend.forward_decode(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla graph replay")
 
     def test_graph_replay_consistent(self):
@@ -451,7 +474,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
         init_graph_capture(
             self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
-        q, k, v = _mla_qkv(_MAX_BS)
+        q, k_nope, v, k_rope = _trtllm_mla_qkv(_MAX_BS)
 
         def _replay():
             init_graph_replay(
@@ -464,7 +487,9 @@ class TestTRTLLMMLAInit(CustomTestCase):
                 ForwardMode.DECODE,
                 seq_lens_cpu,
             )
-            return self.backend.forward_decode(q, k, v, self.layer, fb)
+            return self.backend.forward_decode(
+                q, k_nope, v, self.layer, fb, k_rope=k_rope
+            )
 
         out1 = _replay()
         out2 = _replay()
@@ -474,9 +499,9 @@ class TestTRTLLMMLAInit(CustomTestCase):
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
-        q, k, v = _mla_qkv(bs * _EXTEND_LEN)
+        q, k_nope, v, k_rope = _trtllm_mla_qkv(bs * _EXTEND_LEN)
         self.backend.init_forward_metadata(fb)
-        out = self.backend.forward_extend(q, k, v, self.layer, fb)
+        out = self.backend.forward_extend(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla pcg extend path")
 
 

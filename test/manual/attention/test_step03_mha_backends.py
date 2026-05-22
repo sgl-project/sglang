@@ -552,6 +552,7 @@ class TestTRTLLMMHAInit(CustomTestCase):
             max_bs=_MAX_BS,
             max_context_len=_MAX_CTX,
             dtype=torch.bfloat16,
+            page_size=16,  # TRTLLM-GEN decode kernel requires numTokensPerPage >= 16
         )
         cls.backend = TRTLLMHAAttnBackend(cls.mr)
         cls.layer = make_radix_attention(_NUM_HEADS, _HEAD_DIM)
