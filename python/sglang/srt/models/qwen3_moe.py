@@ -82,12 +82,9 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
-    get_moe_topk_tiebreak,
     get_on_policy_rms_norm_kwargs,
-    should_disable_fused_qk_norm_mrope,
+    is_true_on_policy_enabled,
     should_force_bfloat16_dense_tensor_math,
-    should_use_deterministic_moe_combine,
-    should_use_deterministic_moe_routing,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -347,17 +344,10 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if gate_weight is not None and router_hidden_states.dtype != gate_weight.dtype:
             router_hidden_states = router_hidden_states.to(gate_weight.dtype)
         router_logits, _ = self.gate(router_hidden_states)
-        if should_use_deterministic_moe_routing():
-            if get_moe_topk_tiebreak() == "stable_sort":
-                routing_weights, selected_experts = _stable_topk_softmax(
-                    router_logits, self.top_k, ids_dtype=torch.int32
-                )
-            else:
-                routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-                routing_weights, selected_experts = torch.topk(
-                    routing_weights, self.top_k, dim=-1
-                )
-                routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        if is_true_on_policy_enabled():
+            routing_weights, selected_experts = _stable_topk_softmax(
+                router_logits, self.top_k, ids_dtype=torch.int32
+            )
             routing_weights = routing_weights.to(router_hidden_states.dtype)
             topk_output = StandardTopKOutput(
                 topk_weights=routing_weights,
@@ -378,7 +368,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            if should_use_deterministic_moe_combine():
+            if is_true_on_policy_enabled():
                 final_hidden_states = moe_expert_parallel_tree_all_reduce(
                     final_hidden_states
                 )
