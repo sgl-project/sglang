@@ -4,7 +4,6 @@ from types import SimpleNamespace
 from sglang.srt.managers.template_detection import (
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
-    TOOL_CALL_PARSER_RULES,
     detect_reasoning_parser,
     detect_reasoning_pattern,
     detect_tool_call_parser,

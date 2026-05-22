@@ -1,10 +1,13 @@
 import json
 import pytest
 
+from sglang.srt.entrypoints.openai.protocol import Tool, Function
 from sglang.srt.function_call.minicpm5_detector import (
     MiniCPM5Detector,
 )
-from sglang.srt.entrypoints.openai.protocol import Tool, Function
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(1.0, "base-a-test-cpu")
 
 
 def make_tools_weather():
@@ -284,3 +287,9 @@ def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     result = detector.detect_and_parse(text, tools)
     assert len(result.calls) == 1
     assert json.loads(result.calls[0].parameters)["city"] == "A & B"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
