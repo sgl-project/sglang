@@ -41,15 +41,20 @@ struct VecTypeTrait<fp16_t, 32> {
   using vec_t = device::AlignedVector<packed_t, 8>;
 };
 
-template <typename packed_t>
+template <bool kCastXBeforeOutMul, typename packed_t>
 SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum) {
   float2 valf = device::cast<fp32x2_t, packed_t>(val);
   float2 weightf = device::cast<fp32x2_t, packed_t>(weight);
+  if constexpr (kCastXBeforeOutMul) {
+    auto rounded = device::cast<packed_t, fp32x2_t>(make_float2(valf.x * rsqrt_square_sum, valf.y * rsqrt_square_sum));
+    valf = device::cast<fp32x2_t, packed_t>(rounded);
+    return device::cast<packed_t, fp32x2_t>(make_float2(valf.x * weightf.x, valf.y * weightf.y));
+  }
   return device::cast<packed_t, fp32x2_t>(
       make_float2(valf.x * weightf.x * rsqrt_square_sum, valf.y * weightf.y * rsqrt_square_sum));
 }
 
-template <typename T, int VEC_SIZE_IN_BYTE>
+template <bool kCastXBeforeOutMul, typename T, int VEC_SIZE_IN_BYTE>
 __global__ void fused_add_rmsnorm_reg_kernel(
     T* __restrict__ input, T* __restrict__ residual, const T* __restrict__ weight, int vec_hidden_size, float eps) {
   constexpr int inner_loop = VEC_SIZE_IN_BYTE == 16 ? 4 : 8;
@@ -114,14 +119,14 @@ __global__ void fused_add_rmsnorm_reg_kernel(
   if (threadIdx.x < vec_hidden_size) {
     float rsqrt_square_sum = buffer[threadIdx.x / 32];  // Read rsqrt from Shared Memory(Broadcast)
     for (int i = 0; i < inner_loop; i++) {
-      v_out[i] = rms(v[i], v_weight[i], rsqrt_square_sum);
+      v_out[i] = rms<kCastXBeforeOutMul>(v[i], v_weight[i], rsqrt_square_sum);
     }
     vec_t* p_out = reinterpret_cast<vec_t*>(input) + token_id * vec_hidden_size;
     p_out[threadIdx.x] = v_out;
   }
 }
 
-template <typename DType>
+template <bool kCastXBeforeOutMul, typename DType>
 struct FusedAddRMSNormKernel {
   static void
   run(const tvm::ffi::TensorView input,
@@ -164,7 +169,7 @@ struct FusedAddRMSNormKernel {
           elements_in_vec);
 
       // Launch kernel
-      auto kernel = fused_add_rmsnorm_reg_kernel<DType, device::kMaxVecBytes>;
+      auto kernel = fused_add_rmsnorm_reg_kernel<kCastXBeforeOutMul, DType, device::kMaxVecBytes>;
       LaunchKernel(static_cast<uint>(N.unwrap()), threads, device.unwrap())
           .enable_pdl(false)(
               kernel,

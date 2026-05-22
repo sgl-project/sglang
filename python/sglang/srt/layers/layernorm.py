@@ -105,22 +105,10 @@ if _is_cuda:
 
         _jit_rmsnorm_hf = None
 
-    _jit_fused_add_rmsnorm_hf_available = False
-    try:
-        from sglang.jit_kernel.fused_add_rmsnorm_hf import (
-            fused_add_rmsnorm_hf as _jit_fused_add_rmsnorm_hf,
-        )
-        from sglang.jit_kernel.fused_add_rmsnorm_hf import (
-            is_supported_fused_add_rmsnorm_hf_hidden_size,
-        )
-
-        _jit_fused_add_rmsnorm_hf_available = True
-    except ImportError:
-
-        def is_supported_fused_add_rmsnorm_hf_hidden_size(d: int) -> bool:
-            return False
-
-        _jit_fused_add_rmsnorm_hf = None
+    from sglang.jit_kernel.norm import (
+        fused_add_rmsnorm as _jit_fused_add_rmsnorm,
+    )
+    from sglang.jit_kernel.norm import is_supported_jit_fused_add_rmsnorm_hidden_size
 
 
 logger = logging.getLogger(__name__)
@@ -269,21 +257,22 @@ class RMSNorm(MultiPlatformOp):
         if residual is not None:
             if self.cast_x_before_out_mul:
                 if (
-                    _jit_fused_add_rmsnorm_hf_available
-                    and x.dtype in (torch.float16, torch.bfloat16)
+                    x.dtype in (torch.float16, torch.bfloat16)
                     and self.weight.data.dtype == x.dtype
                     and (
                         post_residual_addition is None
                         or post_residual_addition.dtype == x.dtype
                     )
-                    and is_supported_fused_add_rmsnorm_hf_hidden_size(x.shape[-1])
+                    and is_supported_jit_fused_add_rmsnorm_hidden_size(x.shape[-1])
                 ):
-                    _jit_fused_add_rmsnorm_hf(
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    _jit_fused_add_rmsnorm(
                         x,
                         residual,
                         self.weight.data,
                         self.variance_epsilon,
-                        post_residual=post_residual_addition,
+                        cast_x_before_out_mul=self.cast_x_before_out_mul,
                     )
                     return x, residual
                 return self.forward_native(x, residual, post_residual_addition)

@@ -66,9 +66,16 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
     )
 
 
+def is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_size: int) -> bool:
+    # Conservative bound covering both 16B-vec (Ampere) and 32B-vec (Hopper+) paths.
+    return hidden_size > 0 and hidden_size % 8 == 0 and hidden_size <= 8192
+
+
 @cache_once
-def _jit_fused_add_rmsnorm_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype)
+def _jit_fused_add_rmsnorm_module(
+    dtype: torch.dtype, cast_x_before_out_mul: bool
+) -> Module:
+    args = make_cpp_args(cast_x_before_out_mul, dtype)
     return load_jit(
         "fused_add_rmsnorm",
         *args,
@@ -144,8 +151,10 @@ def fused_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float = 1e-6,
+    *,
+    cast_x_before_out_mul: bool = False,
 ) -> None:
-    module = _jit_fused_add_rmsnorm_module(input.dtype)
+    module = _jit_fused_add_rmsnorm_module(input.dtype, cast_x_before_out_mul)
     module.fused_add_rmsnorm(input, residual, weight, eps)
 
 
