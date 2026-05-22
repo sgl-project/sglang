@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -15,6 +16,11 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+
+# Token-buf consume tracking: init to -1, assert non-negative on gather,
+# write -1 back. Catches "gather without intermediate stash" bugs. Off by
+# default; CI enables via SGLANG_FUTURE_MAP_DEBUG_ASSERT=1.
+_DEBUG_ASSERT = os.getenv("SGLANG_FUTURE_MAP_DEBUG_ASSERT", "0") == "1"
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
@@ -59,8 +65,12 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        self.output_tokens_buf = (
+            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
+            if _DEBUG_ASSERT
+            else torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
         )
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
@@ -99,6 +109,10 @@ class FutureMap:
         # input_ids tokens / spec extras here.
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
+            if _DEBUG_ASSERT:
+                # Any remaining negative means the sentinel slot was empty (-1).
+                torch._assert_async((batch.input_ids >= 0).all())
+                self.output_tokens_buf[batch.req_pool_indices] = -1
         else:
             self._resolve_spec_extras(batch)
 
@@ -114,6 +128,9 @@ class FutureMap:
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
         draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if _DEBUG_ASSERT:
+            torch._assert_async((draft_input.bonus_tokens >= 0).all())
+            self.output_tokens_buf[indices] = -1
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
