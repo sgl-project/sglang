@@ -24,6 +24,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
+        os.environ["WITH_NVIDIA_PEERMEM"] = "true"
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
         base_port = str(parsed_url.port)
@@ -142,6 +143,7 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        os.environ.pop("WITH_NVIDIA_PEERMEM")
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
                 try:
