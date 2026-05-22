@@ -67,9 +67,14 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            # Keep max-total-tokens aligned with --context-length=16384 in utils.py so
-            # the KV pool can hold the ~9k-token long-prompt requests this harness builds.
-            extra_server_args=("--max-total-tokens", "16384", *cls.extra_server_args),
+            # per_forward_verify_capacity = pool_slot_count * 1.2 in
+            # CanaryLaunchCapacities, and a per-step overflow there causes the plan
+            # kernel to set enable=0 and skip verify — which makes perturb e2e tests
+            # silently lose all violation signal. Size the pool to cover the worst
+            # case sum_r prefix_lens across send_parallel_requests' default n=8 long
+            # prompts (8 * ~7000 = ~56000, → pool >= ~47k). 65536 leaves headroom
+            # and still fits Qwen3-0.6B / gemma-3-1b KV cache on an H200.
+            extra_server_args=("--max-total-tokens", "65536", *cls.extra_server_args),
         )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
