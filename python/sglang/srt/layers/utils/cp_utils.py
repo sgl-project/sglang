@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     is_allocation_symmetric,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -66,17 +67,17 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
@@ -88,18 +89,18 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
@@ -238,11 +239,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -342,7 +343,7 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    get_token_to_kv_pool().set_kv_buffer(
         layer,
         cache_loc,
         key_cache_full,
@@ -395,11 +396,11 @@ def prepare_context_parallel_metadata(
     cp_size,
     seqs_len,
 ):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         return ContextParallelMetadata()
 
     """prepare_input_dp_with_cp_dsa-zigzag index
@@ -505,16 +506,16 @@ def prepare_context_parallel_metadata(
 
     # TODO Support multi-batch-cp-split, multi-batch-cp support has accuracy issues
     # Prefix offset is critical when radix cache hits (prefix_len > 0).
-    # For non-NSA CP (e.g. qwen3-moe), consumers use these values directly as
+    # For non-DSA CP (e.g. qwen3-moe), consumers use these values directly as
     # FlashAttention cache_seqlens, so the prefix must be baked in here.
-    # For NSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
+    # For DSA CP, `_get_topk_ragged_with_cp` re-adds the cached-prefix offset
     # from (seq_lens_cpu - extend_seq_lens_cpu); baking prefix_len in here
     # would silently drop it whenever the scheduler packs multiple requests
     # into a single CP extend (len(seqs_len) != 1 -> prefix_len falls back
     # to 0), corrupting the indexer's ke_offset on prefix-cache hits.
-    from sglang.srt.layers.attention.nsa.utils import is_nsa_enable_prefill_cp
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 
-    if is_nsa_enable_prefill_cp():
+    if is_dsa_enable_prefill_cp():
         kv_len_prev = prefix_sum_list[cp_rank]
         kv_len_next = prefix_sum_list[cp_size * 2 - cp_rank - 1]
     else:

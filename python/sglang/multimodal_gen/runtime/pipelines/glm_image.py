@@ -4,6 +4,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image import (
+    GlmImageAR,
     GlmImageBeforeDenoisingStage,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -27,14 +28,20 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(
+            GlmImageAR(
+                processor=self.get_module("processor"),
+                vision_language_encoder=self.get_module("vision_language_encoder"),
+            ),
+            "glm_image_ar",
+        )
+
+        self.add_stage(
             GlmImageBeforeDenoisingStage(
                 vae=self.get_module("vae"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
-                processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                vision_language_encoder=self.get_module("vision_language_encoder"),
             ),
             "glm_image_before_denoising_stage",
         )
