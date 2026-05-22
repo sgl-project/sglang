@@ -183,7 +183,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
-            # Non-spec: positive last token feeds decode directly. No FutureMap
-            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
-            # a no-op on positive input_ids).
-            self.input_ids = last_tokens_tensor
+            # Non-spec: stash last token into the relay so the first DECODE's
+            # resolve_forward_inputs gathers it like any other decode iter.
+            from sglang.srt.managers.overlap_utils import FutureIndices
+
+            future_indices = FutureIndices(indices=self.req_pool_indices)
+            future_map.stash(future_indices, last_tokens_tensor)
+            self.input_ids = None
