@@ -39,7 +39,7 @@ class TestFutureTensors(CustomTestCase):
         alt_stream = torch.cuda.Stream(device=device)
         src = torch.tensor([5], dtype=torch.int32, device=device)
         future = FutureTensors.device_to_host(src_device=src, stream=alt_stream)
-        self.assertTrue(future._tensor.is_pinned())
+        self.assertTrue(future._tensors.is_pinned())
         self.assertEqual(int(future.wait().item()), 5)
 
     def test_cuda_each_call_allocates_fresh_host(self) -> None:
@@ -50,7 +50,7 @@ class TestFutureTensors(CustomTestCase):
         src_b = torch.tensor([29], dtype=torch.int32, device=device)
         future_a = FutureTensors.device_to_host(src_device=src_a, stream=alt_stream)
         future_b = FutureTensors.device_to_host(src_device=src_b, stream=alt_stream)
-        self.assertNotEqual(future_a._tensor.data_ptr(), future_b._tensor.data_ptr())
+        self.assertNotEqual(future_a._tensors.data_ptr(), future_b._tensors.data_ptr())
         self.assertEqual(int(future_a.wait().item()), 13)
         self.assertEqual(int(future_b.wait().item()), 29)
 
