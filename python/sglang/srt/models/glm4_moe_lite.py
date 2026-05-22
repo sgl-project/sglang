@@ -184,7 +184,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
     ):
-        nn.Module.__init__(self)
+        super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -546,7 +546,8 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        nn.Module.__init__(self)
+
+        super().__init__()
         self.hidden_size = config.hidden_size
         self.config = config
         rope_theta, rope_scaling = get_rope_config(config)
