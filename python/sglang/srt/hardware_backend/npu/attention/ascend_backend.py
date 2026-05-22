@@ -440,6 +440,100 @@ class AscendAttnBackend(AttentionBackend):
 
         self.graph_mode = False
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Init the metadata for a forward pass."""
+        metadata = ForwardMetadata()
+
+        bs = forward_batch.batch_size
+        seq_lens = forward_batch.seq_lens
+        req_pool_indices = forward_batch.req_pool_indices
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+
+        metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
+        if self.is_dllm_model:
+            max_len = int(seq_lens[:bs].max().item())
+            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
+            metadata.block_tables[:bs, :max_seq_pages].copy_(
+                (
+                    self.req_to_token[req_pool_indices[:bs], :max_len][
+                        :, :: self.page_size
+                    ]
+                    // self.page_size
+                ).to(torch.int32)
+            )
+            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
+            metadata.block_tables[bs:, :].fill_(0)
+
+        if self.is_hybrid_swa:
+            metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
+        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
+        metadata.seq_lens = seq_lens
+        if (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+            or forward_mode.is_draft_extend()
+        ):
+            metadata.actual_seq_lengths_q = torch.arange(
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens
+                + bs * self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        else:
+            metadata.actual_seq_lengths_q = torch.tensor(
+                [1 + i * 1 for i in range(bs)],
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+        if forward_mode.is_dllm_extend():
+            extend_seq_lens_cpu_int = torch.tensor(
+                [self.dllm_block_size for i in range(bs)],
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            metadata.seq_lens_list_cumsum = (
+                torch.cumsum(extend_seq_lens_cpu_int, dim=0).int().tolist()
+            )
+
+        if (
+            self.q_head_num_padding is not None
+            and self.q_head_num_padding > self.tp_q_head_num
+        ):
+            # In the MLA architecture, the FIA kernel requires the head count to be a power of 2.
+            # Therefore, we pad the head dimension accordingly and initialize an empty tensor for padding.
+            metadata.nope_padding = torch.empty(
+                [
+                    bs,
+                    1,
+                    self.q_head_num_padding - self.tp_q_head_num,
+                    self.kv_lora_rank,
+                ],
+                dtype=(
+                    self.model_dtype if self.model_dtype is not None else torch.bfloat16
+                ),
+                device=seq_lens.device,
+            )
+            metadata.rope_padding = torch.empty(
+                [
+                    bs,
+                    1,
+                    self.q_head_num_padding - self.tp_q_head_num,
+                    self.qk_rope_head_dim,
+                ],
+                dtype=(
+                    self.model_dtype if self.model_dtype is not None else torch.bfloat16
+                ),
+                device=seq_lens.device,
+            )
+
+        self.graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
+        self.graph_mode = True
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         total_context_len = self.max_context_len + self.page_size - 1
         if self.speculative_num_draft_tokens is not None:
