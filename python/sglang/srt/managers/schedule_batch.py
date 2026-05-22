@@ -430,6 +430,7 @@ class MultimodalProcessorOutput:
 
     @staticmethod
     def build_padded_input_ids(input_ids, mm_items: List[MultimodalDataItem]):
+        """pad the input_ids with mm_items if it's not already padded"""
         if input_ids is None or not mm_items:
             return None
 

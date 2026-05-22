@@ -398,8 +398,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
+    # TODO: consider moving it to SGLangBaseProcessor
     @staticmethod
     def _get_processor_output_value(ret, key):
+        """get value with key from returned value of processor"""
         if ret is None:
             return None
         if hasattr(ret, "get"):
@@ -409,6 +411,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         return getattr(ret, key, None)
 
     def _get_precomputed_mrope_from_output(self, ret):
+        """get the precomputed mrope from processor output"""
         mrope_positions = self._get_processor_output_value(ret, "mrope_positions")
         mrope_position_delta = self._get_processor_output_value(
             ret, "mrope_position_delta"
