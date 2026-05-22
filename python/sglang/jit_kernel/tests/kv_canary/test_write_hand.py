@@ -45,7 +45,7 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     run_write_diff,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _dummy_pseudo_tensors,
+    dummy_pseudo_tensors,
     clone_real_kv_sources,
 )
 from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
@@ -90,7 +90,7 @@ def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
         num_valid_reqs=1,
         device=_DEVICE,
     )
-    pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+    pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
     sources_cuda = case.real_kv_sources
     sources_ref = clone_real_kv_sources(sources_cuda)
     run_write_diff(
@@ -119,7 +119,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
 
         run_write_diff(
             buf_pair=buf_pair,
@@ -161,7 +161,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
 
         run_write_diff(
             buf_pair=buf_pair,
@@ -203,7 +203,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -270,7 +270,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -326,7 +326,7 @@ class TestSeedSlot:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -357,7 +357,7 @@ class TestChain:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -394,7 +394,7 @@ class TestChain:
             to_signed_int64(h) for h in expected_prev_hashes_u64
         ]
 
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -442,7 +442,7 @@ class TestChain:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -715,7 +715,7 @@ class TestSlotHandling:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -746,7 +746,7 @@ class TestSlotHandling:
         )
         # Slot 4 here could equally be a FULL-group raw out_cache_loc value, or the result of an SWA
         # endpoint's host gather. The kernel can't tell the difference and that's the point.
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -773,7 +773,7 @@ class TestSlotHandling:
             req_capacity=4,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -805,7 +805,7 @@ class TestSlotHandling:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(3)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(3)
 
         cuda_buf_before_slot_view = cuda_buf.view(torch.int64).clone()
 
@@ -842,7 +842,7 @@ class TestSlotHandling:
             num_valid_reqs=8,
             device=_DEVICE,
         )
-        pseudo_tokens_big, pseudo_positions_big = _dummy_pseudo_tensors(8)
+        pseudo_tokens_big, pseudo_positions_big = dummy_pseudo_tensors(8)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_big,
@@ -865,7 +865,7 @@ class TestSlotHandling:
             num_valid_reqs=3,
             device=_DEVICE,
         )
-        pseudo_tokens_small, pseudo_positions_small = _dummy_pseudo_tensors(3)
+        pseudo_tokens_small, pseudo_positions_small = dummy_pseudo_tensors(3)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_small,
@@ -898,7 +898,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -936,7 +936,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(3)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(3)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -964,7 +964,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1086,7 +1086,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1135,7 +1135,7 @@ class TestRealKvHash:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(2)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(2)
         run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1214,7 +1214,7 @@ class TestRunCounter:
         input_ids = _int32_tensor([0])
         positions = _int32_tensor([0])
         out_cache_loc = _int32_tensor([0])
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         cuda_log, ref_log = make_log_pair(device=_DEVICE)
 
         for _ in range(3):
@@ -1251,7 +1251,7 @@ class TestRunCounter:
             num_valid_reqs=2,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(5)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(5)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -1278,7 +1278,7 @@ class TestMisc:
             req_capacity=4,
             device=_DEVICE,
         )
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
+        pseudo_tokens, pseudo_positions = dummy_pseudo_tensors(1)
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,

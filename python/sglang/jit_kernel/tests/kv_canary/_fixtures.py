@@ -205,7 +205,7 @@ def derive_plan_capacity(
     raise ValueError(f"unknown CapacityKind: {kind}")
 
 
-def _allocate_plan_pair(
+def allocate_plan_pair(
     *,
     verify_capacity: int,
     write_req_capacity: int,
@@ -218,7 +218,7 @@ def _allocate_plan_pair(
     )
 
 
-def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(1, dtype=torch.int64, device=_DEVICE),
         torch.zeros(1, dtype=torch.int64, device=_DEVICE),
@@ -227,7 +227,7 @@ def _empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Ten
     )
 
 
-def _dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+def dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
     return (
         torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
         torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),

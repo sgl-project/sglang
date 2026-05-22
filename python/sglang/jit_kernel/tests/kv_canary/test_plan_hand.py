@@ -13,8 +13,8 @@ from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import run_plan_diff
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _allocate_plan_pair,
-    _empty_extras,
+    allocate_plan_pair,
+    empty_extras,
     derive_plan_capacity,
     make_lut,
     make_req_to_token,
@@ -36,7 +36,7 @@ def _tensor(values: list[int]) -> torch.Tensor:
 def _plan_pair(
     *, verify_capacity: int, write_req_capacity: int
 ) -> tuple[tuple[VerifyPlan, WritePlan], tuple[VerifyPlan, WritePlan]]:
-    triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
+    triton_v, triton_w, ref_v, ref_w = allocate_plan_pair(
         verify_capacity=verify_capacity, write_req_capacity=write_req_capacity
     )
     return (triton_v, triton_w), (ref_v, ref_w)
@@ -120,7 +120,7 @@ class TestBasicShape:
             prefix_lens=_tensor([0]),
             extend_seq_lens=_tensor([5]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -144,7 +144,7 @@ class TestBasicShape:
             prefix_lens=_tensor([7]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -165,7 +165,7 @@ class TestBasicShape:
             prefix_lens=_tensor([0, 4, 10]),
             extend_seq_lens=_tensor([8, 1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -190,7 +190,7 @@ class TestSeedSlot:
             prefix_lens=_tensor([0]),
             extend_seq_lens=_tensor([3]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         assert int(plans[0][1].write_seed_slot_indices[0].item()) == -1
@@ -207,7 +207,7 @@ class TestSeedSlot:
             prefix_lens=_tensor([3]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         # First entry has pos=0 → prev_slot = -1.
@@ -226,7 +226,7 @@ class TestSeedSlot:
             prefix_lens=_tensor([4]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v = plans[0][0]
@@ -255,7 +255,7 @@ class TestSeedSlot:
         full_seed_slot = rp * max_seq_len + (prefix - 1)
         expected_seed = int(lut[full_seed_slot].item())
 
-        extras = _empty_extras()
+        extras = empty_extras()
         verify_capacity, write_req_capacity = _alloc_for_inputs(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -298,7 +298,7 @@ class TestSeedSlot:
         req_pool_indices = _tensor([rp])
         prefix_lens = _tensor([prefix])
         extend_seq_lens = _tensor([1])
-        extras = _empty_extras()
+        extras = empty_extras()
 
         window_start = prefix - swa_window_size
         full_prev_slot = int(rtt[rp, window_start - 1].item())
@@ -344,7 +344,7 @@ class TestPadding:
             prefix_lens=_tensor([5, 99, 3]),
             extend_seq_lens=_tensor([1, 99, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -374,7 +374,7 @@ class TestPadding:
         req_pool_indices = _tensor([rp])
         prefix_lens = _tensor([prefix])
         extend_seq_lens = _tensor([1])
-        extras = _empty_extras()
+        extras = empty_extras()
         verify_capacity, write_req_capacity = _alloc_for_inputs(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
@@ -411,7 +411,7 @@ class TestPadding:
         rtt = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )
-        extras = _empty_extras()
+        extras = empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=8, extras_count=0, bs=3
         )
@@ -463,7 +463,7 @@ class TestSwa:
             prefix_lens=_tensor([3]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=128,
             full_to_swa_index_mapping=lut,
         )
@@ -484,7 +484,7 @@ class TestSwa:
             prefix_lens=_tensor([200]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=128,
             full_to_swa_index_mapping=lut,
         )
@@ -513,7 +513,7 @@ class TestSwa:
             prefix_lens=_tensor([3]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=128,
             full_to_swa_index_mapping=lut,
         )
@@ -541,7 +541,7 @@ class TestSwa:
             prefix_lens=_tensor([3]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=128,
             full_to_swa_index_mapping=lut,
         )
@@ -569,7 +569,7 @@ class TestSwa:
             prefix_lens=_tensor(prefix_values),
             extend_seq_lens=_tensor([1, 1, 1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=window,
             full_to_swa_index_mapping=lut,
         )
@@ -591,7 +591,7 @@ class TestNoExtras:
             prefix_lens=_tensor([3]),
             extend_seq_lens=_tensor([1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v = plans[0][0]
@@ -608,7 +608,7 @@ class TestNoExtras:
             prefix_lens=_tensor([0]),
             extend_seq_lens=_tensor([5]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         assert int(plans[0][0].verify_num_valid[0].item()) == 0
@@ -638,7 +638,7 @@ class TestNoExtras:
                 prefix_lens=prefix_lens,
                 extend_seq_lens=extend_seq_lens,
                 req_to_token=rtt,
-                extras=_empty_extras(),
+                extras=empty_extras(),
                 swa_window_size=0,
                 full_to_swa_index_mapping=None,
                 verify_capacity=verify_capacity,
@@ -672,7 +672,7 @@ class TestNoExtras:
             prefix_lens=prefix_lens,
             extend_seq_lens=extend_seq_lens,
             req_to_token=rtt,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
             verify_capacity=verify_capacity,
@@ -684,7 +684,7 @@ class TestNoExtras:
             prefix_lens=prefix_lens,
             extend_seq_lens=extend_seq_lens,
             req_to_token=rtt,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
             verify_capacity=verify_capacity,
@@ -711,7 +711,7 @@ class TestMisc:
             prefix_lens=_tensor([4, 6]),
             extend_seq_lens=_tensor([0, 0]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -733,7 +733,7 @@ class TestMisc:
         rtt = make_req_to_token(
             kind="linear", max_reqs=8, max_seq_len=16, device=_DEVICE
         )
-        extras = _empty_extras()
+        extras = empty_extras()
         verify_capacity, write_req_capacity = derive_plan_capacity(
             kind="loose", total_verify=13, extras_count=0, bs=3
         )
@@ -853,7 +853,7 @@ class TestVerifyContent:
             prefix_lens=_tensor([2, 5, 4]),
             extend_seq_lens=_tensor([1, 1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         assert int(plans[0][0].verify_num_valid[0].item()) == 11
@@ -873,7 +873,7 @@ class TestVerifyContent:
             prefix_lens=_tensor(prefix_values),
             extend_seq_lens=_tensor(extend_values),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         assert int(plans[0][0].verify_num_valid[0].item()) == sum(prefix_values)
@@ -890,7 +890,7 @@ class TestVerifyContent:
             prefix_lens=_tensor([5, 8]),
             extend_seq_lens=_tensor([1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v = plans[0][0]
@@ -913,7 +913,7 @@ class TestVerifyContent:
             prefix_lens=_tensor([3, 5, 99, 99]),
             extend_seq_lens=_tensor([1, 1, 99, 99]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_w = plans[0][1]
@@ -936,7 +936,7 @@ class TestByteEqual:
             prefix_lens=_tensor([0, 3, 8, 15]),
             extend_seq_lens=_tensor([4, 1, 1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
     def test_byte_equal_python_reference_hardcoded(self) -> None:
@@ -956,7 +956,7 @@ class TestByteEqual:
             prefix_lens=_tensor(prefixes),
             extend_seq_lens=_tensor(extends),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
         triton_v, triton_w = plans[0]
@@ -1004,7 +1004,7 @@ class TestBoundarySweep:
             prefix_lens=_tensor(prefix_lens),
             extend_seq_lens=_tensor(extend_seq_lens),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
     @pytest.mark.parametrize("prefix_val", [0, 1, 127, 128, 129, 4096])
@@ -1024,7 +1024,7 @@ class TestBoundarySweep:
             prefix_lens=_tensor([prefix_val, 10]),
             extend_seq_lens=_tensor([1, 1]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )
 
     @pytest.mark.parametrize("extend_val", [1, 128, 4096])
@@ -1041,5 +1041,5 @@ class TestBoundarySweep:
             prefix_lens=_tensor([0]),
             extend_seq_lens=_tensor([extend_val]),
             req_to_token=req_to_token,
-            extras=_empty_extras(),
+            extras=empty_extras(),
         )

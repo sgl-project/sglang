@@ -34,7 +34,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _empty_extras,
+    empty_extras,
     clone_real_kv_sources,
     make_req_to_token,
 )
@@ -269,7 +269,7 @@ def test_pipeline_basic_5_step_single_req() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         swa_window_size=0,
         full_to_swa_index_mapping=None,
     )
@@ -307,7 +307,7 @@ def test_pipeline_multi_req_mixed_extend_decode() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=128,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         swa_window_size=0,
         full_to_swa_index_mapping=None,
         write_req_capacity=4,
@@ -353,7 +353,7 @@ def test_pipeline_swa_window() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=num_slots_full,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
@@ -395,7 +395,7 @@ def test_pipeline_sweep_no_write() -> None:
             out_cache_loc=out_cache_loc,
             req_to_token=req_to_token,
             num_slots=64,
-            extras=_empty_extras(),
+            extras=empty_extras(),
             swa_window_size=0,
             full_to_swa_index_mapping=None,
             initial_canary_buf=initial_buf,
@@ -449,7 +449,7 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         real_kv_sources_real=sources_real,
         real_kv_sources_ref=sources_ref,
         real_kv_hash_mode=real_kv_hash_mode,
@@ -489,7 +489,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         enable_write_verify_inputs=True,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
@@ -530,7 +530,7 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         enable_write_verify_inputs=True,
         expected_input_tokens=expected_input_tokens,
         expected_input_positions=expected_input_positions,
@@ -565,7 +565,7 @@ def test_pipeline_empty_batch() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
     )
 
     assert int(log_real.kernel_run_counter[0].item()) == 2
@@ -609,7 +609,7 @@ def test_pipeline_negative_slot_swa_out_of_window() -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=128,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         swa_window_size=swa_window_size,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
     )
@@ -745,7 +745,7 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
         out_cache_loc=out_cache_loc,
         req_to_token=req_to_token,
         num_slots=64,
-        extras=_empty_extras(),
+        extras=empty_extras(),
         kernel_kind=kernel_kind,
         initial_canary_buf=initial_buf,
     )
