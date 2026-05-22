@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class PDDisaggregationServerBase(CustomTestCase):
+    capture_per_side_logs: ClassVar[bool] = False
     extra_prefill_env: ClassVar[dict[str, str]] = {}
     extra_decode_env: ClassVar[dict[str, str]] = {}
     _prefill_stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -48,10 +49,11 @@ class PDDisaggregationServerBase(CustomTestCase):
             f"{cls.base_host=} {cls.lb_port=} {cls.prefill_port=} {cls.decode_port=} {cls.bootstrap_port=}"
         )
         cls.process_lb, cls.process_decode, cls.process_prefill = None, None, None
-        cls._prefill_stdout_buf = io.StringIO()
-        cls._prefill_stderr_buf = io.StringIO()
-        cls._decode_stdout_buf = io.StringIO()
-        cls._decode_stderr_buf = io.StringIO()
+        if cls.capture_per_side_logs:
+            cls._prefill_stdout_buf = io.StringIO()
+            cls._prefill_stderr_buf = io.StringIO()
+            cls._decode_stdout_buf = io.StringIO()
+            cls._decode_stderr_buf = io.StringIO()
 
         # config transfer backend and rdma devices
         if is_in_ci():
@@ -93,7 +95,11 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
             env=dict(cls.extra_prefill_env),
-            return_stdout_stderr=(cls._prefill_stdout_buf, cls._prefill_stderr_buf),
+            return_stdout_stderr=(
+                (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
         )
 
     @classmethod
@@ -116,7 +122,11 @@ class PDDisaggregationServerBase(CustomTestCase):
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
             env=dict(cls.extra_decode_env),
-            return_stdout_stderr=(cls._decode_stdout_buf, cls._decode_stderr_buf),
+            return_stdout_stderr=(
+                (cls._decode_stdout_buf, cls._decode_stderr_buf)
+                if cls.capture_per_side_logs
+                else None
+            ),
         )
 
     @classmethod
@@ -166,18 +176,19 @@ class PDDisaggregationServerBase(CustomTestCase):
                 except Exception as e:
                     print(f"Error killing process {process.pid}: {e}")
 
-        for buf in (
-            cls._prefill_stdout_buf,
-            cls._prefill_stderr_buf,
-            cls._decode_stdout_buf,
-            cls._decode_stderr_buf,
-        ):
-            if buf is not None:
-                buf.close()
-        cls._prefill_stdout_buf = None
-        cls._prefill_stderr_buf = None
-        cls._decode_stdout_buf = None
-        cls._decode_stderr_buf = None
+        if cls.capture_per_side_logs:
+            for buf in (
+                cls._prefill_stdout_buf,
+                cls._prefill_stderr_buf,
+                cls._decode_stdout_buf,
+                cls._decode_stderr_buf,
+            ):
+                if buf is not None:
+                    buf.close()
+            cls._prefill_stdout_buf = None
+            cls._prefill_stderr_buf = None
+            cls._decode_stdout_buf = None
+            cls._decode_stderr_buf = None
 
         # wait for 5 seconds
         time.sleep(5)

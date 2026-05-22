@@ -16,6 +16,8 @@ _SHORT_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 8).strip
 class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
     """Base for PD disagg canary self-tests."""
 
+    capture_per_side_logs = True
+
     model_mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[CanaryMode] = CanaryMode.LOG
     extra_server_args: ClassVar[tuple[str, ...]] = ("--kv-canary-real-data", "partial")
