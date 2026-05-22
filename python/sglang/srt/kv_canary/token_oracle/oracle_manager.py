@@ -42,7 +42,7 @@ class TokenOracleManager:
             forward_batch=forward_batch,
             num_tokens=num_tokens,
             generalized_req_ids_per_row=select_generalized_req_ids(
-                fallback_generalized_req_ids_int=forward_batch.rids_int,
+                vanilla_req_ids=forward_batch.rids_int,
                 bootstrap_room_ids_int=forward_batch.bootstrap_room_ids_int,
             ),
         )
@@ -103,18 +103,18 @@ def _build_generalized_req_id_per_token(
 
 def select_generalized_req_ids(
     *,
-    fallback_generalized_req_ids_int: torch.Tensor,
+    vanilla_req_ids: torch.Tensor,
     bootstrap_room_ids_int: torch.Tensor | None,
 ) -> torch.Tensor:
     if bootstrap_room_ids_int is None:
-        return fallback_generalized_req_ids_int
+        return vanilla_req_ids
 
     bootstrap_room_ids_int = bootstrap_room_ids_int.to(
-        device=fallback_generalized_req_ids_int.device,
+        device=vanilla_req_ids.device,
         dtype=torch.int64,
     )
     return torch.where(
         bootstrap_room_ids_int >= 0,
         bootstrap_room_ids_int,
-        fallback_generalized_req_ids_int.to(torch.int64),
+        vanilla_req_ids.to(torch.int64),
     )

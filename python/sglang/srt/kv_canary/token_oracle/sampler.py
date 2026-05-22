@@ -40,8 +40,8 @@ class _OracleSampler(Sampler):
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
     ) -> torch.Tensor:
-        fallback_generalized_req_ids_int = sampling_info.rids_int
-        if fallback_generalized_req_ids_int is None:
+        vanilla_req_ids = sampling_info.rids_int
+        if vanilla_req_ids is None:
             raise RuntimeError(
                 "_OracleSampler.forward: generalized_req_id source tensor is None; "
                 "token oracle requires a per-forward generalized_req_id source tensor "
@@ -49,7 +49,7 @@ class _OracleSampler(Sampler):
             )
         batch_next_token_ids = self._token_oracle_manager.sample_next_tokens(
             generalized_req_ids=select_generalized_req_ids(
-                fallback_generalized_req_ids_int=fallback_generalized_req_ids_int,
+                vanilla_req_ids=vanilla_req_ids,
                 bootstrap_room_ids_int=sampling_info.bootstrap_room_ids_int,
             ),
             logits_positions=positions,
