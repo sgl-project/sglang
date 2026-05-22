@@ -2797,8 +2797,15 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = batch.is_spec_v2
+        # Staging fields are consumed by resolve_forward_inputs inside this
+        # isolation; restoring them would re-H2D stale data next iter.
+        _CONSUMED_BY_RESOLVE = {"prefill_input_ids_cpu", "mix_running_indices"}
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            {
+                f.name: getattr(batch, f.name)
+                for f in dataclasses.fields(batch)
+                if f.name not in _CONSUMED_BY_RESOLVE
+            }
             if snapshot_v2_full
             else None
         )
