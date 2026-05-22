@@ -197,8 +197,6 @@ class PerForwardOrchestrator:
             return
         self._perturb_manager.end_of_forward(forward_batch)
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
-        if self._swa_divergence_report is not None:
-            self._swa_divergence_report.on_forward_completed()
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:

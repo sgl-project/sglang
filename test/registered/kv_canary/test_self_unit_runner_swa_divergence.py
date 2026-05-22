@@ -95,7 +95,6 @@ class TestSwaDivergenceReport(CustomTestCase):
                     group=_make_group(PoolKind.SWA),
                     verify_plan=_make_verify_plan(3),
                 )
-                stats.on_forward_completed()
 
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
@@ -152,7 +151,6 @@ class TestSwaDivergenceReport(CustomTestCase):
                         group=_make_group(PoolKind.SWA),
                         verify_plan=_make_verify_plan(2),
                     )
-                    stats.on_forward_completed()
                 _take_snapshot(step=10 + 20 * batch)
 
             for idx in range(1, len(snapshots)):

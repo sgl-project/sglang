@@ -47,9 +47,6 @@ class SwaDivergenceReport:
         idx = _FULL_IDX if group.kind is PoolKind.FULL else _SWA_IDX
         self._verify_total_count_device[idx].add_(verify_plan.verify_num_valid)
 
-    def on_forward_completed(self) -> None:
-        self._forward_ct += 1
-
     def step(
         self,
         *,
@@ -57,6 +54,7 @@ class SwaDivergenceReport:
         period: int,
         forward_batch: "ForwardBatch",
     ) -> None:
+        self._forward_ct += 1
         self._handler.step(
             compute_on_device=lambda: self._compute_on_device(
                 step_counter=step_counter, period=period, forward_batch=forward_batch
