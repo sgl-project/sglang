@@ -173,20 +173,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 bonus_tokens=last_tokens_tensor,
-                new_seq_lens=self.seq_lens,
             )
-            # prepare_for_extend shifts batch.input_ids in place — keep it
-            # as the prefill prompt, not the [bs] last-token tensor.
-            spec_info.prepare_for_extend(self)
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
-                spec_info.future_indices = future_map.alloc_future_indices(
-                    len(self.seq_lens)
-                )
-                future_map.store_to_map_for_new_batch(
-                    spec_info.future_indices, spec_info
-                )
+                spec_info.future_indices = self.req_pool_indices
+                future_map.publish(spec_info.future_indices, self.seq_lens)
+                future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
-            # Non-spec: input_ids feeds the next decode forward directly.
+            # Non-spec: positive last token feeds decode directly. No FutureMap
+            # bootstrap needed (SB self-maintains seq_lens; resolve_future is
+            # a no-op on positive input_ids).
             self.input_ids = last_tokens_tensor

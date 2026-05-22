@@ -241,14 +241,14 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -269,7 +269,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         q_nope = q_nope.to(self.q_data_type)
         q_rope = q_rope.to(self.q_data_type)
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         o = cutlass_mla_decode(
             q_nope=q_nope,
