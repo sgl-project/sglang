@@ -1362,7 +1362,7 @@
                 "1": 115.0,
                 "2": 130.0
             },
-            "expected_e2e_ms": 2684.91,
+            "expected_e2e_ms": 3150.0,
             "expected_avg_denoise_ms": 95.0,
             "expected_median_denoise_ms": 120.0,
             "estimated_full_test_time_s": 125.2
@@ -2442,7 +2442,7 @@
                 "per_frame_generation": null
             },
             "denoise_step_ms": {
-                "0": 179.26,
+                "0": 225.43,
                 "1": 283.15,
                 "2": 193.3,
                 "3": 166.82,
@@ -2477,7 +2477,7 @@
                 "32": 184.4
             },
             "expected_e2e_ms": 18039.38,
-            "expected_avg_denoise_ms": 183.75,
+            "expected_avg_denoise_ms": 271.95,
             "expected_median_denoise_ms": 179.26,
             "estimated_full_test_time_s": 160.0
         },
@@ -2487,7 +2487,7 @@
                 "TextEncodingStage": 1554.35,
                 "LTX2TextConnectorStage": 27.64,
                 "LTX2HalveResolutionStage": 0.05,
-                "LTX2LoRASwitchStage": 114.37,
+                "LTX2LoRASwitchStage": 70.0,
                 "LTX2SigmaPreparationStage": 0.4,
                 "TimestepPreparationStage": 23.51,
                 "LTX2AVLatentPreparationStage": 0.15,
@@ -2531,10 +2531,10 @@
                 "29": 237.2,
                 "30": 127.08,
                 "31": 123.1,
-                "32": 128.06
+                "32": 209.80
             },
-            "expected_e2e_ms": 17660.77,
-            "expected_avg_denoise_ms": 238.8,
+            "expected_e2e_ms": 12000.0,
+            "expected_avg_denoise_ms": 299.01,
             "expected_median_denoise_ms": 246.85,
             "estimated_full_test_time_s": 170.0
         },

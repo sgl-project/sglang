@@ -251,7 +251,7 @@ class MMDoubleStreamBlock(nn.Module):
         # Run distributed attention
         img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
         img_attn_out, _ = self.img_attn_proj(
-            img_attn.view(batch_size, image_seq_len, -1)
+            img_attn.reshape(batch_size, image_seq_len, -1)
         )
         # Use fused operation for residual connection, normalization, and modulation
         img_mlp_input, img_residual = self.img_attn_residual_mlp_norm(

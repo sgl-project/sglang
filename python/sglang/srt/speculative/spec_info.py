@@ -117,23 +117,25 @@ class SpeculativeAlgorithm(Enum):
 
     def create_future_map(
         self,
-        max_running_requests: int,
-        chunked_prefill_size: int,
-        context_len: int,
         device: torch.device,
+        req_to_token_pool,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(
-            max_running_requests,
-            chunked_prefill_size,
-            context_len,
-            device,
-            self,
-        )
+        return FutureMap(device, self, req_to_token_pool)
 
     def supports_spec_v2(self) -> bool:
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # FIXME: Remove this after the forward mode refactor. Target verify is
+        # essentially a fixed sequence length prefill/extend with full cuda
+        # graph support. We can use it for target verify, or we can use it for
+        # other cases which is not target verify but fixed length prefill.
+        # Here, we expose this interface to allow the other use cases.
+        return num_draft_tokens
 
     def create_worker(
         self, server_args: ServerArgs
@@ -232,9 +234,11 @@ class SpecInput(ABC):
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
+    # Cross-algorithm phase guards. Used by attention backends and
+    # ForwardBatch padding logic to dispatch on phase without hardcoding the
+    # specific algo class (EAGLE / FROZEN_KV_MTP / DFLASH / NGRAM each have
+    # their own draft / verify SpecInput subclasses).
     def is_draft_input(self) -> bool:
-        # FIXME: remove this function which is only used for assertion
-        # or use another variable name like `draft_input` to substitute `spec_info`
         return self.spec_input_type in {
             SpecInputType.EAGLE_DRAFT,
             SpecInputType.EAGLE_DRAFT_EXTEND,

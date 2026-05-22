@@ -1031,7 +1031,7 @@ class MMReceiverBase(ABC):
             priority=recv_req.priority,
             metrics_collector=(
                 self.scheduler.metrics_collector
-                if self.scheduler.enable_metrics
+                if self.scheduler.metrics_reporter.enable_metrics
                 else None
             ),
             http_worker_ipc=recv_req.http_worker_ipc,

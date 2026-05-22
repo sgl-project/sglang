@@ -120,7 +120,10 @@ class DisaggregationDecodeRadixCacheTestMixin:
         )
 
 
-@unittest.skip("Temporarily disabled until nixl backend is stable.")
+@unittest.skipUnless(
+    is_in_ci() or _has_nixl(),
+    "NIXL is required for decode radix cache disaggregation coverage.",
+)
 class TestDisaggregationDecodeRadixCacheNixl(
     DisaggregationDecodeRadixCacheTestMixin, PDDisaggregationServerBase
 ):
