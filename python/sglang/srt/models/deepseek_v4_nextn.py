@@ -37,6 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer, DeepseekV4ForCausalLM
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
@@ -127,6 +128,11 @@ class DeepseekV4ModelNextN(nn.Module):
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=1)
         return y.to(dtype)
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.decoder.prewarm_mhc_token_count_buckets(max_num_tokens, device)
 
     def forward(
         self,
@@ -245,15 +251,14 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
                     forward_batch.seq_lens_cpu.tolist(),
                 )
                 if is_dsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
                     core_meta.init_flashmla_related()
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
+                            attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
         hidden_states, pre_hc_head = self.model(input_ids, positions, forward_batch)

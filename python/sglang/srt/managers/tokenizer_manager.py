@@ -216,6 +216,16 @@ class InputFormat(Enum):
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    @property
+    def serving_chat_class(self):
+        """Return the serving chat class for OpenAI API.
+
+        Override in subclass to provide custom serving behavior.
+        """
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        return OpenAIServingChat
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -444,7 +454,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        start_disagg_service(self.server_args)
+        # Keep a reference so the bootstrap server is not garbage-collected.
+        self.bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
