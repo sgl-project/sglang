@@ -14,10 +14,10 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
-    import torch
-
     import mlx.core as mx
     import mlx.nn as nn
+    import torch
+
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,
@@ -331,7 +331,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(model.seen_inputs, [[[7]]])
         self.assertEqual(model.seen_cache_types, [["AttentionOffsetCache"]])
 
-    def test_auxiliary_decode_keeps_native_cache_for_multi_request(self):
+    def test_auxiliary_decode_uses_hybrid_batching_for_multi_request(self):
         runner = object.__new__(MlxModelRunner)
         _set_runner_cache_layout(
             runner,
@@ -343,24 +343,21 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         runner._req_token_ids = {rid: [idx + 20] for idx, rid in enumerate(req_ids)}
         calls = []
 
-        def fake_native(caches, input_ids_by_request):
-            calls.append(
-                (
-                    len(caches),
-                    [input_ids.tolist() for input_ids in input_ids_by_request],
-                )
-            )
+        def fake_hybrid(caches, batched_input):
+            calls.append((len(caches), batched_input.tolist()))
             return mx.array([4, 5], dtype=mx.int32)
 
         def fail_batched(*args, **kwargs):
-            raise AssertionError("auxiliary decode should use native caches")
+            raise AssertionError(
+                "auxiliary decode should use hybrid batching, not full batched"
+            )
 
-        runner._decode_with_native_cache = fake_native
+        runner._decode_with_hybrid_batching = fake_hybrid
         runner._decode_with_batched_attention = fail_batched
 
         pending = runner.decode_batch_start(req_ids)
 
-        self.assertEqual(calls, [(2, [[[20]], [[21]]])])
+        self.assertEqual(calls, [(2, [[20], [21]])])
         self.assertEqual(pending.lazy_tokens.tolist(), [4, 5])
 
     def test_auxiliary_state_prefill_restores_prefix_state(self):

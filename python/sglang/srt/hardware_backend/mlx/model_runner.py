@@ -21,12 +21,12 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import mlx.core as mx
 import psutil
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
-import mlx.core as mx
-from mlx.utils import tree_flatten
 from sglang.srt.hardware_backend.mlx.kv_cache import (
     AttentionOffsetCache,
     BatchedDecodeContext,
@@ -154,6 +154,10 @@ class MlxModelRunner:
         ):
             raise RuntimeError(
                 "MLX models with auxiliary cache state require model.make_cache()."
+            )
+        if self._cache_layout.has_auxiliary_state:
+            self._model_embed, self._model_norm, self._model_lm_head = (
+                self._extract_model_components()
             )
         self._max_seq_len = 4096  # doubles on overflow
 
@@ -823,9 +827,71 @@ class MlxModelRunner:
         )
         return next_token
 
-    def _decode_requires_native_cache(self) -> bool:
-        # Auxiliary layers keep opaque mlx-lm cache state that is not batchable yet.
-        return self._cache_layout.has_auxiliary_state
+    def _extract_model_components(self):
+        """Cache embedding, norm, and lm_head for layer-by-layer hybrid forward."""
+        root = getattr(self.model, "language_model", self.model)
+        text_model = getattr(root, "model", root)
+        embed = text_model.embed_tokens
+        norm = text_model.norm
+        if hasattr(root, "lm_head"):
+            lm_head = root.lm_head
+        elif hasattr(root, "args") and getattr(root.args, "tie_word_embeddings", False):
+            lm_head = text_model.embed_tokens.as_linear
+        else:
+            lm_head = root.lm_head
+        return embed, norm, lm_head
+
+    def _decode_with_hybrid_batching(
+        self,
+        caches: list[list[Any]],
+        batched_input: mx.array,
+    ) -> mx.array:
+        """Layer-by-layer hybrid decode: batch attention, serialize DeltaNet.
+
+        Attention layers run with batched hidden states via
+        ``BatchedDecodeContext``. Auxiliary (DeltaNet) layers run
+        per-request since their recurrent state is not batchable.
+        """
+        batch_size = len(caches)
+
+        hidden_states = self._model_embed(batched_input)
+
+        seq_lens = [
+            self._first_attention_cache(caches[i]).offset for i in range(batch_size)
+        ]
+        attention_layer_caches = self._cache_layout.attention_layer_caches(caches)
+        ctx = BatchedDecodeContext(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            attention_layer_caches=attention_layer_caches,
+            attention_pool_index_by_layer=(
+                self._cache_layout.attention_pool_index_by_layer
+            ),
+        )
+        max_offset = max(seq_lens)
+
+        for layer_idx in range(self._cache_layout.num_layers):
+            layer = self._cache_layout.layers[layer_idx]
+
+            if self._cache_layout.attention_attrs[layer_idx] is not None:
+                set_context(ctx)
+                try:
+                    shim = AttentionOffsetCache(offset=max_offset)
+                    hidden_states = layer(hidden_states, mask=None, cache=shim)
+                finally:
+                    clear_context()
+            else:
+                per_req = [hidden_states[i : i + 1] for i in range(batch_size)]
+                results = []
+                for i in range(batch_size):
+                    results.append(
+                        layer(per_req[i], mask=None, cache=caches[i][layer_idx])
+                    )
+                hidden_states = mx.concatenate(results, axis=0)
+
+        hidden_states = self._model_norm(hidden_states)
+        logits = self._extract_logits(self._model_lm_head(hidden_states))
+        return mx.argmax(logits[:, -1, :], axis=-1)
 
     def _decode_with_native_cache(
         self,
@@ -882,19 +948,12 @@ class MlxModelRunner:
         to kick off GPU work before :meth:`decode_batch_finalize`.
         """
         caches = [self._req_caches[rid] for rid in req_ids]
+        last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
+        batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
-        if self._decode_requires_native_cache():
-            input_ids_by_request = [
-                mx.array([[self._req_token_ids[rid][-1]]], dtype=mx.int32)
-                for rid in req_ids
-            ]
-            lazy_tokens = self._decode_with_native_cache(
-                caches,
-                input_ids_by_request,
-            )
+        if self._cache_layout.has_auxiliary_state:
+            lazy_tokens = self._decode_with_hybrid_batching(caches, batched_input)
         else:
-            last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
-            batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
             lazy_tokens = self._decode_with_batched_attention(caches, batched_input)
 
         return MlxPendingDecode(
@@ -936,16 +995,10 @@ class MlxModelRunner:
         # mutates the Python offset synchronously at graph-build time.
         # So layer-0 offsets reflect the position the NEW token will
         # be written at in step N+1 (and equivalently the RoPE offset).
-        if self._decode_requires_native_cache():
-            input_ids_by_request = [
-                prev.lazy_tokens[i : i + 1, None] for i in range(len(prev.req_ids))
-            ]
-            lazy_tokens = self._decode_with_native_cache(
-                caches,
-                input_ids_by_request,
-            )
+        batched_input = prev.lazy_tokens[:, None]
+        if self._cache_layout.has_auxiliary_state:
+            lazy_tokens = self._decode_with_hybrid_batching(caches, batched_input)
         else:
-            batched_input = prev.lazy_tokens[:, None]
             lazy_tokens = self._decode_with_batched_attention(caches, batched_input)
 
         return MlxPendingDecode(
