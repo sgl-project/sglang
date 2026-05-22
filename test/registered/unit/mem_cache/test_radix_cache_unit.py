@@ -28,6 +28,7 @@ import random
 import time
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 import torch
 
@@ -773,6 +774,14 @@ class TestRadixCache(unittest.TestCase):
 
         print(cache.available_and_evictable_str())
         print(available_and_evictable_str(cache))
+
+        dummy_allocator = unittest.mock.Mock()
+        dummy_allocator.available_size.return_value = 7
+        dummy_cache = SimpleNamespace(token_to_kv_pool_allocator=dummy_allocator)
+
+        diag = available_and_evictable_str(dummy_cache)
+        self.assertIn("Available tokens: 7", diag)
+        self.assertIn("available_size=7", diag)
 
 
 if __name__ == "__main__":
