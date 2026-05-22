@@ -40,14 +40,13 @@ class KernelRunCounterHealthChecker:
         self._device_state = device_state
         self._active_tags = active_tags
         self._step_counter_getter = step_counter_getter
-        self._handler = DelayedDeviceHostHandler(
-            compute_on_device=self._compute_on_device,
-            postprocess_on_host=self._postprocess_on_host,
-            d2h_stream=d2h_stream,
-        )
+        self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
     def step(self) -> None:
-        self._handler.step()
+        self._handler.step(
+            compute_on_device=self._compute_on_device,
+            postprocess_on_host=self._postprocess_on_host,
+        )
 
     def _compute_on_device(self) -> Optional[torch.Tensor]:
         step_counter = self._step_counter_getter()
@@ -92,14 +91,13 @@ class PeriodicCanaryStatsLogger:
         self._active_tags = active_tags
         self._step_counter_getter = step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
-        self._handler = DelayedDeviceHostHandler(
-            compute_on_device=self._compute_on_device,
-            postprocess_on_host=self._postprocess_on_host,
-            d2h_stream=d2h_stream,
-        )
+        self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
     def step(self) -> None:
-        self._handler.step()
+        self._handler.step(
+            compute_on_device=self._compute_on_device,
+            postprocess_on_host=self._postprocess_on_host,
+        )
 
     def _compute_on_device(self) -> Optional[dict[str, torch.Tensor]]:
         period = self._config.stats_print_every_n_steps

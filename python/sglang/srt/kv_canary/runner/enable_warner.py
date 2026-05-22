@@ -21,19 +21,13 @@ class _CanaryEnableWarner:
     ) -> None:
         self._verify_capacity = verify_capacity
         self._overflow_count_total: int = 0
-        self._current_enable_device: Optional[torch.Tensor] = None
-        self._handler = DelayedDeviceHostHandler(
-            compute_on_device=self._compute_on_device,
-            postprocess_on_host=self._postprocess_on_host,
-            d2h_stream=d2h_stream,
-        )
+        self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
     def tick(self, enable_device: torch.Tensor) -> None:
-        self._current_enable_device = enable_device
-        self._handler.step()
-
-    def _compute_on_device(self) -> Optional[torch.Tensor]:
-        return self._current_enable_device
+        self._handler.step(
+            compute_on_device=lambda: enable_device,
+            postprocess_on_host=self._postprocess_on_host,
+        )
 
     def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
         if int(host_tensor.item()) == 0:

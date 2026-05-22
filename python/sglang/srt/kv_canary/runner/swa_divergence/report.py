@@ -39,14 +39,7 @@ class SwaDivergenceReport:
         self._verify_total_count_device: torch.Tensor = torch.zeros(
             2, dtype=torch.int32, device=device
         )
-        self._current_step_counter: int = 0
-        self._current_period: int = 0
-        self._current_forward_batch: Optional["ForwardBatch"] = None
-        self._handler = DelayedDeviceHostHandler(
-            compute_on_device=self._compute_on_device,
-            postprocess_on_host=self._postprocess_on_host,
-            d2h_stream=d2h_stream,
-        )
+        self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
     def observe_after_invoke_plan(
         self, *, group: CanaryBufferGroup, verify_plan: VerifyPlan
@@ -64,14 +57,20 @@ class SwaDivergenceReport:
         period: int,
         forward_batch: "ForwardBatch",
     ) -> None:
-        self._current_step_counter = step_counter
-        self._current_period = period
-        self._current_forward_batch = forward_batch
-        self._handler.step()
+        self._handler.step(
+            compute_on_device=lambda: self._compute_on_device(
+                step_counter=step_counter, period=period, forward_batch=forward_batch
+            ),
+            postprocess_on_host=self._postprocess_on_host,
+        )
 
-    def _compute_on_device(self) -> Optional[dict[str, torch.Tensor]]:
-        period = self._current_period
-        step_counter = self._current_step_counter
+    def _compute_on_device(
+        self,
+        *,
+        step_counter: int,
+        period: int,
+        forward_batch: "ForwardBatch",
+    ) -> Optional[dict[str, torch.Tensor]]:
         if period <= 0 or step_counter == 0 or step_counter % period != 0:
             return None
 
@@ -82,7 +81,7 @@ class SwaDivergenceReport:
             result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
                 swa_allocator=self._swa_allocator,
                 req_to_token_pool=self._req_to_token_pool,
-                forward_batch=self._current_forward_batch,
+                forward_batch=forward_batch,
             )
         return result
 

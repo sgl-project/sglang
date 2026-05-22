@@ -60,19 +60,23 @@ class DelayedDeviceHostHandler:
     Each call to :meth:`step` first drains the previous step's staged future (running
     ``postprocess_on_host`` against the host snapshot) and then asks ``compute_on_device``
     for fresh device data to stage. ``compute_on_device`` may return ``None`` to skip
-    staging (e.g. period gating)."""
+    staging (e.g. period gating). Both callables are passed per-call so the caller can
+    capture step-local state in a closure instead of stashing it on ``self``."""
 
-    compute_on_device: Callable[[], Optional[_TensorOrDict]]
-    postprocess_on_host: Callable[[_TensorOrDict], None]
     d2h_stream: torch.cuda.Stream
     _future: Optional[FutureTensors] = field(default=None)
 
-    def step(self) -> None:
+    def step(
+        self,
+        *,
+        compute_on_device: Callable[[], Optional[_TensorOrDict]],
+        postprocess_on_host: Callable[[_TensorOrDict], None],
+    ) -> None:
         if (pending := self._future) is not None:
-            self.postprocess_on_host(pending.wait())
+            postprocess_on_host(pending.wait())
 
         with torch.cuda.stream(self.d2h_stream):
-            device_data = self.compute_on_device()
+            device_data = compute_on_device()
 
         if device_data is None:
             self._future = None
