@@ -151,9 +151,9 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
-        self._pending_output_results: deque[
-            tuple[bytes | None, OutputBatch, bool]
-        ] = deque()
+        self._pending_output_results: deque[tuple[bytes | None, OutputBatch, bool]] = (
+            deque()
+        )
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
