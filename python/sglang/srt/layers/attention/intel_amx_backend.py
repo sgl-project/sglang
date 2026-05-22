@@ -41,6 +41,26 @@ class IntelAMXAttnBackend(AttentionBackend):
         self.decode_attention_fwd = torch.ops.sgl_kernel.decode_attention_cpu
         self.extend_attention_fwd = torch.ops.sgl_kernel.extend_attention_cpu
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Init the metadata for a forward pass."""
+
+        bs = forward_batch.batch_size
+        attn_logits = torch.zeros(
+            (
+                bs,
+                self.num_head,
+                8,  # self.num_kv_splits,
+                self.v_head_dim + 1,
+            ),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if forward_batch.forward_mode.is_decode_or_idle():
+            max_extend_len = None
+        else:
+            max_extend_len = torch.max(forward_batch.extend_seq_lens).item()
+        self.forward_metadata = (attn_logits, max_extend_len)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
 
