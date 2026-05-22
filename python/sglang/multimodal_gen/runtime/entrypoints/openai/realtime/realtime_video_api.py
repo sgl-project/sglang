@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
-import io
 import os
 import shutil
 import tempfile
@@ -10,7 +9,6 @@ from typing import TypedDict
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from msgpack import packb, unpackb
-from PIL import Image
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeAction,
@@ -18,7 +16,6 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.realtime.generate_session import (
     GenerateSession,
-    RealtimeVideoMode,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     process_generation_batch,
@@ -164,18 +161,6 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
         try:
             start = time.perf_counter()
             timings: dict[str, float] = {}
-            # For stream-driven v2v (no first_frame),
-            # wait until enough frames are buffered for this block.
-            stage_start = time.perf_counter()
-            if (
-                session.request is not None
-                and session.is_v2v_enabled()
-                and session.request.first_frame is None
-            ):
-                while not session.has_pending_video_frames():
-                    await asyncio.sleep(0.01)
-            timings["wait_video_ms"] = (time.perf_counter() - stage_start) * 1000.0
-
             session.new_request()
 
             # send to scheduler and generate video chunk
@@ -246,15 +231,14 @@ async def _generate_loop(ws: WebSocket, session: GenerateSession):
 
             logger.info(
                 "realtime video stage timing: session_id=%s request_id=%s "
-                "chunk_idx=%s wait_video=%.2fms prepare=%.2fms "
-                "process_generation=%.2fms msgpack_pack=%.2fms "
+                "chunk_idx=%s prepare=%.2fms process_generation=%.2fms "
+                "msgpack_pack=%.2fms "
                 "header_send=%.2fms raw_join=%.2fms raw_send=%.2fms "
                 "ws_send=%.2fms total=%.2fms batches=%d frames=%d "
                 "frame_shape=%s raw_bytes=%d ws_payload_bytes=%d content_type=%s",
                 session.id,
                 session.request_id,
                 batch.block_idx,
-                timings["wait_video_ms"],
                 timings["prepare_ms"],
                 timings["process_generation_ms"],
                 timings["msgpack_pack_ms"],
@@ -314,52 +298,22 @@ async def _listen_actions(ws: WebSocket, session: GenerateSession):
             if not isinstance(data, dict):
                 raise ValueError("realtime action must be a map")
             realtime_action = RealtimeAction.model_validate(data)
-            if realtime_action.type == "video":
-                if not session.is_v2v_enabled():
-                    logger.warning(
-                        "ignore video action in non-v2v mode, session_id=%s",
-                        session.id,
-                    )
-                    await write_error_msg(
-                        "video action requires mode=v2v (or first_frame in auto mode)",
-                        ws,
-                    )
-                    continue
-
-                encoded_frames = list(realtime_action.video_frames or [])
-                if realtime_action.video_frame is not None:
-                    encoded_frames.append(realtime_action.video_frame)
-                if len(encoded_frames) == 0:
-                    raise ValueError(
-                        "video action requires video_frame or video_frames"
-                    )
-
-                frames = []
-                for frame_bytes in encoded_frames:
-                    image = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
-                    frames.append(image)
-                session.append_video_frames(frames)
-                total_bytes = sum(len(frame) for frame in encoded_frames)
-                action_log = (
-                    f"type=video, num_frames={len(encoded_frames)}, "
-                    f"total_bytes={total_bytes}"
-                )
-            elif realtime_action.type == "control":
+            if realtime_action.type == "control":
                 control_chunk = realtime_action.control_chunk
                 if control_chunk is not None:
                     session.append_control_chunk(control_chunk)
-                    action_log = (
-                        f"type=control, mode=chunk, chunk_len={len(control_chunk)}"
-                    )
+                    action_log = f"type=control, chunk_len={len(control_chunk)}"
                 else:
                     raise ValueError("control action requires control_chunk")
-            else:
+            elif realtime_action.type == "prompt":
                 if not realtime_action.action_content:
                     raise ValueError("prompt action requires action_content")
-                session.append_action(realtime_action)
+                session.append_prompt_action(realtime_action)
                 action_log = (
                     f"type=prompt, content_len={len(realtime_action.action_content)}"
                 )
+            else:
+                raise ValueError(f"unsupported action type: {realtime_action.type}")
             logger.debug(
                 "receive realtime action, session_id=%s, %s",
                 session.id,
@@ -378,24 +332,6 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
             data = unpackb(await ws.receive_bytes(), raw=False)
             if not isinstance(data, dict):
                 raise ValueError("generate request must be a map")
-
-            mode_raw = data.get("mode")
-            if mode_raw is None:
-                mode = None
-            else:
-                if isinstance(mode_raw, bytes):
-                    try:
-                        mode_raw = mode_raw.decode("utf-8")
-                    except Exception as e:
-                        raise ValueError("mode must be a utf-8 string") from e
-                if not isinstance(mode_raw, str):
-                    raise ValueError("mode must be one of: t2v, v2v")
-                try:
-                    mode = RealtimeVideoMode(mode_raw)
-                except Exception as e:
-                    raise ValueError("mode must be one of: t2v, v2v") from e
-            if mode == RealtimeVideoMode.T2V and data.get("first_frame") is not None:
-                raise ValueError("first_frame is not allowed when mode=t2v")
 
             realtime_req = RealtimeVideoGenerationsRequest.model_validate(data)
             # TODO(puf147): convert RGB for krea
@@ -419,7 +355,6 @@ async def _listen_generate_request(ws: WebSocket, session: GenerateSession):
                 realtime_req.first_frame = image_path
 
             # Keep session state update atomic with validated request.
-            session.set_mode(mode)
             session.set_request(realtime_req)
             break
         except Exception as e:

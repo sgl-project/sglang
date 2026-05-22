@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
-from enum import Enum
 from uuid import uuid4
-
-import numpy as np
 
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
     RealtimeAction,
@@ -16,24 +13,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.realtime_session import (
 )
 
 
-class RealtimeVideoMode(str, Enum):
-    T2V = "t2v"
-    V2V = "v2v"
-
-
 class GenerateSession:
-    _FIRST_BLOCK_ENCODE_FRAMES = 9
-    _NEXT_BLOCK_ENCODE_FRAMES = 12
-
     def __init__(self):
         self.id = uuid4().hex
         self.request_id = None
         self.request: RealtimeVideoGenerationsRequest | None = None
-        self.mode: RealtimeVideoMode | None = None
         self.input_temp_dir: str | None = None
-        self.action_queue = deque(maxlen=1)
+        self.prompt_queue = deque(maxlen=1)
         self.control_queue = deque(maxlen=512)
-        self.video_frame_queue = deque(maxlen=256)
         self.generate_chunk_cnt = 0
         self.last_control_actions: list[str] = []
         self.has_control_state = False
@@ -42,14 +29,9 @@ class GenerateSession:
     def set_request(self, request: RealtimeVideoGenerationsRequest):
         self.request = request
 
-    def set_mode(self, mode: RealtimeVideoMode | None):
-        self.mode = mode
-
     def dispose(self):
-        self.action_queue.clear()
+        self.prompt_queue.clear()
         self.control_queue.clear()
-        self.video_frame_queue.clear()
-        self.mode = None
         self.request = None
         self.request_id = None
         self.input_temp_dir = None
@@ -64,8 +46,8 @@ class GenerateSession:
     def generate_chunk_completed(self):
         self.generate_chunk_cnt += 1
 
-    def append_action(self, action: RealtimeAction):
-        self.action_queue.append(action)
+    def append_prompt_action(self, action: RealtimeAction):
+        self.prompt_queue.append(action)
 
     def _append_control_frame(self, actions: list[str]):
         normalized = list(actions)
@@ -74,32 +56,15 @@ class GenerateSession:
         self.has_control_state = True
 
     def append_control_chunk(self, control_chunk: list[list[str]]):
+        if len(control_chunk) == 0:
+            self.last_control_actions = []
+            self.has_control_state = True
+            return
         for actions in control_chunk:
             self._append_control_frame(actions)
 
-    def append_video_frames(self, frames: list):
-        if len(frames) > 0:
-            self.video_frame_queue.extend(frames)
-
-    def has_pending_video_frames(self) -> bool:
-        return len(self.video_frame_queue) >= self.required_video_frames()
-
-    def is_v2v_enabled(self) -> bool:
-        if self.request is None:
-            return False
-        if self.mode is not None:
-            return self.mode == RealtimeVideoMode.V2V
-        # Auto mode only checks first_frame.
-        return self.request.first_frame is not None
-
-    def required_video_frames(self) -> int:
-        # todo make _FIRST_BLOCK_ENCODE_FRAMES and _NEXT_BLOCK_ENCODE_FRAMES config
-        if self.generate_chunk_cnt == 0:
-            return self._FIRST_BLOCK_ENCODE_FRAMES
-        return self._NEXT_BLOCK_ENCODE_FRAMES
-
-    def sample_action(self) -> RealtimeAction:
-        return self.action_queue.popleft()
+    def sample_prompt_action(self) -> RealtimeAction:
+        return self.prompt_queue.popleft()
 
     def sample_control_chunk(self, chunk_size: int) -> list[list[str]] | None:
         if chunk_size <= 0:
@@ -110,8 +75,8 @@ class GenerateSession:
             chunk.append(list(self.control_queue.popleft()))
 
         if len(chunk) == 0 and not self.has_control_state:
-            # Keep emitting an explicit no-op control chunk so LingBot-style
-            # camera conditioning stays active before any user control arrives.
+            # Keep emitting an explicit no-op control chunk before any user
+            # control arrives.
             return [[] for _ in range(chunk_size)]
 
         pad_actions = list(self.last_control_actions)
@@ -119,35 +84,13 @@ class GenerateSession:
             chunk.append(list(pad_actions))
         return chunk
 
-    def sample_video_frames(self):
-        required = self.required_video_frames()
-        if len(self.video_frame_queue) < required:
-            return None
-
-        pending_frames = []
-        while len(self.video_frame_queue) > 0:
-            pending_frames.append(self.video_frame_queue.popleft())
-        if len(pending_frames) < required:
-            return None
-        if len(pending_frames) == required:
-            return pending_frames
-
-        # TODO more sampling strategy.
-        indices = np.round(np.linspace(0, len(pending_frames) - 1, required)).astype(
-            int
-        )
-        return [pending_frames[i] for i in indices]
-
     def build_sampling_params(self):
         if self.generate_chunk_cnt == 0:
             prompt = self.request.prompt
-        elif len(self.action_queue) > 0:
-            realtime_action = self.sample_action()
-            # TODO more sampling strategy.
-            # only support prompt action now
-            if realtime_action.type == "prompt":
-                prompt = realtime_action.action_content
-                self.request.prompt = prompt
+        elif len(self.prompt_queue) > 0:
+            realtime_action = self.sample_prompt_action()
+            prompt = realtime_action.action_content
+            self.request.prompt = prompt
         else:
             prompt = self.request.prompt
 

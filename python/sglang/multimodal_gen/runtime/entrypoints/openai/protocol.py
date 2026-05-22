@@ -133,6 +133,7 @@ class VideoRemixRequest(BaseModel):
 
 
 class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
+    type: Literal["init"]
     # WebSocket does not support multipart/form-data image uploads
     first_frame: Optional[bytes | str] = None
     seed: Optional[int] = 42
@@ -144,10 +145,8 @@ class RealtimeVideoGenerationsRequest(VideoGenerationsRequest):
 
 
 class RealtimeAction(BaseModel):
-    type: Literal["prompt", "video", "control"]
+    type: Literal["prompt", "control"]
     action_content: Optional[str] = None
-    video_frame: Optional[bytes] = None
-    video_frames: Optional[List[bytes]] = None
     control_chunk: Optional[List[List[str]]] = None
 
 
