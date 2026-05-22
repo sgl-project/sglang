@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import make_pool
 
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import PoolKind
@@ -33,6 +32,7 @@ from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_buffer_group,
     make_forward_batch,
+    make_req_to_token_pool,
 )
 from sglang.test.test_utils import CustomTestCase
 
@@ -150,7 +150,7 @@ class TestPerturbManager(CustomTestCase):
                 target_group_kind=TargetGroupKind.FULL,
                 warmup_steps=0,
             ),
-            req_to_token_pool=make_pool(device),
+            req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(),
             step_counter_getter=lambda: 10,
         )
@@ -229,7 +229,7 @@ class TestReqToTokenPerturb(CustomTestCase):
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
         """Verify req_to_token perturbation replaces a slot with another live slot."""
         device = DEFAULT_DEVICE
-        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token[1, :3] = torch.tensor(
             [11, 22, 33], dtype=torch.int32, device=device
         )
@@ -273,7 +273,7 @@ class TestReqToTokenPerturb(CustomTestCase):
     def test_collect_active_slots_ignores_padded_out_cache_loc(self) -> None:
         """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE
-        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token[1, :2] = torch.tensor(
             [0, 7], dtype=torch.int32, device=device
         )
@@ -297,7 +297,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
     ) -> None:
         """Verify real_kv_used flips only the first real KV byte for an active FULL slot."""
         device = DEFAULT_DEVICE
-        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token.fill_(-1)
         pool.req_to_token[1, 0] = 2
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
@@ -361,7 +361,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
     def test_warmup_gate_prevents_perturbation_when_probabilities_are_one(self) -> None:
         """Verify warmup prevents all perturbations even when every probability is one."""
         device = DEFAULT_DEVICE
-        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token.fill_(-1)
         pool.req_to_token[1, 0] = 2
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
@@ -409,7 +409,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
     ) -> None:
         """Verify real_kv_unused_cache flips only the first real KV byte for an orphan slot."""
         device = DEFAULT_DEVICE
-        pool = make_pool(device, max_reqs=4, max_seq=8)
+        pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor.copy_(
@@ -465,7 +465,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
                 target_group_kind=TargetGroupKind.FULL,
                 warmup_steps=0,
             ),
-            req_to_token_pool=make_pool(device),
+            req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(group,),
             step_counter_getter=lambda: 10,
         )

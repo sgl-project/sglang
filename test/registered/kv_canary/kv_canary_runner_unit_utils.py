@@ -14,19 +14,14 @@ from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
+from sglang.test.kv_canary.fixtures import (
+    DEFAULT_DEVICE,
+    make_buffer_group,
+    make_req_to_token_pool,
+)
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=1, stage="extra-a", runner_config="1-gpu-large")
-
-
-def make_pool(
-    device: torch.device,
-    max_reqs: int = 4,
-    max_seq: int = 8,
-) -> SimpleNamespace:
-    req_to_token = torch.zeros(max_reqs, max_seq, dtype=torch.int32, device=device)
-    return SimpleNamespace(req_to_token=req_to_token, size=max_reqs)
 
 
 def make_config(
@@ -70,7 +65,7 @@ def make_runner(
     if group is None:
         group = make_buffer_group(device=device)
     if req_pool is None:
-        req_pool = make_pool(device)
+        req_pool = make_req_to_token_pool(device=device, max_reqs=4, max_seq_len=8)
     return CanaryRunner(
         config=config,
         buffer_groups=(group,),
