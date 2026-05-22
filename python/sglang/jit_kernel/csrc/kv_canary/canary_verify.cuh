@@ -70,7 +70,7 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     const int64_t expected_position = p.verify_positions[entry_idx];
     const int64_t prev_slot_idx = p.verify_prev_slot_indices[entry_idx];
 
-    if (slot_idx == kCanaryReservedSlot) {
+    if (slot_idx == kTokenToKvSlotPadding) {
       continue;
     }
 
