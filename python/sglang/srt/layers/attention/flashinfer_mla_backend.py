@@ -412,9 +412,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         restored by a follow-up per-backend optimization PR.
         """
         bs = forward_batch.batch_size
+        # Normalize to bs-length: replay callers may pass full padded buffers;
+        # capture callers pre-slice. [:bs] is safe in both cases.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         num_tokens = bs
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         if forward_mode.is_decode_or_idle():
