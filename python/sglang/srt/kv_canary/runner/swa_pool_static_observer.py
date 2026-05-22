@@ -25,9 +25,7 @@ class SwaPoolStaticObserver:
             )
         self._baseline_mapping: torch.Tensor = mapping.detach().clone()
 
-    def snapshot_nonidentity_future(
-        self, *, stream: torch.cuda.Stream
-    ) -> FutureTensor:
+    def snapshot_nonidentity_future(self, *, stream: torch.cuda.Stream) -> FutureTensor:
         mapping = self._swa_allocator.full_to_swa_index_mapping
         with torch.cuda.stream(stream):
             count = (mapping != self._baseline_mapping).sum().to(torch.int32).view(1)
