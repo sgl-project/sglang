@@ -98,6 +98,31 @@ class MlxPendingDecode:
     caches: list[list[Any]]
 
 
+class _BatchedAuxiliaryCache:
+    """Batched cache adapter for running auxiliary layers across requests.
+
+    Stacks per-request cache arrays along the batch dimension so a single
+    layer call processes all requests at once.  Only supports the decode
+    path (lengths and left_padding are None).
+    """
+
+    __slots__ = ("cache", "lengths", "left_padding")
+
+    def __init__(self, cache_slots: list):
+        self.cache = cache_slots
+        self.lengths = None
+        self.left_padding = None
+
+    def __getitem__(self, idx):
+        return self.cache[idx]
+
+    def __setitem__(self, idx, value):
+        self.cache[idx] = value
+
+    def advance(self, N):
+        pass
+
+
 _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
     # name -> (bits, group_size). group_size=64 matches the mlx-community convention.
     "mlx_q4": (4, 64),
@@ -846,11 +871,12 @@ class MlxModelRunner:
         caches: list[list[Any]],
         batched_input: mx.array,
     ) -> mx.array:
-        """Layer-by-layer hybrid decode: batch attention, serialize DeltaNet.
+        """Layer-by-layer hybrid decode: batch both attention and auxiliary.
 
-        Attention layers run with batched hidden states via
-        ``BatchedDecodeContext``. Auxiliary (DeltaNet) layers run
-        per-request since their recurrent state is not batchable.
+        Attention layers batch via ``BatchedDecodeContext``.  Auxiliary
+        (e.g. DeltaNet) layers batch by stacking per-request cache states
+        along the batch dimension — the Metal kernels already parallelise
+        across B in their grid.
         """
         batch_size = len(caches)
 
@@ -880,14 +906,28 @@ class MlxModelRunner:
                     hidden_states = layer(hidden_states, mask=None, cache=shim)
                 finally:
                     clear_context()
+            elif batch_size == 1:
+                hidden_states = layer(
+                    hidden_states, mask=None, cache=caches[0][layer_idx]
+                )
             else:
-                per_req = [hidden_states[i : i + 1] for i in range(batch_size)]
-                results = []
-                for i in range(batch_size):
-                    results.append(
-                        layer(per_req[i], mask=None, cache=caches[i][layer_idx])
-                    )
-                hidden_states = mx.concatenate(results, axis=0)
+                req_caches = [caches[i][layer_idx] for i in range(batch_size)]
+                num_slots = len(req_caches[0].cache)
+                batched_cache = _BatchedAuxiliaryCache(
+                    [
+                        (
+                            mx.concatenate([rc.cache[s] for rc in req_caches], axis=0)
+                            if req_caches[0].cache[s] is not None
+                            else None
+                        )
+                        for s in range(num_slots)
+                    ]
+                )
+                hidden_states = layer(hidden_states, mask=None, cache=batched_cache)
+                for s in range(num_slots):
+                    if batched_cache.cache[s] is not None:
+                        for i in range(batch_size):
+                            req_caches[i].cache[s] = batched_cache.cache[s][i : i + 1]
 
         hidden_states = self._model_norm(hidden_states)
         logits = self._extract_logits(self._model_lm_head(hidden_states))
