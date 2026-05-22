@@ -33,6 +33,34 @@ def _assert_nonneg_and_invalidate(
     buf[indices] = -1
 
 
+@torch.compile(dynamic=True)
+def _gather_spec_extras_3(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+):
+    """Compiled to fuse 3 advanced-indexing gathers into a single launch."""
+    return topk_p_buf[indices], topk_index_buf[indices], output_tokens_buf[indices]
+
+
+@torch.compile(dynamic=True)
+def _gather_spec_extras_4(
+    indices: torch.Tensor,
+    topk_p_buf: torch.Tensor,
+    topk_index_buf: torch.Tensor,
+    output_tokens_buf: torch.Tensor,
+    hidden_states_buf: torch.Tensor,
+):
+    """4-buf variant for builds that capture hidden states."""
+    return (
+        topk_p_buf[indices],
+        topk_index_buf[indices],
+        output_tokens_buf[indices],
+        hidden_states_buf[indices],
+    )
+
+
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -132,18 +160,36 @@ class FutureMap:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
         indices = draft_input.future_indices
-        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
-        # record_batch_in_overlap; record_stream here is redundant.
-        indices.record_stream(torch.get_device_module(self.device).current_stream())
-        draft_input.topk_p = self.topk_p_buf[indices]
-        draft_input.topk_index = self.topk_index_buf[indices]
-        draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        # indices = batch.req_pool_indices is pinned 2 iters via
+        # record_batch_in_overlap; explicit record_stream is unnecessary.
+        if spec_need_hidden_states():
+            (
+                draft_input.topk_p,
+                draft_input.topk_index,
+                draft_input.bonus_tokens,
+                draft_input.hidden_states,
+            ) = _gather_spec_extras_4(
+                indices,
+                self.topk_p_buf,
+                self.topk_index_buf,
+                self.output_tokens_buf,
+                self.hidden_states_buf,
+            )
+        else:
+            (
+                draft_input.topk_p,
+                draft_input.topk_index,
+                draft_input.bonus_tokens,
+            ) = _gather_spec_extras_3(
+                indices,
+                self.topk_p_buf,
+                self.topk_index_buf,
+                self.output_tokens_buf,
+            )
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
-        if spec_need_hidden_states():
-            draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def set_input_ids_sentinel(
         self, batch: ScheduleBatch, future_indices: torch.Tensor

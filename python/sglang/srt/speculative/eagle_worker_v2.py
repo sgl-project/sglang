@@ -201,6 +201,15 @@ class EagleDraftWorker(BaseDraftWorker):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
+        # Upper-bound buffer reused across iters in `prepare_for_v2_draft` so
+        # we don't pay a `torch.empty` dispatch on every decode step.
+        max_bs = self.req_to_token_pool.req_to_token.shape[0]
+        self._draft_out_cache_loc_buf = torch.empty(
+            (max_bs * self.topk * self.speculative_num_steps,),
+            dtype=torch.int64,
+            device=self.device,
+        )
+
     def init_token_map(self):
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
@@ -353,6 +362,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
+            out_cache_loc_buf=self._draft_out_cache_loc_buf,
         )
 
         # Run draft
