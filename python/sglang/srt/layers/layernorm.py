@@ -57,12 +57,6 @@ _flashinfer_layernorm_available = False
 _enable_true_on_policy_fused_rms_norm = get_bool_env_var(
     "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM"
 )
-_debug_true_on_policy_fused_rms_norm = get_bool_env_var(
-    "SGLANG_TRUE_ON_POLICY_FUSED_RMSNORM_DEBUG"
-)
-_debug_true_on_policy_fused_rms_norm_keys: set[
-    tuple[int, tuple[int, ...], bool, bool, bool]
-] = set()
 
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
@@ -125,41 +119,6 @@ logger = logging.getLogger(__name__)
 if _is_npu:
     import torch_npu
     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
-
-
-def _maybe_log_true_on_policy_fused_rms_norm(
-    norm_module,
-    x: torch.Tensor,
-    residual: Optional[torch.Tensor],
-    post_residual_addition: Optional[torch.Tensor],
-) -> None:
-    if not _debug_true_on_policy_fused_rms_norm:
-        return
-
-    key = (
-        norm_module.hidden_size,
-        tuple(x.shape),
-        residual is not None,
-        post_residual_addition is not None,
-        norm_module.fp32_residual,
-    )
-    if (
-        key in _debug_true_on_policy_fused_rms_norm_keys
-        or len(_debug_true_on_policy_fused_rms_norm_keys) >= 16
-    ):
-        return
-
-    _debug_true_on_policy_fused_rms_norm_keys.add(key)
-    logger.warning(
-        "SGLang fused true-on-policy RMSNorm shape=%s dtype=%s hidden_size=%s "
-        "residual=%s post_residual=%s fp32_residual=%s",
-        tuple(x.shape),
-        x.dtype,
-        norm_module.hidden_size,
-        residual is not None,
-        post_residual_addition is not None,
-        norm_module.fp32_residual,
-    )
 
 
 def _forward_with_allreduce_fusion(
@@ -296,7 +255,7 @@ class RMSNorm(MultiPlatformOp):
             and (residual is None or self.fp32_residual)
         ):
             orig_dtype = self.override_orig_dtype or x.dtype
-            output = true_on_policy_rms_norm(
+            return true_on_policy_rms_norm(
                 x,
                 self.weight.data,
                 self.variance_epsilon,
@@ -307,10 +266,6 @@ class RMSNorm(MultiPlatformOp):
                 weight_cast_dtype=self.weight.dtype,
                 residual_dtype=orig_dtype,
             )
-            _maybe_log_true_on_policy_fused_rms_norm(
-                self, x, residual, post_residual_addition
-            )
-            return output
         if (
             self.weight.dtype != x.dtype
             or self.cast_x_before_out_mul
