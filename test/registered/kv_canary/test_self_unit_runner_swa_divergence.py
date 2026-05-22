@@ -5,7 +5,6 @@ import logging
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
 from unittest.mock import patch
 
 import torch
@@ -149,9 +148,7 @@ class TestSwaDivergenceReport(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(
-                    step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH
-                )
+                stats.step(step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH)
 
             lines = [
                 line
@@ -181,9 +178,7 @@ class TestSwaDivergenceReport(CustomTestCase):
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
-                    stats.step(
-                        step_counter=step, forward_batch=_EMPTY_FORWARD_BATCH
-                    )
+                    stats.step(step_counter=step, forward_batch=_EMPTY_FORWARD_BATCH)
                 matching = [
                     line
                     for line in captured.output
