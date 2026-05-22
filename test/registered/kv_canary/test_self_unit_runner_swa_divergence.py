@@ -96,7 +96,9 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.emit_log_if_due(step_counter=20, period=10)
 
             lines = [
-                line for line in captured.output if SwaDivergenceLog.parse(line) is not None
+                line
+                for line in captured.output
+                if SwaDivergenceLog.parse(line) is not None
             ]
             self.assertEqual(len(lines), 1, lines)
             fields = _parse_swa_divergence_line(lines[0])
