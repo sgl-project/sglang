@@ -60,16 +60,20 @@ class PipelineStage(StageDedupMixin, ABC):
     for a specific part of the process, such as prompt encoding, latent preparation, etc.
     """
 
+    # Class-level defaults so subclasses that override __init__ without
+    # calling super().__init__() (e.g. lightweight test doubles) still see
+    # a consistent NVTX state. All four values are immutable, so sharing
+    # the class attribute until a per-instance assignment shadows it is safe.
+    _nvtx_hooks: DiffusionNvtxHooks | None = None
+    _nvtx_registered_ids: frozenset[int] = frozenset()
+    _nvtx_zero_warned: bool = False
+    _current_use_nvtx: bool = False
+
     def __init__(self):
         self.server_args = get_global_server_args()
         self._component_residency_manager = None
         self._registered_stage_name: str | None = None
         self._profile_stage_name: str | None = None
-        # Layerwise NVTX hooks; registered lazily via _apply_nvtx_gate.
-        self._nvtx_hooks: DiffusionNvtxHooks | None = None
-        self._nvtx_registered_ids: frozenset[int] = frozenset()
-        self._nvtx_zero_warned: bool = False
-        self._current_use_nvtx: bool = False
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
