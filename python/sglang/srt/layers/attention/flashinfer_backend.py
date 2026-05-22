@@ -775,21 +775,74 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        import types
+        # Replay path: reuse stored capture-time wrappers.  Do NOT create new
+        # wrappers — that would deref the capture-time wrapper objects, allowing
+        # GC to free their internal GPU workspaces while the CUDA graph still
+        # holds those addresses.  Call indices_updater.update on the stored
+        # wrappers to refresh per-iter KV indices / mask data in-place.
+        req_pool_indices = req_pool_indices[:bs]
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu_sliced = seq_lens_cpu[:bs] if seq_lens_cpu is not None else None
+        encoder_lens_sliced = encoder_lens[:bs] if encoder_lens is not None else None
 
-        self.init_forward_data_out_graph(
-            types.SimpleNamespace(
-                batch_size=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
+        if forward_mode.is_decode_or_idle():
+            decode_wrappers = self.decode_cuda_graph_metadata[bs]
+            self.indices_updater_decode.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_sliced,
+                seq_lens_sum,
+                decode_wrappers=decode_wrappers,
+                encoder_lens=encoder_lens_sliced,
                 spec_info=spec_info,
-                seq_lens_sum=seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=req_pool_indices.new_empty(bs),
+                fixed_split_size=None,
+                disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        )
+            self.forward_metadata = DecodeMetadata(decode_wrappers)
+        elif forward_mode.is_target_verify():
+            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_sliced,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens_sliced,
+                spec_info=spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_draft_extend():
+            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_sliced,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=False,
+                encoder_lens=encoder_lens_sliced,
+                spec_info=spec_info,
+            )
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
+        elif forward_mode.is_dllm_extend():
+            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu_sliced,
+                seq_lens_sum,
+                prefix_lens=seq_lens - self.dllm_config.block_size,
+                prefill_wrappers=prefill_wrappers,
+                use_ragged=not self.use_paged,
+                encoder_lens=encoder_lens_sliced,
+                spec_info=None,
+            )
+            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+        else:
+            raise ValueError(f"Invalid forward mode for replay: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1

@@ -500,21 +500,55 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        import types
-
-        self.init_forward_data_out_graph(
-            types.SimpleNamespace(
-                batch_size=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                seq_lens_sum=seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=req_pool_indices.new_empty(bs),
+        # Replay path: reuse stored capture-time wrappers (same as original).
+        if forward_mode.is_decode_or_idle():
+            assert seq_lens_cpu is not None
+            kv_len_arr_cpu = seq_lens_cpu[:bs]
+            self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
+                kv_len_arr_cpu, dim=0
             )
-        )
+            self.fast_decode_kwargs.update(
+                {
+                    "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
+                    "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu[: bs + 1],
+                    "kv_len_arr_cpu": kv_len_arr_cpu,
+                }
+            )
+            self.indices_updater_decode.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                decode_wrapper=self.decode_cuda_graph_metadata[bs],
+                init_metadata_replay=True,
+                spec_info=spec_info,
+                **self.fast_decode_kwargs,
+            )
+        elif forward_mode.is_target_verify():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
+                    (forward_mode, bs)
+                ],
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+        elif forward_mode.is_draft_extend():
+            self.indices_updater_prefill.update(
+                req_pool_indices[:bs],
+                seq_lens[:bs],
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
+                    (forward_mode, bs)
+                ],
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+        else:
+            raise ValueError(f"Invalid forward mode for MLA replay: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
