@@ -1484,8 +1484,9 @@ class AiterAttnBackend(AttentionBackend):
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
 
