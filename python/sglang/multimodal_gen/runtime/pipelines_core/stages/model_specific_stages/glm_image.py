@@ -1,7 +1,7 @@
 import inspect
 import re
 import time
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import PIL
@@ -12,6 +12,9 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -106,20 +109,44 @@ def retrieve_latents(
         raise AttributeError("Could not access latents of provided encoder_output")
 
 
+def image_path_to_list(image_path: Union[str, List[str]]) -> List[str]:
+    return image_path if isinstance(image_path, list) else [image_path]
+
+
+def pooled_image_features_to_tensor(image_features) -> torch.Tensor:
+    pooler_output = getattr(image_features, "pooler_output", None)
+    if pooler_output is not None:
+        image_features = pooler_output
+    if isinstance(image_features, torch.Tensor):
+        return image_features
+    return torch.cat(tuple(image_features), dim=0)
+
+
 class GlmImageAR(PipelineStage):
+    r"""
+    Pipeline for text-to-image generation using GLM-Image.
+
+    This stage for the AR (autoregressive) model for token generation.
+
+    Args:
+        processor (`AutoProcessor`):
+            Processor for the AR model to handle chat templates and tokenization.
+        vision_language_encoder ([`GlmImageForConditionalGeneration`]):
+            The AR model that generates image tokens from text prompts.
+    """
 
     def __init__(
         self,
         processor,
+        vision_language_encoder,
     ):
         super().__init__()
         self.processor = processor
+        self.vision_language_encoder = vision_language_encoder
 
     @property
     def parallelism_type(self) -> StageParallelismType:
-        # if get_global_server_args().enable_cfg_parallel:
-        #     return StageParallelismType.MAIN_RANK_ONLY
-        return StageParallelismType.MAIN_RANK_ONLY
+        return StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS
 
     @staticmethod
     def _compute_generation_params(
@@ -145,37 +172,50 @@ class GlmImageAR(PipelineStage):
             target_grid_h, target_grid_w = grid_hw[0]
         return max_new_tokens, large_image_start_offset, target_grid_h, target_grid_w
 
+    @staticmethod
+    def _upsample_token_ids(
+        token_ids: torch.Tensor, token_h: int, token_w: int
+    ) -> torch.Tensor:
+        token_ids = token_ids.view(1, 1, token_h, token_w)
+        token_ids = torch.nn.functional.interpolate(
+            token_ids.float(), scale_factor=2, mode="nearest"
+        ).to(dtype=torch.long)
+        token_ids = token_ids.view(1, -1)
+        return token_ids
+
     def generate_prior_tokens(
         self,
         prompt: str,
         height: int,
         width: int,
         server_args: ServerArgs,
-        image=None,
+        image: Optional[List[PIL.Image.Image]] = None,
         factor: int = 32,
-    ):
+    ) -> Tuple[torch.Tensor, int, int]:
         """
-        Generate prior tokens using the AR model via SGLang Engine.
-
-        Only text-to-image is supported.
+        Generate prior tokens using the AR (vision_language_encoder) model.
 
         Args:
-            prompt: The text prompt
-            height: Target image height in pixels
-            width: Target image width in pixels
-            image: Unused, kept for API compatibility
-            factor: Rounding factor for height/width
+            prompt: The text prompt with shape info (e.g., "description<sop>36 24<eop>")
+            condition_images: Optional list of condition images for i2i
 
         Returns:
-            Tuple of (prior_token_ids, None)
+            Tuple of (prior_token_ids, pixel_height, pixel_width)
             - prior_token_ids: Upsampled to d16 format, shape [1, token_h*token_w*4]
+            - pixel_height: Image height in pixels
+            - pixel_width: Image width in pixels
         """
-        device = get_local_torch_device()
+        device = self.vision_language_encoder.device
         height = (height // factor) * factor
         width = (width // factor) * factor
 
-        # Build chat template inputs via HF processor
-        content = [{"type": "text", "text": prompt}]
+        is_text_to_image = image is None or len(image) == 0
+        # Build messages for processor
+        content = []
+        if image is not None:
+            for img in image:
+                content.append({"type": "image", "image": img})
+        content.append({"type": "text", "text": prompt})
         messages = [{"role": "user", "content": content}]
 
         inputs = self.processor.apply_chat_template(
@@ -185,15 +225,43 @@ class GlmImageAR(PipelineStage):
             target_w=width,
             return_dict=True,
             return_tensors="pt",
-        )
+        ).to(device)
 
         image_grid_thw = inputs.get("image_grid_thw")
         max_new_tokens, large_image_offset, token_h, token_w = (
             self._compute_generation_params(
-                image_grid_thw=image_grid_thw, is_text_to_image=True
+                image_grid_thw=image_grid_thw, is_text_to_image=is_text_to_image
             )
         )
 
+        prior_token_image_ids = None
+        if image is not None:
+            source_grids = image_grid_thw[:-1]
+            prior_token_image_embed = pooled_image_features_to_tensor(
+                self.vision_language_encoder.get_image_features(
+                    inputs["pixel_values"], source_grids
+                )
+            )
+            prior_token_image_ids_d32 = self.vision_language_encoder.get_image_tokens(
+                prior_token_image_embed, source_grids
+            )
+            prior_token_image_ids = []
+            prior_ids_per_source = torch.split(
+                prior_token_image_ids_d32,
+                source_grids.prod(dim=-1).tolist(),
+            )
+            for prior_ids, source_grid in zip(prior_ids_per_source, source_grids):
+                _, source_h, source_w = source_grid.tolist()
+                prior_token_image_ids.append(
+                    self._upsample_token_ids(
+                        prior_ids,
+                        int(source_h),
+                        int(source_w),
+                    ).squeeze(0)
+                )
+
+        # For GLM-Image, greedy decoding is not allowed; it may cause repetitive outputs.
+        # max_new_tokens must be exactly grid_h * grid_w + 1 (the +1 is for EOS).
         if server_args.srt_encoder_url is not None:
             payload = {
                 "input_ids": inputs["input_ids"][0].tolist(),
@@ -226,18 +294,7 @@ class GlmImageAR(PipelineStage):
             prior_token_ids_d32, token_h, token_w
         )
 
-        return prior_token_ids, None
-
-    @staticmethod
-    def _upsample_token_ids(
-        token_ids: torch.Tensor, token_h: int, token_w: int
-    ) -> torch.Tensor:
-        token_ids = token_ids.view(1, 1, token_h, token_w)
-        token_ids = torch.nn.functional.interpolate(
-            token_ids.float(), scale_factor=2, mode="nearest"
-        ).to(dtype=torch.long)
-        token_ids = token_ids.view(1, -1)
-        return token_ids
+        return prior_token_ids, prior_token_image_ids
 
     @torch.no_grad()
     def forward(
@@ -249,12 +306,24 @@ class GlmImageAR(PipelineStage):
         prompt = batch.prompt
         height = batch.height
         width = batch.width
+        if batch.image_path is not None:
+            ar_condition_images = [
+                load_image(img_path)
+                for img_path in image_path_to_list(batch.image_path)
+            ]
+        else:
+            ar_condition_images = None
 
         device = get_local_torch_device()
 
+        if ar_condition_images is not None:
+            height = height or ar_condition_images[0].height
+            width = width or ar_condition_images[0].width
+
         time_start = time.time()
-        prior_token_id, _ = self.generate_prior_tokens(
+        prior_token_id, prior_token_image_ids = self.generate_prior_tokens(
             prompt=prompt,
+            image=ar_condition_images,
             height=height,
             width=width,
             server_args=server_args,
@@ -264,6 +333,9 @@ class GlmImageAR(PipelineStage):
         logger.info(f"generate_prior_tokens time: {time_end - time_start}")
 
         batch.prior_token_id = prior_token_id
+        batch.prior_token_image_ids = prior_token_image_ids
+        batch.height = height
+        batch.width = width
 
         return batch
 
@@ -272,8 +344,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
     r"""
     Pipeline for text-to-image generation using GLM-Image.
 
-    This pipeline integrates both the AR (autoregressive) model for token generation and the DiT (diffusion
-    transformer) model for image decoding.
+    This stage for preparations before denoising stage like encoding, latents, timesteps
 
     Args:
         vae ([`AutoencoderKL`]):
@@ -282,10 +353,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             Frozen text-encoder for glyph embeddings.
         tokenizer (`PreTrainedTokenizer`):
             Tokenizer for the text encoder.
-        processor (`AutoProcessor`):
-            Processor for the AR model to handle chat templates and tokenization.
-        vision_language_encoder:
-            SGLang Engine instance for the AR model that generates image tokens from text prompts.
         transformer ([`GlmImageTransformer2DModel`]):
             A text conditioned transformer to denoise the encoded image latents (DiT).
         scheduler ([`SchedulerMixin`]):
@@ -295,9 +362,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
     def __init__(
         self,
         tokenizer,
-        processor,
         text_encoder,
-        vision_language_encoder,
         vae,
         transformer,
         scheduler,
@@ -305,9 +370,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         super().__init__()
 
         self.tokenizer = tokenizer
-        self.processor = processor
         self.text_encoder = text_encoder
-        self.ar_engine = vision_language_encoder
         self.vae = vae
         self.transformer = transformer
         self.scheduler = scheduler
@@ -326,6 +389,22 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             and hasattr(self.transformer.config, "sample_size")
             else 128
         )
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
+        if self.transformer is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="transformer",
+                    phase="reference_image",
+                    memory_intensive=True,
+                )
+            )
+        return uses
 
     def get_glyph_texts(self, prompt):
         prompt = prompt[0] if isinstance(prompt, list) else prompt
@@ -557,7 +636,8 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         num_inference_steps = batch.num_inference_steps
         if batch.image_path is not None:
             ar_condition_images = [
-                load_image(img_path) for img_path in batch.image_path
+                load_image(img_path)
+                for img_path in image_path_to_list(batch.image_path)
             ]
         else:
             ar_condition_images = None
@@ -577,8 +657,6 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         self._current_timestep = None
         self._interrupt = False
 
-        batch_size = 1
-
         if ar_condition_images is not None:
             height = height or ar_condition_images[0].height
             width = width or ar_condition_images[0].width
@@ -586,6 +664,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         prior_token_id = batch.prior_token_id
         prior_token_image_ids = batch.prior_token_image_ids
         prior_token_id = prior_token_id.to(device)
+
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
             prompt,
@@ -656,25 +735,32 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
                 # Do not remove.
                 # It would be use to run the reference image through a
                 # forward pass at timestep 0 and keep the KV cache.
-                with set_forward_context(current_timestep=1, attn_metadata=None):
-                    _ = self.transformer(
-                        hidden_states=condition_latent,
-                        encoder_hidden_states=torch.zeros_like(prompt_embeds)[
-                            :1, :0, ...
-                        ],
-                        prior_token_id=condition_image_prior_token_id,
-                        prior_token_drop=torch.full_like(
-                            condition_image_prior_token_id, False, dtype=torch.bool
-                        ),
-                        timestep=torch.zeros((1,), device=device),
-                        target_size=torch.tensor(
-                            [condition_image.shape[-2:]], device=device
-                        ),
-                        crop_coords=torch.zeros((1, 2), device=device),
-                        attention_kwargs=attention_kwargs,
-                        kv_caches=kv_caches,
-                        kv_caches_mode="write",
-                    )
+                with self.use_declared_component(
+                    component_name="transformer",
+                    module=self.transformer,
+                    phase="reference_image",
+                ) as transformer:
+                    assert transformer is not None
+                    self.transformer = transformer
+                    with set_forward_context(current_timestep=1, attn_metadata=None):
+                        _ = transformer(
+                            hidden_states=condition_latent,
+                            encoder_hidden_states=torch.zeros_like(prompt_embeds)[
+                                :1, :0, ...
+                            ],
+                            prior_token_id=condition_image_prior_token_id,
+                            prior_token_drop=torch.full_like(
+                                condition_image_prior_token_id, False, dtype=torch.bool
+                            ),
+                            timestep=torch.zeros((1,), device=device),
+                            target_size=torch.tensor(
+                                [condition_image.shape[-2:]], device=device
+                            ),
+                            crop_coords=torch.zeros((1, 2), device=device),
+                            attention_kwargs=attention_kwargs,
+                            kv_caches=kv_caches,
+                            kv_caches_mode="write",
+                        )
 
         # 6. Prepare additional timestep conditions
         target_size = (height, width)

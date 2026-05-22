@@ -30,18 +30,18 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
         self.add_stage(
             GlmImageAR(
                 processor=self.get_module("processor"),
+                vision_language_encoder=self.get_module("vision_language_encoder"),
             ),
             "glm_image_ar",
         )
+
         self.add_stage(
             GlmImageBeforeDenoisingStage(
                 vae=self.get_module("vae"),
                 text_encoder=self.get_module("text_encoder"),
                 tokenizer=self.get_module("tokenizer"),
-                processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
-                vision_language_encoder=self.get_module("vision_language_encoder"),
             ),
             "glm_image_before_denoising_stage",
         )

@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 import einops
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
+from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -131,7 +131,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
             assert envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get()
             assert envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-            assert envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get()
             self.use_swizzle = True
 
     def run(
@@ -168,7 +167,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.jit_kernel.deepseek_v4 import silu_and_mul_contig_post_quant
+        from sglang.jit_kernel.dsv4 import silu_and_mul_contig_post_quant
         from sglang.srt.layers.moe.ep_moe.kernels import tma_align_input_scale
         from sglang.srt.layers.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,

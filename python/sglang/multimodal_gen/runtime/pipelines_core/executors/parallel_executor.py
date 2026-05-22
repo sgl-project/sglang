@@ -78,7 +78,9 @@ class ParallelExecutor(PipelineExecutor):
                     if rank == 0:
                         # Only main rank executes, others just wait
                         self.before_stage(stage, stage_index, batch, server_args)
-                        batch = stage(batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
                         self.after_stage(stage_index)
                     torch.distributed.barrier()
                     obj_list = [batch] if rank == 0 else []
@@ -101,15 +103,37 @@ class ParallelExecutor(PipelineExecutor):
                     if rank != 0:
                         batch = broadcasted_list[0]
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
 
                     torch.distributed.barrier()
 
                 elif paradigm == StageParallelismType.REPLICATED:
                     self.before_stage(stage, stage_index, batch, server_args)
-                    batch = stage(batch, server_args)
+                    batch = self.run_stage_with_context(
+                        stage, batch, server_args, run_stage
+                    )
                     self.after_stage(stage_index)
+                elif paradigm == StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS:
+                    if rank == 0:
+                        # Only main rank executes, others just wait
+                        self.before_stage(stage, stage_index, batch, server_args)
+                        batch = self.run_stage_with_context(
+                            stage, batch, server_args, run_stage
+                        )
+                        self.after_stage(stage_index)
+                    torch.distributed.barrier()
+
+                    # Send batch to other ranks
+                    obj_list = [batch] if rank == 0 else []
+                    broadcasted_list = broadcast_pyobj(
+                        obj_list, rank=rank, dist_group=group.cpu_group, src=0
+                    )
+                    if rank != 0:
+                        batch = broadcasted_list[0]
+                    torch.distributed.barrier()
         finally:
             self.finish_component_residency_request()
         return batch
