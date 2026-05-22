@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.srt.arg_groups.disaggregation_hook import validate_ib_devices
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -87,13 +88,12 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
 
 class TestIBDeviceValidation(unittest.TestCase):
-    @patch("sglang.srt.server_args.os.listdir")
-    @patch("sglang.srt.server_args.os.path.isdir", return_value=True)
+    @patch("sglang.srt.arg_groups.disaggregation_hook.os.listdir")
+    @patch("sglang.srt.arg_groups.disaggregation_hook.os.path.isdir", return_value=True)
     def test_json_gpu_mapping_allows_reusing_ib_devices_across_gpus(
         self, mock_isdir, mock_listdir
     ):
         mock_listdir.return_value = ["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"]
-        server_args = ServerArgs(model_path="dummy")
         ib_mapping = json.dumps(
             {
                 "0": "mlx5_0,mlx5_1",
@@ -102,7 +102,7 @@ class TestIBDeviceValidation(unittest.TestCase):
             }
         )
 
-        self.assertEqual(server_args._validate_ib_devices(ib_mapping), ib_mapping)
+        self.assertEqual(validate_ib_devices(ib_mapping), ib_mapping)
 
 
 class TestPortArgs(unittest.TestCase):
