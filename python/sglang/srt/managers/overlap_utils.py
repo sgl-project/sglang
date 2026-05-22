@@ -41,10 +41,8 @@ def _gather_spec_extras(
     output_tokens_buf: torch.Tensor,
     hidden_states_buf: Optional[torch.Tensor],
 ):
-    """Fuse the 3-4 advanced-indexing gathers into one compiled launch.
-    `hidden_states_buf` is None on builds that don't capture hidden states;
-    `spec_need_hidden_states()` is fixed per process so only one variant
-    actually gets compiled."""
+    """Compiled gather of spec extras. `hidden_states_buf` is None when the
+    build does not capture hidden states."""
     topk_p = topk_p_buf[indices]
     topk_index = topk_index_buf[indices]
     bonus_tokens = output_tokens_buf[indices]
