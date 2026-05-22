@@ -510,7 +510,12 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32 = self.draft_extend_metadata[
                     "cache_seqlens"
                 ][:bs]
-                num_tokens_per_bs = self.speculative_step_id + 1
+                # Recover tokens-per-request from the positions placeholder that
+                # init_forward_metadata_capture_cuda_graph allocated as
+                # req_pool_indices.new_empty(num_tokens).  During replay this
+                # branch is unreachable so the division is always valid.
+                num_tokens = forward_batch.positions.shape[0]
+                num_tokens_per_bs = num_tokens // bs if bs > 0 else 1
                 # cu_seqlens_q is constant for a given (bs, num_tokens_per_bs);
                 # allocate fresh at capture so the CUDA graph records its pointer.
                 metadata.cu_seqlens_q = torch.arange(
@@ -533,7 +538,21 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 )
                 self.draft_extend_metadata[bs] = metadata
             else:
+                # Replay: fetch the pre-allocated metadata object.
                 metadata = self.draft_extend_metadata[bs]
+                # Update variable-length query fields from spec_info so the
+                # kernel sees the correct per-request accept lengths this step.
+                # (These fields are NOT constant across replays, unlike cu_seqlens_k.)
+                if spec_info is not None:
+                    extend_lens = spec_info.num_accept_tokens[:bs]
+                    num_accept_cpu = getattr(spec_info, "num_accept_tokens_cpu", None)
+                    if num_accept_cpu:
+                        metadata.max_seq_len_q = max(num_accept_cpu)
+                    else:
+                        metadata.max_seq_len_q = 1
+                    metadata.cu_seqlens_q[1:].copy_(
+                        torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
+                    )
 
             # Both capture and replay: copy current data into the pre-allocated buffers.
             metadata.cache_seqlens_int32.copy_(seq_lens)
