@@ -64,13 +64,9 @@ def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -
     if component_name not in ("vae", "video_vae") or not torch.cuda.is_available():
         return False
 
-    model_id = (server_args.model_id or "").lower()
-    pipeline_name = server_args.pipeline_config.__class__.__name__.lower()
-    auto_enabled = "qwen-image" in model_id or "qwenimage" in pipeline_name
-
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
     if override is None or override.strip().lower() == "auto":
-        return auto_enabled
+        return True
     return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
 
 
