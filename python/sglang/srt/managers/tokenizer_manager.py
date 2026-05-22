@@ -216,6 +216,16 @@ class InputFormat(Enum):
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
+    @property
+    def serving_chat_class(self):
+        """Return the serving chat class for OpenAI API.
+
+        Override in subclass to provide custom serving behavior.
+        """
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        return OpenAIServingChat
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -2488,6 +2498,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        del self.rid_to_state[recv_obj.rid]
+
         state.out_list.append(out)
         state.event.set()
 
