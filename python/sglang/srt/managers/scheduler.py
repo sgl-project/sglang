@@ -144,7 +144,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureIndices, resolve_forward_inputs
+from sglang.srt.managers.overlap_utils import resolve_forward_inputs
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -2253,9 +2253,7 @@ class Scheduler(
         last_tokens = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
-        self.future_map.stash(
-            FutureIndices(indices=batch.req_pool_indices), last_tokens
-        )
+        self.future_map.stash(batch.req_pool_indices, last_tokens)
         batch.input_ids = None
 
         if batch.return_logprob:
@@ -2849,7 +2847,7 @@ class Scheduler(
                 self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
-                    future_indices = FutureIndices(indices=batch.req_pool_indices)
+                    future_indices = batch.req_pool_indices
 
                     # Spec_v2 fires on_publish mid-worker (between verify and
                     # draft_extend) so schedule prep can overlap with draft_extend.
@@ -2899,7 +2897,7 @@ class Scheduler(
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                future_indices = FutureIndices(indices=batch.req_pool_indices)
+                future_indices = batch.req_pool_indices
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -2911,7 +2909,7 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                future_indices = FutureIndices(indices=batch.req_pool_indices)
+                future_indices = batch.req_pool_indices
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs

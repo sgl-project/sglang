@@ -176,17 +176,12 @@ class ScheduleBatchDisaggregationDecodeMixin:
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
-                from sglang.srt.managers.overlap_utils import FutureIndices
-
-                spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
+                spec_info.future_indices = self.req_pool_indices
                 future_map.publish(spec_info.future_indices, self.seq_lens)
                 future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
             # Non-spec: stash last token into the relay so the first DECODE's
             # resolve_forward_inputs gathers it like any other decode iter.
-            from sglang.srt.managers.overlap_utils import FutureIndices
-
-            future_indices = FutureIndices(indices=self.req_pool_indices)
-            future_map.stash(future_indices, last_tokens_tensor)
+            future_map.stash(self.req_pool_indices, last_tokens_tensor)
             self.input_ids = None
