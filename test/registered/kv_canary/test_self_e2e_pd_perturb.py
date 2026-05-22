@@ -13,6 +13,8 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 class _PDPerturbBase(CanaryPDFixture):
     """Perturb point (d): P-side post-forward flip; D-side detects the real_kv_hash mismatch."""
 
+    __test__ = False  # pytest must not collect the abstract base (target_group is unset)
+
     target_group: ClassVar[TargetGroupKind]
 
     @classmethod
@@ -37,16 +39,19 @@ class _PDPerturbBase(CanaryPDFixture):
 
 
 class TestPDPerturbMhaFull(_PDPerturbBase):
+    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
 class TestPDPerturbSwaFull(_PDPerturbBase):
+    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
 class TestPDPerturbSwaSwa(_PDPerturbBase):
+    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
 
