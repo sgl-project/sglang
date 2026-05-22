@@ -284,7 +284,11 @@ class LayerwiseOffloadManager:
 
         # create gpu buffer and load from CPU buffer
         gpu_buffers: Dict[torch.dtype, torch.Tensor] = {}
-        with torch.get_device_module().stream(self.copy_stream):
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            torch.get_device_module().stream(self.copy_stream),
+        ):
             for dtype, cpu_buffer in self._consolidated_cpu_weights[layer_idx].items():
                 gpu_buffer = torch.empty(
                     cpu_buffer.shape, dtype=dtype, device=self.device
@@ -343,12 +347,13 @@ class LayerwiseOffloadManager:
         if layer_idx not in self._gpu_layers:
             return
 
-        for name, meta in self._weight_metadata.get(layer_idx, {}).items():
-            target = self.get_target_with_name(name)
-            # Wraparound prefetch will reload the layer when it is needed again
-            target.data = self._get_shared_empty_tensor_for_target(
-                target, meta["dtype"]
-            )
+        with torch.inference_mode(False), torch.no_grad():
+            for name, meta in self._weight_metadata.get(layer_idx, {}).items():
+                target = self.get_target_with_name(name)
+                # Wraparound prefetch will reload the layer when it is needed again
+                target.data = self._get_shared_empty_tensor_for_target(
+                    target, meta["dtype"]
+                )
 
         self._gpu_layers.discard(layer_idx)
 
