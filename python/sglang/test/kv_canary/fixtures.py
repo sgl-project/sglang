@@ -254,7 +254,7 @@ def make_buffer_group(
         v_head=_zero() if has_v else None,
         v_tail=_zero() if has_v else None,
         real_kv_sources_k=real_kv_sources,
-        real_kv_sources_v=real_kv_sources,
+        real_kv_sources_v=real_kv_sources if has_v else (),
         swa_index_lut=swa_index_lut,
     )
 
