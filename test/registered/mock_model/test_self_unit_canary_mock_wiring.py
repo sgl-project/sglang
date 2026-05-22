@@ -8,7 +8,10 @@ import torch
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
-from sglang.srt.model_executor.forward_batch_info import _stable_hash_rid_i64
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardMode,
+    _stable_hash_rid_i64,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model_utils import mock_model_server_args, mock_model_server_env
 from sglang.test.test_utils import CustomTestCase
@@ -17,19 +20,11 @@ register_cuda_ci(est_time=60, suite="extra-a-1-gpu-large")
 
 
 @dataclasses.dataclass
-class _StubForwardMode:
-    extend: bool
-
-    def is_extend(self) -> bool:
-        return self.extend
-
-
-@dataclasses.dataclass
 class _StubForwardBatch:
     input_ids: torch.Tensor
     positions: torch.Tensor
     req_pool_indices: torch.Tensor
-    forward_mode: _StubForwardMode
+    forward_mode: ForwardMode
     extend_seq_lens: object
     rids_int: torch.Tensor
     spec_info: object | None = None
@@ -72,7 +67,7 @@ class TestFillExpectedInputs(CustomTestCase):
             input_ids=torch.tensor([0, 0], dtype=torch.int64),
             positions=torch.tensor([10, 20], dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
-            forward_mode=_StubForwardMode(extend=False),
+            forward_mode=ForwardMode.DECODE,
             extend_seq_lens=None,
             rids_int=torch.tensor(
                 [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
@@ -114,7 +109,7 @@ class TestFillExpectedInputs(CustomTestCase):
             input_ids=torch.tensor([101, 102, 103, 201], dtype=torch.int64),
             positions=torch.tensor([0, 1, 2, 0], dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
-            forward_mode=_StubForwardMode(extend=True),
+            forward_mode=ForwardMode.EXTEND,
             extend_seq_lens=torch.tensor([3, 1], dtype=torch.int64),
             rids_int=torch.tensor([hashed_a, hashed_b], dtype=torch.int64),
         )
@@ -145,7 +140,7 @@ class TestFillExpectedInputs(CustomTestCase):
             input_ids=torch.empty(0, dtype=torch.int64),
             positions=torch.empty(0, dtype=torch.int64),
             req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
-            forward_mode=_StubForwardMode(extend=False),
+            forward_mode=ForwardMode.DECODE,
             extend_seq_lens=None,
             rids_int=torch.tensor(
                 [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
