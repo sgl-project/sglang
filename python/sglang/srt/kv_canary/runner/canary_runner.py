@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Iterator, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
@@ -21,6 +22,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
+from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -55,10 +58,12 @@ class CanaryRunner:
         launch_capacities: CanaryLaunchCapacities,
         swa_window_size: int = 0,
         token_oracle_manager: Optional[TokenOracleManager] = None,
+        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
+        self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
@@ -82,6 +87,22 @@ class CanaryRunner:
         )
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
+
+        swa_divergence_interval = (
+            envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
+        )
+        if swa_divergence_interval > 0:
+            self._swa_divergence_report: Optional[SwaDivergenceReport] = (
+                SwaDivergenceReport(
+                    device=device,
+                    d2h_stream=self._d2h_stream,
+                    interval=swa_divergence_interval,
+                    swa_allocator=self._swa_allocator,
+                    req_to_token_pool=self._req_to_token_pool,
+                )
+            )
+        else:
+            self._swa_divergence_report = None
 
         self._violation_manager = ViolationManager(
             config=config,
@@ -117,6 +138,7 @@ class CanaryRunner:
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
             d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
+            swa_divergence_report=self._swa_divergence_report,
         )
         self._health_checker = KernelRunCounterHealthChecker(
             config=config,
@@ -188,3 +210,8 @@ class CanaryRunner:
         self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
+        if self._swa_divergence_report is not None:
+            self._swa_divergence_report.step(
+                step_counter=self._step_counter,
+                forward_batch=forward_batch,
+            )

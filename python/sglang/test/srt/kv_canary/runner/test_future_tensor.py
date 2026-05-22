@@ -5,7 +5,7 @@ from typing import cast
 import pytest
 import torch
 
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 
 
 class FakeEvent:
@@ -19,7 +19,7 @@ class FakeEvent:
 def test_wait_clears_fields_and_rejects_second_wait() -> None:
     tensor = torch.tensor([1, 2, 3])
     event = FakeEvent()
-    future = FutureTensor(_tensor=tensor, _event=cast(torch.cuda.Event, event))
+    future = FutureTensors(_tensors=tensor, _event=cast(torch.cuda.Event, event))
 
     assert future.wait() is tensor
 
