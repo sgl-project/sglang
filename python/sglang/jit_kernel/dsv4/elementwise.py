@@ -249,11 +249,9 @@ def fused_k_norm_rope_flashmla(
 def fused_q_norm_rope_torch(
     q_input: torch.Tensor,  # (B, num_q_heads, head_dim)  any float dtype
     q_output: torch.Tensor,  # (B, num_q_heads, head_dim)  same dtype, pre-allocated
-    eps: float,
     freqs_cis: torch.Tensor,  # (max_pos, rope_dim) fp32, interleaved re/im
-    # — pass the *already-flattened* tensor, i.e.
-    #   torch.view_as_real(freqs_cis).flatten(-2)
     positions: torch.Tensor,  # (B,) int32 or int64
+    eps: float,
 ) -> None:
     """
     In-place fused warp-per-(token, head) RMSNorm-self + RoPE.
