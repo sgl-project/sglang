@@ -726,25 +726,26 @@ class DeepseekV4HipRadixBackend(
 
         Merged from the old ``init_forward_metadata_capture_cuda_graph`` and
         ``init_forward_metadata_replay_cuda_graph`` variants. The merged
-        body branches on ``self._replay_forward_batch`` (set out-of-band
-        by the caller before replay; cleared after) to distinguish the
-        two paths because they differ structurally:
+        body distinguishes the two paths by checking whether metadata for
+        this ``bs`` already exists in
+        ``cuda_graph_metadata_of_bucket_and_bs[bucket]``:
 
-          * **Capture** (``_replay_forward_batch is None``): build the
-            metadata from ``forward_batch`` fields directly, store the
-            result in ``cuda_graph_metadata_of_bucket_and_bs[bucket][bs]``,
-            and publish it as ``self.forward_metadata``.
-          * **Replay** (``_replay_forward_batch is not None``): read the
-            actual unpadded ``out_cache_loc`` + ``forward_mode`` from the
-            side channel (the padded buffer view comes via
-            ``forward_batch`` itself); apply IDLE replacement when the
-            actual mode is IDLE; build a temp metadata; then in-place
-            copy it into the previously captured metadata via
-            ``replay_cuda_graph_metadata_from``.
+          * **Capture** (metadata absent): build the metadata from
+            ``forward_batch`` fields directly, store the result in
+            ``cuda_graph_metadata_of_bucket_and_bs[bucket][bs]``, and
+            publish it as ``self.forward_metadata``.
+          * **Replay** (metadata present): read the actual unpadded
+            ``out_cache_loc`` + ``forward_mode`` from ``forward_batch``
+            directly (the replay shim adds these fields so both the
+            cuda_graph_runner path and spec-runner paths supply them);
+            apply IDLE replacement when the actual mode is IDLE; build a
+            temp metadata; then in-place copy it into the previously
+            captured metadata via ``replay_cuda_graph_metadata_from``.
 
-        Step 04 will replace ``_replay_forward_batch`` by having the
-        caller pass a fully-formed fb view that already carries the
-        IDLE-replaced fields, eliminating this side channel.
+        ``_replay_forward_batch`` is still set by cuda_graph_runner (step
+        04 removes it), but the gate no longer depends on it, so spec
+        runners that skip the side channel now correctly take the replay
+        branch.
         """
         bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers may pass full padded buffers.
@@ -753,7 +754,7 @@ class DeepseekV4HipRadixBackend(
         forward_mode = forward_batch.forward_mode
         bucket = _GraphBucket.of(forward_mode)
 
-        if self._replay_forward_batch is None:
+        if bs not in self.cuda_graph_metadata_of_bucket_and_bs[bucket]:
             # ---- capture path ----
             assert req_pool_indices.size(0) == bs
             assert seq_lens.size(0) == bs
@@ -800,12 +801,15 @@ class DeepseekV4HipRadixBackend(
             return
 
         # ---- replay path ----
-        # FIXME: see cuda_graph_runner — this attribute is set out-of-band.
-        # Step 04 removes the side channel by having the caller build a
-        # complete fb view that already carries these fields.
-        replay_fb = self._replay_forward_batch
-        out_cache_loc = replay_fb.out_cache_loc
-        actual_forward_mode = replay_fb.forward_mode
+        # ``forward_batch.out_cache_loc`` and ``forward_batch.forward_mode``
+        # carry the actual (potentially-IDLE-mode, unpadded) values.  The
+        # replay shim populates them from ``_replay_forward_batch`` for the
+        # cuda_graph_runner path; spec runners that call
+        # ``init_forward_data_out_graph`` directly supply them via their
+        # own ForwardBatch.  ``_replay_forward_batch`` is kept as a
+        # no-op side channel until step 04 removes it.
+        out_cache_loc = forward_batch.out_cache_loc
+        actual_forward_mode = forward_batch.forward_mode
 
         seq_lens_cpu = forward_batch.seq_lens_cpu
 
@@ -919,16 +923,29 @@ class DeepseekV4HipRadixBackend(
     ) -> None:
         import types
 
+        # Promote actual forward_mode and out_cache_loc from the side
+        # channel when cuda_graph_runner has set it.  Spec runners that
+        # call init_forward_data_out_graph directly supply these fields on
+        # their own ForwardBatch; this shim is only used from callers that
+        # cannot pass a full ForwardBatch (cuda_graph_runner, frozen_kv
+        # worker, eagle_draft_extend runners).
+        replay_fb = self._replay_forward_batch
+        actual_forward_mode = (
+            replay_fb.forward_mode if replay_fb is not None else forward_mode
+        )
+        out_cache_loc = replay_fb.out_cache_loc if replay_fb is not None else None
+
         self.init_forward_data_out_graph(
             types.SimpleNamespace(
                 batch_size=bs,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
+                forward_mode=actual_forward_mode,
                 spec_info=spec_info,
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
+                out_cache_loc=out_cache_loc,
                 positions=req_pool_indices.new_empty(bs),
             )
         )
@@ -1278,18 +1295,22 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         """Capture + replay path -- merged from old capture/replay variants.
 
-        Distinguishes capture vs replay via ``self._replay_forward_batch``
-        (inherited from ``DeepseekV4HipRadixBackend``; set by the caller --
-        cuda_graph_runner for the standalone case, or the spec runner
-        after the step 03 caller switch for the multi-step case -- before
-        replay and cleared after).
+        Distinguishes capture vs replay by checking whether metadata for
+        ``bs`` already exists in ``attn_backends[0]``'s
+        ``cuda_graph_metadata_of_bucket_and_bs[bucket]`` dict.
 
         Replay does NOT recurse into every backend's ``_out_graph``; only
         backend[0] runs the per-iter prep, and backends 1..N-2 reuse its
         metadata via ``replay_cuda_graph_metadata_from`` (this is the
         original multi-step replay optimization, preserved as-is).
         """
-        if self._replay_forward_batch is None:
+        bs = forward_batch.batch_size
+        bucket = _GraphBucket.of(forward_batch.forward_mode)
+        is_capture = (
+            bs not in self.attn_backends[0].cuda_graph_metadata_of_bucket_and_bs[bucket]
+        )
+
+        if is_capture:
             # ---- capture path ----
             for i in range(self.speculative_num_steps):
                 self.attn_backends[i].init_forward_data_out_graph(forward_batch)
@@ -1299,12 +1320,11 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
         if self.speculative_num_steps == 1:
             return
 
-        bs = forward_batch.batch_size
-        # Propagate the replay signal to backend[0] so its merged _out_graph
-        # body takes the replay branch.
-        self.attn_backends[0]._replay_forward_batch = self._replay_forward_batch
+        # backend[0] does the per-iter metadata computation; backends 1..N-2
+        # copy from it.  forward_batch already carries the actual forward_mode
+        # and out_cache_loc so backend[0]'s single-step _out_graph reads them
+        # directly; no side-channel propagation needed here.
         self.attn_backends[0].init_forward_data_out_graph(forward_batch)
-        self.attn_backends[0]._replay_forward_batch = None
         temp_metadata = self.attn_backends[0].forward_metadata
 
         for i in range(1, self.speculative_num_steps - 1):
