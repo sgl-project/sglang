@@ -375,7 +375,9 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload eval results
-        if: always() && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true')
+        # Mirror the env block's override logic so workflow_dispatch force-eval
+        # on a non-marked entry still uploads its artifacts.
+        if: ${{ always() && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true' || inputs.run_eval || inputs.eval_only) }}
         uses: actions/upload-artifact@v4
         with:
           name: gb200-eval-${{ matrix.config.name }}-${{ github.run_id }}
@@ -384,13 +386,13 @@ jobs:
             ${{ github.workspace }}/results*.json
             ${{ github.workspace }}/sample*.jsonl
           retention-days: 30
-          if-no-files-found: ${{ matrix.config.eval_only == 'true' && 'error' || 'ignore' }}
+          if-no-files-found: ${{ (matrix.config.eval_only == 'true' || inputs.eval_only) && 'error' || 'ignore' }}
 
       - name: Verify eval scores
         # Eval scores must meet thresholds.json on cron runs. For workflow_dispatch
         # we still report results but don't gate the workflow on them — accuracy
         # below threshold is "info" for a dev-triggered run, "failure" for nightly.
-        if: ${{ (success() || failure()) && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true') }}
+        if: ${{ (success() || failure()) && (matrix.config.run_eval == 'true' || matrix.config.eval_only == 'true' || inputs.run_eval || inputs.eval_only) }}
         continue-on-error: ${{ github.event_name != 'schedule' }}
         run: |
           if ls ${{ github.workspace }}/results*.json 1>/dev/null 2>&1; then
