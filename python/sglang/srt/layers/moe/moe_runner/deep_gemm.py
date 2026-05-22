@@ -863,8 +863,11 @@ def _varlen_deep_gemm_silu_mul_quant(
         dtype=torch.float8_e4m3fn,
     )
 
-    if envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get():
-        assert N % 4 == 0 and G % 4 == 0
+    use_jit_ep_activation = envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
+    if N % 4 != 0 or G % 4 != 0:
+        use_jit_ep_activation = False
+
+    if use_jit_ep_activation:
         packed_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         down_input_scale = torch.empty(
             (E, G // 4, N) if packed_ue8m0 else (E, N, G),
