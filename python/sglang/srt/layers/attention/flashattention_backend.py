@@ -2724,7 +2724,25 @@ class FlashAttentionMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        self.init_forward_data_out_graph(forward_batch)
+        # Call each per-step backend replay with PADDED bs (not forward_batch.batch_size).
+        # init_forward_data_out_graph uses forward_batch.batch_size (raw/unpadded) as
+        # the dict key; if raw_bs != padded_bs the key misses and the capture path
+        # fires at replay, creating new GPU tensors that replace captured ones
+        # -> GC -> NaN (seen with FA3 + EAGLE topk=5).
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
+            )
 
 
 @triton.jit
