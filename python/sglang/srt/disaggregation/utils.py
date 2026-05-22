@@ -17,6 +17,11 @@ import torch.distributed as dist
 
 from sglang.srt.utils import get_ip, is_npu
 
+if is_npu():
+    from sglang.srt.hardware_backend.npu.alignment import zeros_2m_aligned as _zeros
+else:
+    _zeros = torch.zeros
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
 
@@ -110,21 +115,21 @@ class MetadataBuffers:
 
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
-            self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
+            self.output_ids = _zeros((size, 16), dtype=torch.int32, device=device)
 
-            self.output_token_logprobs_val = torch.zeros(
+            self.output_token_logprobs_val = _zeros(
                 (size, 16), dtype=torch.float32, device=device
             )
-            self.output_token_logprobs_idx = torch.zeros(
+            self.output_token_logprobs_idx = _zeros(
                 (size, 16), dtype=torch.int32, device=device
             )
-            self.output_top_logprobs_val = torch.zeros(
+            self.output_top_logprobs_val = _zeros(
                 (size, max_top_logprobs_num), dtype=torch.float32, device=device
             )
-            self.output_top_logprobs_idx = torch.zeros(
+            self.output_top_logprobs_idx = _zeros(
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
-            self.output_hidden_states = torch.zeros(
+            self.output_hidden_states = _zeros(
                 (size, hidden_size), dtype=dtype, device=device
             )
 
