@@ -45,12 +45,6 @@ export default async function RegressionDetailPage({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={reg.severity === "minor" ? "warning" : "destructive"}
-              className="uppercase tracking-wider"
-            >
-              {reg.severity}
-            </Badge>
             {reg.resolved_at ? (
               <Badge variant="success">resolved</Badge>
             ) : (
@@ -68,7 +62,11 @@ export default async function RegressionDetailPage({
             <CardTitle>Delta</CardTitle>
           </CardHeader>
           <CardContent className="space-y-3">
-            <p className="font-mono text-3xl font-semibold tabular-numbers text-destructive">
+            <p
+              className={`font-mono text-3xl font-semibold tabular-numbers ${
+                delta > 0 ? "text-success" : "text-destructive"
+              }`}
+            >
               {delta > 0 ? "+" : ""}
               {delta.toFixed(2)}%
             </p>

@@ -2,7 +2,6 @@ import Link from "next/link";
 import { api } from "@/lib/api";
 import { formatRelative } from "@/lib/format";
 import { Card, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { AutoRefresh } from "@/components/auto-refresh";
 
 export const dynamic = "force-dynamic";
@@ -57,14 +56,6 @@ export default async function RegressionsPage({
             <Link key={r.id} href={`/regressions/${r.id}`} className="block">
               <Card className="transition-colors hover:border-destructive/60">
                 <CardContent className="flex flex-wrap items-center gap-3 p-4">
-                  <Badge
-                    variant={
-                      r.severity === "minor" ? "warning" : "destructive"
-                    }
-                    className="uppercase tracking-wider"
-                  >
-                    {r.severity}
-                  </Badge>
                   <div className="min-w-0 flex-1">
                     <p className="truncate font-mono text-[13px]">
                       <span className="text-foreground/80">{r.config_name}</span>
@@ -77,7 +68,11 @@ export default async function RegressionsPage({
                     </p>
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
                       {r.delta_percent !== null && (
-                        <span className="font-mono tabular-numbers text-destructive">
+                        <span
+                          className={`font-mono tabular-numbers ${
+                            r.delta_percent > 0 ? "text-success" : "text-destructive"
+                          }`}
+                        >
                           {r.delta_percent > 0 ? "+" : ""}
                           {r.delta_percent.toFixed(1)}%
                         </span>
