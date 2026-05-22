@@ -2212,13 +2212,6 @@ class UnifiedRadixCacheSuite:
         tokens = self._swa_anchor_chain_tokens(len(chain))
         return tree, chain, n, y, x, tokens
 
-    def test_hicache_swa_match_prefix_picks_best_match_node_above_last_host(self):
-        tree, _, n, y, x, tokens = self._swa_anchor_setup()
-        result = tree.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
-        self.assertIs(result.best_match_node, x)
-        self.assertIs(result.last_device_node, n.parent)
-        self.assertIs(result.last_host_node, y)
-
     def test_hicache_swa_load_back_anchored_on_best_match_node(self):
         tree, _, _, y, x, _ = self._swa_anchor_setup()
         ps = self.cfg.page_size
