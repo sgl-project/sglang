@@ -87,6 +87,10 @@ class HybridAttnBackend(AttentionBackend):
             spec_info,
         )
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_data_out_graph(forward_batch)
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
