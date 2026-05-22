@@ -454,6 +454,93 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Per-iter metadata prep for capture + replay paths.
+
+        Body taken from the old ``init_forward_metadata_capture_cuda_graph`` --
+        capture and replay had structurally different bodies (capture builds a
+        fresh ``BatchMLAPagedAttentionWrapper`` per bs, replay reuses the
+        cached one via ``init_metadata_replay=True`` + ``fast_decode_kwargs``).
+        Per the initial-stage scope we keep the capture body and accept the
+        wrapper-rebuild cost at replay; the replay-time fast path may be
+        restored by a follow-up per-backend optimization PR.
+        """
+        bs = forward_batch.batch_size
+        num_tokens = bs
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if forward_mode.is_decode_or_idle():
+            decode_wrapper = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
+                kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
+                backend="auto",
+            )
+
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_decode.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                decode_wrapper=decode_wrapper,
+                init_metadata_replay=False,
+                spec_info=spec_info,
+            )
+            self.decode_cuda_graph_metadata[bs] = decode_wrapper
+            self.forward_metadata = DecodeMetadata(decode_wrapper)
+            decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
+        elif forward_mode.is_target_verify():
+            verify_wrapper = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                backend="auto",
+            )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=verify_wrapper,
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = verify_wrapper
+            self.forward_metadata = PrefillMetadata(verify_wrapper, False)
+        elif forward_mode.is_draft_extend():
+            draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                use_cuda_graph=True,
+                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
+                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
+                kv_indices=self.cuda_graph_kv_indices,
+                kv_len_arr=self.cuda_graph_kv_lens[:bs],
+                backend="auto",
+            )
+            seq_lens_sum = seq_lens.sum().item()
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                prefix_lens=None,
+                prefill_wrapper_paged=draft_extend_wrapper,
+                use_ragged=False,
+                spec_info=spec_info,
+            )
+            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
+            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -1028,6 +1115,19 @@ class FlashInferMLAMultiStepDraftBackend:
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
             )
+
+        self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
+
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Capture + replay path -- merged from old capture/replay variants.
+
+        Both variants dispatched into ``common_template`` and per-step called
+        the underlying backend's capture/replay variant; after step 03 both
+        recurse into ``init_forward_data_out_graph`` on the per-step backend.
+        """
+
+        def call_fn(i, forward_batch):
+            self.attn_backends[i].init_forward_data_out_graph(forward_batch)
 
         self.common_template(forward_batch, self.cuda_graph_kv_indices, call_fn)
 
