@@ -759,7 +759,7 @@ class Envs:
     # e2e tests to drive detection deterministically.
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
-    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS = EnvBool(False)
+    SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     # ===================================================================
     # /KV-Canary / Token-Oracle
     # ===================================================================

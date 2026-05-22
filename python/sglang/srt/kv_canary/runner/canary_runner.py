@@ -88,11 +88,15 @@ class CanaryRunner:
 
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
-        if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
+        swa_divergence_interval = (
+            envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.get()
+        )
+        if swa_divergence_interval > 0:
             self._swa_divergence_report: Optional[SwaDivergenceReport] = (
                 SwaDivergenceReport(
                     device=device,
                     d2h_stream=self._d2h_stream,
+                    interval=swa_divergence_interval,
                     swa_allocator=self._swa_allocator,
                     req_to_token_pool=self._req_to_token_pool,
                 )
@@ -209,6 +213,5 @@ class CanaryRunner:
         if self._swa_divergence_report is not None:
             self._swa_divergence_report.step(
                 step_counter=self._step_counter,
-                period=self.config.stats_print_every_n_steps,
                 forward_batch=forward_batch,
             )

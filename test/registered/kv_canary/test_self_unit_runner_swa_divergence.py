@@ -132,6 +132,7 @@ class TestSwaDivergenceReport(CustomTestCase):
             stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
+                interval=10,
                 swa_allocator=None,
                 req_to_token_pool=None,
             )
@@ -149,7 +150,7 @@ class TestSwaDivergenceReport(CustomTestCase):
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
                 stats.step(
-                    step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH
+                    step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH
                 )
 
             lines = [
@@ -169,6 +170,7 @@ class TestSwaDivergenceReport(CustomTestCase):
             stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
+                interval=10,
                 swa_allocator=None,
                 req_to_token_pool=None,
             )
@@ -180,7 +182,7 @@ class TestSwaDivergenceReport(CustomTestCase):
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
                     stats.step(
-                        step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH
+                        step_counter=step, forward_batch=_EMPTY_FORWARD_BATCH
                     )
                 matching = [
                     line
@@ -349,6 +351,7 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
             stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
+                interval=10,
                 swa_allocator=swa_allocator,
                 req_to_token_pool=req_to_token_pool,
             )
@@ -364,7 +367,7 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(step_counter=10, period=10, forward_batch=forward_batch)
+                stats.step(step_counter=10, forward_batch=forward_batch)
 
         matching = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None
@@ -379,15 +382,15 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
 
 class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
     def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
-            False
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
+            0
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
             runner = make_runner(device=self.device)
         self.assertIsNone(runner._swa_divergence_report)
 
     def test_swa_divergence_report_present_when_env_enabled(self) -> None:
-        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
-            True
+        with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
+            20
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
             runner = make_runner(device=self.device)
         self.assertIsNotNone(runner._swa_divergence_report)

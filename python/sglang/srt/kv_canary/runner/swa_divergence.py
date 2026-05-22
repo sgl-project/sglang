@@ -31,9 +31,11 @@ class SwaDivergenceReport:
         *,
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
+        interval: int,
         swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
         req_to_token_pool: Optional["ReqToTokenPool"] = None,
     ) -> None:
+        self._interval = interval
         self._swa_allocator = swa_allocator
         self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
@@ -52,13 +54,12 @@ class SwaDivergenceReport:
         self,
         *,
         step_counter: int,
-        period: int,
         forward_batch: "ForwardBatch",
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
             compute_on_device=lambda: self._compute_on_device(
-                step_counter=step_counter, period=period, forward_batch=forward_batch
+                step_counter=step_counter, forward_batch=forward_batch
             ),
             postprocess_on_host=self._postprocess_on_host,
         )
@@ -67,10 +68,9 @@ class SwaDivergenceReport:
         self,
         *,
         step_counter: int,
-        period: int,
         forward_batch: "ForwardBatch",
     ) -> Optional[dict[str, torch.Tensor]]:
-        if period <= 0 or step_counter == 0 or step_counter % period != 0:
+        if step_counter == 0 or step_counter % self._interval != 0:
             return None
 
         result: dict[str, torch.Tensor] = {

@@ -57,7 +57,7 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         server_env = os.environ.copy()
         server_env.update(cls.extra_env)
         if cls.model_mode == "swa":
-            server_env.setdefault("SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS", "1")
+            server_env.setdefault("SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL", "20")
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
