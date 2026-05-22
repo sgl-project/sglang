@@ -508,6 +508,76 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+
+        # Delegate to parent for non-decode modes.
+        if (
+            not forward_mode.is_decode_or_idle()
+            and not forward_mode.is_target_verify()
+            and not forward_mode.is_draft_extend(include_v2=True)
+        ):
+            super().init_forward_data_out_graph(forward_batch)
+            return
+
+        metadata = TRTLLMMLADecodeMetadata()
+
+        if forward_mode.is_target_verify():
+            seq_lens = seq_lens + self.num_draft_tokens
+            metadata.seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=seq_lens.device
+            )
+            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
+        elif forward_mode.is_draft_extend(include_v2=True):
+            num_tokens_per_bs = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_bs
+            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            metadata.cu_seqlens_q = torch.arange(
+                0,
+                bs * num_tokens_per_bs + 1,
+                num_tokens_per_bs,
+                dtype=torch.int32,
+                device=seq_lens.device,
+            )
+            metadata.seq_lens_q = torch.full(
+                (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
+            )
+            # NOTE(draft_extend seq_len handling):
+            # forward_batch.seq_lens is the seq_lens of the prev_context + verified tokens.
+            # To account for pad_draft_extend_query, we need seq_lens = prev_context + max_draft_tokens.
+            # This will ensure queries align with kvs correctly when calling
+            # flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.
+            seq_lens = seq_lens - metadata.seq_lens_q + metadata.max_seq_len_q
+            metadata.seq_lens_k = torch.zeros(
+                (bs,), dtype=torch.int32, device=seq_lens.device
+            )
+            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
+
+        # Custom fast-path for decode/idle.
+        # Capture with full width so future longer sequences are safe during replay
+        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
+
+        create_flashmla_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            None,
+            block_kv_indices,
+            self.req_to_token.stride(0),
+            max_blocks_per_seq,
+            PAGED_SIZE=self.page_size,
+        )
+
+        metadata.block_kv_indices = block_kv_indices
+        metadata.max_seq_len_k = self.max_context_len
+
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_decode_metadata = metadata
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
