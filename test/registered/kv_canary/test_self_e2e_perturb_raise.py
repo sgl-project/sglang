@@ -22,7 +22,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
 
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
-    extra_server_args = ("--kv-canary-real-data", "partial")
+    extra_server_args = ("--kv-canary-real-data", "partial", "--skip-server-warmup")
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",

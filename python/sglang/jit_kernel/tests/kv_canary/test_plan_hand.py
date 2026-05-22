@@ -715,7 +715,7 @@ class TestMisc:
         )
 
         triton_v, triton_w = plans[0]
-        # VerifyPlan covers 4+6 = 10 entries; write counts are zero.
+        # VerifyPlan covers 4+6 = 10 entries; write offsets are zero.
         assert int(triton_v.verify_num_valid[0].item()) == 10
         # write_offsets cumsum of zeros stays zero across the active prefix.
         assert int(triton_w.write_offsets[0].item()) == 0

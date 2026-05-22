@@ -232,6 +232,7 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
         "all",
         "--kv-canary-sweep-interval",
         "1",
+        "--disaggregation-decode-enable-radix-cache",
     )
 
     def test_pd_transfer_checksum_full_real_data(self) -> None:

@@ -68,7 +68,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
+    from sglang.srt.managers.schedule_batch import MultimodalInputs, Req, ScheduleBatch
     from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -560,7 +560,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
             hashed = _hash_rids_to_i64_tensor(
-                rids=[req.rid for req in batch.reqs],
+                rids=_oracle_request_ids(batch.reqs),
                 device=device,
             )
             batch.sampling_info.rids_int = hashed
@@ -1288,6 +1288,13 @@ else:
 def _hash_rids_to_i64_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
     values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
     return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _oracle_request_ids(reqs: List["Req"]) -> List[str]:
+    return [
+        str(req.bootstrap_room) if req.bootstrap_room is not None else req.rid
+        for req in reqs
+    ]
 
 
 def _stable_hash_rid_i64(rid: str) -> int:

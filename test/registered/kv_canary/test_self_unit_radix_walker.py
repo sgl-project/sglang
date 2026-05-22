@@ -91,6 +91,38 @@ class TestSelfUnitRadixWalker(CustomTestCase):
         result = walk_radix_cache_for_canary(radix_cache=cache, unlocked_only=True)
         self.assertEqual(result.slot_indices.tolist(), [3, 4])
 
+    def test_swa_resident_only_skips_tombstoned_nodes(self):
+        """Verify SWA radix walking skips nodes whose SWA storage was evicted."""
+        cache = SWARadixCache.__new__(SWARadixCache)
+        cache.device = self.device
+        cache.page_size = 1
+        cache.disable = False
+
+        root = TreeNode()
+        root.value = torch.tensor([], dtype=torch.int32, device=self.device)
+        cache.root_node = root
+
+        tombstoned_child = TreeNode()
+        tombstoned_child.value = torch.tensor(
+            [1, 2], dtype=torch.int32, device=self.device
+        )
+        tombstoned_child.parent = root
+        tombstoned_child.swa_tombstone = True
+        root.children[tombstoned_child.id] = tombstoned_child
+
+        resident_child = TreeNode()
+        resident_child.value = torch.tensor(
+            [3, 4], dtype=torch.int32, device=self.device
+        )
+        resident_child.parent = root
+        root.children[resident_child.id] = resident_child
+
+        slots, _, _ = walk_radix_cache_for_canary(
+            radix_cache=cache,
+            swa_resident_only=True,
+        )
+        self.assertEqual(slots.tolist(), [3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()

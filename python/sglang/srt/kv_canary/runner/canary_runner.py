@@ -123,6 +123,8 @@ class CanaryRunner:
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
             step_counter_getter=self._get_step_counter,
+            swa_window_size=self._swa_window_size,
+            sweep_interval=config.sweep_interval,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,
@@ -205,6 +207,7 @@ class CanaryRunner:
             return
 
         self._per_forward_orchestrator.end_of_step(forward_batch)
+        self._perturb_manager.perturb_real_kv_unused_cache(forward_batch=None)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()
