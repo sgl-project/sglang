@@ -1568,16 +1568,47 @@ class Scheduler(
         import time as _gc_time
         from collections import Counter
 
+        _gc_tensor_logged = False
+
         def _gc_callback(phase, info):
+            nonlocal _gc_tensor_logged
             if phase == "start":
                 gc._debug_t0 = _gc_time.perf_counter()
                 gc._debug_gen = info.get("generation", -1)
-                # Snapshot object types in this generation before collection
                 gen = gc._debug_gen
                 try:
                     objs = gc.get_objects(generation=gen)
                     gc._debug_types = Counter(type(o).__name__ for o in objs)
                     gc._debug_n_objs = len(objs)
+                    # Log Tensor referrer chains (only first few times)
+                    if not _gc_tensor_logged:
+                        import torch
+
+                        tensors = [o for o in objs if isinstance(o, torch.Tensor)]
+                        if tensors:
+                            _gc_tensor_logged = True
+                            for t in tensors[:3]:
+                                referrers = gc.get_referrers(t)
+                                ref_info = []
+                                for r in referrers:
+                                    if r is objs:
+                                        continue
+                                    rtype = type(r).__name__
+                                    rmod = getattr(type(r), "__module__", "?")
+                                    # For dicts, show keys
+                                    if isinstance(r, dict):
+                                        keys = list(r.keys())[:5]
+                                        ref_info.append(f"dict(keys={keys})")
+                                    else:
+                                        ref_info.append(f"{rmod}.{rtype}")
+                                logger.info(
+                                    "[GC_TENSOR] shape=%s dtype=%s "
+                                    "device=%s referrers=%s",
+                                    list(t.shape),
+                                    t.dtype,
+                                    t.device,
+                                    ref_info[:5],
+                                )
                 except TypeError:
                     gc._debug_types = Counter()
                     gc._debug_n_objs = 0
