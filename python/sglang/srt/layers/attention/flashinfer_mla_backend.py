@@ -384,75 +384,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        if forward_mode.is_decode_or_idle():
-            decode_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: num_tokens + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:num_tokens],
-                backend="auto",
-            )
+        import types
 
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                decode_wrapper=decode_wrapper,
-                init_metadata_replay=False,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
                 spec_info=spec_info,
+                seq_lens_sum=int(seq_lens.sum()),
+                seq_lens_cpu=None,
+                positions=req_pool_indices.new_empty(num_tokens),
             )
-            self.decode_cuda_graph_metadata[bs] = decode_wrapper
-            self.forward_metadata = DecodeMetadata(decode_wrapper)
-            decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
-        elif forward_mode.is_target_verify():
-            verify_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:bs],
-                backend="auto",
-            )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=verify_wrapper,
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = verify_wrapper
-            self.forward_metadata = PrefillMetadata(verify_wrapper, False)
-        elif forward_mode.is_draft_extend():
-            draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer,
-                use_cuda_graph=True,
-                qo_indptr=self.cuda_graph_qo_indptr[: bs + 1],
-                kv_indptr=self.cuda_graph_kv_indptr[: bs + 1],
-                kv_indices=self.cuda_graph_kv_indices,
-                kv_len_arr=self.cuda_graph_kv_lens[:bs],
-                backend="auto",
-            )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=draft_extend_wrapper,
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
-            self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
-        else:
-            raise ValueError(f"Invalid mode: {forward_mode=}")
+        )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         """Per-iter metadata prep for capture + replay paths.
@@ -552,51 +498,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        if forward_mode.is_decode_or_idle():
-            assert seq_lens_cpu is not None
-            kv_len_arr_cpu = seq_lens_cpu[:bs]
-            self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
-                kv_len_arr_cpu, dim=0
-            )
-            self.fast_decode_kwargs.update(
-                {
-                    "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
-                    "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu[: bs + 1],
-                    "kv_len_arr_cpu": kv_len_arr_cpu,
-                }
-            )
+        import types
 
-            self.indices_updater_decode.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_sum,
-                decode_wrapper=self.decode_cuda_graph_metadata[bs],
-                init_metadata_replay=True,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
                 spec_info=spec_info,
-                **self.fast_decode_kwargs,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=req_pool_indices.new_empty(bs),
             )
-        elif forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-        elif forward_mode.is_draft_extend():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                spec_info=spec_info,
-            )
-        else:
-            raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
