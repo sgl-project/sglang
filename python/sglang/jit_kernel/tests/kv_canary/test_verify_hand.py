@@ -115,9 +115,9 @@ def _stamp_clean_kv_chain(
         num_valid_reqs=1,
         device=_DEVICE,
     )
-    pseudo_tokens = torch.zeros(n, dtype=torch.int64, device=_DEVICE)
-    pseudo_positions = torch.zeros(n, dtype=torch.int64, device=_DEVICE)
     log = FakeViolationLog.allocate(device=_DEVICE)
+    # enable_assert_inputs=False is hard-wired here, so the kernel API requires the
+    # expected_* tensors be None (otherwise it raises ValueError).
     launch_canary_write_kernel_torch_reference(
         context=VerifyOrWriteContext(
             canary_buf=cuda_buf,
@@ -134,8 +134,8 @@ def _stamp_clean_kv_chain(
         positions=positions,
         out_cache_loc=out_cache_loc,
         enable_assert_inputs=False,
-        expected_input_tokens=pseudo_tokens,
-        expected_input_positions=pseudo_positions,
+        expected_input_tokens=None,
+        expected_input_positions=None,
     )
     ref_buf.copy_(cuda_buf)
 

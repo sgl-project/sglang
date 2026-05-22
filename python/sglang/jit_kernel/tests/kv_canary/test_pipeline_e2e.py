@@ -187,15 +187,19 @@ def _run_both_and_assert_pipeline_equal(
     VerifyPlan,
     WritePlan,
 ]:
-    total_tokens = int(input_ids.shape[0])
-    if expected_input_tokens is None:
-        expected_input_tokens = torch.zeros(
-            total_tokens, dtype=torch.int64, device=_DEVICE
-        )
-    if expected_input_positions is None:
-        expected_input_positions = torch.zeros(
-            total_tokens, dtype=torch.int64, device=_DEVICE
-        )
+    # The kernel rejects non-None expected_* tensors when enable_write_verify_inputs=False
+    # (sanity check to catch caller bugs), so only synthesise zero placeholders in the
+    # branch that will actually assert against them.
+    if enable_write_verify_inputs:
+        total_tokens = int(input_ids.shape[0])
+        if expected_input_tokens is None:
+            expected_input_tokens = torch.zeros(
+                total_tokens, dtype=torch.int64, device=_DEVICE
+            )
+        if expected_input_positions is None:
+            expected_input_positions = torch.zeros(
+                total_tokens, dtype=torch.int64, device=_DEVICE
+            )
 
     if initial_canary_buf is None:
         buf_real = make_canary_buf(num_slots=num_slots, device=_DEVICE)
