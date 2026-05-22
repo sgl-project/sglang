@@ -1117,20 +1117,6 @@ class DecodePreallocQueue:
                     and len(self.transfer_queue.queue) == 0
                     and projected_tokens > full_allocatable_tokens
                 ):
-                    logger.warning(
-                        "[Decode] Request %s aborted: projected memory need "
-                        "%d tokens (input=%d, max_new=%d, prefix=%d) exceeds "
-                        "allocatable %d with no retractable requests.",
-                        decode_req.req.rid,
-                        projected_tokens,
-                        origin_input_len,
-                        min(
-                            decode_req.req.sampling_params.max_new_tokens,
-                            CLIP_MAX_NEW_TOKEN,
-                        ),
-                        prefix_len,
-                        full_allocatable_tokens,
-                    )
                     self._unlock_prefix(decode_req.req, prefix_len)
                     full_allocatable_tokens -= lock_delta
                     decode_req.req.finished_reason = FINISH_ABORT(
@@ -1535,34 +1521,7 @@ class DecodePreallocQueue:
             return
 
         if req is None:
-            logger.warning(
-                "Batch eviction insufficient: needed %s tokens, available %s after "
-                "evicting %s/%s tokens. evictable_size=%s, protected_size=%s",
-                required_alloc_tokens,
-                available_after,
-                result.num_tokens_evicted,
-                num_to_evict,
-                self.tree_cache.evictable_size(),
-                self.tree_cache.protected_size(),
-            )
             return
-
-        logger.warning(
-            "Eviction insufficient: needed %s tokens, available %s after "
-            "evicting %s/%s tokens. evictable_size=%s, protected_size=%s, "
-            "fill_len=%s, prefix_len=%s, delta_len=%s, page_size=%s, req=%s",
-            required_alloc_tokens,
-            available_after,
-            result.num_tokens_evicted,
-            num_to_evict,
-            self.tree_cache.evictable_size(),
-            self.tree_cache.protected_size(),
-            fill_len,
-            prefix_len,
-            delta_len,
-            self.token_to_kv_pool_allocator.page_size,
-            req.rid,
-        )
 
     def _batch_evict_for_prealloc(
         self, planned_preallocs: List[_PlannedPrealloc]

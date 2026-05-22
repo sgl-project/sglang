@@ -139,9 +139,7 @@ class DeepseekMLAForwardMixin:
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ):
-        from sglang.srt.model_executor.cuda_graph_runner import (
-            get_is_capture_mode,
-        )
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
         topk_indices = None

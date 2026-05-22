@@ -706,12 +706,6 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         total = self._total_size_helper()
         self._digest_dirty = False
-        logger.debug(
-            "[CacheDigest] built digest: entries=%d total_cached=%d "
-            "evictable=%d protected=%d chunk_size=%d",
-            len(prefix_entries), total, self.evictable_size_, self.protected_size_,
-            chunk_size,
-        )
         return {
             "prefix_entries": prefix_entries,
             "total_cached_tokens": total,

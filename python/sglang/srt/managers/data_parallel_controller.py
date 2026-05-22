@@ -202,14 +202,6 @@ class DataParallelController:
         self.dp_routing_digest_chunk_size = server_args.dp_routing_digest_chunk_size
         self.dp_routing_max_extra_reqs = server_args.dp_routing_max_extra_reqs
 
-        if self.load_balance_method == LoadBalanceMethod.CACHE_AWARE:
-            logger.info(
-                "[CacheAware] enabled: chunk_size=%d max_extra_reqs=%d dp_size=%d",
-                self.dp_routing_digest_chunk_size,
-                self.dp_routing_max_extra_reqs,
-                server_args.dp_size,
-            )
-
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
 
@@ -265,15 +257,6 @@ class DataParallelController:
                     if cur_count != prev_count:
                         prev[d.dp_rank] = cur_count
                         self._prev_digest_entries = prev
-                        logger.info(
-                            "[CacheAware] digest update dp_rank=%d entries=%d "
-                            "cached=%d evictable=%d protected=%d",
-                            d.dp_rank,
-                            cur_count,
-                            d.total_cached_tokens,
-                            d.evictable_tokens,
-                            d.protected_tokens,
-                        )
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         self.status = ranks.status
@@ -734,11 +717,6 @@ class DataParallelController:
             if target is None:
                 target = active_ranks[self.round_robin_counter % len(active_ranks)]
                 self.round_robin_counter += 1
-            logger.debug(
-                "[CacheAware] fallback, target=%d (input_len=%d)",
-                target,
-                len(token_ids) if token_ids else 0,
-            )
             self.workers[target].send_pyobj(req)
             return
 
@@ -762,36 +740,8 @@ class DataParallelController:
 
         min_reqs = min(self.dp_budget.total_requests[r] for r in active_ranks)
         if self.dp_budget.total_requests[best_rank] - min_reqs >= max_extra:
-            old_rank = best_rank
             best_rank = min(
                 active_ranks, key=lambda r: self.dp_budget.total_requests[r]
-            )
-            logger.debug(
-                "[CacheAware] req=%s input_len=%d -> dp_rank=%d "
-                "(balance override: rank %d had match=%d but reqs=%d, "
-                "min_reqs=%d, max_extra=%d) matches=%s reqs=%s",
-                getattr(req, "rid", "?"),
-                len(token_ids),
-                best_rank,
-                old_rank,
-                match_info.get(old_rank, 0),
-                self.dp_budget.total_requests[old_rank],
-                min_reqs,
-                max_extra,
-                match_info,
-                {r: self.dp_budget.total_requests[r] for r in active_ranks},
-            )
-        else:
-            logger.debug(
-                "[CacheAware] req=%s input_len=%d -> dp_rank=%d "
-                "(match=%d, reqs=%d) matches=%s reqs=%s",
-                getattr(req, "rid", "?"),
-                len(token_ids),
-                best_rank,
-                match_info.get(best_rank, 0),
-                self.dp_budget.total_requests[best_rank],
-                match_info,
-                {r: self.dp_budget.total_requests[r] for r in active_ranks},
             )
 
         input_len = len(token_ids)
@@ -805,22 +755,8 @@ class DataParallelController:
                 and self._rank_available_tokens(r) >= input_len - match_info.get(r, 0)
             ]
             if viable:
-                old_rank = best_rank
                 best_rank = min(
                     viable, key=lambda r: self.dp_budget.total_requests[r]
-                )
-                logger.debug(
-                    "[CacheAware] req=%s input_len=%d -> dp_rank=%d "
-                    "(capacity override: rank %d needed=%d but available=%d) "
-                    "matches=%s reqs=%s",
-                    getattr(req, "rid", "?"),
-                    input_len,
-                    best_rank,
-                    old_rank,
-                    needed,
-                    int(available),
-                    match_info,
-                    {r: self.dp_budget.total_requests[r] for r in active_ranks},
                 )
 
         self.dp_budget.total_requests[best_rank] += 1
