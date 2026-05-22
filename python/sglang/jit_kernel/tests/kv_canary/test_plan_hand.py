@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary.plan import canary_plan_step
-from sglang.jit_kernel.kv_canary.plan_ref import launch_canary_plan_kernels_torch_reference
+from sglang.jit_kernel.kv_canary.plan_ref import (
+    launch_canary_plan_kernels_torch_reference,
+)
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import run_plan_diff
@@ -84,7 +86,11 @@ def _run_label(
     write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=_DEVICE
     )
-    runner = canary_plan_step if label == "real" else launch_canary_plan_kernels_torch_reference
+    runner = (
+        canary_plan_step
+        if label == "real"
+        else launch_canary_plan_kernels_torch_reference
+    )
     runner(
         verify_plan_out=verify_plan,
         write_plan_out=write_plan,
@@ -640,6 +646,7 @@ class TestNoExtras:
             )
             n = int(v_plan.verify_num_valid[0].item())
             assert n == total_verify, f"[{label}] num_valid {n}"
+            assert int(v_plan.enable[0].item()) == 1
 
     def test_verify_capacity_undershoot_by_one(self) -> None:
         rp = 1
@@ -686,9 +693,7 @@ class TestNoExtras:
         n_real = int(real_v.verify_num_valid[0].item())
         n_ref = int(ref_v.verify_num_valid[0].item())
         assert n_real == n_ref, f"real {n_real} vs ref {n_ref} diverged under cap"
-        assert (
-            n_real <= verify_capacity
-        ), f"real n_valid {n_real} exceeded cap {verify_capacity}"
+        assert n_real == verify_capacity
         assert int(real_v.enable[0].item()) == 0
         assert int(ref_v.enable[0].item()) == 0
 

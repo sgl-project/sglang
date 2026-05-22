@@ -125,7 +125,7 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     )
 
     input_ids = torch.tensor(
-        [rng.randint(0, 0xFFFFFFFF) for _ in range(total_tokens)],
+        [rng.randint(-(1 << 31), (1 << 31) - 1) for _ in range(total_tokens)],
         dtype=torch.int64,
         device=_DEVICE,
     )

@@ -1,9 +1,9 @@
-"""Perturb point (c): flip the first byte of a radix-cached but currently-unused
-(orphan) slot.
+"""Perturb point (d): flip the first byte of a slot in forward_batch.out_cache_loc
+AFTER the TAIL kernel has captured its canary hash.
 
-Detection should come from sweep (per-forward verify won't even look at this
-slot). Designed to surface bugs where cached KV is silently corrupted and
-sleeps until much later when a prefix happens to match.
+The flip is a PyTorch indexed write on the current CUDA stream; because TAIL is
+launched on the same stream, stream ordering guarantees it happens-after TAIL's
+canary write.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
-from sglang.srt.kv_canary.perturb.slot_picker import pick_orphan_slot
+from sglang.srt.kv_canary.perturb.slot_picker import pick_out_cache_loc_slot
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_random_source_byte_and_log,
@@ -22,7 +22,6 @@ from sglang.srt.kv_canary.perturb.utils import (
 )
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -33,23 +32,21 @@ def run(
     forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
-    radix_cache: Optional["BasePrefixCache"],
     warmup_gate: WarmupGate,
 ) -> None:
     if not should_run_perturbation(
-        perturb_name="real_kv_unused_cache",
-        probability=config.real_kv_unused_cache_prob,
+        perturb_name="real_kv_post_forward",
+        probability=config.real_kv_post_forward_prob,
         warmup_gate=warmup_gate,
         forward_batch=forward_batch,
-        require_forward_batch=False,
     ):
         return
 
-    slot = pick_orphan_slot(radix_cache=radix_cache)
+    slot = pick_out_cache_loc_slot(forward_batch=forward_batch)
     if slot is None:
         logger.info(
-            "kv_canary perturb real_kv_unused_cache: skipped because no orphan radix-cache slot "
-            "was found"
+            "kv_canary perturb real_kv_post_forward: skipped because forward_batch.out_cache_loc "
+            "had no valid slot"
         )
         return
     group = pick_target_group(
@@ -58,14 +55,14 @@ def run(
     )
     if group is None:
         logger.info(
-            "kv_canary perturb real_kv_unused_cache: skipped because no target group matched "
+            "kv_canary perturb real_kv_post_forward: skipped because no target group matched "
             "target_group_kind=%s slot=%d",
             config.target_group_kind,
             slot,
         )
         return
     flip_random_source_byte_and_log(
-        perturb_name="real_kv_unused_cache",
+        perturb_name="real_kv_post_forward",
         group=group,
         slot_idx=slot,
     )

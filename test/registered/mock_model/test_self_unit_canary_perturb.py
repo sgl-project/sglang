@@ -13,10 +13,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 class TestCanaryPerturb(CustomTestCase):
     def test_real_kv_used_logs_when_target_group_has_no_real_kv_sources(self) -> None:
+        """Verify real KV used perturbation logs when the target group has no sources."""
         config = PerturbConfig(
             req_to_token_prob=0.0,
             real_kv_used_prob=1.0,
             real_kv_unused_cache_prob=0.0,
+            real_kv_post_forward_prob=0.0,
             target_group_kind=TargetGroupKind.FULL,
             warmup_steps=0,
         )

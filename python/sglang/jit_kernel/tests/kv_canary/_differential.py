@@ -14,12 +14,11 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
-    canary_verify_step,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (
     launch_canary_verify_kernel_torch_reference,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
 )
@@ -27,6 +26,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_buf_equal,
     assert_canary_state_equal,
+    launch_canary_verify_kernel_from_parts,
+    launch_canary_write_kernel_from_parts,
     make_log_pair,
 )
 
@@ -158,7 +159,7 @@ def _run_both_verify(
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     assert_equal: bool = True,
 ) -> None:
-    canary_verify_step(
+    launch_canary_verify_kernel_from_parts(
         canary_buf=cuda_canary_buf,
         plan=plan_cuda,
         kernel_kind=kernel_kind,
@@ -206,7 +207,13 @@ def _run_both_write(
     kernel_kind: CanaryLaunchTag = CanaryLaunchTag.HEAD_K_FULL,
     assert_equal: bool = True,
 ) -> None:
-    canary_write_step(
+    expected_tokens_for_launch = (
+        expected_input_tokens if enable_write_verify_inputs else None
+    )
+    expected_positions_for_launch = (
+        expected_input_positions if enable_write_verify_inputs else None
+    )
+    launch_canary_write_kernel_from_parts(
         canary_buf=cuda_canary_buf,
         plan=plan_cuda,
         input_ids=input_ids,
@@ -214,8 +221,8 @@ def _run_both_write(
         out_cache_loc=out_cache_loc,
         kernel_kind=kernel_kind,
         enable_write_verify_inputs=enable_write_verify_inputs,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
+        expected_input_tokens=expected_tokens_for_launch,
+        expected_input_positions=expected_positions_for_launch,
         violation_ring=cuda_log.ring,
         violation_write_index=cuda_log.write_index,
         slot_run_counter=cuda_log.slot_run_counter,
@@ -231,8 +238,8 @@ def _run_both_write(
         out_cache_loc=out_cache_loc,
         kernel_kind=kernel_kind,
         enable_write_verify_inputs=enable_write_verify_inputs,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
+        expected_input_tokens=expected_tokens_for_launch,
+        expected_input_positions=expected_positions_for_launch,
         violation_ring=ref_log.ring,
         violation_write_index=ref_log.write_index,
         slot_run_counter=ref_log.slot_run_counter,

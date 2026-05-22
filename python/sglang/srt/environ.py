@@ -747,6 +747,13 @@ class Envs:
     # (per-forward HEAD/TAIL won't look at this slot). Requires
     # --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
+    # Real-KV-post-forward perturbation. When >0, the canary self-test flips
+    # byte 0 of a slot picked from forward_batch.out_cache_loc (the slot just
+    # written by this forward) AFTER the TAIL kernel has captured its canary
+    # hash. Designed for PD disagg self-test: P-side perturbation lands in
+    # the slot's real KV right before send_kv_chunk transfers it to D, so D's
+    # first decode forward catches the real_kv_hash violation. 0 = disabled.
+    SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
     # Which CanaryBufferGroup the real_kv_used / real_kv_unused_cache perturb
     # targets: "full" / "swa" exact-match the PoolKind name. Used by per-group
     # e2e tests to drive detection deterministically.

@@ -11,7 +11,10 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
-    canary_verify_step,
+)
+from sglang.jit_kernel.kv_canary.verify_ref import (
+    _compute_real_kv_hash_scalar,
+    launch_canary_verify_kernel_torch_reference,
 )
 from sglang.jit_kernel.kv_canary.write_ref import (
     launch_canary_write_kernel_torch_reference,
@@ -20,6 +23,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_only_bits_set,
     chain_anchor_signed,
+    launch_canary_verify_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -925,21 +929,14 @@ class TestRealKvHash:
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         real_kv_hashes: list[int] = []
         for slot_idx in slot_indices:
-            rkv = 0
-            for src in sources_cuda:
-                page_id = slot_idx // src.page_size
-                page_off = (slot_idx % src.page_size) * src.num_bytes_per_token
-                row_bytes = (
-                    src.tensor[page_id, page_off : page_off + src.read_bytes]
-                    .detach()
-                    .cpu()
-                    .tolist()
+            real_kv_hashes.append(
+                _compute_real_kv_hash_scalar(
+                    real_kv_sources=sources_cuda,
+                    real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                    slot_idx=slot_idx,
+                    work_device=torch.device("cpu"),
                 )
-                fold = 0
-                for b in row_bytes:
-                    fold = splitmix64(fold ^ int(b))
-                rkv = splitmix64(rkv ^ fold)
-            real_kv_hashes.append(rkv)
+            )
 
         for slot_idx, token, position, rkv in zip(
             slot_indices, tokens, positions, real_kv_hashes
@@ -1098,7 +1095,7 @@ class TestRealKvSource:
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            canary_verify_step(
+            launch_canary_verify_kernel_from_parts(
                 canary_buf=canary_buf,
                 plan=plan,
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1261,7 +1258,7 @@ class TestLayoutAndScheduling:
         )
         log = FakeViolationLog.allocate(capacity=8, device=_DEVICE)
 
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=canary_buf,
             plan=plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1278,7 +1275,16 @@ class TestLayoutAndScheduling:
         assert int(log.slot_run_counter[0].item()) == 0
         assert int(log.kernel_run_counter[0].item()) == 1
 
-    def test_disabled_plan_skips_slots_but_counts_kernel(self) -> None:
+    @pytest.mark.parametrize(
+        "runner",
+        [
+            launch_canary_verify_kernel_from_parts,
+            launch_canary_verify_kernel_torch_reference,
+        ],
+    )
+    def test_disabled_plan_skips_slots_but_counts_kernel(
+        self, runner: Callable[..., None]
+    ) -> None:
         """``VerifyPlan.enable = 0`` skips active entries while still marking the verify launch as run."""
         canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
         slot_idx = 5
@@ -1308,7 +1314,7 @@ class TestLayoutAndScheduling:
         slot_run_before = log.slot_run_counter.clone()
         kernel_run_before = log.kernel_run_counter.clone()
 
-        canary_verify_step(
+        runner(
             canary_buf=canary_buf,
             plan=plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -1319,7 +1325,8 @@ class TestLayoutAndScheduling:
             real_kv_sources=(),
             real_kv_hash_mode=consts.RealKvHashMode.OFF,
         )
-        torch.cuda.synchronize()
+        if runner is launch_canary_verify_kernel_from_parts:
+            torch.cuda.synchronize()
 
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)

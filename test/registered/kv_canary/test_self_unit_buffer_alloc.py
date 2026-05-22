@@ -29,7 +29,7 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
     )
 
 
-class TestBufferAlloc(CustomTestCase):
+class TestResolveRealKvReadBytes(CustomTestCase):
     def test_resolve_real_kv_read_bytes_off_returns_zero(self) -> None:
         """Verify OFF mode disables real KV byte reads."""
         self.assertEqual(resolve_real_kv_read_bytes(_config(RealKvHashMode.OFF)), 0)
@@ -48,6 +48,8 @@ class TestBufferAlloc(CustomTestCase):
             resolve_real_kv_read_bytes(_config(RealKvHashMode.ALL)), sys.maxsize
         )
 
+
+class TestMakeRowSource(CustomTestCase):
     def test_make_row_source_partial_large_stride_clips_to_32(self) -> None:
         """Verify row sources cap partial reads on large strides."""
         num_slots = 4
@@ -84,6 +86,8 @@ class TestBufferAlloc(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
             make_row_source(layer_buffer=layer_buf, read_bytes=sys.maxsize)
 
+
+class TestMakePackedSource(CustomTestCase):
     def test_make_packed_source_partial_large_stride_clips_to_32(self) -> None:
         """Verify packed sources cap partial reads on large strides."""
         bytes_per_token = 128

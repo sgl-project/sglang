@@ -51,15 +51,20 @@ class TokenOracleManager:
             num_tokens=num_tokens,
             rids_per_row=rids_int,
         )
-        expected_tokens = self.oracle.expected_tokens(
-            req_ids=req_ids, positions=positions.to(torch.int64)
-        )
+        if forward_batch.forward_mode.is_extend():
+            expected_tokens = input_ids
+        else:
+            expected_tokens = self.oracle.expected_tokens(
+                req_ids=req_ids, positions=positions.to(torch.int64)
+            )
         expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
         expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
 
-    def sample(self, *, req_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def sample_next_tokens(
+        self, *, req_ids: torch.Tensor, logits_positions: torch.Tensor
+    ) -> torch.Tensor:
         return self.oracle.expected_tokens(
-            req_ids=req_ids, positions=positions.to(torch.int64)
+            req_ids=req_ids, positions=logits_positions.to(torch.int64) + 1
         )
 
 
@@ -70,7 +75,7 @@ def _build_req_id_per_token(
     rids_per_row: torch.Tensor,
 ) -> torch.Tensor:
     forward_mode = forward_batch.forward_mode
-    if forward_mode is not None and forward_mode.is_extend():
+    if forward_mode.is_extend():
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
             raise RuntimeError(

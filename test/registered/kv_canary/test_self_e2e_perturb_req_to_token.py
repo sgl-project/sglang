@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 
@@ -18,7 +19,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
     FULL or SWA. We only assert that *some* per-forward chain_hash violation is logged.
     """
 
-    kv_canary_mode = "log"
+    kv_canary_mode = CanaryMode.LOG
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",

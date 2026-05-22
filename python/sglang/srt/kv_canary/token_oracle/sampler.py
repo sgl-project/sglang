@@ -44,8 +44,8 @@ class _OracleSampler(Sampler):
                 "token oracle requires the per-forward rids_int tensor "
                 "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
             )
-        batch_next_token_ids = self._token_oracle_manager.sample(
+        batch_next_token_ids = self._token_oracle_manager.sample_next_tokens(
             req_ids=rids_int,
-            positions=positions,
+            logits_positions=positions,
         )
         return batch_next_token_ids

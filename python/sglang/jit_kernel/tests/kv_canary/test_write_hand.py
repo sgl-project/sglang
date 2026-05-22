@@ -2,22 +2,30 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
+from sglang.jit_kernel.kv_canary import write as write_module
 from sglang.jit_kernel.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
-    canary_verify_step,
+    VerifyOrWriteContext,
 )
-from sglang.jit_kernel.kv_canary.write import canary_write_step
+from sglang.jit_kernel.kv_canary.verify_ref import _compute_real_kv_hash_scalar
+from sglang.jit_kernel.kv_canary.write import (
+    launch_canary_write_kernel,
+)
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     FakeViolationLog,
     assert_canary_state_equal,
     assert_only_bits_set,
     chain_anchor_signed,
+    launch_canary_verify_kernel_from_parts,
+    launch_canary_write_kernel_from_parts,
     make_canary_buf,
     make_canary_buf_pair,
     make_log_pair,
@@ -64,6 +72,14 @@ class _WriteSingleSlotInput:
     enable_write_verify_inputs: bool = False
     real_kv_sources: tuple[RealKvSource, ...] = ()
     real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
+
+
+class _RecordingWriteModule:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def canary_write_step_cuda(self, *args: object) -> None:
+        self.calls.append(args)
 
 
 def _run_write_single_slot_byte_equal(case: _WriteSingleSlotInput) -> None:
@@ -204,7 +220,7 @@ class TestSeedSlot:
             slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=cuda_buf,
             plan=verify_plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -441,15 +457,12 @@ class TestChain:
 
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for slot_idx, token, position in zip(slot_indices, tokens, positions):
-            rkv = 0
-            for src in sources_cuda:
-                row_bytes = (
-                    src.tensor[slot_idx, : src.read_bytes].detach().cpu().tolist()
-                )
-                fold = 0
-                for b in row_bytes:
-                    fold = splitmix64(fold ^ int(b))
-                rkv = splitmix64(rkv ^ fold)
+            rkv = _compute_real_kv_hash_scalar(
+                real_kv_sources=sources_cuda,
+                real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                slot_idx=slot_idx,
+                work_device=torch.device("cpu"),
+            )
             stored_prev_signed = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
             )[2]
@@ -603,7 +616,7 @@ class TestMockMode:
             device=_DEVICE,
         )
         verify_log = FakeViolationLog.allocate(device=_DEVICE)
-        canary_verify_step(
+        launch_canary_verify_kernel_from_parts(
             canary_buf=cuda_buf,
             plan=verify_plan,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
@@ -976,14 +989,13 @@ class TestRealKvHash:
         input_ids = _int32_tensor([1])
         positions = _int32_tensor([0])
         out_cache_loc = _int32_tensor([0])
-        pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
         log = FakeViolationLog.allocate(device=_DEVICE)
         sources = make_real_kv_sources(count=4, device=_DEVICE)
         extra = make_real_kv_source(device=_DEVICE)
         too_many = sources + (extra,)
 
         with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            canary_write_step(
+            launch_canary_write_kernel_from_parts(
                 canary_buf=cuda_buf,
                 plan=plan,
                 input_ids=input_ids,
@@ -991,8 +1003,8 @@ class TestRealKvHash:
                 out_cache_loc=out_cache_loc,
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
                 enable_write_verify_inputs=False,
-                expected_input_tokens=pseudo_tokens,
-                expected_input_positions=pseudo_positions,
+                expected_input_tokens=None,
+                expected_input_positions=None,
                 violation_ring=log.ring,
                 violation_write_index=log.write_index,
                 slot_run_counter=log.slot_run_counter,
@@ -1157,9 +1169,8 @@ class TestRealKvHash:
                 num_valid_reqs=1,
                 device=_DEVICE,
             )
-            pseudo_tokens, pseudo_positions = _dummy_pseudo_tensors(1)
             log = FakeViolationLog.allocate(device=_DEVICE)
-            canary_write_step(
+            launch_canary_write_kernel_from_parts(
                 canary_buf=buf,
                 plan=plan,
                 input_ids=_int32_tensor([1]),
@@ -1167,8 +1178,8 @@ class TestRealKvHash:
                 out_cache_loc=_int32_tensor([2]),
                 kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
                 enable_write_verify_inputs=False,
-                expected_input_tokens=pseudo_tokens,
-                expected_input_positions=pseudo_positions,
+                expected_input_tokens=None,
+                expected_input_positions=None,
                 violation_ring=log.ring,
                 violation_write_index=log.write_index,
                 slot_run_counter=log.slot_run_counter,
@@ -1317,6 +1328,51 @@ class TestMisc:
         assert int(cuda_log.write_index[0].item()) == 0
         assert int(ref_log.write_index[0].item()) == 0
 
+    def test_disabled_assert_inputs_passes_none_to_cuda(self) -> None:
+        """Disabled input assertions pass None instead of dummy tensors."""
+        canary_buf = torch.zeros(
+            4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=_DEVICE
+        )
+        plan = make_write_plan(
+            write_offsets=[0, 0],
+            seed_slot_indices=[-1],
+            num_valid_reqs=0,
+            device=_DEVICE,
+        )
+        input_ids = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        positions = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        out_cache_loc = torch.zeros(1, dtype=torch.int64, device=_DEVICE)
+        log = FakeViolationLog.allocate(capacity=2, device=_DEVICE)
+        context = VerifyOrWriteContext(
+            canary_buf=canary_buf,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=log.ring,
+            violation_write_index=log.write_index,
+            slot_run_counter=log.slot_run_counter,
+            kernel_run_counter=log.kernel_run_counter,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        )
+        module = _RecordingWriteModule()
+
+        with patch.object(write_module, "_jit_canary_write_module", lambda: module):
+            launch_canary_write_kernel(
+                context=context,
+                plan=plan,
+                input_ids=input_ids,
+                positions=positions,
+                out_cache_loc=out_cache_loc,
+                enable_assert_inputs=False,
+                expected_input_tokens=None,
+                expected_input_positions=None,
+            )
+
+        assert len(module.calls) == 1
+        call = module.calls[0]
+        assert call[8] == 0
+        assert call[9] is None
+        assert call[10] is None
+
 
 class TestBoundarySweep:
     @pytest.mark.parametrize(
@@ -1371,7 +1427,7 @@ class TestPseudoMode:
         ), f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
 
     def test_pseudo_mode_off_skips_token_check(self) -> None:
-        """enable_write_verify_inputs=False + intentional mismatch in expected_input_* → no violation recorded."""
+        """enable_write_verify_inputs=False makes the caller pass no expected-input tensors."""
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )

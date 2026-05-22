@@ -15,6 +15,7 @@ register_cuda_ci(est_time=30, suite="extra-a-1-gpu-large")
 
 class TestHashOracleTorchVsRef(CustomTestCase):
     def test_hash_oracle_matches_scalar_splitmix64_ref(self) -> None:
+        """Verify single-item HashOracle calls match the scalar SplitMix64 reference."""
         rng = random.Random(0)
         vocab_size = 32000
         num_cases = 1000
@@ -49,6 +50,7 @@ class TestHashOracleTorchVsRef(CustomTestCase):
             )
 
     def test_hash_oracle_batched_matches_scalar_splitmix64_ref(self) -> None:
+        """Verify batched HashOracle calls match the scalar SplitMix64 reference."""
         rng = random.Random(1)
         vocab_size = 32000
         num_cases = 1000

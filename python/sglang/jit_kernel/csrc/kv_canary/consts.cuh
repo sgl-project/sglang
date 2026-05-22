@@ -6,10 +6,14 @@ namespace canary {
 
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 
-// Slot 0 of every canary buffer is a reserved padding sentinel. Pools that attach a canary MUST reserve
-// slot 0 (free_slots starts at 1) so unfilled req_to_token entries (zero-initialized) translate to this
-// slot and the verify kernel skips them instead of raising spurious chain_hash / position violations.
-constexpr int64_t kCanaryReservedSlot = 0;
+// Mirrors SGLang's ReqToTokenPool contract: req_pool_idx 0 is the CUDA-graph padding row, while real
+// request rows start at 1.
+constexpr int64_t kReqPoolIdxPadding = 0;
+
+// Mirrors SGLang's TokenToKVPoolAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
+// writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
+// instead of treating unfilled entries as real KV slots.
+constexpr int64_t kTokenToKvSlotPadding = 0;
 
 constexpr int kCanaryFieldsPerSlot = 4;
 constexpr int kCanaryFieldToken = 0;

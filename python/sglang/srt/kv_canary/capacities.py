@@ -70,6 +70,8 @@ class CanaryLaunchCapacities:
             )
 
         spec_num_draft_tokens = server_args.speculative_num_draft_tokens
+        if spec_num_draft_tokens is None:
+            spec_num_draft_tokens = 0
         if spec_num_draft_tokens < 0:
             raise ValueError(
                 "kv-canary: speculative_num_draft_tokens must be non-negative, "

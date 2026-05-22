@@ -51,6 +51,20 @@ class TestComputeLaunchCapacities(CustomTestCase):
             int(max_total_num_tokens * 1.2),
         )
 
+    def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
+        """Verify default non-speculative args compute launch capacities."""
+        server_args = self._make_server_args(max_bs=2)
+        server_args.speculative_num_draft_tokens = None
+
+        capacities = CanaryLaunchCapacities.from_args(
+            server_args=server_args,
+            req_to_token_pool_size=2,
+            max_seq_len_per_req=32,
+            pool_slot_count=64,
+        )
+
+        self.assertEqual(capacities.per_forward_write_entry_capacity, 128)
+
     def test_manual_capacities_reject_non_positive_fields(self) -> None:
         """Verify manual launch capacities fail instead of being clamped."""
         with self.assertRaisesRegex(ValueError, "per_forward_verify_capacity"):

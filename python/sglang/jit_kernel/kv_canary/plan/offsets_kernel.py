@@ -328,6 +328,7 @@ def _plan_offsets_kernel(
         HAS_SWA_LUT,
         WRITE_OFFSETS_LEN,
         WRITE_REQ_CAPACITY,
+        TOKEN_TO_KV_SLOT_PADDING,
     )
 
 
@@ -388,6 +389,7 @@ def _plan_write_offsets(
     HAS_SWA_LUT: tl.constexpr,
     WRITE_OFFSETS_LEN: tl.constexpr,
     WRITE_REQ_CAPACITY: tl.constexpr,
+    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
     has_write_contribution = has_prefix & (write_lens > 0)  # [BS_BLOCK] bool
 

@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
+class TestRunnerPerForward(CanaryRunnerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
         """Verify per-forward execution launches plan, head, and tail kernels."""
         calls: list[object] = []
@@ -67,6 +67,8 @@ class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
             )
         )
 
+
+class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
     def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self) -> None:
         """Verify endpoint launch preserves CUDA graph-stable tensor shapes."""
         group = make_group(device=self.device)
@@ -150,6 +152,8 @@ class TestSelfUnitRunnerPerForward(CanaryRunnerTestCase):
         self.assertEqual(call["positions"].dtype, torch.int64)
         self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
 
+
+class TestRunnerBeforeForward(CanaryRunnerTestCase):
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:
         """Verify oversized prefix sums are handled without host-side errors."""
         # Overflow no longer raises host-side: the plan kernel sets VerifyPlan.enable=0 and the
