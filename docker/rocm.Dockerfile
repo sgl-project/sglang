@@ -202,11 +202,17 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
 
+# cherry pick:
+#   - d7caa3d: fix mhc split-k acc_sq mask (PR #3278)
+#   - 4901f7e: mhc decrease BLOCK_M, add asymmetric_exp_domain option (PR #3305)
+# may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
+ && git cherry-pick --no-commit d7caa3d20b28fff4ea95623ee5a147d0e1a50c4e \
+ && git cherry-pick --no-commit 4901f7e76fc1b926e3047717131394026c6c817e \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
