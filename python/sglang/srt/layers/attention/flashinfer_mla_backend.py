@@ -459,6 +459,31 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
             self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
+        elif forward_mode.is_extend_or_mixed():
+            # Prefill / extend path -- invoked by piecewise / breakable cuda
+            # graph capture for non-decode modes. Mirrors the eager body's
+            # ``else:`` clause: build prefill metadata from the live
+            # ``req_to_token_pool`` view (no pre-allocated buffer reuse).
+            prefix_lens = forward_batch.extend_prefix_lens
+            extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+            # PCG uses paged prefill for prefix-cache compat; check current scope.
+            use_ragged = (
+                not get_global_server_args().flashinfer_mla_disable_ragged
+                and extend_no_prefix
+                and not is_in_piecewise_cuda_graph()
+            )
+
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                prefill_wrapper_paged=self.prefill_wrapper_paged,
+                use_ragged=use_ragged,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrapper_paged, use_ragged
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 

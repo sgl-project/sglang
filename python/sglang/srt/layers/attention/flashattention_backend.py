@@ -1883,6 +1883,40 @@ class FlashAttentionBackend(AttentionBackend):
                 ]
 
             self.draft_extend_metadata[bs] = metadata
+        elif forward_mode.is_extend_or_draft_extend_or_mixed(
+            include_draft_extend_v2=True
+        ):
+            # Prefill / extend path -- invoked by piecewise / breakable cuda
+            # graph capture for non-decode modes. Mirrors the eager body's
+            # ``elif is_extend_or_draft_extend_or_mixed`` clause; reads the
+            # live ``req_to_token_pool`` view (no pre-allocated buffer reuse).
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.page_table = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices, : metadata.max_seq_len_k
+            ]
+
+            if any(
+                forward_batch.extend_prefix_lens_cpu
+            ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                extend_seq_lens = forward_batch.extend_seq_lens
+                # max() with tensor or python list both work; coerce to int
+                max_q = max(forward_batch.extend_seq_lens_cpu)
+                metadata.max_seq_len_q = (
+                    int(max_q.item()) if isinstance(max_q, torch.Tensor) else int(max_q)
+                )
+                metadata.cu_seqlens_q = torch.nn.functional.pad(
+                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            else:
+                metadata.max_seq_len_q = metadata.max_seq_len_k
+                metadata.cu_seqlens_q = metadata.cu_seqlens_k
+
+            if forward_batch.forward_mode == ForwardMode.EXTEND:
+                self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
         if encoder_lens is not None:
             encoder_bs = encoder_lens.numel()
@@ -1896,6 +1930,42 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.encoder_page_table = self.encoder_metadata["encoder_page_table"][
                 :bs, :
             ]
+
+        # SWA page table + strided conversion (mirrors eager).
+        if self.use_sliding_window_kv_pool and metadata.page_table is not None:
+            if metadata.swa_page_table is None:
+                metadata.swa_page_table = (
+                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                        metadata.page_table
+                    )
+                )
+
+        if self.page_size > 1 and not forward_mode.is_decode_or_idle():
+            # For non-decode modes the page table was built from
+            # req_to_token_pool above; strided conversion applies.
+            if (
+                metadata.page_table is not None
+                and forward_mode.is_extend_or_draft_extend_or_mixed(
+                    include_draft_extend_v2=True
+                )
+            ):
+                self.strided_indices = torch.arange(
+                    0,
+                    metadata.page_table.shape[1],
+                    self.page_size,
+                    device=self.device,
+                )
+                if (
+                    self.use_sliding_window_kv_pool
+                    and metadata.swa_page_table is not None
+                ):
+                    metadata.swa_page_table = (
+                        metadata.swa_page_table[:, self.strided_indices]
+                        // self.page_size
+                    )
+                metadata.page_table = (
+                    metadata.page_table[:, self.strided_indices] // self.page_size
+                )
 
         self.forward_metadata = metadata
         self.forward_metadata_spec_decode_expand = metadata_expand

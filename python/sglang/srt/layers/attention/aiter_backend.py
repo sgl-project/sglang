@@ -1894,6 +1894,11 @@ class AiterAttnBackend(AttentionBackend):
                     max_extend_len=num_tokens_per_bs,
                 )
         else:
+            # FIXME: prefill/extend branch missing -- latent because PCG is
+            # disabled on HIP/AMD today (the only place this backend runs).
+            # When PCG is enabled on ROCm, port the eager body's ``else:``
+            # branch here, mirroring the triton / flashinfer / fa3 fixes
+            # in step 03. Tracked as a follow-up for ROCm PCG enablement.
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
     def get_cuda_graph_seq_len_fill_value(self):

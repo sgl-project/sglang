@@ -727,6 +727,48 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+        elif forward_mode.is_extend_or_mixed():
+            # Prefill / extend path -- invoked by piecewise / breakable cuda
+            # graph capture for non-decode modes. Mirrors the eager body's
+            # ``else:`` clause; reads the live ``req_to_token_pool`` view
+            # (no pre-allocated buffer reuse, like the eager path).
+            prefix_lens = forward_batch.extend_prefix_lens
+
+            if self.is_multimodal or self.enable_mis:
+                use_ragged = False
+                extend_no_prefix = False
+            else:
+                use_ragged = (
+                    not self.enable_deterministic
+                    and not is_in_piecewise_cuda_graph()
+                    and not self.use_paged
+                )
+                extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
+
+            multi_item_params = MultiItemScoringParams()
+            if self.enable_mis:
+                multi_item_params = self._process_multi_item_scoring(forward_batch)
+
+            self.indices_updater_prefill.update(
+                req_pool_indices,
+                seq_lens,
+                forward_batch.seq_lens_cpu,
+                forward_batch.seq_lens_sum,
+                prefix_lens,
+                prefill_wrappers=self.prefill_wrappers_paged,
+                use_ragged=use_ragged,
+                encoder_lens=encoder_lens,
+                spec_info=None,
+                fixed_split_size=self.prefill_split_tile_size,
+                multi_item_params=multi_item_params,
+                cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
+            )
+            self.forward_metadata = PrefillMetadata(
+                self.prefill_wrappers_paged,
+                use_ragged,
+                extend_no_prefix,
+                multi_item_params,
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 

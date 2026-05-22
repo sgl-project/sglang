@@ -730,6 +730,56 @@ class TritonAttnBackend(AttentionBackend):
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
+        elif forward_mode.is_extend_or_mixed():
+            # Prefill / extend path -- invoked by piecewise / breakable cuda
+            # graph capture for non-decode modes. Mirrors the eager body's
+            # ``else:`` clause: build kv_indices/qo_indptr from the live
+            # ``req_to_token_pool`` view (no pre-allocated buffer reuse).
+            kv_indptr_local = self.kv_indptr
+            kv_indptr_local[1 : bs + 1] = torch.cumsum(
+                forward_batch.extend_prefix_lens, dim=0
+            )
+            kv_indptr = kv_indptr_local[: bs + 1]
+            kv_indices = torch.empty(
+                sum(forward_batch.extend_prefix_lens_cpu),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                forward_batch.extend_prefix_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                (
+                    window_kv_indptr,
+                    window_kv_indices,
+                    _window_kv_lens,
+                    window_kv_offsets,
+                ) = update_sliding_window_buffer(
+                    self.window_kv_indptr,
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    forward_batch.extend_prefix_lens,
+                    req_pool_indices,
+                    bs,
+                    self.device,
+                    self.token_to_kv_pool_allocator,
+                )
+
+            qo_indptr = self.qo_indptr
+            qo_indptr[1 : bs + 1] = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
+            qo_indptr = qo_indptr[: bs + 1]
+            custom_mask = None
+            mask_indptr = None
+            attn_logits = None
+            attn_lse = None
+            max_extend_len = max(forward_batch.extend_seq_lens_cpu)
+            num_kv_splits = None
         else:
             raise ValueError(
                 f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
