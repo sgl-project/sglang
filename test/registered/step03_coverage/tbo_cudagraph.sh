@@ -14,6 +14,7 @@ MODEL_PATH="${MODEL_PATH:-/mnt/vast/models/dsv3-nvfp4}"
 LAUNCH_ARGS=(
     --tp-size 4
     --moe-a2a-backend deepep
+    --moe-runner-backend deep_gemm
     --enable-two-batch-overlap
     --enable-dp-attention
     --dp-size 4
