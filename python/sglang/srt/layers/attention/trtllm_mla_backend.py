@@ -436,77 +436,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInput],
     ):
         """Initialize metadata for CUDA graph capture."""
+        import types
 
-        # Delegate to parent for non-decode modes.
-        if (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
-        ):
-            return super().init_forward_metadata_capture_cuda_graph(
-                bs,
-                num_tokens,
-                req_pool_indices,
-                seq_lens,
-                encoder_lens,
-                forward_mode,
-                spec_info,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=int(seq_lens.sum()),
+                seq_lens_cpu=None,
+                positions=req_pool_indices.new_empty(num_tokens),
             )
-
-        metadata = TRTLLMMLADecodeMetadata()
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens + self.num_draft_tokens
-            metadata.seq_lens_k = torch.zeros(
-                (bs,), dtype=torch.int32, device=seq_lens.device
-            )
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = num_tokens // bs
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=seq_lens.device
-            )
-            # NOTE(draft_extend seq_len handling):
-            # forward_batch.seq_lens is the seq_lens of the prev_context + verified tokens.
-            # To account for pad_draft_extend_query, we need seq_lens = prev_context + max_draft_tokens.
-            # This will ensure queries align with kvs correctly when calling
-            # flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla.
-            seq_lens = seq_lens - metadata.seq_lens_q + metadata.max_seq_len_q
-            metadata.seq_lens_k = torch.zeros(
-                (bs,), dtype=torch.int32, device=seq_lens.device
-            )
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-
-        # Custom fast-path for decode/idle.
-        # Capture with full width so future longer sequences are safe during replay
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
-
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices,
-            seq_lens,
-            None,
-            block_kv_indices,
-            self.req_to_token.stride(0),
-            max_blocks_per_seq,
-            PAGED_SIZE=self.page_size,
         )
-
-        metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
-
-        self.decode_cuda_graph_metadata[bs] = metadata
-        self.forward_decode_metadata = metadata
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
@@ -590,57 +534,20 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_cpu: Optional[torch.Tensor],
     ):
         """Replay CUDA graph with new inputs."""
-        # Delegate to parent for non-decode modes.
-        if (
-            not forward_mode.is_decode_or_idle()
-            and not forward_mode.is_target_verify()
-            and not forward_mode.is_draft_extend(include_v2=True)
-        ):
-            return super().init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
+        import types
+
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=req_pool_indices.new_empty(bs),
             )
-
-        metadata = self.decode_cuda_graph_metadata[bs]
-
-        if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
-            del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
-            metadata.cu_seqlens_q[: bs + 1].copy_(
-                torch.arange(
-                    0,
-                    bs * num_tokens_per_bs + 1,
-                    step=num_tokens_per_bs,
-                    dtype=torch.int32,
-                    device=seq_lens.device,
-                )
-            )
-            metadata.seq_lens_q[:bs].fill_(num_tokens_per_bs)
-            # see NOTE(draft_extend seq_len handling)
-            seq_lens = seq_lens[:bs] - metadata.seq_lens_q[:bs] + metadata.max_seq_len_q
-            metadata.seq_lens_k.copy_(seq_lens.to(torch.int32))
-
-        # Update block indices for new sequences.
-        create_flashmla_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens,
-            None,
-            metadata.block_kv_indices,
-            self.req_to_token.stride(0),
-            metadata.block_kv_indices.shape[1],
-            PAGED_SIZE=self.page_size,
         )
 
     def get_cuda_graph_seq_len_fill_value(self) -> int:
