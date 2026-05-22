@@ -59,13 +59,14 @@ def build_mha_runner(
         enable_memory_saver=False,
     )
 
-    # Capture before class bodies to avoid name-shadowing inside the class scope.
-    # Python class bodies pre-scan assignments: `head_dim = head_dim` inside a
-    # class makes `head_dim` look "local" to the class, breaking earlier reads.
+    # Capture before class bodies: any `x = x` in a class body fails because
+    # Python pre-scans class bodies for assignments and marks those names as
+    # class-scope locals, making the right-side lookup fail.
     _hd = head_dim
     _nh = num_heads
     _nkv = _num_kv_heads
     _ctx = max_context_len
+    _ps = page_size
 
     class _HFTextConfig:
         num_attention_heads = _nh
@@ -95,7 +96,7 @@ def build_mha_runner(
 
     class _ServerArgs:
         kv_cache_dtype = "auto"
-        page_size = page_size  # TritonMultiStepDraft reads server_args.page_size
+        page_size = _ps  # TritonMultiStepDraft reads server_args.page_size
         speculative_eagle_topk = None
         speculative_num_draft_tokens = 0
         speculative_num_steps = 0
@@ -198,6 +199,7 @@ def build_mla_runner(
     _vhd = v_head_dim
     _nh_mla = num_heads
     _ctx_mla = max_context_len
+    _ps_mla = page_size
 
     class _ModelConfig:
         attention_arch = AttentionArch.MLA
@@ -223,7 +225,7 @@ def build_mla_runner(
 
     class _ServerArgs:
         kv_cache_dtype = "auto"
-        page_size = page_size
+        page_size = _ps_mla
         speculative_eagle_topk = None
         speculative_num_draft_tokens = 0
         speculative_num_steps = 0
