@@ -529,10 +529,9 @@ class SchedulerPPMixin:
         # - Scatter-based MoE a2a backends (deepep, etc.): hidden states are
         #   scattered (each TP rank holds different tokens), so all-gather
         #   would mix non-identical data and produce incorrect results.
-        self.require_attn_tp_allgather = (
-            not self.server_args.enable_nsa_prefill_context_parallel
+         self.require_attn_tp_allgather = (
+            not self.server_args.enable_dsa_prefill_context_parallel
             and self.server_args.moe_a2a_backend == "none"
-            and not self.server_args.enable_dsa_prefill_context_parallel
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
