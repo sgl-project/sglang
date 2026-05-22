@@ -204,6 +204,11 @@ class AiterAttnBackend(AttentionBackend):
                     model_runner, self
                 )
 
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
+
         # sliding window attention
         self.use_sliding_window_kv_pool = (
             isinstance(model_runner.token_to_kv_pool, SWAKVPool)
@@ -211,7 +216,6 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         if self.use_sliding_window_kv_pool:
-            self.token_to_kv_pool = model_runner.token_to_kv_pool
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
@@ -2355,8 +2359,8 @@ class AiterAttnBackend(AttentionBackend):
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
-                    token_to_kv_pool = forward_batch.token_to_kv_pool
-                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    token_to_kv_pool = self.token_to_kv_pool
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
                     slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
@@ -2380,9 +2384,9 @@ class AiterAttnBackend(AttentionBackend):
                         v_scale=v_descale,
                     )
                 elif self.use_mla:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_descale, v_descale
                     )
 
@@ -2392,8 +2396,8 @@ class AiterAttnBackend(AttentionBackend):
             kv_indptr = self.forward_metadata.kv_indptr
             kv_indices = self.forward_metadata.kv_indices
             qo_indptr = self.forward_metadata.qo_indptr
-            K_Buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            V_Buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            K_Buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            V_Buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
             kv_lora_rank = V_Buffer.shape[-1]
             qk_rope_head_dim = K_Buffer.shape[-1] - kv_lora_rank
             qk_nope_head_dim = k.shape[-1] - qk_rope_head_dim
@@ -2646,7 +2650,7 @@ class AiterAttnBackend(AttentionBackend):
                     self._use_unified_verify
                     and forward_batch.forward_mode.is_target_verify()
                 ):
-                    k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
                     )
                     page_table = self.forward_metadata.kv_indices
@@ -2705,8 +2709,8 @@ class AiterAttnBackend(AttentionBackend):
                     k.contiguous(),
                     v.contiguous(),
                     o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                    forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                    forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                     self.forward_metadata.qo_indptr,
                     self.forward_metadata.kv_indptr,
                     self.forward_metadata.kv_indices,
@@ -2721,9 +2725,7 @@ class AiterAttnBackend(AttentionBackend):
                 )
                 return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             bs0 = forward_batch.batch_size + 1
 
@@ -2798,10 +2800,8 @@ class AiterAttnBackend(AttentionBackend):
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
-                token_to_kv_pool = forward_batch.token_to_kv_pool
-                k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                    layer.layer_id
-                )
+                token_to_kv_pool = self.token_to_kv_pool
+                k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
 
                 launch_reshape_and_cache_flash(
@@ -2822,7 +2822,7 @@ class AiterAttnBackend(AttentionBackend):
                 # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
                 # fuse bf16→fp8 cast + paged write in one Triton kernel,
                 # eliminating separate float8_copy + store_kvcache overhead.
-                token_to_kv_pool = forward_batch.token_to_kv_pool
+                token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
                 launch_reshape_and_cache_flash(
                     k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
@@ -2836,12 +2836,12 @@ class AiterAttnBackend(AttentionBackend):
                     forward_batch.out_cache_loc,
                 )
             else:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
                 )
 
         if self.use_mla:
-            k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
             work_metadata = self.forward_metadata.work_metadata
             work_indptr = self.forward_metadata.work_indptr
@@ -2878,9 +2878,7 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.logits_soft_cap = layer.logit_cap
 
-            k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
-                layer.layer_id
-            )
+            k_cache, v_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
             if layer.qk_head_dim != layer.v_head_dim:
                 o = q.new_empty(
@@ -3185,6 +3183,7 @@ class AiterMultiStepDraftBackend:
         )
         self.device = model_runner.device
         # Cached variables for generate_draft_decode_kv_indices
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
 
@@ -3199,7 +3198,7 @@ class AiterMultiStepDraftBackend:
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
