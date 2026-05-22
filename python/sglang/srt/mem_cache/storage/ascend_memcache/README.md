@@ -70,7 +70,7 @@ git clean -xdf
 git reset --hard
 ```
 
-For build parameters, refer to [this document](https://gitcode.com/Ascend/memfabric_hybrid/blob/master/doc/installation.md#%E4%BA%8C%E3%80%81-%E4%BD%BF%E7%94%A8-c-api)
+For build parameters, refer to [this document](https://gitcode.com/Ascend/memfabric_hybrid/blob/master/doc/installation.md#3-%E7%BC%96%E8%AF%91%E6%9E%84%E5%BB%BA)
 ```bash
 bash script/build_and_pack_run.sh
 ```
@@ -113,7 +113,7 @@ source /usr/local/memcache_hybrid/set_env.sh
 ### Metaservice
 
 (1) Environment variables plus configuration file
-(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/build.md#metaservice)
+(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/install_run.md#%E5%90%AF%E5%8A%A8metaservice)
 
 Recommended approach: add `metaservice_config.json`
 ```json
@@ -126,7 +126,7 @@ Recommended approach: add `metaservice_config.json`
 ### Localservice
 
 (1) Environment variables plus configuration file
-(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/build.md#localservice)
+(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/install_run.md#localservice)
 
 
 Recommended approach: add `localservice_config.json`
