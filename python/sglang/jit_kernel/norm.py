@@ -67,8 +67,7 @@ def _jit_rmsnorm_module(hidden_size: int, dtype: torch.dtype) -> Module:
 
 
 def is_supported_jit_fused_add_rmsnorm_hidden_size(hidden_size: int) -> bool:
-    # Conservative bound covering both 16B-vec (Ampere) and 32B-vec (Hopper+) paths.
-    return hidden_size > 0 and hidden_size % 8 == 0 and hidden_size <= 8192
+    return hidden_size > 0 and hidden_size % 16 == 0 and hidden_size <= 8192
 
 
 @cache_once
