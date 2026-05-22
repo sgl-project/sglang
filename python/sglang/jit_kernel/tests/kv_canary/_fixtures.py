@@ -62,7 +62,10 @@ def make_req_to_token(
     if rng is None:
         rng = random.Random(0)
     pool_size = max_reqs * max_seq_len
-    slot_universe = list(range(1, pool_size + max_seq_len))
+    # Slots index into a full_to_swa LUT sized [pool_size + 1], so values must stay
+    # in [0, pool_size]. The universe spans [1, pool_size] (skipping 0 as reserved),
+    # giving exactly max_reqs * max_seq_len unique slots — one per (rp, pos) cell.
+    slot_universe = list(range(1, pool_size + 1))
     rng.shuffle(slot_universe)
     rtt = torch.zeros((max_reqs, max_seq_len), dtype=torch.int32, device=device)
     cursor = 0

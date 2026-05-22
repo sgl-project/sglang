@@ -472,12 +472,17 @@ class WriteInvariants:
             assert delta == 0, f"empty plan incremented slot_run_counter by {delta}"
             return
         total = int(plan.write_offsets[n_active].item())
+        # The write kernel skips entries where out_cache_loc < 0 (the documented "mark
+        # skip" path used by SWA-translated callers), so the slot_run_counter delta
+        # tracks the count of writeable entries, not the planned total.
+        writeable = int((out_cache_loc[:total] >= 0).sum().item())
         delta = int(log_after.slot_run_counter[0].item()) - int(
             log_before.slot_run_counter[0].item()
         )
-        assert (
-            delta == total
-        ), f"slot_run_counter delta {delta} != total write entries {total}"
+        assert delta == writeable, (
+            f"slot_run_counter delta {delta} != writeable entries {writeable} "
+            f"(total={total}, skipped={total - writeable})"
+        )
 
     @staticmethod
     def _assert_write_kernel_run_counter_incremented_by_one(
