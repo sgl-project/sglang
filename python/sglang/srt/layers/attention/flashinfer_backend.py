@@ -614,8 +614,6 @@ class FlashInferAttnBackend(AttentionBackend):
     ) -> None:
         if forward_mode.is_decode_or_idle():
             decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
-            for w in decode_wrappers:
-                w.begin_forward = partial(fast_decode_plan, w)
             self.decode_cuda_graph_metadata[bs] = decode_wrappers
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif (
@@ -659,6 +657,11 @@ class FlashInferAttnBackend(AttentionBackend):
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
+        # fast_decode_plan requires _cached_module set by the initial full
+        # begin_forward call above; install it only after that first plan runs.
+        if forward_mode.is_decode_or_idle():
+            for w in self.decode_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_decode_plan, w)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
