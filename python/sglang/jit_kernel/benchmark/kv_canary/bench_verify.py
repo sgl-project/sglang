@@ -26,8 +26,8 @@ from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
-    VerifyPlan,
     VerifyOrWriteContext,
+    VerifyPlan,
     launch_canary_verify_kernel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
