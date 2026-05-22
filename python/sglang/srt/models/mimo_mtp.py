@@ -1,7 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/pull/17433/files  and deepseek_nextn.py
 
-from functools import partial
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn

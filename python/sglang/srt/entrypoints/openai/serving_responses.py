@@ -2,6 +2,8 @@
 # Adapted from vLLM's OpenAIServingResponses
 """Handler for /v1/responses requests"""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import json
@@ -9,10 +11,11 @@ import logging
 import time
 from contextlib import AsyncExitStack
 from http import HTTPStatus
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncGenerator, AsyncIterator, Optional, Union
 
 import jinja2
 import openai.types.responses as openai_responses_types
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
@@ -54,10 +57,12 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sglang.srt.entrypoints.openai.tool_server import MCPToolServer, ToolServer
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.template_manager import TemplateManager
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
-from sglang.srt.reasoning_parser import ReasoningParser
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.utils import random_uuid
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.template_manager import TemplateManager
+    from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +76,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         template_manager: TemplateManager,
         *,
         enable_prompt_tokens_details: bool = False,
-        enable_force_include_usage: bool = False,
         tool_server: Optional[ToolServer] = None,
     ) -> None:
         super().__init__(tokenizer_manager, template_manager)
@@ -79,7 +83,6 @@ class OpenAIServingResponses(OpenAIServingChat):
         # template_manager is already set by parent class
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
-        self.enable_force_include_usage = enable_force_include_usage
 
         # Get default sampling params from model config if available
         self.default_sampling_params = {}
@@ -119,6 +122,39 @@ class OpenAIServingResponses(OpenAIServingChat):
         ] = {}
 
         self.background_tasks: dict[str, asyncio.Task] = {}
+
+    # error helpers dedicated for v1/responses
+    def create_error_response(
+        self,
+        message: str,
+        err_type: str = "invalid_request_error",
+        status_code: int = 400,
+        param: Optional[str] = None,
+    ) -> ORJSONResponse:
+        nested_error = {
+            "message": message,
+            "type": err_type,
+            "param": param,
+            "code": status_code,
+        }
+        return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
+
+    def create_streaming_error_response(
+        self,
+        message: str,
+        err_type: str = "BadRequestError",
+        status_code: int = 400,
+    ) -> str:
+        return json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": err_type,
+                    "param": None,
+                    "code": status_code,
+                }
+            }
+        )
 
     def _request_id_prefix(self) -> str:
         return "resp_"
@@ -220,8 +256,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                         if hasattr(self.tokenizer_manager.model_config, "context_len")
                         else 4096
                     )
+                    # Account for reserved tokens (e.g., EAGLE speculative decoding slots)
+                    # that the tokenizer_manager adds during validation
+                    num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
                     default_max_tokens = max(
-                        context_len - prompt_length, 512
+                        context_len - prompt_length - num_reserved_tokens, 512
                     )  # Ensure minimum 512 tokens
                     sampling_params = request.to_sampling_params(
                         default_max_tokens, self.default_sampling_params
@@ -242,6 +281,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
+                        extra_key=self._compute_extra_key(request),
                         background=request.background,
                     )
 
@@ -492,7 +532,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         if self.reasoning_parser:
             # Use standard reasoning parser (openai maps to T4Detector internally)
             reasoning_parser = ReasoningParser(
-                model_type=self.reasoning_parser, stream_reasoning=False
+                model_type=self.reasoning_parser,
+                stream_reasoning=False,
+                request=request,
             )
             reasoning_content, content = reasoning_parser.parse_non_stream(final_output)
         else:
@@ -741,7 +783,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             # Update the status to "cancelled"
             response.status = "cancelled"
 
-        # Abort the request
+        # The response_id is the same as the rid used when submitting the request
+        self.tokenizer_manager.abort_request(rid=response_id)
+
         if task := self.background_tasks.get(response_id):
             task.cancel()
             try:
@@ -829,6 +873,13 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         async for ctx in result_generator:
+
+            # Only process context objects that implement the `is_expecting_start()` method,
+            # which indicates they support per-turn streaming (e.g., StreamingHarmonyContext).
+            # Contexts without this method are skipped, as they do not represent a new turn
+            # or are not compatible with per-turn handling in the /v1/responses endpoint.
+            if not hasattr(ctx, "is_expecting_start"):
+                continue
 
             if ctx.is_expecting_start():
                 current_output_index += 1
@@ -1017,7 +1068,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 ):
                     function_name = previous_item.recipient[len("browser.") :]
                     action = None
-                    parsed_args = json.loads(previous_item.content[0].text)
+                    parsed_args = orjson.loads(previous_item.content[0].text)
                     if function_name == "search":
                         action = openai_responses_types.response_function_web_search.ActionSearch(
                             type="search",
@@ -1247,6 +1298,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 sampling_params=sampling_params,
                 stream=adapted_request.stream,
                 rid=request_id,
+                extra_key=adapted_request.extra_key,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,
@@ -1262,7 +1314,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 context_len = getattr(
                     self.tokenizer_manager.model_config, "context_len", 4096
                 )
-                remaining_tokens = context_len - len(prompt_token_ids) - 1
+                num_reserved_tokens = self.tokenizer_manager.num_reserved_tokens
+                remaining_tokens = (
+                    context_len - len(prompt_token_ids) - num_reserved_tokens
+                )
 
                 if isinstance(sampling_params, dict):
                     sampling_params["max_new_tokens"] = max(remaining_tokens, 1)

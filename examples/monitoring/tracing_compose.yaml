@@ -1,0 +1,21 @@
+services:
+  otel-collector:
+    image: docker.io/otel/opentelemetry-collector
+    volumes:
+      - ./opentelemetry.yaml:/etc/otelcol/config.yaml
+      - /tmp:/tmp
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - jaeger
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one
+    container_name: jaeger
+    ports:
+      - "16686:16686"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped

@@ -43,10 +43,8 @@
 
 import copy
 import logging
-import math
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -56,10 +54,6 @@ from sglang.srt.configs import KimiVLConfig
 from sglang.srt.configs.deepseekvl2 import DeepseekV2Config
 from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
-from sglang.srt.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -134,13 +128,16 @@ class KimiVLForConditionalGeneration(nn.Module):
 
         self.multi_modal_projector = KimiVLMultiModalProjector(config=config)
         self.quant_config = quant_config
-        text_config = copy.deepcopy(config.text_config)
-        text_config.architectures = ["DeepseekV2ForCausalLM"]
-        self.language_model = DeepseekV2ForCausalLM(
-            config=text_config,
-            quant_config=quant_config,
-            prefix=add_prefix("language_model", prefix),
-        )
+
+        self.language_model = None
+        if not config.encoder_only:
+            text_config = copy.deepcopy(config.text_config)
+            text_config.architectures = ["DeepseekV2ForCausalLM"]
+            self.language_model = DeepseekV2ForCausalLM(
+                config=text_config,
+                quant_config=quant_config,
+                prefix=add_prefix("language_model", prefix),
+            )
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         pixel_values = (
@@ -148,6 +145,13 @@ class KimiVLForConditionalGeneration(nn.Module):
             .type(self.vision_tower.dtype)
             .to(self.vision_tower.device)
         )
+
+        if (
+            pixel_values.dim() == 2
+            and pixel_values.shape[-1] == self.config.text_config.hidden_size
+        ):
+            return pixel_values
+
         image_grid_hws = torch.cat([item.image_grid_hws for item in items], dim=0).to(
             self.vision_tower.device
         )
@@ -214,6 +218,13 @@ class KimiVLForConditionalGeneration(nn.Module):
         for args in weights:
             name, loaded_weight = args[:2]
             kwargs = args[2] if len(args) > 2 else {}
+
+            is_vision_weight = ("vision" in name) or ("multi_modal_projector" in name)
+            if self.config.encoder_only and not is_vision_weight:
+                continue
+            if self.config.language_only and is_vision_weight:
+                continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
@@ -250,6 +261,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
+                    if name not in params_dict:
+                        continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -265,6 +278,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+                        if name not in params_dict:
+                            continue
 
                         param = params_dict[name]
                         weight_loader = param.weight_loader
@@ -294,7 +309,8 @@ class KimiVLForConditionalGeneration(nn.Module):
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, **kwargs)
-        self.language_model.post_load_weights()
+        if self.language_model is not None:
+            self.language_model.post_load_weights()
 
 
 def get_spec_layer_idx_from_weight_name(

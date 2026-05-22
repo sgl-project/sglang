@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -29,4 +31,4 @@ def test_dsv3_fused_a_gemm(num_tokens):
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

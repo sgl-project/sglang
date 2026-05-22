@@ -20,7 +20,7 @@ from sglang.srt.utils import is_cuda
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInfo
+    from sglang.srt.speculative.spec_info import SpecInput
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -151,7 +151,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
     ):
         if forward_mode.is_decode_or_idle():
             if spec_info is None:
@@ -190,7 +190,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         seq_lens_sum: int,
         encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInfo],
+        spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
 
@@ -241,14 +241,14 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -269,7 +269,7 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         q_nope = q_nope.to(self.q_data_type)
         q_rope = q_rope.to(self.q_data_type)
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         o = cutlass_mla_decode(
             q_nope=q_nope,

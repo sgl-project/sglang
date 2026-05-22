@@ -1,10 +1,18 @@
 import itertools
+import sys
 
 import pytest
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import moe_align_block_size
+from sgl_kernel import moe_align_block_size, moe_sum
+
+
+def is_hip() -> bool:
+    return torch.version.hip is not None
+
+
+_is_hip = is_hip()
 
 
 def ceil_div(a, b):
@@ -158,6 +166,8 @@ def test_moe_align_block_size_compare_implementations(
     ]
 
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
+    if topk_ids.numel() < num_experts + 1:
+        max_num_tokens_padded = topk_ids.numel() * block_size
 
     sorted_ids_cuda = torch.empty(
         (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
@@ -246,5 +256,20 @@ def test_moe_align_block_size_compare_implementations(
     )
 
 
+@pytest.mark.parametrize("m", [1, 33, 64, 222])
+@pytest.mark.parametrize("topk", [2, 6])
+@pytest.mark.parametrize("k", [128, 511, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.skipif(_is_hip, reason="Skip for AMD GPU")
+def test_moe_sum(m: int, topk: int, k: int, dtype: torch.dtype):
+    input = torch.randn((m, topk, k), device="cuda", dtype=dtype)
+    actual = torch.empty((m, k), device="cuda", dtype=dtype)
+
+    expected = input.sum(dim=1)
+    moe_sum(input, actual)
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=0)
+
+
 if __name__ == "__main__":
-    pytest.main([__file__])
+    sys.exit(pytest.main([__file__]))

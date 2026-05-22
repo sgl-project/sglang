@@ -1,96 +1,63 @@
-name: PR Test (sgl-kernel)
+name: PR Test - SGL Kernel
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "sgl-kernel/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "sgl-kernel/**"
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      sgl_kernel:
+        required: true
+        type: string
+      runner_config:
+        required: true
+        type: string
+      runs_on_map:
+        required: true
+        type: string
+      git_ref:
+        required: false
+        type: string
+        default: ''
+      skip_pr_test_health_check:
+        required: false
+        type: boolean
+        default: false
 
-concurrency:
-  group: pr-test-sgl-kernel-${{ github.ref }}
-  cancel-in-progress: true
+# Workflow-level env is NOT inherited from the caller in reusable workflows.
+# The github context (including github.event_name) IS inherited from the caller.
+env:
+  SGLANG_IS_IN_CI: true
+  SGLANG_CUDA_COREDUMP: "1"
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == true && 'true' || 'false' }}
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  sgl-kernel-unit-test:
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Check clang-format
-        uses: DoozyX/clang-format-lint-action@v0.18.1
+      - uses: actions/checkout@v4
         with:
-          source: sgl-kernel
-          extensions: h,c,cpp,hpp,cu,cuh,cc
-          clangFormatVersion: 18
-          style: file
+          ref: ${{ inputs.git_ref || github.sha }}
 
-  build-wheels:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    runs-on: sgl-kernel-build-node
-    strategy:
-      matrix:
-        include:
-          - python-version: "3.10"
-            cuda-version: "12.4"
-          - python-version: "3.10"
-            cuda-version: "12.8"
-          - python-version: "3.10"
-            cuda-version: "12.9"
-    name: Build Wheel (CUDA ${{ matrix.cuda-version }})
-    steps:
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
       - name: Cleanup
         run: |
-          sudo rm -rf $GITHUB_WORKSPACE/* || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
-        if: github.event_name != 'push' || (matrix.cuda-version != '11.8' && matrix.cuda-version != '12.9')
-        run: |
-          cd sgl-kernel
-          chmod +x ./build.sh
-          ./build.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}
-          path: sgl-kernel/dist/*
-
-  unit-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheels
-    runs-on: 1-gpu-runner
-    steps:
-      - uses: actions/checkout@v4
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda*
 
-      - name: Install
+      - name: Install dependencies
+        timeout-minutes: 20
         run: |
-          bash scripts/ci/ci_install_dependency.sh
-          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126 && pip3 install pytest
-          pip3 uninstall sgl-kernel -y || true
-          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
-          pip3 list | grep sgl-kernel
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
       - name: Run test
         timeout-minutes: 30
@@ -98,54 +65,114 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-      - name: Uninstall dependencies
-        run: |
-          pip3 uninstall sgl-kernel -y
-
-  mla-test:
-    if: github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request'
-    needs: build-wheels
-    runs-on: 1-gpu-runner
+  sgl-kernel-benchmark-test:
+    runs-on: 1-gpu-h100
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.4
+          pattern: wheel-python3.10-cuda*
 
-      - name: Install
+      - name: Install dependencies
+        timeout-minutes: 20
         run: |
-          bash scripts/ci/ci_install_dependency.sh
-          pip3 install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu126
-          pip3 uninstall sgl-kernel -y || true
-          pip3 install sgl-kernel/dist/*whl --force-reinstall --no-deps
-          pip3 list | grep sgl-kernel
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
-      - name: Run test
+      - name: Run benchmark tests
+        timeout-minutes: 45
+        run: |
+          cd sgl-kernel/benchmark
+          echo "Running sgl-kernel benchmark tests in CI mode..."
+
+          echo "CI environment variable: $CI"
+          echo "GITHUB_ACTIONS environment variable: $GITHUB_ACTIONS"
+
+          for bench_file in bench_*.py; do
+            echo "Testing $bench_file..."
+            timeout 60 python3 "$bench_file" || echo "Warning: $bench_file timed out or failed, continuing..."
+            echo "Completed $bench_file"
+            echo "---"
+          done
+
+          echo "All benchmark tests completed!"
+
+  sgl-kernel-b200-test:
+    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-pr-test-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Cleanup
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run sgl-kernel unit tests on B200
         timeout-minutes: 30
         run: |
-          cd test/srt
-          python3 test_mla_deepseek_v3.py
+          cd sgl-kernel
+          pytest tests/
 
-      - name: Uninstall dependencies
-        run: |
-          pip3 uninstall sgl-kernel -y
+  # Adding a single CUDA13 build-and-run check for the kernel
+  # TODO: Add back this test when it can pass on CI
+  # cuda13-kernel-build-check:
+  #   if: inputs.sgl_kernel == 'true'
+  #   runs-on: x64-cu13-kernel-tests
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-  finish:
-    needs: [unit-test, mla-test, lint, build-wheels]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check all dependent job statuses
-        run: |
-          results=(${{ join(needs.*.result, ' ') }})
-          for result in "${results[@]}"; do
-            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
-              echo "Job failed with result: $result"
-              exit 1
-            fi
-          done
-          echo "All jobs completed successfully"
-          exit 0
+  #     - name: Cleanup
+  #       run: |
+  #         ls -alh sgl-kernel/dist || true
+  #         rm -rf sgl-kernel/dist/* || true
+
+  #     - name: Download CUDA 13.0 artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         path: sgl-kernel/dist/
+  #         merge-multiple: true
+  #         pattern: wheel-python3.10-cuda*
+
+  #     - name: Install dependencies
+  #       run: |
+  #         CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
+
+  #     - name: Run kernel unit tests
+  #       timeout-minutes: 30
+  #       run: |
+  #         cd sgl-kernel
+  #         pytest tests/

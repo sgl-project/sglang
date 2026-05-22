@@ -6,7 +6,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.managers.tokenizer_manager import UpdateWeightsFromTensorReqInput
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 from sglang.srt.model_executor.model_runner import LocalSerializedTensor
 from sglang.srt.utils import MultiprocessingSerializer
 
@@ -33,7 +33,7 @@ async def update_weights(
     """
     infer_tp_size = device_mesh[device_mesh_key].mesh.size()[0]
     infer_tp_rank = device_mesh[device_mesh_key].get_local_rank()
-    from sglang.srt.patch_torch import monkey_patch_torch_reductions
+    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
     monkey_patch_torch_reductions()
 

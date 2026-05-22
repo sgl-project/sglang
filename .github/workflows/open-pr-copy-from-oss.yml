@@ -23,6 +23,6 @@ jobs:
 
       - name: Copy from OSS code
         env:
-          GH_TOKEN: ${{ secrets.PAT_FOR_CODE_SYNC_FROM_LIANMIN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_OPEN_PR_TO_PRIVATE }}
         run: |
           python3 scripts/code_sync/copy_from_oss.py

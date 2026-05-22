@@ -86,7 +86,10 @@ subject2category = {
 
 class MMLUEval(Eval):
     def __init__(self, filename: str, num_examples: Optional[int], num_threads: int):
-        df = pandas.read_csv(filename)
+        if "://" in filename:
+            df = pandas.read_csv(filename, storage_options={"timeout": 30})
+        else:
+            df = pandas.read_csv(filename)
         examples = [row.to_dict() for _, row in df.iterrows()]
         if num_examples:
             examples = random.Random(0).sample(examples, num_examples)
@@ -101,6 +104,7 @@ class MMLUEval(Eval):
                 )
             ]
             response_text = sampler(prompt_messages)
+            response_text = response_text or ""
             match = re.search(ANSWER_PATTERN_MULTICHOICE, response_text)
             extracted_answer = match.group(1) if match else None
             score = 1.0 if extracted_answer == row["Answer"] else 0.0

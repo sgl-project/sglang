@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.ebnf_composer import EBNFComposer
 from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
@@ -204,17 +203,9 @@ class DeepSeekV3Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
-            begin=">" + name + "\n```json\n",
-            end="\n```<",
-            trigger=">" + name + "\n```json\n",
-        )
-
-    def build_ebnf(self, tools: List[Tool]):
-        return EBNFComposer.build_ebnf(
-            tools,
-            sequence_start_token=self.bot_token,
-            sequence_end_token=self.eot_token,
-            tool_call_separator="",
-            call_rule_fmt='"<｜tool▁call▁begin｜>function<｜tool▁sep｜>{name}\\n```json\\n"{arguments_rule}"\\n```<｜tool▁call▁end｜>"',
-            function_format="json",
+            begin="<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            + name
+            + "\n```json\n",
+            end="\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+            trigger="<｜tool▁calls▁begin｜>",
         )

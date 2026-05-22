@@ -1,0 +1,421 @@
+import argparse
+import glob
+import json
+import os
+import sys
+from typing import Dict, List, Optional
+
+import tabulate
+
+from sglang.test.ci.ci_register import (
+    CIRegistry,
+    HWBackend,
+    auto_partition,
+    collect_tests,
+)
+from sglang.test.ci.ci_utils import run_unittest_files
+
+HW_MAPPING = {
+    "cpu": HWBackend.CPU,
+    "cuda": HWBackend.CUDA,
+    "amd": HWBackend.AMD,
+    "npu": HWBackend.NPU,
+}
+
+# Per-commit test suites (run on every PR).
+# Includes both base-a/b/c (always-on; pr-test.yml) and extra-a/b
+# (label-gated; pr-test-extra.yml). Tests are tagged per-commit regardless;
+# pr-test-extra.yml's `run-ci-extra` PR label decides whether extra-* dispatches.
+PER_COMMIT_SUITES = {
+    HWBackend.CPU: ["base-a-test-cpu", "base-b-test-cpu"],
+    HWBackend.AMD: [
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
+        "jit-kernel-unit-test-amd",
+        "stage-c-test-4-gpu-amd",
+        "stage-c-test-large-8-gpu-amd",
+        "stage-c-test-large-8-gpu-amd-mi35x",
+    ],
+    HWBackend.CUDA: [
+        "base-a-test-1-gpu-small",
+        "base-b-test-1-gpu-small",
+        "base-b-test-1-gpu-large",
+        "base-b-test-2-gpu-large",
+        "base-b-test-4-gpu-b200",
+        "base-b-kernel-unit-1-gpu-large",
+        "base-b-kernel-unit-1-gpu-b200",
+        "base-b-kernel-unit-8-gpu-h200",
+        "base-b-kernel-benchmark-1-gpu-large",
+        "base-c-test-4-gpu-h100",
+        "base-c-test-4-gpu-b200",
+        "base-c-test-4-gpu-gb200",
+        "base-c-test-8-gpu-h20",
+        "base-c-test-8-gpu-h200",
+        "base-c-test-8-gpu-b200",
+        "base-c-test-deepep-4-gpu-h100",
+        "base-c-test-dsv4-4-gpu-b200",
+        "base-c-test-dsv4-8-gpu-h200",
+        # extra-a / extra-b: label-gated PR opt-in suites in pr-test-extra.yml
+        # (tests still tagged per-commit but skipped on default PR runs).
+        "extra-a-test-1-gpu-small",
+        "extra-a-test-1-gpu-large",
+        "extra-a-test-2-gpu-large",
+        "extra-b-test-4-gpu-h100",
+        "extra-b-test-4-gpu-b200",
+        "extra-b-test-8-gpu-h200",
+        "extra-b-test-deepep-8-gpu-h200",
+    ],
+    HWBackend.NPU: [
+        "base-a-test-1-gpu-small",
+        "stage-b-test-1-npu-a2",
+        "stage-b-test-2-npu-a2",
+        "stage-b-test-4-npu-a3",
+        "stage-b-test-16-npu-a3",
+    ],
+}
+
+# Nightly test suites (run nightly, organized by GPU configuration)
+NIGHTLY_SUITES = {
+    HWBackend.CUDA: [
+        "nightly-1-gpu",
+        "nightly-2-gpu",
+        "nightly-4-gpu",
+        "nightly-4-gpu-b200",
+        "nightly-8-gpu",
+        "nightly-8-gpu-h200",
+        "nightly-8-gpu-h20",
+        "nightly-8-gpu-b200",
+        "nightly-8-gpu-h200-basic",  # Basic tests for large models on H200
+        "nightly-8-gpu-b200-basic",  # Basic tests for large models on B200
+        "nightly-8-gpu-common",  # Common tests that run on both H200 and B200
+        "nightly-kernel-1-gpu",
+        "nightly-kernel-8-gpu-h200",
+        # Eval and perf suites (2-gpu)
+        "nightly-eval-text-2-gpu",
+        "nightly-eval-vlm-2-gpu",
+        "nightly-perf-text-2-gpu",
+        "nightly-perf-vlm-2-gpu",
+        # GB300 (4x B200 NVL4) nightly suite
+        "nightly-4-gpu-gb300",
+    ],
+    HWBackend.AMD: [
+        "nightly-amd",
+        "nightly-amd-1-gpu",
+        "nightly-amd-1-gpu-mi35x",
+        "nightly-amd-1-gpu-zimage-turbo",
+        "nightly-amd-4-gpu",
+        "nightly-amd-8-gpu",
+        "nightly-amd-vlm",
+        # MI35x 8-GPU suite (different model configs)
+        "nightly-amd-8-gpu-mi35x",
+    ],
+    HWBackend.CPU: [],
+    HWBackend.NPU: [
+        "nightly-1-npu-a3",
+        "nightly-2-npu-a3",
+        "nightly-4-npu-a3",
+        "nightly-8-npu-a3",
+        "nightly-16-npu-a3",
+        "full-1-npu-a3",
+        "full-2-npu-a3",
+        "full-4-npu-a3",
+        "full-8-npu-a3",
+        "full-16-npu-a3",
+    ],
+}
+
+
+OTHER_SUITES = {
+    HWBackend.CPU: [
+        "default",
+    ],
+    HWBackend.CUDA: [
+        "stress",
+        "weekly-8-gpu-h200",
+    ],
+}
+
+
+_SUITE_CHECKED_BACKENDS = {HWBackend.CUDA, HWBackend.CPU}
+
+
+def _valid_suites_by_backend() -> dict:
+    """Build a mapping from backend to its set of valid suite names."""
+    result = {}
+    for suite_dict in (PER_COMMIT_SUITES, NIGHTLY_SUITES, OTHER_SUITES):
+        for backend, suites in suite_dict.items():
+            if backend not in result:
+                result[backend] = set()
+            result[backend].update(suites)
+    return result
+
+
+def validate_all_suites(all_tests: List[CIRegistry]):
+    """Fail fast if any test is registered to a suite that doesn't belong to its backend."""
+    valid_by_backend = _valid_suites_by_backend()
+    errors = []
+    for t in all_tests:
+        if t.backend not in _SUITE_CHECKED_BACKENDS:
+            continue
+        valid = valid_by_backend.get(t.backend, set())
+        if t.effective_suite not in valid:
+            errors.append(
+                f"  {t.filename}: backend={t.backend.name}, suite='{t.effective_suite}'"
+            )
+    if errors:
+        raise ValueError("Tests registered to invalid suites:\n" + "\n".join(errors))
+
+
+def filter_tests(
+    ci_tests: List[CIRegistry], hw: HWBackend, suite: str, nightly: bool = False
+) -> List[CIRegistry]:
+    ci_tests = [
+        t
+        for t in ci_tests
+        if t.backend == hw and t.effective_suite == suite and t.nightly == nightly
+    ]
+
+    valid_suites = (
+        NIGHTLY_SUITES.get(hw, []) if nightly else PER_COMMIT_SUITES.get(hw, [])
+    )
+
+    if suite not in valid_suites:
+        print(
+            f"Warning: Unknown suite {suite} for backend {hw.name}, nightly={nightly}"
+        )
+
+    enabled_tests = [t for t in ci_tests if t.disabled is None]
+    skipped_tests = [t for t in ci_tests if t.disabled is not None]
+
+    return enabled_tests, skipped_tests
+
+
+def pretty_print_tests(
+    args, ci_tests: List[CIRegistry], skipped_tests: List[CIRegistry]
+):
+    hw = HW_MAPPING[args.hw]
+    suite = args.suite
+    nightly = args.nightly
+    if args.auto_partition_size:
+        partition_info = (
+            f"{args.auto_partition_id + 1}/{args.auto_partition_size} "
+            f"(0-based id={args.auto_partition_id})"
+        )
+    else:
+        partition_info = "full"
+
+    headers = ["Hardware", "Suite", "Nightly", "Partition"]
+    rows = [[hw.name, suite, str(nightly), partition_info]]
+    msg = tabulate.tabulate(rows, headers=headers, tablefmt="psql") + "\n"
+
+    if skipped_tests:
+        msg += f"⚠️  Skipped {len(skipped_tests)} test(s):\n"
+        for t in skipped_tests:
+            reason = t.disabled or "disabled"
+            msg += f"  - {t.filename} (reason: {reason})\n"
+        msg += "\n"
+
+    if len(ci_tests) == 0:
+        msg += f"No tests found for hw={hw.name}, suite={suite}, nightly={nightly}\n"
+        msg += "This is expected during incremental migration. Skipping.\n"
+    else:
+        total_est_time = sum(t.est_time for t in ci_tests)
+        msg += (
+            f"✅ Enabled {len(ci_tests)} test(s) (est total {total_est_time:.1f}s):\n"
+        )
+        for t in ci_tests:
+            msg += f"  - {t.filename} (est_time={t.est_time})\n"
+
+    print(msg, flush=True)
+
+
+def load_live_est(
+    partition_model_file: Optional[str], suite: str, repo_root: str
+) -> Optional[Dict[str, float]]:
+    """`CIRegistry.filename -> est seconds` from `model.json est[suite]`;
+    None on any miss (caller falls back to in-source `est_time`)."""
+    if not partition_model_file or not os.path.exists(partition_model_file):
+        return None
+    try:
+        with open(partition_model_file) as f:
+            partition_model = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(partition_model, dict):
+        return None
+    suite_est = partition_model.get("est", {}).get(suite)
+    if not isinstance(suite_est, dict) or not suite_est:
+        return None
+    return {
+        os.path.join(repo_root, relpath): float(elapsed)
+        for relpath, elapsed in suite_est.items()
+    }
+
+
+def run_a_suite(args):
+    hw = HW_MAPPING[args.hw]
+    suite = args.suite
+    nightly = args.nightly
+    auto_partition_id = args.auto_partition_id
+    auto_partition_size = args.auto_partition_size
+
+    # Use absolute paths so the script works from any working directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(script_dir)
+
+    # Registered tests under test/registered/
+    files = [
+        f
+        for f in glob.glob(
+            os.path.join(script_dir, "registered", "**", "*.py"), recursive=True
+        )
+        if not f.endswith("/conftest.py")
+        and not f.endswith("/__init__.py")
+        and not f.endswith("/cpu/utils.py")
+    ]
+
+    # JIT kernel tests and benchmarks (live alongside kernel source)
+    jit_kernel_dir = os.path.join(repo_root, "python", "sglang", "jit_kernel")
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "tests", "**", "test_*.py"), recursive=True
+    )
+    files += glob.glob(
+        os.path.join(jit_kernel_dir, "benchmark", "**", "bench_*.py"), recursive=True
+    )
+
+    # Strict: all discovered files must have proper registration
+    sanity_check = True
+
+    all_tests = collect_tests(files, sanity_check=sanity_check)
+    validate_all_suites(all_tests)
+    ci_tests, skipped_tests = filter_tests(all_tests, hw, suite, nightly)
+
+    if auto_partition_size:
+        live_est = load_live_est(args.partition_model_file, suite, repo_root)
+        if live_est is not None:
+            print(
+                f"LPT: {len(live_est)} live est entries from {args.partition_model_file}",
+                flush=True,
+            )
+        else:
+            print(
+                f"LPT: no live est ({args.partition_model_file!r}); using in-source est_time",
+                flush=True,
+            )
+        ci_tests = auto_partition(
+            ci_tests, auto_partition_id, auto_partition_size, live_est=live_est
+        )
+
+    pretty_print_tests(args, ci_tests, skipped_tests)
+
+    # Add extra timeout when retry is enabled
+    timeout = args.timeout_per_file
+    if args.enable_retry:
+        timeout += args.retry_timeout_increase
+
+    return run_unittest_files(
+        ci_tests,
+        timeout_per_file=timeout,
+        continue_on_error=args.continue_on_error,
+        enable_retry=args.enable_retry,
+        max_attempts=args.max_attempts,
+        retry_wait_seconds=args.retry_wait_seconds,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run CI test suites from test/registered/"
+    )
+    parser.add_argument(
+        "--hw",
+        type=str,
+        choices=HW_MAPPING.keys(),
+        required=True,
+        help="Hardware backend to run tests on.",
+    )
+    parser.add_argument("--suite", type=str, required=True, help="Test suite to run.")
+    parser.add_argument(
+        "--nightly",
+        action="store_true",
+        help="Run nightly tests instead of per-commit tests.",
+    )
+    parser.add_argument(
+        "--timeout-per-file",
+        type=int,
+        default=1200,
+        help="The time limit for running one file in seconds (default: 1200).",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        default=False,
+        help="Continue running remaining tests even if one fails (default: False, useful for nightly tests).",
+    )
+    parser.add_argument(
+        "--auto-partition-id",
+        type=int,
+        help="Use auto load balancing. The part id.",
+    )
+    parser.add_argument(
+        "--auto-partition-size",
+        type=int,
+        help="Use auto load balancing. The number of parts.",
+    )
+    parser.add_argument(
+        "--enable-retry",
+        action="store_true",
+        default=False,
+        help="Enable smart retry for accuracy/performance assertion failures (not code errors)",
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=2,
+        help="Maximum number of attempts per file including initial run (default: 2)",
+    )
+    parser.add_argument(
+        "--retry-wait-seconds",
+        type=int,
+        default=60,
+        help="Seconds to wait between retries (default: 60)",
+    )
+    parser.add_argument(
+        "--retry-timeout-increase",
+        type=int,
+        default=600,
+        help="Additional timeout in seconds when retry is enabled (default: 600)",
+    )
+    parser.add_argument(
+        "--partition-model-file",
+        type=str,
+        default=None,
+        help="Path to sglang-ci-stats model.json for live LPT est; missing/malformed -> in-source est_time fallback.",
+    )
+    args = parser.parse_args()
+
+    # Validate auto-partition arguments
+    if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
+        parser.error(
+            "--auto-partition-id and --auto-partition-size must be specified together."
+        )
+    if args.auto_partition_size is not None:
+        if args.auto_partition_size <= 0:
+            parser.error("--auto-partition-size must be positive.")
+        if not 0 <= args.auto_partition_id < args.auto_partition_size:
+            parser.error(
+                f"--auto-partition-id must be in range [0, {args.auto_partition_size}), "
+                f"but got {args.auto_partition_id}"
+            )
+
+    exit_code = run_a_suite(args)
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

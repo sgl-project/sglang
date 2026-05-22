@@ -41,8 +41,8 @@ using MmaType = cutlass::float_e4m3_t;     // FP8 e4m3 type
 using QuantType = cutlass::int4b_t;        // 4-bit integer type
 using ElementAccumulator = float;          // Accumulator type
 using ElementScale = cutlass::bfloat16_t;  // Scale type
-using ElementC = cutlass::half_t;          // Default output type (FP16)
-using ElementD = ElementC;                 // Default output type (FP16)
+using ElementC = cutlass::bfloat16_t;      // Output type
+using ElementD = ElementC;                 // Output type
 using ProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 
 // Architecture-specific configurations
@@ -174,7 +174,7 @@ void cutlass_w4a8_group_gemm_caller(
   bool per_out_ch = b_scales.numel() != num_experts;
 
   // Check inputs
-  TORCH_CHECK(a_tensors.dim() == 2, "A tensor must be 2D");
+  TORCH_CHECK(a_tensors.dim() == 2 or a_tensors.dim() == 3, "A tensor must be 2D/3D");
   TORCH_CHECK(b_tensors.dim() == 3, "B tensor must be 3D [E, N, K/2]");
   TORCH_CHECK(b_scales.dim() == 3, "Scale tensor must be 3D [E, K//512, N*4]");
   TORCH_CHECK(a_scales.dim() == 1, "A Scale tensor must be 1D [1]");
@@ -186,7 +186,9 @@ void cutlass_w4a8_group_gemm_caller(
   TORCH_CHECK(problem_sizes.size(1) == 3, "problem_sizes must have 3 columns (N, M, K)");
   TORCH_CHECK(b_tensors.size(0) == num_experts, "B tensor first dimension must match number of groups");
   TORCH_CHECK(b_scales.size(0) == num_experts, "Scale tensor first dimension must match number of groups");
-  TORCH_CHECK(b_tensors.size(2) * 2 == a_tensors.size(1), "B tensor K/2 dimension must match A tensor K dimension");
+  TORCH_CHECK(
+      b_tensors.size(2) * 2 == a_tensors.size(1) or b_tensors.size(2) * 2 == a_tensors.size(2),
+      "B tensor K/2 dimension must match A tensor K dimension");
 
   // Check tensor types
   TORCH_CHECK(a_tensors.scalar_type() == torch::kFloat8_e4m3fn, "A tensor must be fp8 (float_e4m3_t) type");
@@ -209,7 +211,7 @@ void cutlass_w4a8_group_gemm_caller(
 
   Args arguments;
   decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 1.0f;
+  fusion_args.alpha = 0;
   fusion_args.beta = 0;
   fusion_args.alpha_ptr = a_scales.data_ptr<float>();
   ;

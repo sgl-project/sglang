@@ -18,6 +18,7 @@ from data_utils import (
     construct_prompt,
     load_yaml,
     process_single_sample,
+    save_json,
 )
 from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
@@ -28,15 +29,18 @@ class EvalArgs:
     seed: int = 42
     split: str = "validation"
     image_pixels_limit: int = -1
-    result_filename: str = ""
+    result_filename: str = f"./val_sglang.json"
     prompt_format_file: str = "prompt_format.yaml"
     dataset_path: str = "MMMU/MMMU"
     extra_request_body: Optional[str] = None
     profile: bool = False
     profile_number: int = 5
     concurrency: int = 1
-    response_answer_regex: str = "(.*)"
+    max_new_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    response_answer_regex: str = "(?s)(.*)"
     lora_path: Optional[str] = None
+    reasoning_effort: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -94,6 +98,18 @@ class EvalArgs:
             help="Number of concurrent requests to make during evaluation. Default is 1, which means no concurrency.",
         )
         parser.add_argument(
+            "--max-new-tokens",
+            type=int,
+            default=EvalArgs.max_new_tokens,
+            help="Maximum number of new tokens to generate per sample.",
+        )
+        parser.add_argument(
+            "--temperature",
+            type=float,
+            default=EvalArgs.temperature,
+            help="Sampling temperature for generation.",
+        )
+        parser.add_argument(
             "--response-answer-regex",
             type=str,
             default=EvalArgs.response_answer_regex,
@@ -104,6 +120,13 @@ class EvalArgs:
             type=str,
             default=EvalArgs.lora_path,
             help="Specify the LoRA path to use for evaluation. If specified, the value will be specified in the body of every request as `lora-path`.",
+        )
+        parser.add_argument(
+            "--reasoning-effort",
+            type=str,
+            default=EvalArgs.reasoning_effort,
+            choices=["none", "high"],
+            help="Reasoning effort for the model (none or high).",
         )
 
     @classmethod
@@ -233,26 +256,59 @@ def prepare_samples(eval_args: EvalArgs):
 
 
 def get_sampling_params(eval_args):
-    max_new_tokens = 30
-    temperature = 0.001
-
     extra_request_body = {}
     if eval_args.extra_request_body:
         extra_request_body = json.loads(eval_args.extra_request_body)
-
-    return {
-        "temperature": temperature,
-        "max_new_tokens": max_new_tokens,
+    sampling_params = {
         **extra_request_body,
     }
 
+    if eval_args.max_new_tokens is not None and eval_args.max_new_tokens > 0:
+        sampling_params.update({"max_completion_tokens": eval_args.max_new_tokens})
+
+    if eval_args.temperature is not None:
+        sampling_params.update({"temperature": eval_args.temperature})
+
+    return sampling_params
+
 
 # ----------- Process Multi-choice -------------
+# Patterns that explicitly commit to a single letter as the final answer.
+# Each captures the letter in group(1).  Matching uses ``re.IGNORECASE`` and
+# all matches are collected across patterns; the one with the latest offset
+# wins.
+_EXPLICIT_ANSWER_PATTERNS = (
+    # "answer: X" / "Final answer: X" (with optional bold/parens)
+    r"\banswer\s*:\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])",
+    # bare "X" / "(X)" on its own line at the end of the response
+    r"(?:^|\n)\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\.?\s*$",
+    # "\boxed{X}" (LaTeX boxed answer, common in math/CoT outputs)
+    r"\\boxed\{\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\}",
+    # "(the) answer is X" / "(the) correct answer is X"
+    r"\b(?:the\s+)?answer\s+is\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])",
+)
+
+
+def _parse_explicit_multi_choice_answer(response, all_choices):
+    choice_map = {choice.upper(): choice for choice in all_choices}
+    matches = []
+    for pattern in _EXPLICIT_ANSWER_PATTERNS:
+        for match in re.finditer(pattern, response, flags=re.IGNORECASE):
+            candidate = match.group(1).upper()
+            if candidate in choice_map:
+                matches.append((match.start(1), choice_map[candidate]))
+    return max(matches)[1] if matches else None
+
+
 def parse_multi_choice_response(response, all_choices, index2ans):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
     """
+    explicit_answer = _parse_explicit_multi_choice_answer(response, all_choices)
+    if explicit_answer is not None:
+        return explicit_answer
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "  # add space to avoid partial match
@@ -445,6 +501,18 @@ def eval_multi_choice(gold_i, pred_i):
     Evaluate a multiple choice instance.
     """
     correct = False
+    # for case like Answer: A, Answer is A, answer is A, answer: A
+    for _exp in ["Answer:", "Answer is ", "answer is ", "answer: "]:
+        if _exp in pred_i:
+            pred_i = pred_i.split(_exp)[1].strip()
+            break
+    # for case like (A), (B), (C), (D) ......
+    if "(" in pred_i and ")" in pred_i:
+        try:
+            pred_i = re.search(r"\(([A-Z])\)", pred_i).group(1)
+        except:
+            print(f"Error to extract answer from: {pred_i}")
+            pass
     # only they are exactly the same, we consider it as correct
     if isinstance(gold_i, list):
         for answer in gold_i:
@@ -535,7 +603,12 @@ def process_result(response, sample, answer_dict, out_samples):
     else:  # open question
         pred_ans = response
 
-    out_samples[sample["id"]] = pred_ans
+    out_samples[sample["id"]] = {
+        "pred_ans": pred_ans,
+        "original_response": sample["original_response"],
+        "ground_truth": sample["answer"],
+        "question_type": sample["question_type"],
+    }
 
     # set ground truth answer
     answer_dict[sample["id"]] = {
@@ -554,6 +627,12 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
     # group by category
     output_dict_w_cat = {}
     for data_id, parsed_pred in output_dict.items():
+        if isinstance(parsed_pred, str):
+            parsed_pred = parsed_pred
+        elif isinstance(parsed_pred, dict):
+            parsed_pred = parsed_pred["pred_ans"]
+        else:
+            raise ValueError(f"Unknown type of parsed_pred: {type(parsed_pred)}")
         category = "_".join(data_id.split("_")[1:-1])
         if category not in output_dict_w_cat:
             output_dict_w_cat.update({category: {}})
@@ -600,9 +679,12 @@ def eval_result(model_answer_path, answer_dict, eval_output_path=None):
 
         judge_dict, metric_dict = evaluate(exampels_to_eval)
         metric_dict.update({"num_example": len(exampels_to_eval)})
+        for key, value in judge_dict.items():
+            output_dict[key]["judge"] = value
 
         evaluation_result[category] = metric_dict
 
+    save_json(model_answer_path, output_dict)
     printable_results = {}
     # pdb.set_trace()
     # add domain Subject

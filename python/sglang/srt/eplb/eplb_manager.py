@@ -41,6 +41,9 @@ class EPLBManager:
     def on_forward_pass_end(self):
         next(self._main_generator)
 
+    def reset_generator(self):
+        self._main_generator = self._entrypoint()
+
     # can be more complex if needed
     def _entrypoint(self):
         while True:
@@ -55,7 +58,7 @@ class EPLBManager:
         enable_timing = self._rebalance_layers_per_chunk is None
 
         if enable_timing:
-            torch.cuda.synchronize()
+            torch.get_device_module().synchronize()
             time_start = time.time()
 
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
@@ -85,7 +88,7 @@ class EPLBManager:
 
         msg = f"[EPLBManager] rebalance end"
         if enable_timing:
-            torch.cuda.synchronize()
+            torch.get_device_module().synchronize()
             time_end = time.time()
             msg += f" time={time_end - time_start:.3f}s"
         logger.info(msg)

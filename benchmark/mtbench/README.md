@@ -18,7 +18,7 @@ python3 bench_sglang.py --num-questions 80
 ### Benchmark sglang EAGLE
 ```
 python3 -m sglang.launch_server --model meta-llama/Meta-Llama-3-8B-Instruct --speculative-algo EAGLE \
-    --speculative-draft lmsys/sglang-EAGLE-LLaMA3-Instruct-8B --speculative-num-steps 5 \
+    --speculative-draft-model-path lmsys/sglang-EAGLE-LLaMA3-Instruct-8B --speculative-num-steps 5 \
     --speculative-eagle-topk 8 --speculative-num-draft-tokens 64 --dtype float16 --port 30000
 ```
 

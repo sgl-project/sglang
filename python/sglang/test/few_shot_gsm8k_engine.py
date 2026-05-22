@@ -1,16 +1,23 @@
+"""
+.. deprecated::
+    This module is deprecated. Use ``sglang.test.run_eval`` with
+    ``eval_name="gsm8k"`` instead, which routes through the unified
+    Chat API evaluation framework with dump_metric support.
+"""
+
 import argparse
 import ast
 import asyncio
-import json
 import re
 import time
+import warnings
+from typing import Optional
 
 import numpy as np
 
 import sglang as sgl
-from sglang.lang.api import set_default_backend
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
-from sglang.utils import download_and_cache_file, dump_state_text, read_jsonl
+from sglang.srt.utils import get_or_create_event_loop
+from sglang.utils import download_and_cache_file, read_jsonl
 
 INVALID = -9999999
 
@@ -50,6 +57,12 @@ async def concurrent_generate(engine, prompts, sampling_param):
 
 
 def run_eval(args):
+    warnings.warn(
+        "sglang.test.few_shot_gsm8k_engine is deprecated. "
+        "Use sglang.test.run_eval with eval_name='gsm8k' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     # Select backend
     engine = sgl.Engine(model_path=args.model_path, log_level="error")
 
@@ -91,7 +104,7 @@ def run_eval(args):
     # Run requests
     tic = time.perf_counter()
 
-    loop = asyncio.get_event_loop()
+    loop = get_or_create_event_loop()
 
     outputs = loop.run_until_complete(
         concurrent_generate(engine, prompts, sampling_param)

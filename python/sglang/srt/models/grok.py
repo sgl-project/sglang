@@ -12,31 +12,23 @@
 # limitations under the License.
 # ==============================================================================
 
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
-"""Inference-only Grok1 model."""
 import functools
 import logging
 import math
-import os
-import warnings
 from typing import Iterable, Optional, Tuple
 
-import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.elementwise import (
-    experts_combine_triton,
     fused_dual_residual_rmsnorm,
     fused_rmsnorm,
     gelu_and_mul_triton,
@@ -49,7 +41,6 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe.ep_moe.layer import EPMoE
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.router import fused_moe_router_shim
 from sglang.srt.layers.moe.topk import TopK
@@ -65,23 +56,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, dispose_tensor, dump_to_file
+from sglang.srt.utils import add_prefix, is_npu
+
+_is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
-
-
-# Dump tensors for debugging
-debug_tensor_dump_output_folder = None
-debug_tensor_dump_prefill_only = False
-# Skip all the other tensor dumps, only dump the target logits
-debug_tensor_dump_only_target_logprobs = False
-debug_tensor_dump_inject = False
-debug_tensor_dump_layers = None
-debug_tensor_dump_test = False
 
 
 class Grok1MLP(nn.Module):
@@ -126,14 +109,6 @@ class Grok1MLP(nn.Module):
 
 
 class Grok1MoE(nn.Module):
-    """A tensor-parallel MoE implementation for Grok1 that shards each expert
-    across all ranks.
-
-    Each expert's weights are sharded across all ranks and a fused MoE
-    kernel is used for the forward pass, and finally we reduce the outputs
-    across ranks.
-    """
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -154,7 +129,6 @@ class Grok1MoE(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
 
-        # Gate always runs at full precision for stability (see https://arxiv.org/pdf/2101.03961)
         self.gate = ReplicatedLinear(
             hidden_size,
             num_experts,
@@ -163,9 +137,7 @@ class Grok1MoE(nn.Module):
             quant_config=None,
         )
 
-        self.router_logit_softcapping = getattr(
-            config, "router_logit_softcapping", 30.0
-        )
+        self.router_logit_softcapping = 30.0
         custom_routing_function = functools.partial(
             fused_moe_router_shim, self.router_logit_softcapping
         )
@@ -173,20 +145,11 @@ class Grok1MoE(nn.Module):
         self.topk = TopK(
             top_k=top_k,
             renormalize=False,
-            custom_routing_function=custom_routing_function,
+            layer_id=layer_id,
+            custom_routing_function=None if _is_npu else custom_routing_function,
         )
 
-        kwargs = {}
-        if get_moe_expert_parallel_world_size() > 1:
-            MoEImpl = EPMoE
-        else:
-            MoEImpl = FusedMoE
-            kwargs["reduce_results"] = reduce_results
-            kwargs["use_presharded_weights"] = use_presharded_weights
-            kwargs["inplace"] = inplace
-            kwargs["no_combine"] = no_combine
-
-        self.experts = MoEImpl(
+        self.experts = FusedMoE(
             num_experts=num_experts,
             top_k=top_k,
             layer_id=layer_id,
@@ -195,13 +158,28 @@ class Grok1MoE(nn.Module):
             params_dtype=params_dtype,
             quant_config=quant_config,
             activation="gelu",
-            **kwargs,
+            reduce_results=reduce_results,
+            use_presharded_weights=use_presharded_weights,
+            inplace=inplace,
+            no_combine=no_combine,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # need to assert self.gate.quant_method is unquantized
-        topk_output = self.topk(hidden_states, self.gate.weight)
-        return self.experts(hidden_states, topk_output)
+        if not _is_npu:
+            topk_output = self.topk(hidden_states, self.gate.weight)
+            return self.experts(hidden_states, topk_output)
+        else:
+            orig_shape = hidden_states.shape
+            hidden_states = hidden_states.view(-1, self.hidden_size)
+
+            router_logits, _ = self.gate(hidden_states)
+            router_logits = self.router_logit_softcapping * F.tanh(
+                router_logits / self.router_logit_softcapping
+            )
+            topk_output = self.topk(hidden_states, router_logits)
+
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            return final_hidden_states.view(orig_shape)
 
 
 def _yarn_linear_ramp_mask(
@@ -234,7 +212,7 @@ def get_rope_scaling(config):
             "attn_factor": attn_factor,
             "beta_fast": beta_fast,
             "beta_slow": beta_slow,
-            "dtype": torch.float,
+            "dtype": torch.bfloat16,
         }
         return rope_scaling
     else:
@@ -266,6 +244,8 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         self.attn_factor = attn_factor
         self.beta_fast = beta_fast
         self.beta_slow = beta_slow
+        if _is_npu:
+            dtype = torch.float32
         # Get n-d magnitude scaling corrected for interpolation
         self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
         super().__init__(
@@ -434,6 +414,7 @@ class Grok1Attention(nn.Module):
                 max_position=max_position,
                 base=int(self.rope_theta),
                 is_neox_style=True,
+                dtype=torch.float32 if _is_npu else None,
             )
             pos_encoding_mode = "NONE"
 
@@ -460,75 +441,17 @@ class Grok1Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if hidden_states.shape[0] == 0:
-            assert (
-                not self.o_proj.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
-            return hidden_states
-        if debug_tensor_dump_output_folder:
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                f"attn_input_{self.layer_id}",
-                hidden_states,
-            )
-
-            if debug_tensor_dump_inject:
-                name = os.path.join(
-                    debug_tensor_dump_output_folder,
-                    f"jax_dump_attn_input_{self.layer_id}.npy",
-                )
-                logger.info(f"Load {name} from jax.")
-                x = np.load(name)
-                hidden_states = torch.tensor(x[0, : hidden_states.shape[0]]).to(
-                    hidden_states
-                )
-
         qkv, _ = self.qkv_proj(hidden_states)
-        dispose_tensor(hidden_states)
 
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-
-        if debug_tensor_dump_output_folder:
-            num_tokens = q.shape[0]
-            num_heads_q = self.num_heads
-            head_dim = self.head_dim
-            num_heads_kv = k.numel() // (num_tokens * head_dim)
-
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                f"q_{self.layer_id}",
-                tensor_model_parallel_all_gather(
-                    q.reshape(num_tokens, num_heads_q, head_dim).contiguous(), dim=1
-                ).contiguous(),
-            )
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                f"k_{self.layer_id}",
-                tensor_model_parallel_all_gather(
-                    k.reshape(num_tokens, num_heads_kv, head_dim).contiguous(), dim=1
-                ).contiguous(),
-            )
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                f"v_{self.layer_id}",
-                tensor_model_parallel_all_gather(
-                    v.reshape(num_tokens, num_heads_kv, head_dim).contiguous(), dim=1
-                ).contiguous(),
-            )
+        if not _is_npu:
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            odtype = q.dtype
+            q, k = self.rotary_emb(positions, q.to(torch.float32), k.to(torch.float32))
+            q, k = q.to(odtype), k.to(odtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
-        del q, k, v, qkv
-
-        if debug_tensor_dump_output_folder:
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                f"attn_output_{self.layer_id}",
-                tensor_model_parallel_all_gather(
-                    attn_output.reshape(num_tokens, num_heads_q, head_dim).contiguous(),
-                    dim=1,
-                ).contiguous(),
-            )
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -554,7 +477,10 @@ class Grok1DecoderLayer(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream or torch.cuda.Stream()
 
-        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_params = getattr(config, "rope_parameters", None)
+            rope_theta = rope_params["rope_theta"] if rope_params else 10000
         self.self_attn = Grok1Attention(
             config=config,
             hidden_size=self.hidden_size,
@@ -661,14 +587,6 @@ class Grok1DecoderLayer(nn.Module):
                 hidden_states,
             )
 
-        if residual_original is not None:
-            dispose_tensor(residual_original)
-
-        dispose_flag = False
-        if residual is not hidden_states_original:
-            dispose_flag = True
-            dispose_tensor(hidden_states_original)
-
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -686,21 +604,21 @@ class Grok1DecoderLayer(nn.Module):
             self.post_attn_norm.variance_epsilon,
         )
 
-        if not dispose_flag:
-            dispose_tensor(hidden_states_original)
-
         # Fully Connected
         hidden_states = self.ffn(hidden_states)
         return hidden_states, residual, self.post_moe_norm  # defer layernorm
 
     def moe_with_rmoe(self, x):
-        current_stream = torch.cuda.current_stream()
-        self.alt_stream.wait_stream(current_stream)
-        mlp_result = self.mlp(x)
-        with torch.cuda.stream(self.alt_stream):
-            # moe should not be inplace because of stream race condition
+        if self.alt_stream is not None and get_is_capture_mode():
+            current_stream = torch.cuda.current_stream()
+            self.alt_stream.wait_stream(current_stream)
+            mlp_result = self.mlp(x)
+            with torch.cuda.stream(self.alt_stream):
+                moe_result = self.block_sparse_moe(x)
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            mlp_result = self.mlp(x)
             moe_result = self.block_sparse_moe(x)
-        current_stream.wait_stream(self.alt_stream)
         return (mlp_result + moe_result) / 1.4142135623730951
 
 
@@ -765,41 +683,13 @@ class Grok1Model(nn.Module):
                 positions, hidden_states, forward_batch, residual, deferred_norm
             )
 
-        if debug_tensor_dump_output_folder:
-            hidden_states = (
-                fused_rmsnorm(
-                    hidden_states,
-                    deferred_norm.weight,
-                    deferred_norm.variance_epsilon,
-                )
-                + residual
-            )
-
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                "last_hidden_before_norm",
-                hidden_states,
-            )
-
-            hidden_states = fused_rmsnorm(
-                hidden_states,
-                self.norm.weight,
-                self.norm.variance_epsilon,
-            )
-
-            dump_to_file(
-                debug_tensor_dump_output_folder,
-                "last_hidden_after_norm",
-                hidden_states,
-            )
-        else:
-            hidden_states, _ = fused_dual_residual_rmsnorm(
-                hidden_states,
-                residual,
-                deferred_norm.weight,
-                self.norm.weight,
-                deferred_norm.variance_epsilon,
-            )
+        hidden_states, _ = fused_dual_residual_rmsnorm(
+            hidden_states,
+            residual,
+            deferred_norm.weight,
+            self.norm.weight,
+            deferred_norm.variance_epsilon,
+        )
 
         return hidden_states
 
@@ -827,19 +717,12 @@ class Grok1ForCausalLM(nn.Module):
             config, "load_presharded_embedding", False
         )
 
-        self.is_weights_presharded = (
-            self.load_presharded_mlp
-            or self.load_presharded_moe
-            or self.load_presharded_attn
-            or self.load_presharded_embedding
-        )
-
         default_replicate_lm_head = False
         self.replicate_lm_head = getattr(
             config, "replicate_lm_head", default_replicate_lm_head
         )
 
-        if self.is_weights_presharded:
+        if get_tensor_model_parallel_world_size() > 1:
             setattr(DefaultModelLoader, "_prepare_weights", _prepare_presharded_weights)
 
         self.replicate_embedding = getattr(config, "replicate_embedding", False)
@@ -875,21 +758,9 @@ class Grok1ForCausalLM(nn.Module):
             )
             self.logits_processor = LogitsProcessor(config)
 
-        # Dump tensors for debugging
-        global debug_tensor_dump_output_folder, debug_tensor_dump_inject
-        debug_tensor_dump_output_folder = global_server_args_dict[
-            "debug_tensor_dump_output_folder"
-        ]
-        debug_tensor_dump_inject = global_server_args_dict["debug_tensor_dump_inject"]
-        warnings.filterwarnings("ignore", category=FutureWarning)
-
-        if get_tensor_model_parallel_rank() == 0:
-            logger.info(
-                f"#parameters (analytical): {self.get_num_params_analytical() / 1e9:.2f} B, "
-                f"#parameters (actual): {self.get_num_params_torch() / 1e9:.2f} B"
-            )
         self.loaded_param_names = set()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -897,9 +768,6 @@ class Grok1ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        if debug_tensor_dump_output_folder:
-            dump_to_file(debug_tensor_dump_output_folder, "input_ids", input_ids)
-
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
@@ -1114,6 +982,9 @@ def _prepare_presharded_weights(
     hf_weights_files = []
     for pattern in allow_patterns:
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+
+    if not hf_weights_files:
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
     if hf_weights_files[0].endswith("safetensors"):
         use_safetensors = True

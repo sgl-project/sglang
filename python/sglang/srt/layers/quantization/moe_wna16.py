@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/moe_wna16.py
 from __future__ import annotations
 
@@ -9,6 +11,8 @@ import torch
 
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.awq import AWQConfig
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -16,14 +20,19 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
-    from sglang.srt.layers.moe.topk import TopKOutput
+    from sglang.srt.layers.moe.token_dispatcher import (
+        CombineInput,
+        StandardDispatchOutput,
+    )
 
 
 def get_weight_perm(num_bits: int):
@@ -190,6 +199,8 @@ class MoeWNA16Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
         if is_layer_skipped_quant(prefix, self.modules_to_not_convert):
+            if isinstance(layer, FusedMoE):
+                return UnquantizedFusedMoEMethod()
             return UnquantizedLinearMethod()
         elif isinstance(layer, LinearBase):
 
@@ -349,37 +360,38 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 layer.register_parameter(key, param)
                 set_weight_attrs(param, extra_weight_attrs)
 
-    def apply(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        moe_runner_config: MoeRunnerConfig,
-    ) -> torch.Tensor:
-        # avoid circular import
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
-        assert (
-            moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
-
+    def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
         weight_bits = self.quant_config.weight_bits
         has_zp = self.quant_config.has_zp
-
-        return fused_experts(
-            x,
-            layer.w13_qweight,
-            layer.w2_qweight,
-            topk_output=topk_output,
-            moe_runner_config=moe_runner_config,
+        return TritonMoeQuantInfo(
+            w13_weight=layer.w13_qweight,
+            w2_weight=layer.w2_qweight,
             use_int4_w4a16=weight_bits == 4,
             use_int8_w8a16=weight_bits == 8,
-            w1_scale=layer.w13_scales,
+            w13_scale=layer.w13_scales,
             w2_scale=layer.w2_scales,
-            w1_zp=layer.w13_qzeros if has_zp else None,
+            w13_zp=layer.w13_qzeros if has_zp else None,
             w2_zp=layer.w2_qzeros if has_zp else None,
             block_shape=[0, layer.group_size],
         )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
+
+        quant_info = self.get_triton_quant_info(layer)
+        return self.runner.run(dispatch_output, quant_info)
 
     @staticmethod
     def get_weight_loader(layer, weight_loader):

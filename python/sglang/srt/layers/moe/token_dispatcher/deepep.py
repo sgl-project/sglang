@@ -1,21 +1,36 @@
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
+from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.layers.moe import DeepEPMode, get_deepep_config, is_tbo_enabled
-from sglang.srt.layers.moe.token_dispatcher.base_dispatcher import (
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     BaseDispatcherConfig,
+    CombineInput,
+    CombineInputFormat,
+    DispatcherBaseHooks,
     DispatchOutput,
     DispatchOutputFormat,
 )
-from sglang.srt.layers.quantization import deep_gemm_wrapper
+from sglang.srt.layers.moe.topk import TopKOutput
+from sglang.srt.layers.moe.utils import (
+    DeepEPMode,
+    DeepEPOutputDtype,
+    get_deepep_config,
+    get_deepep_output_dtype,
+    is_tbo_enabled,
+)
 from sglang.srt.utils import (
     get_bool_env_var,
-    get_int_env_var,
+    is_blackwell,
     is_hip,
     is_npu,
     load_json_config,
@@ -23,8 +38,15 @@ from sglang.srt.utils import (
 
 _is_npu = is_npu()
 
+if TYPE_CHECKING:
+    from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
+
 try:
-    from deep_ep import Buffer, Config
+    if _is_npu and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0:
+        from zbal.zbal.deepep_adaptor import Config
+        from zbal.zbal_buffer import Buffer
+    else:
+        from deep_ep import Buffer, Config
 
     if not _is_npu:
         from sglang.srt.layers.quantization.fp8_kernel import (
@@ -40,23 +62,32 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-from sglang.srt.layers.moe.ep_moe.kernels import (
-    deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
-    deepep_run_moe_deep_preprocess,
-)
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
 
 
-class DeepEPNormalOutput(NamedTuple):
+def _deepep_precompile_tp_barrier() -> None:
+    # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
+    # so if different ranks compile at different speeds, it may quickly trigger a timeout.
+    # To avoid this, we use torch.distributed's barrier during the compile stage.
+    # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
+    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+        get_tp_group().barrier()
+
+
+class DeepEPPDispatchHooks(DispatcherBaseHooks):
+    def __call__(self, dispatcher: BaseDispatcher):
+        for hook_fun in self.hook_dict.values():
+            hook_fun(dispatcher)
+
+
+class DeepEPNormalDispatchOutput(NamedTuple):
     """DeepEP normal dispatch output."""
 
-    hidden_states: torch.Tensor | Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     num_recv_tokens_per_expert: List[int]
 
@@ -65,11 +96,12 @@ class DeepEPNormalOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_NORMAL
 
 
-class DeepEPLLOutput(NamedTuple):
+class DeepEPLLDispatchOutput(NamedTuple):
     """DeepEP low latency dispatch output."""
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
     masked_m: torch.Tensor
     expected_m: int
@@ -79,24 +111,36 @@ class DeepEPLLOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
-class AscendDeepEPLLOutput(NamedTuple):
-    """AscendDeepEP low latency dispatch output."""
+assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
-    hidden_states_fp8: Tuple[torch.Tensor, torch.Tensor]
-    topk_idx: torch.Tensor
+
+class DeepEPNormalCombineInput(NamedTuple):
+    """DeepEP normal combine input."""
+
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
     topk_weights: torch.Tensor
-    masked_m: torch.Tensor
-    seg_indptr: torch.Tensor
-    expected_m: int
 
     @property
-    def format(self) -> DispatchOutputFormat:
-        return DispatchOutputFormat.ASCENT_LL
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
 
 
-assert isinstance(DeepEPNormalOutput, DispatchOutput)
-assert isinstance(DeepEPLLOutput, DispatchOutput)
-assert isinstance(AscendDeepEPLLOutput, DispatchOutput)
+class DeepEPLLCombineInput(NamedTuple):
+    """DeepEP low latency combine input."""
+
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
+assert isinstance(DeepEPNormalCombineInput, CombineInput)
+assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
@@ -158,10 +202,19 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
+        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
-        elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = DeepEPConfig.get_instance().num_sms
+        elif deepep_mode == DeepEPMode.LOW_LATENCY:
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
+        elif deepep_mode == DeepEPMode.AUTO:
+            # low-latency and normal mode all need run
+            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            num_qps_per_rank = max(
+                DeepEPConfig.get_instance().num_sms, num_experts // group.size()
+            )
         else:
             raise NotImplementedError
 
@@ -210,6 +263,15 @@ class DeepEPBuffer:
         if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+
+    @classmethod
+    def set_dispatch_mode(cls, mode: DeepEPMode):
+        if mode.is_low_latency():
+            cls.set_dispatch_mode_as_low_latency()
+        elif mode.is_normal():
+            cls.set_dispatch_mode_as_normal()
+        else:
+            raise Exception("unsupported mode")
 
 
 class DeepEPConfig(BaseDispatcherConfig):
@@ -269,17 +331,27 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        self.num_max_dispatch_tokens_per_rank = get_int_env_var(
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 128
+        # A large value will lead to large memory occupation, thus users should change it accordingly
+        self.num_max_dispatch_tokens_per_rank = (
+            envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
+        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
+        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
+
+        self.quant_config: Optional[dict] = None
+
+        self.overlap_args: Optional[CombineOverlapArgs] = None
+        self.meta_overlap_args: Optional[dict] = None
+
+        self.set_deepep_dispatcher_dtype()
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         raise NotImplementedError
 
@@ -289,7 +361,7 @@ class _DeepEPDispatcherImplBase:
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         raise NotImplementedError
@@ -300,6 +372,87 @@ class _DeepEPDispatcherImplBase:
     def _get_buffer(self):
         raise NotImplementedError
 
+    def set_quant_config(self, quant_config: dict) -> None:
+        self.quant_config = quant_config
+        self.set_deepep_dispatcher_dtype()
+
+    def set_deepep_dispatcher_dtype(self) -> None:
+        self.deepep_output_dtype = get_deepep_output_dtype(self)
+
+        # Configuration mapping for each dtype
+        config_map = {
+            DeepEPOutputDtype.BF16: {
+                "use_fp8": False,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.FP8: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            # Needed for Ascend A2/A3 NPU case,
+            # despite the use_fp8 flag,
+            # quantization will be performed in int8
+            DeepEPOutputDtype.INT8: {
+                "use_fp8": True,
+                "use_nvfp4": False,
+            },
+            DeepEPOutputDtype.NVFP4: {
+                "use_fp8": False,
+                "use_nvfp4": True,
+            },
+        }
+
+        # Validate and apply hardware-specific adjustments
+        self._validate_and_adjust_dtype()
+
+        # Apply configuration
+        config = config_map[self.deepep_output_dtype]
+        self.use_fp8 = config["use_fp8"]
+        self.use_nvfp4 = config["use_nvfp4"]
+
+        # Handle environment variables
+        if _is_npu:
+            self._update_int8_quant_env()
+
+    def _validate_and_adjust_dtype(self) -> None:
+        """Validate dtype against hardware and adjust if necessary."""
+        if _is_npu:
+            if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
+                logger.warning_once(
+                    "Ascend A2/A3 NPU does not support fp8 "
+                    "deepep_dispatcher_output_dtype, switching to int8..."
+                )
+                self.deepep_output_dtype = DeepEPOutputDtype.INT8
+            elif self.deepep_output_dtype == DeepEPOutputDtype.NVFP4:
+                raise RuntimeError(
+                    "Ascend A2/A3 NPU does not support nvfp4 deepep_dispatcher_output_dtype."
+                )
+        else:
+            if self.deepep_output_dtype == DeepEPOutputDtype.INT8:
+                logger.warning_once(
+                    "GPU does not support int8 "
+                    "deepep_dispatcher_output_dtype, switching to fp8..."
+                )
+                self.deepep_output_dtype = DeepEPOutputDtype.FP8
+            # NVFP4 is supported on GPU, no adjustment needed
+
+    def _update_int8_quant_env(self) -> None:
+        """Update the DEEP_NORMAL_MODE_USE_INT8_QUANT environment variable."""
+        if self.use_fp8:
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "1"
+        else:
+            os.environ["DEEP_NORMAL_MODE_USE_INT8_QUANT"] = "0"
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ) -> None:
+        self.overlap_args = combine_overlap_args
+        self.meta_overlap_args = meta_overlap_args
+
+    def clear_overlap_args(self) -> None:
+        self.overlap_args = None
+        self.meta_overlap_args = None
+
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def __init__(self, async_finish: bool, **kwargs):
@@ -307,15 +460,16 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         self.async_finish = async_finish
         self.src2dst = None
+        self.quant_config = {}
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
-        topk_idx = topk_idx.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
             # TODO hard code 128 block quant,use fp8 communication
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
@@ -325,25 +479,35 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
         previous_event = Buffer.capture() if self.async_finish else None
-        return hidden_states, topk_idx, topk_weights, previous_event
+        return hidden_states, topk_ids, topk_weights, previous_event
 
-    def dispatch_b(self, hidden_states, topk_idx, topk_weights, previous_event):
+    def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
         (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             num_recv_tokens_per_expert,
             event,
-        ) = self._dispatch_core(hidden_states, topk_idx, topk_weights, previous_event)
+        ) = self._dispatch_core(hidden_states, topk_ids, topk_weights, previous_event)
         event.current_stream_wait() if self.async_finish else ()
-        return DeepEPNormalOutput(
-            hidden_states, topk_idx, topk_weights, num_recv_tokens_per_expert
+
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
+        else:
+            hidden_states_scale = None
+
+        return DeepEPNormalDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            num_recv_tokens_per_expert,
         )
 
     def _dispatch_core(
         self,
         x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         previous_event,
     ):
@@ -355,27 +519,27 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             is_token_in_rank,
             previous_event,
         ) = buffer.get_dispatch_layout(
-            topk_idx,
+            topk_ids,
             self.num_experts,
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-
         # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
+        _deepep_precompile_tp_barrier()
         (
             recv_x,
-            recv_topk_idx,
+            recv_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
             self.handle,
             event,
         ) = buffer.dispatch(
             x,
-            topk_idx=topk_idx,
+            topk_idx=topk_ids,
             topk_weights=topk_weights,
             num_tokens_per_rank=num_tokens_per_rank,
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
@@ -387,7 +551,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
-
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
             num_recv_tokens_per_expert,
             num_tokens_per_rank=num_tokens_per_rank,
@@ -397,7 +560,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
         return (
             recv_x,
-            recv_topk_idx,
+            recv_topk_ids,
             recv_topk_weights,
             num_recv_tokens_per_expert,
             event,
@@ -406,35 +569,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter:
+
+        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            if hidden_states.shape[0] > 0:
-                num_tokens = self.src2dst.shape[0] // self.router_topk
-                output = torch.empty(
-                    (num_tokens, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
-                deepep_post_reorder_triton_kernel[(num_tokens,)](
-                    hidden_states,
-                    output,
-                    self.src2dst,
-                    topk_idx,
-                    topk_weights,
-                    self.router_topk,
-                    hidden_states.shape[1],
-                    BLOCK_SIZE=512,
-                )
-            else:
-                output = torch.zeros(
-                    (0, hidden_states.shape[1]),
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
+            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
@@ -447,6 +590,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
@@ -479,27 +623,28 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
+        self.device_module = torch.get_device_module()
+        self.quant_config = {}
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
+        topk_output: TopKOutput,
     ):
         buffer = self._get_buffer()
-        topk_idx = topk_idx.to(torch.int64)
+        topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
+        topk_ids = topk_ids.to(torch.int64)
         expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_idx.shape[1]
+            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
-            topk_idx,
-            use_fp8=True,
+            topk_ids,
         )
         return (
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
             masked_m,
             expected_m,
@@ -510,7 +655,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
     def dispatch_b(
         self,
         hidden_states,
-        topk_idx,
+        topk_ids,
         topk_weights,
         masked_m,
         expected_m,
@@ -523,82 +668,135 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             masked_m
         )
 
-        if _is_npu:
-            deepep_output = AscendDeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                self.handle[1],
-                expected_m,
-            )
+        if isinstance(hidden_states, tuple):
+            hidden_states, hidden_states_scale = hidden_states
         else:
-            deepep_output = DeepEPLLOutput(
-                hidden_states,
-                topk_idx,
-                topk_weights,
-                masked_m,
-                expected_m,
-            )
+            hidden_states_scale = None
+
+        deepep_output = DeepEPLLDispatchOutput(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            topk_weights,
+            masked_m,
+            expected_m,
+        )
         return deepep_output
 
     def _dispatch_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        use_fp8: bool = False,
+        topk_ids: torch.Tensor,
     ):
-        buffer = self._get_buffer()
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
-                hidden_states,
-                topk_idx,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
-                use_fp8=use_fp8,
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
+        input_global_scale = self.quant_config.get("input_global_scale", None)
+
+        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
+        # to return int32-packed UE8M0 scales that don't feed the flashinfer
+        # cutedsl kernel.
+        fp8_deepgemm_scale_opts = (
+            dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
                 use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
                 and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
+            if self.use_fp8
+            else dict()
         )
-        return packed_recv_hidden, packed_recv_count, event, hook
+
+        buffer = self._get_buffer()
+        _deepep_precompile_tp_barrier()
+        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+            buffer.low_latency_dispatch(
+                hidden_states,
+                topk_ids,
+                self.num_max_dispatch_tokens_per_rank,
+                self.num_experts,
+                use_fp8=self.use_fp8,
+                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+                **(
+                    dict(x_global_scale=input_global_scale)
+                    if input_global_scale is not None
+                    else dict()
+                ),
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                **fp8_deepgemm_scale_opts,
+            )
+        )
+        return packed_recv_hidden, self.packed_recv_count, event, hook
 
     def combine_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         hidden_states, event, hook = self._combine_core(
             hidden_states,
-            topk_idx,
+            topk_ids,
             topk_weights,
         )
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
+        overlap_args = self.overlap_args
+        if overlap_args is not None:
+            overlap_args.stream.wait_stream(self.device_module.current_stream())
+
         hook() if self.return_recv_hook else event.current_stream_wait()
+
+        if overlap_args is not None:
+            self.device_module.current_stream().wait_stream(overlap_args.stream)
+
         return hidden_states
 
     def _combine_core(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
+        topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        combined_hidden_states, event, hook = buffer.low_latency_combine(
-            hidden_states,
-            topk_idx,
-            topk_weights,
-            self.handle,
-            async_finish=not self.return_recv_hook,
-            return_recv_hook=self.return_recv_hook,
-        )
-        self.handle = None
+        overlap_args = self.overlap_args
+        meta_overlap_args = self.meta_overlap_args
+
+        ctx = nullcontext()
+        if overlap_args is not None:
+            overlap_args.stream.wait_event(overlap_args.wait_event)
+            ctx = torch.cuda.stream(overlap_args.stream)
+
+            if is_blackwell():
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    src_signals=overlap_args.signal,
+                    src_signal_expect_value=overlap_args.threshold,
+                )
+            else:
+                overlap_args_dict = dict(
+                    overlap=overlap_args.overlap,
+                    packed_recv_count=self.packed_recv_count,
+                    comp_signal=overlap_args.signal,
+                    block_m=meta_overlap_args["block_m"],
+                    threshold=meta_overlap_args["threshold"],
+                    num_sms=overlap_args.num_sms,
+                )
+        else:
+            overlap_args_dict = {}
+
+        with ctx:
+            _deepep_precompile_tp_barrier()
+            combined_hidden_states, event, hook = buffer.low_latency_combine(
+                x=hidden_states,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                handle=self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+                **overlap_args_dict,
+            )
+
+        self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
@@ -635,6 +833,8 @@ class DeepEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(
@@ -660,63 +860,80 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
         self._stage = _Stage.INITIAL
+        self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
-    def dispatch(self, *args, **kwargs) -> DispatchOutput:
-        self.dispatch_a(*args, **kwargs)
+        # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
+        # pre_permute reroutes them to a sink slot at index num_local_experts,
+        # which is masked off here.
+        self.expert_mask_gpu = None
+        if _use_aiter and num_local_experts is not None:
+            expert_mask = torch.zeros(
+                num_local_experts + 1,
+                device=torch.cuda.current_device(),
+                dtype=torch.int,
+            )
+            expert_mask[:-1] = 1
+            self.expert_mask_gpu = expert_mask
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output: TopKOutput,
+    ) -> DispatchOutput:
+        self.dispatch_a(hidden_states, topk_output)
+        if self._deepep_dispatch_hooks is not None:
+            self._deepep_dispatch_hooks(self)
         ret = self.dispatch_b()
         return ret
 
     def dispatch_a(
         self,
         hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
+        topk_output: TopKOutput,
     ):
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
-        inner_state = self._get_impl(forward_batch).dispatch_a(
+        inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
-            topk_weights=topk_weights,
+            topk_output=topk_output,
         )
-        self._dispatch_intermediate_state = forward_batch, inner_state
+        self._dispatch_intermediate_state = inner_state
 
     def dispatch_b(self):
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
-        forward_batch, inner_state = self._dispatch_intermediate_state
+        inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
-        return self._get_impl(forward_batch).dispatch_b(*inner_state)
+        return self._get_impl().dispatch_b(*inner_state)
 
-    def combine(self, *args, **kwargs) -> Tuple:
-        self.combine_a(*args, **kwargs)
+    def combine(
+        self,
+        combine_input: CombineInput,
+    ) -> torch.Tensor:
+        self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
 
     def combine_a(
         self,
-        hidden_states: torch.Tensor,
-        topk_idx: torch.Tensor,
-        topk_weights: torch.Tensor,
-        forward_batch: ForwardBatch,
+        combine_input: CombineInput,
     ):
+        hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
-        inner_state = self._get_impl(forward_batch).combine_a(
+        inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,
-            topk_idx=topk_idx,
+            topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
-        self._combine_intermediate_state = forward_batch, inner_state
+        self._combine_intermediate_state = inner_state
 
     def combine_b(self):
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
-        forward_batch, inner_state = self._combine_intermediate_state
+        inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
-        return self._get_impl(forward_batch).combine_b(*inner_state)
+        return self._get_impl().combine_b(*inner_state)
 
-    def _get_impl(self, forward_batch: ForwardBatch) -> _DeepEPDispatcherImplBase:
-        resolved_deepep_mode = self.deepep_mode.resolve(
-            forward_batch.is_extend_in_batch
-        )
+    def _get_impl(self) -> _DeepEPDispatcherImplBase:
+        is_extend_in_batch = get_is_extend_in_batch()
+        resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
             return self._normal_dispatcher
         elif resolved_deepep_mode == DeepEPMode.LOW_LATENCY:
@@ -727,3 +944,33 @@ class DeepEPDispatcher(BaseDispatcher):
     def _update_stage(self, old_stage, new_stage):
         assert self._stage == old_stage
         self._stage = new_stage
+
+    def set_quant_config(self, quant_config: dict):
+        super().set_quant_config(quant_config)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_quant_config(quant_config)
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_quant_config(quant_config)
+
+    def set_overlap_args(
+        self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
+    ):
+        super().set_overlap_args(combine_overlap_args, meta_overlap_args)
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.set_overlap_args(
+                combine_overlap_args, meta_overlap_args
+            )
+
+    def clear_overlap_args(self):
+        super().clear_overlap_args()
+        if self.deepep_mode.enable_low_latency():
+            self._low_latency_dispatcher.clear_overlap_args()
+        if self.deepep_mode.enable_normal():
+            self._normal_dispatcher.clear_overlap_args()
+
+    def register_deepep_dispatch_hook(self, hook):
+        return self._deepep_dispatch_hooks.register_hook(hook)

@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional
+from typing import Optional
 
 import torch
 
@@ -28,11 +28,77 @@ def moe_align_block_size(
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    gating_output: float,
+    gating_output: torch.Tensor,
     renormalize: bool = False,
+    moe_softcapping: float = 0.0,
+    correction_bias: Optional[torch.Tensor] = None,
 ) -> None:
+    """
+    Compute top-k softmax for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        moe_softcapping: Tanh softcapping value (0.0 to disable)
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
     torch.ops.sgl_kernel.topk_softmax.default(
-        topk_weights, topk_ids, gating_output, renormalize
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        moe_softcapping,
+        correction_bias,
+    )
+
+
+def topk_sigmoid(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    gating_output: torch.Tensor,
+    renormalize: bool = False,
+    correction_bias: Optional[torch.Tensor] = None,
+) -> None:
+    """
+    Compute top-k sigmoid for MoE routing.
+
+    Args:
+        topk_weights: Output tensor for top-k weights [num_tokens, topk]
+        topk_ids: Output tensor for top-k expert indices [num_tokens, topk]
+        gating_output: Gating logits [num_tokens, num_experts]
+        renormalize: Whether to renormalize the top-k weights
+        correction_bias: Per-expert bias correction [num_experts], must be float32 if provided
+    """
+    torch.ops.sgl_kernel.topk_sigmoid.default(
+        topk_weights,
+        topk_ids,
+        gating_output,
+        renormalize,
+        correction_bias,
+    )
+
+
+def moe_sum_reduce(
+    input_tensor,
+    output_tensor,
+    routed_scaling_factor=0,
+):
+    torch.ops.sgl_kernel.moe_sum_reduce.default(
+        input_tensor,
+        output_tensor,
+        routed_scaling_factor,
+    )
+
+
+def moe_sum(
+    input_tensor: torch.Tensor,
+    output_tensor: torch.Tensor,
+):
+    torch.ops.sgl_kernel.moe_sum.default(
+        input_tensor,
+        output_tensor,
     )
 
 
@@ -71,67 +137,38 @@ def moe_fused_gate(
     )
 
 
-def ep_moe_pre_reorder(
+def kimi_k2_moe_fused_gate(
     input_tensor,
-    gateup_input,
-    src2dst,
-    topk_ids,
-    a1_scales,
-    start_expert_id,
-    end_expert_id,
+    bias,
     topk,
-    use_per_token_if_dynamic,
+    renormalize=True,
+    routed_scaling_factor=1.0,
+    apply_routed_scaling_factor_on_output=False,
 ):
-    return torch.ops.sgl_kernel.ep_moe_pre_reorder.default(
+    """
+    Simplified fused kernel for Kimi K2 model (num_expert_group=1).
+    This kernel removes the grouped topk logic since all experts belong to a single group.
+
+    Args:
+        input_tensor: Gating output tensor [num_tokens, num_experts]
+        bias: Correction bias tensor [num_experts]
+        topk: Number of experts to select per token
+        renormalize: Whether to renormalize the topk weights
+        routed_scaling_factor: Scaling factor for expert weights
+        apply_routed_scaling_factor_on_output: If true, apply scaling factor to output
+
+    Returns:
+        Tuple of (topk_weights, topk_ids)
+        - topk_weights: [num_tokens, topk] float32 tensor
+        - topk_ids: [num_tokens, topk] int32 tensor
+    """
+    return torch.ops.sgl_kernel.kimi_k2_moe_fused_gate.default(
         input_tensor,
-        gateup_input,
-        src2dst,
-        topk_ids,
-        a1_scales,
-        start_expert_id,
-        end_expert_id,
+        bias,
         topk,
-        use_per_token_if_dynamic,
-    )
-
-
-def ep_moe_silu_and_mul(
-    gateup_output,
-    down_input,
-    reorder_topk_ids,
-    scales,
-    start_expert_id,
-    end_expert_id,
-):
-    return torch.ops.sgl_kernel.ep_moe_silu_and_mul.default(
-        gateup_output,
-        down_input,
-        reorder_topk_ids,
-        scales,
-        start_expert_id,
-        end_expert_id,
-    )
-
-
-def ep_moe_post_reorder(
-    down_output,
-    output,
-    src2dst,
-    topk_ids,
-    topk_weights,
-    start_expert_id,
-    end_expert_id,
-    topk,
-):
-    return torch.ops.sgl_kernel.ep_moe_post_reorder.default(
-        down_output,
-        output,
-        src2dst,
-        topk_ids,
-        topk_weights,
-        start_expert_id,
-        end_expert_id,
-        topk,
+        renormalize,
+        routed_scaling_factor,
+        apply_routed_scaling_factor_on_output,
     )
 
 
@@ -214,48 +251,39 @@ def apply_shuffle_mul_sum(
     )
 
 
-def cutlass_fp4_group_mm(
-    a_fp4,
-    b_fp4,
-    a_blockscale,
-    b_blockscale,
-    alphas,
-    out_dtype,
-    device,
-    params: Dict[str, Any],
-):
-    """
-    An FP4 Blockscaled Group Gemm that takes in  a_tensors, b_tensors and runs
-    the gemms for each combination based on the specified problem sizes.
-
-    This is used as the MoE gemm during NVFP4 Quantized FusedMoE forward.
-    - a/b_tensors: the NVFP4 a_ptrs and b_ptrs tensors which are quantized
-                     input and expert weights.
-    - a_/b_scales: The blockscales in FP8-E4M3 precision
-    - ab_strides/c_strides: Strides for the a/b tensors between rows.
-    - expert_offsets/sf_offsets: Indices that mark at which token index
-                    each expert begins its computation. The number of tokens
-                    computed with expert E is expert_offsets[E + 1] -
-                    expert_offsets[E] And the sf_size per expert is
-                    sf_offset[E+1] - sf_offset[E]
-    - problem_sizes: MxNxK sizes of each expert's multiplication in two grouped
-                     MMs used in the fused MoE operation.
-    """
-    m_topk = a_fp4.shape[0]
-    n = b_fp4.shape[1]
-    c_shape = (m_topk, n)
-    c = torch.empty(c_shape, device=device, dtype=out_dtype)
-    torch.ops.sgl_kernel.cutlass_fp4_group_mm.default(
-        c,
-        a_fp4,
-        b_fp4,
-        a_blockscale,
-        b_blockscale,
-        alphas,
-        params["ab_strides"],
-        params["c_strides"],
-        params["problem_sizes"],
-        params["expert_offsets"],
-        params["blockscale_offsets"],
+def fused_qk_norm_rope(
+    qkv: torch.Tensor,
+    num_heads_q: int,
+    num_heads_k: int,
+    num_heads_v: int,
+    head_dim: int,
+    eps: float,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    base: float,
+    is_neox: bool,
+    position_ids: torch.Tensor,
+    factor: float,
+    low: float,
+    high: float,
+    attention_factor: float,
+    rotary_dim: Optional[int] = None,
+) -> None:
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        q_weight,
+        k_weight,
+        base,
+        is_neox,
+        position_ids,
+        factor,
+        low,
+        high,
+        attention_factor,
+        rotary_dim if rotary_dim is not None else head_dim,
     )
-    return c.to(dtype=out_dtype)
