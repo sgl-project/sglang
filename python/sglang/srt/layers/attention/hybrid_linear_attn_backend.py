@@ -404,6 +404,26 @@ class MambaAttnBackendBase(AttentionBackend):
             bs, req_pool_indices, forward_mode, spec_info
         )
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            self.forward_metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            self.forward_metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -698,6 +718,34 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             draft_token_num=draft_token_num,
         )
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        self.forward_metadata = Mamba2Metadata.prepare_decode(
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -814,6 +862,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
             )
+
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_data_out_graph(forward_batch)
 
     def init_forward_metadata_capture_cpu_graph(
         self,
