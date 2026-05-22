@@ -230,6 +230,8 @@ class MMEncoder:
             use_image_processor_gpu and not server_args.disable_fast_image_processor
         )
         self._build_vision_config(server_args.mm_process_config)
+        self.model_audio_sr = self._resolve_audio_sr()
+        logger.info(f"Resolved model audio sample rate: {self.model_audio_sr} Hz")
 
         init_distributed_environment(
             backend=get_default_distributed_backend(self.device),
@@ -348,6 +350,40 @@ class MMEncoder:
         logger.info(f"Global cache embedding dims: {dims}")
         return dims
 
+    def _resolve_audio_sr(self) -> int:
+        # Must match MiMoProcessor.from_hf_config — drift causes mimo to
+        # re-resample already-target audio and warp the waveform.
+        def _read(obj, attr):
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(attr)
+            return getattr(obj, attr, None)
+
+        audio_cfg = self.vision_config.get("audio", {})
+        sr = audio_cfg.get("audio_sampling_rate")
+        if sr:
+            return int(sr)
+
+        hf_cfg = self.model_config.hf_config
+        thinker_cfg = _read(hf_cfg, "thinker_config")
+        pc = _read(thinker_cfg, "processor_config") or _read(
+            hf_cfg, "processor_config"
+        )
+        sr = _read(pc, "audio_sampling_rate")
+        if sr:
+            return int(sr)
+        ac = _read(thinker_cfg, "audio_config") or _read(hf_cfg, "audio_config")
+        for attr in ("sampling_rate", "sample_rate"):
+            sr = _read(ac, attr)
+            if sr:
+                return int(sr)
+
+        sr = audio_cfg.get("sampling_rate")
+        if sr:
+            return int(sr)
+        return 16000
+
     def _build_vision_config(self, mm_process_config):
         """
         Validate vision config, used for image/video/audio.
@@ -447,7 +483,6 @@ class MMEncoder:
         data,
         modality: Modality,
         frame_count_limit=None,
-        audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
     ):
         """
@@ -470,7 +505,7 @@ class MMEncoder:
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
             elif modality == Modality.AUDIO:
-                return load_audio(data, audio_sample_rate)
+                return load_audio(data, self.model_audio_sr)
 
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
@@ -883,7 +918,8 @@ class MMEncoder:
 
     async def _flatten_and_load_audios(self, mm_items):
         """
-        Flatten mm_items structure, load audios concurrently, and restore original structure.
+        Flatten mm_items, load audios concurrently as np.ndarray at
+        self.model_audio_sr, restore original structure.
         """
         return await self._flatten_and_load_data_by_modality(mm_items, Modality.AUDIO)
 
@@ -1070,18 +1106,21 @@ class MMEncoder:
         return processor_input
 
     async def _process_audio_items(self, mm_items, model_preprocessor):
+        # Await off the event loop so EncoderScheduler can accumulate
+        # cross-request batches during download.
+        audios = await self._flatten_and_load_audios(mm_items)
+
         if model_preprocessor:
-            return model_preprocessor(mm_items, Modality.AUDIO, self.vision_config)
+            return model_preprocessor(audios, Modality.AUDIO, self.vision_config)
+
         if not self.audio_processor:
             raise ValueError("No audio processor available")
 
-        audios = await self._flatten_and_load_audios(mm_items)
         audio_config = self.vision_config.get("audio", {})
         processor_input = self.audio_processor.feature_extractor(audios, **audio_config)
         processor_input["feature_attention_mask"] = processor_input.pop(
             "attention_mask"
         )
-        # convert to same format as image/video
         input_lengths = torch.tensor(
             processor_input["feature_attention_mask"].sum(-1), dtype=torch.long
         )
