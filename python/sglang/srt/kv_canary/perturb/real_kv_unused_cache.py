@@ -24,7 +24,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     pick_target_group,
     should_run_perturbation,
 )
-from sglang.srt.kv_canary.sweep_plan_builder import build_verify_plan_radix_sweep
+from sglang.srt.kv_canary.radix_cache_walker import walk_radix_cache_for_canary
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -122,20 +122,42 @@ def _pick_sweep_slot_for_group(
     if radix_cache is None:
         return None
 
-    window = swa_window_size if group.kind is PoolKind.SWA else 0
-    verify_plan = build_verify_plan_radix_sweep(
+    walk_result = walk_radix_cache_for_canary(
         radix_cache=radix_cache,
-        swa_window_size=window,
-        full_to_swa_index_mapping=group.swa_index_lut,
         unlocked_only=True,
+        swa_resident_only=group.kind is PoolKind.SWA,
     )
     slots = [
         int(raw_slot)
-        for raw_slot in verify_plan.verify_slot_indices.detach().to("cpu").tolist()
+        for raw_slot in walk_result.slot_indices.detach().to("cpu").tolist()
         if int(raw_slot) >= 0
     ]
+    if group.kind is PoolKind.SWA:
+        slots = _translate_full_slots_to_swa_slots(
+            slots=slots,
+            full_to_swa_index_mapping=group.swa_index_lut,
+        )
     if not slots:
         return None
 
     pick = int(torch.randint(0, len(slots), (1,)).item())
     return slots[pick]
+
+
+def _translate_full_slots_to_swa_slots(
+    *,
+    slots: list[int],
+    full_to_swa_index_mapping: Optional[torch.Tensor],
+) -> list[int]:
+    if full_to_swa_index_mapping is None:
+        return []
+
+    lut = full_to_swa_index_mapping.detach().to("cpu").to(torch.int64)
+    translated: list[int] = []
+    for slot in slots:
+        if slot >= int(lut.shape[0]):
+            continue
+        physical_slot = int(lut[slot].item())
+        if physical_slot >= 0:
+            translated.append(physical_slot)
+    return translated

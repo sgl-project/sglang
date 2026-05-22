@@ -29,7 +29,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     pick_target_group,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_radix_cache
 from sglang.test.test_utils import CustomTestCase
 
 if TYPE_CHECKING:
@@ -425,20 +425,54 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             req_to_token_pool=pool,
             buffer_groups=(group,),
             step_counter_getter=lambda: 10,
+            sweep_interval=1,
         )
-        manager.attach_radix_cache(cast("BasePrefixCache", object()))
+        manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
 
         snapshot = source.tensor.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            real_kv_unused_cache_module,
-            "_pick_sweep_slot_for_group",
-            return_value=3,
+            torch,
+            "randint",
+            return_value=torch.tensor(0),
         ):
             manager.perturb_real_kv_unused_cache(None)
 
         expected = snapshot.clone()
         expected[3, 0] = int(snapshot[3, 0].item()) ^ 0xFF
         self.assertTrue(torch.equal(source.tensor, expected))
+
+    def test_pick_sweep_slot_for_group_skips_locked_radix_nodes(self) -> None:
+        """Verify unused-cache perturbation chooses only unlocked radix-cache slots."""
+        device = DEFAULT_DEVICE
+        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        cache = make_radix_cache([[], [1, 2], [3]], device=device)
+        locked_node = next(iter(cache.root_node.children.values()))
+        locked_node.lock_ref = 1
+
+        with patch.object(torch, "randint", return_value=torch.tensor(0)):
+            slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
+                radix_cache=cache,
+                group=group,
+                swa_window_size=0,
+            )
+
+        self.assertEqual(slot, 3)
+
+    def test_pick_sweep_slot_for_group_translates_swa_slots(self) -> None:
+        """Verify unused-cache SWA perturbation translates full slots to physical SWA slots."""
+        device = DEFAULT_DEVICE
+        lut = torch.tensor([-1, 2], dtype=torch.int64, device=device)
+        group = _make_group(kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut)
+        cache = make_radix_cache([[], [1]], device=device)
+
+        with patch.object(torch, "randint", return_value=torch.tensor(0)):
+            slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
+                radix_cache=cache,
+                group=group,
+                swa_window_size=4,
+            )
+
+        self.assertEqual(slot, 2)
 
     def test_real_kv_unused_cache_skips_without_radix_cache_when_forward_batch_is_none(
         self,
@@ -464,6 +498,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             req_to_token_pool=make_pool(device),
             buffer_groups=(group,),
             step_counter_getter=lambda: 10,
+            sweep_interval=1,
         )
 
         snapshot = source.tensor.clone()
