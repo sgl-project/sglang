@@ -251,11 +251,7 @@ def stamp_pair(
     prev_hash: int,
     real_kv_hash: int = 0,
 ) -> None:
-    """Stamp the same slot fields into both (cuda, ref) canary buffers.
-
-    Replaces the ``for buf in (cuda_buf, ref_buf): write_slot_fields(...)`` loop that appears
-    dozens of times across the hand tests.
-    """
+    """Stamp the same slot fields into both (cuda, ref) canary buffers."""
     for buf in buf_pair:
         write_slot_fields(
             canary_buf=buf,
