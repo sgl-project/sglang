@@ -27,7 +27,8 @@ from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
     VerifyPlan,
-    canary_verify_step,
+    VerifyOrWriteContext,
+    launch_canary_verify_kernel,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -89,21 +90,21 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
         num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
     )
 
-    slot_indices = torch.empty(capacity, dtype=torch.int32, device=device)
-    positions = torch.empty(capacity, dtype=torch.int32, device=device)
-    prev_slots = torch.empty(capacity, dtype=torch.int32, device=device)
+    slot_indices = torch.empty(capacity, dtype=torch.int64, device=device)
+    positions = torch.empty(capacity, dtype=torch.int64, device=device)
+    prev_slots = torch.empty(capacity, dtype=torch.int64, device=device)
     if total_entries > 0:
         flat_idx = torch.arange(total_entries, device=device, dtype=torch.int64)
         per_req = total_entries // case.bs if case.bs > 0 else 0
         slot_indices[:total_entries] = (flat_idx % max(num_slots - 1, 1)).to(
-            torch.int32
+            torch.int64
         )
-        positions[:total_entries] = (flat_idx % max(per_req, 1)).to(torch.int32)
+        positions[:total_entries] = (flat_idx % max(per_req, 1)).to(torch.int64)
         is_head = (flat_idx % max(per_req, 1)) == 0
         prev_seq = (flat_idx - 1) % max(num_slots - 1, 1)
         prev_slots[:total_entries] = torch.where(
             is_head, torch.full_like(flat_idx, -1), prev_seq
-        ).to(torch.int32)
+        ).to(torch.int64)
     if capacity > total_entries:
         slot_indices[total_entries:] = 0
         positions[total_entries:] = 0
@@ -138,6 +139,29 @@ def _build_verify_inputs(case: BenchCase, *, device: torch.device) -> Tuple[
         slot_run_counter,
         kernel_run_counter,
         real_kv_sources,
+    )
+
+
+def _build_context(
+    *,
+    canary_buf: torch.Tensor,
+    violation_ring: torch.Tensor,
+    violation_write_index: torch.Tensor,
+    slot_run_counter: torch.Tensor,
+    kernel_run_counter: torch.Tensor,
+    real_kv_sources: tuple[RealKvSource, ...],
+    kernel_kind: CanaryLaunchTag,
+    hash_mode: consts.RealKvHashMode,
+) -> VerifyOrWriteContext:
+    return VerifyOrWriteContext(
+        canary_buf=canary_buf,
+        kernel_kind=kernel_kind,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        slot_run_counter=slot_run_counter,
+        kernel_run_counter=kernel_run_counter,
+        real_kv_sources=real_kv_sources,
+        real_kv_hash_mode=hash_mode,
     )
 
 
@@ -188,19 +212,22 @@ def benchmark(
             real_kv_sources,
         ) = _build_verify_inputs(case, device=device)
         hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+        context = _build_context(
+            canary_buf=canary_buf,
+            violation_ring=violation_ring,
+            violation_write_index=violation_write_index,
+            slot_run_counter=slot_run_counter,
+            kernel_run_counter=kernel_run_counter,
+            real_kv_sources=real_kv_sources,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            hash_mode=hash_mode_enum,
+        )
 
         def fn() -> None:
             violation_write_index.zero_()
-            canary_verify_step(
-                canary_buf=canary_buf,
+            launch_canary_verify_kernel(
+                context=context,
                 plan=plan,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                violation_ring=violation_ring,
-                violation_write_index=violation_write_index,
-                slot_run_counter=slot_run_counter,
-                kernel_run_counter=kernel_run_counter,
-                real_kv_sources=real_kv_sources,
-                real_kv_hash_mode=hash_mode_enum,
             )
 
     else:
@@ -249,19 +276,22 @@ def benchmark_kernel_kind(
     ) = _build_verify_inputs(case, device=device)
     kernel_kind = CanaryLaunchTag[kernel_kind_name]
     hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+    context = _build_context(
+        canary_buf=canary_buf,
+        violation_ring=violation_ring,
+        violation_write_index=violation_write_index,
+        slot_run_counter=slot_run_counter,
+        kernel_run_counter=kernel_run_counter,
+        real_kv_sources=real_kv_sources,
+        kernel_kind=kernel_kind,
+        hash_mode=hash_mode_enum,
+    )
 
     def fn() -> None:
         violation_write_index.zero_()
-        canary_verify_step(
-            canary_buf=canary_buf,
+        launch_canary_verify_kernel(
+            context=context,
             plan=plan,
-            kernel_kind=kernel_kind,
-            violation_ring=violation_ring,
-            violation_write_index=violation_write_index,
-            slot_run_counter=slot_run_counter,
-            kernel_run_counter=kernel_run_counter,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=hash_mode_enum,
         )
 
     return run_benchmark(fn)

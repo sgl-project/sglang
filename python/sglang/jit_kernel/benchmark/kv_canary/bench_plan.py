@@ -20,7 +20,7 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -96,9 +96,9 @@ def _build_plan_inputs(
         write_req_capacity=write_req_capacity, device=device
     )
 
-    req_pool_indices = torch.arange(1, bs + 1, dtype=torch.int32, device=device)
-    prefix_lens = torch.full((bs,), prefix_len, dtype=torch.int32, device=device)
-    extend_seq_lens = torch.full((bs,), extend_len, dtype=torch.int32, device=device)
+    req_pool_indices = torch.arange(1, bs + 1, dtype=torch.int64, device=device)
+    prefix_lens = torch.full((bs,), prefix_len, dtype=torch.int64, device=device)
+    extend_seq_lens = torch.full((bs,), extend_len, dtype=torch.int64, device=device)
 
     max_seq_len = max(prefix_len + extend_len, 1)
     req_to_token_rows = bs + 1
@@ -139,7 +139,7 @@ def _build_plan_inputs(
 
 def _make_plan_callable(inputs: dict):
     def fn() -> None:
-        canary_plan_step(
+        launch_canary_plan_kernels(
             verify_plan_out=inputs["verify_plan_out"],
             write_plan_out=inputs["write_plan_out"],
             req_pool_indices=inputs["req_pool_indices"],
