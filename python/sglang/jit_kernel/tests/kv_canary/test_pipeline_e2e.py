@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.plan_ref import (
     launch_canary_plan_kernels_torch_reference,
 )
@@ -75,7 +75,7 @@ def _run_pipeline(
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
 
-    plan_fn = canary_plan_step if real else launch_canary_plan_kernels_torch_reference
+    plan_fn = launch_canary_plan_kernels if real else launch_canary_plan_kernels_torch_reference
     plan_fn(
         verify_plan_out=plan_v,
         write_plan_out=plan_w,
@@ -677,7 +677,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     plan_v_ref = VerifyPlan.allocate(verify_capacity=256, device=_DEVICE)
     plan_w_ref = WritePlan.allocate(write_req_capacity=4, device=_DEVICE)
 
-    canary_plan_step(
+    launch_canary_plan_kernels(
         verify_plan_out=plan_v_real,
         write_plan_out=plan_w_real,
         req_pool_indices=req_pool_indices,

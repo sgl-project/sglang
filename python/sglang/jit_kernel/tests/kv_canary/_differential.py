@@ -6,7 +6,7 @@ from typing import Any, Callable, Iterator, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.plan_ref import (
     launch_canary_plan_kernels_torch_reference,
 )
@@ -53,7 +53,7 @@ def _run_both_plan(
 ) -> None:
     _ = extras
     verify_capacity = int(triton_verify.verify_slot_indices.shape[0])
-    canary_plan_step(
+    launch_canary_plan_kernels(
         verify_plan_out=triton_verify,
         write_plan_out=triton_write,
         req_pool_indices=req_pool_indices,

@@ -5,7 +5,7 @@ import random
 import pytest
 import torch
 
-from sglang.jit_kernel.kv_canary.plan import canary_plan_step
+from sglang.jit_kernel.kv_canary.plan import launch_canary_plan_kernels
 from sglang.jit_kernel.kv_canary.plan_ref import (
     launch_canary_plan_kernels_torch_reference,
 )
@@ -87,7 +87,7 @@ def _run_label(
         write_req_capacity=write_req_capacity, device=_DEVICE
     )
     runner = (
-        canary_plan_step
+        launch_canary_plan_kernels
         if label == "real"
         else launch_canary_plan_kernels_torch_reference
     )
@@ -803,7 +803,7 @@ class TestMisc:
                 write_req_capacity=write_req_capacity, device=_DEVICE
             )
             runner = (
-                canary_plan_step
+                launch_canary_plan_kernels
                 if label == "real"
                 else launch_canary_plan_kernels_torch_reference
             )
