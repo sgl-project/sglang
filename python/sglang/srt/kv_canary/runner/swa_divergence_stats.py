@@ -13,7 +13,9 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+    from sglang.srt.kv_canary.runner.swa_pool_static_observer import (
+        SwaPoolStaticObserver,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +69,11 @@ class SwaDivergenceStats:
         *,
         device: torch.device,
         d2h_stream: torch.cuda.Stream,
-        swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
+        swa_pool_static_observer: Optional["SwaPoolStaticObserver"] = None,
     ) -> None:
         self._device = device
         self._d2h_stream = d2h_stream
-        self._swa_allocator = swa_allocator
+        self._swa_pool_static_observer = swa_pool_static_observer
         self._forward_ct: int = 0
 
         self._verify_full_total_device: torch.Tensor = torch.zeros(
@@ -156,9 +158,17 @@ class SwaDivergenceStats:
             stream=self._d2h_stream,
         )
 
+        mapping_future: Optional[FutureTensor] = (
+            self._swa_pool_static_observer.snapshot_nonidentity_future(
+                stream=self._d2h_stream
+            )
+            if self._swa_pool_static_observer is not None
+            else None
+        )
+
         self._pending = _PendingSnapshot(
             step_counter=step_counter,
             verify_full=verify_full_future,
             verify_swa=verify_swa_future,
-            mapping_nonidentity=None,
+            mapping_nonidentity=mapping_future,
         )

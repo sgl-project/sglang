@@ -23,6 +23,7 @@ from sglang.srt.kv_canary.runner.health import (
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
 from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
+from sglang.srt.kv_canary.runner.swa_pool_static_observer import SwaPoolStaticObserver
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -89,11 +90,16 @@ class CanaryRunner:
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
         if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
+            swa_pool_static_observer: Optional[SwaPoolStaticObserver] = (
+                SwaPoolStaticObserver(swa_allocator=self._swa_allocator)
+                if self._swa_allocator is not None
+                else None
+            )
             self._swa_divergence_stats: Optional[SwaDivergenceStats] = (
                 SwaDivergenceStats(
                     device=device,
                     d2h_stream=self._d2h_stream,
-                    swa_allocator=self._swa_allocator,
+                    swa_pool_static_observer=swa_pool_static_observer,
                 )
             )
         else:
