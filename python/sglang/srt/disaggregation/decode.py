@@ -1773,10 +1773,19 @@ class SchedulerDisaggregationDecodeMixin:
             self.polling_interval = (
                 self.server_args.disaggregation_decode_polling_interval
             )
+            self.polling_threshold = (
+                self.server_args.disaggregation_decode_polling_threshold
+            )
 
+        batch_size = len(self.last_batch.reqs) if self.last_batch else 0
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
-        if self.polling_count % self.polling_interval == 0:
+        if self.polling_threshold > 0 and batch_size < self.polling_threshold:
+            should_poll = True
+        else:
+            should_poll = self.polling_count == 0
+
+        if should_poll:
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
