@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
@@ -65,6 +66,25 @@ class TestParseTargetGroupKind(CustomTestCase):
                     ValueError, "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP"
                 ):
                     _parse_target_group_kind(raw)
+
+    def test_from_env_allows_missing_target_when_real_kv_perturb_is_disabled(
+        self,
+    ) -> None:
+        """Verify normal canary startup does not require a perturb target group."""
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
+                "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
+                "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
+                "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
+            },
+            clear=False,
+        ):
+            os.environ.pop("SGLANG_KV_CANARY_PERTURB_TARGET_GROUP", None)
+            config = PerturbConfig.from_env()
+
+        self.assertIsNone(config.target_group_kind)
 
 
 class TestPickTargetGroup(CustomTestCase):

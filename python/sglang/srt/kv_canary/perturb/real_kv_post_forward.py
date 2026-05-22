@@ -12,7 +12,10 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
-from sglang.srt.kv_canary.perturb.config import PerturbConfig
+from sglang.srt.kv_canary.perturb.config import (
+    PerturbConfig,
+    require_target_group_kind,
+)
 from sglang.srt.kv_canary.perturb.slot_picker import pick_out_cache_loc_slot
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
@@ -51,7 +54,10 @@ def run(
         return
     group = pick_target_group(
         buffer_groups=buffer_groups,
-        target_kind=config.target_group_kind,
+        target_kind=require_target_group_kind(
+            target_group_kind=config.target_group_kind,
+            perturb_name="real_kv_post_forward",
+        ),
     )
     if group is None:
         logger.info(

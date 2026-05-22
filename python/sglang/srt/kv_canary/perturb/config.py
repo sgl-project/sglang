@@ -34,8 +34,9 @@ class PerturbConfig:
             hash. Designed for PD disagg self-test: P-side runs the flip just before
             ``send_kv_chunk`` so D's first decode forward HEAD/TAIL kernel catches the
             real_kv_hash violation. 0 = disabled.
-        target_group_kind: which CanaryBufferGroup to target with real_kv_used / real_kv_unused
-            perturb. FULL / SWA exact-match the PoolKind name.
+        target_group_kind: which CanaryBufferGroup to target with real_kv_used /
+            real_kv_unused perturb. FULL / SWA exact-match the PoolKind name. None means
+            real-KV perturbation is disabled and no target was configured.
         warmup_steps: number of initial forward steps to gate off all perturb hooks. Prevents
             perturb from firing during sglang warmup, where a garbage write can trip a CUDA error
             before the canary's deferred D2H violation pump has a chance to log the canary_kind
@@ -46,21 +47,60 @@ class PerturbConfig:
     real_kv_used_prob: float
     real_kv_unused_cache_prob: float
     real_kv_post_forward_prob: float
-    target_group_kind: TargetGroupKind
+    target_group_kind: TargetGroupKind | None
     warmup_steps: int
 
     @classmethod
     def from_env(cls) -> "PerturbConfig":
+        real_kv_used_prob = envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB.get()
+        real_kv_unused_cache_prob = (
+            envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB.get()
+        )
+        real_kv_post_forward_prob = (
+            envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB.get()
+        )
         return cls(
             req_to_token_prob=envs.SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB.get(),
-            real_kv_used_prob=envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB.get(),
-            real_kv_unused_cache_prob=envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB.get(),
-            real_kv_post_forward_prob=envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB.get(),
-            target_group_kind=_parse_target_group_kind(
-                envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.get()
+            real_kv_used_prob=real_kv_used_prob,
+            real_kv_unused_cache_prob=real_kv_unused_cache_prob,
+            real_kv_post_forward_prob=real_kv_post_forward_prob,
+            target_group_kind=_parse_target_group_kind_from_env(
+                raw=envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.get(),
+                real_kv_used_prob=real_kv_used_prob,
+                real_kv_unused_cache_prob=real_kv_unused_cache_prob,
+                real_kv_post_forward_prob=real_kv_post_forward_prob,
             ),
             warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS.get(),
         )
+
+
+def _parse_target_group_kind_from_env(
+    *,
+    raw: str | None,
+    real_kv_used_prob: float,
+    real_kv_unused_cache_prob: float,
+    real_kv_post_forward_prob: float,
+) -> TargetGroupKind | None:
+    if raw is not None and raw.strip():
+        return _parse_target_group_kind(raw)
+    if (
+        real_kv_used_prob > 0.0
+        or real_kv_unused_cache_prob > 0.0
+        or real_kv_post_forward_prob > 0.0
+    ):
+        return _parse_target_group_kind(raw)
+    return None
+
+
+def require_target_group_kind(
+    *, target_group_kind: TargetGroupKind | None, perturb_name: str
+) -> TargetGroupKind:
+    if target_group_kind is None:
+        raise ValueError(
+            "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP must be explicitly set to "
+            f"'full' or 'swa' when {perturb_name} perturbation is enabled"
+        )
+    return target_group_kind
 
 
 def _parse_target_group_kind(raw: str | None) -> TargetGroupKind:
