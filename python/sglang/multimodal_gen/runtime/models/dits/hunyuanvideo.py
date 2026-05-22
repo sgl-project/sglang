@@ -37,7 +37,9 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
     unpatchify,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.models.utils import modulate
 from sglang.multimodal_gen.runtime.platforms import (
@@ -249,7 +251,7 @@ class MMDoubleStreamBlock(nn.Module):
         # Run distributed attention
         img_attn, txt_attn = self.attn(img_q, img_k, img_v, txt_q, txt_k, txt_v)
         img_attn_out, _ = self.img_attn_proj(
-            img_attn.view(batch_size, image_seq_len, -1)
+            img_attn.reshape(batch_size, image_seq_len, -1)
         )
         # Use fused operation for residual connection, normalization, and modulation
         img_mlp_input, img_residual = self.img_attn_residual_mlp_norm(
@@ -418,7 +420,7 @@ class MMSingleStreamBlock(nn.Module):
         return self.output_residual(output, mod_gate, x)
 
 
-class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
+class HunyuanVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     HunyuanVideo Transformer backbone adapted for distributed training.
 

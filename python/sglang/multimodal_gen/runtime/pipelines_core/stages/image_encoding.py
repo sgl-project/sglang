@@ -20,8 +20,13 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    configure_layerwise_offload_modules,
+)
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     normalize,
@@ -485,6 +490,16 @@ class LTX2ImageEncodingStage(PipelineStage):
             safetensors_load_file(weights_path), strict=True
         )
         self._condition_image_encoder_dir = encoder_dir
+        if server_args.should_configure_layerwise_offload_for_lazy_component(
+            "condition_image_encoder"
+        ):
+            modules = {"condition_image_encoder": self._condition_image_encoder}
+            configure_layerwise_offload_modules(
+                modules,
+                server_args,
+                component_names=server_args.layerwise_offload_components,
+                warn_missing=False,
+            )
         return True
 
     # -- image preprocessing ---------------------------------------------
@@ -788,9 +803,15 @@ class ImageVAEEncodingStage(PipelineStage):
         "vae_image_sizes",
     )
 
-    def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
+    def __init__(
+        self,
+        vae: ParallelTiledVAE,
+        component_name: str = "vae",
+        **kwargs,
+    ) -> None:
         super().__init__()
         self.vae: ParallelTiledVAE = vae
+        self.component_name = component_name
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -800,7 +821,7 @@ class ImageVAEEncodingStage(PipelineStage):
         return [
             ComponentUse(
                 stage_name,
-                "vae",
+                self.component_name,
                 target_dtype=vae_dtype,
             )
         ]
@@ -836,7 +857,10 @@ class ImageVAEEncodingStage(PipelineStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+        with self.use_declared_component(
+            component_name=self.component_name,
+            module=self.vae,
+        ) as vae:
             assert vae is not None
             self.vae = vae
 

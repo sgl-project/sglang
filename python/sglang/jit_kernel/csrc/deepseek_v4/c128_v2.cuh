@@ -1,3 +1,16 @@
+/**
+ * \brief Here's some dimension info for the main buffer used in C128 prefill and decode.
+ *
+ * kv_buffer: [num_indices, 128, head_dim * 2]
+ * - last dimension layout: | kv | score |
+ * kv_input: [batch_size, head_dim * 2]
+ * kv_output: [batch_size, head_dim]
+ * score_bias (ape): [128, head_dim]
+ * plan_c/plan_w: [variable length]
+ *
+ * For prefill, batch_size = num_q_tokens
+ */
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -8,7 +21,7 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/deepseek_v4/compress.cuh>
+#include <sgl_kernel/deepseek_v4/compress_v2.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -18,8 +31,9 @@
 
 namespace {
 
-using Plan128 = device::compress::PrefillPlan;
-using IndiceT = int32_t;
+using PlanD = device::compress::DecodePlan;
+using PlanC = device::compress::CompressPlan;
+using PlanW = device::compress::WritePlan;
 
 /// \brief Each thread will handle this many elements (split along head_dim)
 constexpr int32_t kTileElements = 2;
@@ -27,59 +41,30 @@ constexpr int32_t kTileElements = 2;
 constexpr int32_t kElementsPerWarp = 8;
 constexpr uint32_t kNumWarps = 128 / kElementsPerWarp;
 constexpr uint32_t kBlockSize = device::kWarpThreads * kNumWarps;
+constexpr uint32_t kWriteBlockSize = 128;  // one warp per write
 
 /// \brief Need to reduce register usage to increase occupancy
 #define C128_KERNEL __global__ __launch_bounds__(kBlockSize, 2)
+#define WRITE_KERNEL __global__ __launch_bounds__(kWriteBlockSize, 16)
 
 struct Compress128DecodeParams {
-  /**
-   * \brief Shape: `[num_indices, 128, head_dim * 2]` \n
-   * last dimension layout:
-   * | kv current | score current |
-   */
-  void* __restrict__ kv_score_buffer;
-  /** \brief Shape: `[batch_size, head_dim * 2]` */
-  const void* __restrict__ kv_score_input;
-  /** \brief Shape: `[batch_size, head_dim]` */
-  void* __restrict__ kv_compressed_output;
-  /** \brief Shape: `[128, head_dim]` (called `ape`) */
+  void* __restrict__ kv_buffer;
+  const void* __restrict__ kv_input;
+  void* __restrict__ kv_output;
   const void* __restrict__ score_bias;
-  /** \brief Shape: `[batch_size, ]`*/
-  const IndiceT* __restrict__ indices;
-  /** \brief Shape: `[batch_size, ]` */
-  const IndiceT* __restrict__ seq_lens;
-  /** \NOTE: `batch_size` <= `num_indices` */
+  const PlanD* __restrict__ plan_d;
   uint32_t batch_size;
 };
 
 struct Compress128PrefillParams {
-  /**
-   * \brief Shape: `[num_indices, 128, head_dim * 2]` \n
-   * last dimension layout:
-   * | kv current | score current |
-   */
-  void* __restrict__ kv_score_buffer;
-  /** \brief Shape: `[batch_size, head_dim * 2]` */
-  const void* __restrict__ kv_score_input;
-  /** \brief Shape: `[batch_size, head_dim]` */
-  void* __restrict__ kv_compressed_output;
-  /** \brief Shape: `[128, head_dim]` (called `ape`) */
+  void* __restrict__ kv_buffer;
+  const void* __restrict__ kv_input;
+  void* __restrict__ kv_output;
   const void* __restrict__ score_bias;
-  /** \brief Shape: `[batch_size, ]`*/
-  const IndiceT* __restrict__ indices;
-  /** \brief Shape: `[batch_size, ]`*/
-  const int32_t* __restrict__ load_indices;
-  /** \brief The following part is plan info. */
-
-  const Plan128* __restrict__ compress_plan;
-  const Plan128* __restrict__ write_plan;
-
+  const PlanC* __restrict__ plan_c;
+  const PlanW* __restrict__ plan_w;
   uint32_t num_compress;
   uint32_t num_write;
-
-  uint32_t num_q_tokens;
-  uint32_t batch_size;
-  uint32_t num_indices;
 };
 
 struct Compress128SharedBuffer {
@@ -93,46 +78,28 @@ struct Compress128SharedBuffer {
   }
 };
 
-template <typename T>
-SGL_DEVICE void c128_write(
-    T* kv_score_buf,  //
-    const T* kv_score_src,
-    const int64_t head_dim,
-    const int32_t write_pos,
-    const uint32_t lane_id) {
-  using namespace device;
+template <int64_t kHeadDim_>
+struct C128Trait {
+  static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
+  static constexpr int64_t kHeadDim = kHeadDim_;
+  static constexpr int64_t kScoreOffset = kHeadDim;
+  static constexpr int64_t kElementSize = kHeadDim * 2;
+  static constexpr int64_t kPageElementSize = 128 * kElementSize;  // page size = 128
+  static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
+  static_assert(kHeadDim % kTileDim == 0);
+};
 
-  using Storage = AlignedVector<T, kTileElements>;
-  const auto element_size = head_dim * 2;
-  const auto gmem = tile::Memory<Storage>{lane_id, kWarpThreads};
-  kv_score_buf += write_pos * element_size;
-
-  /// NOTE: Layout | [0] = kv | [1] = score |
-  Storage kv_score[2];
-#pragma unroll
-  for (int32_t i = 0; i < 2; ++i) {
-    kv_score[i] = gmem.load(kv_score_src + head_dim * i);
-  }
-#pragma unroll
-  for (int32_t i = 0; i < 2; ++i) {
-    gmem.store(kv_score_buf + head_dim * i, kv_score[i]);
-  }
-}
-
-template <typename InFloat, typename OutFloat>
+template <typename Trait, bool kUsePDL, typename InFloat, typename OutFloat>
 SGL_DEVICE void c128_forward(
-    const InFloat* kv_score_buf,
-    const InFloat* kv_score_src,
+    const InFloat* kv_buf,  // [128n, 128n + 127]
+    const InFloat* kv_src,  // ragged pointer at position = 128n + 127
     OutFloat* kv_out,
     const InFloat* score_bias,
-    const int64_t head_dim,
-    const int32_t window_len,
-    const uint32_t warp_id,
-    const uint32_t lane_id) {
+    const int32_t buffer_len) {
   using namespace device;
 
-  const auto element_size = head_dim * 2;
-  const auto score_offset = head_dim;
+  const auto warp_id = threadIdx.x / kWarpThreads;
+  const auto lane_id = threadIdx.x % kWarpThreads;
 
   /// NOTE: part 1: load kv + score
   using StorageIn = AlignedVector<InFloat, kTileElements>;
@@ -145,23 +112,18 @@ SGL_DEVICE void c128_forward(
 #pragma unroll
   for (int32_t i = 0; i < 8; ++i) {
     const int32_t j = i + warp_offset;
-    bias[i] = gmem_in.load(score_bias + j * head_dim);
+    bias[i] = gmem_in.load(score_bias + j * Trait::kHeadDim);
   }
+
+  const auto kv_start = kv_src - 127 * Trait::kElementSize;  // point to start
 
 #pragma unroll
   for (int32_t i = 0; i < kElementsPerWarp; ++i) {
     const int32_t j = i + warp_offset;
-    const InFloat* src;
     __builtin_assume(j < 128);
-    if (j < window_len) {
-      src = kv_score_buf + j * element_size;
-    } else {
-      /// NOTE: k in [-127, 0]. We'll load from the ragged `kv_score_src`
-      const int32_t k = j - 127;
-      src = kv_score_src + k * element_size;
-    }
-    kv[i] = gmem_in.load(src);
-    score[i] = gmem_in.load(src + score_offset);
+    const auto src = j < buffer_len ? kv_buf : kv_start;
+    kv[i] = gmem_in.load(src + j * Trait::kElementSize);
+    score[i] = gmem_in.load(src + j * Trait::kElementSize + Trait::kScoreOffset);
   }
 
   /// NOTE: part 2: safe online softmax + weighted sum
@@ -174,28 +136,32 @@ SGL_DEVICE void c128_forward(
   TmpStorage tmp_exp_sum;
   TmpStorage tmp_product;
 
+  float score_fp32[kTileElements][kElementsPerWarp];
+
+  // convert to fp32 and apply bias first
 #pragma unroll
   for (int32_t i = 0; i < kTileElements; ++i) {
-    float score_fp32[kElementsPerWarp];
+    for (int32_t j = 0; j < kElementsPerWarp; ++j) {
+      score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
+    }
+  }
 
 #pragma unroll
-    for (int32_t j = 0; j < kElementsPerWarp; ++j) {
-      score_fp32[j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
-    }
-
-    float max_value = score_fp32[0];
+  for (int32_t i = 0; i < kTileElements; ++i) {
+    const auto& score = score_fp32[i];
+    float max_value = score[0];
     float sum_exp_value = 0.0f;
 
 #pragma unroll
     for (int32_t j = 1; j < kElementsPerWarp; ++j) {
-      const auto fp32_score = score_fp32[j];
+      const auto fp32_score = score[j];
       max_value = fmaxf(max_value, fp32_score);
     }
 
     float sum_product = 0.0f;
 #pragma unroll
     for (int32_t j = 0; j < 8; ++j) {
-      const auto fp32_score = score_fp32[j];
+      const auto fp32_score = score[j];
       const auto exp_score = expf(fp32_score - max_value);
       sum_product += cast<float>(kv[j][i]) * exp_score;
       sum_exp_value += exp_score;
@@ -218,6 +184,8 @@ SGL_DEVICE void c128_forward(
   /// each reduce will consume `kNumWarps` threads (use partial warp reduction)
   constexpr uint32_t kReductionCount = kTileElements * kWarpThreads * kNumWarps;
   constexpr uint32_t kIteration = kReductionCount / kBlockSize;
+
+  PDLTriggerSecondary<kUsePDL>();
 
 #pragma unroll
   for (uint32_t i = 0; i < kIteration; ++i) {
@@ -247,293 +215,230 @@ SGL_DEVICE void c128_forward(
   }
 }
 
+template <typename Trait, typename InFloat>
+SGL_DEVICE void c128_write_decode(InFloat* kv_buf, const InFloat* kv_src) {
+  using namespace device;
+
+  using Storage = AlignedVector<InFloat, kTileElements>;
+  const auto gmem = tile::Memory<Storage>::warp();
+
+  Storage data[2];
+#pragma unroll
+  for (int32_t i = 0; i < 2; ++i) {
+    data[i] = gmem.load(kv_src + Trait::kHeadDim * i);
+  }
+#pragma unroll
+  for (int32_t i = 0; i < 2; ++i) {
+    gmem.store(kv_buf + Trait::kHeadDim * i, data[i]);
+  }
+}
+
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_decode(const __grid_constant__ Compress128DecodeParams params) {
   using namespace device;
+  using Trait = C128Trait<kHeadDim>;
 
-  constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
-  constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
-  constexpr int64_t kElementSize = kHeadDim * 2;
-  static_assert(kHeadDim % kTileDim == 0, "Head dim must be multiple of tile dim");
-
-  const auto& [
-    _kv_score_buffer, _kv_score_input, _kv_compressed_output, _score_bias, // kv score
-    indices, seq_lens, batch_size // decode info
-  ] = params;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
-  const uint32_t lane_id = threadIdx.x % kWarpThreads;
+  const uint32_t global_bid = blockIdx.x / Trait::kNumSplit;  // batch id
+  const uint32_t global_sid = blockIdx.x % Trait::kNumSplit;  // split id
+  const int64_t split_offset = global_sid * Trait::kTileDim;
+  if (global_bid >= params.batch_size) return;
 
-  const uint32_t global_bid = blockIdx.x / kNumSplit;  // batch id
-  const uint32_t global_sid = blockIdx.x % kNumSplit;  // split id
-  if (global_bid >= batch_size) return;
+  const auto plan = params.plan_d[global_bid];
+  const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
+  const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
+  const auto kv_buffer = static_cast<InFloat*>(params.kv_buffer) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
 
-  const int32_t index = indices[global_bid];
-  const int32_t seq_len = seq_lens[global_bid];
-  const int64_t split_offset = global_sid * kTileDim;
-
-  // kv score
-  const auto kv_score_buffer = static_cast<InFloat*>(_kv_score_buffer);
-  const auto kv_buf = kv_score_buffer + index * (kElementSize * 128) + split_offset;
-
-  // kv input
-  const auto kv_score_input = static_cast<const InFloat*>(_kv_score_input);
-  const auto kv_src = kv_score_input + global_bid * kElementSize + split_offset;
-
-  // kv output
-  const auto kv_compressed_output = static_cast<OutFloat*>(_kv_compressed_output);
-  const auto kv_out = kv_compressed_output + global_bid * kHeadDim + split_offset;
-
-  // score bias (ape)
-  const auto score_bias = static_cast<const InFloat*>(_score_bias) + split_offset;
+  const auto kv_src = kv_input + global_bid * Trait::kElementSize;
+  const auto kv_out = kv_output + global_bid * Trait::kHeadDim;
+  const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+  const auto kv_dst = kv_buffer + plan.write_loc * Trait::kElementSize;
 
   PDLWaitPrimary<kUsePDL>();
-
-  /// NOTE: the write must be visible to the subsequent c128_forward,
-  /// so only the last warp can write to HBM
-  /// In addition, `position` = `seq_len - 1`. To avoid underflow, we use `seq_len + 127`
+  // the write warp must match the load warp in the following `c128_forward`
   if (warp_id == kNumWarps - 1) {
-    c128_write(kv_buf, kv_src, kHeadDim, /*write_pos=*/(seq_len + 127) % 128, lane_id);
+    c128_write_decode<Trait>(kv_dst, kv_src);
   }
-  if (seq_len % 128 == 0) {
-    c128_forward(kv_buf, kv_src, kv_out, score_bias, kHeadDim, /*window_len=*/128, warp_id, lane_id);
+  if (plan.write_loc % 128 == 127) {
+    c128_forward<Trait, kUsePDL>(kv_buf, kv_src, kv_out, score_bias, 128);
   }
-
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 // compress kernel
-template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kWrite, bool kUsePDL>
+template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
 C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
   using namespace device;
+  using Trait = C128Trait<kHeadDim>;
 
-  constexpr int64_t kTileDim = kTileElements * kWarpThreads;  // 64
-  constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
-  constexpr int64_t kElementSize = kHeadDim * 2;
-  static_assert(kHeadDim % kTileDim == 0, "Head dim must be multiple of tile dim");
+  const uint32_t global_pid = blockIdx.x / Trait::kNumSplit;  // plan id
+  const uint32_t global_sid = blockIdx.x % Trait::kNumSplit;  // split id
+  const int64_t split_offset = global_sid * Trait::kTileDim;
+  if (global_pid >= params.num_compress) return;
 
-  const auto& [
-    _kv_score_buffer, _kv_score_input, _kv_compressed_output, _score_bias, // kv score
-    indices, load_indices, compress_plan, write_plan, num_compress, num_write, // prefill plan
-    _num_q_tokens, _batch_size, _num_indices
-  ] = params;
-  const uint32_t warp_id = threadIdx.x / kWarpThreads;
-  const uint32_t lane_id = threadIdx.x % kWarpThreads;
+  const auto plan = params.plan_c[global_pid];
+  const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
+  const auto kv_output = static_cast<OutFloat*>(params.kv_output) + split_offset;
+  const auto kv_buffer = static_cast<InFloat*>(params.kv_buffer) + split_offset;
+  const auto score_bias = static_cast<const InFloat*>(params.score_bias) + split_offset;
+  if (plan.is_invalid()) return;
 
-  uint32_t global_id;
-  if constexpr (kWrite) {
-    // for write kernel, we use global warp_id to dispatch work
-    global_id = (blockIdx.x * blockDim.x + threadIdx.x) / kWarpThreads;
-  } else {
-    // for compress kernel, we use block id to dispatch work
-    global_id = blockIdx.x;  // block id
-  }
-  const uint32_t global_pid = global_id / kNumSplit;  // plan id
-  const uint32_t global_sid = global_id % kNumSplit;  // split id
+  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  // Compact output: one row per compress plan, indexed by `global_pid`.
+  const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
+  const auto kv_buf = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
+  PDLWaitPrimary<kUsePDL>();
+  c128_forward<Trait, kUsePDL>(kv_buf, kv_src, kv_out, score_bias, plan.buffer_len);
+}
 
-  /// NOTE: compiler can optimize this if-else at compile time
-  const auto num_plans = kWrite ? num_write : num_compress;
-  const auto plan_ptr = kWrite ? write_plan : compress_plan;
-  if (global_pid >= num_plans) return;
+template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
+WRITE_KERNEL void write_c128_prefill(const __grid_constant__ Compress128PrefillParams params) {
+  using namespace device;
+  using Trait = C128Trait<kHeadDim>;
+  using StorageIn = AlignedVector<InFloat, kTileElements>;
 
-  const auto& [ragged_id, global_bid, position, window_len] = plan_ptr[global_pid];
-  const auto indices_ptr = kWrite ? indices : load_indices;
+  const uint32_t global_tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const uint32_t global_wid = global_tid / kWarpThreads;      // warp id
+  const uint32_t global_pid = global_wid / Trait::kNumSplit;  // plan id
+  const uint32_t global_sid = global_wid % Trait::kNumSplit;  // split id
+  // split the contiguous `kHeadDim * 2` into `kNumSplit` tiles
+  // each warp handles 1 contiguous tile (in contrast, decode handle the strided head_dim)
+  const int64_t split_offset = global_sid * (Trait::kTileDim * 2);
+  if (global_pid >= params.num_write) return;
 
-  const int64_t split_offset = global_sid * kTileDim;
+  const auto plan = params.plan_w[global_pid];
+  const auto kv_input = static_cast<const InFloat*>(params.kv_input) + split_offset;
+  const auto kv_buffer = static_cast<InFloat*>(params.kv_buffer) + split_offset;
+  if (plan.is_invalid()) return;
 
-  // kv input
-  const auto kv_score_input = static_cast<const InFloat*>(_kv_score_input);
-  const auto kv_src = kv_score_input + ragged_id * kElementSize + split_offset;
-
-  // kv output
-  const auto kv_compressed_output = static_cast<OutFloat*>(_kv_compressed_output);
-  const auto kv_out = kv_compressed_output + ragged_id * kHeadDim + split_offset;
-
-  // score bias (ape)
-  const auto score_bias = static_cast<const InFloat*>(_score_bias) + split_offset;
-
-  if (ragged_id == 0xFFFFFFFF) [[unlikely]]
-    return;
-
-  if (ragged_id >= _num_q_tokens) [[unlikely]]
-    return;
-  if (global_bid >= _batch_size) [[unlikely]]
-    return;
-
-  const int32_t index = indices_ptr[global_bid];
-
-  if (index < 0 || static_cast<uint32_t>(index) >= _num_indices) [[unlikely]]
-    return;
-
-  // kv score
-  const auto kv_score_buffer = static_cast<InFloat*>(_kv_score_buffer);
-  const auto kv_buf = kv_score_buffer + index * (kElementSize * 128) + split_offset;
+  // each warp will handle a contiguous region
+  const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
+  const auto kv_buf = kv_buffer + plan.write_loc * Trait::kElementSize;
+  const auto gmem = tile::Memory<StorageIn>::warp();
 
   PDLWaitPrimary<kUsePDL>();
-
-  // only responsible for the compress part
-  if constexpr (kWrite) {
-    c128_write(kv_buf, kv_src, kHeadDim, /*write_pos=*/position % 128, lane_id);
-  } else {
-    c128_forward(kv_buf, kv_src, kv_out, score_bias, kHeadDim, window_len, warp_id, lane_id);
+  StorageIn data[2];
+#pragma unroll
+  for (int32_t i = 0; i < 2; ++i) {
+    data[i] = gmem.load(kv_src, i);
   }
-
   PDLTriggerSecondary<kUsePDL>();
+#pragma unroll
+  for (int32_t i = 0; i < 2; ++i) {
+    gmem.store(kv_buf, data[i], i);
+  }
 }
 
 template <int64_t kHeadDim, typename InFloat, typename OutFloat, bool kUsePDL>
 struct FlashCompress128Kernel {
   static constexpr auto decode_kernel = flash_c128_decode<kHeadDim, InFloat, OutFloat, kUsePDL>;
-  template <bool kWrite>
-  static constexpr auto prefill_kernel = flash_c128_prefill<kHeadDim, InFloat, OutFloat, kWrite, kUsePDL>;
-  static constexpr auto prefill_c_kernel = prefill_kernel</*kWrite=*/false>;
-  static constexpr auto prefill_w_kernel = prefill_kernel</*kWrite=*/true>;
+  static constexpr auto prefill_c_kernel = flash_c128_prefill<kHeadDim, InFloat, OutFloat, kUsePDL>;
+  static constexpr auto prefill_w_kernel = write_c128_prefill<kHeadDim, InFloat, OutFloat, kUsePDL>;
   static constexpr int64_t kTileDim = kTileElements * device::kWarpThreads;  // 64
   static constexpr uint32_t kNumSplit = kHeadDim / kTileDim;
-  static constexpr uint32_t kWriteBlockSize = 128;
-  static constexpr uint32_t kWarpsPerWriteBlock = kWriteBlockSize / device::kWarpThreads;
+  using Trait = C128Trait<kHeadDim>;
 
   static void run_decode(
-      const tvm::ffi::TensorView kv_score_buffer,
-      const tvm::ffi::TensorView kv_score_input,
-      const tvm::ffi::TensorView kv_compressed_output,
+      const tvm::ffi::TensorView kv_buffer,
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
-      const tvm::ffi::TensorView indices,
-      const tvm::ffi::TensorView seq_lens,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> /* UNUSED */) {
+      const tvm::ffi::TensorView plan_d_) {
     using namespace host;
 
-    // this should not happen in practice
-    auto B = SymbolicSize{"batch_size"};
-    auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    auto N = SymbolicSize{"batch_size"};
+    auto device_ = SymbolicDevice{};
+    device_.set_options<kDLCUDA>();
 
-    TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
+    TensorMatcher({-1, 128, Trait::kElementSize})  // kv score
         .with_dtype<InFloat>()
-        .with_device(device)
-        .verify(kv_score_buffer);
-    TensorMatcher({B, kHeadDim * 2})  // kv score input
+        .with_device(device_)
+        .verify(kv_buffer);
+    TensorMatcher({N, Trait::kElementSize})  // kv score input
         .with_dtype<InFloat>()
-        .with_device(device)
-        .verify(kv_score_input);
-    TensorMatcher({B, kHeadDim})  // kv compressed output
+        .with_device(device_)
+        .verify(kv_input);
+    TensorMatcher({N, kHeadDim})  // kv compressed output
         .with_dtype<OutFloat>()
-        .with_device(device)
-        .verify(kv_compressed_output);
+        .with_device(device_)
+        .verify(kv_output);
     TensorMatcher({128, kHeadDim})  // ape
         .with_dtype<InFloat>()
-        .with_device(device)
+        .with_device(device_)
         .verify(ape);
-    TensorMatcher({B})  // indices
-        .with_dtype<IndiceT>()
-        .with_device(device)
-        .verify(indices);
-    TensorMatcher({B})  // seq lens
-        .with_dtype<IndiceT>()
-        .with_device(device)
-        .verify(seq_lens);
 
-    const auto batch_size = static_cast<uint32_t>(B.unwrap());
+    const auto plan_d = compress::verify_plan_d(plan_d_, N, device_);
+    const auto batch_size = static_cast<uint32_t>(N.unwrap());
     const auto params = Compress128DecodeParams{
-        .kv_score_buffer = kv_score_buffer.data_ptr(),
-        .kv_score_input = kv_score_input.data_ptr(),
-        .kv_compressed_output = kv_compressed_output.data_ptr(),
+        .kv_buffer = kv_buffer.data_ptr(),
+        .kv_input = kv_input.data_ptr(),
+        .kv_output = kv_output.data_ptr(),
         .score_bias = ape.data_ptr(),
-        .indices = static_cast<const IndiceT*>(indices.data_ptr()),
-        .seq_lens = static_cast<const IndiceT*>(seq_lens.data_ptr()),
+        .plan_d = plan_d,
         .batch_size = batch_size,
     };
-
     const uint32_t num_blocks = batch_size * kNumSplit;
-    LaunchKernel(num_blocks, kBlockSize, device.unwrap())  //
+    LaunchKernel(num_blocks, kBlockSize, device_.unwrap())  //
         .enable_pdl(kUsePDL)(decode_kernel, params);
   }
 
   static void run_prefill(
-      const tvm::ffi::TensorView kv_score_buffer,
-      const tvm::ffi::TensorView kv_score_input,
-      const tvm::ffi::TensorView kv_compressed_output,
+      const tvm::ffi::TensorView kv_buffer,
+      const tvm::ffi::TensorView kv_input,
+      const tvm::ffi::TensorView kv_output,
       const tvm::ffi::TensorView ape,
-      const tvm::ffi::TensorView indices,
-      const tvm::ffi::TensorView compress_plan,
-      const tvm::ffi::TensorView write_plan,
-      const tvm::ffi::Optional<tvm::ffi::TensorView> extra) {
+      const tvm::ffi::TensorView plan_c_,
+      const tvm::ffi::TensorView plan_w_) {
     using namespace host;
 
-    auto B = SymbolicSize{"batch_size"};
     auto N = SymbolicSize{"num_q_tokens"};
-    auto X = SymbolicSize{"compress_tokens"};
-    auto Y = SymbolicSize{"write_tokens"};
-    auto K = SymbolicSize{"num_indices"};
+    auto C = SymbolicSize{"num_c_plans"};
+    auto W = SymbolicSize{"num_w_plans"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({K, 128, kHeadDim * 2})  // kv score
+    TensorMatcher({-1, 128, Trait::kElementSize})  // kv score
         .with_dtype<InFloat>()
         .with_device(device_)
-        .verify(kv_score_buffer);
-    TensorMatcher({N, kHeadDim * 2})  // kv score input
+        .verify(kv_buffer);
+    TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
         .with_dtype<InFloat>()
         .with_device(device_)
-        .verify(kv_score_input);
-    TensorMatcher({N, kHeadDim})  // kv compressed output
+        .verify(kv_input);
+    TensorMatcher({C, kHeadDim})  // kv compressed output (compact)
         .with_dtype<OutFloat>()
         .with_device(device_)
-        .verify(kv_compressed_output);
+        .verify(kv_output);
     TensorMatcher({128, kHeadDim})  // ape
         .with_dtype<InFloat>()
         .with_device(device_)
         .verify(ape);
-    TensorMatcher({B})  // indices
-        .with_dtype<IndiceT>()
-        .with_device(device_)
-        .verify(indices);
-    TensorMatcher({X, compress::kPrefillPlanDim})  // compress plan
-        .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
-        .verify(compress_plan);
-    TensorMatcher({Y, compress::kPrefillPlanDim})  // write plan
-        .with_dtype<compress::PrefillPlanTensorDtype>()
-        .with_device(device_)
-        .verify(write_plan);
 
-    // might be needed for prefill write
-    const auto load_indices = extra.value_or(indices);
-    TensorMatcher({B})  // [read_positions]
-        .with_dtype<IndiceT>()
-        .with_device(device_)
-        .verify(load_indices);
-
+    const auto plan_c = compress::verify_plan_c(plan_c_, C, device_);
+    const auto plan_w = compress::verify_plan_w(plan_w_, W, device_);
     const auto device = device_.unwrap();
-    const auto batch_size = static_cast<uint32_t>(B.unwrap());
     const auto num_q_tokens = static_cast<uint32_t>(N.unwrap());
-    const auto num_c = static_cast<uint32_t>(X.unwrap());
-    const auto num_w = static_cast<uint32_t>(Y.unwrap());
-    const auto num_indices = static_cast<uint32_t>(K.unwrap());
+    const auto num_c = static_cast<uint32_t>(C.unwrap());
+    const auto num_w = static_cast<uint32_t>(W.unwrap());
     const auto params = Compress128PrefillParams{
-        .kv_score_buffer = kv_score_buffer.data_ptr(),
-        .kv_score_input = kv_score_input.data_ptr(),
-        .kv_compressed_output = kv_compressed_output.data_ptr(),
+        .kv_buffer = kv_buffer.data_ptr(),
+        .kv_input = kv_input.data_ptr(),
+        .kv_output = kv_output.data_ptr(),
         .score_bias = ape.data_ptr(),
-        .indices = static_cast<const IndiceT*>(indices.data_ptr()),
-        .load_indices = static_cast<const IndiceT*>(load_indices.data_ptr()),
-        .compress_plan = static_cast<const Plan128*>(compress_plan.data_ptr()),
-        .write_plan = static_cast<const Plan128*>(write_plan.data_ptr()),
+        .plan_c = plan_c,
+        .plan_w = plan_w,
         .num_compress = num_c,
         .num_write = num_w,
-        .num_q_tokens = num_q_tokens,
-        .batch_size = batch_size,
-        .num_indices = num_indices,
     };
-    RuntimeCheck(num_q_tokens >= batch_size, "num_q_tokens must be >= batch_size");
-    RuntimeCheck(num_q_tokens >= std::max(num_c, num_w), "invalid prefill plan");
-
-    constexpr auto kBlockSize_C = kBlockSize;
-    constexpr auto kBlockSize_W = kWriteBlockSize;
+    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = num_c * kNumSplit) {
+      constexpr auto kBlockSize_C = kBlockSize;
       LaunchKernel(num_c_blocks, kBlockSize_C, device)  //
           .enable_pdl(kUsePDL)(prefill_c_kernel, params);
     }
+    constexpr uint32_t kWarpsPerWriteBlock = kWriteBlockSize / device::kWarpThreads;
     if (const auto num_w_blocks = div_ceil(num_w * kNumSplit, kWarpsPerWriteBlock)) {
+      constexpr auto kBlockSize_W = kWriteBlockSize;
       LaunchKernel(num_w_blocks, kBlockSize_W, device)  //
           .enable_pdl(kUsePDL)(prefill_w_kernel, params);
     }

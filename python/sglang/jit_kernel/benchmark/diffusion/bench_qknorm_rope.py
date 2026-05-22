@@ -13,7 +13,7 @@ from sglang.jit_kernel.benchmark.utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=13, suite="stage-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=13, suite="base-b-kernel-benchmark-1-gpu-large")
 
 MAX_SEQ_LEN = 131072
 ROPE_BASE = 10000.0
