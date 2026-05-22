@@ -1,5 +1,5 @@
 #!/bin/bash
-# flashmla backend + full CUDA graph (DSV3 mini MLA model).
+# flashmla backend + full CUDA graph (DSV3 NVFP4 MLA model).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/_common.sh"
 step03_preamble
 
 TEST_NAME="flashmla_cudagraph"
-MODEL_PATH="${MODEL_PATH:-lmsys/sglang-ci-dsv3-test}"
+MODEL_PATH="${MODEL_PATH:-/mnt/vast/models/dsv3-nvfp4}"
 
 LAUNCH_ARGS=(
     --attention-backend flashmla
@@ -15,7 +15,7 @@ LAUNCH_ARGS=(
     --cuda-graph-max-bs 4
     --max-running-requests 4
     --disable-piecewise-cuda-graph
-    --tp-size 1
+    --tp-size 4
 )
 
 run_server_smoke

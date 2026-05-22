@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/_common.sh"
 step03_preamble
 
 TEST_NAME="cutlass_mla_cudagraph"
-MODEL_PATH="${MODEL_PATH:-lmsys/sglang-ci-dsv3-test}"
+MODEL_PATH="${MODEL_PATH:-/mnt/vast/models/dsv3-nvfp4}"
 
 LAUNCH_ARGS=(
     --attention-backend cutlass_mla
@@ -15,7 +15,7 @@ LAUNCH_ARGS=(
     --cuda-graph-max-bs 4
     --max-running-requests 4
     --disable-piecewise-cuda-graph
-    --tp-size 1
+    --tp-size 4
 )
 
 run_server_smoke

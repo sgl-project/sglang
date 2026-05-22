@@ -1,6 +1,8 @@
 #!/bin/bash
-# fa3 + EAGLE3 (multi-layer draft) + CUDA graph.
-# Uses Llama-3.1-8B target + sglang EAGLE3 draft.
+# triton + EAGLE3 (multi-layer draft) + CUDA graph.
+# Uses Llama-3.1-8B target + sglang EAGLE3 draft. fa3 would be ideal
+# here but the cluster GPUs are Blackwell (SM>=10) — triton is the
+# next-best portable choice for the smoke.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,8 +12,16 @@ step03_preamble
 TEST_NAME="fa3_eagle3"
 MODEL_PATH="${MODEL_PATH:-meta-llama/Llama-3.1-8B-Instruct}"
 
+# On Blackwell pick triton; on Hopper use fa3.
+SM_VERSION=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || echo "unknown")
+if [[ "$SM_VERSION" == "10.0" || "$SM_VERSION" == "10.3" || "$SM_VERSION" == "12.0" ]]; then
+    BACKEND="triton"
+else
+    BACKEND="fa3"
+fi
+
 LAUNCH_ARGS=(
-    --attention-backend fa3
+    --attention-backend "$BACKEND"
     --speculative-algorithm EAGLE3
     --speculative-draft-model-path lmsys/sglang-EAGLE3-LLaMA3.1-Instruct-8B
     --speculative-num-steps 5
@@ -24,4 +34,5 @@ LAUNCH_ARGS=(
     --tp-size 1
 )
 
+READY_TIMEOUT=2400
 run_server_smoke

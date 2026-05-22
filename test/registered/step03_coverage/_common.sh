@@ -21,11 +21,13 @@ step03_preamble() {
 
     export SGLANG_JIT_DEEPGEMM_PRECOMPILE=False
     export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
-    export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}
 
-    # Make HF cache resolve to the cluster cache if mounted at /root/.cache.
+    # Force offline HF resolution: many test models (Llama-3.1 etc.) are
+    # gated and re-validate even when present in the cache. The cluster
+    # cache is mounted at /root/.cache; tell HF to use only that.
+    export HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-1}
+    export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-1}
     export HF_HOME=${HF_HOME:-/root/.cache/huggingface}
-    export TRANSFORMERS_OFFLINE=${TRANSFORMERS_OFFLINE:-0}
 }
 
 # Wait for server to print readiness banner; returns 0 on success, 1 on timeout / crash.
