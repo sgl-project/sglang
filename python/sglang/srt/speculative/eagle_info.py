@@ -695,7 +695,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # V2 overlap worker only
     future_indices: Optional[FutureIndices] = None
-    new_seq_lens: Optional[torch.Tensor] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
@@ -742,7 +741,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
             capture_hidden_mode=capture_hidden_mode,
-            new_seq_lens=torch.empty((0,), device=device, dtype=torch.int32),
         )
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):

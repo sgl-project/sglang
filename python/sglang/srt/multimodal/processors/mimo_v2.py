@@ -2107,7 +2107,7 @@ class MiMoV2Processor(BaseMultimodalProcessor):
             input_text = f"{self.mm_tokens.audio_token}{input_text}"
 
         video_data = getattr(request_obj, "video_data", [])
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=video_data,
