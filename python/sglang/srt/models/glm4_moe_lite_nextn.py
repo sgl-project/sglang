@@ -1,4 +1,4 @@
-# Copyright 2025-2026 SGLang Team
+# Copyright 2026-2027 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.7-Flash (MLA) Speculative Decoding (MTP / NextN)."""
+"""Inference-only GLM-4.7-Flash Speculative Decoding (NextN) compatible with HuggingFace weights."""
 
 import logging
 from typing import Iterable, Optional, Tuple
