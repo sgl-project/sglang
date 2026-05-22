@@ -61,6 +61,7 @@ def log_hicache_debug(msg: str, *args, **kwargs) -> None:
     if hicache_debug_enabled():
         logger.debug(msg, *args, **kwargs)
 
+
 # Snapshot of HiRadixCache.evictable_host_leaves cardinality when calling EvictKVPath
 # (`cache_controller.evict_host`). Other callers leave this unset (default None).
 _radix_evictable_host_leaves: contextvars.ContextVar[Optional[int]] = (

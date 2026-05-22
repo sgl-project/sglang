@@ -3564,7 +3564,7 @@ class ServerArgs:
 
         self.hicache_mem_layout = new_layout
         logger.warning(
-            f"Mooncake/Ascend Memcache storage backend does not support layer_first layout, " 
+            f"Mooncake/Ascend Memcache storage backend does not support layer_first layout, "
             f"switching to {new_layout} layout for {self.hicache_io_backend} io backend"
         )
 

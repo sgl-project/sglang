@@ -18,10 +18,10 @@ from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
 )
 from sglang.srt.managers.cache_controller import (
-    log_hicache_debug,
+    StorageOperation as BaseStorageOperation,
 )
 from sglang.srt.managers.cache_controller import (
-    StorageOperation as BaseStorageOperation,
+    log_hicache_debug,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,

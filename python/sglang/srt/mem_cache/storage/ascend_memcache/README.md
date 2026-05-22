@@ -13,7 +13,7 @@ Related documentation:
 
 ## About MemCache
 
-MemCache is a distributed cache system from Ascend, built on MemFabric underneath, and can provide a high-performance distributed memory pool.  
+MemCache is a distributed cache system from Ascend, built on MemFabric underneath, and can provide a high-performance distributed memory pool.
 In SGLang HiCache, MemCache can be used as the L3 KV Cache backend to store and reuse KV cache.
 
 
@@ -75,7 +75,7 @@ For build parameters, refer to [this document](https://gitcode.com/Ascend/memfab
 bash script/build_and_pack_run.sh
 ```
 
-The package will be saved at `output/memfabric-hybrid-${version}_${os}_${arch}.run`.  
+The package will be saved at `output/memfabric-hybrid-${version}_${os}_${arch}.run`.
 
 Run:
 ```bash
@@ -159,5 +159,5 @@ python -m sglang.launch_server \
   --attention-backend ascend \
   --enable-hierarchical-cache \
   --hicache-storage-backend ascend_memcache \
-  --hicache-mem-layout page_first_kv_split 
+  --hicache-mem-layout page_first_kv_split
 ```

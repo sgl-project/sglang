@@ -73,7 +73,9 @@ class AscendMemcacheConfig:
                     merged.update(json.load(fin))
                 logger.info("Memcache configuration loaded from %s", path)
             except Exception as exc:
-                logger.warning("Failed to load memcache configuration from %s: %s", path, exc)
+                logger.warning(
+                    "Failed to load memcache configuration from %s: %s", path, exc
+                )
 
         extra = getattr(storage_config, "extra_config", None) or {}
         merged.update(extra)
@@ -180,7 +182,9 @@ class AscendMemcacheStore(HiCacheStorage):
             local_cfg = LocalConfig()
             unknown_fields = config.apply_to_local_config(local_cfg)
             if unknown_fields:
-                logger.warning("Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields)
+                logger.warning(
+                    "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
+                )
 
             self.store = DistributedObjectStore()
             if self.store.setup(local_cfg) != 0:
@@ -229,7 +233,9 @@ class AscendMemcacheStore(HiCacheStorage):
             logger.error("Ascend Memcache store initialization failed: %s", exc)
             raise
 
-    def _init_runtime_fields(self, storage_config: Optional[HiCacheStorageConfig]) -> None:
+    def _init_runtime_fields(
+        self, storage_config: Optional[HiCacheStorageConfig]
+    ) -> None:
         self.enable_storage_metrics = False
         if storage_config is not None:
             self.is_mla_backend = storage_config.is_mla_model
@@ -265,7 +271,8 @@ class AscendMemcacheStore(HiCacheStorage):
             target_ranks = [base_rank + i for i in range(self.split_factor)]
             if self.enable_pp or self.enable_cp:
                 self.mha_suffix = [
-                    f"{rank}_{self.pp_rank}_{self.attn_cp_rank}" for rank in target_ranks
+                    f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
+                    for rank in target_ranks
                 ]
             else:
                 self.mha_suffix = [f"{rank}" for rank in target_ranks]
@@ -285,7 +292,9 @@ class AscendMemcacheStore(HiCacheStorage):
         self.trace_batch_exists_max_hit = (
             envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_EXISTS_MAX_HIT.get()
         )
-        self.trace_batch_put_keys = envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS.get()
+        self.trace_batch_put_keys = (
+            envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_KEYS.get()
+        )
         self.trace_batch_put_post_exist = (
             envs.SGLANG_ASCEND_MEMCACHE_TRACE_BATCH_PUT_POST_EXIST.get()
         )
@@ -324,7 +333,9 @@ class AscendMemcacheStore(HiCacheStorage):
             return list(values)
         return list(values[: self.trace_max_keys])
 
-    def _split_component_keys(self, keys: List[str]) -> Tuple[List[str], List[str], List[str]]:
+    def _split_component_keys(
+        self, keys: List[str]
+    ) -> Tuple[List[str], List[str], List[str]]:
         k_keys: List[str] = []
         v_keys: List[str] = []
         other_keys: List[str] = []
@@ -351,7 +362,9 @@ class AscendMemcacheStore(HiCacheStorage):
         try:
             os.makedirs(os.path.dirname(self.trace_log_path), exist_ok=True)
             with open(self.trace_log_path, "a", encoding="utf-8") as fout:
-                fout.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {payload}\n")
+                fout.write(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {payload}\n"
+                )
         except Exception as exc:
             logger.warning("Failed to append Ascend memcache trace file: %s", exc)
 
@@ -439,9 +452,7 @@ class AscendMemcacheStore(HiCacheStorage):
                     self.register_buffer(self.mem_pool_host.index_k_buffer)
         except TypeError as err:
             logger.error("Failed to register buffer to Ascend Memcache Store: %s", err)
-            raise TypeError(
-                "Ascend Memcache Store Register Buffer Error."
-            ) from err
+            raise TypeError("Ascend Memcache Store Register Buffer Error.") from err
 
         if envs.SGLANG_ASCEND_MEMCACHE_ENABLE_WARMUP.get():
             self.warmup()
@@ -683,8 +694,10 @@ class AscendMemcacheStore(HiCacheStorage):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = self.mem_pool_host.get_split_heads_page_buffer_meta(
-            indices, self.split_factor
+        ptr_list, element_size_list = (
+            self.mem_pool_host.get_split_heads_page_buffer_meta(
+                indices, self.split_factor
+            )
         )
         key_list = []
         for key_ in keys:
@@ -811,7 +824,9 @@ class AscendMemcacheStore(HiCacheStorage):
                 "total_page_keys": len(page_keys),
                 "total_component_keys": len(key_strs),
             }
-            payload.update(self._kv_component_trace_fields(page_keys, "batch_put_input_page"))
+            payload.update(
+                self._kv_component_trace_fields(page_keys, "batch_put_input_page")
+            )
             payload.update(
                 self._kv_component_trace_fields(key_strs, "batch_put_input_component")
             )
@@ -872,9 +887,7 @@ class AscendMemcacheStore(HiCacheStorage):
                         "total_component_keys": len(set_keys),
                         "put_ok_keys": sum(1 for r in put_results if int(r) == 0),
                         "post_exist_keys": sum(1 for r in post_exist if int(r) == 1),
-                        "post_missing_keys": sum(
-                            1 for r in post_exist if int(r) != 1
-                        ),
+                        "post_missing_keys": sum(1 for r in post_exist if int(r) != 1),
                         "raw_put_results": self._clip_trace_list(
                             [int(x) for x in put_results]
                         ),
@@ -1089,9 +1102,13 @@ class AscendMemcacheStore(HiCacheStorage):
             "sample_keys": self._sample_keys(query_keys),
         }
         if self.trace_batch_exists_keys:
-            payload.update(self._kv_component_trace_fields(page_keys, "batch_exists_input_page"))
             payload.update(
-                self._kv_component_trace_fields(query_keys, "batch_exists_input_component")
+                self._kv_component_trace_fields(page_keys, "batch_exists_input_page")
+            )
+            payload.update(
+                self._kv_component_trace_fields(
+                    query_keys, "batch_exists_input_component"
+                )
             )
         if self.trace_batch_exists_max_hit:
             payload["max_contiguous_hit_pages"] = longest_hit_pages

@@ -874,9 +874,7 @@ class HiRadixCache(RadixCache):
             f"in_evictable_host_leaves={node in self.evictable_host_leaves}"
         )
 
-    def _host_leaf_children_trace(
-        self, node: TreeNode, max_children: int = 16
-    ) -> str:
+    def _host_leaf_children_trace(self, node: TreeNode, max_children: int = 16) -> str:
         if not node.children:
             return "children=[]"
         parts: List[str] = []
@@ -933,10 +931,14 @@ class HiRadixCache(RadixCache):
                 if c.backuped and not c.evicted
             )
             hot_display = str(hot_cnt)
-            diag_note = "root_children_hot_backuped_count_only_when_evictable_host_leaves_empty"
+            diag_note = (
+                "root_children_hot_backuped_count_only_when_evictable_host_leaves_empty"
+            )
         else:
             hot_display = "n/a"
-            diag_note = "skip_root_children_hot_backuped_count_evictable_host_leaves_nonempty"
+            diag_note = (
+                "skip_root_children_hot_backuped_count_evictable_host_leaves_nonempty"
+            )
         logger.debug(
             "[HiCachePrefetchAbortDebug] phase=%s req_id=%s evict_host_attempted=%s "
             "evictable_host_leaves=%s root_children_total=%s root_children_backuped_T_evicted_F=%s diag=%s",
@@ -986,9 +988,7 @@ class HiRadixCache(RadixCache):
                 )
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
-                    mutation = (
-                        "removed_from_evictable_host_leaves_child_still_backuped_under_subtree"
-                    )
+                    mutation = "removed_from_evictable_host_leaves_child_still_backuped_under_subtree"
                 else:
                     mutation = "cannot_enter_while_backuped_children_remain"
                 self._trace_host_leaf_node(
@@ -1216,9 +1216,7 @@ class HiRadixCache(RadixCache):
                     "removed_from_evictable_host_leaves_explicit_after_detach_from_tree"
                 )
             else:
-                leaf_mut = (
-                    "unexpected_missing_from_evictable_host_leaves_during_explicit_evict_host"
-                )
+                leaf_mut = "unexpected_missing_from_evictable_host_leaves_during_explicit_evict_host"
             self._trace_host_leaf_node(
                 caller="evict_host",
                 phase="detached_radix_leaf_after_controller_free",
@@ -1232,9 +1230,7 @@ class HiRadixCache(RadixCache):
                 phase="after_parent_host_leaf_refresh",
                 node=x.parent,
                 mutation="observe",
-                reason=(
-                    "may_promote_parent_if_no_backuped_children_remain_in_subtree"
-                ),
+                reason=("may_promote_parent_if_no_backuped_children_remain_in_subtree"),
             )
 
             if len(x.parent.children) == 0 and x.parent.evicted:
@@ -1494,9 +1490,7 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(
-            "Prefetch %s completed with %s tokens", req_id, completed_tokens
-        )
+        logger.debug("Prefetch %s completed with %s tokens", req_id, completed_tokens)
 
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
@@ -1651,9 +1645,7 @@ class HiRadixCache(RadixCache):
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
             available_size = self.cache_controller.mem_pool_host.available_size()
-            reduced_prefetch_length = available_size - (
-                available_size % self.page_size
-            )
+            reduced_prefetch_length = available_size - (available_size % self.page_size)
             if reduced_prefetch_length >= self.prefetch_threshold:
                 log_hicache_debug(
                     "[HiCachePrefetchHostMem] prefetch_retry_with_reduced_length req_id=%s "
