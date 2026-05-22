@@ -22,7 +22,6 @@ from sglang.srt.true_on_policy import (
     is_true_on_policy_enabled,
     override_true_on_policy_runtime_policy_enabled,
     patch_prefill_only_deterministic_attention_backend,
-    patch_prefill_only_deterministic_inference_for_cuda_graph,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
     should_disable_fused_qk_norm_mrope,
@@ -118,7 +117,6 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
             json.dumps(
                 {
                     "enable_deterministic_inference": server_args.enable_deterministic_inference,
-                    "enable_prefill_only_deterministic_inference": server_args.enable_prefill_only_deterministic_inference,
                     "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
                     "true_on_policy_contract": server_args.true_on_policy_contract,
                     "sampling_backend": server_args.sampling_backend,
@@ -145,20 +143,6 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
 
 
 class TestOnPolicyServerArgs(unittest.TestCase):
-    def test_cli_parses_prefill_only_deterministic_flag(self):
-        result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--enable-prefill-only-deterministic-inference",
-            ]
-        )
-
-        self.assertTrue(result["enable_prefill_only_deterministic_inference"])
-        self.assertFalse(result["enable_deterministic_inference"])
-
     def test_cli_accepts_explicit_true_on_policy_contract(self):
         result = _run_server_args_script(
             [
@@ -176,25 +160,6 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
         self.assertTrue(result["enable_deterministic_inference"])
 
-    def test_prefill_only_contract_does_not_force_decode_deterministic(self):
-        result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--true-on-policy-contract",
-                QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                "--enable-prefill-only-deterministic-inference",
-            ]
-        )
-
-        self.assertEqual(
-            result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
-        )
-        self.assertTrue(result["enable_prefill_only_deterministic_inference"])
-        self.assertFalse(result["enable_deterministic_inference"])
-
     def test_contract_tp_rollout_disables_flashinfer_allreduce_fusion(self):
         result = _run_server_args_script(
             [
@@ -210,24 +175,6 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             ]
         )
         self.assertFalse(result["enable_flashinfer_allreduce_fusion"])
-
-    def test_prefill_only_contract_keeps_flashinfer_fusion_for_decode(self):
-        result = _run_server_args_script(
-            [
-                "--model-path",
-                "dummy",
-                "--attention-backend",
-                "triton",
-                "--tensor-parallel-size",
-                "2",
-                "--true-on-policy-contract",
-                QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                "--enable-prefill-only-deterministic-inference",
-                "--enable-flashinfer-allreduce-fusion",
-            ]
-        )
-        self.assertTrue(result["enable_flashinfer_allreduce_fusion"])
-
 
 class TestDefaultPathUnchanged(unittest.TestCase):
     """Default serving must not enter true-on-policy policy paths."""
@@ -278,7 +225,6 @@ class TestDefaultPathUnchanged(unittest.TestCase):
             ["--model-path", "dummy", "--attention-backend", "triton"]
         )
         self.assertFalse(result["enable_deterministic_inference"])
-        self.assertFalse(result["enable_prefill_only_deterministic_inference"])
 
 
 class TestOnPolicyHelpers(unittest.TestCase):
@@ -363,33 +309,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
             self.assertFalse(is_true_on_policy_enabled(server_args))
             self.assertFalse(should_use_deterministic_moe_routing(server_args))
 
-        self.assertTrue(is_true_on_policy_enabled(server_args))
-        self.assertTrue(should_use_deterministic_moe_routing(server_args))
-
-    def test_prefill_only_cuda_graph_patch_disables_contract_runtime_policy(self):
-        server_args = self._moe_contract_args(tp_size=4, ep_size=4)
-        server_args.enable_prefill_only_deterministic_inference = True
-        attn_backend = SimpleNamespace(num_splits=7)
-
-        self.assertTrue(is_true_on_policy_enabled(server_args))
-        self.assertTrue(
-            should_use_tp_invariant_row_linear(256, server_args=server_args)
-        )
-        self.assertTrue(should_use_deterministic_moe_routing(server_args))
-
-        with patch_prefill_only_deterministic_inference_for_cuda_graph(
-            server_args,
-            attn_backend=attn_backend,
-        ) as patched:
-            self.assertTrue(patched)
-            self.assertEqual(attn_backend.num_splits, 0)
-            self.assertFalse(is_true_on_policy_enabled(server_args))
-            self.assertFalse(
-                should_use_tp_invariant_row_linear(256, server_args=server_args)
-            )
-            self.assertFalse(should_use_deterministic_moe_routing(server_args))
-
-        self.assertEqual(attn_backend.num_splits, 7)
         self.assertTrue(is_true_on_policy_enabled(server_args))
         self.assertTrue(should_use_deterministic_moe_routing(server_args))
 
@@ -898,71 +817,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertEqual(output.dtype, torch.float32)
         self.assertEqual(output_residual.dtype, torch.float32)
 
-    def test_prefill_only_cuda_graph_patch_only_scopes_attention_splits(self):
-        server_args = SimpleNamespace(
-            enable_prefill_only_deterministic_inference=True,
-            enable_deterministic_inference=True,
-            enable_flashinfer_allreduce_fusion=False,
-            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            disable_custom_all_reduce=True,
-        )
-        global_server_args = SimpleNamespace(
-            enable_prefill_only_deterministic_inference=True,
-            enable_deterministic_inference=True,
-            enable_flashinfer_allreduce_fusion=False,
-            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            disable_custom_all_reduce=True,
-        )
-        attn_backend = SimpleNamespace(num_splits=1)
-
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_ENABLE_DETERMINISTIC_INFERENCE": "1",
-                "SGLANG_DISABLE_CUSTOM_ALL_REDUCE": "1",
-                "NCCL_ALGO": "allreduce:tree",
-            },
-            clear=False,
-        ):
-            with patch_prefill_only_deterministic_inference_for_cuda_graph(
-                server_args,
-                attn_backend=attn_backend,
-                global_server_args=global_server_args,
-            ) as patched:
-                self.assertTrue(patched)
-                self.assertTrue(server_args.enable_deterministic_inference)
-                self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
-                self.assertEqual(
-                    server_args.true_on_policy_contract,
-                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                )
-                self.assertEqual(
-                    global_server_args.true_on_policy_contract,
-                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
-                )
-                self.assertEqual(attn_backend.num_splits, 0)
-                self.assertEqual(
-                    os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1"
-                )
-                self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "1")
-                self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
-
-            self.assertTrue(server_args.enable_deterministic_inference)
-            self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
-            self.assertEqual(
-                server_args.true_on_policy_contract,
-                QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            )
-            self.assertEqual(
-                global_server_args.true_on_policy_contract,
-                QWEN3_DENSE_TRUE_ON_POLICY_V1,
-            )
-            self.assertTrue(server_args.disable_custom_all_reduce)
-            self.assertEqual(attn_backend.num_splits, 1)
-            self.assertEqual(os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1")
-            self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "1")
-            self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
-
     def test_row_linear_k_alignment_edge_cases(self):
         server_args = self._contract_args(tp_size=2)
 
@@ -1046,31 +900,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         )
 
-    def test_cuda_graph_patch_noop_when_disabled(self):
-        server_args = SimpleNamespace(
-            enable_prefill_only_deterministic_inference=False,
-            enable_deterministic_inference=True,
-        )
-        with patch_prefill_only_deterministic_inference_for_cuda_graph(
-            server_args,
-        ) as patched:
-            self.assertFalse(patched)
-            self.assertTrue(server_args.enable_deterministic_inference)
-
-    def test_cuda_graph_patch_noop_when_dvr_verify(self):
-        server_args = SimpleNamespace(
-            enable_prefill_only_deterministic_inference=True,
-            enable_deterministic_inference=True,
-            enable_flashinfer_allreduce_fusion=False,
-            disable_custom_all_reduce=True,
-        )
-        with patch_prefill_only_deterministic_inference_for_cuda_graph(
-            server_args,
-            dvr_target_verify_cuda_graph=True,
-        ) as patched:
-            self.assertFalse(patched)
-            self.assertTrue(server_args.enable_deterministic_inference)
-
     def test_tp_invariant_ops_import_is_available(self):
         import sglang.srt.tp_invariant_ops as tp_invariant_ops
 
@@ -1083,10 +912,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertIs(
             legacy.should_use_tp_invariant_row_linear,
             true_on_policy.should_use_tp_invariant_row_linear,
-        )
-        self.assertIs(
-            legacy.patch_prefill_only_deterministic_inference_for_cuda_graph,
-            true_on_policy.patch_prefill_only_deterministic_inference_for_cuda_graph,
         )
         self.assertTrue(hasattr(torch.ops, "tp_inv_ops"))
 

@@ -35,10 +35,6 @@ def _get_server_args(server_args: Optional[Any] = None) -> Any:
     return get_global_server_args()
 
 
-def get_rl_on_policy_target() -> Optional[str]:
-    return getattr(_get_server_args(), "rl_on_policy_target", None)
-
-
 def is_true_on_policy_enabled(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(_get_server_args(server_args)).enabled
 
@@ -281,33 +277,3 @@ def DeterministicInferenceScope(
             disable_batch_invariant_mode()
         if enabled_tp_invariant_here:
             disable_tp_invariant_mode()
-
-@contextlib.contextmanager
-def patch_prefill_only_deterministic_inference_for_cuda_graph(
-    server_args: Any,
-    *,
-    attn_backend: Optional[Any] = None,
-    global_server_args: Optional[Any] = None,
-    dvr_target_verify_cuda_graph: bool = False,
-) -> Iterator[bool]:
-    enabled = (
-        getattr(server_args, "enable_prefill_only_deterministic_inference", False)
-        and not dvr_target_verify_cuda_graph
-    )
-    if not enabled:
-        yield False
-        return
-
-    saved_num_splits = None
-    if attn_backend is not None and hasattr(attn_backend, "num_splits"):
-        saved_num_splits = attn_backend.num_splits
-
-    try:
-        if attn_backend is not None and hasattr(attn_backend, "num_splits"):
-            attn_backend.num_splits = 0
-
-        with override_true_on_policy_runtime_policy_enabled(False):
-            yield True
-    finally:
-        if attn_backend is not None and hasattr(attn_backend, "num_splits"):
-            attn_backend.num_splits = saved_num_splits

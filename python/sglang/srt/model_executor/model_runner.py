@@ -68,7 +68,6 @@ from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.debug_utils.weight_audit import write_weight_audit
 from sglang.srt.distributed import (
     get_default_distributed_backend,
     get_pp_group,
@@ -757,7 +756,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-        if is_tp_invariant_target():
+        if is_tp_invariant_target(server_args):
             from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
 
             enable_tp_invariant_mode()
@@ -2192,22 +2191,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
-        write_weight_audit(
-            self.model,
-            stage="pre_load",
-            weight_version=weight_version,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
-        )
         self.model.load_weights(reconstructed_tensors)
-        write_weight_audit(
-            self.model,
-            stage="post_load",
-            weight_version=weight_version,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
-            extra_tensors=reconstructed_tensors,
-        )
 
         return True, "Success"
 
@@ -3760,13 +3744,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
 
-        write_weight_audit(
-            self.model,
-            stage="post_process",
-            weight_version=self.server_args.weight_version,
-            tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
-        )
         return True, "Success"
 
 
