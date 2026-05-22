@@ -776,20 +776,21 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        import types
-
-        self.init_forward_data_out_graph(
-            types.SimpleNamespace(
-                batch_size=bs,
-                req_pool_indices=req_pool_indices,
-                seq_lens=seq_lens,
-                encoder_lens=encoder_lens,
-                forward_mode=forward_mode,
-                spec_info=spec_info,
-                seq_lens_sum=seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=req_pool_indices.new_empty(bs),
-            )
+        # Call _replay_metadata directly (do NOT go through _out_graph).
+        # _out_graph uses `seq_lens_cpu is None` as the capture sentinel; if the
+        # caller passes seq_lens_cpu=None at replay time (e.g. when the runner
+        # does not allocate seq_lens_cpu), the sentinel would misfire and call
+        # _capture_metadata, creating new GPU tensors that replace the captured
+        # ones — the CUDA graph then reads from GC'd addresses → wrong outputs.
+        metadata = self._replay_metadata(
+            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
+        )
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
+        self.forward_metadata = Mamba2Metadata.prepare_decode(
+            metadata,
+            seq_lens,
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def forward(
