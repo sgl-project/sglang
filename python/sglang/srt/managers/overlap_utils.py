@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -13,6 +14,22 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
+# Token-buf consume tracking: init to -1, assert non-negative on gather,
+# write -1 back. Catches "gather without intermediate stash" bugs. CI enables
+# via the existing SGLANG_IS_IN_CI; off in production.
+_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
+
+
+@torch.compile(dynamic=True)
+def _assert_nonneg_and_invalidate(
+    values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
+    Compiled so the reduction + assert + scatter run as one kernel launch."""
+    torch._assert_async((values >= 0).all())
+    buf[indices] = -1
+
+
 def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
     """Materialize input_ids at forward entry. Prefill H2D from pinned CPU
     staging; decode gather from future_map.output_tokens_buf. Spec_v2 sets
@@ -22,6 +39,12 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         prefill_dev = batch.prefill_input_ids_cpu.to(batch.device, non_blocking=True)
         if batch.mix_running_indices is not None:
             decode_dev = future_map.output_tokens_buf[batch.mix_running_indices]
+            if _DEBUG_ASSERT:
+                _assert_nonneg_and_invalidate(
+                    decode_dev,
+                    future_map.output_tokens_buf,
+                    batch.mix_running_indices,
+                )
             batch.input_ids = torch.cat([prefill_dev, decode_dev])
         else:
             batch.input_ids = prefill_dev
@@ -29,6 +52,10 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
         batch.mix_running_indices = None
     elif batch.input_ids is None and future_map.spec_algo.is_none():
         batch.input_ids = future_map.output_tokens_buf[batch.req_pool_indices]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                batch.input_ids, future_map.output_tokens_buf, batch.req_pool_indices
+            )
 
     # spec_v1 (non-overlap spec) doesn't relay extras; only spec_v2 does.
     if batch.is_spec_v2:
@@ -52,8 +79,12 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        self.output_tokens_buf = (
+            torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)
+            if _DEBUG_ASSERT
+            else torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
         )
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
@@ -98,6 +129,10 @@ class FutureMap:
         draft_input.topk_p = self.topk_p_buf[indices]
         draft_input.topk_index = self.topk_index_buf[indices]
         draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if _DEBUG_ASSERT:
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
