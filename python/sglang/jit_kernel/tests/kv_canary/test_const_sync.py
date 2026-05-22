@@ -11,7 +11,7 @@ register_cuda_ci(est_time=30, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 _CONSTS_CUH: Path = (
-    Path(__file__).resolve().parents[1] / "csrc" / "kv_canary" / "consts.cuh"
+    Path(__file__).resolve().parents[2] / "csrc" / "kv_canary" / "consts.cuh"
 )
 
 
