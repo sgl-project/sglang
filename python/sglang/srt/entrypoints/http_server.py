@@ -19,11 +19,15 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import errno
 import logging
 import os
+import socket
+import stat
 import tempfile
 import threading
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from http import HTTPStatus
 from typing import (
@@ -2160,17 +2164,38 @@ def _format_listen_addr(server_args: ServerArgs) -> str:
 
 
 def _prepare_uds_path(path: str) -> None:
-    """Make `path` safe to bind() against.
+    """Make ``path`` safe to ``bind()`` against.
 
-    - No-op if nothing exists at `path`.
-    - If a non-socket file exists, refuse (FileExistsError).
-    - If a live UDS is bound, refuse (OSError EADDRINUSE).
-    - Otherwise (stale socket file) unlink it and log a warning.
+    Behavior, in order:
+
+    - No-op if nothing exists at ``path``.
+    - If a non-socket file (including a symlink, which ``lstat`` reports as
+      ``S_IFLNK`` rather than ``S_IFSOCK``) exists, refuse with
+      ``FileExistsError``. We refuse to follow symlinks to avoid being tricked
+      into unlinking arbitrary files via a hostile path.
+    - Otherwise probe with a short non-blocking connect (100 ms timeout --
+      much shorter than any reasonable server startup pause, long enough that
+      a routine kernel queue blip on CI hardware rarely exceeds it).
+      * On ``ConnectionRefusedError`` / ``FileNotFoundError``: nobody is
+        bound; treat as stale.
+      * On ``TimeoutError``: probe inconclusive; treat as live (conservative
+        refuse) rather than risk unlinking a slow-but-running listener.
+      * On ``PermissionError``: surface the error so the operator can fix
+        ownership / mode rather than have us silently clobber or refuse.
+      * On any other ``OSError``: treat as live for the same conservative
+        reason as ``TimeoutError``.
+    - Live → raise ``OSError(EADDRINUSE)``.
+    - Stale → ``os.unlink`` and log a warning. A concurrent unlink that
+      already removed the file is tolerated; any other ``OSError`` during
+      unlink is re-raised with the path context preserved.
+
+    Known TOCTOU races: between ``lstat`` and ``connect``, between
+    ``connect`` and ``unlink``, and between ``unlink`` and the caller's
+    subsequent ``bind()``, a concurrent process could change the state at
+    ``path``. Callers are expected to serialize UDS-path allocation per
+    orchestrator. The worst case is a noisier-than-necessary error from
+    ``bind()`` and never a silent compromise of an unrelated file.
     """
-    import errno
-    import socket as _socket
-    import stat
-
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -2179,7 +2204,7 @@ def _prepare_uds_path(path: str) -> None:
         raise FileExistsError(
             f"{path} exists and is not a socket; refusing to overwrite"
         )
-    probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     probe.settimeout(0.1)
     is_live = False
     try:
@@ -2189,8 +2214,15 @@ def _prepare_uds_path(path: str) -> None:
         # Nobody bound; stale or missing file.
         pass
     except TimeoutError:
-        # Can't determine state in time -- treat as live to be safe; refusing
-        # is preferable to silently unlinking a running server's socket file.
+        # Probe took too long; refuse rather than risk clobbering a live
+        # listener whose accept queue is temporarily saturated.
+        is_live = True
+    except PermissionError:
+        # Surface to the operator -- a chmod/chown is the real fix.
+        raise
+    except OSError:
+        # Any other transient probe-time error gets the conservative
+        # treatment too.
         is_live = True
     finally:
         probe.close()
@@ -2199,14 +2231,22 @@ def _prepare_uds_path(path: str) -> None:
             errno.EADDRINUSE,
             f"UDS {path} is already in use by another process",
         )
-    os.unlink(path)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        # Raced with another process that already cleaned up the stale file.
+        return
+    except OSError as e:
+        raise OSError(
+            e.errno,
+            f"Detected stale UDS file at {path} but failed to remove it: "
+            f"{e.strerror}",
+        ) from e
     logger.warning("Removed stale UDS file at %s", path)
 
 
 def _run_granian_server(server_args: ServerArgs):
     """Launch Granian with HTTP/2 support."""
-    from pathlib import Path
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
 
@@ -2344,7 +2384,8 @@ def _setup_and_run_http_server(
         set_uvicorn_logging_configs(server_args)
 
         if server_args.uds:
-            logger.info(f"Listening on {_format_listen_addr(server_args)}")
+            # Logged BEFORE bind, so the wording avoids implying success.
+            logger.info(f"Preparing to bind on {_format_listen_addr(server_args)}")
 
         if server_args.ssl_certfile:
             logger.info(
