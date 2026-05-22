@@ -33,6 +33,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
@@ -466,13 +467,17 @@ class EagleDraftWorker(BaseDraftWorker):
             # Set inputs
             forward_batch.input_ids = input_ids
             forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # Run forward under a per-step ForwardContext so the model layer
+            # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
+            # honors the outer context and does not override.
+            with forward_context(
+                ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
+            ):
+                logits_output = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -756,7 +761,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -766,6 +771,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
+
+            # Publish before draft_extend so the fence is at target-end.
+            if on_publish is not None:
+                on_publish(batch.seq_lens)
 
             # Draft prefill
             with (
@@ -809,6 +818,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
+            # Publish before draft_extend so the fence is at verify-end.
+            if on_publish is not None:
+                on_publish(batch_output.next_draft_input.new_seq_lens)
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1068,9 +1080,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, verify_input, accept_lens, accept_index, bs
             )
 
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
-
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
@@ -1089,15 +1098,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
+            bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens
         )
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache,
-        # until the next iter's verify_done.synchronize() in filter_batch.
+        # batch.input_ids rebind in prepare_for_extend_to_fill_draft_kvcache.
         # Scheduler pins it in batch_record_buf for the 2-iter window.
         return GenerationBatchResult(
             logits_output=logits_output,

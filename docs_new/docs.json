@@ -905,6 +905,8 @@
                   "docs/hardware-platforms/ascend-npus/ascend_npu_qwen3_5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_glm5_examples",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_environment_variables",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_profiling",
+                  "docs/hardware-platforms/ascend-npus/ascend_npu_operator_development",
                   "docs/hardware-platforms/ascend-npus/ascend_npu_faq"
                 ]
               },
