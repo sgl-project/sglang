@@ -2563,8 +2563,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = None
         # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
-        if self.input_ids is not None:
+        # If either side has staged via relay (input_ids=None), drop direct
+        # tensor and let resolve_forward_inputs gather the merged req_pool_indices.
+        if self.input_ids is not None and other.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
+        else:
+            self.input_ids = None
         self.mamba_track_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
