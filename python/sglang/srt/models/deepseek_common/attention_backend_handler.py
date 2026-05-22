@@ -1,5 +1,6 @@
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
     AttnForwardMethod,
 )
@@ -153,7 +154,7 @@ def handle_attention_dsa(attn, forward_batch):
     in init_forward_metadata. Read the decision from backend.use_mha.
     """
 
-    backend = forward_batch.attn_backend
+    backend = get_attn_backend()
     if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
         backend = backend.primary
     if hasattr(backend, "use_mha") and backend.use_mha:
