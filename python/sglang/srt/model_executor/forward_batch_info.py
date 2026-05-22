@@ -443,6 +443,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
     rids_int: Optional[torch.Tensor] = None
+    bootstrap_room_ids_int: Optional[torch.Tensor] = None
 
     @classmethod
     def init_new(
@@ -563,8 +564,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 rids=[req.rid for req in batch.reqs],
                 device=device,
             )
+            bootstrap_room_ids = _bootstrap_rooms_to_i64_tensor(
+                bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
+                device=device,
+            )
             batch.sampling_info.rids_int = hashed
+            batch.sampling_info.bootstrap_room_ids_int = bootstrap_room_ids
             ret.rids_int = hashed
+            ret.bootstrap_room_ids_int = bootstrap_room_ids
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
@@ -1049,6 +1056,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.rids_int = self._pad_tensor_to_size(self.rids_int, bs)
             if self.sampling_info is not None:
                 self.sampling_info.rids_int = self.rids_int
+        if self.bootstrap_room_ids_int is not None:
+            self.bootstrap_room_ids_int = self._pad_tensor_to_size(
+                self.bootstrap_room_ids_int, bs, value=-1
+            )
+            if self.sampling_info is not None:
+                self.sampling_info.bootstrap_room_ids_int = self.bootstrap_room_ids_int
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
             spec_info = self.spec_info
@@ -1287,6 +1300,13 @@ else:
 
 def _hash_rids_to_i64_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
     values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
+    return torch.tensor(values, dtype=torch.int64, device=device)
+
+
+def _bootstrap_rooms_to_i64_tensor(
+    *, bootstrap_rooms: List[Optional[int]], device: torch.device
+) -> torch.Tensor:
+    values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
     return torch.tensor(values, dtype=torch.int64, device=device)
 
 

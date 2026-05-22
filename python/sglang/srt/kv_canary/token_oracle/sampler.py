@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, List
 import torch
 
 from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
-from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+from sglang.srt.kv_canary.token_oracle.oracle_manager import (
+    TokenOracleManager,
+    select_oracle_req_ids,
+)
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 
 if TYPE_CHECKING:
@@ -45,7 +48,10 @@ class _OracleSampler(Sampler):
                 "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
             )
         batch_next_token_ids = self._token_oracle_manager.sample_next_tokens(
-            req_ids=rids_int,
+            req_ids=select_oracle_req_ids(
+                rids_int=rids_int,
+                bootstrap_room_ids_int=sampling_info.bootstrap_room_ids_int,
+            ),
             logits_positions=positions,
         )
         return batch_next_token_ids

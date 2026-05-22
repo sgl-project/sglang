@@ -49,7 +49,10 @@ class TokenOracleManager:
         req_ids = _build_req_id_per_token(
             forward_batch=forward_batch,
             num_tokens=num_tokens,
-            rids_per_row=rids_int,
+            rids_per_row=select_oracle_req_ids(
+                rids_int=rids_int,
+                bootstrap_room_ids_int=forward_batch.bootstrap_room_ids_int,
+            ),
         )
         if forward_batch.forward_mode.is_extend():
             expected_tokens = input_ids
@@ -101,3 +104,22 @@ def _build_req_id_per_token(
             f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
         )
     return result
+
+
+def select_oracle_req_ids(
+    *,
+    rids_int: torch.Tensor,
+    bootstrap_room_ids_int: torch.Tensor | None,
+) -> torch.Tensor:
+    if bootstrap_room_ids_int is None:
+        return rids_int
+
+    bootstrap_room_ids_int = bootstrap_room_ids_int.to(
+        device=rids_int.device,
+        dtype=torch.int64,
+    )
+    return torch.where(
+        bootstrap_room_ids_int >= 0,
+        bootstrap_room_ids_int,
+        rids_int.to(torch.int64),
+    )
