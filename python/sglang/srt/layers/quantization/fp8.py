@@ -1743,11 +1743,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
+        from sglang.srt.layers import deep_gemm_wrapper
+
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
 
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif (
+                self.is_fp4_expert
+                and _is_cuda
+                and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            ):
+                # FP4-packed expert weights (``w1.shape[2] = hidden_size // 2``)
+                # are incompatible with the Triton fused-MoE path -- the bf16
+                # activations entering MoE would be twice as wide as the
+                # kernel-expected K, tripping the hidden-size assertion in
+                # ``fused_experts_impl``. DeepGEMM has native fp4-expert support
+                # via the ``recipe=(1,128)/(1,32)`` path, so route there even
+                # when no a2a backend is active (e.g., the DSV4 attention
+                # backend without DeepEP, which is exercised by cuda-graph
+                # capture for bs=256).
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             elif (
                 _is_hip
