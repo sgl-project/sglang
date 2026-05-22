@@ -37,7 +37,7 @@ class SwaDivergenceStats:
         self._swa_allocator = swa_allocator
         self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
-        self._verify_total_device: torch.Tensor = torch.zeros(
+        self._verify_total_count_device: torch.Tensor = torch.zeros(
             2, dtype=torch.int32, device=device
         )
 
@@ -45,7 +45,7 @@ class SwaDivergenceStats:
         self, *, group: CanaryBufferGroup, verify_plan: VerifyPlan
     ) -> None:
         idx = _FULL_IDX if group.kind is PoolKind.FULL else _SWA_IDX
-        self._verify_total_device[idx].add_(verify_plan.verify_num_valid)
+        self._verify_total_count_device[idx].add_(verify_plan.verify_num_valid)
 
     def on_forward_completed(self) -> None:
         self._forward_ct += 1
@@ -70,7 +70,7 @@ class SwaDivergenceStats:
                 )
 
         verify_future = FutureTensor.device_to_host(
-            src_device=self._verify_total_device, stream=self._d2h_stream
+            src_device=self._verify_total_count_device, stream=self._d2h_stream
         )
         mapping_future = (
             FutureTensor.device_to_host(
