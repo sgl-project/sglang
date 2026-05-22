@@ -18,9 +18,9 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 
 # Token-buf consume tracking: init to -1, assert non-negative on gather,
-# write -1 back. Catches "gather without intermediate stash" bugs. Off by
-# default; CI enables via SGLANG_FUTURE_MAP_DEBUG_ASSERT=1.
-_DEBUG_ASSERT = os.getenv("SGLANG_FUTURE_MAP_DEBUG_ASSERT", "0") == "1"
+# write -1 back. Catches "gather without intermediate stash" bugs. CI enables
+# via the existing SGLANG_IS_IN_CI; off in production.
+_DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
