@@ -295,7 +295,9 @@ class TestFlashInferMLAInit(CustomTestCase):
                 ForwardMode.DECODE,
                 seq_lens_cpu,
             )
-            return backend.forward_decode(q, k, v, layer, fb)
+            # save_kv_cache=False: skip KV writes so the cache state is identical
+            # for both replays (KV writes would change cache content and affect output)
+            return backend.forward_decode(q, k, v, layer, fb, save_kv_cache=False)
 
         out1 = _replay()
         out2 = _replay()
@@ -491,7 +493,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
         assert_no_nan_inf(self, out, "trtllm_mla eager decode")
 
     def test_eager_extend_no_nan(self):
-        # forward_extend uses unabsorbed q: qk_nope + qk_rope per head (not absorbed form)
+        # TRTLLM MLA forward_extend also expects absorbed q: kv_lora + qk_rope per head
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
@@ -499,7 +501,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
         q = torch.randn(
             num_tokens,
             _TRTLLM_NUM_HEADS,
-            _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+            _TRTLLM_KV_LORA + _TRTLLM_QK_ROPE,  # absorbed form, same as decode
             dtype=_DTYPE,
             device="cuda",
         )
@@ -572,7 +574,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
         self.assertTrue(torch.allclose(out1, out2, atol=0))
 
     def test_pcg_extend_path(self):
-        # PCG extend also uses unabsorbed q: qk_nope + qk_rope per head
+        # TRTLLM MLA: extend also expects absorbed q: kv_lora + qk_rope per head
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
@@ -580,7 +582,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
         q = torch.randn(
             num_tokens,
             _TRTLLM_NUM_HEADS,
-            _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+            _TRTLLM_KV_LORA + _TRTLLM_QK_ROPE,  # absorbed form
             dtype=_DTYPE,
             device="cuda",
         )
