@@ -1568,10 +1568,10 @@ class Scheduler(
         import time as _gc_time
         from collections import Counter
 
-        _gc_tensor_logged = False
+        _gc_tensor_log_count = 0
 
         def _gc_callback(phase, info):
-            nonlocal _gc_tensor_logged
+            nonlocal _gc_tensor_log_count
             if phase == "start":
                 gc._debug_t0 = _gc_time.perf_counter()
                 gc._debug_gen = info.get("generation", -1)
@@ -1581,12 +1581,12 @@ class Scheduler(
                     gc._debug_types = Counter(type(o).__name__ for o in objs)
                     gc._debug_n_objs = len(objs)
                     # Log Tensor referrer chains (only first few times)
-                    if not _gc_tensor_logged:
+                    if _gc_tensor_log_count < 20:
                         import torch
 
                         tensors = [o for o in objs if isinstance(o, torch.Tensor)]
                         if tensors:
-                            _gc_tensor_logged = True
+                            _gc_tensor_log_count += 1
                             for t in tensors[:3]:
                                 referrers = gc.get_referrers(t)
                                 ref_info = []
