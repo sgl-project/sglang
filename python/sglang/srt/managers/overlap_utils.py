@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
@@ -34,31 +34,24 @@ def _assert_nonneg_and_invalidate(
 
 
 @torch.compile(dynamic=True)
-def _gather_spec_extras_3(
+def _gather_spec_extras(
     indices: torch.Tensor,
     topk_p_buf: torch.Tensor,
     topk_index_buf: torch.Tensor,
     output_tokens_buf: torch.Tensor,
+    hidden_states_buf: Optional[torch.Tensor],
 ):
-    """Compiled to fuse 3 advanced-indexing gathers into a single launch."""
-    return topk_p_buf[indices], topk_index_buf[indices], output_tokens_buf[indices]
-
-
-@torch.compile(dynamic=True)
-def _gather_spec_extras_4(
-    indices: torch.Tensor,
-    topk_p_buf: torch.Tensor,
-    topk_index_buf: torch.Tensor,
-    output_tokens_buf: torch.Tensor,
-    hidden_states_buf: torch.Tensor,
-):
-    """4-buf variant for builds that capture hidden states."""
-    return (
-        topk_p_buf[indices],
-        topk_index_buf[indices],
-        output_tokens_buf[indices],
-        hidden_states_buf[indices],
+    """Fuse the 3-4 advanced-indexing gathers into one compiled launch.
+    `hidden_states_buf` is None on builds that don't capture hidden states;
+    `spec_need_hidden_states()` is fixed per process so only one variant
+    actually gets compiled."""
+    topk_p = topk_p_buf[indices]
+    topk_index = topk_index_buf[indices]
+    bonus_tokens = output_tokens_buf[indices]
+    hidden_states = (
+        hidden_states_buf[indices] if hidden_states_buf is not None else None
     )
+    return topk_p, topk_index, bonus_tokens, hidden_states
 
 
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
@@ -162,30 +155,23 @@ class FutureMap:
         indices = draft_input.future_indices
         # indices = batch.req_pool_indices is pinned 2 iters via
         # record_batch_in_overlap; explicit record_stream is unnecessary.
-        if spec_need_hidden_states():
-            (
-                draft_input.topk_p,
-                draft_input.topk_index,
-                draft_input.bonus_tokens,
-                draft_input.hidden_states,
-            ) = _gather_spec_extras_4(
-                indices,
-                self.topk_p_buf,
-                self.topk_index_buf,
-                self.output_tokens_buf,
-                self.hidden_states_buf,
-            )
-        else:
-            (
-                draft_input.topk_p,
-                draft_input.topk_index,
-                draft_input.bonus_tokens,
-            ) = _gather_spec_extras_3(
-                indices,
-                self.topk_p_buf,
-                self.topk_index_buf,
-                self.output_tokens_buf,
-            )
+        hidden_states_buf = (
+            self.hidden_states_buf if spec_need_hidden_states() else None
+        )
+        (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.bonus_tokens,
+            hidden_states,
+        ) = _gather_spec_extras(
+            indices,
+            self.topk_p_buf,
+            self.topk_index_buf,
+            self.output_tokens_buf,
+            hidden_states_buf,
+        )
+        if hidden_states is not None:
+            draft_input.hidden_states = hidden_states
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
