@@ -23,6 +23,10 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -420,9 +424,7 @@ class DeepseekMLAForwardMixin:
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
@@ -516,9 +518,7 @@ class DeepseekMLAForwardMixin:
                     q_pe,
                     k_nope,
                     k_pe,
-                    forward_batch.token_to_kv_pool.get_key_buffer(
-                        self.attn_mqa.layer_id
-                    ),
+                    get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id),
                     forward_batch.out_cache_loc,
                     positions,
                     cos,
@@ -694,7 +694,7 @@ class DeepseekMLAForwardMixin:
             return (
                 get_global_server_args().dsa_decode_backend == "trtllm"
                 or get_global_server_args().dsa_prefill_backend == "trtllm"
-            ) and forward_batch.attn_backend.kv_cache_dtype == torch.float8_e4m3fn
+            ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
         return (
             self.current_attention_backend in ("trtllm_mla", "tokenspeed_mla")
@@ -702,7 +702,7 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and forward_batch.attn_backend.data_type == torch.float8_e4m3fn
+            and get_attn_backend().data_type == torch.float8_e4m3fn
         )
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
