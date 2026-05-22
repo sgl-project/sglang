@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import unittest
 
-from runner_test_base import CanaryRunnerTestCase, make_config, make_runner
+from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_config, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.runner import canary_runner as runner_module

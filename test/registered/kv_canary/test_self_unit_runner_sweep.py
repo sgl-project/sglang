@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-from runner_test_base import (
+from sglang.test.kv_canary.runner_test_base import (
     CanaryRunnerTestCase,
     make_config,
     make_runner,
