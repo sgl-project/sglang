@@ -62,6 +62,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
@@ -246,7 +247,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
 
-        with set_forward_context(
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ), set_forward_context(
             forward_batch,
             self.attention_layers,
             self.quant_config,
@@ -471,7 +474,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
 
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-            with set_forward_context(
+            with forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ), set_forward_context(
                 static_forward_batch,
                 self.attention_layers,
                 self.quant_config,
