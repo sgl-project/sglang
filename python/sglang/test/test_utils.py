@@ -720,10 +720,23 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     return child_env
 
 
-def _attach_tee_threads(
-    process: subprocess.Popen,
-    return_stdout_stderr: tuple,
-) -> None:
+def _subprocess_popen_with_outputs(
+    command: list,
+    env: Optional[dict],
+    return_stdout_stderr: Optional[tuple],
+) -> subprocess.Popen:
+    if not return_stdout_stderr:
+        return subprocess.Popen(command, stdout=None, stderr=None, env=env)
+
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        text=True,
+        bufsize=1,
+    )
+
     def _dump(src, sinks):
         for line in iter(src.readline, ""):
             for sink in sinks:
@@ -741,6 +754,7 @@ def _attach_tee_threads(
         args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
         daemon=True,
     ).start()
+    return process
 
 
 def _launch_server_process(
@@ -765,20 +779,7 @@ def _launch_server_process(
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    if return_stdout_stderr:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=child_env,
-            text=True,
-            bufsize=1,
-        )
-        _attach_tee_threads(proc, return_stdout_stderr)
-    else:
-        proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
-
-    return proc
+    return _subprocess_popen_with_outputs(command, child_env, return_stdout_stderr)
 
 
 def _wait_for_server_health(
@@ -1031,20 +1032,7 @@ def popen_launch_pd_server(
     if env is not None:
         env = {**os.environ, **env}
 
-    if return_stdout_stderr:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            text=True,
-            bufsize=1,
-        )
-        _attach_tee_threads(process, return_stdout_stderr)
-    else:
-        process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
-
-    return process
+    return _subprocess_popen_with_outputs(command, env, return_stdout_stderr)
 
 
 def get_similarities(vec1, vec2):
