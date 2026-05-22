@@ -88,17 +88,18 @@ class TritonLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, 3 * r, input_dim)
-        # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         sgemm_info = self._sgemm_info()
-        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=3)
+        lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
             qkv_lora_b,
@@ -106,6 +107,7 @@ class TritonLoRABackend(BaseLoRABackend):
             output_offset,
             max_qkv_out_dim,
             base_output,
+            n_slices=n_slices,
         )
         return lora_output
 
@@ -201,7 +203,7 @@ class TritonLoRABackend(BaseLoRABackend):
                 return
             sgemm.permutation[:bs] = perm
             sgemm.seg_lens[:] = seg_lens
-            sgemm.seg_indptr[0] = 0
+            sgemm.seg_indptr[0:1].zero_()
             torch.cumsum(sgemm.seg_lens, dim=0, out=sgemm.seg_indptr[1:])
             sgemm.max_len = bs
             sgemm.lora_ranks[:mlpb] = bi.lora_ranks[:mlpb]

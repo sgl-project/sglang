@@ -395,7 +395,7 @@ def _decode_grouped_att_m_fwd_rope(
         IS_NEOX_STYLE=is_neox_style,
         num_warps=4,
         num_stages=num_stages,
-        **extra_kargs
+        **extra_kargs,
     )
 
 

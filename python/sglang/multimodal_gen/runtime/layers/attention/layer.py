@@ -1,10 +1,12 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
+from contextlib import nullcontext
 from typing import Type
 
 import torch
 import torch.nn as nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     sequence_model_parallel_all_gather,
@@ -34,6 +36,13 @@ from sglang.multimodal_gen.runtime.managers.forward_context import (
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.utils import get_compute_dtype
+
+_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS = [
+    SDPBackend.CUDNN_ATTENTION,
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+]
 
 
 class UlyssesAttention(nn.Module):
@@ -246,6 +255,7 @@ class LocalAttention(nn.Module):
             head_size, dtype, supported_attention_backends=supported_attention_backends
         )
         impl_cls = attn_backend.get_impl_cls()
+        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -304,15 +314,21 @@ class LocalAttention(nn.Module):
                     mask = mask[:, None, :, :]
                 mask = (mask - 1.0) * torch.finfo(q_.dtype).max
 
-            return torch.nn.functional.scaled_dot_product_attention(
-                q_,
-                k_,
-                v_,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.softmax_scale,
-            ).transpose(1, 2)
+            sdpa_context = (
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                else nullcontext()
+            )
+            with sdpa_context:
+                return torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
 
         output = self.attn_impl.forward(q, k, v, attn_metadata=ctx_attn_metadata)
         return output
@@ -373,6 +389,7 @@ class USPAttention(nn.Module):
                     f"Please ensure your platform supports these backends."
                 )
         impl_cls: Type["AttentionImpl"] = attn_backend.get_impl_cls()
+        self.allow_cudnn_sdp = bool(extra_impl_args.get("allow_cudnn_sdp", False))
         self.attn_impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
@@ -453,15 +470,21 @@ class USPAttention(nn.Module):
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
                 mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
-                return torch.nn.functional.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    is_causal=False,
-                    scale=self.softmax_scale,
-                ).transpose(1, 2)
+                sdpa_context = (
+                    sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                    if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                    else nullcontext()
+                )
+                with sdpa_context:
+                    return torch.nn.functional.scaled_dot_product_attention(
+                        q_,
+                        k_,
+                        v_,
+                        attn_mask=mask,
+                        dropout_p=0.0,
+                        is_causal=False,
+                        scale=self.softmax_scale,
+                    ).transpose(1, 2)
 
             if get_ring_parallel_world_size() > 1:
                 raise NotImplementedError(
@@ -478,6 +501,10 @@ class USPAttention(nn.Module):
                 k = _usp_input_all_to_all(k, head_dim=2)
                 v = _usp_input_all_to_all(v, head_dim=2)
 
+            # If NCCL timeout/deadlock occurs here, check whether
+            # attn_mask is inconsistent across SP ranks (None on some, Tensor on
+            # others), which causes all_gather participant mismatch. Upstream
+            # mask builders must ensure all ranks produce the same mask type.
             gathered_mask = sequence_model_parallel_all_gather(
                 attn_mask.contiguous(), dim=1
             )
@@ -485,15 +512,21 @@ class USPAttention(nn.Module):
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
             mask = _prepare_sdpa_mask(gathered_mask, dtype=q_.dtype, device=q_.device)
-            out = torch.nn.functional.scaled_dot_product_attention(
-                q_,
-                k_,
-                v_,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.softmax_scale,
-            ).transpose(1, 2)
+            sdpa_context = (
+                sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS)
+                if self.allow_cudnn_sdp and q_.device.type == "cuda"
+                else nullcontext()
+            )
+            with sdpa_context:
+                out = torch.nn.functional.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    is_causal=False,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
             if sp_size > 1:
                 out = _usp_output_all_to_all(out, head_dim=2)
             return out
