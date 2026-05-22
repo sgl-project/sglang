@@ -117,10 +117,11 @@ class Qwen3MoeLLMModel(Qwen3MoeModel):
                 layer_idx - 1, input_deepstack_embeds
             )
             a2a_backend = get_moe_a2a_backend()
+            # When deepep is enabled, the scatter mode of deepstack_embeds is set to TP_ATTN_FULL, whereas that of residual is SCATTERED.
+            # Therefore, deepstack_embeds must be split in this scenario.
             if (
                 deepstack_embeds is not None
                 and a2a_backend.is_deepep()
-                and deepstack_embeds.shape[0] != residual.shape[0]
             ):
                 deepstack_embeds = deepstack_embeds.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
