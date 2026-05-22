@@ -411,14 +411,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 extra_metric_labels=self.extra_metric_labels,
             )
 
-        logger.info(
-            f"HiCache D\u2194H initialized: "
-            f"host_pool_size={self.host_pool_group.size}, "
-            f"write_policy={server_args.hicache_write_policy}, "
-            f"tp_world_size={self.tp_world_size}, "
-            f"transfer_layer_num={self.cache_controller.layer_num}"
-        )
-
     def register_sidecar_pool(self, spec: SidecarPoolSpec) -> None:
         self.sidecar_pool_specs.append(spec)
 
@@ -1664,14 +1656,6 @@ class UnifiedRadixCache(BasePrefixCache):
             comp_xfers,
         )
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
-        logger.info(
-            "HiCache prefetch queued req=%s full_tokens=%d node=%d last_hash=%s occupied=%d",
-            req_id,
-            len(prefetch_key),
-            last_host_node.id,
-            last_hash,
-            self.cache_controller.prefetch_tokens_occupied,
-        )
 
     def _prefetch_timeout_check_linear_func(self, operation) -> bool:
         return (
@@ -1918,24 +1902,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        revoke_count = _drain_revoke()
-        backup_count = _drain_backup()
-        full_release_items, full_release_tokens = _drain_release()
-        extra_release_stats = _drain_extra_release()
-        if (
-            revoke_count > 0
-            or backup_count > 0
-            or full_release_items > 0
-            or any(item_count > 0 for item_count, _ in extra_release_stats.values())
-        ):
-            logger.info(
-                "HiCache drain applied revoke=%d backup=%d release_items=%d release_tokens=%d occupied=%d",
-                revoke_count,
-                backup_count,
-                full_release_items,
-                full_release_tokens,
-                cc.prefetch_tokens_occupied,
-            )
+        _drain_revoke()
+        _drain_backup()
+        _drain_release()
+        _drain_extra_release()
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -1959,12 +1929,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
         qsize_list = list(map(int, qsizes.tolist()))
-        if any(local_qsize_list) or any(qsize_list):
-            logger.info(
-                "HiCache drain queues local=%s synced=%s",
-                local_qsize_list,
-                qsize_list,
-            )
         n_revoke, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
@@ -2163,11 +2127,6 @@ class UnifiedRadixCache(BasePrefixCache):
                         last_best_match_device_node,
                     )
 
-                logger.debug(
-                    "init_load_back success: loaded %d tokens for node %d",
-                    len(new_indices),
-                    best_match_node.id,
-                )
                 return new_indices, best_match_node
 
         return (
@@ -2584,10 +2543,6 @@ class UnifiedRadixCache(BasePrefixCache):
             logger.error(msg)
             self.pretty_print()
             raise AssertionError(msg)
-        logger.debug(
-            f"Sanity check PASSED: {len(all_nodes)} nodes, "
-            f"{len(self.tree_components)} components"
-        )
 
     def _check_lru_linked_list(
         self,
