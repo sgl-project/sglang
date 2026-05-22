@@ -18,6 +18,7 @@ Run on the cluster:
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -45,6 +46,23 @@ from sglang.test.test_utils import (
 
 _CUDA = torch.cuda.is_available()
 
+# MLA model selection:
+#   1. Env var MLA_MODEL overrides everything
+#   2. lmsys/sglang-ci-dsv3-test (tiny CI model, private) if available
+#   3. deepseek-ai/DeepSeek-V2-Lite-Chat (16B, public, same MLA architecture)
+_MLA_MODEL_DEFAULT = (
+    "lmsys/sglang-ci-dsv3-test"
+    if _model_exists("lmsys/sglang-ci-dsv3-test")
+    else (
+        "deepseek-ai/DeepSeek-V2-Lite-Chat"
+        if _model_exists("deepseek-ai/DeepSeek-V2-Lite-Chat")
+        else DEFAULT_MODEL_NAME_FOR_TEST_MLA
+    )
+)
+_MLA_MODEL = os.environ.get("MLA_MODEL", _MLA_MODEL_DEFAULT)
+# DeepSeek-V2-Lite-Chat is 16B; needs TP=4 to fit on GB300 (128GB HBM)
+_MLA_TP_SIZE = "1" if "sglang-ci-dsv3-test" in _MLA_MODEL else "4"
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -56,7 +74,7 @@ _BASE_SERVER_ARGS = [
     "--max-running-requests",
     "8",
     "--tp-size",
-    "1",
+    _MLA_TP_SIZE,
 ]
 
 # Questions suitable for a tiny (CI) DSV3 model
@@ -112,7 +130,7 @@ def _raw_generate(base_url: str, prompt: str, max_new_tokens: int = 16) -> str:
 
 
 class _MLAAccuracyBase(CustomTestCase):
-    model: str = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+    model: str = _MLA_MODEL
     runner_args: list = []
 
     @classmethod
@@ -207,7 +225,7 @@ class TestFlashInferMLAPCGAccuracy(_MLAAccuracyBase):
 class TestTRTLLMMLAEagerAccuracy(_MLAAccuracyBase):
     """TRTLLM MLA + eager."""
 
-    runner_args = ["--attention-backend", "trtllm", "--disable-cuda-graph"]
+    runner_args = ["--attention-backend", "trtllm_mla", "--disable-cuda-graph"]
 
 
 class TestTRTLLMMLACudaGraphAccuracy(_MLAAccuracyBase):
@@ -215,7 +233,7 @@ class TestTRTLLMMLACudaGraphAccuracy(_MLAAccuracyBase):
 
     runner_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mla",
         "--disable-piecewise-cuda-graph",
         "--cuda-graph-max-bs",
         "8",
@@ -227,7 +245,7 @@ class TestTRTLLMMLAPCGAccuracy(_MLAAccuracyBase):
 
     runner_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mla",
         "--enforce-piecewise-cuda-graph",
         "--cuda-graph-max-bs",
         "8",
@@ -249,11 +267,11 @@ class TestMLABackendConsistency(CustomTestCase):
     and compares raw-completion outputs.
     """
 
-    model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+    model = _MLA_MODEL
 
     _BACKENDS = {
         "flashinfer_mla": ["--attention-backend", "flashinfer", "--disable-cuda-graph"],
-        "trtllm_mla": ["--attention-backend", "trtllm", "--disable-cuda-graph"],
+        "trtllm_mla": ["--attention-backend", "trtllm_mla", "--disable-cuda-graph"],
     }
 
     @classmethod
@@ -309,7 +327,7 @@ class _MLAConsistencyBase(CustomTestCase):
     for a given MLA backend.
     """
 
-    model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+    model = _MLA_MODEL
     backend_flag: str = "flashinfer"
 
     @property
@@ -408,7 +426,7 @@ class TestFlashInferMLAConsistency(_MLAConsistencyBase):
 class TestTRTLLMMLAConsistency(_MLAConsistencyBase):
     """TRTLLM MLA: eager / full-CG / PCG must produce identical outputs."""
 
-    backend_flag = "trtllm"
+    backend_flag = "trtllm_mla"
 
 
 if __name__ == "__main__":
