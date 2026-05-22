@@ -261,6 +261,13 @@ class TestFlashInferMLAInit(CustomTestCase):
             dtype=_DTYPE,
         )
         backend = FlashInferMLAAttnBackend(fresh_mr)
+        # Force a fresh workspace buffer: the module-level global_workspace_buffer
+        # is shared across all FlashInferMLAAttnBackend instances; the decode wrappers
+        # created during graph capture use self.workspace_buffer at capture time, so
+        # overriding it here (before capture) gives the fresh backend isolated state.
+        backend.workspace_buffer = torch.empty(
+            64 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+        )
         layer = _make_mla_layer()
         set_forward_context(ForwardContext(attn_backend=backend))
 
@@ -484,10 +491,25 @@ class TestTRTLLMMLAInit(CustomTestCase):
         assert_no_nan_inf(self, out, "trtllm_mla eager decode")
 
     def test_eager_extend_no_nan(self):
+        # forward_extend uses unabsorbed q: qk_nope + qk_rope per head (not absorbed form)
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
-        q, k_nope, v, k_rope = _trtllm_mla_qkv(bs * _EXTEND_LEN)
+        num_tokens = bs * _EXTEND_LEN
+        q = torch.randn(
+            num_tokens,
+            _TRTLLM_NUM_HEADS,
+            _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+            dtype=_DTYPE,
+            device="cuda",
+        )
+        k_nope = torch.randn(
+            num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda"
+        )
+        v = torch.randn(num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda")
+        k_rope = torch.randn(
+            num_tokens, 1, _TRTLLM_QK_ROPE, dtype=_DTYPE, device="cuda"
+        )
         self.backend.init_forward_metadata(fb)
         out = self.backend.forward_extend(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla eager extend")
@@ -550,10 +572,25 @@ class TestTRTLLMMLAInit(CustomTestCase):
         self.assertTrue(torch.allclose(out1, out2, atol=0))
 
     def test_pcg_extend_path(self):
+        # PCG extend also uses unabsorbed q: qk_nope + qk_rope per head
         bs = 2
         self._fill(bs, _PREFIX_LEN + _EXTEND_LEN)
         fb = make_extend_batch(bs, _EXTEND_LEN, _PREFIX_LEN)
-        q, k_nope, v, k_rope = _trtllm_mla_qkv(bs * _EXTEND_LEN)
+        num_tokens = bs * _EXTEND_LEN
+        q = torch.randn(
+            num_tokens,
+            _TRTLLM_NUM_HEADS,
+            _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+            dtype=_DTYPE,
+            device="cuda",
+        )
+        k_nope = torch.randn(
+            num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda"
+        )
+        v = torch.randn(num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda")
+        k_rope = torch.randn(
+            num_tokens, 1, _TRTLLM_QK_ROPE, dtype=_DTYPE, device="cuda"
+        )
         self.backend.init_forward_metadata(fb)
         out = self.backend.forward_extend(q, k_nope, v, self.layer, fb, k_rope=k_rope)
         assert_no_nan_inf(self, out, "trtllm_mla pcg extend path")
