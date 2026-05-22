@@ -588,159 +588,20 @@ class TritonAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
-        assert encoder_lens is None, "Not supported"
-        window_kv_indptr = self.window_kv_indptr
-        window_kv_indices = None
-        window_num_kv_splits = None
-        window_kv_offsets = None
-        swa_attn_logits = None
+        import types
 
-        if forward_mode.is_decode_or_idle():
-            if spec_info is None:
-                kv_indptr = self.kv_indptr
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                kv_indices = self.cuda_graph_kv_indices
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices,
-                    seq_lens,
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-                if (
-                    self.sliding_window_size is not None
-                    and self.sliding_window_size > 0
-                ):
-                    window_kv_indices = self.cuda_graph_window_kv_indices
-                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                    window_kv_indptr, window_kv_indices, _, _ = (
-                        update_sliding_window_buffer_cuda_graph(
-                            self.window_kv_indptr,
-                            window_kv_indices,
-                            self.req_to_token,
-                            self.sliding_window_size,
-                            seq_lens[:bs],
-                            req_pool_indices,
-                            bs,
-                            self.token_to_kv_pool_allocator,
-                        )
-                    )
-            else:
-                kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
-
-            attn_logits = self.cuda_graph_attn_logits
-            swa_attn_logits = self.cuda_graph_swa_attn_logits
-            attn_lse = self.cuda_graph_attn_lse
-            max_extend_len = None
-            num_kv_splits = self.cuda_graph_num_kv_splits
-            qo_indptr = None
-            custom_mask = None
-            mask_indptr = None
-        elif forward_mode.is_target_verify():
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=int(seq_lens.sum()),
+                seq_lens_cpu=None,
+                positions=req_pool_indices.new_empty(num_tokens),
             )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_kv_indices = self.cuda_graph_window_kv_indices
-                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                window_kv_offsets = self.cuda_graph_window_kv_offsets
-                window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
-                    update_sliding_window_buffer_cuda_graph(
-                        self.window_kv_indptr,
-                        window_kv_indices,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        seq_lens[:bs],
-                        req_pool_indices,
-                        bs,
-                        self.token_to_kv_pool_allocator,
-                    )
-                )
-
-            custom_mask = self.cuda_graph_custom_mask
-            if (
-                spec_info is not None
-                and getattr(spec_info, "custom_mask", None) is not None
-            ):
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            else:
-                custom_mask = None
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-            mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-            max_extend_len = self.num_draft_tokens
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens_per_bs = self.speculative_num_steps + 1
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                step=num_tokens_per_bs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-            custom_mask = None
-            mask_indptr = None
-            max_extend_len = num_tokens_per_bs
-            num_kv_splits = None
-            attn_logits = None
-            attn_lse = None
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_mode=} for CUDA Graph capture."
-            )
-
-        self.forward_metadata = ForwardMetadata(
-            attn_logits,
-            attn_lse,
-            max_extend_len,
-            num_kv_splits,
-            kv_indptr,
-            kv_indices,
-            qo_indptr,
-            custom_mask,
-            mask_indptr,
-            window_kv_indptr,
-            window_kv_indices,
-            window_num_kv_splits,
-            window_kv_offsets,
-            swa_attn_logits=swa_attn_logits,
         )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
@@ -927,126 +788,21 @@ class TritonAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        # NOTE: encoder_lens expected to be zeros or None
-        if forward_mode.is_decode_or_idle():
-            # Update kv_indptr, kv_indices
-            kv_indptr = self.kv_indptr
-            kv_indices = self.cuda_graph_kv_indices
-            num_kv_splits = self.cuda_graph_num_kv_splits
-            if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens[:bs], dim=0)
-                kv_indptr = kv_indptr[: bs + 1]
-                create_flashinfer_kv_indices_triton[(bs,)](
-                    self.req_to_token,
-                    req_pool_indices[:bs],
-                    seq_lens[:bs],
-                    kv_indptr,
-                    None,
-                    kv_indices,
-                    self.req_to_token.stride(0),
-                )
-                num_token = bs
-                if (
-                    self.sliding_window_size is not None
-                    and self.sliding_window_size > 0
-                ):
-                    window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                    window_kv_indices = self.cuda_graph_window_kv_indices
-                    _, _, window_kv_lens, _ = update_sliding_window_buffer_cuda_graph(
-                        self.window_kv_indptr,
-                        window_kv_indices,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        seq_lens[:bs],
-                        req_pool_indices[:bs],
-                        bs,
-                        self.token_to_kv_pool_allocator,
-                    )
-                    self.get_num_kv_splits(
-                        window_num_kv_splits[:num_token], window_kv_lens[:bs]
-                    )
+        import types
 
-            else:
-                assert False, "Multi-step cuda graph init is not done here."
-            self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
-
-        elif forward_mode.is_target_verify():
-            # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
-            bs = len(req_pool_indices)
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=req_pool_indices.new_empty(bs),
             )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-            if self.sliding_window_size is not None and self.sliding_window_size > 0:
-                window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                window_kv_indices = self.cuda_graph_window_kv_indices
-                window_kv_offsets = self.cuda_graph_window_kv_offsets
-                _, _, window_kv_lens, window_kv_offsets[:bs] = (
-                    update_sliding_window_buffer_cuda_graph(
-                        self.window_kv_indptr,
-                        window_kv_indices,
-                        self.req_to_token,
-                        self.sliding_window_size,
-                        seq_lens[:bs],
-                        req_pool_indices,
-                        bs,
-                        self.token_to_kv_pool_allocator,
-                    )
-                )
-            custom_mask = self.cuda_graph_custom_mask
-            if (
-                spec_info is not None
-                and getattr(spec_info, "custom_mask", None) is not None
-            ):
-                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            else:
-                custom_mask = None
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
-            mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
-        elif forward_mode.is_draft_extend(include_v2=True):
-            seq_lens = seq_lens[:bs]
-            num_tokens_per_bs = self.speculative_num_steps + 1
-            qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[: bs + 1] = torch.arange(
-                0,
-                bs * num_tokens_per_bs + 1,
-                step=num_tokens_per_bs,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            kv_indptr = self.kv_indptr[: bs + 1]
-            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-            kv_indices = self.cuda_graph_kv_indices
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-        else:
-            raise ValueError(
-                f"Invalid forward mode: {forward_mode=} for CUDA Graph replay."
-            )
+        )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
