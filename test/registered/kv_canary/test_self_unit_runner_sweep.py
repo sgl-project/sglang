@@ -6,13 +6,16 @@ from unittest.mock import patch
 from kv_canary_runner_unit_utils import (
     CanaryRunnerTestCase,
     make_config,
-    make_forward_batch,
     make_runner,
 )
 
 from sglang.srt.kv_canary import endpoint as endpoint_module
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import make_radix_cache, make_req_to_token_pool
+from sglang.test.kv_canary.fixtures import (
+    make_forward_batch,
+    make_radix_cache,
+    make_req_to_token_pool,
+)
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 

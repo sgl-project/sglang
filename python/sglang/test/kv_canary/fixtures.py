@@ -159,6 +159,8 @@ def make_req_to_token_pool(
 def make_forward_batch(
     device: torch.device = DEFAULT_DEVICE,
     *,
+    bs: int = 2,
+    seq_lens_list: tuple[int, ...] = (3, 4),
     req_pool_indices: Optional[torch.Tensor] = None,
     seq_lens: Optional[torch.Tensor] = None,
     seq_lens_sum: Optional[int] = None,
@@ -173,18 +175,39 @@ def make_forward_batch(
     input_ids: Optional[torch.Tensor] = None,
     positions: Optional[torch.Tensor] = None,
     out_cache_loc: Optional[torch.Tensor] = None,
+    num_token_non_padded_cpu: Optional[int] = None,
 ) -> SimpleNamespace:
+    seq_lens_default = list(seq_lens_list[:bs])
+    if req_pool_indices is None:
+        req_pool_indices = torch.tensor(
+            [1, 2][:bs], dtype=torch.int64, device=device
+        )
+    if seq_lens is None:
+        seq_lens = torch.tensor(seq_lens_default, dtype=torch.int32, device=device)
+    if seq_lens_sum is None:
+        seq_lens_sum = int(sum(seq_lens_default))
+    if input_ids is None:
+        input_ids = torch.zeros(bs, dtype=torch.int32, device=device)
+    if positions is None:
+        positions = torch.zeros(bs, dtype=torch.int32, device=device)
+    if out_cache_loc is None:
+        out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=device)
+
     is_decode_or_idle = not (is_extend or is_target_verify or is_draft_extend_v2)
     mode = SimpleNamespace(
         is_extend=lambda include_draft_extend_v2=False: is_extend
         or (include_draft_extend_v2 and is_draft_extend_v2),
+        is_extend_or_draft_extend_or_mixed=lambda include_draft_extend_v2=False: is_extend
+        or (include_draft_extend_v2 and is_draft_extend_v2),
         is_mixed=lambda: False,
+        is_decode=lambda: is_decode_or_idle,
         is_decode_or_idle=lambda: is_decode_or_idle,
         is_target_verify=lambda: is_target_verify,
         is_draft_extend_v2=lambda: is_draft_extend_v2,
     )
     return SimpleNamespace(
         forward_mode=mode,
+        batch_size=bs,
         req_pool_indices=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_sum=seq_lens_sum,
@@ -196,6 +219,7 @@ def make_forward_batch(
         input_ids=input_ids,
         positions=positions,
         out_cache_loc=out_cache_loc,
+        num_token_non_padded_cpu=num_token_non_padded_cpu,
     )
 
 

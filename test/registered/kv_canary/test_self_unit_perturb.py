@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
 import torch
-from kv_canary_runner_unit_utils import make_forward_batch, make_pool
+from kv_canary_runner_unit_utils import make_pool
 
 from sglang.jit_kernel.kv_canary.verify import RealKvSource
 from sglang.srt.kv_canary.buffer_group import PoolKind
@@ -29,7 +29,11 @@ from sglang.srt.kv_canary.perturb.utils import (
     pick_target_group,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
+from sglang.test.kv_canary.fixtures import (
+    DEFAULT_DEVICE,
+    make_buffer_group,
+    make_forward_batch,
+)
 from sglang.test.test_utils import CustomTestCase
 
 if TYPE_CHECKING:

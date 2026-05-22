@@ -13,7 +13,6 @@ from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
 from sglang.test.test_utils import CustomTestCase
@@ -46,29 +45,6 @@ def make_config(
         real_kv_hash_mode=real_kv_hash_mode,
         input_check_mode=input_check_mode,
         stats_print_every_n_steps=stats_print_every_n_steps,
-    )
-
-
-def make_forward_batch(
-    device: torch.device,
-    bs: int = 2,
-    seq_lens_list: tuple[int, ...] = (3, 4),
-) -> SimpleNamespace:
-    seq_lens = list(seq_lens_list[:bs])
-    return SimpleNamespace(
-        forward_mode=ForwardMode.DECODE,
-        spec_info=None,
-        batch_size=bs,
-        req_pool_indices=torch.tensor([1, 2][:bs], dtype=torch.int64, device=device),
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=device),
-        seq_lens_sum=int(sum(seq_lens)),
-        extend_prefix_lens=None,
-        extend_seq_lens=None,
-        extend_prefix_lens_cpu=None,
-        input_ids=torch.zeros(bs, dtype=torch.int32, device=device),
-        positions=torch.zeros(bs, dtype=torch.int32, device=device),
-        out_cache_loc=torch.zeros(bs, dtype=torch.int32, device=device),
-        num_token_non_padded_cpu=None,
     )
 
 
