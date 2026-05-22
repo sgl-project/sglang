@@ -49,7 +49,7 @@ MINIMAX_M2_5_32K_OTHER_ARGS = [
     200,
     "--enable-prefill-delayer",
     "--max-running-requests",
-    96,
+    48,
     "--chunked-prefill-size",
     -1,
     "--max-prefill-tokens",
@@ -88,8 +88,8 @@ class TestNPUMiniMaxM2_5_W8A8_8P_In32k_Out1k_HighThroughput(
     other_args = MINIMAX_M2_5_32K_OTHER_ARGS
     envs = MINIMAX_M2_5_32K_ENVS
     dataset_name = "random"
-    max_concurrency = 36
-    num_prompts = 144
+    max_concurrency = 24
+    num_prompts = 96
     input_len = 32768
     output_len = 1024
     random_range_ratio = 1

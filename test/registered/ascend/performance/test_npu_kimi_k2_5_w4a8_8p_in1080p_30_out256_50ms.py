@@ -44,9 +44,9 @@ KIMI_K2_5_IN1080P_30_OUT256_OTHER_ARGS = [
     "--tp-size",
     16,
     "--mem-fraction-static",
-    0.765,
+    0.7,
     "--max-running-requests",
-    160,
+    80,
     "--chunked-prefill-size",
     -1,
     "--context-length",
@@ -78,11 +78,11 @@ KIMI_K2_5_IN1080P_30_OUT256_OTHER_ARGS = [
     "--speculative-draft-model-path",
     KIMI_K2_5_EAGLE3_MODEL_PATH,
     "--speculative-num-steps",
-    2,
+    4,
     "--speculative-eagle-topk",
     1,
     "--speculative-num-draft-tokens",
-    3,
+    5,
     "--speculative-draft-model-quantization",
     "unquant",
 ]
@@ -100,8 +100,8 @@ class TestNPUKimiK2_5_W4A8_8P_IN1080P_30_OUT256_50ms(TestAscendPerformanceTestCa
     dataset_name = "image"
     image_resolution = "1920x1080"
     image_count = 1
-    max_concurrency = 64
-    num_prompts = 64
+    max_concurrency = 20
+    num_prompts = 20
     request_rate = 1
     input_len = 30
     output_len = 256

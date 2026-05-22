@@ -91,7 +91,7 @@ class TestNPUMiniMaxM2_5_W8A8_8P_AIME2025(TestAscendAccuracyTestCaseBase):
     model = MINIMAX_M2_5_W8A8_MODEL_PATH
     other_args = MINIMAX_M2_5_HIGH_THROUGHPUT_OTHER_ARGS
     envs = MINIMAX_M2_5_HIGH_THROUGHPUT_ENVS
-    accuracy = 80
+    accuracy = 86.3
     dataset_type = "aime2025"
     dataset_name = "aime2025_gen"
     max_concurrency = 64
