@@ -6,7 +6,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -492,6 +492,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.cached_loc = None  # mapping replaced; discard any cached translation
+
+    def invalidate_loc_cache(self) -> None:
+        self.cached_loc = None
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -502,13 +506,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert self.full_to_swa_index_mapping is not None
 
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
-
-    def set_swa_loc(self, loc: torch.Tensor) -> None:
-        # No-op: SWAKVPool's set_swa_loc precomputes SWA-translated loc once per
-        # forward batch for set_kv_buffer to read via self.swa_loc. DSV4 has its
-        # own equivalent cache via `_should_cache_swa + cached_loc` (in
-        # set_swa_key_buffer_radix_fused), so we ignore main's precomputed loc.
-        pass
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
