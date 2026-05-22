@@ -384,7 +384,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -674,9 +673,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
+            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+            # Extend processed L prompt tokens; next verify iter expects same L.
+            batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
             if on_publish is not None:
-                on_publish(batch.seq_lens)
+                on_publish(batch_output.new_seq_lens)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
@@ -706,7 +708,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
             if on_publish is not None:
-                on_publish(batch_output.next_draft_input.new_seq_lens)
+                on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
@@ -786,10 +788,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            new_seq_lens=new_seq_lens,
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
         # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
@@ -800,6 +799,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

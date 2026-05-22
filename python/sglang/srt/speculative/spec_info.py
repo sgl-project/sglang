@@ -82,6 +82,9 @@ class SpeculativeAlgorithm(Enum):
             spec_class=spec_class,
         )
 
+    def is_some(self) -> bool:
+        return self != SpeculativeAlgorithm.NONE
+
     def is_none(self) -> bool:
         return self == SpeculativeAlgorithm.NONE
 
