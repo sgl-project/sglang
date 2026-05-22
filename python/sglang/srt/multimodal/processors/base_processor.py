@@ -49,8 +49,9 @@ _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
     input_text: str
-    # original pre-tokenized ids, used when processor_output/precomputed inputs
-    # already carry the expanded prompt
+
+    # original pre-tokenized ids, useful for processor_output/precomputed inputs,
+    # when they already carry the input ids
     input_ids: Optional[Union[List[int], torch.Tensor]] = None
 
     # frames loaded from image, in given order
@@ -544,6 +545,9 @@ class BaseMultimodalProcessor(ABC):
 
     @staticmethod
     def _get_preprocessed_input_format(data):
+        """returns the detailed format if the provided data is already preprocessed.
+        returns none if the provided data is not preprocessed
+        """
         if not isinstance(data, dict):
             return None
         data_format = data.get("format")
@@ -563,6 +567,7 @@ class BaseMultimodalProcessor(ABC):
 
     @classmethod
     def _is_preprocessed_input(cls, data):
+        """returns if the data is already preprocessed (by the vlm processor)"""
         return cls._get_preprocessed_input_format(data) is not None
 
     @classmethod
@@ -776,6 +781,7 @@ class BaseMultimodalProcessor(ABC):
         if input_ids is not None and self._all_mm_data_is_preprocessed(
             image_data, video_data, audio_data
         ):
+            # fast path for preprocessed data: early return
             return BaseMultiModalProcessorOutput(
                 input_text="",
                 input_ids=input_ids,
@@ -1130,7 +1136,8 @@ class BaseMultimodalProcessor(ABC):
         return collected_items, input_ids, ret
 
     @staticmethod
-    def _as_input_ids_tensor(input_ids) -> Optional[torch.Tensor]:
+    def _ensure_input_ids_is_tensor(input_ids) -> Optional[torch.Tensor]:
+        """make sure the input_ids is a flattened tensor"""
         if input_ids is None:
             return None
         if isinstance(input_ids, torch.Tensor):
@@ -1216,11 +1223,11 @@ class BaseMultimodalProcessor(ABC):
             ret = dict_ret
 
         if input_ids is None:
-            input_ids = self._as_input_ids_tensor(base_output.input_ids)
+            input_ids = self._ensure_input_ids_is_tensor(base_output.input_ids)
 
         if input_ids is None:
             for _, dict_item in dict_items:
-                input_ids = self._as_input_ids_tensor(dict_item.get("input_ids"))
+                input_ids = self._ensure_input_ids_is_tensor(dict_item.get("input_ids"))
                 if input_ids is not None:
                     break
 
