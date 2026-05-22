@@ -1008,10 +1008,19 @@ class DeepseekSparseAttnBackend(
         bs = forward_batch.batch_size
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens
-        forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         seq_lens_cpu = forward_batch.seq_lens_cpu
         assert seq_lens_cpu is not None
+
+        # Mirror dsv4 (``deepseek_v4_backend.py:812``): the fb view's forward_mode
+        # is the capture-time mode (DECODE bucket); the LIVE forward_mode comes
+        # from the side channel and may be IDLE for dp-attention idle ranks.
+        # IDLE handling is tracked separately by step 04; for now we just read
+        # the live mode so the branch checks aren't wrong.
+        if self._replay_forward_batch is not None:
+            forward_mode = self._replay_forward_batch.forward_mode
+        else:
+            forward_mode = forward_batch.forward_mode
 
         self.set_dsa_prefill_impl(forward_batch=None)
 
