@@ -395,10 +395,10 @@ The following environment variables are used in other best practice configuratio
 The table shows Feature combinations of SGLang capabilities.
 
 The symbols used are defined as follows:
-F = Full compatibility
-P = Partial compatibility
-N = No compatibility
-? = Unknown or TBD
+🟢 = Full compatibility
+🟠 = Partial compatibility
+❌ = No compatibility
+❔ = Unknown or TBD
 
 <table>
   <thead>
@@ -424,239 +424,239 @@ N = No compatibility
     <tr>
       <td>Tensor Parallelism</td>
       <td></td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Data Parallelism</td>
-      <td>F</td>
+      <td>🟢</td>
       <td></td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Expert Parallelism</td>
-      <td>F</td>
-      <td>F</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Context Parallelism</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>PD Disaggregation</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Encode Prefill Disaggregation</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
       <td></td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Multimodal</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
       <td></td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Quantization</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Chunked Prefill</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
       <td></td>
-      <td>P</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>LoRA</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Speculative Decoding</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Mamba Cache</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>F</td>
-      <td>P</td>
-      <td>F</td>
-      <td>P</td>
-      <td>P</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟢</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
-      <td>P</td>
-      <td>?</td>
+      <td>🟠</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Hierarchical Cache</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
-      <td>P</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
+      <td>🟠</td>
       <td></td>
-      <td>?</td>
+      <td>❔</td>
     </tr>
     <tr>
       <td>Ngram Speculative Decoding</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
-      <td>?</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
+      <td>❔</td>
       <td></td>
     </tr>
   </tbody>
