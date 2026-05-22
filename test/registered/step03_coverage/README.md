@@ -65,7 +65,7 @@ The cluster has many GB300 nodes; cap at ~10 in flight.
 | `trtllm_mha_cudagraph.sh`        | trtllm_mha      | full CG        | none   | Qwen/Qwen3-0.6B                  | default MHA backend on B200                       |
 | `trtllm_mha_pcg.sh`              | trtllm_mha      | PCG            | none   | Qwen/Qwen3-0.6B                  | regression guard for step03 prefill bug           |
 | `triton_eagle.sh`                | triton          | full CG        | EAGLE  | meta-llama/Llama-2-7b-chat-hf    | EAGLE2 (spec v1 default)                          |
-| `fa3_eagle3.sh`                  | fa3             | full CG        | EAGLE3 | meta-llama/Llama-3.1-8B-Instruct | multi-layer draft                                 |
+| `fa3_eagle3.sh`                  | triton (fp16)   | full CG        | EAGLE3 | meta-llama/Llama-3.1-8B-Instruct | multi-layer draft. fp16+triton recipe (bf16+cutlass RMSNorm broken on Blackwell). |
 | `dsv4_cudagraph.sh`              | dsv4            | full CG        | none   | DeepSeek-V4-Flash (`/flash_model`)| needs `flashinfer_mxfp4` + #26024                  |
 | `dsv4_eagle.sh`                  | dsv4            | full CG        | EAGLE  | DeepSeek-V4-Flash                | motivating workload                               |
 | `dsa_cudagraph.sh`               | dsa             | full CG        | none   | deepseek-ai/DeepSeek-V3.2        | sparse attention                                  |
