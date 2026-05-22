@@ -260,14 +260,14 @@ class TestFlashInferMLAInit(CustomTestCase):
             max_context_len=_MAX_CTX,
             dtype=_DTYPE,
         )
+        # Force a fresh global_workspace_buffer so this backend is completely isolated
+        # from any prior FlashInfer state set by MHA tests running earlier in the suite.
+        import sglang.srt.layers.attention.flashinfer_mla_backend as _fi_mla_mod
+
+        _saved_ws = _fi_mla_mod.global_workspace_buffer
+        _fi_mla_mod.global_workspace_buffer = None  # force new allocation in __init__
         backend = FlashInferMLAAttnBackend(fresh_mr)
-        # Force a fresh workspace buffer: the module-level global_workspace_buffer
-        # is shared across all FlashInferMLAAttnBackend instances; the decode wrappers
-        # created during graph capture use self.workspace_buffer at capture time, so
-        # overriding it here (before capture) gives the fresh backend isolated state.
-        backend.workspace_buffer = torch.empty(
-            64 * 1024 * 1024, dtype=torch.uint8, device="cuda"
-        )
+        _fi_mla_mod.global_workspace_buffer = _saved_ws  # restore for other tests
         layer = _make_mla_layer()
         set_forward_context(ForwardContext(attn_backend=backend))
 
