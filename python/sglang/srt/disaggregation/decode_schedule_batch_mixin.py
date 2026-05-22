@@ -173,16 +173,25 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 topk_index=topk_index,
                 hidden_states=hidden_states,
                 bonus_tokens=last_tokens_tensor,
-                new_seq_lens=self.seq_lens,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
             if self.enable_overlap:
                 from sglang.srt.managers.overlap_utils import FutureIndices
 
                 spec_info.future_indices = FutureIndices(indices=self.req_pool_indices)
-                future_map.publish(spec_info.future_indices, spec_info.new_seq_lens)
+                future_map.publish(spec_info.future_indices, self.seq_lens)
                 future_map.stash(spec_info.future_indices, spec_info)
             self.spec_info = spec_info
         else:
             # Non-spec: input_ids feeds the next decode forward directly.
             self.input_ids = last_tokens_tensor
+            if self.enable_overlap:
+                from sglang.srt.managers.overlap_utils import FutureIndices
+
+                future_indices = FutureIndices(indices=self.req_pool_indices)
+                # Bootstrap FutureMap so the first DECODE after PREBUILT can
+                # resolve_future from buf. Non-spec convention: batch.seq_lens
+                # at decode forward INCLUDES this iter's new token, so publish
+                # current + 1.
+                future_map.publish(future_indices, self.seq_lens + 1)
+                future_map.stash(future_indices, last_tokens_tensor)
