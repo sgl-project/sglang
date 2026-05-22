@@ -50,99 +50,66 @@ class TestResolveRealKvReadBytes(CustomTestCase):
 
 
 class TestMakeRowSource(CustomTestCase):
-    def test_make_row_source_partial_large_stride_clips_to_32(self) -> None:
-        """Verify row sources cap partial reads on large strides."""
-        num_slots = 4
+    def test_make_row_source_large_stride(self) -> None:
+        """Verify row sources with 128-byte stride return the requested clip / full stride."""
         bytes_per_token = 128
-        layer_buf = torch.zeros(num_slots, bytes_per_token, dtype=torch.uint8)
-        sources = make_row_source(layer_buffer=layer_buf, read_bytes=32)
-        self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0].read_bytes, 32)
-        self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
+        layer_buf = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
+        cases = [
+            ("partial", 32, 32),
+            ("all", sys.maxsize, bytes_per_token),
+        ]
+        for label, read_bytes, expected_read in cases:
+            with self.subTest(label=label):
+                sources = make_row_source(layer_buffer=layer_buf, read_bytes=read_bytes)
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(sources[0].read_bytes, expected_read)
+                self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
 
-    def test_make_row_source_all_large_stride_uses_full_stride(self) -> None:
-        """Verify row sources use the full stride for ALL mode."""
-        num_slots = 4
-        bytes_per_token = 128
-        layer_buf = torch.zeros(num_slots, bytes_per_token, dtype=torch.uint8)
-        sources = make_row_source(layer_buffer=layer_buf, read_bytes=sys.maxsize)
-        self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0].read_bytes, bytes_per_token)
-        self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
-
-    def test_make_row_source_partial_small_stride_raises(self) -> None:
-        """Verify row sources reject strides that cannot satisfy 16-byte aligned loads."""
-        num_slots = 4
-        bytes_per_token = 8
-        layer_buf = torch.zeros(num_slots, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
-            make_row_source(layer_buffer=layer_buf, read_bytes=32)
-
-    def test_make_row_source_all_small_stride_raises(self) -> None:
-        """Verify ALL mode rejects strides that cannot satisfy 16-byte aligned loads."""
-        num_slots = 4
-        bytes_per_token = 8
-        layer_buf = torch.zeros(num_slots, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
-            make_row_source(layer_buffer=layer_buf, read_bytes=sys.maxsize)
+    def test_make_row_source_small_stride_raises(self) -> None:
+        """Verify row sources reject 8-byte strides (cannot satisfy 16-byte aligned loads)."""
+        layer_buf = torch.zeros(4, 8, dtype=torch.uint8)
+        for label, read_bytes in [("partial", 32), ("all", sys.maxsize)]:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
+                    make_row_source(layer_buffer=layer_buf, read_bytes=read_bytes)
 
 
 class TestMakePackedSource(CustomTestCase):
-    def test_make_packed_source_partial_large_stride_clips_to_32(self) -> None:
-        """Verify packed sources cap partial reads on large strides."""
+    def test_make_packed_source_large_stride(self) -> None:
+        """Verify packed sources with 128-byte stride return the requested clip / full stride."""
         bytes_per_token = 128
         page_size = 2
         page_buffer = torch.zeros(4, bytes_per_token * page_size, dtype=torch.uint8)
-        sources = make_packed_source(
-            page_buffer=page_buffer,
-            page_size=page_size,
-            bytes_per_token=bytes_per_token,
-            read_bytes=32,
-        )
-        self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0].read_bytes, 32)
-        self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
+        cases = [
+            ("partial", 32, 32),
+            ("all", sys.maxsize, bytes_per_token),
+        ]
+        for label, read_bytes, expected_read in cases:
+            with self.subTest(label=label):
+                sources = make_packed_source(
+                    page_buffer=page_buffer,
+                    page_size=page_size,
+                    bytes_per_token=bytes_per_token,
+                    read_bytes=read_bytes,
+                )
+                self.assertEqual(len(sources), 1)
+                self.assertEqual(sources[0].read_bytes, expected_read)
+                self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
 
-    def test_make_packed_source_all_large_stride_uses_full_stride(self) -> None:
-        """Verify packed sources use the full token stride for ALL mode."""
-        bytes_per_token = 128
-        page_size = 2
-        page_buffer = torch.zeros(4, bytes_per_token * page_size, dtype=torch.uint8)
-        sources = make_packed_source(
-            page_buffer=page_buffer,
-            page_size=page_size,
-            bytes_per_token=bytes_per_token,
-            read_bytes=sys.maxsize,
-        )
-        self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0].read_bytes, bytes_per_token)
-        self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
-
-    def test_make_packed_source_partial_small_stride_raises(self) -> None:
-        """Verify packed sources reject strides that cannot satisfy 16-byte aligned loads."""
+    def test_make_packed_source_small_stride_raises(self) -> None:
+        """Verify packed sources reject 8-byte strides (cannot satisfy 16-byte aligned loads)."""
         bytes_per_token = 8
         page_size = 1
         page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
-            make_packed_source(
-                page_buffer=page_buffer,
-                page_size=page_size,
-                bytes_per_token=bytes_per_token,
-                read_bytes=32,
-            )
-
-    def test_make_packed_source_all_small_stride_raises(self) -> None:
-        """Verify ALL mode rejects strides that cannot satisfy 16-byte aligned loads."""
-        bytes_per_token = 8
-        page_size = 1
-        page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
-        with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
-            make_packed_source(
-                page_buffer=page_buffer,
-                page_size=page_size,
-                bytes_per_token=bytes_per_token,
-                read_bytes=sys.maxsize,
-            )
+        for label, read_bytes in [("partial", 32), ("all", sys.maxsize)]:
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "num_bytes_per_token"):
+                    make_packed_source(
+                        page_buffer=page_buffer,
+                        page_size=page_size,
+                        bytes_per_token=bytes_per_token,
+                        read_bytes=read_bytes,
+                    )
 
     def test_make_packed_source_unaligned_read_bytes_raises(self) -> None:
         """Verify packed sources reject unaligned explicit reads."""
