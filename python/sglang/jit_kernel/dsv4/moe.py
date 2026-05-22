@@ -236,8 +236,8 @@ def silu_and_mul_contig_post_quant(
 
 
 def silu_and_mul_clamp_torch(
-    input: torch.Tensor,       # (M, 2*H)  bf16 or fp16
-    output: torch.Tensor,      # (M, H)    same dtype, pre-allocated
+    input: torch.Tensor,  # (M, 2*H)  bf16 or fp16
+    output: torch.Tensor,  # (M, H)    same dtype, pre-allocated
     swiglu_limit: float,
 ) -> None:
     """
@@ -270,16 +270,18 @@ def silu_and_mul_clamp_torch(
     assert D % 2 == 0, "input last dim must be even (gate || up)"
     H = D // 2
     assert output.shape == (M, H), f"output must be ({M}, {H}), got {output.shape}"
-    assert input.dtype in (torch.bfloat16, torch.float16), \
-        "only bf16/fp16 supported (matches CUDA static_assert sizeof(DType)==2)"
+    assert input.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), "only bf16/fp16 supported (matches CUDA static_assert sizeof(DType)==2)"
 
     # ------------------------------------------------------------------
     # Step 1: Split into gate and up halves
     # Matches: gate_vec.load(input, bid*2+0); up_vec.load(input, bid*2+1)
     # in the CTA-tiled kernel where each CTA handles one token row.
     # ------------------------------------------------------------------
-    gate = input[:, :H]   # (M, H)
-    up   = input[:, H:]   # (M, H)
+    gate = input[:, :H]  # (M, H)
+    up = input[:, H:]  # (M, H)
 
     # ------------------------------------------------------------------
     # Step 2: Clamp in BF16
@@ -293,10 +295,10 @@ def silu_and_mul_clamp_torch(
     # cast to bf16 before clamping even when the input is fp16.
     # ------------------------------------------------------------------
     gate_bf16 = gate.to(torch.bfloat16)
-    up_bf16   = up.to(torch.bfloat16)
+    up_bf16 = up.to(torch.bfloat16)
 
-    gate_clamped = gate_bf16.clamp(max= swiglu_limit)                   # upper only
-    up_clamped   = up_bf16.clamp(min=-swiglu_limit, max=swiglu_limit)   # both sides
+    gate_clamped = gate_bf16.clamp(max=swiglu_limit)  # upper only
+    up_clamped = up_bf16.clamp(min=-swiglu_limit, max=swiglu_limit)  # both sides
 
     # ------------------------------------------------------------------
     # Step 3: SiLU(gate) * up  in fp32
@@ -305,10 +307,12 @@ def silu_and_mul_clamp_torch(
     #   val0  = silu0 * u0
     # ------------------------------------------------------------------
     gate_fp32 = gate_clamped.float()
-    up_fp32   = up_clamped.float()
+    up_fp32 = up_clamped.float()
 
-    silu_gate = gate_fp32 * torch.sigmoid(gate_fp32)   # equivalent to torch.nn.functional.silu
-    result    = silu_gate * up_fp32                    # (M, H)  fp32
+    silu_gate = gate_fp32 * torch.sigmoid(
+        gate_fp32
+    )  # equivalent to torch.nn.functional.silu
+    result = silu_gate * up_fp32  # (M, H)  fp32
 
     # ------------------------------------------------------------------
     # Step 4: Cast back to input dtype and write to output
