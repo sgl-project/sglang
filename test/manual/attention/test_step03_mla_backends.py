@@ -72,7 +72,7 @@ from sglang.test.test_utils import CustomTestCase
 _CUDA = torch.cuda.is_available()
 _SM = gpu_arch_sm()
 
-# MLA geometry matching lmsys/sglang-ci-dsv3-test (tiny DSV3)
+# MLA geometry for FlashInferMLA / FlashMLA / CutlassMLA (flexible dims)
 _NUM_HEADS = 16  # tp_q_head_num with TP=1
 _KV_LORA = 64
 _QK_ROPE = 32
@@ -84,6 +84,15 @@ _SEQ_LEN = 16
 _EXTEND_LEN = 8
 _PREFIX_LEN = 4
 _DTYPE = torch.bfloat16
+
+# TRTLLM MLA geometry: kernel only supports kv_lora_rank∈{256,512}, qk_rope_head_dim=64
+_TRTLLM_NUM_HEADS = 16
+_TRTLLM_KV_LORA = 256
+_TRTLLM_QK_ROPE = 64
+_TRTLLM_QK_NOPE = 64
+_TRTLLM_V_HEAD = 128
+_TRTLLM_MAX_CTX = 32
+_TRTLLM_PAGE_SIZE = 32  # TRTLLM MLA kernel requires block_size 32 or 64
 
 try:
     from sglang.srt.utils import is_flashinfer_available as _fi_avail
@@ -126,13 +135,17 @@ def _mla_qkv(num_tokens: int):
 
 
 def _trtllm_mla_qkv(num_tokens: int):
-    """Split k_nope / k_rope for TRTLLMMLABackend which stores them separately."""
+    """Split k_nope / k_rope for TRTLLMMLABackend (TRTLLM-supported dims)."""
     q = torch.randn(
-        num_tokens, _NUM_HEADS, _QK_NOPE + _QK_ROPE, dtype=_DTYPE, device="cuda"
+        num_tokens,
+        _TRTLLM_NUM_HEADS,
+        _TRTLLM_QK_NOPE + _TRTLLM_QK_ROPE,
+        dtype=_DTYPE,
+        device="cuda",
     )
-    k_nope = torch.randn(num_tokens, 1, _KV_LORA, dtype=_DTYPE, device="cuda")
-    v = torch.randn(num_tokens, 1, _KV_LORA, dtype=_DTYPE, device="cuda")
-    k_rope = torch.randn(num_tokens, 1, _QK_ROPE, dtype=_DTYPE, device="cuda")
+    k_nope = torch.randn(num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda")
+    v = torch.randn(num_tokens, 1, _TRTLLM_KV_LORA, dtype=_DTYPE, device="cuda")
+    k_rope = torch.randn(num_tokens, 1, _TRTLLM_QK_ROPE, dtype=_DTYPE, device="cuda")
     return q, k_nope, v, k_rope
 
 
@@ -225,22 +238,42 @@ class TestFlashInferMLAInit(CustomTestCase):
         assert_no_nan_inf(self, out, "flashinfer_mla graph replay")
 
     def test_graph_replay_consistent(self):
-        self.backend.init_cuda_graph_state(_MAX_BS, _MAX_BS)
-        self._fill(_MAX_BS, _SEQ_LEN)
+        # Use a fresh backend to avoid flashinfer workspace buffer pollution
+        # from test_graph_decode_replay_no_nan which runs before this test.
+        from sglang.srt.layers.attention.flashinfer_mla_backend import (
+            FlashInferMLAAttnBackend,
+        )
+
+        fresh_mr = build_mla_runner(
+            num_heads=_NUM_HEADS,
+            kv_lora_rank=_KV_LORA,
+            qk_rope_head_dim=_QK_ROPE,
+            qk_nope_head_dim=_QK_NOPE,
+            v_head_dim=_V_HEAD,
+            max_bs=_MAX_BS,
+            max_context_len=_MAX_CTX,
+            dtype=_DTYPE,
+        )
+        backend = FlashInferMLAAttnBackend(fresh_mr)
+        layer = _make_mla_layer()
+        set_forward_context(ForwardContext(attn_backend=backend))
+
+        backend.init_cuda_graph_state(_MAX_BS, _MAX_BS)
+        fill_req_to_token(fresh_mr, _MAX_BS, _SEQ_LEN)
         req_pool = torch.arange(_MAX_BS, dtype=torch.int32, device="cuda")
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
         fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         init_graph_capture(
-            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
+            backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
 
         q, k, v = _mla_qkv(_MAX_BS)
 
         def _replay():
             init_graph_replay(
-                self.backend,
+                backend,
                 fb,
                 _MAX_BS,
                 req_pool,
@@ -249,7 +282,7 @@ class TestFlashInferMLAInit(CustomTestCase):
                 ForwardMode.DECODE,
                 seq_lens_cpu,
             )
-            return self.backend.forward_decode(q, k, v, self.layer, fb)
+            return backend.forward_decode(q, k, v, layer, fb)
 
         out1 = _replay()
         out2 = _replay()
@@ -390,26 +423,41 @@ class TestCutlassMLAInit(CustomTestCase):
 
 
 @unittest.skipUnless(_TRTLLM_OK, "sgl_kernel not installed")
+def _trtllm_mla_layer():
+    """RadixAttention layer sized for TRTLLM MLA dimensions."""
+    return RadixAttention(
+        num_heads=_TRTLLM_NUM_HEADS,
+        head_dim=_TRTLLM_KV_LORA + _TRTLLM_QK_ROPE,
+        scaling=(_TRTLLM_KV_LORA + _TRTLLM_QK_ROPE) ** -0.5,
+        num_kv_heads=1,
+        layer_id=0,
+        v_head_dim=_TRTLLM_V_HEAD,
+    )
+
+
 class TestTRTLLMMLAInit(CustomTestCase):
-    """TRTLLM MLA backend — uses split k_nope / k_rope via _trtllm_mla_qkv."""
+    """TRTLLM MLA backend — uses split k_nope / k_rope via _trtllm_mla_qkv.
+
+    Uses TRTLLM-supported dimensions: kv_lora_rank=256, qk_rope_head_dim=64.
+    """
 
     @classmethod
     def setUpClass(cls):
         from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 
         cls.mr = build_mla_runner(
-            num_heads=_NUM_HEADS,
-            kv_lora_rank=_KV_LORA,
-            qk_rope_head_dim=_QK_ROPE,
-            qk_nope_head_dim=_QK_NOPE,
-            v_head_dim=_V_HEAD,
+            num_heads=_TRTLLM_NUM_HEADS,
+            kv_lora_rank=_TRTLLM_KV_LORA,
+            qk_rope_head_dim=_TRTLLM_QK_ROPE,
+            qk_nope_head_dim=_TRTLLM_QK_NOPE,
+            v_head_dim=_TRTLLM_V_HEAD,
             max_bs=_MAX_BS,
-            max_context_len=_MAX_CTX,
+            max_context_len=_TRTLLM_MAX_CTX,
             dtype=_DTYPE,
-            page_size=32,  # TRTLLM MLA kernel requires block_size 32 or 64
+            page_size=_TRTLLM_PAGE_SIZE,
         )
         cls.backend = TRTLLMMLABackend(cls.mr)
-        cls.layer = _make_mla_layer()
+        cls.layer = _trtllm_mla_layer()
         set_forward_context(ForwardContext(attn_backend=cls.backend))
 
     @classmethod
