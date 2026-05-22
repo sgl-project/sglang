@@ -40,24 +40,10 @@ class _PendingSnapshot:
     wrap_count: Optional[FutureTensor]
 
 
-def format_swa_divergence_line(
-    *,
-    forward_ct: int,
-    verify_full: int,
-    verify_swa: int,
-    mapping_nonidentity: int,
-    swa_pool_wrap: int,
-) -> str:
-    payload = asdict(
-        ParsedSwaDivergenceLine(
-            forward_ct=forward_ct,
-            verify_full=verify_full,
-            verify_swa=verify_swa,
-            mapping_nonidentity=mapping_nonidentity,
-            swa_pool_wrap=swa_pool_wrap,
-        )
+def format_swa_divergence_line(parsed: ParsedSwaDivergenceLine) -> str:
+    return SWA_DIVERGENCE_LOG_PREFIX + json.dumps(
+        asdict(parsed), separators=(",", ":")
     )
-    return SWA_DIVERGENCE_LOG_PREFIX + json.dumps(payload, separators=(",", ":"))
 
 
 def parse_swa_divergence_line(line: str) -> Optional[ParsedSwaDivergenceLine]:
@@ -156,14 +142,17 @@ class SwaDivergenceStats:
         self._latest_verify_swa = verify_swa
         self._latest_mapping_nonidentity = mapping_nonidentity
 
-        line = format_swa_divergence_line(
-            forward_ct=self._forward_ct,
-            verify_full=verify_full,
-            verify_swa=verify_swa,
-            mapping_nonidentity=mapping_nonidentity,
-            swa_pool_wrap=wrap_count,
+        logger.info(
+            format_swa_divergence_line(
+                ParsedSwaDivergenceLine(
+                    forward_ct=self._forward_ct,
+                    verify_full=verify_full,
+                    verify_swa=verify_swa,
+                    mapping_nonidentity=mapping_nonidentity,
+                    swa_pool_wrap=wrap_count,
+                )
+            )
         )
-        logger.info(line)
 
         self._pending = None
 
