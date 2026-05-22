@@ -15,6 +15,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     RealKvSource,
     VerifyOrWriteContext,
 )
+from sglang.jit_kernel.kv_canary.verify_ref import _compute_real_kv_hash_scalar
 from sglang.jit_kernel.kv_canary.write import (
     launch_canary_write_kernel,
 )
@@ -456,15 +457,12 @@ class TestChain:
 
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for slot_idx, token, position in zip(slot_indices, tokens, positions):
-            rkv = 0
-            for src in sources_cuda:
-                row_bytes = (
-                    src.tensor[slot_idx, : src.read_bytes].detach().cpu().tolist()
-                )
-                fold = 0
-                for b in row_bytes:
-                    fold = splitmix64(fold ^ int(b))
-                rkv = splitmix64(rkv ^ fold)
+            rkv = _compute_real_kv_hash_scalar(
+                real_kv_sources=sources_cuda,
+                real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                slot_idx=slot_idx,
+                work_device=torch.device("cpu"),
+            )
             stored_prev_signed = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
             )[2]
