@@ -344,7 +344,15 @@ class MultimodalDataItem:
         return ret
 
     def reconstruct(self):
-        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
+        has_ipc_proxy = isinstance(
+            self.feature, CudaIpcTensorTransportProxy
+        ) or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+        if not has_ipc_proxy:
+            has_ipc_proxy = any(
+                isinstance(value, CudaIpcTensorTransportProxy)
+                for value in self.model_specific_data.values()
+            )
+        if not has_ipc_proxy:
             return
 
         reconstruct_device = torch.cuda.current_device()
@@ -368,11 +376,12 @@ class MultimodalDataItem:
 
 @dataclasses.dataclass
 class MultimodalProcessorOutput:
-    """Raw output from multimodal processors, before pad/hash computation.
+    """Raw output from multimodal processors before scheduler-side preparation.
 
     This is the typed replacement for the dict previously returned by
-    ``BaseMultimodalProcessor.process_mm_data_async``.  Unlike
-    ``MultimodalInputs``, items here do NOT carry pad_value or hash yet.
+    ``BaseMultimodalProcessor.process_mm_data_async``.  Preprocessed inputs may
+    already carry ``pad_value`` and ``hash`` to avoid hashing the same tensor once
+    per scheduler TP rank.
     """
 
     mm_items: List[MultimodalDataItem]

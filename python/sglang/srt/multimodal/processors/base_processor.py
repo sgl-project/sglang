@@ -1083,6 +1083,31 @@ class BaseMultimodalProcessor(ABC):
 
         return collected_items, input_ids, ret
 
+    def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
+        if not tensor.is_cuda:
+            return tensor
+
+        sync_flag, available_slice, byte_offset = (
+            self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(tensor)
+        )
+        if isinstance(available_slice, torch.Tensor):
+            available_slice.copy_(tensor.view(torch.int8).view(-1), non_blocking=True)
+            return CudaIpcTensorTransportProxy(
+                data=available_slice,
+                info_data=tensor,
+                sync_buffer_meta=sync_flag,
+                pool_ipc_handle=(
+                    self.cudaipc_mmfeature_pool._pool_ipc_handle
+                    if _IPC_POOL_HANDLE_CACHE
+                    else None
+                ),
+                pool_byte_offset=byte_offset,
+                pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
+            )
+        if self.server_args.keep_mm_feature_on_device:
+            return tensor
+        return tensor.cpu()
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
@@ -1177,6 +1202,13 @@ class BaseMultimodalProcessor(ABC):
 
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
+        for item in all_collected_items:
+            if item.format in (
+                MultimodalInputFormat.PROCESSOR_OUTPUT,
+                MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+            ):
+                item.set_pad_value()
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)
@@ -1188,58 +1220,11 @@ class BaseMultimodalProcessor(ABC):
         if SGL_USE_CUDA_IPC:
             # post-process
             for item in all_collected_items:
-                if isinstance(item.feature, torch.Tensor) and item.feature.is_cuda:
-                    sync_flag, available_slice, byte_offset = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.feature
-                        )
+                if isinstance(item.feature, torch.Tensor):
+                    item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)
+                if isinstance(item.precomputed_embeddings, torch.Tensor):
+                    item.precomputed_embeddings = self._wrap_tensor_for_cuda_ipc(
+                        item.precomputed_embeddings
                     )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.feature.view(torch.int8).view(-1), non_blocking=True
-                        )
-                        item.feature = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.feature,
-                            sync_buffer_meta=sync_flag,
-                            pool_ipc_handle=(
-                                self.cudaipc_mmfeature_pool._pool_ipc_handle
-                                if _IPC_POOL_HANDLE_CACHE
-                                else None
-                            ),
-                            pool_byte_offset=byte_offset,
-                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.feature = item.feature.cpu()
-                elif (
-                    isinstance(item.precomputed_embeddings, torch.Tensor)
-                    and item.precomputed_embeddings.is_cuda
-                ):
-
-                    sync_flag, available_slice, byte_offset = (
-                        self.cudaipc_mmfeature_pool.return_a_slice_tensor_with_flag(
-                            item.precomputed_embeddings
-                        )
-                    )
-                    if isinstance(available_slice, torch.Tensor):
-                        available_slice.copy_(
-                            item.precomputed_embeddings.view(torch.int8).view(-1),
-                            non_blocking=True,
-                        )
-                        item.precomputed_embeddings = CudaIpcTensorTransportProxy(
-                            data=available_slice,
-                            info_data=item.precomputed_embeddings,
-                            sync_buffer_meta=sync_flag,
-                            pool_ipc_handle=(
-                                self.cudaipc_mmfeature_pool._pool_ipc_handle
-                                if _IPC_POOL_HANDLE_CACHE
-                                else None
-                            ),
-                            pool_byte_offset=byte_offset,
-                            pool_device_index=self.cudaipc_mmfeature_pool._pool_device_index,
-                        )
-                    elif not self.server_args.keep_mm_feature_on_device:
-                        item.precomputed_embeddings = item.precomputed_embeddings.cpu()
 
         return all_collected_items, input_ids, ret
