@@ -123,8 +123,15 @@ async def kda_cache(disaggregation_mode: str, tokenizer_manager: TokenizerManage
         )
         return
 
-    with open(prompts_file) as f:
-        prompts = json.load(f)
+    try:
+        with open(prompts_file) as f:
+            prompts = json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Warmup prompts file not found: {prompts_file}")
+        return
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding JSON from warmup prompts file: {prompts_file}: {e}")
+        return
 
     if not isinstance(prompts, list) or len(prompts) == 0:
         logger.warning("warmup prompts file is empty or not a list, skipping")
