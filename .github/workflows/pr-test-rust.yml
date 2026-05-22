@@ -91,6 +91,17 @@ jobs:
           python3 -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python3 -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
 
+  sgl-kernel-build-wheels:
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
+    with:
+      runs_on: x64-kernel-build-node
+      job_display_name: Build sgl-kernel Wheel
+    secrets: inherit
+
   python-unit-tests:
     needs: build-wheel
     runs-on: ubuntu-latest
@@ -193,7 +204,7 @@ jobs:
 
   gateway-e2e:
     name: ${{ matrix.name }}
-    needs: build-wheel
+    needs: [build-wheel, sgl-kernel-build-wheels]
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -282,9 +293,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Prepare sgl-kernel/dist for prebuilt wheel
+        run: |
+          ls -alh sgl-kernel/dist || true
+          rm -rf sgl-kernel/dist/* || true
+
+      - name: Download sgl-kernel wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: sgl-kernel/dist/
+          merge-multiple: true
+          pattern: wheel-python3.10-cuda*
+
       - name: Install SGLang dependencies
         run: |
-          bash scripts/ci/cuda/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
