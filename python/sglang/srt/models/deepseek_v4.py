@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
+import time
+from typing import (
+    TYPE_CHECKING,
+    Iterable,
+    List,
+    Literal,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -11,23 +21,27 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
     fused_rope_inplace,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention.dsa.utils import (
+    can_dsa_cp_split,
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.layers.attention.dsv4.compressor import Compressor
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
-from sglang.srt.layers.attention.nsa.utils import (
-    can_nsa_cp_split,
-    is_nsa_enable_prefill_cp,
-    is_nsa_prefill_cp_round_robin_split,
-    nsa_use_prefill_cp,
-)
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -49,7 +63,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.rotary_embedding import get_rope_wrapper
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -62,10 +77,21 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
 )
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+
+if not _is_hip:
+    from sglang.srt.layers.utils.cp_utils import (
+        prepare_context_parallel_metadata,
+    )
+
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
@@ -84,12 +110,12 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
     )
+    from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
+        DeepseekV4HipRadixBackend,
+    )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.model_executor.forward_batch_info import (
-        ForwardBatch,
-        PPProxyTensors,
-    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @triton.jit
@@ -156,8 +182,8 @@ class MQALayer(nn.Module):
         super().__init__()
         self.tp_rank = attn_tp_rank = get_attention_tp_rank()
         self.tp_size = attn_tp_size = get_attention_tp_size()
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
             self.tp_rank = attn_tp_rank = 0
             self.tp_size = attn_tp_size = 1
@@ -192,6 +218,16 @@ class MQALayer(nn.Module):
             rope_scaling["rope_type"] = "deepseek_yarn"
 
         rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
+
+        self.rotary_emb = get_rope_wrapper(
+            head_size=self.rope_head_dim,
+            rotary_dim=self.rope_head_dim,
+            max_position=config.max_position_embeddings,
+            base=rope_base,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+            device=get_global_server_args().device,
+        )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
@@ -236,6 +272,7 @@ class MQALayer(nn.Module):
                 head_dim=self.head_dim,
                 rotate=False,
                 prefix=add_prefix("compressor", prefix),
+                rotary_emb=getattr(self, "rotary_emb", None),
             )
             if self.compress_ratio == 4:
                 self.indexer = C4Indexer(
@@ -245,10 +282,11 @@ class MQALayer(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix("indexer", prefix),
                     alt_streams=self.alt_streams_indexer,
+                    rotary_emb=getattr(self, "rotary_emb", None),
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -357,14 +395,14 @@ class MQALayer(nn.Module):
     ) -> None:
         """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
 
-        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
+        Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
@@ -383,11 +421,12 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
+        """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        kv = kv.contiguous()
         fused_norm_rope_inplace(
             kv,
             self.kv_norm.weight.data,
@@ -402,7 +441,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4AttnBackend,
+        attn_backend,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
@@ -432,6 +471,7 @@ class MQALayer(nn.Module):
                     x=x,
                     q_lora=q_lora,
                     forward_batch=forward_batch,
+                    attn_backend=attn_backend,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
                 )
@@ -462,7 +502,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4AttnBackend,
+        attn_backend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
@@ -474,10 +514,10 @@ class MQALayer(nn.Module):
         q_lora = self.q_norm(q_lora)
         q = self._compute_q_b(q_lora, positions, q_out)
 
-        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
             # write to the FlashMLA cache after gather.
             kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
             kv = cp_all_gather_rerange_output(
@@ -498,7 +538,12 @@ class MQALayer(nn.Module):
         del qkv_a
 
         if self.indexer is not None:
-            self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
+            self.indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                attn_backend=attn_backend,
+            )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -521,16 +566,19 @@ class MQALayer(nn.Module):
             ), "short-circuiting allreduce will lead to hangs"
             return x
 
-        attn_backend = forward_batch.attn_backend
+        attn_backend = get_attn_backend()
         if TYPE_CHECKING:
-            assert isinstance(attn_backend, DeepseekV4AttnBackend)
+            assert isinstance(
+                attn_backend,
+                (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
-            and not (self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch))
+            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
@@ -554,7 +602,7 @@ class MQALayer(nn.Module):
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
+        # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
         o = attn_backend.forward(
@@ -587,6 +635,7 @@ class MQALayer(nn.Module):
                 o.reshape(T * G, D).contiguous(),
                 group_size=128,
             )
+            o_s = deep_gemm.ceil_to_ue8m0(o_s)
             output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
@@ -656,7 +705,71 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+
+    def prewarm_mhc_token_counts(
+        self, token_counts: Tuple[int, ...], device: torch.device
+    ) -> None:
+        paths = (
+            (
+                "attn",
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.input_layernorm,
+            ),
+            (
+                "ffn",
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
+            ),
+        )
+
+        with torch.inference_mode():
+            for num_tokens in token_counts:
+                for path_name, hc_fn, hc_scale, hc_base, norm in paths:
+                    tic = time.perf_counter()
+                    residual = torch.empty(
+                        (num_tokens, self.hc_mult, self.hidden_size),
+                        dtype=torch.bfloat16,
+                        device=device,
+                    )
+                    y, post, comb, _ = self.hc_pre(
+                        residual,
+                        hc_fn,
+                        hc_scale,
+                        hc_base,
+                        norm=norm,
+                    )
+                    del residual, y, post, comb
+                    torch.cuda.synchronize()
+                    logger.info(
+                        "DeepSeek V4 MHC prewarm path=%s num_tokens=%s completed in %.3fs",
+                        path_name,
+                        num_tokens,
+                        time.perf_counter() - tic,
+                    )
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        from sglang.srt.layers.mhc import get_mhc_pre_token_count_representatives
+
+        token_counts = get_mhc_pre_token_count_representatives(
+            max_num_tokens, self.hc_mult * self.hidden_size
+        )
+        if not token_counts:
+            return token_counts
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm max_num_tokens=%s representative token counts: %s",
+            max_num_tokens,
+            token_counts,
+        )
+        self.prewarm_mhc_token_counts(token_counts, device)
+        return token_counts
 
     def hc_pre(
         self,
@@ -710,6 +823,22 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            return y, post.squeeze(-1), comb, False
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
@@ -757,6 +886,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
+
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+            return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -808,7 +944,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if not norm_fused:
             hidden_states = self.post_attention_layernorm(hidden_states)
 
-        _use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
             not _use_cp
             and get_attention_dp_size() > 1
@@ -830,7 +966,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids = input_ids[cp_rank::cp_size].contiguous()
             input_ids_global = input_ids
         elif _use_tp_moe_gather:
-            hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+            hidden_states, local_hidden_states = (
+                get_global_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
         _a2a_scatter_chunks: Optional[List[torch.Tensor]] = None
         if _use_tp_attn_a2a_scatter:
@@ -846,7 +985,10 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids_global=input_ids_global,
         )
         if _use_tp_moe_gather:
-            hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
+            hidden_states, global_hidden_states = (
+                get_local_dp_buffer(get_tp_group()),
+                hidden_states,
+            )
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
         if _use_tp_attn_a2a_scatter:
             assert _a2a_scatter_chunks is not None
@@ -870,11 +1012,15 @@ class DeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            enable_tp=not is_dp_attention_enabled(),
-        )
+        self.hidden_size = config.hidden_size
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                enable_tp=not is_dp_attention_enabled(),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.rms_norm_eps = config.rms_norm_eps
         self.alt_streams = (
             [torch.cuda.Stream() for _ in range(5)] if (_is_cuda or _is_hip) else None
@@ -892,21 +1038,43 @@ class DeepseekV4Model(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
         self.gemm_output_zero_allocator_size = 0
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
-        hc_dim = hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+        if self.pp_group.is_last_rank:
+            hc_dim = hc_mult * config.hidden_size
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(hc_mult, hc_dim, dtype=torch.float32)
+            )
+            self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
+            self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        tic = time.perf_counter()
+        logger.info(
+            "Running DeepSeek V4 MHC prewarm for max_num_tokens=%s",
+            max_num_tokens,
+        )
+        token_counts = self.layers[self.start_layer].prewarm_mhc_token_count_buckets(
+            max_num_tokens, device
+        )
+        logger.info(
+            "DeepSeek V4 MHC prewarm finished in %.3fs for representative token counts: %s",
+            time.perf_counter() - tic,
+            token_counts,
+        )
+        return token_counts
 
     def hc_head(
         self,
@@ -940,9 +1108,19 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
-        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        else:
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+            if hidden_states.ndim == 2:
+                hidden_states = hidden_states.view(
+                    hidden_states.shape[0], self.hc_mult, self.hidden_size
+                )
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -955,9 +1133,14 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if nsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
+        if dsa_use_prefill_cp(forward_batch):
+            if self.pp_group.is_first_rank:
+                hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        # Upgrade lazy raw metadata on the main stream once before any layer
+        # forks alt-streams; later per-layer calls become no-ops.
+        get_attn_backend()._maybe_upgrade_forward_metadata()
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -969,13 +1152,18 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if nsa_use_prefill_cp(forward_batch):
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+
+        if not self.pp_group.is_last_rank:
+            # Flatten 3D mHC tensor for PP IPC.
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -1003,32 +1191,68 @@ class DeepseekV4ForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("model", prefix)
         )
         self.pp_group = get_pp_group()
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    prefix=add_prefix("lm_head", prefix),
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                )
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
-            )
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
-        get_attn_tp_context().init_context(config.q_lora_rank, is_nsa=True)
+        get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, deepseek_v2.DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(
+                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                )
             }
         )
 
-        self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-        if self.nsa_enable_prefill_cp:
+        # Expose start_layer/end_layer for model_runner PP support
+        self.start_layer = self.model.start_layer
+        self.end_layer = self.model.end_layer
+
+        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        if self.dsa_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
             self.cp_size = get_attention_cp_size()
+
+    def prewarm_mhc_token_count_buckets(
+        self, max_num_tokens: int, device: torch.device
+    ) -> Tuple[int, ...]:
+        return self.model.prewarm_mhc_token_count_buckets(max_num_tokens, device)
+
+    def kernel_warmup(self, model_runner) -> None:
+        if not model_runner.is_hybrid_swa:
+            return
+        if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+            return
+        if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+            return
+
+        max_num_tokens = model_runner.server_args.chunked_prefill_size
+        if max_num_tokens is None or max_num_tokens <= 0:
+            max_num_tokens = 8192
+
+        token_counts = self.prewarm_mhc_token_count_buckets(
+            max_num_tokens, model_runner.device
+        )
+        model_runner.tp_group.barrier()
+
+        logger.info(
+            "DeepSeek V4 MHC prewarm completed for representative token-count shapes: %s",
+            token_counts,
+        )
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -1055,30 +1279,32 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.nsa_enable_prefill_cp:
-            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+        if self.dsa_enable_prefill_cp:
+            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
                 )
-                if is_nsa_prefill_cp_round_robin_split():
-                    metadata = forward_batch.attn_backend.forward_metadata
+                if is_dsa_prefill_cp_round_robin_split():
+                    attn_backend = get_attn_backend()
+                    metadata = attn_backend.forward_metadata
                     core_meta = metadata.core_attn_metadata
                     core_meta.apply_cp_reindex()
                     core_meta.init_flashmla_related()
                     if metadata.indexer_metadata is not None:
                         metadata.indexer_metadata = (
-                            forward_batch.attn_backend.init_forward_metadata_indexer(
-                                core_meta
-                            )
+                            attn_backend.init_forward_metadata_indexer(core_meta)
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
-                input_ids, positions, forward_batch, input_embeds
+                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
@@ -1095,7 +1321,13 @@ class DeepseekV4ForCausalLM(nn.Module):
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from deep_gemm import transform_sf_into_required_layout
 
-        layers = self.model.layers
+        if is_nextn:
+            layers = [self.model.decoder]
+        else:
+            layers = [
+                self.model.layers[layer_id]
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+            ]
         for layer in layers:
             attn = layer.self_attn
             G = attn.n_local_groups
@@ -1118,7 +1350,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
-        for layer in self.model.layers:
+        for layer_id in range(self.model.start_layer, self.model.end_layer):
+            layer = self.model.layers[layer_id]
             self_attn = layer.self_attn
             if self_attn.compress_ratio != 0 and not self_attn.compressor.ape_converted:
                 self_attn.compressor.apply_ape_hotfix()
@@ -1234,7 +1467,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -1386,7 +1619,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
-                            if ".norm." in name and not self.pp_group.is_last_rank:
+                            if (
+                                name == "model.norm.weight"
+                                and not self.pp_group.is_last_rank
+                            ):
+                                continue
+                            if (
+                                name.startswith("model.hc_head_")
+                                or name == "lm_head.weight"
+                            ) and not self.pp_group.is_last_rank:
                                 continue
                             elif COMPRESSOR_PART in name:
                                 is_kv = name.endswith(".wkv.weight")
@@ -1490,6 +1731,11 @@ class DeepseekV4ForCausalLM(nn.Module):
         unloaded_params = params_dict.keys() - loaded_params
 
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
+        if not self.pp_group.is_first_rank:
+            skipped_checking_patterns.append("embed_tokens")
+        if not self.pp_group.is_last_rank:
+            skipped_checking_patterns.append("model.norm.")
+            skipped_checking_patterns.extend(["lm_head", "hc_head_"])
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
         unloaded_params = {

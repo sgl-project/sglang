@@ -27,13 +27,12 @@ export const DeepSeekV4Deployment = () => {
       name: "hardware",
       title: "Hardware Platform",
       items: [
-        { id: "b200",  label: "B200 (FP4)",  default: true  },
-        { id: "b300",  label: "B300 (FP4)",  default: false  },
-        { id: "gb200", label: "GB200 (FP4)", default: false },
-        { id: "gb300", label: "GB300 (FP4)", default: false },
-        { id: "h200",  label: "H200 (FP8)",  default: false },
-        { id: "h200-fp4", label: "H200 (FP4)", default: false },
-        { id: "h100", label: "H100 (FP4)", default: false },
+        { id: "b200",  label: "B200",  default: true  },
+        { id: "b300",  label: "B300",  default: false },
+        { id: "gb200", label: "GB200", default: false },
+        { id: "gb300", label: "GB300", default: false },
+        { id: "h200",  label: "H200",  default: false },
+        { id: "h100",  label: "H100",  default: false },
       ],
     },
     modelSize: {
@@ -42,6 +41,14 @@ export const DeepSeekV4Deployment = () => {
       items: [
         { id: "small", label: "Flash", default: true,  subtitle: "285B" },
         { id: "big",   label: "Pro",   default: false, subtitle: "1.6T" },
+      ],
+    },
+    quantization: {
+      name: "quantization",
+      title: "Quantization",
+      items: [
+        { id: "fp4", label: "FP4",        default: true  },
+        { id: "fp8", label: "FP8", default: false, subtitle: "H100/H200 only" },
       ],
     },
     recipe: {
@@ -71,19 +78,99 @@ export const DeepSeekV4Deployment = () => {
         { id: "enabled",  label: "Enabled",  default: false, subtitle: "deepseekv4" },
       ],
     },
+    hicache: {
+      name: "hicache",
+      title: "HiCache",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "l2",       label: "L2",       default: false, subtitle: "GPU+CPU" },
+      ],
+    },
+    megamoe: {
+      name: "megamoe",
+      title: "MegaMoE",
+      items: [
+        { id: "disabled", label: "Disabled", default: true  },
+        { id: "w4a8",     label: "W4A8",     default: false },
+        { id: "w4a4",     label: "W4A4",     default: false, subtitle: "FP4 acts" },
+      ],
+    },
+  };
+
+  // Hopper GPUs supporting the SGLang FP8 repackaging path.
+  const FP8_SUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+
+  // Internal "effective hardware" id used by HW_SIZE_SPEC / VERIFIED_RECIPES.
+  // Combines the user-facing hardware choice with the Quantization axis:
+  //   h200 + fp4 → h200-fp4   (Marlin FP4 path on H200)
+  //   h200 + fp8 → h200       (sgl-project FP8 ckpts on H200)
+  //   h100 + fp4 → h100       (Marlin FP4 path on H100)
+  //   h100 + fp8 → h100-fp8   (Flash-only FP8 path on H100)
+  //   anything else → hardware unchanged
+  const effHw = (hardware, quantization) => {
+    if (hardware === "h200") return quantization === "fp8" ? "h200" : "h200-fp4";
+    if (hardware === "h100") return quantization === "fp8" ? "h100-fp8" : "h100";
+    return hardware;
   };
 
   // Recipes that are not supported on the Marlin (FP4) Hopper paths
   // (H200 FP4, H100 FP4).
   const MARLIN_UNSUPPORTED_RECIPES = new Set(["cp", "pd-disagg"]);
-  const MARLIN_HARDWARE = new Set(["h200-fp4", "h100"]);
+  const MARLIN_EFFHW = new Set(["h200-fp4", "h100"]);
   const MARLIN_LABEL = { "h200-fp4": "H200 (FP4)", h100: "H100 (FP4)" };
 
+  // MegaMoE is only supported on Blackwell with DeepEP-based recipes
+  // (balanced / max-throughput / pd-disagg). It's disabled on Hopper
+  // (H100 / H200, both FP4 and FP8) and on low-latency / cp recipes.
+  const MEGAMOE_UNSUPPORTED_RECIPES = new Set(["low-latency", "cp"]);
+  const MEGAMOE_UNSUPPORTED_HARDWARE = new Set(["h100", "h200"]);
+  const isMegamoeUnsupported = (vals) =>
+    MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware) ||
+    MEGAMOE_UNSUPPORTED_RECIPES.has(vals.recipe);
+
+  // H100 + SGLang FP8 only ships a Flash variant — Pro FP8 on H100 isn't
+  // covered by the generator yet, so the Pro radio is greyed out there.
+  const isProDisabledFp8H100 = (vals) =>
+    vals.hardware === "h100" && vals.quantization === "fp8";
+
   const resolveItems = (option, vals) => {
-    if (option.name === "recipe" && vals && MARLIN_HARDWARE.has(vals.hardware)) {
+    const eff = vals ? effHw(vals.hardware, vals.quantization) : null;
+    if (option.name === "recipe" && eff && MARLIN_EFFHW.has(eff)) {
       return option.items.map((it) =>
         MARLIN_UNSUPPORTED_RECIPES.has(it.id)
-          ? { ...it, disabled: true, disabledReason: `Not supported on ${MARLIN_LABEL[vals.hardware]}` }
+          ? { ...it, disabled: true, disabledReason: `Not supported on ${MARLIN_LABEL[eff]}` }
+          : it
+      );
+    }
+    if (option.name === "recipe" && eff === "h100-fp8") {
+      // H100 SGLang FP8 only has low-latency / balanced / max-throughput
+      // commands verified — cp and pd-disagg fall back to the Marlin
+      // "not supported" message.
+      return option.items.map((it) =>
+        MARLIN_UNSUPPORTED_RECIPES.has(it.id)
+          ? { ...it, disabled: true, disabledReason: "Not supported on H100 (SGLang FP8)" }
+          : it
+      );
+    }
+    if (option.name === "megamoe" && vals && isMegamoeUnsupported(vals)) {
+      const reason = MEGAMOE_UNSUPPORTED_HARDWARE.has(vals.hardware)
+        ? "MegaMoE is only supported on Blackwell"
+        : "MegaMoE is not supported on this recipe";
+      return option.items.map((it) =>
+        it.id === "disabled" ? it : { ...it, disabled: true, disabledReason: reason }
+      );
+    }
+    if (option.name === "quantization" && vals && !FP8_SUPPORTED_HARDWARE.has(vals.hardware)) {
+      return option.items.map((it) =>
+        it.id === "fp8"
+          ? { ...it, disabled: true, disabledReason: "SGLang FP8 is only available on H100 / H200" }
+          : it
+      );
+    }
+    if (option.name === "modelSize" && vals && isProDisabledFp8H100(vals)) {
+      return option.items.map((it) =>
+        it.id === "big"
+          ? { ...it, disabled: true, disabledReason: "H100 SGLang FP8 only ships a Flash variant" }
           : it
       );
     }
@@ -124,15 +211,53 @@ export const DeepSeekV4Deployment = () => {
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => {
       const next = { ...prev, [optionName]: value };
+      // Switching to a hardware that doesn't support FP8 while FP8 is
+      // selected: fall back to FP4.
+      if (
+        optionName === "hardware" &&
+        next.quantization === "fp8" &&
+        !FP8_SUPPORTED_HARDWARE.has(value)
+      ) {
+        next.quantization = "fp4";
+      }
+      // H100 + SGLang FP8 only supports Flash; auto-flip Pro → Flash when
+      // entering that combo (via hardware or quantization switch).
+      if (
+        (optionName === "hardware" || optionName === "quantization") &&
+        isProDisabledFp8H100(next) &&
+        next.modelSize === "big"
+      ) {
+        next.modelSize = "small";
+      }
       // Switching to a Marlin (FP4) Hopper path while cp / pd-disagg is
       // selected: fall back to low-latency since those recipes are not
       // supported on Marlin.
+      const nextEff = effHw(next.hardware, next.quantization);
       if (
-        optionName === "hardware" &&
-        MARLIN_HARDWARE.has(value) &&
+        (optionName === "hardware" || optionName === "quantization") &&
+        (MARLIN_EFFHW.has(nextEff) || nextEff === "h100-fp8") &&
         MARLIN_UNSUPPORTED_RECIPES.has(next.recipe)
       ) {
         next.recipe = "low-latency";
+      }
+      // Switching to a hardware/recipe combo that doesn't support MegaMoE
+      // while w4a8 / w4a4 is selected: fall back to disabled.
+      if (
+        (optionName === "hardware" || optionName === "recipe") &&
+        next.megamoe !== "disabled" &&
+        isMegamoeUnsupported(next)
+      ) {
+        next.megamoe = "disabled";
+      }
+      // Switching to max-throughput on supported hardware: default MegaMoE to
+      // W4A8 if it's currently disabled (best throughput config).
+      if (
+        (optionName === "recipe" || optionName === "hardware") &&
+        next.recipe === "max-throughput" &&
+        next.megamoe === "disabled" &&
+        !isMegamoeUnsupported(next)
+      ) {
+        next.megamoe = "w4a8";
       }
       return next;
     });
@@ -187,6 +312,10 @@ export const DeepSeekV4Deployment = () => {
     // a higher TP: Flash fits at TP=8 single-node, Pro needs TP=16 across 2 nodes.
     "h100|small":  { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 8,  multinode: false },
     "h100|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 16, multinode: true, nnodes: 2 },
+    // H100 (SGLang FP8) ships Flash only — Pro FP8 on H100 is not exposed by
+    // the generator. TP=8 single-node uses the same sgl-project FP8 ckpt as
+    // H200; the Flash/balanced/max-throughput recipes use TP=8 DP=8 + DeepEP.
+    "h100-fp8|small": { slug: "sgl-project/DeepSeek-V4-Flash-FP8", tp: 8, multinode: false },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -254,6 +383,9 @@ export const DeepSeekV4Deployment = () => {
     "h100|big|low-latency",
     "h100|big|balanced",
     "h100|big|max-throughput",
+    "h100-fp8|small|low-latency",
+    "h100-fp8|small|balanced",
+    "h100-fp8|small|max-throughput",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -294,10 +426,20 @@ export const DeepSeekV4Deployment = () => {
     `${cmd}`;
   // === SHARED END ===
 
+  // Hopper FP8 paths (effHw values that share the sgl-project FP8 codepath):
+  // both H200 FP8 and H100 SGLang FP8 go through the same "general" command
+  // branch, skipping flashinfer_mxfp4 / chunked-prefill / mem-frac flags that
+  // are Blackwell-FP4-specific.
+  const isHopperFp8 = (effHwId) => effHwId === "h200" || effHwId === "h100-fp8";
+
   const generateCommand = () => {
-    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: userHardware, modelSize, quantization, recipe, reasoningParser, toolcall, hicache, megamoe } = values;
     // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
-    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
+    const rawHardware = userHardware === "b300" ? "b200" : userHardware;
+    // Translate (hardware, quantization) into the internal "effective hw" id
+    // that HW_SIZE_SPEC / VERIFIED_RECIPES are keyed by. See the effHw helper
+    // at the top of this component for the full mapping.
+    const hardware = effHw(rawHardware, quantization);
     const specKey = `${hardware}|${modelSize}`;
     const spec = HW_SIZE_SPEC[specKey];
     const { slug, tp, multinode, nnodes } = spec;
@@ -307,22 +449,33 @@ export const DeepSeekV4Deployment = () => {
       return buildPDDisaggCommand(hardware, modelSize);
     }
 
-    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
-    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
-    // or flags with either the FP8 H200 path or the Blackwell paths.
+    // H200 (FP4) path: dedicated branch — Hopper runs the FP4-mixed Instruct
+    // repos through one of two w4a16 MoE runners (Marlin or Flashinfer mxfp4),
+    // so it doesn't share envs or flags with either the FP8 H200 path or the
+    // Blackwell paths.
     //   Flash: TP=4, single node       Pro: TP=8, single node
     //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
     //   balanced:       MTP 1 / 1 / 2
     //   max-throughput: MTP disabled
+    //
+    // MoE runner selection (verified on 2026-05-20):
+    //   - Pro: flashinfer_mxfp4 for all recipes
+    //   - Flash Balanced: flashinfer_mxfp4 (~1.5x faster output throughput vs
+    //     Marlin in the balanced throughput benchmark).
+    //   - Flash Low-Latency / Max-Throughput: Marlin (faster than
+    //     flashinfer_mxfp4 in those benchmarks).
     if (hardware === "h200-fp4") {
       const verifyKey = `${hardware}|${modelSize}|${recipe}`;
       if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
 
+      const useFlashinferMxfp4 = isBig || recipe === "balanced";
       const fp4Flags = [
         "  --trust-remote-code",
         `  --model-path ${slug}`,
         `  --tp ${tp}`,
-        "  --moe-runner-backend marlin",
+        useFlashinferMxfp4
+          ? "  --moe-runner-backend flashinfer_mxfp4"
+          : "  --moe-runner-backend marlin",
       ];
       if (recipe === "low-latency") {
         fp4Flags.push("  --speculative-algo EAGLE");
@@ -338,10 +491,21 @@ export const DeepSeekV4Deployment = () => {
       if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
       if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
       if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
+      if (hicache === "l2") {
+        fp4Flags.push("  --enable-hierarchical-cache");
+        fp4Flags.push("  --hicache-ratio 2");
+        fp4Flags.push("  --hicache-size 0");
+        fp4Flags.push("  --hicache-write-policy write_through");
+        fp4Flags.push("  --hicache-io-backend direct");
+        fp4Flags.push("  --hicache-mem-layout page_first_direct");
+      }
       fp4Flags.push("  --host 0.0.0.0");
       fp4Flags.push("  --port 30000");
 
-      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
+      const fp4Env = [];
+      if (hicache === "l2") fp4Env.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+      const fp4EnvBlock = fp4Env.length ? fp4Env.join(" \\\n") + " \\\n" : "";
+      const fp4Cmd = `${fp4EnvBlock}sglang serve \\\n${fp4Flags.join(" \\\n")}`;
       return VERIFIED_RECIPES.has(verifyKey)
         ? fp4Cmd
         : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
@@ -405,11 +569,12 @@ export const DeepSeekV4Deployment = () => {
     // _LAUNCH_HEAD always prepends these:
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
-      h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
-      b200:  [],                              // _ENV_B200 minus NVSHMEM
-      gb300: [],                              // _ENV_GB300
+      h200:      ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
+      "h100-fp8": ["SGLANG_DSV4_FP4_EXPERTS=0"],  // H100 SGLang FP8 shares H200's FP8 env
+      b200:      [],                              // _ENV_B200 minus NVSHMEM
+      gb300:     [],                              // _ENV_GB300
       // GB200 multinode needs NCCL MNNVL for cross-node NVLink communication.
-      gb200: multinode ? ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1"] : [],
+      gb200:     multinode ? ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1"] : [],
     }[hardware];
 
     // Recipe-specific env (matches allinone exactly, taking size into account).
@@ -421,78 +586,29 @@ export const DeepSeekV4Deployment = () => {
       } else if (hardware === "gb200" && isBig) {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       }
-      // B200/B300 Pro accuracy-verified env vars.
-      if (isBig && hardware === "b200") {
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-        );
-      }
     } else if (recipe === "balanced") {
-      if (hardware === "h200") {
+      if (isHopperFp8(hardware)) {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=0",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-        );
+        // B200/B300 Pro: no extra env vars needed.
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
     } else if (recipe === "max-throughput") {
-      if (hardware === "h200") {
-        if (!isBig) {
-          recipeEnv.push("SGLANG_JIT_DEEPGEMM_PRECOMPILE=0");
-        }
+      if (isHopperFp8(hardware)) {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
-      } else if (isBig && hardware === "b200") {
-        // B200/B300 Pro accuracy-verified env vars.
-        recipeEnv.push(
-          "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0",
-          "SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT=1",
-          "SGLANG_OPT_USE_JIT_NORM=1",
-          "SGLANG_OPT_USE_JIT_INDEXER_METADATA=1",
-          "SGLANG_OPT_USE_TOPK_V2=1",
-          "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1",
-          "SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN=1",
-          "SGLANG_OPT_USE_FAST_MASK_EP=1",
-          "SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1",
-          "SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1",
-          "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0",
-          "NVSHMEM_DISABLE_IB=1",
-          "SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW=1",
-          "SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1",
-          "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320",
-        );
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
     } else if (recipe === "cp") {
-      recipeEnv.push("SGLANG_OPT_USE_JIT_INDEXER_METADATA=1");
       if (hardware === "h200") {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       } else {
@@ -528,7 +644,7 @@ export const DeepSeekV4Deployment = () => {
       if (hardware === "h200" && isBig) {
         flags.push("  --moe-a2a-backend deepep");
       }
-      if (hardware !== "h200") {
+      if (!isHopperFp8(hardware)) {
         flags.push("  --moe-runner-backend flashinfer_mxfp4");
       }
       if (hardware === "h200" && isBig) {
@@ -540,14 +656,14 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-num-steps 3");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 4");
-      if (hardware !== "h200") {
+      if (!isHopperFp8(hardware)) {
         // B200/B300 Pro accuracy-verified: chunked-prefill-size 8192
         flags.push(isBig ? "  --chunked-prefill-size 8192" : "  --chunked-prefill-size 4096");
         flags.push("  --disable-flashinfer-autotune");
         flags.push("  --swa-full-tokens-ratio 0.1");
       }
       // B200/B300 Pro accuracy-verified: mem-fraction-static 0.90
-      if (isBig && hardware !== "h200") {
+      if (isBig && !isHopperFp8(hardware)) {
         flags.push("  --mem-fraction-static 0.90");
       } else if (isBig) {
         flags.push("  --mem-fraction-static 0.88");
@@ -600,7 +716,8 @@ export const DeepSeekV4Deployment = () => {
       }
       // allinone H200 gates DEEPEP_LARGE_SMS_FLAG on !multinode — only H200 big
       // is multi-node; all Blackwell cells get the flag unconditionally.
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      // Skip when MegaMoE is enabled (uses its own backend, not DeepEP).
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "max-throughput") {
       // allinone max-throughput: TP + DP + DP-attn + DeepEP (NO MTP).
       //   H200 small: cg=128 max-run=256  |  H200 big: cg=128 max-run=256 (same)
@@ -637,7 +754,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --max-running-requests 256");
       }
-      if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      if (!multinode && megamoe === "disabled") flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "cp") {
       // allinone cp: TP (NO --dp) + DeepEP + _CP_FLAGS (mem-frac 0.78, max-run 1024).
       //   Blackwell big additionally: mem-frac 0.70 (overrides), cg=256, max-run=256.
@@ -645,8 +762,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --tp ${tp}`);
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      flags.push("  --enable-nsa-prefill-context-parallel");
-      flags.push("  --nsa-prefill-cp-mode round-robin-split");
+      flags.push("  --enable-dsa-prefill-context-parallel");
+      flags.push("  --dsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
       // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
       // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
@@ -676,11 +793,52 @@ export const DeepSeekV4Deployment = () => {
     if (toolcall === "enabled") flags.push("  --tool-call-parser deepseekv4");
     if (reasoningParser === "enabled") flags.push("  --reasoning-parser deepseek-v4");
 
+    // HiCache flags (opt-in toggle, not in allinone).
+    if (hicache === "l2") {
+      flags.push("  --enable-hierarchical-cache");
+      flags.push("  --hicache-ratio 2");
+      flags.push("  --hicache-size 0");
+      flags.push("  --hicache-write-policy write_through");
+      flags.push("  --hicache-io-backend direct");
+      flags.push("  --hicache-mem-layout page_first_direct");
+    }
+
+    // MegaMoE: override --moe-a2a-backend deepep → megamoe in generated flags.
+    if (megamoe !== "disabled") {
+      const idx = flags.indexOf("  --moe-a2a-backend deepep");
+      if (idx !== -1) {
+        flags[idx] = "  --moe-a2a-backend megamoe";
+      } else {
+        flags.push("  --moe-a2a-backend megamoe");
+      }
+    }
+
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv];
+    // HiCache env vars.
+    const hicacheEnv = [];
+    if (hicache === "l2") {
+      hicacheEnv.push("SGLANG_ENABLE_UNIFIED_RADIX_TREE=1");
+    }
+
+    // MegaMoE env vars.
+    const megamoeEnv = [];
+    if (megamoe !== "disabled" && recipe === "max-throughput") {
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320");
+    }
+    if (megamoe === "w4a4") {
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_FP4_ACTS=1");
+      megamoeEnv.push("SGLANG_OPT_DEEPGEMM_MEGA_MOE_USE_MXF4_KIND=1");
+    }
+
+    // When MegaMoE is enabled, DeepEP dispatch buffer env is not needed — filter it out.
+    const filteredRecipeEnv = megamoe !== "disabled"
+      ? recipeEnv.filter((e) => !e.startsWith("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK="))
+      : recipeEnv;
+
+    // Assemble: [HW env] [recipe env] [hicache env] [megamoe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...filteredRecipeEnv, ...hicacheEnv, ...megamoeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     // B200/B300 Pro recipes carry many accuracy-verified env vars that will be
     // consolidated; prepend a shell comment so users know these are temporary.
@@ -982,31 +1140,6 @@ python3 -m sglang_router.launch_router \\
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
-      </div>
-      <div style={{ padding: "12px 16px", background: isDark ? "#1a2332" : "#f0f7ff", borderRadius: "6px", border: `1px solid ${isDark ? "#2d4a6f" : "#c8ddf5"}`, fontSize: "13px", lineHeight: "1.6", color: isDark ? "#c8ddf5" : "#1e3a5f" }}>
-        <strong style={{ display: "block", marginBottom: "6px" }}>Enabling MegaMoE</strong>
-        <p style={{ margin: "0" }}>
-          MegaMoE fuses expert dispatch + GEMM into a single kernel for higher throughput on MoE layers.
-          It is currently verified on B200/B300 Pro (balanced &amp; max-throughput recipes above).
-          We have not yet tested the full hardware/recipe matrix, but it should work on other platforms (GB200, GB300, Flash).
-          To enable it, add the flag and env vars:
-        </p>
-        <pre style={{ margin: "8px 0 0 0", padding: "8px 12px", background: isDark ? "#111827" : "#f5f5f5", borderRadius: "4px", fontSize: "12px", lineHeight: "1.5", overflowX: "auto" }}>{
-`# Add this flag to the sglang serve command:
---moe-a2a-backend deepep
-
-# And set these env vars:
-SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE=1
-SGLANG_OPT_FIX_MEGA_MOE_MEMORY=1
-SGLANG_OPT_FIX_NEXTN_MEGA_MOE=1
-SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0`
-        }</pre>
-        <p style={{ margin: "6px 0 0 0", fontSize: "12px", opacity: 0.85, lineHeight: "1.8" }}>
-          Adjust <code>SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK</code> based on your chunked prefill size (e.g. 4096 for balanced, 8320 for max-throughput).<br/>
-          <code>SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=0</code> — if your config mentions DeepEP dispatch buffer constraints, they do not apply when this is set to 0.<br/>
-          These flags are expected to be simplified in a future release.
-        </p>
       </div>
     </div>
   );
