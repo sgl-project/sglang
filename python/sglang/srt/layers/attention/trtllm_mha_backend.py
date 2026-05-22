@@ -332,15 +332,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
-        num_tokens = (
-            forward_batch.positions.shape[0]
-            if forward_batch.positions is not None
-            else bs
-        )
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        req_pool_indices = forward_batch.req_pool_indices
         metadata = TRTLLMMHAMetadata()
         device = seq_lens.device
 
@@ -402,7 +398,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         elif forward_mode.is_target_verify():
             # Target Verify
             # Here we only support topk = 1 for now.
-            tokens_per_req = num_tokens // bs
+            tokens_per_req = self.speculative_num_draft_tokens
             metadata.cache_seqlens_int32 = self.target_verify_metadata["cache_seqlens"][
                 :bs
             ]
@@ -437,7 +433,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 :bs
             ]
             metadata.cache_seqlens_int32.copy_(seq_lens)
-            num_tokens_per_bs = num_tokens // bs
+            num_tokens_per_bs = self.speculative_step_id + 1
             metadata.cu_seqlens_q = torch.arange(
                 0,
                 bs * num_tokens_per_bs + 1,
@@ -449,7 +445,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k = self.draft_extend_metadata["cu_seqlens_k"][
                 : (bs + 1)
             ]
-            num_tokens_per_bs = num_tokens // bs
             metadata.max_seq_len_q = num_tokens_per_bs
             metadata.max_seq_len_k = seq_lens.max().item()
 
