@@ -52,8 +52,8 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        self.output_tokens_buf = torch.full(
-            (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+        self.output_tokens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
         )
         self.new_seq_lens_buf = torch.empty(
             (self.req_pool_size,), dtype=torch.int64, device=self.device
