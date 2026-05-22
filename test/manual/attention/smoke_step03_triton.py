@@ -89,24 +89,26 @@ fill_req_to_token(mr, MAX_BS, SEQ_LEN)
 req_pool = torch.arange(MAX_BS, dtype=torch.int32, device="cuda")
 seq_lens = torch.full((MAX_BS,), SEQ_LEN, dtype=torch.int32, device="cuda")
 seq_lens_cpu = torch.full((MAX_BS,), SEQ_LEN, dtype=torch.int32)
+from step03_test_utils import init_graph_capture, init_graph_replay
+
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
-print("Calling init_forward_metadata_capture_cuda_graph...")
-backend.init_forward_metadata_capture_cuda_graph(
-    MAX_BS, MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+fb_g = make_decode_batch(MAX_BS, SEQ_LEN)
+print("Calling graph capture init...")
+init_graph_capture(
+    backend, fb_g, MAX_BS, MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
 )
-print("Calling init_forward_metadata_replay_cuda_graph...")
-backend.init_forward_metadata_replay_cuda_graph(
+print("Calling graph replay init...")
+init_graph_replay(
+    backend,
+    fb_g,
     MAX_BS,
     req_pool,
     seq_lens,
     MAX_BS * SEQ_LEN,
-    None,
     ForwardMode.DECODE,
-    None,
     seq_lens_cpu,
 )
-fb_g = make_decode_batch(MAX_BS, SEQ_LEN)
 q_g, k_g, v_g = make_qkv(MAX_BS, NUM_HEADS, HEAD_DIM, dtype=DTYPE)
 print("Calling forward_decode (graph replay)...")
 out_g = backend.forward_decode(q_g, k_g, v_g, layer, fb_g)

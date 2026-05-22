@@ -382,6 +382,59 @@ def gpu_arch_sm() -> Optional[int]:
     return major * 10 + minor
 
 
+# ---------------------------------------------------------------------------
+# API-compatibility helpers
+# ---------------------------------------------------------------------------
+# Step-03 removed init_forward_metadata_capture/replay_cuda_graph (they raise
+# NotImplementedError) and replaced them with init_forward_data_out_graph(fb).
+# These wrappers try the old API first, then fall back to the new API, so the
+# same test file works on both the pre-step-03 branch and the step-03 branch.
+
+
+def init_graph_capture(
+    backend,
+    fb: "ForwardBatch",
+    bs: int,
+    num_tokens: int,
+    req_pool_indices: "torch.Tensor",
+    seq_lens: "torch.Tensor",
+    forward_mode: "ForwardMode",
+) -> None:
+    """Graph capture init: old API or step-03 init_forward_data_out_graph."""
+    try:
+        backend.init_forward_metadata_capture_cuda_graph(
+            bs, num_tokens, req_pool_indices, seq_lens, None, forward_mode, None
+        )
+    except NotImplementedError:
+        backend.init_forward_data_out_graph(fb)
+
+
+def init_graph_replay(
+    backend,
+    fb: "ForwardBatch",
+    bs: int,
+    req_pool_indices: "torch.Tensor",
+    seq_lens: "torch.Tensor",
+    seq_lens_sum: int,
+    forward_mode: "ForwardMode",
+    seq_lens_cpu: "torch.Tensor",
+) -> None:
+    """Graph replay init: old API or step-03 init_forward_data_out_graph."""
+    try:
+        backend.init_forward_metadata_replay_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            None,
+            forward_mode,
+            None,
+            seq_lens_cpu,
+        )
+    except NotImplementedError:
+        backend.init_forward_data_out_graph(fb)
+
+
 def _model_exists(model_id: str) -> bool:
     """Return True if the model appears accessible (local path or HF offline cache)."""
     import os

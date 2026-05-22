@@ -32,6 +32,8 @@ from step03_test_utils import (
     build_mla_runner,
     fill_req_to_token,
     gpu_arch_sm,
+    init_graph_capture,
+    init_graph_replay,
     make_decode_batch,
     make_extend_batch,
 )
@@ -158,8 +160,9 @@ class TestFlashInferMLAInit(CustomTestCase):
         self._fill(_MAX_BS, _SEQ_LEN)
         req_pool = torch.arange(_MAX_BS, dtype=torch.int32, device="cuda")
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
 
     def test_graph_decode_replay_no_nan(self):
@@ -169,20 +172,20 @@ class TestFlashInferMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        init_graph_replay(
+            self.backend,
+            fb,
             _MAX_BS,
             req_pool,
             seq_lens,
             _MAX_BS * _SEQ_LEN,
-            None,
             ForwardMode.DECODE,
-            None,
             seq_lens_cpu,
         )
-        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         q, k, v = _mla_qkv(_MAX_BS)
         out = self.backend.forward_decode(q, k, v, self.layer, fb)
         assert_no_nan_inf(self, out, "flashinfer_mla graph replay")
@@ -194,22 +197,22 @@ class TestFlashInferMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
 
-        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         q, k, v = _mla_qkv(_MAX_BS)
 
         def _replay():
-            self.backend.init_forward_metadata_replay_cuda_graph(
+            init_graph_replay(
+                self.backend,
+                fb,
                 _MAX_BS,
                 req_pool,
                 seq_lens,
                 _MAX_BS * _SEQ_LEN,
-                None,
                 ForwardMode.DECODE,
-                None,
                 seq_lens_cpu,
             )
             return self.backend.forward_decode(q, k, v, self.layer, fb)
@@ -264,20 +267,20 @@ class TestFlashMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        init_graph_replay(
+            self.backend,
+            fb,
             _MAX_BS,
             req_pool,
             seq_lens,
             _MAX_BS * _SEQ_LEN,
-            None,
             ForwardMode.DECODE,
-            None,
             seq_lens_cpu,
         )
-        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         q, k, v = _mla_qkv(_MAX_BS)
         out = self.backend.forward_decode(q, k, v, self.layer, fb)
         assert_no_nan_inf(self, out, "flashmla graph replay")
@@ -328,20 +331,20 @@ class TestCutlassMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        init_graph_replay(
+            self.backend,
+            fb,
             _MAX_BS,
             req_pool,
             seq_lens,
             _MAX_BS * _SEQ_LEN,
-            None,
             ForwardMode.DECODE,
-            None,
             seq_lens_cpu,
         )
-        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         q, k, v = _mla_qkv(_MAX_BS)
         out = self.backend.forward_decode(q, k, v, self.layer, fb)
         assert_no_nan_inf(self, out, "cutlass_mla graph replay")
@@ -401,20 +404,20 @@ class TestTRTLLMMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
+        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
         )
-        self.backend.init_forward_metadata_replay_cuda_graph(
+        init_graph_replay(
+            self.backend,
+            fb,
             _MAX_BS,
             req_pool,
             seq_lens,
             _MAX_BS * _SEQ_LEN,
-            None,
             ForwardMode.DECODE,
-            None,
             seq_lens_cpu,
         )
-        fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
         q, k, v = _mla_qkv(_MAX_BS)
         out = self.backend.forward_decode(q, k, v, self.layer, fb)
         assert_no_nan_inf(self, out, "trtllm_mla graph replay")
@@ -426,21 +429,21 @@ class TestTRTLLMMLAInit(CustomTestCase):
         seq_lens = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32, device="cuda")
         seq_lens_cpu = torch.full((_MAX_BS,), _SEQ_LEN, dtype=torch.int32)
 
-        self.backend.init_forward_metadata_capture_cuda_graph(
-            _MAX_BS, _MAX_BS, req_pool, seq_lens, None, ForwardMode.DECODE, None
-        )
         fb = make_decode_batch(_MAX_BS, _SEQ_LEN)
+        init_graph_capture(
+            self.backend, fb, _MAX_BS, _MAX_BS, req_pool, seq_lens, ForwardMode.DECODE
+        )
         q, k, v = _mla_qkv(_MAX_BS)
 
         def _replay():
-            self.backend.init_forward_metadata_replay_cuda_graph(
+            init_graph_replay(
+                self.backend,
+                fb,
                 _MAX_BS,
                 req_pool,
                 seq_lens,
                 _MAX_BS * _SEQ_LEN,
-                None,
                 ForwardMode.DECODE,
-                None,
                 seq_lens_cpu,
             )
             return self.backend.forward_decode(q, k, v, self.layer, fb)
