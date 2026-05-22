@@ -4411,27 +4411,10 @@ class ServerArgs:
                 else:
                     # CUDA: use NCCL tree algorithm
                     os.environ["NCCL_ALGO"] = "allreduce:tree"
-                    custom_tree_all_reduce = (
-                        os.environ.get(
-                            "SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE", "0"
-                        )
-                        == "1"
-                        or os.environ.get(
-                            "SGLANG_TRUE_ON_POLICY_TREE_CUSTOM_ALL_REDUCE", "0"
-                        )
-                        == "1"
+                    self.disable_custom_all_reduce = True
+                    logger.warning(
+                        "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
                     )
-                    if custom_tree_all_reduce:
-                        logger.warning(
-                            "NCCL_ALGO is set to 'allreduce:tree'; custom all "
-                            "reduce remains available only for exact true-on-policy "
-                            "tree-reduce calls."
-                        )
-                    else:
-                        self.disable_custom_all_reduce = True
-                        logger.warning(
-                            "NCCL_ALGO is set to 'allreduce:tree' and custom all reduce is disabled for deterministic inference when TP size > 1."
-                        )
 
     def _handle_dllm_inference(self):
         if self.dllm_algorithm is None:

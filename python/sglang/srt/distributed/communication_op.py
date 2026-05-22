@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
-import os
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -17,21 +16,6 @@ from .parallel_state import (
     get_moe_tp_group,
     get_tp_group,
 )
-
-
-def _maybe_custom_tree_all_reduce(input_: torch.Tensor, group) -> Optional[torch.Tensor]:
-    if (
-        os.environ.get("SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE", "0") != "1"
-        and os.environ.get("SGLANG_TRUE_ON_POLICY_TREE_CUSTOM_ALL_REDUCE", "0")
-        != "1"
-    ):
-        return None
-
-    ca_comm = getattr(group, "ca_comm", None)
-    custom_tree_all_reduce = getattr(ca_comm, "custom_tree_all_reduce", None)
-    if custom_tree_all_reduce is None:
-        return None
-    return custom_tree_all_reduce(input_)
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
@@ -49,18 +33,12 @@ def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor
 def tensor_model_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group in fixed tree order."""
     group = get_tp_group()
-    custom_result = _maybe_custom_tree_all_reduce(input_, group)
-    if custom_result is not None:
-        return custom_result
     return tree_all_reduce_sum(input_, device_group=group.device_group)
 
 
 def attention_tensor_model_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across attention TP group in fixed tree order."""
     group = get_attn_tp_group()
-    custom_result = _maybe_custom_tree_all_reduce(input_, group)
-    if custom_result is not None:
-        return custom_result
     return tree_all_reduce_sum(input_, device_group=group.device_group)
 
 
@@ -127,10 +105,5 @@ def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
 def moe_expert_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group in fixed tree order."""
-    from sglang.srt.tp_invariant_ops import tree_all_reduce_sum
-
     group = get_moe_ep_group()
-    custom_result = _maybe_custom_tree_all_reduce(input_, group)
-    if custom_result is not None:
-        return custom_result
     return tree_all_reduce_sum(input_, device_group=group.device_group)

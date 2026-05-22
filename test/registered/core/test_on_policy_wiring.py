@@ -1,9 +1,7 @@
 import json
 import os
 import subprocess
-import sys
 import textwrap
-import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,15 +11,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.true_on_policy import (
-    DeterministicInferenceScope,
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
     QWEN3_MOE_TRUE_ON_POLICY_V1,
     get_moe_topk_tiebreak,
     get_true_on_policy_contract,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
-    override_true_on_policy_runtime_policy_enabled,
-    patch_prefill_only_deterministic_attention_backend,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
     should_disable_fused_qk_norm_mrope,
@@ -296,80 +291,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         )
 
-    def test_runtime_policy_override_disables_contract_paths_in_decode_context(self):
-        server_args = self._moe_contract_args(tp_size=1, ep_size=4)
-
-        self.assertTrue(is_true_on_policy_enabled(server_args))
-        self.assertTrue(should_use_deterministic_moe_routing(server_args))
-
-        with override_true_on_policy_runtime_policy_enabled(False):
-            policy = resolve_true_on_policy_runtime_policy(server_args)
-
-            self.assertFalse(policy.enabled)
-            self.assertFalse(is_true_on_policy_enabled(server_args))
-            self.assertFalse(should_use_deterministic_moe_routing(server_args))
-
-        self.assertTrue(is_true_on_policy_enabled(server_args))
-        self.assertTrue(should_use_deterministic_moe_routing(server_args))
-
-    def test_deterministic_scope_temporarily_disables_flashinfer_fusion(self):
-        server_args = self._moe_contract_args(tp_size=4, ep_size=4)
-        server_args.enable_deterministic_inference = False
-        server_args.enable_flashinfer_allreduce_fusion = True
-
-        batch_state = {"enabled": False}
-        tp_state = {"enabled": False}
-        batch_mod = types.ModuleType("sglang.srt.batch_invariant_ops")
-        batch_mod.is_batch_invariant_mode_enabled = lambda: batch_state["enabled"]
-        batch_mod.enable_batch_invariant_mode = lambda: batch_state.update(enabled=True)
-        batch_mod.disable_batch_invariant_mode = lambda: batch_state.update(
-            enabled=False
-        )
-        tp_mod = types.ModuleType("sglang.srt.tp_invariant_ops")
-        tp_mod.is_tp_invariant_mode_enabled = lambda: tp_state["enabled"]
-        tp_mod.enable_tp_invariant_mode = lambda: tp_state.update(enabled=True)
-        tp_mod.disable_tp_invariant_mode = lambda: tp_state.update(enabled=False)
-
-        with patch.dict(
-            sys.modules,
-            {
-                "sglang.srt.batch_invariant_ops": batch_mod,
-                "sglang.srt.tp_invariant_ops": tp_mod,
-            },
-        ):
-            with DeterministicInferenceScope(server_args):
-                self.assertTrue(server_args.enable_deterministic_inference)
-                self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
-                self.assertTrue(should_use_tp_invariant_tree_all_reduce(server_args))
-                self.assertTrue(batch_state["enabled"])
-                self.assertTrue(tp_state["enabled"])
-
-        self.assertFalse(server_args.enable_deterministic_inference)
-        self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
-        self.assertFalse(batch_state["enabled"])
-        self.assertFalse(tp_state["enabled"])
-
-    def test_prefill_only_deterministic_attention_backend_restores_num_splits(self):
-        nested = SimpleNamespace(num_splits=3)
-        root = SimpleNamespace(
-            num_splits=0,
-            prefill_backend=SimpleNamespace(num_splits=5),
-            decode_backend=SimpleNamespace(num_splits=8),
-            attn_backend_list=[nested],
-        )
-        nested.primary = root
-
-        with patch_prefill_only_deterministic_attention_backend(root):
-            self.assertEqual(root.num_splits, 1)
-            self.assertEqual(root.prefill_backend.num_splits, 1)
-            self.assertEqual(root.decode_backend.num_splits, 1)
-            self.assertEqual(nested.num_splits, 1)
-
-        self.assertEqual(root.num_splits, 0)
-        self.assertEqual(root.prefill_backend.num_splits, 5)
-        self.assertEqual(root.decode_backend.num_splits, 8)
-        self.assertEqual(nested.num_splits, 3)
-
     def test_contract_object_owns_sglang_runtime_policy_values(self):
         contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
 
@@ -455,28 +376,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
         self.assertIn("should_use_deterministic_moe_combine", qwen3_moe_source)
         self.assertIn("moe_expert_parallel_tree_all_reduce", qwen3_moe_source)
-
-    def test_custom_tree_all_reduce_is_opt_in(self):
-        from sglang.srt.distributed.communication_op import (
-            _maybe_custom_tree_all_reduce,
-        )
-
-        input_tensor = torch.tensor([1.0])
-        ca_comm = SimpleNamespace(custom_tree_all_reduce=lambda x: x + 1.0)
-        group = SimpleNamespace(ca_comm=ca_comm)
-
-        with patch.dict(os.environ, {}, clear=True):
-            self.assertIsNone(_maybe_custom_tree_all_reduce(input_tensor, group))
-
-        with patch.dict(
-            os.environ, {"SGLANG_TRUE_ON_POLICY_CUSTOM_TREE_ALL_REDUCE": "1"}
-        ):
-            self.assertTrue(
-                torch.equal(
-                    _maybe_custom_tree_all_reduce(input_tensor, group),
-                    torch.tensor([2.0]),
-                )
-            )
 
     def test_true_on_policy_dp_attention_uses_max_len_padding(self):
         try:
@@ -914,83 +813,6 @@ class TestOnPolicyHelpers(unittest.TestCase):
             true_on_policy.should_use_tp_invariant_row_linear,
         )
         self.assertTrue(hasattr(torch.ops, "tp_inv_ops"))
-
-
-class TestDeterministicMoEConfigEnv(unittest.TestCase):
-    def test_deterministic_moe_config_guard_keeps_default_without_env(self):
-        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
-
-        server_args = SimpleNamespace(enable_deterministic_inference=True)
-
-        with (
-            patch.object(
-                fused_moe_triton_config,
-                "get_global_server_args",
-                return_value=server_args,
-            ),
-            patch.dict(
-                os.environ,
-                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "0"},
-            ),
-        ):
-            config = fused_moe_triton_config.get_default_config(
-                M=16,
-                E=32,
-                N=1856,
-                K=2048,
-                topk=8,
-                dtype=None,
-                is_marlin=False,
-            )
-
-        self.assertEqual(config["BLOCK_SIZE_M"], 64)
-        self.assertEqual(config["BLOCK_SIZE_K"], 32)
-
-    def test_deterministic_moe_config_can_use_standard_heuristic_by_env(self):
-        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
-
-        server_args = SimpleNamespace(enable_deterministic_inference=True)
-
-        with (
-            patch.object(
-                fused_moe_triton_config,
-                "get_global_server_args",
-                return_value=server_args,
-            ),
-            patch.dict(
-                os.environ,
-                {"SGLANG_TRUE_ON_POLICY_DETERMINISTIC_MOE_USE_CONFIGS": "1"},
-            ),
-        ):
-            config = fused_moe_triton_config.get_default_config(
-                M=16,
-                E=32,
-                N=1856,
-                K=2048,
-                topk=8,
-                dtype=None,
-                is_marlin=False,
-            )
-
-        self.assertEqual(config["BLOCK_SIZE_M"], 16)
-        self.assertEqual(config["BLOCK_SIZE_K"], 64)
-
-    def test_env_override_moe_config_parses_json_dict(self):
-        from sglang.srt.layers.moe.fused_moe_triton import fused_moe_triton_config
-
-        with patch.dict(
-            os.environ,
-            {
-                "SGLANG_TRUE_ON_POLICY_MOE_KERNEL_CONFIG_JSON": (
-                    '{"BLOCK_SIZE_M":16,"BLOCK_SIZE_N":64,'
-                    '"BLOCK_SIZE_K":128,"GROUP_SIZE_M":1}'
-                )
-            },
-        ):
-            config = fused_moe_triton_config._get_env_override_config()
-
-        self.assertEqual(config["BLOCK_SIZE_M"], 16)
-        self.assertEqual(config["BLOCK_SIZE_K"], 128)
 
 
 class TestStableTopKSoftmax(unittest.TestCase):

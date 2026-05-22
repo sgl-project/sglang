@@ -101,7 +101,6 @@ _CONTRACT_BY_NAME = {
     QWEN3_MOE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_MOE_TRUE_ON_POLICY_CONTRACT,
 }
 
-
 def get_true_on_policy_contract(contract_name: str) -> SGLangTrueOnPolicyContract:
     try:
         return _CONTRACT_BY_NAME[contract_name]
