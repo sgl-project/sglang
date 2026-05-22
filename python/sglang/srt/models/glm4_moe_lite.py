@@ -1,4 +1,4 @@
-# Copyright 2025-2026 SGLang Team
+# Copyright 2026-2027 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,15 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights.
-
-This module is intentionally standalone: the GLM-4 MoE-Lite classes inline the
-forward / op_* / helper logic they need instead of subclassing the
-``deepseek_v2.py`` wrapper classes. Only the stable, shared pieces are reused:
-``DeepseekV2AttentionMLA`` (composition) and ``DeepseekV2WeightLoaderMixin``
-(from the decoupled ``deepseek_common`` layer). This keeps GLM insulated from
-DSV4 / DSA / context-parallel churn in ``deepseek_v2.py``.
-"""
+"""Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
 import logging
 import re
