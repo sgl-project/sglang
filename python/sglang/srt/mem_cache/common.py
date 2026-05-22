@@ -45,6 +45,12 @@ def page_align_floor(length: int, page_size: int) -> int:
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
+        if kwargs.get("chunked", False):
+            # Same as ChunkCache.cache_unfinished_req — 
+            # only advance prefix_indices, no tree insertion
+            kv_indices = tree_cache.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : len(req.fill_ids)
+            ]
         return
 
     tree_cache.cache_unfinished_req(req, **kwargs)
