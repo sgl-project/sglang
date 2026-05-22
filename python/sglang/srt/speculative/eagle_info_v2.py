@@ -14,7 +14,10 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    ScheduleBatch,
+    set_mamba_track_indices_from_reqs,
+)
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -93,9 +96,6 @@ class EagleDraftInputV2Mixin:
 
         bs = batch.batch_size()
 
-        # Now seq_lens is correct
-        batch.maybe_wait_verify_done()
-
         # Accumulate penalty
         # This is a relaxed version of penalties for speculative decoding.
         if batch.sampling_info.penalizer_orchestrator.is_required:
@@ -170,10 +170,6 @@ class EagleDraftInputV2Mixin:
             bs,
         )
 
-        # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
-        batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
-
     def prepare_for_v2_draft(
         self: EagleDraftInput,
         req_to_token_pool: ReqToTokenPool,
@@ -232,7 +228,7 @@ class EagleDraftInputV2Mixin:
         batch.input_ids = predict
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
-        batch.seq_lens_sum += extend_num_tokens
+        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
         batch.extend_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
         batch.prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
@@ -277,29 +273,15 @@ class EagleVerifyInputV2Mixin:
                 device=device,
             )
 
-            # Set mamba_track_indices for mamba prefix-cache state tracking
             if get_global_server_args().enable_mamba_extra_buffer():
-                mapping = (
-                    req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
-                )
-                req_pool_idx_tensor = batch.req_pool_indices.to(
-                    device=mapping.device, dtype=torch.int64
-                )
-                track_col_idx = torch.tensor(
-                    [req.mamba_next_track_idx for req in batch.reqs],
-                    dtype=torch.int64,
-                    pin_memory=True,
-                ).to(mapping.device, non_blocking=True)
-                batch.mamba_track_indices = mapping[
-                    req_pool_idx_tensor, track_col_idx
-                ].to(dtype=torch.int64)
+                set_mamba_track_indices_from_reqs(batch)
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
             # TBO's split_spec_info can slice the custom_mask correctly.
             self.seq_lens_cpu = batch.seq_lens_cpu
-            self.seq_lens_sum = batch.seq_lens_sum
+            self.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
         # Get a forward batch
         batch.forward_mode = (
