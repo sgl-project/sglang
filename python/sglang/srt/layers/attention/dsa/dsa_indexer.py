@@ -119,9 +119,7 @@ if _is_cuda:
 
         forward_batch = get_forward_context().forward_batch
         indexer = get_forward_context().dsa_indexers[layer_id]
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
-        )
+        metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
 
         # slice off padding from piecewise CUDA graph
         extend_num_tokens = forward_batch.extend_num_tokens
