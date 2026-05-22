@@ -1109,6 +1109,7 @@ class ModelConfig:
             "modelopt",
             "modelopt_fp8",
             "modelopt_fp4",
+            "per_token_nvfp4",
             "modelopt_mixed",
         ]
         modelopt_quantization_specified = (

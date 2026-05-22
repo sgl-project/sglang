@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, suite="nightly-4-gpu-b200", nightly=True)
+register_cuda_ci(est_time=900, suite="nightly-4-gpu-b200", nightly=True)
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -243,6 +243,54 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         self.assertGreater(metrics["score"], 0.89)
 
 
+class FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base:
+    backend = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--attention-backend",
+                "triton",
+                "--moe-runner-backend",
+                cls.backend,
+                "--tp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--quantization",
+                "per_token_nvfp4",
+                "--mem-fraction-static",
+                "0.7",
+                "--mamba-ssm-dtype",
+                "bfloat16",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.90)
+
+
 class TestFlashinferTrtllmGenMoeBackendFP8(
     FlashinferTrtllmGenMoeBackendFP8Base, CustomTestCase
 ):
@@ -278,6 +326,12 @@ class TestFlashinferTrtllmGenMoeBackendPerTokenNVFP4Routed(
 ):
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4(
+    FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base, CustomTestCase
+):
+    backend = "flashinfer_trtllm"
 
 
 if __name__ == "__main__":

@@ -148,6 +148,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
+      <td><code>per_token_nvfp4</code></td>
+      <td>Yes (Blackwell/SM100 or SM103)</td>
+      <td>No</td>
+      <td>No</td>
+      <td>Online MoE-only NVFP4 quantization for BF16/FP16 checkpoints; requires <code>flashinfer_trtllm</code> or <code>flashinfer_trtllm_routed</code></td>
+    </tr>
+    <tr>
       <td><code>petit_nvfp4</code></td>
       <td>No</td>
       <td>Yes (MI250/MI300X/MI325X)</td>
@@ -795,6 +802,23 @@ python3 -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --torchao-config int8dq \
     --disable-cuda-graph \
+    --port 30000 --host 0.0.0.0
+```
+
+### `per_token_nvfp4` online quantization method
+
+SGLang running on NVIDIA Blackwell SM100 or SM103 GPUs supports `--quantization per_token_nvfp4` for MoE checkpoints stored in BF16/FP16. It quantizes MoE expert weights online as each expert weight tensor is loaded, using standard 2D NVFP4 weight quantization with per-tensor amax-derived FP32 scales. Dense linear layers are kept in the original precision. The `per_token` name refers to activation scaling: weights use static per-tensor FP32 scales, while activations get runtime per-token FP32 scales from FlashInfer, so activation FP32 calibration scales are not required.
+
+Only `--moe-runner-backend flashinfer_trtllm` and `--moe-runner-backend flashinfer_trtllm_routed` are supported. If `--moe-runner-backend` is omitted, SGLang selects `flashinfer_trtllm`. MoE tensor parallelism must be 1; for a 2-GPU expert-parallel launch, use `--tp-size 2 --ep-size 2`.
+
+FlashInfer TRTLLM MoE backends disable shared-expert fusion, so online quantization applies to routed MoE experts while shared experts stay in the checkpoint precision. To keep specific routed MoE layers high precision, include their module path in `SGLANG_FP8_IGNORED_LAYERS`.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-30B-A3B-Instruct-2507 \
+    --tp-size 2 \
+    --ep-size 2 \
+    --quantization per_token_nvfp4 \
     --port 30000 --host 0.0.0.0
 ```
 

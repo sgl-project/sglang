@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -15,7 +16,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import (
     MoeRunner,
@@ -287,6 +288,7 @@ class ModelOptQuantConfig(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping
         self.exclude_modules = exclude_modules or []
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        self.use_per_token_activation = False
 
     def _get_quant_method(
         self,
@@ -1171,6 +1173,7 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         group_size: int = None,
         exclude_modules: List[str] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        use_per_token_activation: Optional[bool] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
@@ -1180,6 +1183,11 @@ class ModelOptFp4Config(ModelOptQuantConfig):
                 "format is experimental and subject to change."
             )
         self.group_size = group_size
+        if use_per_token_activation is None:
+            use_per_token_activation = (
+                envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
+            )
+        self.use_per_token_activation = use_per_token_activation
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1740,11 +1748,30 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        if not self.quant_config.is_checkpoint_nvfp4_serialized:
+        is_online_per_token_nvfp4 = getattr(
+            self.quant_config, "is_online_per_token_nvfp4", False
+        )
+        if (
+            not self.quant_config.is_checkpoint_nvfp4_serialized
+            and not is_online_per_token_nvfp4
+        ):
             raise ValueError(
                 "NVFP4 quantization was selected, "
                 " dynamic quantization is not supported."
             )
+        if is_online_per_token_nvfp4:
+            if not self.enable_flashinfer_trtllm_moe:
+                raise ValueError(
+                    "--quantization per_token_nvfp4 supports only "
+                    "--moe-runner-backend flashinfer_trtllm or "
+                    "flashinfer_trtllm_routed."
+                )
+            if layer.moe_tp_size != 1:
+                raise ValueError(
+                    "--quantization per_token_nvfp4 currently supports MoE "
+                    "expert parallelism only. Use MoE TP size 1, e.g. "
+                    "--tp-size N --ep-size N."
+                )
 
         # TODO(ch-wan): check if this is needed
         layer.intermediate_size_per_partition = intermediate_size_per_partition
@@ -1754,6 +1781,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         weight_scale_dtype = torch.float8_e4m3fn
         weight_loader = extra_weight_attrs.get("weight_loader")
+        if is_online_per_token_nvfp4:
+            weight_loader = self.get_online_weight_loader(layer, weight_loader)
         # GEMM 1
         num_shards = 2 if layer.moe_runner_config.is_gated else 1
 
@@ -1939,10 +1968,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w13_input_scale = layer.w13_input_scale.max(dim=-1).values.to(torch.float32)
             w2_input_scale = layer.w2_input_scale
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            and envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION.get()
-        ):
+        if self.quant_config.use_per_token_activation:
             w13_input_scale = torch.ones_like(w13_input_scale, dtype=torch.float32)
             w2_input_scale = torch.ones_like(w2_input_scale, dtype=torch.float32)
 
@@ -2267,6 +2293,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 local_num_experts=layer.num_local_experts,
                 intermediate_size_per_partition=layer.intermediate_size_per_partition,
                 routing_method_type=routing_method_type,
+                use_per_token_activation=self.quant_config.use_per_token_activation,
             )
 
             return self.runner.run(dispatch_output, quant_info)
@@ -2421,3 +2448,310 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         ).to(x.dtype)
         # Scale by routed_scaling_factor is fused into select_experts.
         return StandardCombineInput(hidden_states=output)
+
+
+class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
+    """Online per-token NVFP4 MoE method for BF16/FP16 checkpoints."""
+
+    _quant_fast_math_env_lock = threading.Lock()
+
+    def __init__(self, quant_config: PerTokenNvFp4Config):
+        super().__init__(quant_config)
+        if not self.enable_flashinfer_trtllm_moe:
+            raise ValueError(
+                "--quantization per_token_nvfp4 supports only "
+                "--moe-runner-backend flashinfer_trtllm or "
+                "flashinfer_trtllm_routed."
+            )
+
+    @staticmethod
+    def _weight_amax(weight: torch.Tensor) -> float:
+        return float(weight.float().abs().nan_to_num().amax().item())
+
+    @staticmethod
+    def _weight_scale_2_from_amax(
+        weight_amax: float, device: torch.device
+    ) -> torch.Tensor:
+        weight_amax_tensor = torch.tensor(
+            weight_amax, device=device, dtype=torch.float32
+        )
+        nvfp4_max = torch.tensor(
+            float(torch.finfo(torch.float8_e4m3fn).max) * 6.0,
+            device=device,
+            dtype=torch.float32,
+        )
+        return torch.where(
+            weight_amax_tensor > 0,
+            weight_amax_tensor / nvfp4_max,
+            torch.ones_like(weight_amax_tensor, dtype=torch.float32),
+        )
+
+    @staticmethod
+    def _quantize_weight_nvfp4(
+        weight: torch.Tensor,
+        weight_scale_2: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from flashinfer import SfLayout, nvfp4_quantize
+
+        logger.info_once("Running online NVFP4 quantization for MoE expert weights.")
+
+        if weight.ndim != 2:
+            raise ValueError(
+                "--quantization per_token_nvfp4 expects 2D expert weights, "
+                f"got shape {tuple(weight.shape)}."
+            )
+        if weight.shape[-1] % 16 != 0:
+            raise ValueError(
+                "--quantization per_token_nvfp4 requires expert weight K to be "
+                f"a multiple of 16, got shape {tuple(weight.shape)}."
+            )
+
+        if weight_scale_2 is None:
+            weight_scale_2 = (
+                ModelOptPerTokenNvFp4FusedMoEMethod._weight_scale_2_from_amax(
+                    ModelOptPerTokenNvFp4FusedMoEMethod._weight_amax(weight),
+                    weight.device,
+                )
+            )
+        else:
+            weight_scale_2 = weight_scale_2.to(
+                device=weight.device, dtype=torch.float32
+            )
+        with ModelOptPerTokenNvFp4FusedMoEMethod._quant_fast_math_env_lock:
+            with temp_set_env(TRTLLM_DISABLE_FP4_QUANT_FAST_MATH="1"):
+                fp4_weight, weight_sf = nvfp4_quantize(
+                    weight.contiguous(),
+                    1.0 / weight_scale_2,
+                    sfLayout=SfLayout.layout_linear,
+                )
+        rows, cols = weight.shape
+        weight_sf = weight_sf.view(torch.float8_e4m3fn).reshape(rows, cols // 16)
+        return (
+            fp4_weight.reshape(rows, cols // 2),
+            weight_sf.contiguous(),
+            weight_scale_2,
+        )
+
+    @staticmethod
+    def _should_skip_loaded_expert(
+        layer: torch.nn.Module,
+        param: torch.nn.Parameter,
+        expert_id: Optional[int],
+    ) -> bool:
+        if expert_id is None:
+            return False
+        if getattr(param, "_sglang_require_global_experts", False):
+            return False
+        # With EPLB or explicit expert placement, logical expert IDs can map to
+        # one or more physical experts. Let the canonical MoE loader do that
+        # mapping instead of pre-skipping from the trivial EP layout.
+        from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        if get_global_expert_location_metadata() is not None:
+            return False
+        return layer._map_global_expert_id_to_local_expert_id(expert_id) == -1
+
+    @staticmethod
+    def _scale_weight_name(weight_name: str) -> str:
+        if "weight" in weight_name:
+            return weight_name.replace("weight", "weight_scale")
+        return f"{weight_name}.weight_scale"
+
+    @staticmethod
+    def _scale_2_weight_name(weight_name: str) -> str:
+        if "weight" in weight_name:
+            return weight_name.replace("weight", "weight_scale_2")
+        return f"{weight_name}.weight_scale_2"
+
+    def get_online_weight_loader(self, layer, original_weight_loader):
+        pending_w13_weights = {}
+        pending_w13_lock = threading.Lock()
+
+        def load_quantized_weight(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: Optional[int],
+            weight_scale_2: Optional[torch.Tensor] = None,
+        ) -> None:
+            loaded_weight = loaded_weight.to(param.device).contiguous()
+            fp4_weight, weight_scale, weight_scale_2 = self._quantize_weight_nvfp4(
+                loaded_weight, weight_scale_2
+            )
+
+            original_weight_loader(
+                param,
+                fp4_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
+            scale_param = (
+                layer.w13_weight_scale
+                if shard_id in ("w1", "w3")
+                else layer.w2_weight_scale
+            )
+            original_weight_loader(
+                scale_param,
+                weight_scale,
+                weight_name=self._scale_weight_name(weight_name),
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            scale_2_param = (
+                layer.w13_weight_scale_2
+                if shard_id in ("w1", "w3")
+                else layer.w2_weight_scale_2
+            )
+            original_weight_loader(
+                scale_2_param,
+                weight_scale_2,
+                weight_name=self._scale_2_weight_name(weight_name),
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
+        def online_per_token_nvfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: Optional[int],
+        ):
+            if "weight" not in weight_name or shard_id not in ("w1", "w2", "w3"):
+                original_weight_loader(
+                    param,
+                    loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                return
+            if self._should_skip_loaded_expert(layer, param, expert_id):
+                return
+
+            if shard_id == "w2":
+                load_quantized_weight(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+                return
+
+            pending_key = expert_id
+            current = (
+                param,
+                loaded_weight.contiguous(),
+                weight_name,
+                shard_id,
+                expert_id,
+            )
+            with pending_w13_lock:
+                pending = pending_w13_weights.pop(pending_key, None)
+                if pending is None:
+                    pending_w13_weights[pending_key] = current
+                    return
+
+            (
+                pending_param,
+                pending_weight,
+                pending_name,
+                pending_shard_id,
+                pending_eid,
+            ) = pending
+            if pending_shard_id == shard_id:
+                raise ValueError(
+                    "--quantization per_token_nvfp4 expects paired w1/w3 expert "
+                    f"weights, got two {shard_id} tensors for expert {expert_id}."
+                )
+            common_amax = max(
+                self._weight_amax(pending_weight), self._weight_amax(loaded_weight)
+            )
+            weight_scale_2 = self._weight_scale_2_from_amax(common_amax, param.device)
+            load_quantized_weight(
+                pending_param,
+                pending_weight,
+                pending_name,
+                pending_shard_id,
+                pending_eid,
+                weight_scale_2,
+            )
+            load_quantized_weight(
+                param,
+                loaded_weight,
+                weight_name,
+                shard_id,
+                expert_id,
+                weight_scale_2,
+            )
+
+        return online_per_token_nvfp4_weight_loader
+
+
+class PerTokenNvFp4Config(ModelOptQuantConfig):
+    """Online NVFP4 config that quantizes MoE experts."""
+
+    is_online_per_token_nvfp4 = True
+    is_checkpoint_nvfp4_serialized = False
+    group_size = 16
+
+    def __init__(
+        self,
+        exclude_modules: Optional[List[str]] = None,
+        packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+    ) -> None:
+        ignored_layers = list(exclude_modules or [])
+        if ignored_layers_str := envs.SGLANG_FP8_IGNORED_LAYERS.get():
+            ignored_layers.extend(
+                layer.strip()
+                for layer in ignored_layers_str.split(",")
+                if layer.strip()
+            )
+        super().__init__(
+            kv_cache_quant_algo=None,
+            exclude_modules=list(dict.fromkeys(ignored_layers)),
+            packed_modules_mapping=packed_modules_mapping or {},
+        )
+        self.use_per_token_activation = True
+
+    @classmethod
+    def get_name(cls) -> str:
+        return "per_token_nvfp4"
+
+    @classmethod
+    def get_supported_act_dtypes(cls) -> List[torch.dtype]:
+        return [torch.bfloat16, torch.half]
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return 100
+
+    @classmethod
+    def get_config_filenames(cls) -> List[str]:
+        return []
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any]) -> PerTokenNvFp4Config:
+        ignored_layers = config.get("ignored_layers") or config.get(
+            "modules_to_not_convert"
+        )
+        if isinstance(ignored_layers, str):
+            ignored_layers = [ignored_layers]
+        return cls(
+            exclude_modules=ignored_layers,
+            packed_modules_mapping=config.get("packed_modules_mapping"),
+        )
+
+    def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        from sglang.srt.layers.linear import LinearBase
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+
+        if isinstance(layer, LinearBase):
+            return UnquantizedLinearMethod()
+        if isinstance(layer, FusedMoE):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return None
+            return ModelOptPerTokenNvFp4FusedMoEMethod(self)
+        return None
