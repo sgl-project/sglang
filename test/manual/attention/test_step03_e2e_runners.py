@@ -220,7 +220,7 @@ class TestTRTLLMMHAEager(_ServerSmokeBase):
     model = _SMALL_MODEL
     launch_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mha",
         "--disable-cuda-graph",
         "--mem-fraction-static",
         "0.7",
@@ -304,7 +304,7 @@ class TestTRTLLMMHACudaGraph(_ServerSmokeBase):
     model = _SMALL_MODEL
     launch_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mha",
         "--disable-piecewise-cuda-graph",
         "--mem-fraction-static",
         "0.7",
@@ -388,7 +388,7 @@ class TestTRTLLMMHAPCG(_ServerSmokeBase):
     model = _SMALL_MODEL
     launch_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mha",
         "--enforce-piecewise-cuda-graph",
         "--mem-fraction-static",
         "0.7",
@@ -501,7 +501,7 @@ class TestTRTLLMMLACudaGraph(_ServerSmokeBase):
     model = _DSV3_MODEL
     launch_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mla",
         "--disable-piecewise-cuda-graph",
         "--mem-fraction-static",
         "0.7",
