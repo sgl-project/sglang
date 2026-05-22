@@ -142,7 +142,7 @@ export const benchmarks = [
       workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
       ttft_ms: 115, tpot_ms: 5.04, e2e_ms_p50: 1768,
     },
-    accuracy: { gsm8k_pct: 96.5, mmlu_pct: 88.5 },
+    accuracy: { gsm8k_pct: 96.5, mmlu_pct: 87.9 },
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
