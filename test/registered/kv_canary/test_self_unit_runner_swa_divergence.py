@@ -12,11 +12,9 @@ from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_runner
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.runner import swa_divergence_stats as swa_div_module
-from sglang.srt.kv_canary.runner.swa_divergence_stats import (
-    SwaDivergenceLog,
-    SwaDivergenceStats,
-)
+from sglang.srt.kv_canary.runner.swa_divergence import stats as swa_div_module
+from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
+from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

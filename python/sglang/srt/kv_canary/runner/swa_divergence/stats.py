@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
-import re
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -11,46 +9,14 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.swa_live_divergence_observer import (
+    from sglang.srt.kv_canary.runner.swa_divergence.observer import (
         SwaLiveDivergenceObserver,
     )
 
 logger = logging.getLogger(__name__)
-
-_SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary_swa_divergence="
-
-_SWA_DIVERGENCE_LINE_RE = re.compile(re.escape(_SWA_DIVERGENCE_LOG_PREFIX) + r"(\S+)")
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class SwaDivergenceLog:
-    forward_ct: int
-    verify_full: int
-    verify_swa: int
-    mapping_nonidentity: int
-
-    def format(self) -> str:
-        return _SWA_DIVERGENCE_LOG_PREFIX + json.dumps(
-            asdict(self), separators=(",", ":")
-        )
-
-    @classmethod
-    def parse(cls, line: str) -> Optional["SwaDivergenceLog"]:
-        match = _SWA_DIVERGENCE_LINE_RE.search(line)
-        if match is None:
-            return None
-        return cls(**json.loads(match.group(1)))
-
-    @classmethod
-    def find_last(cls, text: str) -> Optional[tuple["SwaDivergenceLog", str]]:
-        last_match: Optional[re.Match] = None
-        for match in _SWA_DIVERGENCE_LINE_RE.finditer(text):
-            last_match = match
-        if last_match is None:
-            return None
-        return cls(**json.loads(last_match.group(1))), last_match.group(0)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.runner.swa_divergence_stats import SwaDivergenceStats
+from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
