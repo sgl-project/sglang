@@ -700,16 +700,7 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
-          # ===== PR 547 Qwen3 16p cross-node TP (node_size=2) =====
-          - name: test_ascend_qwen3_235b_w8a8_16p_in2k_out2k_50ms
-            node_size: 2
-            test_case: test/registered/ascend/performance/qwen3_235b_a22b/test_ascend_qwen3_235b_w8a8_16p_in2k_out2k_50ms.py
-            test_type: 'perf'
-          - name: test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms
-            node_size: 2
-            test_case: test/registered/ascend/performance/qwen3_coder_480b_a35b_instruct/test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms.py
-            test_type: 'perf'
-          # ===== PR 547 DeepSeek R1 W4A8 1p1d_16p PD separation =====
+          # ===== DeepSeek R1 W4A8 1p1d_16p PD separation =====
           - name: test_ascend_deepseek_r1_w4a8_1p1d_16p_in2k_out2k_50ms
             prefill_size: 1
             decode_size: 1
@@ -724,7 +715,7 @@ jobs:
             test_case: test/registered/ascend/performance/deepseek_r1/test_ascend_deepseek_r1_w4a8_1p1d_16p_in3k5_out1k5_50ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 DeepSeek R1 W8A8 1p1d_24p PD separation =====
+          # ===== DeepSeek R1 W8A8 1p1d_24p PD separation =====
           - name: test_ascend_deepseek_r1_w8a8_1p1d_24p_in2k_out2k_50ms
             prefill_size: 1
             decode_size: 2
@@ -732,7 +723,7 @@ jobs:
             test_case: test/registered/ascend/performance/deepseek_r1/test_ascend_deepseek_r1_w8a8_1p1d_24p_in2k_out2k_50ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 DeepSeek R1 W8A8 2p1d_32p PD separation =====
+          # ===== DeepSeek R1 W8A8 2p1d_32p PD separation =====
           - name: test_ascend_deepseek_r1_w8a8_2p1d_32p_in3k5_out1k5_16ms
             prefill_size: 2
             decode_size: 2
@@ -768,7 +759,7 @@ jobs:
             test_case: test/registered/ascend/performance/deepseek_r1/test_ascend_deepseek_r1_w8a8_2p1d_32p_in6k_out1k6_15ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 DeepSeek V3.2 W8A8 1p1d_32p PD separation =====
+          # ===== DeepSeek V3.2 W8A8 1p1d_32p PD separation =====
           - name: test_ascend_deepseek_v3_2_w8a8_1p1d_32p_in128k_out1k_26ms
             prefill_size: 2
             decode_size: 2
@@ -790,7 +781,7 @@ jobs:
             test_case: test/registered/ascend/performance/deepseek_v3_2/test_ascend_deepseek_v3_2_w8a8_1p1d_32p_in128k_out1k_bs8.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 Qwen3-235B W8A8 1p1d_16p PD separation =====
+          # ===== Qwen3-235B W8A8 1p1d_16p PD separation =====
           - name: test_ascend_qwen3_235b_w8a8_1p1d_16p_in256k_out1k
             prefill_size: 1
             decode_size: 1
@@ -798,7 +789,7 @@ jobs:
             test_case: test/registered/ascend/performance/qwen3_235b_a22b/test_ascend_qwen3_235b_w8a8_1p1d_16p_in256k_out1k.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 Qwen3-235B W8A8 1p1d_24p PD separation =====
+          # ===== Qwen3-235B W8A8 1p1d_24p PD separation =====
           - name: test_ascend_qwen3_235b_w8a8_1p1d_24p_in3k5_out1k5_50ms
             prefill_size: 1
             decode_size: 2
@@ -806,7 +797,7 @@ jobs:
             test_case: test/registered/ascend/performance/qwen3_235b_a22b/test_ascend_qwen3_235b_w8a8_1p1d_24p_in3k5_out1k5_50ms.py
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
-          # ===== PR 547 Qwen3-480B W8A8 1p1d_24p PD separation =====
+          # ===== Qwen3-480B W8A8 1p1d_24p PD separation =====
           - name: test_ascend_qwen3_480b_w8a8_1p1d_24p_in2k_out2k_50ms
             prefill_size: 1
             decode_size: 2
@@ -1358,6 +1349,15 @@ jobs:
       max-parallel: 1
       matrix:
         test_config:
+          # ===== Qwen3 16p cross-node ====
+          - name: test_ascend_qwen3_235b_w8a8_16p_in2k_out2k_50ms
+            node_size: 2
+            test_case: test/registered/ascend/performance/qwen3_235b_a22b/test_ascend_qwen3_235b_w8a8_16p_in2k_out2k_50ms.py
+            test_type: 'perf'
+          - name: test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms
+            node_size: 2
+            test_case: test/registered/ascend/performance/qwen3_coder_480b_a35b_instruct/test_ascend_qwen3_480b_w8a8_16p_in3k5_out1k5_50ms.py
+            test_type: 'perf'
           # glm-w4a8
 #          - name: test_npu_glm5_1_w4a8_16p_gpqa
 #            node_size: 2
