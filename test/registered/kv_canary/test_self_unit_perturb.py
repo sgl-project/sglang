@@ -8,8 +8,8 @@ from unittest.mock import patch
 import torch
 from kv_canary_runner_unit_utils import make_forward_batch, make_pool
 
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.jit_kernel.kv_canary.verify import RealKvSource
+from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.perturb import (
     real_kv_post_forward,
 )
@@ -29,7 +29,7 @@ from sglang.srt.kv_canary.perturb.utils import (
     pick_target_group,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
 from sglang.test.test_utils import CustomTestCase
 
 if TYPE_CHECKING:
@@ -97,8 +97,8 @@ class TestPickTargetGroup(CustomTestCase):
 
         for target_kind, expected_kind in cases:
             with self.subTest(target_kind=target_kind):
-                full_group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
-                swa_group = _make_group(kind=PoolKind.SWA, has_real_kv=True)
+                full_group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
+                swa_group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True)
 
                 group = pick_target_group(
                     buffer_groups=(full_group, swa_group),
@@ -110,7 +110,7 @@ class TestPickTargetGroup(CustomTestCase):
 
     def test_pick_target_group_rejects_unsupported_kind(self) -> None:
         """Verify target group selection rejects unsupported enum values."""
-        full_group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        full_group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
 
         with self.assertRaisesRegex(ValueError, "Unsupported target_group_kind"):
             pick_target_group(
@@ -120,8 +120,8 @@ class TestPickTargetGroup(CustomTestCase):
 
     def test_pick_target_group_ignores_groups_without_real_kv_sources(self) -> None:
         """Verify target group selection skips groups without real KV sources."""
-        full_group = _make_group(kind=PoolKind.FULL, has_real_kv=False)
-        swa_group = _make_group(kind=PoolKind.SWA, has_real_kv=True)
+        full_group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=False)
+        swa_group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True)
 
         group = pick_target_group(
             buffer_groups=(full_group, swa_group),
@@ -179,7 +179,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
     def test_real_kv_post_forward_flips_a_byte_in_out_cache_loc_slot(self) -> None:
         """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers untouched."""
         device = DEFAULT_DEVICE
-        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         config = PerturbConfig(
             req_to_token_prob=0.0,
@@ -296,7 +296,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
         pool = make_pool(device, max_reqs=4, max_seq=8)
         pool.req_to_token.fill_(-1)
         pool.req_to_token[1, 0] = 2
-        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor.copy_(
             torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
@@ -339,10 +339,10 @@ class TestRealKvUsedPerturb(CustomTestCase):
             num_bytes_per_token=8,
             read_bytes=8,
         )
-        group = _make_group(
+        group = make_buffer_group(
             kind=PoolKind.SWA,
             has_real_kv=True,
-            source=source,
+            real_kv_source=source,
             swa_index_lut=torch.tensor([0, 3], dtype=torch.int32),
         )
 
@@ -360,7 +360,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
         pool = make_pool(device, max_reqs=4, max_seq=8)
         pool.req_to_token.fill_(-1)
         pool.req_to_token[1, 0] = 2
-        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor.copy_(
             torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
@@ -406,7 +406,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         """Verify real_kv_unused_cache flips only the first real KV byte for an orphan slot."""
         device = DEFAULT_DEVICE
         pool = make_pool(device, max_reqs=4, max_seq=8)
-        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor.copy_(
             torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
@@ -445,7 +445,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
     ) -> None:
         """Verify unused-cache perturbation accepts no forward batch but skips without radix_cache."""
         device = DEFAULT_DEVICE
-        group = _make_group(kind=PoolKind.FULL, has_real_kv=True)
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor.copy_(
             torch.arange(source.tensor.numel(), dtype=torch.uint8).view_as(
@@ -471,32 +471,6 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             manager.perturb_real_kv_unused_cache(None)
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
-
-
-def _make_group(
-    *,
-    kind: PoolKind,
-    has_real_kv: bool,
-    source: RealKvSource | None = None,
-    swa_index_lut: torch.Tensor | None = None,
-) -> CanaryBufferGroup:
-    source = source or RealKvSource(
-        tensor=torch.zeros(4, 16, dtype=torch.uint8),
-        page_size=1,
-        num_bytes_per_token=16,
-        read_bytes=16,
-    )
-    real_kv_sources = (source,) if has_real_kv else ()
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8),
-        k_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8),
-        v_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8),
-        v_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8),
-        real_kv_sources_k=real_kv_sources,
-        real_kv_sources_v=real_kv_sources,
-        swa_index_lut=swa_index_lut,
-    )
 
 
 if __name__ == "__main__":

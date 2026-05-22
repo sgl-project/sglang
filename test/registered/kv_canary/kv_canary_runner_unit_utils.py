@@ -6,45 +6,19 @@ from unittest.mock import patch
 import torch
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, CanaryLaunchTag
+from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary import endpoint as endpoint_module
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE, make_buffer_group
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=1, stage="extra-a", runner_config="1-gpu-large")
-
-
-def make_group(
-    *,
-    device: torch.device,
-    has_v: bool = True,
-    kind: PoolKind = PoolKind.FULL,
-) -> CanaryBufferGroup:
-    return CanaryBufferGroup(
-        kind=kind,
-        k_head=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-        k_tail=torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device),
-        v_head=(
-            torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v
-            else None
-        ),
-        v_tail=(
-            torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
-            if has_v
-            else None
-        ),
-        real_kv_sources_k=(),
-        real_kv_sources_v=(),
-        swa_index_lut=None,
-    )
 
 
 def make_pool(
@@ -118,7 +92,7 @@ def make_runner(
     if config is None:
         config = make_config()
     if group is None:
-        group = make_group(device=device)
+        group = make_buffer_group(device=device)
     if req_pool is None:
         req_pool = make_pool(device)
     return CanaryRunner(
