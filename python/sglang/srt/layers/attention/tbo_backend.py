@@ -73,6 +73,11 @@ class TboAttnBackend(AttentionBackend):
             capture_num_tokens=num_tokens,
         )
 
+    def init_forward_data_out_graph(self, forward_batch: "ForwardBatch") -> None:
+        self.primary.init_forward_data_out_graph(forward_batch)
+        for child in self.children:
+            child.init_forward_data_out_graph(forward_batch)
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
