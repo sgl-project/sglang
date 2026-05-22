@@ -474,7 +474,15 @@ class EAGLEDraftCudaGraphRunner:
         # ops recorded into the captured graph at capture time auto-replay via
         # graph.replay(). The padded ``bs`` is read off ``forward_batch.batch_size``
         # which is set above to the capture bs.
+        # FIXME: side channel mirroring ``cuda_graph_runner.replay_prepare``.
+        # DSV4/DSA multi-step backends discriminate capture vs replay via
+        # ``self._replay_forward_batch``; without setting it here the inner
+        # backends take the capture branch at replay and rebuild metadata
+        # into freshly-allocated tensors while the captured graph holds
+        # capture-time pointers. Step 04 removes the side channel.
+        self.draft_attn_backend._replay_forward_batch = forward_batch
         self.draft_attn_backend.init_forward_data_out_graph(forward_batch)
+        self.draft_attn_backend._replay_forward_batch = None
         self.raw_bs = raw_bs
         self.bs = bs
         # TODO: The forward_batch.seq_len_sum might need to be updated to reflect the padding in the cuda graph

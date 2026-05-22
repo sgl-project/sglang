@@ -535,8 +535,17 @@ class EAGLEDraftExtendCudaGraphRunner:
             + (bs - raw_bs) * self.seq_len_fill_value,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
             encoder_lens=None,
+            positions=buffers.positions[:num_tokens],
         )
+        # FIXME: side channel mirroring ``cuda_graph_runner.replay_prepare``.
+        # DSV4/DSA multi-step backends discriminate capture vs replay via
+        # ``self._replay_forward_batch``; without setting it here the inner
+        # backends take the capture branch at replay and rebuild metadata
+        # into freshly-allocated tensors while the captured graph holds
+        # capture-time pointers. Step 04 removes the side channel.
+        self.draft_extend_attn_backend._replay_forward_batch = forward_batch
         self.draft_extend_attn_backend.init_forward_data_out_graph(fb_view)
+        self.draft_extend_attn_backend._replay_forward_batch = None
 
         # Replay
         self.raw_bs = raw_bs

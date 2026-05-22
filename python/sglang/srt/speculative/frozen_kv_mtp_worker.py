@@ -336,8 +336,16 @@ class FrozenKVMTPWorker(TpModelWorker):
             encoder_lens=None,
             spec_info=None,
         )
+        # FIXME: side channel mirroring ``cuda_graph_runner.replay_prepare``.
+        # DSV4/DSA backends discriminate capture vs replay via
+        # ``self._replay_forward_batch``; without setting it here the inner
+        # backends take the capture branch at replay and rebuild metadata
+        # into freshly-allocated tensors while the captured graph holds
+        # capture-time pointers. Step 04 removes the side channel.
         with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend._replay_forward_batch = forward_batch
             self.draft_attn_backend.init_forward_data_out_graph(fb_view)
+            self.draft_attn_backend._replay_forward_batch = None
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
