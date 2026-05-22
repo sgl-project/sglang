@@ -100,7 +100,8 @@ class FutureMap:
             )
 
     def resolve_future(self, batch: ScheduleBatch):
-        # seq_lens GPU is SB-maintained (see class docstring); only resolve
+        # seq_lens is already real on entry (SB +1 for non-spec;
+        # resolve_seq_lens_cpu pulled from buf for spec_v2). Only resolve
         # input_ids tokens / spec extras here.
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
