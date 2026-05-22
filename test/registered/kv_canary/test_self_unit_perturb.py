@@ -32,6 +32,7 @@ from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_buffer_group,
     make_forward_batch,
+    make_radix_cache,
     make_req_to_token_pool,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -338,10 +339,10 @@ class TestRealKvUsedPerturb(CustomTestCase):
     ) -> None:
         """Verify SWA groups map logical slots through swa_index_lut before flipping bytes."""
         source = RealKvSource(
-            tensor=torch.arange(32, dtype=torch.uint8).view(2, 16),
+            tensor=torch.arange(64, dtype=torch.uint8).view(2, 32),
             page_size=2,
-            num_bytes_per_token=8,
-            read_bytes=8,
+            num_bytes_per_token=16,
+            read_bytes=16,
         )
         group = make_buffer_group(
             kind=PoolKind.SWA,
@@ -353,9 +354,9 @@ class TestRealKvUsedPerturb(CustomTestCase):
         snapshot = source.tensor.clone()
         result = flip_first_byte_in_source(group=group, source=source, slot_idx=1)
 
-        self.assertEqual(result, (1, 8, int(snapshot[1, 8].item())))
+        self.assertEqual(result, (1, 16, int(snapshot[1, 16].item())))
         expected = snapshot.clone()
-        expected[1, 8] = int(snapshot[1, 8].item()) ^ 0xFF
+        expected[1, 16] = int(snapshot[1, 16].item()) ^ 0xFF
         self.assertTrue(torch.equal(source.tensor, expected))
 
     def test_warmup_gate_prevents_perturbation_when_probabilities_are_one(self) -> None:
@@ -394,7 +395,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
         source_snapshot = source.tensor.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
             real_kv_unused_cache_module,
-            "pick_orphan_slot",
+            "_pick_sweep_slot_for_group",
             return_value=3,
         ):
             manager.perturb(forward_batch)
@@ -429,20 +430,54 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             req_to_token_pool=pool,
             buffer_groups=(group,),
             step_counter_getter=lambda: 10,
+            sweep_interval=1,
         )
-        manager.attach_radix_cache(cast("BasePrefixCache", object()))
+        manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
 
         snapshot = source.tensor.clone()
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)), patch.object(
-            real_kv_unused_cache_module,
-            "pick_orphan_slot",
-            return_value=3,
+            torch,
+            "randint",
+            return_value=torch.tensor(0),
         ):
             manager.perturb_real_kv_unused_cache(None)
 
         expected = snapshot.clone()
         expected[3, 0] = int(snapshot[3, 0].item()) ^ 0xFF
         self.assertTrue(torch.equal(source.tensor, expected))
+
+    def test_pick_sweep_slot_for_group_skips_locked_radix_nodes(self) -> None:
+        """Verify unused-cache perturbation chooses only unlocked radix-cache slots."""
+        device = DEFAULT_DEVICE
+        group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
+        cache = make_radix_cache([[], [1, 2], [3]], device=device)
+        locked_node = next(iter(cache.root_node.children.values()))
+        locked_node.lock_ref = 1
+
+        with patch.object(torch, "randint", return_value=torch.tensor(0)):
+            slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
+                radix_cache=cache,
+                group=group,
+                swa_window_size=0,
+            )
+
+        self.assertEqual(slot, 3)
+
+    def test_pick_sweep_slot_for_group_translates_swa_slots(self) -> None:
+        """Verify unused-cache SWA perturbation translates full slots to physical SWA slots."""
+        device = DEFAULT_DEVICE
+        lut = torch.tensor([-1, 2], dtype=torch.int64, device=device)
+        group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut)
+        cache = make_radix_cache([[], [1]], device=device)
+
+        with patch.object(torch, "randint", return_value=torch.tensor(0)):
+            slot = real_kv_unused_cache_module._pick_sweep_slot_for_group(
+                radix_cache=cache,
+                group=group,
+                swa_window_size=4,
+            )
+
+        self.assertEqual(slot, 2)
 
     def test_real_kv_unused_cache_skips_without_radix_cache_when_forward_batch_is_none(
         self,
@@ -468,6 +503,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(group,),
             step_counter_getter=lambda: 10,
+            sweep_interval=1,
         )
 
         snapshot = source.tensor.clone()
@@ -475,6 +511,28 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             manager.perturb_real_kv_unused_cache(None)
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
+
+
+class TestPerturbUtils(CustomTestCase):
+    def test_flip_first_byte_in_physical_swa_slot_does_not_translate_twice(
+        self,
+    ) -> None:
+        """Verify a physical SWA slot selected from sweep is not LUT-translated again."""
+        group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True)
+        source = group.real_kv_sources_k[0]
+        source.tensor[2, 0] = 0x12
+        source.tensor[3, 0] = 0x34
+
+        result = flip_first_byte_in_source(
+            group=group,
+            source=source,
+            slot_idx=2,
+            slot_is_physical=True,
+        )
+
+        self.assertEqual(result, (2, 0, 0x12))
+        self.assertEqual(int(source.tensor[2, 0].item()), 0xED)
+        self.assertEqual(int(source.tensor[3, 0].item()), 0x34)
 
 
 if __name__ == "__main__":

@@ -25,8 +25,9 @@ from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
+    VerifyOrWriteContext,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan, canary_write_step
+from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=180, suite="base-b-kernel-benchmark-1-gpu-large")
@@ -84,12 +85,12 @@ def _build_write_inputs(
         num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
     )
 
-    write_offsets = torch.zeros(case.bs + 1, dtype=torch.int32, device=device)
+    write_offsets = torch.zeros(case.bs + 1, dtype=torch.int64, device=device)
     if case.bs > 0:
-        offsets_host = torch.arange(0, case.bs + 1, dtype=torch.int32) * case.extend_len
+        offsets_host = torch.arange(0, case.bs + 1, dtype=torch.int64) * case.extend_len
         write_offsets.copy_(offsets_host.to(device))
 
-    write_seed_slots = torch.empty(case.bs, dtype=torch.int32, device=device)
+    write_seed_slots = torch.empty(case.bs, dtype=torch.int64, device=device)
     if case.bs > 0:
         if case.prefix_len == 0:
             write_seed_slots.fill_(-1)
@@ -100,7 +101,7 @@ def _build_write_inputs(
                 + case.prefix_len
                 - 1
             )
-            write_seed_slots.copy_(seeds)
+            write_seed_slots.copy_(seeds.to(torch.int64))
 
     write_num_valid_reqs = torch.tensor([case.bs], dtype=torch.int32, device=device)
 
@@ -110,9 +111,9 @@ def _build_write_inputs(
         write_num_valid_reqs=write_num_valid_reqs,
     )
 
-    input_ids = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
-    positions = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
-    out_cache_loc = torch.zeros(num_tokens_padded, dtype=torch.int32, device=device)
+    input_ids = torch.zeros(num_tokens_padded, dtype=torch.int64, device=device)
+    positions = torch.zeros(num_tokens_padded, dtype=torch.int64, device=device)
+    out_cache_loc = torch.zeros(num_tokens_padded, dtype=torch.int64, device=device)
     if total_entries > 0:
         flat_idx = torch.arange(total_entries, device=device, dtype=torch.int64)
         per_req_idx = flat_idx % max(case.extend_len, 1)
@@ -121,27 +122,23 @@ def _build_write_inputs(
         slots = (req_idx * per_req_stride + case.prefix_len + per_req_idx) % max(
             num_slots, 1
         )
-        input_ids[:total_entries] = (flat_idx % 32768).to(torch.int32)
-        positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int32)
-        out_cache_loc[:total_entries] = slots.to(torch.int32)
+        input_ids[:total_entries] = (flat_idx % 32768).to(torch.int64)
+        positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int64)
+        out_cache_loc[:total_entries] = slots.to(torch.int64)
 
     # SWA endpoints would gather the LUT here; identity LUT keeps the bench self-consistent while still
     # exercising the host gather cost.
     if case.pool_kind == "swa_window_128":
-        full_to_swa = torch.arange(num_slots + 1, dtype=torch.int32, device=device)
+        full_to_swa = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
         full_to_swa[-1] = -1
-        out_cache_loc = full_to_swa[out_cache_loc.to(torch.int64)].to(torch.int32)
+        out_cache_loc = full_to_swa[out_cache_loc]
 
     if mirror_expected_inputs:
         expected_input_tokens = input_ids.clone()
         expected_input_positions = positions.clone()
     else:
-        expected_input_tokens = torch.zeros(
-            num_tokens_padded, dtype=torch.int32, device=device
-        )
-        expected_input_positions = torch.zeros(
-            num_tokens_padded, dtype=torch.int32, device=device
-        )
+        expected_input_tokens = None
+        expected_input_positions = None
 
     violation_ring = torch.zeros(
         RING_CAPACITY, consts.VIOLATION_FIELDS, dtype=torch.int64, device=device
@@ -167,6 +164,24 @@ def _build_write_inputs(
         slot_run_counter=slot_run_counter,
         kernel_run_counter=kernel_run_counter,
         real_kv_sources=real_kv_sources,
+    )
+
+
+def _build_context(
+    *,
+    inputs: dict,
+    kernel_kind: CanaryLaunchTag,
+    hash_mode: consts.RealKvHashMode,
+) -> VerifyOrWriteContext:
+    return VerifyOrWriteContext(
+        canary_buf=inputs["canary_buf"],
+        kernel_kind=kernel_kind,
+        violation_ring=inputs["violation_ring"],
+        violation_write_index=inputs["violation_write_index"],
+        slot_run_counter=inputs["slot_run_counter"],
+        kernel_run_counter=inputs["kernel_run_counter"],
+        real_kv_sources=inputs["real_kv_sources"],
+        real_kv_hash_mode=hash_mode,
     )
 
 
@@ -209,24 +224,22 @@ def benchmark(
     if provider == "canary":
         inputs = _build_write_inputs(case, device=device)
         hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+        context = _build_context(
+            inputs=inputs,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            hash_mode=hash_mode_enum,
+        )
 
         def fn() -> None:
-            canary_write_step(
-                canary_buf=inputs["canary_buf"],
+            launch_canary_write_kernel(
+                context=context,
                 plan=inputs["plan"],
                 input_ids=inputs["input_ids"],
                 positions=inputs["positions"],
                 out_cache_loc=inputs["out_cache_loc"],
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                enable_write_verify_inputs=False,
+                enable_assert_inputs=False,
                 expected_input_tokens=inputs["expected_input_tokens"],
                 expected_input_positions=inputs["expected_input_positions"],
-                violation_ring=inputs["violation_ring"],
-                violation_write_index=inputs["violation_write_index"],
-                slot_run_counter=inputs["slot_run_counter"],
-                kernel_run_counter=inputs["kernel_run_counter"],
-                real_kv_sources=inputs["real_kv_sources"],
-                real_kv_hash_mode=hash_mode_enum,
             )
 
     else:
@@ -271,24 +284,22 @@ def benchmark_kernel_kind(
     )
     kernel_kind = CanaryLaunchTag[kernel_kind_name]
     hash_mode_enum = consts.RealKvHashMode[case.hash_mode.upper()]
+    context = _build_context(
+        inputs=inputs,
+        kernel_kind=kernel_kind,
+        hash_mode=hash_mode_enum,
+    )
 
     def fn() -> None:
-        canary_write_step(
-            canary_buf=inputs["canary_buf"],
+        launch_canary_write_kernel(
+            context=context,
             plan=inputs["plan"],
             input_ids=inputs["input_ids"],
             positions=inputs["positions"],
             out_cache_loc=inputs["out_cache_loc"],
-            kernel_kind=kernel_kind,
-            enable_write_verify_inputs=enable_write_verify_inputs,
+            enable_assert_inputs=enable_write_verify_inputs,
             expected_input_tokens=inputs["expected_input_tokens"],
             expected_input_positions=inputs["expected_input_positions"],
-            violation_ring=inputs["violation_ring"],
-            violation_write_index=inputs["violation_write_index"],
-            slot_run_counter=inputs["slot_run_counter"],
-            kernel_run_counter=inputs["kernel_run_counter"],
-            real_kv_sources=inputs["real_kv_sources"],
-            real_kv_hash_mode=hash_mode_enum,
         )
 
     return run_benchmark(fn)

@@ -13,6 +13,8 @@ class _BaselineBase(CanaryE2EBase):
     """No perturb, kv-canary=log, sweep off. Server should run clean with no canary
     violations and every request must come back 200."""
 
+    __test__ = False
+
     kv_canary_mode = CanaryMode.LOG
     extra_env = {}
 
@@ -23,11 +25,15 @@ class _BaselineBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestBaselineMha(_BaselineBase, unittest.TestCase):
+class TestBaselineMha(_BaselineBase):
+    __test__ = True
+
     model_mode = "mha"
 
 
-class TestBaselineSwa(_BaselineBase, unittest.TestCase):
+class TestBaselineSwa(_BaselineBase):
+    __test__ = True
+
     model_mode = "swa"
 
 

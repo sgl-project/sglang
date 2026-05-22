@@ -21,6 +21,8 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
     so orphan slots stay orphan throughout the run.
     """
 
+    __test__ = False
+
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = (
         "--kv-canary-real-data",
@@ -58,23 +60,23 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestPerturbRealKvUnusedCacheMhaFull(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
-):
+class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
+    __test__ = True
+
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUnusedCacheSwaFull(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
-):
+class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
+    __test__ = True
+
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUnusedCacheSwaSwa(
-    _PerturbRealKvUnusedCacheBase, unittest.TestCase
-):
+class TestPerturbRealKvUnusedCacheSwaSwa(_PerturbRealKvUnusedCacheBase):
+    __test__ = True
+
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
 

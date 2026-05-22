@@ -16,6 +16,7 @@ def build_verify_plan_radix_sweep(
     radix_cache: "BasePrefixCache",
     swa_window_size: int,
     full_to_swa_index_mapping: Optional[torch.Tensor],
+    unlocked_only: bool = False,
 ) -> VerifyPlan:
     """Build a sweep VerifyPlan directly from the radix-cache walker.
 
@@ -27,6 +28,7 @@ def build_verify_plan_radix_sweep(
 
     walk_result = walk_radix_cache_for_canary(
         radix_cache=radix_cache,
+        unlocked_only=unlocked_only,
     )
     slot_indices = walk_result.slot_indices.to(device)
     positions = walk_result.positions.to(device)

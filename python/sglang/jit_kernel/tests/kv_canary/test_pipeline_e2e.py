@@ -418,7 +418,8 @@ def test_pipeline_sweep_no_write() -> None:
     )
 
     assert int(plan_v_real.verify_num_valid[0].item()) == prefix_len
-    assert int(plan_w_real.write_num_valid_reqs[0].item()) == 0
+    assert int(plan_w_real.write_num_valid_reqs[0].item()) == 1
+    assert int(plan_w_real.write_offsets[1].item()) == 0
     assert torch.equal(buf_real, initial_buf)
     assert torch.equal(buf_ref, initial_buf)
     assert int(log_real.write_index[0].item()) == 0

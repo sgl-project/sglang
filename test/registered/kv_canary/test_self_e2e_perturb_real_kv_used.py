@@ -20,6 +20,8 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
     match ``target_group``.
     """
 
+    __test__ = False
+
     kv_canary_mode = CanaryMode.LOG
     extra_server_args = ("--kv-canary-real-data", "partial")
 
@@ -44,17 +46,23 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase, unittest.TestCase):
+class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase):
+    __test__ = True
+
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase, unittest.TestCase):
+class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
+    __test__ = True
+
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase, unittest.TestCase):
+class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
+    __test__ = True
+
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
 

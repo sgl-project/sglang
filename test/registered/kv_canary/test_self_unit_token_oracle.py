@@ -28,6 +28,7 @@ class TestTokenOracleManager(CustomTestCase):
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=SimpleNamespace(num_tokens_per_req=4),
             rids_int=torch.tensor([3, 7], dtype=torch.int64, device=self.device),
+            bootstrap_room_ids_int=None,
             input_ids=torch.tensor(
                 [101, 102, 103, 104, 201, 202, 203, 204],
                 dtype=torch.int64,

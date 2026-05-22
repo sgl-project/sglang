@@ -10,7 +10,7 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
+class TestPerturbRaiseMha(CanaryE2EBase):
     """kv-canary=raise: the first violation must abort the server.
 
     Uses perturb point (b) real_kv_used on FULL as the simplest deterministic trigger.
@@ -22,7 +22,7 @@ class TestPerturbRaiseMha(CanaryE2EBase, unittest.TestCase):
 
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
-    extra_server_args = ("--kv-canary-real-data", "partial")
+    extra_server_args = ("--kv-canary-real-data", "partial", "--skip-server-warmup")
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",

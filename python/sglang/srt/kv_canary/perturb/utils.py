@@ -162,6 +162,7 @@ def flip_first_byte_in_source(
     group: CanaryBufferGroup,
     source: RealKvSource,
     slot_idx: int,
+    slot_is_physical: bool = False,
 ) -> Optional[tuple[int, int, int]]:
     """XOR 0xFF on byte_offset=0 of slot_idx in source.tensor.
 
@@ -173,7 +174,11 @@ def flip_first_byte_in_source(
         return None
 
     physical_slot = slot_idx
-    if group.kind == PoolKind.SWA and group.swa_index_lut is not None:
+    if (
+        not slot_is_physical
+        and group.kind == PoolKind.SWA
+        and group.swa_index_lut is not None
+    ):
         lut = group.swa_index_lut
         if slot_idx < 0 or slot_idx >= int(lut.shape[0]):
             return None

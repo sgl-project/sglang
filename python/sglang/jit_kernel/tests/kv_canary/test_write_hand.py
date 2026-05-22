@@ -17,7 +17,6 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyOrWriteContext,
     launch_canary_verify_kernel,
 )
-from sglang.jit_kernel.kv_canary.verify_ref import _compute_real_kv_hash_scalar
 from sglang.jit_kernel.kv_canary.write import (
     launch_canary_write_kernel,
 )
@@ -457,19 +456,13 @@ class TestChain:
 
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for slot_idx, token, position in zip(slot_indices, tokens, positions):
-            rkv = _compute_real_kv_hash_scalar(
-                real_kv_sources=sources_cuda,
-                real_kv_hash_mode=consts.RealKvHashMode.ALL,
-                slot_idx=slot_idx,
-                work_device=torch.device("cpu"),
-            )
-            stored_prev_signed = read_slot_fields(
+            stored_prev_signed, stored_real_kv_hash = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
-            )[2]
+            )[2:]
             assert stored_prev_signed == to_signed_int64(
                 running
             ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
-            running = splitmix64_mix4(running, token, position, rkv)
+            running = splitmix64_mix4(running, token, position, stored_real_kv_hash)
 
 
 class TestMockMode:
@@ -703,8 +696,8 @@ class TestMockMode:
 
 class TestSlotHandling:
     def test_negative_slot_skips_entry(self) -> None:
-        """``out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
-        canary slot mutation. It still counts as a processed write entry for health accounting.
+        """``fb_out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
+        canary slot mutation, and no write slot_run_counter increment.
         Covers both SWA out-of-window (after caller-side LUT gather) and explicit padding intents.
         """
         buf_pair = make_canary_buf_pair(
@@ -730,7 +723,7 @@ class TestSlotHandling:
 
         stored_token, _, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=4)
         assert stored_token == 42
-        assert int(cuda_log.slot_run_counter.item()) == 2
+        assert int(cuda_log.slot_run_counter.item()) == 1
 
     def test_pre_translated_slot_writes_normally(self) -> None:
         """``out_cache_loc[i] >= 0`` → the kernel writes to exactly that slot, with no LUT applied. This

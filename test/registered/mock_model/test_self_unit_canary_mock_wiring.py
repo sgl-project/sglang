@@ -27,6 +27,7 @@ class _StubForwardBatch:
     forward_mode: ForwardMode
     extend_seq_lens: object
     rids_int: torch.Tensor
+    bootstrap_room_ids_int: torch.Tensor | None = None
     spec_info: object | None = None
     seq_lens: torch.Tensor | None = None
 
@@ -92,6 +93,43 @@ class TestFillExpectedInputs(CustomTestCase):
                 _scalar_expected_token(
                     oracle, req_id=_stable_hash_rid_i64(rid_b), position=20
                 ),
+            ],
+        )
+        self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])
+
+    def test_fill_expected_inputs_prefers_bootstrap_room_ids(self) -> None:
+        """Verify PD oracle checks can key by bootstrap room without rewriting rids_int."""
+        oracle = HashOracle(vocab_size=32000)
+        hook = install_oracle_sampler(oracle=oracle)
+
+        rid_a = "prefill-local-rid"
+        rid_b = "regular-rid"
+        hashed_a = _stable_hash_rid_i64(rid_a)
+        hashed_b = _stable_hash_rid_i64(rid_b)
+        fb = _StubForwardBatch(
+            input_ids=torch.tensor([0, 0], dtype=torch.int64),
+            positions=torch.tensor([10, 20], dtype=torch.int64),
+            req_pool_indices=torch.tensor([5, 7], dtype=torch.int64),
+            forward_mode=ForwardMode.DECODE,
+            extend_seq_lens=None,
+            rids_int=torch.tensor([hashed_a, hashed_b], dtype=torch.int64),
+            bootstrap_room_ids_int=torch.tensor([1234, -1], dtype=torch.int64),
+        )
+        expected_inputs = ExpectedInputs.allocate(
+            capacity=8, device=torch.device("cpu")
+        )
+
+        hook.fill_expected_inputs(
+            forward_batch=fb,
+            expected_inputs_out=expected_inputs,
+        )
+
+        self.assertEqual(fb.rids_int.tolist(), [hashed_a, hashed_b])
+        self.assertEqual(
+            expected_inputs.tokens[:2].tolist(),
+            [
+                _scalar_expected_token(oracle, req_id=1234, position=10),
+                _scalar_expected_token(oracle, req_id=hashed_b, position=20),
             ],
         )
         self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])

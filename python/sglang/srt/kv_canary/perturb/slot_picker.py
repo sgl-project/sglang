@@ -31,6 +31,7 @@ class ReqToTokenEntry:
     req_pool_idx: int
     position: int
     value: int
+    seq_len: int = 0
 
 
 def collect_active_slots(
@@ -84,6 +85,7 @@ def collect_active_slots(
                 req_pool_idx=req_pool_idx_int,
                 position=pos,
                 value=value,
+                seq_len=seq_len_int,
             )
             for pos, raw_value in enumerate(row_values)
             if (value := int(raw_value)) >= 0 and value not in excluded

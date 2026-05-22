@@ -123,6 +123,8 @@ class CanaryRunner:
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
             step_counter_getter=self._get_step_counter,
+            swa_window_size=self._swa_window_size,
+            sweep_interval=config.sweep_interval,
         )
         self._per_forward_orchestrator = PerForwardOrchestrator(
             config=config,
