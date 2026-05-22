@@ -1659,20 +1659,21 @@ class FlashAttentionBackend(AttentionBackend):
         be restored by a follow-up per-backend optimization PR.
         """
         bs = forward_batch.batch_size
-        # ``num_tokens == bs * num_tokens_per_bs``. ``positions`` is the only
-        # fb field always sized to ``num_tokens`` across direct (cuda_graph_runner)
-        # and multi-step-wrapper (eagle_draft_cuda_graph_runner) callers --
-        # ``input_ids`` is None in the multi-step wrapper's synthetic fb.
-        num_tokens = (
-            forward_batch.positions.shape[0]
-            if forward_batch.positions is not None
-            else bs
-        )
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        # Derive num_tokens from mode rather than positions.shape[0] so that
+        # replay callers (eagle_draft_extend_cuda_graph_runner) which pass
+        # padded positions buffers do not inflate the count.
+        if forward_mode.is_target_verify():
+            num_tokens = bs * self.speculative_num_draft_tokens
+        elif forward_mode.is_draft_extend(include_v2=True):
+            num_tokens = bs * (self.speculative_num_steps + 1)
+        else:
+            num_tokens = bs
         metadata = FlashAttentionMetadata()
 
         # metadata_expand is needed for Spec Decoding when top k > 1
