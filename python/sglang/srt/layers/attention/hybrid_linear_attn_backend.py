@@ -408,7 +408,13 @@ class MambaAttnBackendBase(AttentionBackend):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens_cpu = (
+            forward_batch.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         if get_is_capture_mode():
@@ -421,7 +427,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 req_pool_indices,
                 forward_mode,
                 spec_info,
-                forward_batch.seq_lens_cpu,
+                seq_lens_cpu,
             )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -729,8 +735,14 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
+        seq_lens_cpu = (
+            forward_batch.seq_lens_cpu[:bs]
+            if forward_batch.seq_lens_cpu is not None
+            else None
+        )
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
         if get_is_capture_mode():
@@ -743,7 +755,7 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
                 req_pool_indices,
                 forward_mode,
                 spec_info,
-                forward_batch.seq_lens_cpu,
+                seq_lens_cpu,
             )
         draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         self.forward_metadata = Mamba2Metadata.prepare_decode(
