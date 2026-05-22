@@ -80,4 +80,4 @@ def test_store_cache_int32_indices(batch_size, num_heads, head_dim, dtype):
 
 
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v", "-s"]))
+    sys.exit(pytest.main([__file__]))
