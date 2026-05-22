@@ -173,15 +173,17 @@ def _run_both_verify(
         plan=plan_cuda,
     )
     launch_canary_verify_kernel_torch_reference(
-        canary_buf=ref_canary_buf,
+        context=VerifyOrWriteContext(
+            canary_buf=ref_canary_buf,
+            kernel_kind=kernel_kind,
+            violation_ring=ref_log.ring,
+            violation_write_index=ref_log.write_index,
+            slot_run_counter=ref_log.slot_run_counter,
+            kernel_run_counter=ref_log.kernel_run_counter,
+            real_kv_sources=real_kv_sources_ref,
+            real_kv_hash_mode=real_kv_hash_mode,
+        ),
         plan=plan_ref,
-        kernel_kind=kernel_kind,
-        violation_ring=ref_log.ring,
-        violation_write_index=ref_log.write_index,
-        slot_run_counter=ref_log.slot_run_counter,
-        kernel_run_counter=ref_log.kernel_run_counter,
-        real_kv_sources=real_kv_sources_ref,
-        real_kv_hash_mode=real_kv_hash_mode,
     )
     torch.cuda.synchronize()
 

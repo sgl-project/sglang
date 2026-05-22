@@ -130,15 +130,17 @@ def _run_pipeline(
             real_kv_hash_mode=real_kv_hash_mode,
         )
         launch_canary_verify_kernel_torch_reference(
-            canary_buf=canary_buf,
+            context=VerifyOrWriteContext(
+                canary_buf=canary_buf,
+                kernel_kind=kernel_kind,
+                violation_ring=log.ring,
+                violation_write_index=log.write_index,
+                slot_run_counter=log.slot_run_counter,
+                kernel_run_counter=log.kernel_run_counter,
+                real_kv_sources=real_kv_sources,
+                real_kv_hash_mode=real_kv_hash_mode,
+            ),
             plan=plan_v,
-            kernel_kind=kernel_kind,
-            violation_ring=log.ring,
-            violation_write_index=log.write_index,
-            slot_run_counter=log.slot_run_counter,
-            kernel_run_counter=log.kernel_run_counter,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
         )
 
     return plan_v, plan_w
@@ -712,15 +714,17 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     torch.cuda.synchronize()
 
     launch_canary_verify_kernel_torch_reference(
-        canary_buf=buf_ref,
+        context=VerifyOrWriteContext(
+            canary_buf=buf_ref,
+            kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+            violation_ring=log_ref.ring,
+            violation_write_index=log_ref.write_index,
+            slot_run_counter=log_ref.slot_run_counter,
+            kernel_run_counter=log_ref.kernel_run_counter,
+            real_kv_sources=(),
+            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+        ),
         plan=plan_v_ref,
-        kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-        violation_ring=log_ref.ring,
-        violation_write_index=log_ref.write_index,
-        slot_run_counter=log_ref.slot_run_counter,
-        kernel_run_counter=log_ref.kernel_run_counter,
-        real_kv_sources=(),
-        real_kv_hash_mode=consts.RealKvHashMode.OFF,
     )
 
     # Step 3: write_index byte-equal; ring contents relaxed (atomic order not guaranteed under overflow).

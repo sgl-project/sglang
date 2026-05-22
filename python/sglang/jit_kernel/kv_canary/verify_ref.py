@@ -7,6 +7,7 @@ from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
+    VerifyOrWriteContext,
     VerifyPlan,
 )
 
@@ -16,16 +17,18 @@ _I64_SIGN_BIT: int = 1 << 63
 
 def launch_canary_verify_kernel_torch_reference(
     *,
-    canary_buf: torch.Tensor,
+    context: VerifyOrWriteContext,
     plan: VerifyPlan,
-    kernel_kind: CanaryLaunchTag,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
 ) -> None:
+    canary_buf = context.canary_buf
+    kernel_kind = context.kernel_kind
+    violation_ring = context.violation_ring
+    violation_write_index = context.violation_write_index
+    slot_run_counter = context.slot_run_counter
+    kernel_run_counter = context.kernel_run_counter
+    real_kv_sources = context.real_kv_sources
+    real_kv_hash_mode = context.real_kv_hash_mode
+
     work_device = torch.device("cpu")
 
     kernel_run_counter.add_(1)

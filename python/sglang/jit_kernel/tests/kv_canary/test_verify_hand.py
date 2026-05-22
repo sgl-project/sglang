@@ -1327,15 +1327,17 @@ class TestLayoutAndScheduling:
             torch.cuda.synchronize()
         else:
             launch_canary_verify_kernel_torch_reference(
-                canary_buf=canary_buf,
+                context=VerifyOrWriteContext(
+                    canary_buf=canary_buf,
+                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                    violation_ring=log.ring,
+                    violation_write_index=log.write_index,
+                    slot_run_counter=log.slot_run_counter,
+                    kernel_run_counter=log.kernel_run_counter,
+                    real_kv_sources=(),
+                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                ),
                 plan=plan,
-                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                violation_ring=log.ring,
-                violation_write_index=log.write_index,
-                slot_run_counter=log.slot_run_counter,
-                kernel_run_counter=log.kernel_run_counter,
-                real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
             )
 
         assert torch.equal(log.ring, ring_before)
