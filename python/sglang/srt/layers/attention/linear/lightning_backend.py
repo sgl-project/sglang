@@ -90,6 +90,30 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
         )
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+
+        bs = forward_batch.batch_size
+        req_pool_indices = forward_batch.req_pool_indices
+        seq_lens = forward_batch.seq_lens
+        forward_mode = forward_batch.forward_mode
+        spec_info = forward_batch.spec_info
+        if get_is_capture_mode():
+            metadata = self._capture_metadata(
+                bs, req_pool_indices, forward_mode, spec_info
+            )
+        else:
+            metadata = self._replay_metadata(
+                bs,
+                req_pool_indices,
+                forward_mode,
+                spec_info,
+                forward_batch.seq_lens_cpu,
+            )
+        self.forward_metadata = BailingLinearMetadata.prepare_decode(
+            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
