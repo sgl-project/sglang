@@ -615,6 +615,11 @@ class TritonAttnBackend(AttentionBackend):
         each call; the underlying buffers stay pinned to ``self.cuda_graph_*``
         across iterations so the captured forward kernel sees the updated
         data via stable pointers.
+
+        ``get_num_kv_splits`` must be called here (not only at capture time)
+        so that ``self.cuda_graph_num_kv_splits`` — the pre-allocated buffer
+        the captured graph reads by pointer — is updated in-place at every
+        replay with the current per-request seq_lens.
         """
         bs = forward_batch.batch_size
         # Normalize to bs-length: replay callers (e.g. eagle_draft_extend) may
@@ -653,7 +658,7 @@ class TritonAttnBackend(AttentionBackend):
                 ):
                     window_kv_indices = self.cuda_graph_window_kv_indices
                     window_num_kv_splits = self.cuda_graph_window_num_kv_splits
-                    window_kv_indptr, window_kv_indices, _, _ = (
+                    window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
                         update_sliding_window_buffer_cuda_graph(
                             self.window_kv_indptr,
                             window_kv_indices,
@@ -665,6 +670,9 @@ class TritonAttnBackend(AttentionBackend):
                             self.token_to_kv_pool_allocator,
                         )
                     )
+                    self.get_num_kv_splits(
+                        window_num_kv_splits[:bs], window_kv_lens[:bs]
+                    )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 
@@ -673,6 +681,10 @@ class TritonAttnBackend(AttentionBackend):
             attn_lse = self.cuda_graph_attn_lse
             max_extend_len = None
             num_kv_splits = self.cuda_graph_num_kv_splits
+            if spec_info is None:
+                # Update the pre-allocated num_kv_splits buffer in-place so the
+                # captured graph reads current per-request split counts.
+                self.get_num_kv_splits(num_kv_splits[:bs], seq_lens)
             qo_indptr = None
             custom_mask = None
             mask_indptr = None
