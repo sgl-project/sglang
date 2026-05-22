@@ -560,6 +560,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+        base_input_ids = getattr(base_output, "input_ids", None)
+        if isinstance(base_input_ids, list) and len(base_input_ids) == input_ids.numel():
+            input_ids_list = base_input_ids
+        else:
+            input_ids_list = input_ids.tolist()
 
         image_grid_thw = None
         if hasattr(ret, "image_grid_thw"):
@@ -611,7 +616,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids_list,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
