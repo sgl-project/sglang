@@ -211,10 +211,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
                     ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
                 )
                 tl.store(p_hs, b_h.to(p_hs.dtype.element_ty), boundary_check=(0, 1))
-            else:
-                assert False, "currently we always do in-place update"
-
-    # Final state is already in ht (initial_state) from the last Phase 2 store
 
 
 def chunk_gated_delta_rule_fwd_h(

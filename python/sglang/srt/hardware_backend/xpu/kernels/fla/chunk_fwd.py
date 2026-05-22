@@ -295,8 +295,6 @@ def chunk_gated_delta_rule_fwd_intra(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     # Step 1: fused kkt + solve_tril
-    # Use float32 for A to avoid precision loss in intermediate scratch storage.
-    # Cast back to input dtype before passing to recompute_w_u_fwd.
     A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
     kernel = chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg
     kernel[(NT, B * H)](
@@ -313,10 +311,6 @@ def chunk_gated_delta_rule_fwd_intra(
         BT=BT,
         BC=BC,
     )
-
-    # Cast A back to input dtype: recompute_w_u_fwd does tl.dot(b_A, b_vb)
-    # which requires matching dtypes.
-    # A = A.to(k.dtype)
 
     # Step 2: recompute_w_u
     w, u = recompute_w_u_fwd(
