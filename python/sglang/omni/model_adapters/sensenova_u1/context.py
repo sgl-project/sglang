@@ -228,10 +228,8 @@ U1_INTERLEAVE_SYSTEM_MESSAGE = (
     "without reasoning. Do not use tags like <image1>, <image2>; present any "
     "images naturally alongside the text.\n\n"
     "After the think block, always provide a concise, user-facing final answer. "
-    "The final answer must not include hidden reasoning, planning steps, numbered "
-    'analysis, explicit image prompts, or phrases like "I will". The answer may '
-    "include text, images, or both. Match the user's language in both reasoning "
-    "and the final answer."
+    "The answer may include text, images, or both. Match the user's language in "
+    "both reasoning and the final answer."
 )
 
 
@@ -1374,6 +1372,7 @@ def _u1_generated_image_commit_metadata(
     )
     return {
         "u1": u1_segment.to_dict(),
+        "omni_srt_position_count": generation_position_start,
         "omni_model_state_updates": state_patch.to_model_state_updates(),
     }
 
