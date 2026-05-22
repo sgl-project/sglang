@@ -8,7 +8,6 @@ import torch
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_SLOT_BYTES,
     CanaryLaunchTag,
     RealKvSource,
     VerifyOrWriteContext,
@@ -16,6 +15,13 @@ from sglang.jit_kernel.kv_canary.verify import (
     launch_canary_verify_kernel,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
+from sglang.jit_kernel.tests.kv_canary._constants import (
+    DEFAULT_NUM_SLOTS,
+    DEFAULT_RING_CAPACITY,
+    DEFAULT_SLOT_STRIDE_BYTES,
+    _I64_SIGN_BIT,
+    _U64_MASK,
+)
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
@@ -46,15 +52,6 @@ __all__ = [
     "to_signed_int64",
     "write_slot_fields",
 ]
-
-# Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
-# stay realistic without bloating the assertion surface.
-DEFAULT_RING_CAPACITY: int = 64
-DEFAULT_NUM_SLOTS: int = 32
-DEFAULT_SLOT_STRIDE_BYTES: int = CANARY_SLOT_BYTES
-
-_U64_MASK: int = (1 << 64) - 1
-_I64_SIGN_BIT: int = 1 << 63
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

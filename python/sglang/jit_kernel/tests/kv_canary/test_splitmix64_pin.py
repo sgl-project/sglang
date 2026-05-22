@@ -5,11 +5,10 @@ import random
 from sglang.jit_kernel.kv_canary.consts import CANARY_CHAIN_ANCHOR
 from sglang.jit_kernel.kv_canary.consts import splitmix64 as splitmix64_consts
 from sglang.jit_kernel.tests.kv_canary._canary_helpers import splitmix64
+from sglang.jit_kernel.tests.kv_canary._constants import _U64_MASK
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="base-b-kernel-unit-1-gpu-large")
-
-_U64_MASK = (1 << 64) - 1
 
 
 def _splitmix64_independent(value: int) -> int:

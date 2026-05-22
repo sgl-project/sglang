@@ -10,12 +10,7 @@ from sglang.jit_kernel.kv_canary.verify import (
     VerifyPlan,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
-
-# Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
-# stay realistic without bloating the assertion surface.
-DEFAULT_NUM_SLOTS: int = 32
-
-_U64_MASK: int = (1 << 64) - 1
+from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
 
 _DEVICE = torch.device("cuda")
 
