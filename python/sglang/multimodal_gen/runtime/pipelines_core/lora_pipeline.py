@@ -4,7 +4,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Hashable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -19,6 +19,9 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     wrap_with_lora_layer,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    is_layerwise_offloaded_module,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
 )
@@ -170,10 +173,6 @@ class LoRAPipeline(ComposedPipelineBase):
         Yields:
             List of modules that had offload disabled.
         """
-        from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
-            is_layerwise_offloaded_module,
-        )
-
         module_names = []
         if target_modules is not None:
             # Extract module names from target_modules
@@ -214,6 +213,22 @@ class LoRAPipeline(ComposedPipelineBase):
             # Re-enable layerwise offload: sync weights to CPU and restore hooks
             for module in offload_disabled_modules:
                 module.enable_offload()
+
+    def _needs_lora_weight_update_context(
+        self,
+        target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]],
+        merge_weights_by_module: dict[str, bool],
+    ) -> bool:
+
+        for module_name, lora_layers_dict in target_modules:
+            if merge_weights_by_module[module_name]:
+                return True
+            if any(layer.merged for layer in lora_layers_dict.values()):
+                return True
+            module = self.modules.get(module_name)
+            if module is not None and is_layerwise_offloaded_module(module):
+                return True
+        return False
 
     def convert_module_lora_layers(
         self,
@@ -578,6 +593,58 @@ class LoRAPipeline(ComposedPipelineBase):
                     )
         return adapted_count
 
+    def _reactivate_cached_dynamic_lora_layers(
+        self,
+        lora_layers: dict[str, BaseLayerWithLoRA],
+        lora_nicknames: list[str],
+        lora_paths: list[str | None],
+        strengths: list[float],
+    ) -> int | None:
+        """
+        Re-enable a previously applied dynamic LoRA without rebuilding per-layer state.
+
+        Dynamic LoRA keeps adapter tensors on the wrapped layers. When a later stage only
+        disables them and the next stage asks for the same single adapter again, toggling
+        `disable_lora` is enough; the stored A/B tensors, rank, alpha, and strength still
+        describe the requested adapter.
+        """
+        if len(lora_nicknames) != 1:
+            return None
+
+        nickname = lora_nicknames[0]
+        strength = strengths[0]
+        adapter = self.lora_adapters.get(nickname)
+        if adapter is None:
+            return None
+        path = lora_paths[0] or self.loaded_adapter_paths.get(nickname)
+        if path is None:
+            return None
+
+        active_count = 0
+        for name, layer in lora_layers.items():
+            if layer.merged or len(layer.lora_weights_list) != 1:
+                return None
+            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
+            if not has_adapter:
+                continue
+            if (
+                layer.lora_A is None
+                or layer.lora_B is None
+                or layer.lora_path != path
+                or layer.strength != strength
+            ):
+                return None
+            active_count += 1
+
+        if active_count == 0:
+            return None
+
+        for name, layer in lora_layers.items():
+            has_adapter = name + ".lora_A" in adapter and name + ".lora_B" in adapter
+            layer.disable_lora = not has_adapter
+
+        return active_count
+
     def is_lora_effective(self, target: str = "all") -> bool:
         """
         Check if LoRA is currently effective for the specified target.
@@ -756,58 +823,79 @@ class LoRAPipeline(ComposedPipelineBase):
             if not target_modules:
                 continue
 
-            # Disable layerwise offload if enabled: load all layers to GPU
-            # the LoRA weights merging process requires weights being on device
-            with self._temporarily_disable_offload(target_modules=target_modules):
-                tgt_nicknames = [lora_nicknames[i] for i in idx_list]
-                tgt_paths = [lora_paths[i] for i in idx_list]
-                tgt_strengths = [strengths[i] for i in idx_list]
+            tgt_nicknames = [lora_nicknames[i] for i in idx_list]
+            tgt_paths = [lora_paths[i] for i in idx_list]
+            tgt_strengths = [strengths[i] for i in idx_list]
 
-                merged_name = (
-                    ",".join(tgt_nicknames)
-                    if len(tgt_nicknames) > 1
-                    else tgt_nicknames[0]
+            merged_name = (
+                ",".join(tgt_nicknames) if len(tgt_nicknames) > 1 else tgt_nicknames[0]
+            )
+
+            # Skip if LoRA configuration matches exactly (including order and strength)
+            # Since all modules for the same target apply the same config, checking one is sufficient
+            first_module_name, first_lora_layers_dict = target_modules[0]
+            first_effective_merge_weights = self._should_merge_lora_for_layers(
+                first_module_name, first_lora_layers_dict, merge_mode
+            )
+            if not first_effective_merge_weights and len(tgt_nicknames) > 1:
+                raise ValueError(
+                    "Dynamic LoRA currently supports only one adapter per target. "
+                    "Use merge_mode='merge' for multiple adapters."
                 )
 
-                # Skip if LoRA configuration matches exactly (including order and strength)
-                # Since all modules for the same target apply the same config, checking one is sufficient
-                first_module_name, first_lora_layers_dict = target_modules[0]
-                first_effective_merge_weights = self._should_merge_lora_for_layers(
-                    first_module_name, first_lora_layers_dict, merge_mode
-                )
-                if not first_effective_merge_weights and len(tgt_nicknames) > 1:
-                    raise ValueError(
-                        "Dynamic LoRA currently supports only one adapter per target. "
-                        "Use merge_mode='merge' for multiple adapters."
+            merge_weights_by_module = {}
+            for module_name, lora_layers_dict in target_modules:
+                merge_weights_by_module[module_name] = (
+                    first_effective_merge_weights
+                    if module_name == first_module_name
+                    else self._should_merge_lora_for_layers(
+                        module_name, lora_layers_dict, merge_mode
                     )
-                if self._check_lora_config_matches(
-                    first_module_name,
-                    tgt_nicknames,
-                    tgt_strengths,
-                    first_effective_merge_weights,
-                    adapter_updated,
-                ):
-                    logger.info("LoRA configuration matches exactly, skipping")
-                    continue
+                )
 
+            if self._check_lora_config_matches(
+                first_module_name,
+                tgt_nicknames,
+                tgt_strengths,
+                first_effective_merge_weights,
+                adapter_updated,
+            ):
+                logger.info("LoRA configuration matches exactly, skipping")
+                continue
+
+            # merged LoRA and offloaded modules update backing weights; dynamic
+            # reactivation only toggles wrapper metadata when cached tensors match
+            if self._needs_lora_weight_update_context(
+                target_modules, merge_weights_by_module
+            ):
+                weight_update_context = self._temporarily_disable_offload(
+                    target_modules=target_modules
+                )
+            else:
+                weight_update_context = nullcontext()
+
+            with weight_update_context:
                 # Apply LoRA to modules for this target
                 for module_name, lora_layers_dict in target_modules:
-                    effective_merge_weights = (
-                        first_effective_merge_weights
-                        if module_name == first_module_name
-                        else self._should_merge_lora_for_layers(
-                            module_name, lora_layers_dict, merge_mode
+                    effective_merge_weights = merge_weights_by_module[module_name]
+                    count = None
+                    if not effective_merge_weights and not adapter_updated:
+                        count = self._reactivate_cached_dynamic_lora_layers(
+                            lora_layers_dict,
+                            tgt_nicknames,
+                            tgt_paths,
+                            tgt_strengths,
                         )
-                    )
-                    count = self._apply_lora_to_layers(
-                        lora_layers_dict,
-                        tgt_nicknames,
-                        tgt_paths,
-                        rank,
-                        tgt_strengths,
-                        clear_existing=True,
-                        merge_weights=effective_merge_weights,
-                    )
+                    if count is None:
+                        count = self._apply_lora_to_layers(
+                            lora_layers_dict,
+                            tgt_nicknames,
+                            tgt_paths,
+                            rank,
+                            tgt_strengths,
+                            clear_existing=True,
+                            merge_weights=effective_merge_weights,
+                        )
                     adapted_count += count
                     self.cur_adapter_name[module_name] = merged_name
                     self.cur_adapter_path[module_name] = ",".join(
