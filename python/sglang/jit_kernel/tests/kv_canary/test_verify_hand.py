@@ -103,7 +103,6 @@ def _stamp_clean_kv_chain(
     positions: torch.Tensor,
     out_cache_loc: torch.Tensor,
     real_kv_hash_mode: consts.RealKvHashMode,
-    seed_offset: int = 0,
 ) -> None:
     """Use the Python write ref impl to populate the canary buf for a fresh chain.
 
@@ -138,7 +137,6 @@ def _stamp_clean_kv_chain(
         real_kv_hash_mode=real_kv_hash_mode,
     )
     ref_buf.copy_(cuda_buf)
-    _ = seed_offset  # reserved for future use
 
 
 # ---------------------------------------------------------------------------
