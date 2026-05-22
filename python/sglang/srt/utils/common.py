@@ -3046,6 +3046,13 @@ def require_attn_tp_gather(server_args: ServerArgs):
     """
     Check if the input of attention is scattered.
     """
+    # Opt-out for models that manage SP scatter/gather at the model level
+    # and do not consume the upstream gathered_buffer. Without this, the
+    # cuda graph runner pads num_tokens to attn_tp_size, which can cause
+    # autotuners to pick suboptimal kernel variants at small batches.
+    if server_args.disable_attn_tp_gather:
+        return False
+
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     assert server_args.moe_dense_tp_size in [1, None]
