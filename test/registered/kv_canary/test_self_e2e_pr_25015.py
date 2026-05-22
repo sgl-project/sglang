@@ -53,13 +53,14 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
         super().setUpClass()
 
     def test_pr_25015_eagle_positions(self) -> None:
+        self.send_parallel_requests(
+            n=_EAGER_DRAFT_REQUEST_COUNT,
+            assert_all_success=False,
+            max_new_tokens=32,
+            timeout=60.0,
+        )
+
         if self.revert_pr:
-            self.send_parallel_requests(
-                n=_EAGER_DRAFT_REQUEST_COUNT,
-                assert_all_success=False,
-                max_new_tokens=32,
-                timeout=60.0,
-            )
             self.assert_violation_logged_any(
                 launch_tag_patterns=("*",),
                 fail_reason="position",
