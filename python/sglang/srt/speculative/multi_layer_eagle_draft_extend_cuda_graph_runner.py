@@ -48,6 +48,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_req_to_token_pool,
+)
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.multi_layer_eagle_utils import assign_new_state_triton
@@ -382,8 +387,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -396,7 +399,6 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=capture_mode,
-            attn_backend=self.eagle_worker.draft_extend_attn_backend_list[self.step],
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             padded_static_len=self.padded_static_len,
@@ -417,22 +419,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         bs = size
         buffers = self.buffers
 
-        self.deepep_adapter.capture(is_extend_in_batch=True)
-
         num_tokens = bs * self.num_tokens_per_bs
         forward_batch = self.get_forward_batch(bs)
-
-        self.eagle_worker.draft_extend_attn_backend_list[
-            self.step
-        ].init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=forward_batch.req_pool_indices,
-            seq_lens=forward_batch.seq_lens,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=forward_batch.spec_info,
-        )
+        attn_backend = self.eagle_worker.draft_extend_attn_backend_list[self.step]
 
         def run_once():
             if self.model_runner.is_hybrid_swa:
@@ -499,15 +488,26 @@ class MultiLayerEagleDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                     forward_batch.batch_size,
                     self.step,
                     forward_batch.req_pool_indices,
-                    forward_batch.req_to_token_pool.req_to_token,
+                    get_req_to_token_pool().req_to_token,
                     self.eagle_worker.req_to_hidden_states_pool,
                 )
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        shape_key = self._make_graph_key(bs)
-        self.backend.capture_one(shape_key, run_once, dummies=None)
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+            self.deepep_adapter.capture(is_extend_in_batch=True)
+            shape_key = self._make_graph_key(bs)
+            self.backend.capture_one(shape_key, run_once, dummies=None)
 
     def init_replay_state(
         self, forward_batch: ForwardBatch, bs: int, raw_bs: int, num_tokens: int

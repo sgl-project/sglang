@@ -28,6 +28,7 @@ from sglang.srt.model_executor.cuda_graph_mode import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -219,7 +220,7 @@ class Qwen3Attention(nn.Module):
 
         qkv_3d = qkv.view(num_tokens, -1, self.head_dim)
 
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = get_token_to_kv_pool()
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(self.attn.layer_id)
         slot_mapping = forward_batch.out_cache_loc
 

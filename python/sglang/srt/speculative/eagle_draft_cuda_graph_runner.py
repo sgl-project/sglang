@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 from sglang.srt.speculative.spec_utils import (
@@ -356,8 +357,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             seq_lens_cpu=seq_lens_cpu,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -374,8 +373,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
 
-        self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(forward_batch)
-
         def run_once():
             if self.model_runner.is_hybrid_swa:
                 self.model_runner.token_to_kv_pool.invalidate_loc_cache()
@@ -388,7 +385,6 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             )
             set_is_extend_in_batch(False)
 
-            # Backup fields that are modified in-place in `draft_forward`.
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
@@ -399,10 +395,13 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
-        self.deepep_adapter.capture(is_extend_in_batch=False)
-
-        shape_key = self._make_graph_key(num_seqs)
-        self.backend.capture_one(shape_key, run_once, dummies=None)
+        with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
+                forward_batch
+            )
+            self.deepep_adapter.capture(is_extend_in_batch=False)
+            shape_key = self._make_graph_key(num_seqs)
+            self.backend.capture_one(shape_key, run_once, dummies=None)
 
     def _postprocess_output_to_raw_bs(self, out, raw_bs):
         parent_list, top_scores_index, draft_tokens = (t[:raw_bs] for t in out)

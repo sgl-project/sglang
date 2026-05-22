@@ -389,7 +389,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         next_draft_input = EagleDraftInput(
             hidden_states=target_hidden_states,
             bonus_tokens=next_token_ids,
-            new_seq_lens=batch.seq_lens,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
             num_tokens_for_logprob_per_req=1,
@@ -424,9 +423,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
-            forward_batch.req_to_token_pool = self.draft_runner_list[
-                step
-            ].req_to_token_pool
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -531,9 +527,6 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
-                forward_batch.req_to_token_pool = self.draft_runner_list[
-                    step
-                ].req_to_token_pool
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
@@ -674,7 +667,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_verify_complete=None):
+    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -685,9 +678,12 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
+            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+            # Extend processed L prompt tokens; next verify iter expects same L.
+            batch_output.new_seq_lens = batch.seq_lens
             # Publish before draft_extend so the fence is at target-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch.seq_lens)
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
 
             # Chain-style MTP needs FULL to get all-token hidden states;
             # non-chain only needs LAST (the target model's hidden states).
@@ -716,8 +712,8 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             batch.spec_info = verify_input
             batch_output = self.verify(batch)
             # Publish before draft_extend so the fence is at verify-end.
-            if on_verify_complete is not None:
-                on_verify_complete(batch_output.next_draft_input.new_seq_lens)
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
             self.draft_worker._draft_extend_for_decode(batch, batch_output)
             return batch_output
 
@@ -797,10 +793,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
-        next_draft_input = EagleDraftInput(
-            bonus_tokens=bonus_tokens,
-            new_seq_lens=new_seq_lens,
-        )
+        next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
         # verify_forward_batch transitively holds verify-time GPU tensors that
         # must outlive the imminent batch.input_ids rebind; scheduler pins it
         # in batch_record_buf via extra_keep_alive_refs. See EAGLEWorkerV2.verify.
@@ -811,6 +804,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
             accept_lens=accept_lens,
+            new_seq_lens=new_seq_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
             indexer_topk_output=forward_batch_output.indexer_topk_output,
             extra_keep_alive_refs=[verify_forward_batch],

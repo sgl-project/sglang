@@ -28,6 +28,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftExtendInput
 from sglang.srt.speculative.spec_utils import fast_topk
@@ -356,8 +357,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             num_accept_tokens=num_accept_tokens,
         )
 
-        self.deepep_adapter.capture(is_extend_in_batch=True)
-
         forward_batch = ForwardBatch(
             forward_mode=self.forward_mode,
             batch_size=bs,
@@ -368,8 +367,6 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             next_token_logits_buffer=next_token_logits_buffer,
             extend_seq_lens=extend_seq_lens,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             return_logprob=False,
@@ -382,18 +379,7 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
-        )
-
-        self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
-            bs=bs,
-            num_tokens=num_tokens,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            encoder_lens=None,
-            forward_mode=self.forward_mode,
-            spec_info=spec_info,
         )
 
         def run_once():
@@ -423,8 +409,21 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        shape_key = self._make_graph_key(bs)
-        self.backend.capture_one(shape_key, run_once, dummies=None)
+        with forward_context(
+            ForwardContext(attn_backend=self.draft_extend_attn_backend)
+        ):
+            self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
+                bs=bs,
+                num_tokens=num_tokens,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=None,
+                forward_mode=self.forward_mode,
+                spec_info=spec_info,
+            )
+            self.deepep_adapter.capture(is_extend_in_batch=True)
+            shape_key = self._make_graph_key(bs)
+            self.backend.capture_one(shape_key, run_once, dummies=None)
 
     def replay(self, forward_batch: ForwardBatch):
         assert forward_batch.out_cache_loc is not None
