@@ -193,8 +193,8 @@ class ImageTransform(object):
             elif not x.is_floating_point():
                 x = x.to(torch.float32)
             if self.normalize:
-
-                x = TF.Normalize(self.mean, self.std)(x)
+                import torchvision.transforms as T
+                x = T.Normalize(self.mean, self.std)(x)
             return x
         x = self.transform(img)
         return x
