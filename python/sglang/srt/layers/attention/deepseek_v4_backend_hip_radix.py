@@ -747,8 +747,9 @@ class DeepseekV4HipRadixBackend(
         IDLE-replaced fields, eliminating this side channel.
         """
         bs = forward_batch.batch_size
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         forward_mode = forward_batch.forward_mode
         bucket = _GraphBucket.of(forward_mode)
 
