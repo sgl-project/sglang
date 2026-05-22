@@ -1189,7 +1189,7 @@ class Indexer(MultiPlatformOp):
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,
-                forward_batch.out_cache_loc.dtype,
+                out_cache_loc.dtype,
                 get_token_to_kv_pool().page_size,
             )
         ):
@@ -1200,7 +1200,7 @@ class Indexer(MultiPlatformOp):
             fused_store_index_k_cache(
                 key,
                 buf,
-                forward_batch.out_cache_loc,
+                out_cache_loc,
                 get_token_to_kv_pool().page_size,
             )
             return
