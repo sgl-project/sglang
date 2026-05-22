@@ -167,26 +167,28 @@ class DeepseekV4AscendAttnBackend(
         max_pages = block_tables_shape[1]
 
         # swa page table — same shape as block_tables (full kv pages).
-        self.graph_metadata["swa_page_table"] = torch.zeros(
-            (max_bs, max_pages), dtype=torch.int32, device=device
+        # Sentinel = -1 ("no valid page"); 0 would collide with legitimate
+        # page id 0 and let the kernel read wrong tokens past the tail.
+        self.graph_metadata["swa_page_table"] = torch.full(
+            (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
-        # c4 / c128 page tables — at ratio R, pages are at most max_pages // R + 1.
-        # The kernel reads up to ceil(seq_len / ratio / page_size) pages anyway.
-        c4_max_pages = max_pages // 4 + 1
-        c128_max_pages = max_pages // 128 + 1
-
-        self.graph_metadata["c4_page_table"] = torch.zeros(
-            (max_bs, c4_max_pages), dtype=torch.int32, device=device
+        # c4 / c128 page tables — allocate the full max_pages width.
+        # Using max_pages // R + 1 (an apparent "1/R" optimization) is unsafe:
+        # _compute_compress_locs can emit more cols than pages/R at certain
+        # seq-len alignments / SWA edges, causing aclnnInplaceCopy 161002
+        # ("[2, 33] vs [2, 34] cannot broadcast") during replay.
+        self.graph_metadata["c4_page_table"] = torch.full(
+            (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_page_table"] = torch.zeros(
-            (max_bs, c128_max_pages), dtype=torch.int32, device=device
+        self.graph_metadata["c128_page_table"] = torch.full(
+            (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        self.graph_metadata["c4_state_page_table"] = torch.zeros(
-            (max_bs, c4_max_pages), dtype=torch.int32, device=device
+        self.graph_metadata["c4_state_page_table"] = torch.full(
+            (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
-        self.graph_metadata["c128_state_page_table"] = torch.zeros(
-            (max_bs, c128_max_pages), dtype=torch.int32, device=device
+        self.graph_metadata["c128_state_page_table"] = torch.full(
+            (max_bs, max_pages), -1, dtype=torch.int32, device=device
         )
 
         # 1 kernel_metadata slot per ratio, 1024 int32 entries per source ref.
@@ -399,12 +401,15 @@ class DeepseekV4AscendAttnBackend(
         )
 
         # In-place copy result into preallocated fm buffers.
-        # Page tables are 2-D (max_bs, c{ratio}_max_pages); zero the tail per row.
+        # Page tables are 2-D (max_bs, max_pages); -1 the tail per row so
+        # unused slots are an invalid-page sentinel (matches reference impl
+        # and the initial fill in _init_dsv4_graph_buffers).
         def _copy_2d(dst: torch.Tensor, src: torch.Tensor) -> None:
-            dst.fill_(0)
+            dst.fill_(-1)
             dst[: src.shape[0], : src.shape[1]].copy_(src)
 
-        # Loc tensors are 1-D flat; zero the tail.
+        # Loc tensors are 1-D flat; zero the tail (loc arrays are token-level
+        # offsets, 0 is a benign default).
         def _copy_1d(dst: torch.Tensor, src: torch.Tensor) -> None:
             dst.fill_(0)
             dst[: src.shape[0]].copy_(src)
@@ -941,6 +946,11 @@ class DeepseekV4AscendAttnBackend(
             metadata=fm.kernel_metadata["c1a_metadata"],
             softmax_scale=layer.scaling,
         )
+        # for _k, _v in attn_kwargs.items():
+        #     if isinstance(_v, torch.Tensor):
+        #         print(f"[dsv4_dense] {_k}: shape={tuple(_v.shape)} dtype={_v.dtype}")
+        #     else:
+        #         print(f"[dsv4_dense] {_k}: {_v!r}")
         out, _ = torch.ops.custom.npu_sparse_attn_sharedkv(**attn_kwargs)
         return out
 
