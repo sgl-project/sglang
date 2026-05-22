@@ -8,7 +8,15 @@ from typing import TYPE_CHECKING, Any, List
 
 import regex as re
 import torch
-
+from humming.dtypes import DataType
+from humming.layer import HummingMethod
+from humming.schema import (
+    BaseInputSchema,
+    BaseWeightSchema,
+    HummingInputSchema,
+    HummingWeightSchema,
+)
+from humming.utils.weight import quantize_weight
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
@@ -41,27 +49,6 @@ from sglang.srt.layers.quantization.unquant import (
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
     from sglang.srt.models.utils import WeightsMapper
-
-
-try:
-    from humming.dtypes import DataType
-    from humming.layer import HummingMethod
-    from humming.schema import (
-        BaseInputSchema,
-        BaseWeightSchema,
-        HummingInputSchema,
-        HummingWeightSchema,
-    )
-    from humming.utils.weight import quantize_weight
-except ModuleNotFoundError:
-    HummingMethod = None
-
-
-def assert_humming_available():
-    assert HummingMethod is not None, (
-        "humming is not available, please run "
-        "'pip install git+https://github.com/inclusionAI/humming' to install it."
-    )
 
 
 def prepare_padded_shape(shape, x):
@@ -174,7 +161,6 @@ class HummingConfig(QuantizationConfig):
     packed_modules_mapping = {}
 
     def __init__(self, full_config: dict[str, Any] | None = None):
-        assert_humming_available()
         self.full_config: dict[str, Any] = full_config or {}
 
     @classmethod
