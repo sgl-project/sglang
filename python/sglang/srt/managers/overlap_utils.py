@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Union
 
 import torch
@@ -34,11 +33,6 @@ if _is_cuda or _is_hip:
     _resolve_future_token_ids = resolve_future_token_ids_cuda
 else:
     _resolve_future_token_ids = _resolve_future_token_ids_native
-
-
-@dataclass
-class FutureIndices:
-    indices: torch.Tensor
 
 
 class FutureMap:
@@ -113,7 +107,7 @@ class FutureMap:
         if draft_input is None:
             # FIXME(lsyin): only prefill; not compatible with mixed mode
             return
-        indices = draft_input.future_indices.indices
+        indices = draft_input.future_indices
         # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
         # record_batch_in_overlap; record_stream here is redundant.
         indices.record_stream(torch.get_device_module(self.device).current_stream())
@@ -124,12 +118,12 @@ class FutureMap:
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def set_input_ids_sentinel(
-        self, batch: ScheduleBatch, future_indices: FutureIndices
+        self, batch: ScheduleBatch, future_indices: torch.Tensor
     ) -> None:
         # Sentinel for the decode portion so mixed batches can cat extend
         # (positive real tokens) + decode (negative sentinels) into one
         # input_ids; resolve_future translates negatives via output_tokens_buf.
-        batch.input_ids = -future_indices.indices
+        batch.input_ids = -future_indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         # Lazy pull from new_seq_lens_buf for spec_v2 (accept_lens not known to
@@ -140,15 +134,13 @@ class FutureMap:
             return
         if self.publish_ready is not None:
             self.publish_ready.wait()
-        new_seq_lens = self.new_seq_lens_buf[fi.indices]
+        new_seq_lens = self.new_seq_lens_buf[fi]
         batch.seq_lens = new_seq_lens
         batch.seq_lens_cpu = new_seq_lens.cpu()
         batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
 
-    def publish(
-        self, future_indices: FutureIndices, new_seq_lens: torch.Tensor
-    ) -> None:
-        indices = future_indices.indices
+    def publish(self, future_indices: torch.Tensor, new_seq_lens: torch.Tensor) -> None:
+        indices = future_indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
@@ -160,10 +152,10 @@ class FutureMap:
 
     def stash(
         self,
-        future_indices: FutureIndices,
+        future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
-        indices = future_indices.indices
+        indices = future_indices
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
