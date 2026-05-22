@@ -54,6 +54,88 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(int(future_a.wait().item()), 13)
         self.assertEqual(int(future_b.wait().item()), 29)
 
+    def test_dict_of_all_tensors_roundtrip(self) -> None:
+        """Verify a dict of multiple tensors round-trips entry-by-entry."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        src = {
+            "x": torch.tensor([11, 22], dtype=torch.int64, device=device),
+            "y": torch.tensor([99], dtype=torch.int32, device=device),
+        }
+        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        out = future.wait()
+        self.assertIsInstance(out, dict)
+        self.assertEqual(out["x"].tolist(), [11, 22])
+        self.assertEqual(int(out["y"].item()), 99)
+        self.assertTrue(out["x"].is_pinned())
+        self.assertTrue(out["y"].is_pinned())
+
+    def test_dict_mixes_tensor_and_passthrough(self) -> None:
+        """Verify non-tensor dict entries ride through verbatim alongside staging."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        sentinel_obj = {"nested": [1, 2, 3]}
+        src = {
+            "step": 42,
+            "label": "decode",
+            "extra": sentinel_obj,
+            "counter": torch.tensor([7], dtype=torch.int32, device=device),
+        }
+        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        out = future.wait()
+        self.assertEqual(out["step"], 42)
+        self.assertEqual(out["label"], "decode")
+        # Identity (not deep-copy) — callers can rely on shared mutable references.
+        self.assertIs(out["extra"], sentinel_obj)
+        self.assertEqual(int(out["counter"].item()), 7)
+        self.assertTrue(out["counter"].is_pinned())
+
+    def test_dict_passthrough_preserves_tensor_value(self) -> None:
+        """Verify tensors share device memory but non-tensor types are not staged."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        src_tensor = torch.tensor([3], dtype=torch.int32, device=device)
+        src = {"step": 100, "buf": src_tensor}
+        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        out = future.wait()
+        # Tensor is staged to a fresh pinned-host buffer (different storage from src).
+        self.assertNotEqual(out["buf"].data_ptr(), src_tensor.data_ptr())
+        self.assertTrue(out["buf"].is_pinned())
+        # Non-tensor passes through with no copy.
+        self.assertEqual(out["step"], 100)
+        self.assertIsInstance(out["step"], int)
+
+    def test_dict_without_tensor_raises(self) -> None:
+        """Verify a tensor-less dict raises (no device to anchor the d2h sync)."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        with self.assertRaises(ValueError):
+            FutureTensors.device_to_host(
+                src_device={"step": 0, "label": "decode"}, stream=stream
+            )
+
+    def test_wait_called_twice_raises(self) -> None:
+        """Verify wait() after the first drain raises (state cleared)."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        src = torch.tensor([3], dtype=torch.int32, device=device)
+        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        self.assertEqual(int(future.wait().item()), 3)
+        with self.assertRaises(RuntimeError):
+            future.wait()
+
+    def test_dict_anchor_picked_from_first_tensor(self) -> None:
+        """Verify staging works when the first key is a non-tensor (anchor must scan)."""
+        device = torch.device("cuda")
+        stream = torch.cuda.Stream(device=device)
+        src = {
+            "step": 5,
+            "buf": torch.tensor([17], dtype=torch.int32, device=device),
+        }
+        out = FutureTensors.device_to_host(src_device=src, stream=stream).wait()
+        self.assertEqual(out["step"], 5)
+        self.assertEqual(int(out["buf"].item()), 17)
+
 
 if __name__ == "__main__":
     unittest.main()
