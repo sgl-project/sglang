@@ -1279,9 +1279,12 @@ class TestLayoutAndScheduling:
         assert int(log.slot_run_counter[0].item()) == 1
         assert int(log.kernel_run_counter[0].item()) == 1
 
-    @pytest.mark.parametrize("runner_kind", ["real", "ref"])
+    @pytest.mark.parametrize(
+        "runner",
+        [launch_canary_verify_kernel, launch_canary_verify_kernel_torch_reference],
+    )
     def test_disabled_plan_skips_slots_but_counts_kernel(
-        self, runner_kind: str
+        self, runner: Callable[..., None]
     ) -> None:
         """``VerifyPlan.enable = 0`` skips active entries while still marking the verify launch as run."""
         canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
@@ -1312,35 +1315,21 @@ class TestLayoutAndScheduling:
         slot_run_before = log.slot_run_counter.clone()
         kernel_run_before = log.kernel_run_counter.clone()
 
-        if runner_kind == "real":
-            launch_canary_verify_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=canary_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    real_kv_sources=(),
-                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
-                ),
-                plan=plan,
-            )
+        runner(
+            context=VerifyOrWriteContext(
+                canary_buf=canary_buf,
+                kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
+                violation_ring=log.ring,
+                violation_write_index=log.write_index,
+                slot_run_counter=log.slot_run_counter,
+                kernel_run_counter=log.kernel_run_counter,
+                real_kv_sources=(),
+                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            ),
+            plan=plan,
+        )
+        if runner is launch_canary_verify_kernel:
             torch.cuda.synchronize()
-        else:
-            launch_canary_verify_kernel_torch_reference(
-                context=VerifyOrWriteContext(
-                    canary_buf=canary_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    real_kv_sources=(),
-                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
-                ),
-                plan=plan,
-            )
 
         assert torch.equal(log.ring, ring_before)
         assert torch.equal(log.write_index, write_index_before)
