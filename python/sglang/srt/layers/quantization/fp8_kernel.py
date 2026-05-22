@@ -166,7 +166,7 @@ def _per_token_group_quant_8bit(
 
     This function converts the tensor values into float8 values.
     """
-    g_id = tl.program_id(0)
+    g_id = tl.program_id(0).to(tl.int64)
     y_off = g_id * y_stride
     y_ptr += y_off
     y_q_ptr += y_off
