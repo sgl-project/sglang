@@ -1,8 +1,8 @@
 # Nightly benchmark configurations for srt-slurm powered runners.
 #
-# Structure mirrors InferenceX nvidia-master.yaml but only includes fields
-# actually needed by the runner — prefill/decode topology details are already
-# encoded in each srt-slurm recipe YAML and are not duplicated here.
+# Each top-level block defines one matrix dimension; per-recipe topology
+# (prefill/decode TP, EP, workers, etc.) lives in the srt-slurm recipe YAML
+# referenced by `config_file` and is not duplicated here.
 #
 # To add/remove concurrencies: edit conc-list for the relevant search-space entry.
 # To add a new runner:         add a new top-level block and create a corresponding

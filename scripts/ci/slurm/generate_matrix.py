@@ -24,7 +24,6 @@ import yaml
 
 # Concurrencies below this are skipped when picking the eval candidate — too
 # few in-flight requests to keep the model warm for a meaningful eval pass.
-# Matches InferenceX's mark_eval_entries policy.
 MIN_EVAL_CONC = 16
 
 
