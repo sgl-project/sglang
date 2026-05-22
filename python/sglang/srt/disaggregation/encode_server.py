@@ -778,6 +778,15 @@ class MMEncoder:
         mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
         num_items = len(grid_thw)
 
+        # Hashes must be grid-space; a leaf-space list would size-mismatch
+        # rank>0's mask (zeros(num_items)) and deadlock TP.
+        if hashes is not None and len(hashes) != num_items:
+            raise BadRequestError(
+                f"User-supplied hashes length {len(hashes)} != grid count "
+                f"{num_items} for {self.model_type}/{modality.name}; hashes "
+                f"must be in grid space (1 per encoder grid entry)."
+            )
+
         # Step 1: Rank 0 checks global cache and broadcasts hit/miss mask to all ranks.
         if self.rank == 0:
             if hashes is None:
@@ -961,6 +970,28 @@ class MMEncoder:
             else:
                 flat.append(item)
         return flat
+
+    def _grid_count_per_leaf(self, leaves: List, modality: Modality) -> List[int]:
+        """Number of grid entries each leaf produces under the model's processor.
+
+        Most processors map 1 leaf → 1 grid. Kimi-VL/K25 image processors expand
+        a leaf shaped {"type": "image", "image": [pil1, pil2, ...]} into N grids
+        (see _normalize_kimi_encoder_images). Cross-request batching needs these
+        counts to keep per-request boundaries aligned with grid_dim.
+        """
+        if self.model_type not in ("kimi_k25", "kimi_vl") or modality != Modality.IMAGE:
+            return [1] * len(leaves)
+
+        def count(leaf):
+            if (
+                isinstance(leaf, dict)
+                and leaf.get("type") == "image"
+                and isinstance(leaf.get("image"), (list, tuple))
+            ):
+                return len(self._flatten_nested_items(leaf["image"]))
+            return 1
+
+        return [count(leaf) for leaf in leaves]
 
     def _normalize_kimi_encoder_images(self, images):
         """Normalize Kimi image inputs for the image processor call."""
@@ -1320,11 +1351,14 @@ class MMEncoder:
         self, requests: List[dict], modality: Modality
     ) -> List[Tuple[int, int, int, Optional[str], Optional[int]]]:
         """Cross-request encoder fusion (image/audio). Skips local mm_cache."""
-        items_per_req, flat_items = [], []
+        # items_per_req counts grid entries (post-expansion) so per-request
+        # slicing of grid_dim/final_slices stays aligned for processors that
+        # expand one leaf into multiple grids (e.g. Kimi-VL/K25 dict-of-images).
+        flat_items, items_per_req = [], []
         for req in requests:
             leaves = MMEncoder._flatten_nested_items(req["mm_items"])
-            items_per_req.append(len(leaves))
             flat_items.extend(leaves)
+            items_per_req.append(sum(self._grid_count_per_leaf(leaves, modality)))
         total = sum(items_per_req)
 
         try:
@@ -1341,6 +1375,19 @@ class MMEncoder:
         try:
             mm_feature = _convert(_get_mm_feature(mm_inputs, modality))
             grid_dim = _get_mm_grid_dim(mm_inputs, modality, self.model_type)
+            if len(grid_dim) != total:
+                return self._batch_set_error(
+                    requests,
+                    modality,
+                    InternalError(
+                        f"Grid count mismatch for {self.model_type}/"
+                        f"{modality.name}: {len(flat_items)} leaves across "
+                        f"{len(requests)} requests → expected {total} grids "
+                        f"(per-req {items_per_req}), but processor produced "
+                        f"{len(grid_dim)}. Add tile-expansion handling in "
+                        f"_grid_count_per_leaf."
+                    ),
+                )
             cache = self.mm_global_cache
 
             if cache is None:
@@ -1365,6 +1412,20 @@ class MMEncoder:
                         user_hashes = None
                         break
                     user_hashes.extend(h if isinstance(h, list) else [h])
+
+                # Hashes must be grid-space; a leaf-space list would size-
+                # mismatch rank>0's mask (zeros(total)) and deadlock TP.
+                if user_hashes is not None and len(user_hashes) != total:
+                    return self._batch_set_error(
+                        requests,
+                        modality,
+                        BadRequestError(
+                            f"User-supplied hashes length {len(user_hashes)} "
+                            f"!= grid count {total} for {self.model_type}/"
+                            f"{modality.name}; hashes must be in grid space "
+                            f"(1 per encoder grid entry)."
+                        ),
+                    )
 
                 if self.rank == 0:
                     mm_hashes = user_hashes or self._calculate_hashes_from_features(
