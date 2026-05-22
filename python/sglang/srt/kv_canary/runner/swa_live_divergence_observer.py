@@ -34,9 +34,7 @@ class SwaLiveDivergenceObserver:
         self._last_req_pool_indices = req_pool_indices
         self._last_seq_lens = seq_lens
 
-    def snapshot_nonidentity_future(
-        self, *, stream: torch.cuda.Stream
-    ) -> FutureTensor:
+    def snapshot_nonidentity_future(self, *, stream: torch.cuda.Stream) -> FutureTensor:
         req_pool_indices = self._last_req_pool_indices
         seq_lens = self._last_seq_lens
         mapping = self._swa_allocator.full_to_swa_index_mapping
