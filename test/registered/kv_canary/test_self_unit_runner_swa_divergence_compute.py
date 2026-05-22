@@ -12,12 +12,13 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.runner.swa_divergence import stats as swa_div_module
+from sglang.srt.kv_canary.runner import future_tensor as future_tensor_module
+from sglang.srt.kv_canary.runner.swa_divergence import report as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence.compute import (
     compute_swa_full_idx_divergence,
 )
 from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
-from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
+from sglang.srt.kv_canary.runner.swa_divergence.report import SwaDivergenceReport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,13 +44,15 @@ def _make_req_to_token_pool_stub(req_to_token: torch.Tensor) -> SimpleNamespace:
 
 
 def _patch_future_tensor():
-    def _fake_device_to_host(
-        *, src_device: torch.Tensor, stream: Optional[torch.cuda.Stream] = None
-    ) -> _RecordingFuture:
+    def _fake_device_to_host(src_device, *, stream=None) -> _RecordingFuture:
+        if isinstance(src_device, dict):
+            return _RecordingFuture(
+                value={k: v.detach().cpu().clone() for k, v in src_device.items()}
+            )
         return _RecordingFuture(value=src_device.detach().cpu().clone())
 
     return patch.object(
-        swa_div_module.FutureTensor, "device_to_host", _fake_device_to_host
+        future_tensor_module.FutureTensors, "device_to_host", _fake_device_to_host
     )
 
 
@@ -225,8 +228,8 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
         )
 
 
-class TestSwaDivergenceStatsWithCompute(CustomTestCase):
-    def test_swa_divergence_stats_emits_swa_full_idx_divergence_from_compute(
+class TestSwaDivergenceReportWithCompute(CustomTestCase):
+    def test_swa_divergence_report_emits_swa_full_idx_divergence_from_compute(
         self,
     ) -> None:
         mapping = _make_identity_mapping(size=64)
@@ -244,7 +247,7 @@ class TestSwaDivergenceStatsWithCompute(CustomTestCase):
         swa_allocator = _make_allocator_stub(mapping)
         req_to_token_pool = _make_req_to_token_pool_stub(req_to_token)
         with _patch_cuda_stream_ctx(), _patch_future_tensor():
-            stats = SwaDivergenceStats(
+            stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
                 swa_allocator=swa_allocator,
@@ -263,7 +266,7 @@ class TestSwaDivergenceStatsWithCompute(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.emit_log_if_due(
+                stats.step(
                     step_counter=10, period=10, forward_batch=forward_batch
                 )
 

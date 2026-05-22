@@ -5,7 +5,6 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-
 _SWA_DIVERGENCE_LOG_PREFIX: str = "kv_canary_swa_divergence="
 
 _SWA_DIVERGENCE_LINE_RE = re.compile(re.escape(_SWA_DIVERGENCE_LOG_PREFIX) + r"(\S+)")

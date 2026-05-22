@@ -8,7 +8,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
@@ -41,7 +41,7 @@ class KernelRunCounterHealthChecker:
         self._active_tags = active_tags
         self._step_counter_getter = step_counter_getter
         self._d2h_stream = d2h_stream
-        self._previous_health_future: Optional[FutureTensor] = None
+        self._previous_health_future: Optional[FutureTensors] = None
 
     def step(self) -> None:
         step_counter = self._step_counter_getter()
@@ -64,7 +64,7 @@ class KernelRunCounterHealthChecker:
                     f"at step={step_counter}; canary path is not executing"
                 )
 
-        self._previous_health_future = FutureTensor.device_to_host(
+        self._previous_health_future = FutureTensors.device_to_host(
             src_device=device_state.kernel_run_counters, stream=self._d2h_stream
         )
 
@@ -91,8 +91,8 @@ class PeriodicCanaryStatsLogger:
         self._step_counter_getter = step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
         self._d2h_stream = d2h_stream
-        self._previous_slot_sum_future: Optional[FutureTensor] = None
-        self._previous_write_index_future: Optional[FutureTensor] = None
+        self._previous_slot_sum_future: Optional[FutureTensors] = None
+        self._previous_write_index_future: Optional[FutureTensors] = None
 
     def step(self) -> None:
         period = self._config.stats_print_every_n_steps
@@ -121,10 +121,10 @@ class PeriodicCanaryStatsLogger:
             )
 
         slot_sum_device = device_state.slot_run_counters.sum().view(1)
-        self._previous_slot_sum_future = FutureTensor.device_to_host(
+        self._previous_slot_sum_future = FutureTensors.device_to_host(
             src_device=slot_sum_device, stream=self._d2h_stream
         )
-        self._previous_write_index_future = FutureTensor.device_to_host(
+        self._previous_write_index_future = FutureTensors.device_to_host(
             src_device=device_state.violation_log.violation_write_index,
             stream=self._d2h_stream,
         )

@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 from sglang.srt.kv_canary.runner.violation_reporter import ViolationReporter
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
@@ -26,7 +26,7 @@ class ViolationManager:
         self._violation_reporter = ViolationReporter(
             config=config, device_state=device_state
         )
-        self._previous_pump_future: Optional[FutureTensor] = None
+        self._previous_pump_future: Optional[FutureTensors] = None
 
     def step(self) -> None:
         any_rank_errored = self._pump()
@@ -42,7 +42,7 @@ class ViolationManager:
         local_errored = False
         if self._previous_pump_future is not None:
             local_errored = bool(int(self._previous_pump_future.wait().item()))
-        self._previous_pump_future = FutureTensor.device_to_host(
+        self._previous_pump_future = FutureTensors.device_to_host(
             src_device=signal.view(-1)[:1], stream=self._d2h_stream
         )
 

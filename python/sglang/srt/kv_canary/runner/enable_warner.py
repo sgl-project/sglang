@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.future_tensor import FutureTensors
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +22,12 @@ class _CanaryEnableWarner:
     ) -> None:
         self._verify_capacity = verify_capacity
         self._d2h_stream = d2h_stream
-        self._pending_future: Optional[FutureTensor] = None
+        self._pending_future: Optional[FutureTensors] = None
         self._overflow_count_total: int = 0
 
     def tick(self, enable_device: torch.Tensor) -> None:
         self._drain_previous()
-        self._pending_future = FutureTensor.device_to_host(
+        self._pending_future = FutureTensors.device_to_host(
             src_device=enable_device,
             stream=self._d2h_stream,
         )

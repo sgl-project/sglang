@@ -22,7 +22,7 @@ from sglang.srt.kv_canary.runner.health import (
     PeriodicCanaryStatsLogger,
 )
 from sglang.srt.kv_canary.runner.per_forward import PerForwardOrchestrator
-from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
+from sglang.srt.kv_canary.runner.swa_divergence.report import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -89,8 +89,8 @@ class CanaryRunner:
         self._d2h_stream: torch.cuda.Stream = torch.cuda.Stream(device=device)
 
         if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
-            self._swa_divergence_stats: Optional[SwaDivergenceStats] = (
-                SwaDivergenceStats(
+            self._swa_divergence_report: Optional[SwaDivergenceReport] = (
+                SwaDivergenceReport(
                     device=device,
                     d2h_stream=self._d2h_stream,
                     swa_allocator=self._swa_allocator,
@@ -98,7 +98,7 @@ class CanaryRunner:
                 )
             )
         else:
-            self._swa_divergence_stats = None
+            self._swa_divergence_report = None
 
         self._violation_manager = ViolationManager(
             config=config,
@@ -134,7 +134,7 @@ class CanaryRunner:
             per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
             d2h_stream=self._d2h_stream,
             token_oracle_manager=token_oracle_manager,
-            swa_divergence_stats=self._swa_divergence_stats,
+            swa_divergence_report=self._swa_divergence_report,
         )
         self._health_checker = KernelRunCounterHealthChecker(
             config=config,
@@ -206,8 +206,8 @@ class CanaryRunner:
         self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
-        if self._swa_divergence_stats is not None:
-            self._swa_divergence_stats.emit_log_if_due(
+        if self._swa_divergence_report is not None:
+            self._swa_divergence_report.step(
                 step_counter=self._step_counter,
                 period=self.config.stats_print_every_n_steps,
                 forward_batch=forward_batch,

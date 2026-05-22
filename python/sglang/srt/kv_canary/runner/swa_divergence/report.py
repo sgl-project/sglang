@@ -7,7 +7,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.runner.future_tensor import FutureTensor
+from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.swa_divergence.compute import (
     compute_swa_full_idx_divergence,
 )
@@ -24,7 +24,7 @@ _FULL_IDX = 0
 _SWA_IDX = 1
 
 
-class SwaDivergenceStats:
+class SwaDivergenceReport:
     def __init__(
         self,
         *,
@@ -33,12 +33,19 @@ class SwaDivergenceStats:
         swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
         req_to_token_pool: Optional["ReqToTokenPool"] = None,
     ) -> None:
-        self._d2h_stream = d2h_stream
         self._swa_allocator = swa_allocator
         self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
         self._verify_total_count_device: torch.Tensor = torch.zeros(
             2, dtype=torch.int32, device=device
+        )
+        self._current_step_counter: int = 0
+        self._current_period: int = 0
+        self._current_forward_batch: Optional["ForwardBatch"] = None
+        self._handler = DelayedDeviceHostHandler(
+            compute_on_device=self._compute_on_device,
+            postprocess_on_host=self._postprocess_on_host,
+            d2h_stream=d2h_stream,
         )
 
     def observe_after_invoke_plan(
@@ -50,41 +57,42 @@ class SwaDivergenceStats:
     def on_forward_completed(self) -> None:
         self._forward_ct += 1
 
-    def emit_log_if_due(
+    def step(
         self,
         *,
         step_counter: int,
         period: int,
         forward_batch: "ForwardBatch",
     ) -> None:
+        self._current_step_counter = step_counter
+        self._current_period = period
+        self._current_forward_batch = forward_batch
+        self._handler.step()
+
+    def _compute_on_device(self) -> Optional[dict[str, torch.Tensor]]:
+        period = self._current_period
+        step_counter = self._current_step_counter
         if period <= 0 or step_counter == 0 or step_counter % period != 0:
-            return
+            return None
 
-        swa_full_idx_divergence_device: Optional[torch.Tensor] = None
+        result: dict[str, torch.Tensor] = {
+            "verify_total_count": self._verify_total_count_device,
+        }
         if self._swa_allocator is not None:
-            with torch.cuda.stream(self._d2h_stream):
-                swa_full_idx_divergence_device = compute_swa_full_idx_divergence(
-                    swa_allocator=self._swa_allocator,
-                    req_to_token_pool=self._req_to_token_pool,
-                    forward_batch=forward_batch,
-                )
-
-        verify_future = FutureTensor.device_to_host(
-            src_device=self._verify_total_count_device, stream=self._d2h_stream
-        )
-        swa_full_idx_divergence_future = (
-            FutureTensor.device_to_host(
-                src_device=swa_full_idx_divergence_device, stream=self._d2h_stream
+            result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
+                swa_allocator=self._swa_allocator,
+                req_to_token_pool=self._req_to_token_pool,
+                forward_batch=self._current_forward_batch,
             )
-            if swa_full_idx_divergence_device is not None
-            else None
-        )
+        return result
 
-        verify_totals = verify_future.wait().tolist()
+    def _postprocess_on_host(self, host_data: dict[str, torch.Tensor]) -> None:
+        verify_totals = host_data["verify_total_count"].tolist()
         swa_full_idx_divergence = (
-            int(swa_full_idx_divergence_future.wait().item()) if swa_full_idx_divergence_future is not None else 0
+            int(host_data["swa_full_idx_divergence"].item())
+            if "swa_full_idx_divergence" in host_data
+            else 0
         )
-
         logger.info(
             SwaDivergenceLog(
                 forward_ct=self._forward_ct,

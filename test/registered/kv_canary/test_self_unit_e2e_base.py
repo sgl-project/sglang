@@ -134,7 +134,9 @@ class TestAssertSwaDivergenceObserved(CustomTestCase):
                     max_retries=2,
                 )
 
-    def test_assert_swa_divergence_observed_catches_zero_swa_full_idx_divergence(self) -> None:
+    def test_assert_swa_divergence_observed_catches_zero_swa_full_idx_divergence(
+        self,
+    ) -> None:
         zero_divergence_line = SwaDivergenceLog(
             forward_ct=200,
             verify_full=10000,

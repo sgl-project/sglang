@@ -13,9 +13,10 @@ from kv_canary_runner_unit_utils import CanaryRunnerTestCase, make_runner
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.runner.swa_divergence import stats as swa_div_module
+from sglang.srt.kv_canary.runner import future_tensor as future_tensor_module
+from sglang.srt.kv_canary.runner.swa_divergence import report as swa_div_module
 from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
-from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
+from sglang.srt.kv_canary.runner.swa_divergence.report import SwaDivergenceReport
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -57,13 +58,15 @@ def _make_group(kind: PoolKind) -> CanaryBufferGroup:
 
 
 def _patch_future_tensor():
-    def _fake_device_to_host(
-        *, src_device: torch.Tensor, stream: Optional[torch.cuda.Stream] = None
-    ) -> _RecordingFuture:
+    def _fake_device_to_host(src_device, *, stream=None) -> _RecordingFuture:
+        if isinstance(src_device, dict):
+            return _RecordingFuture(
+                value={k: v.detach().cpu().clone() for k, v in src_device.items()}
+            )
         return _RecordingFuture(value=src_device.detach().cpu().clone())
 
     return patch.object(
-        swa_div_module.FutureTensor, "device_to_host", _fake_device_to_host
+        future_tensor_module.FutureTensors, "device_to_host", _fake_device_to_host
     )
 
 
@@ -74,10 +77,10 @@ def _parse_swa_divergence_line(line: str) -> SwaDivergenceLog:
     return parsed
 
 
-class TestSwaDivergenceStats(CustomTestCase):
+class TestSwaDivergenceReport(CustomTestCase):
     def test_swa_divergence_log_emitted(self) -> None:
         with _patch_future_tensor():
-            stats = SwaDivergenceStats(
+            stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
                 swa_allocator=None,
@@ -97,7 +100,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.emit_log_if_due(
+                stats.step(
                     step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH
                 )
 
@@ -115,7 +118,7 @@ class TestSwaDivergenceStats(CustomTestCase):
 
     def test_swa_divergence_counts_monotonic_increasing(self) -> None:
         with _patch_future_tensor():
-            stats = SwaDivergenceStats(
+            stats = SwaDivergenceReport(
                 device=_DEVICE,
                 d2h_stream=None,
                 swa_allocator=None,
@@ -128,7 +131,7 @@ class TestSwaDivergenceStats(CustomTestCase):
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
-                    stats.emit_log_if_due(
+                    stats.step(
                         step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH
                     )
                 matching = [
@@ -162,20 +165,20 @@ class TestSwaDivergenceStats(CustomTestCase):
 
 
 class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
-    def test_swa_divergence_stats_is_none_when_env_disabled(self) -> None:
+    def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
             False
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
             runner = make_runner(device=self.device)
-        self.assertIsNone(runner._swa_divergence_stats)
+        self.assertIsNone(runner._swa_divergence_report)
 
-    def test_swa_divergence_stats_present_when_env_enabled(self) -> None:
+    def test_swa_divergence_report_present_when_env_enabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.override(
             True
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
             runner = make_runner(device=self.device)
-        self.assertIsNotNone(runner._swa_divergence_stats)
-        self.assertIsInstance(runner._swa_divergence_stats, SwaDivergenceStats)
+        self.assertIsNotNone(runner._swa_divergence_report)
+        self.assertIsInstance(runner._swa_divergence_report, SwaDivergenceReport)
 
 
 if __name__ == "__main__":
