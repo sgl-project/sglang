@@ -42,6 +42,22 @@ class FutureIndices:
 
 
 class FutureMap:
+    """Forward-stream-side relay for cross-iter values that schedule cannot
+    derive locally.
+
+    Per-forward GPU inputs fall into two classes:
+      G2 - schedule-deterministic: value is known at schedule time (e.g. non-spec
+           seq_lens via +1 per decode). SB maintains the GPU mirror directly.
+      G1 - forward-produced: value depends on the previous forward's output
+           (e.g. spec_v2 seq_lens after accept_lens, sampled next_token_ids).
+           Forward stream publishes into a buf here; consumers pull lazily.
+
+    SB.seq_lens GPU is a G2-style mirror of seq_lens_cpu. For spec_v2 overlap,
+    `resolve_seq_lens_cpu` syncs SB from `new_seq_lens_buf` at the next schedule
+    entry - a lazy pull, not a forward-side push. Forward path treats SB as
+    read-only; spec mutations land on forward_batch.seq_lens.
+    """
+
     def __init__(
         self,
         device: torch.device,
@@ -118,14 +134,15 @@ class FutureMap:
         batch.input_ids = -future_indices.indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
+        # G1 lazy pull (see class docstring). For spec_v2: previous forward's
+        # `seq_lens + accept_lens` was published to `new_seq_lens_buf`; this is
+        # the next iter's pre-verify truth. Pull into both SB CPU and GPU so the
+        # SB.seq_lens GPU == seq_lens_cpu mirror invariant holds.
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
         if fi is None:
             return
         if self.publish_ready is not None:
             self.publish_ready.wait()
-        # Spec_v2: prepare_for_decode's +1 assumption is wrong (accept_lens != 1).
-        # Overwrite both CPU and GPU shadows with the published truth so SB
-        # maintains seq_lens GPU == seq_lens_cpu mirror.
         new_seq_lens = self.new_seq_lens_buf[fi.indices]
         batch.seq_lens = new_seq_lens
         batch.seq_lens_cpu = new_seq_lens.cpu()
