@@ -3812,15 +3812,16 @@ class ServerArgs:
                 f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, Qwen2Audio, Qwen2.5Omni, Kimi, MiMoV2."
             )
 
-    def _validate_ib_devices(self, device_str: str) -> Optional[str]:
+    def _validate_ib_devices(self, device_str: Optional[str]) -> Optional[str]:
         """
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Comma-separated IB device names, a per-GPU JSON mapping,
+                or a path to a JSON file containing that mapping.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            A normalized comma-separated string or per-GPU JSON mapping string, or None if input is None.
         """
         if device_str is None:
             logger.warning(
@@ -3828,20 +3829,34 @@ class ServerArgs:
             )
             return None
 
-        # Strip whitespace from device names
-        devices = [d.strip() for d in device_str.split(",") if d.strip()]
-        if len(devices) == 0:
-            raise ValueError("No valid IB devices specified")
+        def _normalize_device_group(raw_value: str, context: str) -> str:
+            if not isinstance(raw_value, str):
+                raise ValueError(
+                    f"Invalid IB device format for {context}: expected a string. "
+                    f"Got {type(raw_value)}"
+                )
+            devices = [d.strip() for d in raw_value.split(",") if d.strip()]
+            if not devices:
+                raise ValueError(f"No valid IB devices specified for {context}")
+            unique_devices = list(dict.fromkeys(devices))
+            if len(unique_devices) != len(devices):
+                logger.warning(
+                    "Duplicate IB devices specified for %s: %s. Deduplicating to: %s",
+                    context,
+                    raw_value,
+                    ",".join(unique_devices),
+                )
+            invalid_devices = [d for d in unique_devices if d not in available_devices]
+            if len(invalid_devices) != 0:
+                raise ValueError(
+                    f"Invalid IB devices specified for {context}: {invalid_devices}. "
+                    f"Available devices: {sorted(available_devices)}"
+                )
+            return ",".join(unique_devices)
 
-        # Deduplicate while preserving order
-        unique_devices = list(dict.fromkeys(devices))
-        if len(unique_devices) != len(devices):
-            logger.warning(
-                "Duplicate IB devices specified: %s. Deduplicating to: %s",
-                device_str,
-                ",".join(unique_devices),
-            )
-            devices = unique_devices
+        normalized_input = device_str.strip()
+        if not normalized_input:
+            raise ValueError("No valid IB devices specified")
 
         # Get available IB devices from sysfs
         ib_sysfs_path = "/sys/class/infiniband"
@@ -3855,15 +3870,45 @@ class ServerArgs:
         if len(available_devices) == 0:
             raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
-        # Check for invalid devices
-        invalid_devices = [d for d in devices if d not in available_devices]
-        if len(invalid_devices) != 0:
+        mapping = None
+        if normalized_input.endswith(".json"):
+            if not os.path.isfile(normalized_input):
+                raise RuntimeError(
+                    f"IB device JSON file does not exist: {normalized_input}"
+                )
+            try:
+                with open(normalized_input, "r", encoding="utf-8") as file:
+                    mapping = json.load(file)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Failed to read IB device JSON file {normalized_input}: {exc}"
+                ) from exc
+        elif normalized_input.startswith("{"):
+            mapping = json.loads(normalized_input)
+
+        if mapping is None:
+            return _normalize_device_group(normalized_input, "all GPUs")
+        if not isinstance(mapping, dict):
             raise ValueError(
-                f"Invalid IB devices specified: {invalid_devices}. "
-                f"Available devices: {sorted(available_devices)}"
+                "Invalid IB device JSON format: expected a mapping from GPU id to device string"
             )
 
-        return ",".join(devices)
+        normalized_mapping: Dict[str, str] = {}
+        for gpu_key, gpu_devices in mapping.items():
+            normalized_key = str(gpu_key)
+            if not normalized_key.isdigit():
+                raise ValueError(
+                    "Invalid IB device mapping key: expected an integer GPU id or its string representation, "
+                    f"got {gpu_key!r}"
+                )
+            normalized_mapping[normalized_key] = _normalize_device_group(
+                gpu_devices, f"GPU {normalized_key}"
+            )
+
+        if not normalized_mapping:
+            raise ValueError("No valid GPU mappings found in IB device JSON")
+
+        return json.dumps(normalized_mapping, separators=(",", ":"))
 
     def _handle_tokenizer_batching(self):
         if self.enable_tokenizer_batch_encode and self.enable_dynamic_batch_tokenizer:
