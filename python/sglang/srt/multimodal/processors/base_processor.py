@@ -1086,16 +1086,28 @@ class BaseMultimodalProcessor(ABC):
         Note that the data_dict can be passed via offline engine api
         """
 
+        get_data_value = (
+            data_dict.get
+            if hasattr(data_dict, "get")
+            else lambda name, default=None: getattr(data_dict, name, default)
+        )
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
-            if attr_name == "input_ids":
+            if attr_name in (
+                "input_ids",
+                "format",
+                "modality",
+                "hash",
+                "pad_value",
+                "offsets",
+            ):
                 continue
 
             # Get modality for this attribute
             current_modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
 
             if attr_name == "precomputed_embeddings":
-                modality_str = data_dict.get("modality")
+                modality_str = get_data_value("modality")
                 current_modality = Modality.IMAGE
                 if modality_str:
                     try:
@@ -1114,6 +1126,25 @@ class BaseMultimodalProcessor(ABC):
                     attr_name = "feature"
 
                 items[current_modality].set(attr_name, value)
+
+        if len(items) == 1:
+            item = next(iter(items.values()))
+            offsets = get_data_value("offsets")
+            if offsets is not None:
+                if isinstance(offsets, torch.Tensor):
+                    offsets = offsets.detach().cpu().tolist()
+                item.offsets = [(int(start), int(end)) for start, end in offsets]
+
+            hash_value = get_data_value("hash")
+            if hash_value is not None:
+                if isinstance(hash_value, torch.Tensor):
+                    hash_value = hash_value.item()
+                item.hash = int(hash_value)
+                pad_value = get_data_value("pad_value")
+                if pad_value is not None:
+                    if isinstance(pad_value, torch.Tensor):
+                        pad_value = pad_value.item()
+                    item.pad_value = int(pad_value)
 
         return list(items.values())
 
@@ -1240,6 +1271,8 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
+            if mm_item.offsets is not None:
+                continue
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")
