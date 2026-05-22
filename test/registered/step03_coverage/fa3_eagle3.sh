@@ -34,5 +34,9 @@ LAUNCH_ARGS=(
     --tp-size 1
 )
 
+EXTRA_ENV=(
+    "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+)
+
 READY_TIMEOUT=2400
 run_server_smoke
