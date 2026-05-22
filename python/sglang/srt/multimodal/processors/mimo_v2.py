@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from fastapi import HTTPException
 from PIL import Image
+from torchcodec.decoders import AudioDecoder
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
@@ -487,13 +488,13 @@ class MiMoProcessor:
             return _ffprobe_has_audio(path_or_data, stdin=None, label=path_or_data)
 
         if isinstance(path_or_data, bytes):
-            source = io.BytesIO(path_or_data)
+            source = BytesIO(path_or_data)
         elif (
             isinstance(path_or_data, str)
             and path_or_data.startswith("data:")
             and ";base64," in path_or_data
         ):
-            source = io.BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
+            source = BytesIO(base64.b64decode(path_or_data.split(";base64,")[1]))
         else:
             source = path_or_data  # local path or file://
         try:
@@ -578,7 +579,9 @@ class MiMoProcessor:
                 all_timestamps.extend(aligned_ts[::step].tolist())
 
                 if self.has_audio_track(video_blob):
-                    audio_spec, audio_token_len = self.preprocess_audio(video_blob)
+                    audio_spec, audio_token_len = self.audio_pipeline.preprocess_audio(
+                        video_blob
+                    )
                     units = self._build_video_audio_units(
                         grid,
                         aligned_ts,
@@ -615,7 +618,7 @@ class MiMoProcessor:
             for audio in mm_data:
                 if isinstance(audio, np.ndarray):
                     audio = (torch.from_numpy(audio).float(), self.audio_sampling_rate)
-                spec, token_len = self.preprocess_audio(audio)
+                spec, token_len = self.audio_pipeline.preprocess_audio(audio)
                 all_specs.append(spec)
                 all_lens.append(token_len)
             return {

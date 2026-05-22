@@ -1009,8 +1009,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
     # Prefixes for weight routing in encoder_only/language_only modes
     _LANGUAGE_WEIGHT_PREFIXES = ("model.", "lm_head.")
-    _VISION_AUDIO_WEIGHT_PREFIXES = ("visual.", "vision_model.", "audio_")
-    _VISION_AUDIO_WEIGHT_SUBSTRING = "speech_embeddings"
+    _VISION_WEIGHT_PREFIXES = ("visual.", "vision_model.")
+    # ``audio_`` already covers ``audio_encoder.`` so a single prefix is enough.
+    _AUDIO_WEIGHT_PREFIXES = ("audio_",)
+    _AUDIO_WEIGHT_SUBSTRING = "speech_embeddings"
 
     def __init__(
         self,
@@ -1266,22 +1268,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
 
-        def _is_vision_audio_weight(name):
-            return (
-                name.startswith(self._VISION_AUDIO_WEIGHT_PREFIXES)
-                or self._VISION_AUDIO_WEIGHT_SUBSTRING in name
-            )
-            
-
         for name, loaded_weight in weights:
+            is_vision_weight = name.startswith(self._VISION_WEIGHT_PREFIXES)
             is_audio_weight = (
-                name.startswith(("audio_encoder.", "audio_"))
-                or "speech_embeddings" in name
+                name.startswith(self._AUDIO_WEIGHT_PREFIXES)
+                or self._AUDIO_WEIGHT_SUBSTRING in name
             )
 
-            if not self._is_multimodal and (
-                name.startswith(("visual.", "vision_model.")) or is_audio_weight
-            ):
+            if not self._is_multimodal and (is_vision_weight or is_audio_weight):
                 continue
 
             if self.config.encoder_only and name.startswith(
@@ -1300,7 +1294,7 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                if "speech_embeddings" in name:
+                if self._AUDIO_WEIGHT_SUBSTRING in name:
                     weight_loader(param, loaded_weight[: param.shape[0], :])
                 else:
                     weight_loader(param, loaded_weight)
