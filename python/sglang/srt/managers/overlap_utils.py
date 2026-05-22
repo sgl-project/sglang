@@ -23,6 +23,16 @@ _is_hip = is_hip()
 _DEBUG_ASSERT = os.getenv("SGLANG_IS_IN_CI", "").lower() == "true"
 
 
+@torch.compile(dynamic=True)
+def _assert_nonneg_and_invalidate(
+    values: torch.Tensor, buf: torch.Tensor, indices: torch.Tensor
+) -> None:
+    """Fused: assert all `values >= 0` and scatter -1 into `buf[indices]`.
+    Compiled so the reduction + assert + scatter run as one kernel launch."""
+    torch._assert_async((values >= 0).all())
+    buf[indices] = -1
+
+
 def _resolve_future_token_ids_native(input_ids, future_token_ids_map):
     input_ids[:] = torch.where(
         input_ids < 0,
@@ -110,9 +120,9 @@ class FutureMap:
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
             if _DEBUG_ASSERT:
-                # Any remaining negative means the sentinel slot was empty (-1).
-                torch._assert_async((batch.input_ids >= 0).all())
-                self.output_tokens_buf[batch.req_pool_indices] = -1
+                _assert_nonneg_and_invalidate(
+                    batch.input_ids, self.output_tokens_buf, batch.req_pool_indices
+                )
         else:
             self._resolve_spec_extras(batch)
 
@@ -129,8 +139,9 @@ class FutureMap:
         draft_input.topk_index = self.topk_index_buf[indices]
         draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if _DEBUG_ASSERT:
-            torch._assert_async((draft_input.bonus_tokens >= 0).all())
-            self.output_tokens_buf[indices] = -1
+            _assert_nonneg_and_invalidate(
+                draft_input.bonus_tokens, self.output_tokens_buf, indices
+            )
         if spec_need_hidden_states():
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
