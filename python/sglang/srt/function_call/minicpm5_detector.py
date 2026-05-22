@@ -8,7 +8,6 @@ from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
-    StructureInfo,
     _GetInfoFunc,
 )
 
@@ -16,9 +15,11 @@ logger = logging.getLogger(__name__)
 
 try:
     from lxml import etree as ET  # type: ignore
+
     _HAS_LXML = True
 except Exception:  # pragma: no cover - environment may not have lxml
     import xml.etree.ElementTree as ET  # type: ignore
+
     _HAS_LXML = False
 
 _FUNC_NAME_V1_REGEX = re.compile(r"<function\s+name=[\'\"]([^\'\"]+)[\'\"][^>]*>")
@@ -83,7 +84,9 @@ class MiniCPM5Detector(BaseFormatDetector):
         name_to_required = {}
         for name, t in name_to_tool.items():
             params = t.function.parameters or {}
-            props = (params.get("properties", {}) or {}) if isinstance(params, dict) else {}
+            props = (
+                (params.get("properties", {}) or {}) if isinstance(params, dict) else {}
+            )
             name_to_allowed_props[name] = set(props.keys())
             req = params.get("required", []) if isinstance(params, dict) else []
             try:
@@ -117,12 +120,16 @@ class MiniCPM5Detector(BaseFormatDetector):
                     if root.tag == "function":
                         func_node = root
                     else:
-                        func_node = root.find("function") if hasattr(root, "find") else None
+                        func_node = (
+                            root.find("function") if hasattr(root, "find") else None
+                        )
 
                     if func_node is not None:
                         func_name = (func_node.attrib.get("name") or "").strip()
 
-                    args_node = func_node.find("arguments") if func_node is not None else None
+                    args_node = (
+                        func_node.find("arguments") if func_node is not None else None
+                    )
                     param_nodes = []
                     if func_node is not None:
                         param_nodes = list(func_node.findall("param"))
@@ -147,9 +154,11 @@ class MiniCPM5Detector(BaseFormatDetector):
                                 has_invalid_param = True
                                 break
                             seen_keys.add(key)
-                            val_text = (param.text or "")
+                            val_text = param.text or ""
                             val_text = val_text.strip()
-                            arg_type = get_argument_type(func_name or "", key, name_to_tool)
+                            arg_type = get_argument_type(
+                                func_name or "", key, name_to_tool
+                            )
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
                                 arguments[key] = parsed_val
@@ -168,7 +177,9 @@ class MiniCPM5Detector(BaseFormatDetector):
                         m_fn = _FUNC_NAME_V1_REGEX.search(block)
                         if m_fn:
                             func_name = (m_fn.group(1) or "").strip()
-                        has_invalid_param = _PARAM_MISSING_NAME_REGEX.search(block) is not None
+                        has_invalid_param = (
+                            _PARAM_MISSING_NAME_REGEX.search(block) is not None
+                        )
                         seen_keys = set()
                         allowed_props = set()
                         if func_name in tool_names:
@@ -182,11 +193,15 @@ class MiniCPM5Detector(BaseFormatDetector):
                                 has_invalid_param = True
                                 break
                             seen_keys.add(key)
-                            val_text = (pm.group(2) or "")
-                            if val_text.startswith("<![CDATA[") and val_text.endswith("]]>"):
+                            val_text = pm.group(2) or ""
+                            if val_text.startswith("<![CDATA[") and val_text.endswith(
+                                "]]>"
+                            ):
                                 val_text = val_text[len("<![CDATA[") : -len("]]>")]
                             val_text = val_text.strip()
-                            arg_type = get_argument_type(func_name or "", key, name_to_tool)
+                            arg_type = get_argument_type(
+                                func_name or "", key, name_to_tool
+                            )
                             if arg_type != "string":
                                 parsed_val, _ = parse_arguments(val_text)
                                 arguments[key] = parsed_val
@@ -253,7 +268,9 @@ class MiniCPM5Detector(BaseFormatDetector):
             current_text = self._buffer
             start = current_text.find(self.bot_token)
             if start == -1:
-                partial_len = self._ends_with_partial_token(current_text, self.bot_token)
+                partial_len = self._ends_with_partial_token(
+                    current_text, self.bot_token
+                )
                 if partial_len > 0:
                     self._buffer = current_text[-partial_len:]
                     emit = current_text[:-partial_len]
@@ -281,7 +298,9 @@ class MiniCPM5Detector(BaseFormatDetector):
                 self._append_tool_call(call, all_calls)
 
             if self.bot_token not in self._buffer:
-                partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
+                partial_len = self._ends_with_partial_token(
+                    self._buffer, self.bot_token
+                )
                 if partial_len == 0:
                     emit = "" if self.current_tool_id > 0 else self._buffer
                     if emit:
@@ -289,9 +308,7 @@ class MiniCPM5Detector(BaseFormatDetector):
                     self._buffer = ""
                 break
 
-        return StreamingParseResult(
-            normal_text="".join(normal_parts), calls=all_calls
-        )
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=all_calls)
 
     def supports_structural_tag(self) -> bool:
         return False

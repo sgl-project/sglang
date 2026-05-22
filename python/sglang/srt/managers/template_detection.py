@@ -222,9 +222,7 @@ def _is_minimax(ctx):
 def _is_minicpm5(ctx):
     if ctx.has_vocab("<function") and ctx.has_vocab("<param"):
         return True
-    return ctx.has_pattern(r"<function\s+name=") and ctx.has_pattern(
-        r"<param\s+name="
-    )
+    return ctx.has_pattern(r"<function\s+name=") and ctx.has_pattern(r"<param\s+name=")
 
 
 def _is_qwen3(ctx):

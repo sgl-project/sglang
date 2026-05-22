@@ -269,7 +269,7 @@ class TestToolCallParserDetection(unittest.TestCase):
             (
                 "minicpm5",
                 (
-                    '{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}'
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
                     '\n<function name="{{ tool.name }}">'
                     '\n<param name="{{ param.name }}">{{ param.value }}</param>'
                     "\n</function>"

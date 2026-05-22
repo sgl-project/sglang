@@ -1,7 +1,8 @@
 import json
+
 import pytest
 
-from sglang.srt.entrypoints.openai.protocol import Tool, Function
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.minicpm5_detector import (
     MiniCPM5Detector,
 )
@@ -117,11 +118,7 @@ def test_detect_and_parse_cdata_multiline_v3():
 def test_unknown_tool_block_preserved_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = (
-        '<function name="unknown">'
-        '<param name="x">1</param>'
-        "</function>\n"
-    )
+    text = '<function name="unknown">' '<param name="x">1</param>' "</function>\n"
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == 0
     assert "unknown" in res.normal_text
@@ -160,17 +157,18 @@ def test_multiple_calls_interleaved_text_v3():
     args1 = json.loads(res.calls[1].parameters)
     assert args1["nums"] == [7, 8, 9]
     assert args1["exact"] is False
-    assert "Head" in res.normal_text and "TXT" in res.normal_text and "Tail" in res.normal_text
+    assert (
+        "Head" in res.normal_text
+        and "TXT" in res.normal_text
+        and "Tail" in res.normal_text
+    )
     assert "<tool_sep>" not in res.normal_text
 
 
 def test_incomplete_missing_function_end_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    text = (
-        '<function name="get_weather">'
-        '<param name="city">北京</param>'
-    )
+    text = '<function name="get_weather">' '<param name="city">北京</param>'
     res = detector.detect_and_parse(text, tools)
     assert len(res.calls) == 0
     assert "get_weather" in res.normal_text
@@ -181,7 +179,7 @@ def test_param_missing_name_invalid_v3():
     tools = make_tools_weather()
     text = (
         '<function name="get_weather">'
-        '<param>北京</param>'
+        "<param>北京</param>"
         '<param name="date">2024-06-27</param>'
         "</function>\n"
     )
@@ -228,8 +226,8 @@ def test_no_required_and_zero_param_valid_v3():
 def test_streaming_increment_v3():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
-    c1 = "Hello\n<function name=\"get_weather\">\n  <param name=\"city\">"
-    c2 = "北京</param>\n  <param name=\"date\">2024-06-27</param>\n</function>\n"
+    c1 = 'Hello\n<function name="get_weather">\n  <param name="city">'
+    c2 = '北京</param>\n  <param name="date">2024-06-27</param>\n</function>\n'
 
     r1 = detector.parse_streaming_increment(c1, tools)
     assert r1.normal_text == "Hello\n"
@@ -246,9 +244,7 @@ def test_streaming_split_bot_token():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
-        '<function name="get_weather">'
-        '<param name="city">北京</param>'
-        "</function>"
+        '<function name="get_weather">' '<param name="city">北京</param>' "</function>"
     )
 
     r1 = detector.parse_streaming_increment("<", tools)
@@ -279,9 +275,7 @@ def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = (
-        '<function name="get_weather">'
-        '<param name="city">A & B</param>'
-        "</function>"
+        '<function name="get_weather">' '<param name="city">A & B</param>' "</function>"
     )
 
     result = detector.detect_and_parse(text, tools)
