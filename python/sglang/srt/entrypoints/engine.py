@@ -62,6 +62,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    DestroyRelayWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -1029,6 +1030,18 @@ class Engine(EngineScoreMixin, EngineBase):
     ):
         """Destroy parameter update group."""
         obj = DestroyWeightsUpdateGroupReqInput(
+            group_name=group_name,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def destroy_relay_weights_update_group(
+        self,
+        group_name: str,
+    ):
+        """Destroy relay parameter update group."""
+        obj = DestroyRelayWeightsUpdateGroupReqInput(
             group_name=group_name,
         )
         return self.loop.run_until_complete(

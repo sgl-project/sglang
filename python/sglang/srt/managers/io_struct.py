@@ -1628,6 +1628,11 @@ class DestroyWeightsUpdateGroupReqInput(BaseReq):
 
 
 @dataclass
+class DestroyRelayWeightsUpdateGroupReqInput(DestroyWeightsUpdateGroupReqInput):
+    pass
+
+
+@dataclass
 class DestroyWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str

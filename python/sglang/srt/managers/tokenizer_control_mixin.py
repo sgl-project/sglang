@@ -454,6 +454,9 @@ class TokenizerControlMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
+        # Relay receive only enqueues tensors; ModelRunner applies them later in a background loader.
+        # A writer lock here would be released before that load runs, so non-paused relay updates need
+        # a lock or barrier that covers the queued background apply path and is not yet supported.
         async with self.is_pause_cond:
             if not self.is_pause:
                 return (

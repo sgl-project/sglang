@@ -601,7 +601,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # For weight updates
         self._model_update_group = {}
-        self._skipped_model_update_groups = set()
         self._weights_send_group = {}
         self._relay_weight_pending_updates: deque[_PendingRelayWeightUpdate] = deque()
         self._relay_weight_pending_count = 0
@@ -2028,18 +2027,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         return success, message
 
-    def _compute_relay_weight_update_bytes(self, dtypes, shapes):
-        total_bytes = 0
-        for dtype, shape in zip(dtypes, shapes):
-            target_dtype = (
-                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            )
-            numel = 1
-            for dim in shape:
-                numel *= dim
-            total_bytes += numel * torch.empty((), dtype=target_dtype).element_size()
-        return total_bytes
-
     def _check_relay_weight_load_error_locked(self):
         if self._relay_weight_pending_error is not None:
             raise RuntimeError(self._relay_weight_pending_error)
@@ -2056,11 +2043,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self._relay_weight_pending_cond.wait()
             self._check_relay_weight_load_error_locked()
             self._relay_weight_pending_bytes += total_bytes
-
-    def _release_relay_weight_memory(self, total_bytes):
-        with self._relay_weight_pending_cond:
-            self._relay_weight_pending_bytes -= total_bytes
-            self._relay_weight_pending_cond.notify_all()
 
     def _ensure_relay_weight_load_worker(self):
         if self._relay_weight_load_worker is not None:
@@ -2181,7 +2163,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 rank=rank,
                 group_name=group_name,
             )
-            self._skipped_model_update_groups.discard(group_name)
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
@@ -2204,7 +2185,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         assert group_name != "", "Group name cannot be empty"
 
         if self.tp_rank != 0:
-            self._skipped_model_update_groups.add(group_name)
             return True, "Skipped custom process group on non-participant TP rank."
 
         rank = rank_offset
@@ -2222,7 +2202,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 rank=rank,
                 group_name=group_name,
             )
-            self._skipped_model_update_groups.discard(group_name)
             return True, "Succeeded to initialize relay custom process group."
         except Exception as e:
             message = f"Failed to initialize relay custom process group: {e}."
@@ -2234,15 +2213,28 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if group_name in self._model_update_group:
                 pg = self._model_update_group.pop(group_name)
                 torch.distributed.destroy_process_group(pg)
-                self._skipped_model_update_groups.discard(group_name)
                 return True, "Succeeded to destroy custom process group."
-            elif group_name in self._skipped_model_update_groups:
-                self._skipped_model_update_groups.remove(group_name)
-                return True, "Succeeded to clear skipped custom process group."
             else:
                 return False, "The group to be destroyed does not exist."
         except Exception as e:
             message = f"Failed to destroy custom process group: {e}."
+            logger.error(message)
+            return False, message
+
+    def destroy_relay_weights_update_group(self, group_name):
+        try:
+            if self.tp_rank != 0:
+                return (
+                    True,
+                    "No relay custom process group to destroy on non-participant TP rank.",
+                )
+            if group_name not in self._model_update_group:
+                return False, "The relay group to be destroyed does not exist."
+            pg = self._model_update_group.pop(group_name)
+            torch.distributed.destroy_process_group(pg)
+            return True, "Succeeded to destroy relay custom process group."
+        except Exception as e:
+            message = f"Failed to destroy relay custom process group: {e}."
             logger.error(message)
             return False, message
 
@@ -2307,7 +2299,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return False, error_msg
 
     def update_relay_weights_from_distributed(self, names, dtypes, shapes, group_name):
-        total_bytes = self._compute_relay_weight_update_bytes(dtypes, shapes)
+        total_bytes = 0
+        weight_specs = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            numel = 1
+            for dim in shape:
+                numel *= dim
+            total_bytes += numel * torch.empty((), dtype=target_dtype).element_size()
+            weight_specs.append((name, target_dtype, shape))
+
         reserved_pending_bytes = False
         try:
             is_receiver = self.tp_rank == 0
@@ -2320,22 +2323,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     logger.error(message)
                     return False, message
                 send_group = self._model_update_group[group_name]
-            elif group_name not in self._skipped_model_update_groups:
-                message = (
-                    f"Group {group_name} is neither initialized nor marked as skipped. "
-                    "Please call `init_relay_weights_update_group` first."
-                )
-                logger.error(message)
-                return False, message
 
             self._reserve_relay_weight_memory(total_bytes)
             reserved_pending_bytes = True
             weights = []
             recv_ops = []
-            for name, dtype, shape in zip(names, dtypes, shapes):
-                target_dtype = (
-                    dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-                )
+            for name, target_dtype, shape in weight_specs:
                 weight = torch.empty(shape, dtype=target_dtype, device=self.device)
                 if is_receiver:
                     recv_ops.append(
@@ -2360,7 +2353,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return True, "Succeeded to receive parameter online and queue relay load."
         except Exception as e:
             if reserved_pending_bytes:
-                self._release_relay_weight_memory(total_bytes)
+                with self._relay_weight_pending_cond:
+                    self._relay_weight_pending_bytes -= total_bytes
+                    self._relay_weight_pending_cond.notify_all()
             error_msg = (
                 f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "

@@ -115,6 +115,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    DestroyRelayWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DumperControlReqInput,
     EmbeddingReqInput,
@@ -1199,6 +1200,21 @@ async def destroy_weights_update_group(
     obj: DestroyWeightsUpdateGroupReqInput, request: Request
 ):
     """Destroy the parameter update group."""
+    success, message = (
+        await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/destroy_relay_weights_update_group")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def destroy_relay_weights_update_group(
+    obj: DestroyRelayWeightsUpdateGroupReqInput, request: Request
+):
+    """Destroy the relay parameter update group."""
     success, message = (
         await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
     )
