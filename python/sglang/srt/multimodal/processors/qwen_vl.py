@@ -598,7 +598,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             isinstance(base_input_ids, list)
             and len(base_input_ids) == input_ids.numel()
         ):
-            # preprocess input already carries list of input_ids
+            # reuse preprocess input if it already carries list of input_ids
             input_ids_list = base_input_ids
         else:
             input_ids_list = input_ids.tolist()
