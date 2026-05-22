@@ -52,6 +52,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -315,7 +316,7 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         TODO(kpham-sgl): Guard appropriately for gemma3_mm.py:prepare_attn_masks()
         """
-        if not isinstance(forward_batch.attn_backend, TritonAttnBackend):
+        if not isinstance(get_attn_backend(), TritonAttnBackend):
             logger.warning_once(
                 "Bidirectional attention for image tokens requires TritonAttnBackend. "
                 "Falling back to causal attention, which may degrade image quality."
@@ -389,12 +390,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
         if bidirectional_attn_masks_list:
             bidirectional_attn_masks = torch.cat(bidirectional_attn_masks_list, dim=0)
-            forward_batch.attn_backend.forward_metadata.mask_indptr = (
+            get_attn_backend().forward_metadata.mask_indptr = (
                 bidirectional_attn_mask_indptr
             )
-            forward_batch.attn_backend.forward_metadata.custom_mask = (
-                bidirectional_attn_masks
-            )
+            get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         vt = self.vision_tower
