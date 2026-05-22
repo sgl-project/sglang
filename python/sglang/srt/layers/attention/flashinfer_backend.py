@@ -602,18 +602,22 @@ class FlashInferAttnBackend(AttentionBackend):
         # capture callers pre-slice. [:bs] is safe in both cases.
         req_pool_indices = forward_batch.req_pool_indices[:bs]
         seq_lens = forward_batch.seq_lens[:bs]
-        # ``num_tokens == bs * num_tokens_per_bs``. ``positions`` is the only
-        # fb field always sized to ``num_tokens`` across direct (cuda_graph_runner)
-        # and multi-step-wrapper (eagle_draft_cuda_graph_runner) callers --
-        # ``input_ids`` is None in the multi-step wrapper's synthetic fb.
-        num_tokens = (
-            forward_batch.positions.shape[0]
-            if forward_batch.positions is not None
-            else bs
-        )
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        # Derive num_tokens (= number of KV entries the wrapper must cover).
+        # For decode with spec_info (e.g. EAGLE topk>1), spec_info.kv_indptr
+        # has shape [topk_candidates+1]; the wrapper's paged_kv_last_page_len_buffer
+        # must be sized to topk_candidates, not bs. Using positions.shape[0] gives
+        # the wrong size when the replay shim sets positions = new_empty(bs).
+        if spec_info is not None and getattr(spec_info, "kv_indptr", None) is not None:
+            num_tokens = spec_info.kv_indptr.shape[0] - 1
+        elif forward_mode.is_target_verify():
+            num_tokens = bs * self.num_draft_tokens
+        elif forward_mode.is_draft_extend(include_v2=True):
+            num_tokens = bs * (self.speculative_num_steps + 1)
+        else:
+            num_tokens = bs
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
