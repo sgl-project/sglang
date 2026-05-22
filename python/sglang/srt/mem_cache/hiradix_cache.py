@@ -804,10 +804,6 @@ class HiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
-        return RadixKey(token_ids=list(token_ids))
-
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult(delta=0)

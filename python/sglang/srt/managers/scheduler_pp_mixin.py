@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import math
 import time
+from array import array
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -556,7 +557,7 @@ class SchedulerPPMixin:
         if self.pp_group.is_first_rank:
             model_runner = self.tp_worker.model_runner
             model_config = model_runner.model_config
-            input_ids_list = []
+            input_ids_list: List[array[int]] = []
             for i in range(128):
                 chunk_size = int(
                     self.chunked_prefill_size * 1.25
@@ -564,9 +565,12 @@ class SchedulerPPMixin:
                 )
                 if chunk_size <= 0:
                     break
-                input_ids = np.random.randint(
-                    0, 10000, size=chunk_size, dtype=np.int64
-                ).tolist()
+                input_ids = array(
+                    "q",
+                    np.random.randint(
+                        0, 10000, size=chunk_size, dtype=np.int64
+                    ).tobytes(),
+                )
                 input_ids_list.append(input_ids)
 
             sampling_params = SamplingParams(

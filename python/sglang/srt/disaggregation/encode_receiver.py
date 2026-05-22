@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from array import array
 from collections import OrderedDict, defaultdict
 from enum import IntEnum
 from http import HTTPStatus
@@ -588,7 +589,7 @@ class WaitingImageRequest:
             **self.recv_embedding_data.get_mm_extra_meta(),
         )
         self.recv_req.mm_inputs = mm_inputs
-        self.recv_req.input_ids = mm_inputs.input_ids
+        self.recv_req.input_ids = array("q", mm_inputs.input_ids)
         self.status = WaitingImageRequestStatus.SUCCESS
         self.recv_socket.close()
 

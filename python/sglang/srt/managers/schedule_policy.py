@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from array import array
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -84,7 +85,7 @@ IGNORE_EOS_RESERVE_TOKENS = 1
 def match_prefix_for_req(
     tree_cache: BasePrefixCache,
     req: Req,
-    token_ids: Optional[List[int]] = None,
+    token_ids: Optional[array[int]] = None,
     *,
     cow_mamba: bool = False,
     include_req: bool = False,

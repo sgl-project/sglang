@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+from array import array
 from collections import defaultdict
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -456,7 +457,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey([], None)
+        self.root_node.key = RadixKey(array("q"), None)
         self.root_node.value = []
         self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
