@@ -58,6 +58,15 @@ class TestServerArgsUDS(unittest.TestCase):
         args = ServerArgs(model_path="dummy")
         self.assertIsNone(args.uds)
 
+    def test_uds_empty_string_rejected(self):
+        # Empty path can't be bound; argparse would accept it. Catch in
+        # __post_init__ so the operator sees a clear error rather than a
+        # later OS-level bind failure.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(model_path="dummy", uds="")
+        self.assertIn("--uds", str(cm.exception))
+        self.assertIn("non-empty", str(cm.exception))
+
     def test_uds_cli_flag_parsed(self):
         from sglang.srt.server_args import prepare_server_args
         from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN

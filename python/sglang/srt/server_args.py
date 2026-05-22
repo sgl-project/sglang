@@ -894,13 +894,21 @@ class ServerArgs:
         """
 
         if self.uds is not None:
+            if self.uds == "":
+                raise ValueError(
+                    "--uds must be a non-empty path; received an empty string"
+                )
             if sys.platform == "win32":
                 raise ValueError(
                     "--uds is only supported on Linux and macOS; "
                     f"current platform: {sys.platform}"
                 )
             # Compare against dataclass defaults to detect "user explicitly set
-            # --host or --port alongside --uds".
+            # --host or --port alongside --uds". Argparse cannot distinguish
+            # `--host 127.0.0.1` (user typed the default explicitly) from
+            # `--host` omitted, so a user-supplied default value is silently
+            # tolerated here. That is intentional: internal services use these
+            # field values regardless of whether the user typed them.
             uds_field_defaults = {
                 "host": ServerArgs.__dataclass_fields__["host"].default,
                 "port": ServerArgs.__dataclass_fields__["port"].default,
