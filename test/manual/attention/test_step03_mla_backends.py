@@ -406,7 +406,7 @@ class TestTRTLLMMLAInit(CustomTestCase):
             max_bs=_MAX_BS,
             max_context_len=_MAX_CTX,
             dtype=_DTYPE,
-            page_size=16,  # TRTLLM kernel requires numTokensPerPage >= 16
+            page_size=32,  # TRTLLM MLA kernel requires block_size 32 or 64
         )
         cls.backend = TRTLLMMLABackend(cls.mr)
         cls.layer = _make_mla_layer()
