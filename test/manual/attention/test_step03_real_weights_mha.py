@@ -267,7 +267,7 @@ class TestFlashInferPCGAccuracy(_MHAAccuracyBase):
 class TestTRTLLMMHAEagerAccuracy(_MHAAccuracyBase):
     """TRTLLM MHA + eager."""
 
-    runner_args = ["--attention-backend", "trtllm", "--disable-cuda-graph"]
+    runner_args = ["--attention-backend", "trtllm_mha", "--disable-cuda-graph"]
 
 
 class TestTRTLLMMHACudaGraphAccuracy(_MHAAccuracyBase):
@@ -275,7 +275,7 @@ class TestTRTLLMMHACudaGraphAccuracy(_MHAAccuracyBase):
 
     runner_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mha",
         "--disable-piecewise-cuda-graph",
         "--cuda-graph-max-bs",
         "8",
@@ -287,7 +287,7 @@ class TestTRTLLMMHAPCGAccuracy(_MHAAccuracyBase):
 
     runner_args = [
         "--attention-backend",
-        "trtllm",
+        "trtllm_mha",
         "--enforce-piecewise-cuda-graph",
         "--cuda-graph-max-bs",
         "8",
@@ -426,17 +426,17 @@ class TestTRTLLMMHAConsistency(TestTritonConsistency):
     """Same cross-runner consistency check for TRTLLM MHA backend."""
 
     _RUNNERS = {
-        "eager": ["--attention-backend", "trtllm", "--disable-cuda-graph"],
+        "eager": ["--attention-backend", "trtllm_mha", "--disable-cuda-graph"],
         "full_cg": [
             "--attention-backend",
-            "trtllm",
+            "trtllm_mha",
             "--disable-piecewise-cuda-graph",
             "--cuda-graph-max-bs",
             "8",
         ],
         "pcg": [
             "--attention-backend",
-            "trtllm",
+            "trtllm_mha",
             "--enforce-piecewise-cuda-graph",
             "--cuda-graph-max-bs",
             "8",
