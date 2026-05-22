@@ -2914,12 +2914,18 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
-                # PP intermediate / DLLM return non-tensor; skip relay.
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
-                    self.future_map.stash(
-                        batch.req_pool_indices, batch_result.next_token_ids
-                    )
-                batch.input_ids = None
+                    if self.spec_algorithm.is_none():
+                        # Non-spec: relay via future_map, gathered next iter.
+                        self.future_map.stash(
+                            batch.req_pool_indices, batch_result.next_token_ids
+                        )
+                        batch.input_ids = None
+                    else:
+                        # Spec_v1 (non-overlap spec): worker shape doesn't match
+                        # req_pool_indices; relay is unused (worker rebuilds input_ids
+                        # inside verify). Keep pre-PR behavior.
+                        batch.input_ids = batch_result.next_token_ids.to(torch.int64)
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
