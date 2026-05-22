@@ -65,8 +65,24 @@ _CUDA = torch.cuda.is_available()
 
 # Default small model — always assumed present in the HF cache.
 _SMALL_MODEL = os.environ.get("SMALL_MODEL", "Qwen/Qwen3-0.6B")
-# DSV3 MLA test model (private, needs HF token / offline cache)
-_DSV3_MODEL = os.environ.get("DSV3_MODEL", "lmsys/sglang-ci-dsv3-test")
+# TP size constants — must be defined before _DSV3_TP_SIZE below.
+_TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
+_TP_SIZE_LARGE = int(os.environ.get("TP_SIZE_LARGE", "4"))
+# DSV3 MLA test model. lmsys/sglang-ci-dsv3-test is a private tiny CI model;
+# fall back to deepseek-ai/DeepSeek-V3.2 (same MLA architecture, dummy-load only).
+_DSV3_MODEL = os.environ.get(
+    "DSV3_MODEL",
+    (
+        "lmsys/sglang-ci-dsv3-test"
+        if _model_exists("lmsys/sglang-ci-dsv3-test")
+        else "deepseek-ai/DeepSeek-V3.2"
+    ),
+)
+# TP size for the DSV3 model: tiny CI model fits on 1 GPU; full DeepSeek-V3.2
+# needs TP=4 (too large for 1 GPU even with dummy weights).
+_DSV3_TP_SIZE = (
+    "1" if _DSV3_MODEL == "lmsys/sglang-ci-dsv3-test" else str(_TP_SIZE_LARGE)
+)
 # DSV4 model (large; on cluster at /flash_model or via HF)
 _DSV4_MODEL = os.environ.get("DSV4_MODEL", "/flash_model")
 # DSA / DeepSeek-V3.2
@@ -80,10 +96,6 @@ _EAGLE_TARGET = os.environ.get("EAGLE_TARGET", "meta-llama/Llama-2-7b-chat-hf")
 _EAGLE_DRAFT = os.environ.get("EAGLE_DRAFT", "lmsys/sglang-EAGLE-llama2-chat-7B")
 # EAGLE3 target
 _EAGLE3_TARGET = os.environ.get("EAGLE3_TARGET", "meta-llama/Llama-3.1-8B-Instruct")
-# TP size to use for multi-GPU tests (override with TP_SIZE=4)
-_TP_SIZE = int(os.environ.get("TP_SIZE", "1"))
-# Large model TP size
-_TP_SIZE_LARGE = int(os.environ.get("TP_SIZE_LARGE", "4"))
 
 _DEFAULT_PORT = int(os.environ.get("TEST_PORT", "30000"))
 
@@ -431,7 +443,7 @@ class TestBreakableCudaGraph(_ServerSmokeBase):
 
 
 class TestFlashInferMLACudaGraph(_ServerSmokeBase):
-    """flashinfer MLA backend + full CUDA graph (tiny DSV3 model)."""
+    """flashinfer MLA backend + full CUDA graph (DSV3 model)."""
 
     model = _DSV3_MODEL
     launch_args = [
@@ -445,7 +457,7 @@ class TestFlashInferMLACudaGraph(_ServerSmokeBase):
         "--max-running-requests",
         "4",
         "--tp-size",
-        "1",
+        _DSV3_TP_SIZE,
     ]
 
 
@@ -467,7 +479,7 @@ class TestFlashMLACudaGraph(_ServerSmokeBase):
         "--max-running-requests",
         "4",
         "--tp-size",
-        "1",
+        _DSV3_TP_SIZE,
     ]
 
 
@@ -491,7 +503,7 @@ class TestCutlassMLACudaGraph(_ServerSmokeBase):
         "--max-running-requests",
         "4",
         "--tp-size",
-        "1",
+        _DSV3_TP_SIZE,
     ]
 
 
@@ -510,7 +522,7 @@ class TestTRTLLMMLACudaGraph(_ServerSmokeBase):
         "--max-running-requests",
         "4",
         "--tp-size",
-        "1",
+        _DSV3_TP_SIZE,
     ]
 
 
