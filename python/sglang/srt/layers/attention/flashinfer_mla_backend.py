@@ -529,9 +529,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
-                    (forward_mode, bs)
-                ],
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 spec_info=spec_info,
             )
@@ -541,9 +539,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 seq_lens[:bs],
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[
-                    (forward_mode, bs)
-                ],
+                prefill_wrapper_paged=self.prefill_cuda_graph_metadata[bs],
                 use_ragged=False,
                 spec_info=spec_info,
             )
