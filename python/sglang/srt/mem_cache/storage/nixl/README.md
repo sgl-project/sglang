@@ -4,11 +4,12 @@ This directory contains the **NIXL (NVIDIA Inference Xfer Library)** integration
 
 NIXL provides a unified API for accessing various storage plugins, including but not limited to:
 
+- POSIX for file based operations, including AIO / io_uring / POSIX AIO.
 - **Deepseek's 3FS APIs** for high-throughput file operations
 - **GPU Direct Storage (GDS)** for direct data movement between storage and GPU memory, bypassing CPU memory copies
 - **Amazon S3-compatible object storage** for key-value access patterns
 
-Additional backend integrations are planned for future releases.
+NIXL also supports additional backends such as **AZURE_BLOB**, **GUSLI**, and **UCX**. Additional backend integrations are planned for future releases.
 
 ## NIXL Resources
 
@@ -22,6 +23,13 @@ The NIXL integration consists of two main files:
 - **`hicache_nixl.py`** - Main HiCache storage connector using NIXL
 - **`nixl_utils.py`** - Utility classes for backend selection, registration, and file management
 
+At runtime, HiCache uses NIXL as a transfer layer between host memory and either:
+
+- **FILE-backed storage plugins** such as 3FS / POSIX / GDS / GDS_MT
+- **OBJ-backed storage plugins** such as S3-compatible object stores
+
+The connector supports both the legacy tensor-oriented API (`get` / `set`) and the newer page-oriented API (`batch_get_v1` / `batch_set_v1`) used by modern HiCache backends.
+
 ## Components
 
 ### HiCacheNixl
@@ -29,6 +37,9 @@ The main storage connector that provides:
 - Single and batch tensor set/get operations
 - Automatic backend selection (3FS > POSIX > GDS_MT > GDS > OBJ)
 - High-performance file-based (or) object based storage access using NIXL
+- Automatic zero-copy enablement when HiCache host memory layout is `page_first` or `page_first_direct`
+- MLA-aware storage naming and backend-local MLA backup skipping on non-zero TP ranks
+- Runtime diagnostics for mem-pool type, MLA mode, TP rank, and backup-skip state
 
 ### NixlUtils
 Consolidated utility classes:
@@ -37,6 +48,8 @@ Consolidated utility classes:
 - **NixlRegistration** - Manages memory registration for tensors, files and objects
 - **NixlFileManager** - Handles file system operations and NIXL tuple creation
 
+The current implementation performs per-transfer registration for file / object targets and explicitly closes FILE descriptors after registration / transfer setup to avoid descriptor leaks.
+
 ## Using NIXL as the HiCache Storage Backend
 
 ### 1. How Backend Plugin Selection Works
@@ -44,13 +57,19 @@ Consolidated utility classes:
 The NIXL backend can support **multiple storage plugins** (e.g., POSIX, GDS, GDS_MT, 3FS, object store, etc).
 
 * Each plugin has its own configuration section in the TOML file.
+* The connector accepts configuration in two forms:
+
+  * a **fully qualified** form such as `{"plugin": {"posix": {...}, "gds": {...}}}`
+  * a **flat** form such as `{"use_uring": "true"}`, which applies to the selected plugin
 * A plugin is considered **usable** if:
 
   * Its required library is available on the system (POSIX, GDS, GDS_MT are natively supported by NIXL).
   * Its configuration is valid.
   * It is marked as `active = true` in the configuration file (if applicable).
 * Some plugins (e.g., 3FS, GDS) require additional system libraries or hardware support.
-* NIXL selects the backend based on **internal priority and availability**, if neither a config file nor an in-command-line config string is provided.
+* If the config explicitly enables multiple plugins, the connector chooses the **first active plugin** in the config.
+* If no plugin is explicitly selected in config, the connector falls back to the environment variable `SGLANG_HICACHE_NIXL_BACKEND_PLUGIN`, and finally to `auto`.
+* In `auto` mode, NIXL selects the backend based on **internal priority and availability**.
 
 If a plugin is configured but its dependencies are missing, it will be skipped.
 
@@ -62,6 +81,8 @@ For POSIX / GDS / GDS_MT file-based backends, the default storage location is `/
 ```bash
 export SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR=/path/to/storage/dir
 ```
+
+This directory is used only for **FILE-backed** plugins. **OBJ-backed** plugins use object keys instead of local files.
 
 ### 3. How to Provide Configuration for Backends
 
@@ -85,6 +106,12 @@ python3 -m sglang.launch_server \
 ```
 
 By default, NIXL will use its internal backend selection logic to choose an available storage plugin (and use default configs for the selected storage plugin).
+
+For object storage backends, make sure the bucket is configured either in `--hicache-storage-backend-extra-config` or via:
+
+```bash
+export AWS_DEFAULT_BUCKET=<bucket-name>
+```
 
 
 #### 2. Using a Configuration File (Recommended)
@@ -125,7 +152,7 @@ This requires explicitly specifying the plugin type via an environment variable,
 The below example shows how to use command-line string to use the POSIX plugin where URING is enabled for async POSIX storage.
 
 ```bash
-export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN_TYPE=POSIX
+export SGLANG_HICACHE_NIXL_BACKEND_PLUGIN=POSIX
 
 python3 -m sglang.launch_server \
   --model-path <model> \
@@ -142,6 +169,8 @@ python3 -m sglang.launch_server \
 
 ⚠️ **Note**:
 This method is convenient for testing / experimenting. For production or multi-plugin setups, it is always recommended to use the config file based approach.
+
+Also note that the flat inline config form is interpreted as plugin-specific parameters for the selected plugin.
 
 
 ## Running Unit Tests
@@ -177,20 +206,22 @@ Note: The `-o asyncio_mode=strict` flag is added to suppress warnings about asyn
 
 Tests for this integration, a test suite can be found at `test_hicache_nixl_storage.py` which covers:
 
-### HiCache Integration Tests (4 tests)
+### HiCache Integration Tests
 - Single tensor set/get operations
 - Batch tensor set/get operations
 - Mixed single and batch operations
 - Data integrity for various tensor types
 
-### File Management Tests (5 tests)
+### File Management Tests
 - Basic file operations
 - NIXL tuple creation
 - Error handling in file operations
 
-### Registration Tests (2 tests)
+### Registration and MLA / Query Tests
 - Tensor registration with memory type detection
-- File registration using NIXL tuples
+- File registration using file paths
+- MLA backup-skip behavior for `batch_set_v1`
+- Zero-copy `batch_exists()` accounting for MLA and MHA
 
 ## Expected Output
 
@@ -213,16 +244,28 @@ If NIXL operations fail:
 - Check that NIXL is properly installed
 - Verify that required plugins are available
 - Ensure file permissions are correct for test directories
+- For OBJ plugins, verify `bucket` or `AWS_DEFAULT_BUCKET` is set
+- Check the NIXL diagnostic log emitted when the mem pool is registered; it includes:
+  - `mem_pool_device_type`
+  - `is_mla_model`
+  - `tp_rank`
+  - `backup_skip`
+
+### MLA Write Behavior
+For MLA models, the NIXL backend now mirrors HF3FS's backend-local protection:
+- TP rank 0 performs the actual storage write
+- non-zero TP ranks skip backup writes locally in `batch_set` / `batch_set_v1`
+- MLA storage names omit TP rank so all ranks refer to the same logical storage object or file
 
 ## File Structure
 
-```
-python/sglang/srt/mem_cache/nixl/
-├── hicache_nixl.py          # Main HiCache storage connector
-├── nixl_utils.py            # All NIXL utility classes
-├── README.md                # This file
-└── tests/
-    └── test_nixl_unified.py # All tests in one file
+```text
+python/sglang/srt/mem_cache/storage/nixl/
+├── hicache_nixl.py              # Main HiCache storage connector
+├── nixl_utils.py                # NIXL utility classes
+├── test_hicache_nixl_storage.py # Unit tests
+├── nixl.config.toml.sample      # Example configuration
+└── README.md                    # This file
 ```
 
 ## Dependencies
@@ -239,8 +282,26 @@ python/sglang/srt/mem_cache/nixl/
 - **Tensor side**: multi-dimensional tensors of all numeric types (int32, int64, float32, float64) are supported.
   - Tensors can be on CPU or GPU (as long as a GPU capable backend such as GDS_MT is available).
   - Currently each tensor is mapped to a file or key, but it can be extended to support multiple keys per file or key.
+  - The page-oriented `*_v1` path also supports zero-copy transfers using `(address, size)` metadata from the host memory pool.
 
 - **Storage side**: file and object are supported through their relevant backends (e.g., 3FS or OBJ).
+
+### HiCache / NIXL Data Model
+
+- **FILE backends** use local file paths under `SGLANG_HICACHE_NIXL_BACKEND_STORAGE_DIR`
+- **OBJ backends** use object keys directly
+- **MHA naming** includes TP rank and TP size, so each rank stores its own KV data
+- **MLA naming** omits TP rank, so all ranks refer to one shared logical KV object / file
+- In zero-copy mode:
+  - **MHA** expands each logical page into `_k` and `_v` entries
+  - **MLA** expands each logical page into a single `_k` entry because MLA stores one interleaved KV representation
+
+### Zero-Copy Behavior
+
+- Zero-copy is enabled automatically when the HiCache host layout is `page_first` or `page_first_direct`
+- The connector uses `mem_pool_host.get_page_buffer_meta(...)` to obtain `(address, size)` metadata
+- `batch_exists()` uses the same logical key expansion rules as `batch_get_v1()` / `batch_set_v1()`
+- Non-zero MLA TP ranks skip `batch_set` / `batch_set_v1()` locally as a backend-side fallback guard
 
 ### Backend Priority
 
@@ -285,6 +346,8 @@ An example of the configuration is provided in [`nixl.config.toml.sample`](./nix
   * Plugin configuration validity
   * Internal backend priority rules
 * Unless otherwise stated, all configuration keys are **optional** and have sensible defaults.
+
+For object storage, `bucket` may also be omitted from the config if `AWS_DEFAULT_BUCKET` is already defined in the environment.
 
 
 ### 2. POSIX File System Backend (`plugin.posix`)
@@ -467,4 +530,11 @@ Configures an object storage backend compatible with S3 APIs (e.g., AWS S3, MinI
 
 ## Note
 
-This is v0 of the NIXL connector. Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput). These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.
+This is v0 of the NIXL connector. The current implementation favors correctness and compatibility with the existing HiCache API:
+
+- file / object targets are registered per transfer
+- FILE descriptors are explicitly cleaned up after registration / transfer setup
+- MLA uses shared storage naming and backend-local write skipping on non-zero TP ranks
+- zero-copy is driven by HiCache host-memory layout rather than a separate NIXL flag
+
+Future versions will focus on further performance optimizations such as memory pre-registration (pre-allocating and registering memory buffers to reduce registration overhead during transfers) and block merging (combining related blocks as offsets within the same file to reduce file operations and improve throughput). These optimizations require changes at a higher layer, as the current HiCache API doesn't expose information like block relationships or hash patterns that would enable these optimizations.
