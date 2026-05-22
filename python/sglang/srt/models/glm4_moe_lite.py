@@ -273,7 +273,8 @@ class Glm4MoeLiteSparseMoeBlock(DeepseekV2MoE):
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
-        # self.shared_experts_weight_block_size = None
+        self.shared_experts_weight_block_size = None
+        self._shared_expert_tp1 = False
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             # disable tp for shared experts when enable deepep moe, or with fp4 allgather
