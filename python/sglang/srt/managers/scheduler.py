@@ -1271,6 +1271,16 @@ class Scheduler(
             self.result_queue: Deque = deque()
             return
 
+        # forward_stream_ctx / copy_stream are also used by PP (non-overlap)
+        # via scheduler_pp_mixin; init unconditionally to match main.
+        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.forward_stream
+        )
+        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+            self.copy_stream
+        )
+
         # FutureMap is always-on: input_ids relay used in both modes.
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
@@ -1280,13 +1290,6 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
