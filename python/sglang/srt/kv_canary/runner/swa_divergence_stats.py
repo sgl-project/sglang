@@ -166,28 +166,10 @@ class SwaDivergenceStats:
             stream=self._d2h_stream,
         )
 
-        counters = (
-            self._swa_allocator.divergence_stats_device_tensors()
-            if self._swa_allocator is not None
-            else None
-        )
-        if counters is not None and counters.nonidentity_write_count is not None:
-            mapping_future: Optional[FutureTensor] = FutureTensor.device_to_host(
-                src_device=counters.nonidentity_write_count,
-                stream=self._d2h_stream,
-            )
-            wrap_future: Optional[FutureTensor] = FutureTensor.device_to_host(
-                src_device=counters.wrap_count,
-                stream=self._d2h_stream,
-            )
-        else:
-            mapping_future = None
-            wrap_future = None
-
         self._pending = _PendingSnapshot(
             step_counter=step_counter,
             verify_full=verify_full_future,
             verify_swa=verify_swa_future,
-            mapping_nonidentity=mapping_future,
-            wrap_count=wrap_future,
+            mapping_nonidentity=None,
+            wrap_count=None,
         )

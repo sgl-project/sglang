@@ -1,10 +1,8 @@
 import logging
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -26,12 +24,6 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class DivergenceCounterTensors:
-    wrap_count: Optional[torch.Tensor]
-    nonidentity_write_count: Optional[torch.Tensor]
 
 
 class SWAKVPool(BaseSWAKVPool):
@@ -389,44 +381,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-        if envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS.get():
-            self._wrap_count_device: Optional[torch.Tensor] = torch.zeros(
-                1, dtype=torch.int64, device=device
-            )
-            self._max_observed_swa_idx_device: Optional[torch.Tensor] = torch.zeros(
-                1, dtype=torch.int64, device=device
-            )
-            self._nonidentity_write_count_device: Optional[torch.Tensor] = torch.zeros(
-                1, dtype=torch.int64, device=device
-            )
-        else:
-            self._wrap_count_device = None
-            self._max_observed_swa_idx_device = None
-            self._nonidentity_write_count_device = None
-
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
-
-    @property
-    def wrap_count(self) -> int:
-        """Total observed SWA pool wraparound events."""
-        if self._wrap_count_device is None:
-            return 0
-        return int(self._wrap_count_device.item())
-
-    @property
-    def nonidentity_write_count(self) -> int:
-        """Total non-identity full-to-swa mapping writes."""
-        if self._nonidentity_write_count_device is None:
-            return 0
-        return int(self._nonidentity_write_count_device.item())
-
-    def divergence_stats_device_tensors(self) -> DivergenceCounterTensors:
-        return DivergenceCounterTensors(
-            wrap_count=self._wrap_count_device,
-            nonidentity_write_count=self._nonidentity_write_count_device,
-        )
 
     def available_size(self):
         return min(
@@ -480,8 +437,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self._observe_swa_alloc(alloc_swa_indices)
-        self._observe_swa_mapping_write(alloc_full_indices, alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -533,8 +488,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
-        self._observe_swa_alloc(alloc_swa_indices)
-        self._observe_swa_mapping_write(alloc_full_indices, alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -605,10 +558,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
-        self._observe_swa_alloc(alloc_swa_indices)
-        tail_full_indices = alloc_full_indices[-swa_tail_len:]
-        self._observe_swa_mapping_write(tail_full_indices, alloc_swa_indices)
-        self.full_to_swa_index_mapping[tail_full_indices] = alloc_swa_indices
+        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
+            alloc_swa_indices
+        )
         return alloc_full_indices
 
     def alloc_decode(
@@ -631,8 +583,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
-        self._observe_swa_alloc(alloc_swa_indices)
-        self._observe_swa_mapping_write(alloc_full_indices, alloc_swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
@@ -668,7 +618,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         assert full_indices.numel() == swa_indices.numel()
         self._kvcache.invalidate_loc_cache()
-        self._observe_swa_mapping_write(full_indices, swa_indices)
         if _is_npu:
             self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
                 swa_indices.to(torch.int64)
@@ -702,40 +651,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-        if self._wrap_count_device is not None:
-            self._wrap_count_device.zero_()
-            self._max_observed_swa_idx_device.zero_()
-            self._nonidentity_write_count_device.zero_()
-
-    def _observe_swa_alloc(self, alloc_swa_indices: torch.Tensor) -> None:
-        if self._wrap_count_device is None:
-            return
-        if alloc_swa_indices.numel() == 0:
-            return
-        flat = alloc_swa_indices.reshape(-1).to(torch.int64)
-        batch_min = flat.min().view(1)
-        batch_max = flat.max().view(1)
-        wrapped = (batch_min < self._max_observed_swa_idx_device).to(torch.int64)
-        self._wrap_count_device.add_(wrapped)
-        torch.maximum(
-            self._max_observed_swa_idx_device,
-            batch_max,
-            out=self._max_observed_swa_idx_device,
-        )
-
-    def _observe_swa_mapping_write(
-        self,
-        full_indices: torch.Tensor,
-        swa_indices: torch.Tensor,
-    ) -> None:
-        if self._nonidentity_write_count_device is None:
-            return
-        if full_indices.numel() == 0:
-            return
-        full_flat = full_indices.reshape(-1).to(torch.int64)
-        swa_flat = swa_indices.reshape(-1).to(torch.int64)
-        nonidentity = (swa_flat != full_flat).sum().to(torch.int64).view(1)
-        self._nonidentity_write_count_device.add_(nonidentity)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
