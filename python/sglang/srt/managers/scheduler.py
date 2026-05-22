@@ -2797,15 +2797,8 @@ class Scheduler(
         """
         # 1. snapshot
         snapshot_v2_full = batch.is_spec_v2
-        # Staging fields are consumed by resolve_forward_inputs inside this
-        # isolation; restoring them would re-H2D stale data next iter.
-        _CONSUMED_BY_RESOLVE = {"prefill_input_ids_cpu", "mix_running_indices"}
         sched_snapshot = (
-            {
-                f.name: getattr(batch, f.name)
-                for f in dataclasses.fields(batch)
-                if f.name not in _CONSUMED_BY_RESOLVE
-            }
+            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
             if snapshot_v2_full
             else None
         )
@@ -2853,21 +2846,30 @@ class Scheduler(
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
 
-                with self._overlap_forward_isolation(batch):
-                    future_indices = batch.req_pool_indices
+                with self.forward_stream_ctx:
+                    self.forward_stream.wait_stream(self.schedule_stream)
+                    # resolve consumes SB staging (prefill_input_ids_cpu /
+                    # mix_running_indices). Run OUTSIDE isolation so the
+                    # snapshot captures the post-consume state — restoring
+                    # post-forward must not un-consume staging.
+                    resolve_forward_inputs(batch, self.future_map)
 
-                    # Spec_v2 fires on_publish mid-worker (between verify and
-                    # draft_extend) so schedule prep can overlap with draft_extend.
-                    # Non-spec has no later work — scheduler publishes after return.
-                    fwd_kwargs = (
-                        {"on_publish": partial(self.future_map.publish, future_indices)}
-                        if batch.is_spec_v2
-                        else {}
-                    )
+                    with self._overlap_forward_isolation(batch):
+                        future_indices = batch.req_pool_indices
 
-                    with self.forward_stream_ctx:
-                        self.forward_stream.wait_stream(self.schedule_stream)
-                        resolve_forward_inputs(batch, self.future_map)
+                        # Spec_v2 fires on_publish mid-worker (between verify and
+                        # draft_extend) so schedule prep can overlap with draft_extend.
+                        # Non-spec has no later work — scheduler publishes after return.
+                        fwd_kwargs = (
+                            {
+                                "on_publish": partial(
+                                    self.future_map.publish, future_indices
+                                )
+                            }
+                            if batch.is_spec_v2
+                            else {}
+                        )
+
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
