@@ -1154,6 +1154,7 @@ class ModelConfig:
             "modelopt_fp8",
             "modelopt_fp4",
             "modelopt_mixed",
+            "per_token_nvfp4",
             "gptq_marlin_24",
             "gptq_marlin",
             "awq_marlin",

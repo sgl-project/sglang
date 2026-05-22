@@ -47,6 +47,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     block_quant_dequant,
     cutlass_fp8_supported,
+    inverse_transform_scale_ue8m0,
     is_blackwell_supported,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
@@ -2581,7 +2582,12 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
             )
 
         weight = weight.to(device).contiguous()
-        weight_scale = weight_scale.to(device=device, dtype=torch.float32).contiguous()
+        weight_scale = weight_scale.to(device=device).contiguous()
+        if weight_scale.dtype == torch.int32:
+            weight_scale = inverse_transform_scale_ue8m0(
+                weight_scale, mn=weight.shape[-2]
+            )
+        weight_scale = weight_scale.to(dtype=torch.float32).contiguous()
 
         if weight_scale.numel() == 1 or self.quant_config.weight_block_size is None:
             return (
