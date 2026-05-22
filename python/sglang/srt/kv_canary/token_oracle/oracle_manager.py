@@ -28,29 +28,29 @@ class TokenOracleManager:
         time to max per-forward write capacity (cuda-graph safe).
 
         For positions outside [0, current_seq_len) the value is undefined — caller is expected to
-        keep mock-model running such that every (req_id, position) hit by the canary write loop
-        is a valid oracle query.
+        keep mock-model running such that every (generalized_req_id, position) hit by the canary
+        write loop is a valid oracle query.
         """
         positions = forward_batch.positions
         input_ids = forward_batch.input_ids
         num_tokens = int(input_ids.shape[0])
 
-        rids_int = forward_batch.rids_int
-        if rids_int is None:
+        fallback_generalized_req_ids_int = forward_batch.rids_int
+        if fallback_generalized_req_ids_int is None:
             raise RuntimeError(
-                "fill_expected_inputs: forward_batch.rids_int is None; "
-                "token oracle requires the per-forward rids_int tensor "
+                "fill_expected_inputs: generalized_req_id source tensor is None; "
+                "token oracle requires a per-forward generalized_req_id source tensor "
                 "(set in ForwardBatch.init_new when SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1)"
             )
 
         if num_tokens == 0:
             return
 
-        req_ids = _build_req_id_per_token(
+        generalized_req_ids = _build_generalized_req_id_per_token(
             forward_batch=forward_batch,
             num_tokens=num_tokens,
-            rids_per_row=select_oracle_req_ids(
-                rids_int=rids_int,
+            generalized_req_ids_per_row=select_generalized_req_ids(
+                fallback_generalized_req_ids_int=fallback_generalized_req_ids_int,
                 bootstrap_room_ids_int=forward_batch.bootstrap_room_ids_int,
             ),
         )
@@ -58,36 +58,39 @@ class TokenOracleManager:
             expected_tokens = input_ids
         else:
             expected_tokens = self.oracle.expected_tokens(
-                req_ids=req_ids, positions=positions.to(torch.int64)
+                generalized_req_ids=generalized_req_ids,
+                positions=positions.to(torch.int64),
             )
         expected_inputs_out.tokens[:num_tokens].copy_(expected_tokens.to(torch.int64))
         expected_inputs_out.positions[:num_tokens].copy_(positions.to(torch.int64))
 
     def sample_next_tokens(
-        self, *, req_ids: torch.Tensor, logits_positions: torch.Tensor
+        self, *, generalized_req_ids: torch.Tensor, logits_positions: torch.Tensor
     ) -> torch.Tensor:
         return self.oracle.expected_tokens(
-            req_ids=req_ids, positions=logits_positions.to(torch.int64) + 1
+            generalized_req_ids=generalized_req_ids,
+            positions=logits_positions.to(torch.int64) + 1,
         )
 
 
-def _build_req_id_per_token(
+def _build_generalized_req_id_per_token(
     *,
     forward_batch: "ForwardBatch",
     num_tokens: int,
-    rids_per_row: torch.Tensor,
+    generalized_req_ids_per_row: torch.Tensor,
 ) -> torch.Tensor:
     forward_mode = forward_batch.forward_mode
     if forward_mode.is_target_verify():
         lens = torch.full_like(
-            rids_per_row, int(forward_batch.spec_info.draft_token_num)
+            generalized_req_ids_per_row, int(forward_batch.spec_info.draft_token_num)
         )
-        result = torch.repeat_interleave(rids_per_row, lens)
+        result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
     elif forward_mode.is_draft_extend(include_v2=True):
         lens = torch.full_like(
-            rids_per_row, int(forward_batch.spec_info.num_tokens_per_req)
+            generalized_req_ids_per_row,
+            int(forward_batch.spec_info.num_tokens_per_req),
         )
-        result = torch.repeat_interleave(rids_per_row, lens)
+        result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
     elif forward_mode.is_extend():
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
@@ -95,9 +98,9 @@ def _build_req_id_per_token(
                 "fill_expected_inputs: extend_seq_lens is None in extend mode"
             )
         lens = extend_seq_lens.to(torch.int64)
-        result = torch.repeat_interleave(rids_per_row, lens)
+        result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
     else:
-        result = rids_per_row
+        result = generalized_req_ids_per_row
 
     if int(result.shape[0]) != num_tokens:
         raise RuntimeError(
@@ -106,20 +109,20 @@ def _build_req_id_per_token(
     return result
 
 
-def select_oracle_req_ids(
+def select_generalized_req_ids(
     *,
-    rids_int: torch.Tensor,
+    fallback_generalized_req_ids_int: torch.Tensor,
     bootstrap_room_ids_int: torch.Tensor | None,
 ) -> torch.Tensor:
     if bootstrap_room_ids_int is None:
-        return rids_int
+        return fallback_generalized_req_ids_int
 
     bootstrap_room_ids_int = bootstrap_room_ids_int.to(
-        device=rids_int.device,
+        device=fallback_generalized_req_ids_int.device,
         dtype=torch.int64,
     )
     return torch.where(
         bootstrap_room_ids_int >= 0,
         bootstrap_room_ids_int,
-        rids_int.to(torch.int64),
+        fallback_generalized_req_ids_int.to(torch.int64),
     )

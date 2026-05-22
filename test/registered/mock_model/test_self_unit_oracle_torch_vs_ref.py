@@ -20,23 +20,24 @@ class TestHashOracleTorchVsRef(CustomTestCase):
         vocab_size = 32000
         num_cases = 1000
 
-        req_ids: list[int] = []
+        generalized_req_ids: list[int] = []
         positions: list[int] = []
         for _ in range(num_cases):
-            req_ids.append(rng.randrange(0, 1 << 60))
+            generalized_req_ids.append(rng.randrange(0, 1 << 60))
             positions.append(rng.randrange(0, 1 << 60))
 
         ref_tokens: list[int] = [
-            splitmix64(req_ids[i] ^ positions[i]) % vocab_size for i in range(num_cases)
+            splitmix64(generalized_req_ids[i] ^ positions[i]) % vocab_size
+            for i in range(num_cases)
         ]
 
         oracle = HashOracle(vocab_size=vocab_size)
         torch_tokens: list[int] = []
-        req_ids_tensor = torch.tensor(req_ids, dtype=torch.int64)
+        generalized_req_ids_tensor = torch.tensor(generalized_req_ids, dtype=torch.int64)
         positions_tensor = torch.tensor(positions, dtype=torch.int64)
         for i in range(num_cases):
             out = oracle.expected_tokens(
-                req_ids=req_ids_tensor[i : i + 1],
+                generalized_req_ids=generalized_req_ids_tensor[i : i + 1],
                 positions=positions_tensor[i : i + 1],
             )
             torch_tokens.append(int(out.tolist()[0]))
@@ -45,7 +46,7 @@ class TestHashOracleTorchVsRef(CustomTestCase):
             self.assertEqual(
                 torch_tokens[i],
                 ref_tokens[i],
-                f"mismatch at case {i}: req_id={req_ids[i]} "
+                f"mismatch at case {i}: generalized_req_id={generalized_req_ids[i]} "
                 f"position={positions[i]}: torch={torch_tokens[i]} ref={ref_tokens[i]}",
             )
 
@@ -55,15 +56,16 @@ class TestHashOracleTorchVsRef(CustomTestCase):
         vocab_size = 32000
         num_cases = 1000
 
-        req_ids = [rng.randrange(0, 1 << 60) for _ in range(num_cases)]
+        generalized_req_ids = [rng.randrange(0, 1 << 60) for _ in range(num_cases)]
         positions = [rng.randrange(0, 1 << 60) for _ in range(num_cases)]
         ref_tokens = [
-            splitmix64(req_ids[i] ^ positions[i]) % vocab_size for i in range(num_cases)
+            splitmix64(generalized_req_ids[i] ^ positions[i]) % vocab_size
+            for i in range(num_cases)
         ]
 
         oracle = HashOracle(vocab_size=vocab_size)
         out = oracle.expected_tokens(
-            req_ids=torch.tensor(req_ids, dtype=torch.int64),
+            generalized_req_ids=torch.tensor(generalized_req_ids, dtype=torch.int64),
             positions=torch.tensor(positions, dtype=torch.int64),
         )
         torch_tokens = out.tolist()
@@ -72,7 +74,7 @@ class TestHashOracleTorchVsRef(CustomTestCase):
             self.assertEqual(
                 torch_tokens[i],
                 ref_tokens[i],
-                f"batched mismatch at case {i}: req_id={req_ids[i]} "
+                f"batched mismatch at case {i}: generalized_req_id={generalized_req_ids[i]} "
                 f"position={positions[i]}: torch={torch_tokens[i]} ref={ref_tokens[i]}",
             )
 

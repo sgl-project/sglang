@@ -32,9 +32,11 @@ class _StubForwardBatch:
     seq_lens: torch.Tensor | None = None
 
 
-def _scalar_expected_token(oracle: HashOracle, *, req_id: int, position: int) -> int:
+def _scalar_expected_token(
+    oracle: HashOracle, *, generalized_req_id: int, position: int
+) -> int:
     out = oracle.expected_tokens(
-        req_ids=torch.tensor([req_id], dtype=torch.int64),
+        generalized_req_ids=torch.tensor([generalized_req_id], dtype=torch.int64),
         positions=torch.tensor([position], dtype=torch.int64),
     )
     return int(out.tolist()[0])
@@ -48,13 +50,13 @@ class TestFillExpectedInputs(CustomTestCase):
         rid_a = "req-a"
         hashed_a = _stable_hash_rid_i64(rid_a)
         out = hook.sample_next_tokens(
-            req_ids=torch.tensor([hashed_a], dtype=torch.int64),
+            generalized_req_ids=torch.tensor([hashed_a], dtype=torch.int64),
             logits_positions=torch.tensor([5], dtype=torch.int64),
         )
 
         self.assertEqual(
             out.tolist(),
-            [_scalar_expected_token(oracle, req_id=hashed_a, position=6)],
+            [_scalar_expected_token(oracle, generalized_req_id=hashed_a, position=6)],
         )
 
     def test_fill_expected_inputs_decode_one_token_per_req(self) -> None:
@@ -88,10 +90,14 @@ class TestFillExpectedInputs(CustomTestCase):
             expected_inputs.tokens[:2].tolist(),
             [
                 _scalar_expected_token(
-                    oracle, req_id=_stable_hash_rid_i64(rid_a), position=10
+                    oracle,
+                    generalized_req_id=_stable_hash_rid_i64(rid_a),
+                    position=10,
                 ),
                 _scalar_expected_token(
-                    oracle, req_id=_stable_hash_rid_i64(rid_b), position=20
+                    oracle,
+                    generalized_req_id=_stable_hash_rid_i64(rid_b),
+                    position=20,
                 ),
             ],
         )
@@ -128,8 +134,12 @@ class TestFillExpectedInputs(CustomTestCase):
         self.assertEqual(
             expected_inputs.tokens[:2].tolist(),
             [
-                _scalar_expected_token(oracle, req_id=1234, position=10),
-                _scalar_expected_token(oracle, req_id=hashed_b, position=20),
+                _scalar_expected_token(
+                    oracle, generalized_req_id=1234, position=10
+                ),
+                _scalar_expected_token(
+                    oracle, generalized_req_id=hashed_b, position=20
+                ),
             ],
         )
         self.assertEqual(expected_inputs.positions[:2].tolist(), [10, 20])
