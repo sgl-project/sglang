@@ -4,13 +4,16 @@ import time
 from typing import List, Optional, Union
 
 import numpy as np
+import PIL
 import requests
 import torch
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
+from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -85,6 +88,22 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.retrieve_latents
+def retrieve_latents(
+    encoder_output: torch.Tensor,
+    generator: Optional[torch.Generator] = None,
+    sample_mode: str = "sample",
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
 
 
 class GlmImageAR(PipelineStage):
@@ -175,13 +194,6 @@ class GlmImageAR(PipelineStage):
             )
         )
 
-        # SGLang Engine call
-        # output = self.ar_engine.generate(
-        #    input_ids=inputs["input_ids"][0].tolist(),
-        #    image_data=[{"image_grid_thw": image_grid_thw}],
-        #    sampling_params={"temperature": 1.0, "max_new_tokens": max_new_tokens},
-        # )
-        # generated_ids = output["output_ids"]
         if server_args.srt_encoder_url is not None:
             payload = {
                 "input_ids": inputs["input_ids"][0].tolist(),
@@ -196,6 +208,14 @@ class GlmImageAR(PipelineStage):
             )
             data = response.json()
             generated_ids = data.get("output_ids")
+        # else:
+        # SGLang Engine call
+        # output = self.ar_engine.generate(
+        #     input_ids=inputs["input_ids"][0].tolist(),
+        #     image_data=[{"image_grid_thw": image_grid_thw}],
+        #     sampling_params={"temperature": 1.0, "max_new_tokens": max_new_tokens},
+        # )
+        # generated_ids = output["output_ids"]
 
         # Extract large image tokens + upsample D32→D16
         prior_token_ids_d32 = torch.tensor(
@@ -535,6 +555,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         guidance_scale = batch.guidance_scale
         prompt = batch.prompt
         num_inference_steps = batch.num_inference_steps
+        if batch.image_path is not None:
+            ar_condition_images = [
+                load_image(img_path) for img_path in batch.image_path
+            ]
+        else:
+            ar_condition_images = None
 
         height = batch.height
         width = batch.width
@@ -553,7 +579,12 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         batch_size = 1
 
+        if ar_condition_images is not None:
+            height = height or ar_condition_images[0].height
+            width = width or ar_condition_images[0].width
+
         prior_token_id = batch.prior_token_id
+        prior_token_image_ids = batch.prior_token_image_ids
         prior_token_id = prior_token_id.to(device)
         # 3. Encode input prompt
         prompt_embeds, negative_prompt_embeds = self.encode_prompt(
@@ -565,7 +596,25 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
             dtype=dtype,
         )
 
-        # 4. Prepare latents
+        # 4. process images
+        if ar_condition_images is not None:
+            preprocessed_condition_images = []
+            for img in ar_condition_images:
+                image_height, image_width = (
+                    img.size[::-1]
+                    if isinstance(img, PIL.Image.Image)
+                    else img.shape[:2]
+                )
+                multiple_of = self.vae_scale_factor * self.transformer.config.patch_size
+                image_height = (image_height // multiple_of) * multiple_of
+                image_width = (image_width // multiple_of) * multiple_of
+                img = self.image_processor.preprocess(
+                    img, height=image_height, width=image_width
+                )
+                preprocessed_condition_images.append(img)
+            ar_condition_images = preprocessed_condition_images
+
+        # 5. Prepare latents and (optional) condition_images kv cache
         latent_channels = self.transformer.config.in_channels
         latents = self.prepare_latents(
             batch_size=1,
@@ -579,7 +628,55 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
 
         kv_caches = GlmImageKVCache(num_layers=self.transformer.config.num_layers)
 
-        # 5. Prepare additional timestep conditions
+        if ar_condition_images is not None:
+            latents_mean = torch.tensor(self.vae.config.latents_mean).view(
+                1, self.vae.config.latent_channels, 1, 1
+            )
+            latents_std = torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.latent_channels, 1, 1
+            )
+
+            latents_mean = latents_mean.to(device=device, dtype=prompt_embeds.dtype)
+            latents_std = latents_std.to(device=device, dtype=prompt_embeds.dtype)
+
+            for condition_image, condition_image_prior_token_id in zip(
+                ar_condition_images, prior_token_image_ids
+            ):
+                condition_image = condition_image.to(
+                    device=device, dtype=prompt_embeds.dtype
+                )
+
+                condition_latent = retrieve_latents(
+                    self.vae.encode(condition_image),
+                    generator=generator,
+                    sample_mode="argmax",
+                )
+                condition_latent = (condition_latent - latents_mean) / latents_std
+
+                # Do not remove.
+                # It would be use to run the reference image through a
+                # forward pass at timestep 0 and keep the KV cache.
+                with set_forward_context(current_timestep=1, attn_metadata=None):
+                    _ = self.transformer(
+                        hidden_states=condition_latent,
+                        encoder_hidden_states=torch.zeros_like(prompt_embeds)[
+                            :1, :0, ...
+                        ],
+                        prior_token_id=condition_image_prior_token_id,
+                        prior_token_drop=torch.full_like(
+                            condition_image_prior_token_id, False, dtype=torch.bool
+                        ),
+                        timestep=torch.zeros((1,), device=device),
+                        target_size=torch.tensor(
+                            [condition_image.shape[-2:]], device=device
+                        ),
+                        crop_coords=torch.zeros((1, 2), device=device),
+                        attention_kwargs=attention_kwargs,
+                        kv_caches=kv_caches,
+                        kv_caches_mode="write",
+                    )
+
+        # 6. Prepare additional timestep conditions
         target_size = (height, width)
         target_size = torch.tensor(
             [target_size], dtype=prompt_embeds.dtype, device=device
@@ -609,7 +706,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
         self._num_timesteps = len(timesteps)
 
-        # 6. Prepare for denoising loop
+        # 7. Prepare for denoising loop
 
         batch.prompt_embeds = [prompt_embeds]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
