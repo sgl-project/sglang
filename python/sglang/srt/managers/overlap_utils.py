@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Union
 
 import torch
 
@@ -48,27 +48,22 @@ class FutureMap:
         spec_algo: SpeculativeAlgorithm,
         req_to_token_pool: ReqToTokenPool,
     ):
-        # All buffers are indexed by req_pool_idx. Slot 0 mirrors the KV cache
-        # pool's padding row, so CUDA-graph padded batches (req_pool_idx == 0)
-        # read/write here harmlessly.
+        # Bufs indexed by req_pool_idx; slot 0 mirrors KV padding row so
+        # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
 
-        if self.spec_algo.is_none():
-            self.token_ids_buf = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, device=self.device
-            )
-        else:
-            # Schedule-consumed buf, eager fixed dtype.
-            self.new_seq_lens_buf = torch.empty(
-                (self.req_pool_size,), dtype=torch.int64, device=self.device
-            )
-            # Forward-only bufs are lazy (worker-dependent shape).
+        self.output_tokens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
+        self.new_seq_lens_buf = torch.empty(
+            (self.req_pool_size,), dtype=torch.int64, device=self.device
+        )
+        if self.spec_algo.is_some():
             self._forward_buf_initialized = False
 
-        # Fences the schedule-consumed buf fields.
-        self.publish_ready: Optional[torch.cuda.Event] = None
+        self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
 
     def _lazy_init_forward_buf(self, draft_input: EagleDraftInput):
         self._forward_buf_initialized = True
@@ -85,9 +80,6 @@ class FutureMap:
             dtype=topk_index0.dtype,
             device=self.device,
         )
-        self.bonus_tokens_buf = torch.empty(
-            (self.req_pool_size,), dtype=torch.int64, device=self.device
-        )
         if spec_need_hidden_states():
             hidden_states0 = draft_input.hidden_states[0]
             self.hidden_states_buf = torch.empty(
@@ -97,26 +89,34 @@ class FutureMap:
             )
 
     def resolve_future(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_decode():
+            batch.seq_lens = self.new_seq_lens_buf[batch.req_pool_indices]
+            torch._assert_async((batch.seq_lens > 0).all())
+
         if self.spec_algo.is_none():
-            _resolve_future_token_ids(batch.input_ids, self.token_ids_buf)
+            _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
         else:
-            draft_input: EagleDraftInput = batch.spec_info
-            if draft_input is None:
-                # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
-                return
-            indices = draft_input.future_indices.indices
-            # FIXME: redundant. `indices` = batch.req_pool_indices, pinned via
-            # record_batch_in_overlap's attr_snapshot for 2 iters; refcount > 0
-            # across forward's read, allocator can't reclaim. Safe to remove.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
-            draft_input.topk_p = self.topk_p_buf[indices]
-            draft_input.topk_index = self.topk_index_buf[indices]
-            draft_input.bonus_tokens = self.bonus_tokens_buf[indices]
-            draft_input.new_seq_lens = self.new_seq_lens_buf[indices]
-            # Resolve seq_lens placeholder (-indices) to the post-verify view.
-            batch.seq_lens = draft_input.new_seq_lens
-            if spec_need_hidden_states():
-                draft_input.hidden_states = self.hidden_states_buf[indices]
+            self._resolve_spec_extras(batch)
+
+    def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        draft_input: EagleDraftInput = batch.spec_info
+        if draft_input is None:
+            # FIXME(lsyin): only prefill; not compatible with mixed mode
+            return
+        indices = draft_input.future_indices.indices
+        # FIXME: indices = batch.req_pool_indices, pinned 2 iters via
+        # record_batch_in_overlap; record_stream here is redundant.
+        indices.record_stream(torch.get_device_module(self.device).current_stream())
+        draft_input.topk_p = self.topk_p_buf[indices]
+        draft_input.topk_index = self.topk_index_buf[indices]
+        draft_input.bonus_tokens = self.output_tokens_buf[indices]
+        if spec_need_hidden_states():
+            draft_input.hidden_states = self.hidden_states_buf[indices]
+
+    def invalidate(self, batch: ScheduleBatch, future_indices: FutureIndices) -> None:
+        sentinel = -future_indices.indices
+        batch.input_ids = sentinel
+        batch.seq_lens = sentinel
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
@@ -130,33 +130,34 @@ class FutureMap:
     def publish(
         self, future_indices: FutureIndices, new_seq_lens: torch.Tensor
     ) -> None:
-        """Store schedule-consumed fields and signal publish_ready."""
-        if self.spec_algo.is_none():
-            return
         indices = future_indices.indices
         if indices.shape[0] == 0:
             return  # DP idle
         self.new_seq_lens_buf[indices] = new_seq_lens.to(self.new_seq_lens_buf.dtype)
-        if self.publish_ready is None:
-            self.publish_ready = torch.get_device_module(self.device).Event()
-        self.publish_ready.record()
+        # Fast path: only spec_v2 needs the event (schedule-stream D2H sync).
+        if self.spec_algo.is_some():
+            if self.publish_ready is None:
+                self.publish_ready = torch.get_device_module(self.device).Event()
+            self.publish_ready.record()
 
-    def stash(self, future_indices: FutureIndices, payload) -> None:
-        """Store forward-only fields for the next forward batch to pick up."""
+    def stash(
+        self,
+        future_indices: FutureIndices,
+        payload: Union[torch.Tensor, EagleDraftInput],
+    ) -> None:
         indices = future_indices.indices
         if indices.shape[0] == 0:
-            return  # DP idle
+            # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
+            return
         if self.spec_algo.is_none():
-            # next_token_ids is int32; buf is int64. Advanced indexing requires
-            # an explicit cast.
-            self.token_ids_buf[indices] = payload.to(torch.int64)
+            self.output_tokens_buf[indices] = payload.to(torch.int64)
             return
 
         draft_input: EagleDraftInput = payload
         if not self._forward_buf_initialized:
             self._lazy_init_forward_buf(draft_input)
-        self.bonus_tokens_buf[indices] = draft_input.bonus_tokens.to(
-            self.bonus_tokens_buf.dtype
+        self.output_tokens_buf[indices] = draft_input.bonus_tokens.to(
+            self.output_tokens_buf.dtype
         )
         self.topk_p_buf[indices] = draft_input.topk_p.to(self.topk_p_buf.dtype)
         self.topk_index_buf[indices] = draft_input.topk_index.to(

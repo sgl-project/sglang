@@ -354,8 +354,10 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -667,7 +669,7 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
@@ -960,7 +962,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
@@ -1183,7 +1185,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner)
-        self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[DeepseekV4AttnBackend] = []

@@ -120,7 +120,7 @@ The generator currently picks values on the **conservative** side (mirroring an 
 **Hopper (H200) note**
 
 We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
-- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
+- Original FP4 checkpoints: To run original FP4 checkpoints, we provide two different options for w4a16 MoE kernels: Marlin (`--moe-runner-backend marlin`) and Flashinfer (`--moe-runner-backend flashinfer_mxfp4`). For this variant we only support Tensor Parallelism. Complete Pro model can be run on a single H200 node with this option.
 - Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
