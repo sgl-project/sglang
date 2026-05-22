@@ -6,7 +6,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import fused_k_norm_rope_flashmla, fused_store_cache
+from sglang.jit_kernel.dsv4 import fused_k_norm_rope_flashmla, fused_store_cache
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa import index_buf_accessor
@@ -492,6 +492,10 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+        self.cached_loc = None  # mapping replaced; discard any cached translation
+
+    def invalidate_loc_cache(self) -> None:
+        self.cached_loc = None
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
