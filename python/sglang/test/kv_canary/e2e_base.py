@@ -67,7 +67,9 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            extra_server_args=("--max-total-tokens", "8192", *cls.extra_server_args),
+            # Keep max-total-tokens aligned with --context-length=16384 in utils.py so
+            # the KV pool can hold the ~9k-token long-prompt requests this harness builds.
+            extra_server_args=("--max-total-tokens", "16384", *cls.extra_server_args),
         )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
