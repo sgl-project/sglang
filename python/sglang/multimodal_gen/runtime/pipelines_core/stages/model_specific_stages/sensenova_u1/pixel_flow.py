@@ -38,6 +38,7 @@ _U1_EDIT_IMG_CONDITION_ROLE = "u1_edit_img_condition"
 _U1_EDIT_UNCONDITION_ROLE = "u1_edit_uncondition"
 _U1_IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _U1_IMAGENET_STD = (0.229, 0.224, 0.225)
+_U1_PIXEL_FLOW_GENERATOR_KEY = "_sensenova_u1_pixel_flow_generator"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,7 +119,7 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
         ) = _resolve_u1_contexts(context_ops=context_ops, batch=batch)
         prepared = self._prepare(
             model=model,
-            context_metadata=dict(context_ops.metadata),
+            context_metadata=context_ops.metadata,
             batch=batch,
             u1_context=u1_context,
             cfg_img_condition_u1_context=cfg_img_condition_u1_context,
@@ -188,7 +189,11 @@ class SenseNovaU1PixelFlowStage(DenoisingStage):
 
         device = _model_device(model)
         seed = _batch_seed(batch)
-        generator = _new_torch_generator(seed=seed, device=device)
+        generator = _get_or_create_context_generator(
+            context_metadata,
+            seed=seed,
+            device=device,
+        )
         noise_scale = float(_noise_scale_for_image(model, grid_h=grid_h, grid_w=grid_w))
         dtype = _model_dtype(model)
         image_prediction = noise_scale * torch.randn(
@@ -633,9 +638,14 @@ def _require_context(
     message: str,
     condition_path_role: str | None = None,
 ) -> _SenseNovaU1GenerationContext:
-    position_count = context_ops.get_position_count(
-        condition_path_role=condition_path_role
+    position_count = _u1_condition_path_logical_position(
+        context_ops,
+        condition_path_role,
     )
+    if position_count is None:
+        position_count = context_ops.get_position_count(
+            condition_path_role=condition_path_role
+        )
     if position_count is None:
         suffix = (
             f" condition path {condition_path_role}"
@@ -648,6 +658,27 @@ def _require_context(
         condition_path_role=condition_path_role,
         position_count=int(position_count),
     )
+
+
+def _u1_condition_path_logical_position(
+    context_ops: ContextOps,
+    condition_path_role: str | None,
+) -> int | None:
+    if condition_path_role is None:
+        return None
+    runtime = getattr(getattr(context_ops, "session_adapter", None), "runtime", None)
+    session_id = getattr(context_ops, "session_id", None)
+    if runtime is None or session_id is None:
+        return None
+    model_state = runtime.get_condition_path_model_state(
+        session_id,
+        condition_path_role,
+    )
+    u1_state = (model_state or {}).get("u1") or {}
+    position = u1_state.get("generation_position_start")
+    if position is None:
+        return None
+    return int(position)
 
 
 def _require_context_ops(batch: Req) -> ColocatedContextOps:
@@ -824,6 +855,31 @@ def _new_torch_generator(*, seed: int, device: Any) -> Any:
     import torch
 
     return torch.Generator(device=device).manual_seed(int(seed))
+
+
+def _get_or_create_context_generator(
+    metadata: dict[str, Any],
+    *,
+    seed: int,
+    device: Any,
+) -> Any:
+    state = metadata.get(_U1_PIXEL_FLOW_GENERATOR_KEY)
+    device_repr = str(device)
+    if (
+        isinstance(state, dict)
+        and state.get("seed") == int(seed)
+        and state.get("device") == device_repr
+        and state.get("generator") is not None
+    ):
+        return state["generator"]
+
+    generator = _new_torch_generator(seed=seed, device=device)
+    metadata[_U1_PIXEL_FLOW_GENERATOR_KEY] = {
+        "seed": int(seed),
+        "device": device_repr,
+        "generator": generator,
+    }
+    return generator
 
 
 def _batch_seed(batch: Any) -> int:
