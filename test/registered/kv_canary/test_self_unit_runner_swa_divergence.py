@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from runner_test_base import CanaryRunnerTestCase, make_runner
+from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
