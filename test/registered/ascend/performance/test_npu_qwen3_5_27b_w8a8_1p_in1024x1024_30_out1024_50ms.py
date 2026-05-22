@@ -84,7 +84,9 @@ QWEN3_5_27B_W8A8_IN1024X1024_30_OUT1024_50MS_OTHER_ARGS = [
 ]
 
 
-class TestNPUQwen3_5_27B_W8A8_1P_In1024x1024_30_Out1024_50ms(TestAscendPerformanceTestCaseBase):
+class TestNPUQwen3_5_27B_W8A8_1P_In1024x1024_30_Out1024_50ms(
+    TestAscendPerformanceTestCaseBase
+):
     """Test NPU performance for Qwen3.5-27B-W8A8 1p in1024x1024 30 out1024 50ms"""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
