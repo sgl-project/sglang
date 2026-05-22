@@ -700,7 +700,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -730,7 +730,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_dllm_extend():
             prefill_wrappers = []
@@ -759,7 +759,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
-            self.prefill_cuda_graph_metadata[(forward_mode, bs)] = prefill_wrappers
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
@@ -800,7 +800,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = DecodeMetadata(decode_wrappers)
         elif forward_mode.is_target_verify():
-            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
@@ -814,7 +814,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
-            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,
@@ -828,7 +828,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_dllm_extend():
-            prefill_wrappers = self.prefill_cuda_graph_metadata[(forward_mode, bs)]
+            prefill_wrappers = self.prefill_cuda_graph_metadata[bs]
             self.indices_updater_prefill.update(
                 req_pool_indices,
                 seq_lens,

@@ -462,7 +462,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[(forward_mode, bs)] = verify_wrapper
+            self.prefill_cuda_graph_metadata[bs] = verify_wrapper
             self.forward_metadata = PrefillMetadata(verify_wrapper, False)
         elif forward_mode.is_draft_extend():
             draft_extend_wrapper = BatchMLAPagedAttentionWrapper(
@@ -484,7 +484,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 use_ragged=False,
                 spec_info=spec_info,
             )
-            self.prefill_cuda_graph_metadata[(forward_mode, bs)] = draft_extend_wrapper
+            self.prefill_cuda_graph_metadata[bs] = draft_extend_wrapper
             self.forward_metadata = PrefillMetadata(draft_extend_wrapper, False)
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
