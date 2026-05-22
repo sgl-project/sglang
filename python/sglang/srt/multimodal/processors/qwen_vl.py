@@ -611,7 +611,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids_list,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
