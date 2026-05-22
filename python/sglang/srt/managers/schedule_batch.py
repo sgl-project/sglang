@@ -2159,6 +2159,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
+        if running_batch.enable_overlap:
+            # running_batch.seq_lens (GPU) is the FutureMap sentinel between iters;
+            # restore from CPU shadow before merge so MIXED's seq_lens has real values.
+            # (resolve_future only restores for is_decode(), not is_mixed().)
+            running_batch.seq_lens = running_batch.seq_lens_cpu.to(
+                running_batch.device, non_blocking=True
+            )
+
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
         out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
 
@@ -2411,8 +2419,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Update seq_lens after allocation
         if self.enable_overlap:
-            # Do not use in-place operations in the overlap mode
-            self.seq_lens = self.seq_lens + 1
+            # Overlap: GPU seq_lens restored by resolve_future from FutureMap buf.
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
         else:
@@ -2420,8 +2427,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.hisparse_coordinator is not None:
@@ -2447,25 +2453,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 .to(device=self.device, non_blocking=True)
             )
 
-    def maybe_wait_verify_done(self):
-        # Use event.wait() (stream-level wait) instead of .synchronize()
-        # (CPU block). Schedule-stream prep ops following this call get
-        # ordered after the forward-stream verify via the wait; CPU is not
-        # blocked. Subsequent .cpu()/.item() naturally sync the stream.
-        if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
-            if draft_input.verify_done is not None:
-                draft_input.verify_done.wait()
-
-    def refresh_seq_lens_cpu(self, sync: bool = True):
-        # sync=True: D2H from seq_lens (needed when seq_lens_cpu is stale
-        # relative to seq_lens, i.e. spec v2's mid-forward GPU rebind).
-        # sync=False: caller asserts seq_lens_cpu already fresh — skip D2H,
-        # only recompute the cached sum.
-        if sync and self.is_spec_v2:
-            self.seq_lens_cpu = self.seq_lens.cpu()
-        self.seq_lens_sum = int(self.seq_lens_cpu.sum())
-
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
@@ -2473,10 +2460,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # FIXME(lsyin): deprecate this API after spec v1 is deprecated
         v1_spec_info_filtered: Optional[bool] = False,
     ):
-        # FIXME(lsyin): used here to get the correct seq_lens
-        # The batch has been launched but we need it verified to get correct next batch info
-        self.maybe_wait_verify_done()
-
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -2516,8 +2499,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
         self.orig_seq_lens = self.orig_seq_lens[keep_indices_device]
         self.out_cache_loc = None
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
 
         if self.input_ids is not None:
@@ -2553,15 +2535,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: "ScheduleBatch"):
-        # In the regular scheduler path:
-        # 1) self is always prefill, whose seq_lens is not a future
-        # 2) other is always decode, which is finished in previous step
-        # so verify_done is already synced and this is a no-op.
-        # In disagg decode + overlap, merge_batch can be called before
-        # filter_batch, so running_batch.seq_lens may still be a forward_stream
-        # future. Synchronize here to avoid a cross-stream data race.
-        self.maybe_wait_verify_done()
-
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2578,8 +2551,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.orig_seq_lens = torch.cat([self.orig_seq_lens, other.orig_seq_lens])
         self.out_cache_loc = None
-        # Defer compute to refresh_seq_lens_cpu (either pre-forward in scheduler.py
-        # or lazily in ForwardBatch.init_new).
+        # Sum is recomputed lazily by ForwardBatch.init_new.
         self.seq_lens_sum = None
         if self.input_ids is not None:
             self.input_ids = torch.cat([self.input_ids, other.input_ids])
