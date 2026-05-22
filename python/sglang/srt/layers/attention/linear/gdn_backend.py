@@ -263,6 +263,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        super().init_forward_metadata(forward_batch)
+        if self.forward_metadata.has_mamba_track_mask:
+            self.forward_metadata.mamba_track_mask_indices = (
+                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+            )
+            self.forward_metadata.conv_states_mask_indices = (
+                forward_batch.mamba_track_indices[
+                    self.forward_metadata.mamba_track_mask_indices
+                ]
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
