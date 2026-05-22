@@ -2960,6 +2960,7 @@ class Scheduler(
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
+                    resolve_forward_inputs(batch, self.future_map)
                     pooler_output = self.tp_worker.forward_batch_embedding(batch)
                     ret = EmbeddingBatchResult(
                         embeddings=pooler_output.embeddings,
@@ -2967,6 +2968,7 @@ class Scheduler(
                     )
                     ret.copy_to_cpu()
             else:
+                resolve_forward_inputs(batch, self.future_map)
                 pooler_output = self.tp_worker.forward_batch_embedding(batch)
                 ret = EmbeddingBatchResult(
                     embeddings=pooler_output.embeddings,
