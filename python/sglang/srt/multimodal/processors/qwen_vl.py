@@ -598,15 +598,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             isinstance(base_input_ids, list)
             and len(base_input_ids) == input_ids.numel()
         ):
+            # preprocess input already carries list of input_ids
             input_ids_list = base_input_ids
         else:
             input_ids_list = input_ids.tolist()
+
+        # look for if padded_input_ids already exists before computing
         padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
         if padded_input_ids is None:
             padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
                 input_ids_list, mm_items
             )
         elif isinstance(padded_input_ids, torch.Tensor):
+            # reuse existing padded_input_ids
             padded_input_ids = padded_input_ids.flatten().tolist()
         else:
             padded_input_ids = list(padded_input_ids)
