@@ -75,6 +75,29 @@ class TestShmRoundTrip(CustomTestCase):
             if os.path.exists(path):
                 os.unlink(path)
 
+    def test_dispatch_ack_fields_round_trip(self):
+        path = _temp_path()
+        writer = ShmLoadSnapshotWriter(path, dp_size=1, dp_rank=0)
+        reader = ShmLoadSnapshotReader(path, dp_size=1)
+        try:
+            writer.write(
+                LoadSnapshot(
+                    dp_rank=0,
+                    timestamp=1.0,
+                    dp_dispatch_ack_seq=3,
+                    dp_dispatch_ack_cum_tokens=4096,
+                )
+            )
+            load = reader.read(0)
+            self.assertIsNotNone(load)
+            self.assertEqual(load.dp_dispatch_ack_seq, 3)
+            self.assertEqual(load.dp_dispatch_ack_cum_tokens, 4096)
+        finally:
+            reader.close()
+            writer.close()
+            if os.path.exists(path):
+                os.unlink(path)
+
     def test_multi_rank_write_read_all(self):
         path = _temp_path()
         writers = []

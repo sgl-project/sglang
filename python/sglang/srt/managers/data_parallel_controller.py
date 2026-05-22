@@ -92,6 +92,32 @@ class DPBudget:
         self.total_requests = [0] * dp_size
         self.total_tokens = [0] * dp_size
         self.last_timestamp = [0.0] * dp_size
+        self.sent_dispatch_seqs = [0] * dp_size
+        self.sent_dispatch_cum_tokens = [0] * dp_size
+        self.acked_dispatch_seqs = [0] * dp_size
+        self.acked_dispatch_cum_tokens = [0] * dp_size
+
+    def get_effective_load(self, load):
+        dp_rank = load.dp_rank
+        acked_seq = max(
+            self.acked_dispatch_seqs[dp_rank],
+            load.dp_dispatch_ack_seq,
+        )
+        acked_tokens = max(
+            self.acked_dispatch_cum_tokens[dp_rank],
+            load.dp_dispatch_ack_cum_tokens,
+        )
+        acked_seq = min(acked_seq, self.sent_dispatch_seqs[dp_rank])
+        acked_tokens = min(acked_tokens, self.sent_dispatch_cum_tokens[dp_rank])
+
+        unacked_requests = self.sent_dispatch_seqs[dp_rank] - acked_seq
+        unacked_tokens = self.sent_dispatch_cum_tokens[dp_rank] - acked_tokens
+        reported_requests = load.num_running_reqs + load.num_waiting_reqs
+
+        return (
+            reported_requests + unacked_requests,
+            load.num_total_tokens + unacked_tokens,
+        )
 
     def update_budget(self, loads):
         """Update budget from shm snapshots, skipping stale reads."""
@@ -99,10 +125,24 @@ class DPBudget:
             if load.timestamp == self.last_timestamp[load.dp_rank]:
                 continue
             self.last_timestamp[load.dp_rank] = load.timestamp
-            self.total_requests[load.dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
+            dp_rank = load.dp_rank
+            acked_seq = max(
+                self.acked_dispatch_seqs[dp_rank],
+                load.dp_dispatch_ack_seq,
             )
-            self.total_tokens[load.dp_rank] = load.num_total_tokens
+            acked_tokens = max(
+                self.acked_dispatch_cum_tokens[dp_rank],
+                load.dp_dispatch_ack_cum_tokens,
+            )
+            self.acked_dispatch_seqs[dp_rank] = min(
+                acked_seq, self.sent_dispatch_seqs[dp_rank]
+            )
+            self.acked_dispatch_cum_tokens[dp_rank] = min(
+                acked_tokens, self.sent_dispatch_cum_tokens[dp_rank]
+            )
+            total_requests, total_tokens = self.get_effective_load(load)
+            self.total_requests[dp_rank] = total_requests
+            self.total_tokens[dp_rank] = total_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -117,9 +157,15 @@ class DPBudget:
             return None
 
         # Increment the load of that worker by one as a heuristic
+        self.sent_dispatch_seqs[target_rank] += 1
+        self.sent_dispatch_cum_tokens[target_rank] += estimated_tokens
         self.total_requests[target_rank] += 1
         self.total_tokens[target_rank] += estimated_tokens
-        return target_rank
+        return (
+            target_rank,
+            self.sent_dispatch_seqs[target_rank],
+            self.sent_dispatch_cum_tokens[target_rank],
+        )
 
 
 class DataParallelController:
@@ -631,16 +677,22 @@ class DataParallelController:
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
+        target_worker, dispatch_seq, dispatch_cum_tokens = self.dp_budget.dispatch(
+            LoadBalanceMethod.TOTAL_REQUESTS
+        )
+        req.dp_dispatch_seq = dispatch_seq
+        req.dp_dispatch_cum_tokens = dispatch_cum_tokens
         self.workers[target_worker].send_pyobj(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         estimated_tokens = len(req.input_ids)
-        target_worker = self.dp_budget.dispatch(
+        target_worker, dispatch_seq, dispatch_cum_tokens = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
+        req.dp_dispatch_seq = dispatch_seq
+        req.dp_dispatch_cum_tokens = dispatch_cum_tokens
         self.workers[target_worker].send_pyobj(req)
 
     def event_loop(self):

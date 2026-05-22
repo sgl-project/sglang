@@ -51,6 +51,8 @@ class SchedulerLoadInquirer:
     get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
+    get_dp_dispatch_ack_seq: Callable
+    get_dp_dispatch_ack_cum_tokens: Callable
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -226,6 +228,8 @@ class SchedulerLoadInquirer:
             cache_hit_rate=round(self.get_stats().cache_hit_rate, 4),
             utilization=round(self.get_stats().utilization, 4),
             max_running_requests=self.max_running_requests,
+            dp_dispatch_ack_seq=self.get_dp_dispatch_ack_seq(),
+            dp_dispatch_ack_cum_tokens=self.get_dp_dispatch_ack_cum_tokens(),
             memory=memory,
             speculative=speculative,
             lora=lora,

@@ -153,6 +153,8 @@ CORE_METRIC_FIELDS = (
     "gen_throughput",
     "cache_hit_rate",
     "utilization",
+    "dp_dispatch_ack_seq",
+    "dp_dispatch_ack_cum_tokens",
 )
 SECTION_FIELDS = (
     (
@@ -228,6 +230,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
     utilization: float = 0.0
+    dp_dispatch_ack_seq: int = 0
+    dp_dispatch_ack_cum_tokens: int = 0
 
     has_memory: int = 0
     memory_weight_gb: float = 0.0
@@ -303,6 +307,8 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
             "gen_throughput": self.gen_throughput,
             "cache_hit_rate": self.cache_hit_rate,
             "utilization": self.utilization,
+            "dp_dispatch_ack_seq": self.dp_dispatch_ack_seq,
+            "dp_dispatch_ack_cum_tokens": self.dp_dispatch_ack_cum_tokens,
         }
 
         if include is None or "all" in include:

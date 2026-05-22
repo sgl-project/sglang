@@ -845,6 +845,10 @@ class TokenizedGenerateReqInput(BaseReq):
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
+    # For DP load-balance pending accounting.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cum_tokens: int = 0
+
 
 @dataclass
 class BatchTokenizedGenerateReqInput(BaseBatchReq):
@@ -1100,6 +1104,10 @@ class TokenizedEmbeddingReqInput(BaseReq):
     multi_item_delimiter_indices: Optional[List[int]] = None
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
+
+    # For DP load-balance pending accounting.
+    dp_dispatch_seq: int = 0
+    dp_dispatch_cum_tokens: int = 0
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
@@ -2147,6 +2155,19 @@ class GetLoadsReqOutput(BaseReq):
     )
     max_running_requests: int = field(
         metadata={"metric": ("gauge", "Maximum running requests capacity")}
+    )
+    # Latest per-DP controller dispatch counters reflected in this scheduler's
+    # load report. Used by the controller to preserve dispatched-but-not-yet-
+    # reported load.
+    dp_dispatch_ack_seq: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Latest accounted DP dispatch sequence")},
+    )
+    dp_dispatch_ack_cum_tokens: int = field(
+        default=0,
+        metadata={
+            "metric": ("gauge", "Latest accounted cumulative DP dispatch tokens")
+        },
     )
 
     memory: Optional[MemoryMetrics] = None
