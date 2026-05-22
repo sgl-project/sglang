@@ -10,6 +10,7 @@ Usage:
 
 import http.client
 import json
+import logging
 import os
 import socket
 import subprocess
@@ -27,13 +28,13 @@ from sglang.test.test_utils import (
     popen_with_error_check,
 )
 
+logger = logging.getLogger(__name__)
+
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 
 class _UDSConnection(http.client.HTTPConnection):
-    """http.client connection that talks over a Unix domain socket."""
-
     def __init__(self, uds_path: str, timeout: float = 30.0):
         super().__init__("localhost", timeout=timeout)
         self._uds_path = uds_path
@@ -112,10 +113,14 @@ class TestUDSServer(CustomTestCase):
                 for key, value in proxy_env.items():
                     cls._restore_env[key] = os.environ.get(key)
                     os.environ[key] = value
-        except Exception as e:
-            # Non-fatal: live HF fetch will still work; we just lose the offline
-            # optimization for this test run.
-            print(f"UDS test CI cache validation failed (non-fatal): {e}")
+        except (ImportError, OSError) as e:
+            # Non-fatal: live HF fetch will still work; we just lose the
+            # offline optimization for this test run.
+            logger.warning(
+                "UDS test CI cache validation failed (non-fatal): %s",
+                e,
+                exc_info=True,
+            )
 
         cls.process = popen_with_error_check(command)
         _wait_for_uds_health(
@@ -124,21 +129,30 @@ class TestUDSServer(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
-        # Restore environment variables we mutated in setUpClass.
-        for key, original in cls._restore_env.items():
-            if original is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = original
+        # Each cleanup step is isolated so a failure in one (e.g. the server
+        # process already died) does not leak env mutations or tempdir.
+        try:
+            kill_process_tree(cls.process.pid)
+        except Exception:
+            logger.exception("Failed to kill UDS test server process")
+        for key, original in getattr(cls, "_restore_env", {}).items():
+            try:
+                if original is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = original
+            except Exception:
+                logger.exception("Failed to restore env var %s", key)
         try:
             os.unlink(cls.uds_path)
         except FileNotFoundError:
             pass
+        except OSError:
+            logger.exception("Failed to unlink UDS file %s", cls.uds_path)
         try:
             os.rmdir(cls._tmpdir)
         except OSError:
-            pass
+            logger.exception("Failed to remove UDS test tempdir %s", cls._tmpdir)
 
     def _request_json(
         self, method: str, path: str, payload: dict | None = None
