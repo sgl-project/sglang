@@ -368,9 +368,7 @@ class MMEncoder:
 
         hf_cfg = self.model_config.hf_config
         thinker_cfg = _read(hf_cfg, "thinker_config")
-        pc = _read(thinker_cfg, "processor_config") or _read(
-            hf_cfg, "processor_config"
-        )
+        pc = _read(thinker_cfg, "processor_config") or _read(hf_cfg, "processor_config")
         sr = _read(pc, "audio_sampling_rate")
         if sr:
             return int(sr)
