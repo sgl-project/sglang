@@ -605,17 +605,20 @@ class FlashInferAttnBackend(AttentionBackend):
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
-        # Derive num_tokens (= number of KV entries the wrapper must cover).
-        # For decode with spec_info (e.g. EAGLE topk>1), spec_info.kv_indptr
-        # has shape [topk_candidates+1]; the wrapper's paged_kv_last_page_len_buffer
-        # must be sized to topk_candidates, not bs. Using positions.shape[0] gives
-        # the wrong size when the replay shim sets positions = new_empty(bs).
-        if spec_info is not None and getattr(spec_info, "kv_indptr", None) is not None:
+        # num_tokens matters only for the DECODE branch (BatchDecodeWrapper is
+        # initialized with paged_kv_last_page_len_buffer[:num_tokens]).
+        # For TARGET_VERIFY / DRAFT_EXTEND the prefill wrapper uses [:bs], so
+        # num_tokens is irrelevant there.
+        #
+        # For decode with spec_info (e.g. EAGLE topk>1): spec_info.kv_indptr
+        # shape is [topk_candidates+1]; call_begin_forward also reads bs from
+        # kv_indptr, so the wrapper must be sized to topk_candidates, not bs.
+        if (
+            forward_mode.is_decode_or_idle()
+            and spec_info is not None
+            and getattr(spec_info, "kv_indptr", None) is not None
+        ):
             num_tokens = spec_info.kv_indptr.shape[0] - 1
-        elif forward_mode.is_target_verify():
-            num_tokens = bs * self.num_draft_tokens
-        elif forward_mode.is_draft_extend(include_v2=True):
-            num_tokens = bs * (self.speculative_num_steps + 1)
         else:
             num_tokens = bs
         if forward_mode.is_decode_or_idle():
