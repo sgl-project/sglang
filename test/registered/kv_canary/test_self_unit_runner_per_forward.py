@@ -152,6 +152,41 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
         self.assertEqual(call["positions"].dtype, torch.int64)
         self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
 
+    def test_launch_endpoints_per_forward_accepts_strided_boundary_tensors(
+        self,
+    ) -> None:
+        """Verify strided ForwardBatch views are copied at the canary boundary."""
+        group = make_group(device=self.device)
+        endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
+        forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
+        forward_batch.input_ids = torch.tensor(
+            [[101, 102]], dtype=torch.int64, device=self.device
+        )[:, 0]
+        forward_batch.positions = torch.tensor(
+            [[10, 11]], dtype=torch.int64, device=self.device
+        )[:, 0]
+        forward_batch.out_cache_loc = torch.tensor(
+            [[7, 8]], dtype=torch.int64, device=self.device
+        )[:, 0]
+
+        kernel_launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            input_check_mode=False,
+        )
+
+        call = endpoint.calls[0]
+        self.assertTrue(call["input_ids"].is_contiguous())
+        self.assertTrue(call["positions"].is_contiguous())
+        self.assertTrue(call["out_cache_loc"].is_contiguous())
+
 
 class TestRunnerBeforeForward(CanaryRunnerTestCase):
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:

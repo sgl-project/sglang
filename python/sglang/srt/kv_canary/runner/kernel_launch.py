@@ -153,4 +153,4 @@ def _canonicalize_boundary_int64(
         raise TypeError(
             f"kv-canary: {name} must have dtype torch.int32 or torch.int64, got {tensor.dtype}"
         )
-    return tensor.to(torch.int64)
+    return tensor.to(torch.int64).contiguous()
