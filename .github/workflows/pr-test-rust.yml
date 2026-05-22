@@ -22,6 +22,10 @@ concurrency:
   group: gateway-tests-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  actions: read
+  contents: read
+
 env:
   SGLANG_IS_IN_CI: true
 
@@ -91,16 +95,99 @@ jobs:
           python3 -c "from sglang_router.sglang_router_rs import Router; print('Rust extension: OK')"
           python3 -m sglang_router.launch_router --help > /dev/null && echo "Entry point: OK"
 
-  sgl-kernel-build-wheels:
+  find-base-sgl-kernel-artifact:
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    uses: ./.github/workflows/_pr-test-sgl-kernel-build.yml
-    with:
-      runs_on: x64-kernel-build-node
-      job_display_name: Build sgl-kernel Wheel
-    secrets: inherit
+    runs-on: ubuntu-latest
+    outputs:
+      use_kernel_artifact: ${{ steps.find.outputs.use_kernel_artifact }}
+      base_run_id: ${{ steps.find.outputs.base_run_id }}
+    steps:
+      - name: Find PR Test Base sgl-kernel artifact
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          echo "use_kernel_artifact=false" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Not a pull_request event; using the default sglang-kernel wheel."
+            exit 0
+          fi
+
+          for attempt in $(seq 1 120); do
+            run_id=$(gh api \
+              "/repos/$GITHUB_REPOSITORY/actions/workflows/pr-test.yml/runs?event=pull_request&head_sha=$HEAD_SHA&per_page=1" \
+              --jq '.workflow_runs[0].id // empty')
+
+            if [ -z "$run_id" ]; then
+              echo "PR Test Base run for $HEAD_SHA not found yet ($attempt/120)."
+              sleep 30
+              continue
+            fi
+
+            jobs=$(gh api --paginate \
+              "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '.jobs[] | select(.name | startswith("sgl-kernel-build-wheels / Build Wheel")) | [.status, (.conclusion // "")] | @tsv')
+
+            if [ -z "$jobs" ]; then
+              run_status=$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.status')
+              if [ "$run_status" = "completed" ]; then
+                echo "PR Test Base completed without an sgl-kernel wheel build; using the default sglang-kernel wheel."
+                exit 0
+              fi
+              echo "PR Test Base run $run_id exists, but sgl-kernel build job has not materialized yet ($attempt/120)."
+              sleep 30
+              continue
+            fi
+
+            artifact_count=$(gh api \
+              "/repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name == "wheel-python3.10-cuda13.0")] | length')
+
+            if [ "$artifact_count" -gt 0 ]; then
+              echo "Found PR Test Base sgl-kernel artifact in run $run_id."
+              echo "use_kernel_artifact=true" >> "$GITHUB_OUTPUT"
+              echo "base_run_id=$run_id" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            failed=false
+            skipped=false
+            running=false
+            while IFS=$'\t' read -r status conclusion; do
+              if [ "$status" != "completed" ]; then
+                running=true
+              elif [ "$conclusion" = "skipped" ]; then
+                skipped=true
+              elif [ "$conclusion" != "success" ]; then
+                failed=true
+              fi
+            done <<< "$jobs"
+
+            if [ "$failed" = true ]; then
+              echo "PR Test Base sgl-kernel build failed before producing wheel-python3.10-cuda13.0."
+              exit 1
+            fi
+            if [ "$skipped" = true ]; then
+              echo "PR Test Base sgl-kernel build was skipped; using the default sglang-kernel wheel."
+              exit 0
+            fi
+            if [ "$running" = false ]; then
+              echo "PR Test Base sgl-kernel build completed but wheel-python3.10-cuda13.0 is unavailable."
+              exit 1
+            fi
+
+            echo "Waiting for PR Test Base sgl-kernel wheel artifact from run $run_id ($attempt/120)."
+            sleep 30
+          done
+
+          echo "Timed out waiting for PR Test Base sgl-kernel wheel artifact."
+          exit 1
 
   python-unit-tests:
     needs: build-wheel
@@ -204,7 +291,7 @@ jobs:
 
   gateway-e2e:
     name: ${{ matrix.name }}
-    needs: [build-wheel, sgl-kernel-build-wheels]
+    needs: [build-wheel, find-base-sgl-kernel-artifact]
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -294,20 +381,23 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
+        if: needs.find-base-sgl-kernel-artifact.outputs.use_kernel_artifact == 'true'
         run: |
           ls -alh sgl-kernel/dist || true
           rm -rf sgl-kernel/dist/* || true
 
       - name: Download sgl-kernel wheel artifact
+        if: needs.find-base-sgl-kernel-artifact.outputs.use_kernel_artifact == 'true'
         uses: actions/download-artifact@v4
         with:
           path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          name: wheel-python3.10-cuda13.0
+          run-id: ${{ needs.find-base-sgl-kernel-artifact.outputs.base_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install SGLang dependencies
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=true bash scripts/ci/cuda/ci_install_dependency.sh
+          CUSTOM_BUILD_SGL_KERNEL=${{ needs.find-base-sgl-kernel-artifact.outputs.use_kernel_artifact }} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
