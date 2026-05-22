@@ -85,9 +85,20 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+        import types
+
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=int(seq_lens.sum()),
+                seq_lens_cpu=None,
+                positions=req_pool_indices.new_empty(num_tokens),
+            )
         )
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
@@ -125,11 +136,20 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
-        metadata = self._replay_metadata(
-            bs, req_pool_indices, forward_mode, spec_info, seq_lens_cpu
-        )
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+        import types
+
+        self.init_forward_data_out_graph(
+            types.SimpleNamespace(
+                batch_size=bs,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                encoder_lens=encoder_lens,
+                forward_mode=forward_mode,
+                spec_info=spec_info,
+                seq_lens_sum=seq_lens_sum,
+                seq_lens_cpu=seq_lens_cpu,
+                positions=req_pool_indices.new_empty(bs),
+            )
         )
 
     @staticmethod
