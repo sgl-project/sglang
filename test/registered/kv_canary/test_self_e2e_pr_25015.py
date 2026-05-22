@@ -66,7 +66,8 @@ class _EaglePositionsBase(CanaryE2EBase, unittest.TestCase):
                 fail_reason="position",
                 flush_wait_seconds=0.0,
             )
-            return
+        else:
+            self.assert_no_violation(wait_seconds=2.0)
 
 
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
