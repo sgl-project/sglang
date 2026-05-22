@@ -2232,11 +2232,13 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
-                )
+                if self.get_model_config().quantization == "modelopt_fp4":
+                    self.quantization = "modelopt_fp4"
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on "
+                        "SM100 for Gemma-4 (modelopt_fp4)"
+                    )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
