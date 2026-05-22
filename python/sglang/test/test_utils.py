@@ -779,7 +779,11 @@ def _launch_server_process(
     hf_hub_offline = child_env.get("HF_HUB_OFFLINE", "0")
     print(f"CI_OFFLINE: Launching server HF_HUB_OFFLINE={hf_hub_offline} model={model}")
 
-    return _subprocess_popen_with_outputs(command, child_env, return_stdout_stderr)
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=child_env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def _wait_for_server_health(
@@ -1032,7 +1036,11 @@ def popen_launch_pd_server(
     if env is not None:
         env = {**os.environ, **env}
 
-    return _subprocess_popen_with_outputs(command, env, return_stdout_stderr)
+    return _subprocess_popen_with_outputs(
+        command=command,
+        env=env,
+        return_stdout_stderr=return_stdout_stderr,
+    )
 
 
 def get_similarities(vec1, vec2):
