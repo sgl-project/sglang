@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from queue import Empty
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -103,27 +103,12 @@ class UnifiedTreeNode:
             return None
         return self.hash_value[-1]
 
-    def get_prefix_hash_values(self, node: Optional[UnifiedTreeNode]) -> list[str]:
-        values: list[str] = []
-        cur = node
-        stack: list[UnifiedTreeNode] = []
-        while cur is not None:
-            stack.append(cur)
-            cur = cur.parent
-        while stack:
-            entry = stack.pop()
-            if entry.hash_value:
-                values.extend(entry.hash_value)
-        return values
+    @lru_cache(maxsize=1)
+    def get_prefix_hash_values(self, node: UnifiedTreeNode) -> list[str]:
+        if node is None or node.hash_value is None:
+            return []
 
-    def prefix_length(self, stop: Optional[UnifiedTreeNode] = None) -> int:
-        length = 0
-        cur: Optional[UnifiedTreeNode] = self
-        while cur is not None and cur is not stop:
-            if cur.key is not None:
-                length += len(cur.key)
-            cur = cur.parent
-        return length
+        return node.get_prefix_hash_values(node.parent) + node.hash_value
 
 
 class UnifiedLRUList:
