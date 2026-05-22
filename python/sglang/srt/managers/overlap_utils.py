@@ -89,10 +89,9 @@ class FutureMap:
             )
 
     def resolve_future(self, batch: ScheduleBatch):
-        if batch.forward_mode.is_decode():
-            batch.seq_lens = self.new_seq_lens_buf[batch.req_pool_indices]
-            torch._assert_async((batch.seq_lens > 0).all())
-
+        # SB.seq_lens is maintained as a seq_lens_cpu mirror by SB itself
+        # (prepare/filter/merge + resolve_seq_lens_cpu for spec_v2). No GPU
+        # resolve needed here.
         if self.spec_algo.is_none():
             _resolve_future_token_ids(batch.input_ids, self.output_tokens_buf)
         else:
@@ -114,9 +113,9 @@ class FutureMap:
             draft_input.hidden_states = self.hidden_states_buf[indices]
 
     def invalidate(self, batch: ScheduleBatch, future_indices: FutureIndices) -> None:
-        sentinel = -future_indices.indices
-        batch.input_ids = sentinel
-        batch.seq_lens = sentinel
+        # input_ids sentinel: forward populates output_tokens_buf; next iter's
+        # resolve_future translates negative entries back to real tokens.
+        batch.input_ids = -future_indices.indices
 
     def resolve_seq_lens_cpu(self, batch: ScheduleBatch) -> None:
         fi = batch.spec_info.future_indices if batch.spec_info is not None else None
