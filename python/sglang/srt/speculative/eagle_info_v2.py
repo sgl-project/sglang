@@ -241,9 +241,8 @@ class EagleDraftInputV2Mixin:
         )
         batch.capture_hidden_mode = capture_mode
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
-        # Draft extend writes num_draft_tokens KV slots; forward sees post-write
-        # length. SB.seq_lens stays at pre-verify so SB == seq_lens_cpu invariant
-        # holds outside forward path.
+        # Forward sees post-write length (draft extend writes num_draft_tokens
+        # slots); mutation stays on forward_batch to preserve SB.seq_lens.
         forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())

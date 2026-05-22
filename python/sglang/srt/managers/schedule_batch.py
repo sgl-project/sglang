@@ -2409,10 +2409,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.kv_committed_len += 1
             req.kv_allocated_len += 1
 
-        # Update seq_lens after allocation. SB.seq_lens GPU is maintained as a
-        # faithful mirror of seq_lens_cpu; forward path does not mutate it.
-        # New-tensor (vs in-place) avoids racing model_worker_batch references
-        # queued for overlap forward.
+        # New-tensor (vs in-place .add_(1)) avoids racing model_worker_batch
+        # refs queued for overlap forward.
         self.seq_lens = self.seq_lens + 1
         self.seq_lens_cpu = self.seq_lens_cpu + 1
         self.orig_seq_lens = self.orig_seq_lens + 1
