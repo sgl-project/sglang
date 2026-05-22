@@ -76,7 +76,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_pool_static_observer=None,
+                swa_live_divergence_observer=None,
             )
             for _ in range(4):
                 stats.observe_after_invoke_plan(
@@ -110,7 +110,7 @@ class TestSwaDivergenceStats(CustomTestCase):
             stats = SwaDivergenceStats(
                 device=_DEVICE,
                 d2h_stream=None,
-                swa_pool_static_observer=None,
+                swa_live_divergence_observer=None,
             )
 
             snapshots: list[SwaDivergenceLog] = []
