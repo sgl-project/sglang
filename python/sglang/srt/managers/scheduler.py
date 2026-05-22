@@ -1502,10 +1502,6 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
-        import gc
-
-        gc.disable()
-        logger.info("[GC] disabled auto GC, will collect between batches")
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
@@ -1521,13 +1517,9 @@ class Scheduler(
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
-                # Collect GC between batches (not during forward)
-                # to avoid cudaFree stalls on TP0
-                gc.collect()
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
-                gc.collect()
 
             # Update last_batch
             self.last_batch = batch
@@ -1539,8 +1531,62 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         import gc
 
-        gc.disable()
-        logger.info("[GC] disabled auto GC (overlap), will collect between batches")
+        # Trace cyclic CUDA tensors on first few GC runs
+        _cycle_log_count = 0
+
+        def _gc_cycle_tracer(phase, info):
+            nonlocal _cycle_log_count
+            if phase != "start" or _cycle_log_count >= 5:
+                return
+            import torch
+
+            gen = info.get("generation", 0)
+            try:
+                objs = gc.get_objects(generation=gen)
+                tensors = [
+                    o
+                    for o in objs
+                    if isinstance(o, torch.Tensor)
+                    and hasattr(o, "device")
+                    and o.device.type == "cuda"
+                ]
+                if not tensors:
+                    return
+                _cycle_log_count += 1
+                for t in tensors[:5]:
+                    # Walk referrer chain 3 levels deep
+                    chain = []
+                    current = t
+                    for depth in range(3):
+                        referrers = [
+                            r
+                            for r in gc.get_referrers(current)
+                            if r is not objs and not isinstance(r, type)
+                        ]
+                        if not referrers:
+                            break
+                        ref = referrers[0]
+                        rtype = type(ref).__name__
+                        rmod = getattr(type(ref), "__module__", "?")
+                        if isinstance(ref, dict):
+                            keys = list(ref.keys())[:6]
+                            chain.append(f"dict({keys})")
+                        elif isinstance(ref, (list, tuple)):
+                            chain.append(f"{rtype}(len={len(ref)})")
+                        else:
+                            chain.append(f"{rmod}.{rtype}")
+                        current = ref
+                    logger.info(
+                        "[GC_CYCLE] shape=%s device=%s chain: %s → %s",
+                        list(t.shape),
+                        t.device,
+                        type(t).__name__,
+                        " → ".join(chain),
+                    )
+            except Exception:
+                pass
+
+        gc.callbacks.append(_gc_cycle_tracer)
 
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
@@ -1550,7 +1596,6 @@ class Scheduler(
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
-            gc.collect()
 
         while True:
             # Receive requests
@@ -1583,7 +1628,6 @@ class Scheduler(
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
-                gc.collect()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
