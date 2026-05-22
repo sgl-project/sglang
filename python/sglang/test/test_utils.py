@@ -69,6 +69,8 @@ DEFAULT_HYBRID_MAMBA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-Next-80B-A3B-Instruct"
 # VL test models
 DEFAULT_MODEL_NAME_FOR_TEST_VL_PP = "Qwen/Qwen3-VL-2B-Thinking"
 DEFAULT_MODEL_NAME_FOR_TEST_GLM_41V_PP = "zai-org/GLM-4.1V-9B-Thinking"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PP = "google/gemma-4-26B-A4B-it"
+DEFAULT_MODEL_NAME_FOR_TEST_GEMMA4_PLE_PP = "google/gemma-4-E4B-it"
 
 # NVFP4 models
 DEFAULT_DEEPSEEK_NVFP4_MODEL_FOR_TEST = "nvidia/DeepSeek-V3-0324-FP4"
@@ -1015,6 +1017,12 @@ def popen_launch_pd_server(
         command += ["--api-key", api_key]
 
     print(f"command={' '.join(command)}")
+
+    # Merge with os.environ so caller-supplied env adds to (not replaces)
+    # PATH / PYTHONPATH / HF_HOME / etc. When env is None, Popen inherits
+    # parent's environment automatically.
+    if env is not None:
+        env = {**os.environ, **env}
 
     process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 

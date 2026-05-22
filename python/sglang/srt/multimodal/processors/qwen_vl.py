@@ -17,6 +17,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
+from sglang.srt.models.interns2preview import InternS2PreviewForConditionalGeneration
 from sglang.srt.models.qwen2_5_vl import Qwen2_5_VLForConditionalGeneration
 from sglang.srt.models.qwen2_vl import Qwen2VLForConditionalGeneration
 from sglang.srt.models.qwen3_5 import (
@@ -246,6 +247,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
+        InternS2PreviewForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -419,7 +421,14 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 audio_seq_lens = (audio_seq_lens - 2) // 2 + 1
 
         if (
-            self.model_type in ["qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe"]
+            self.model_type
+            in [
+                "qwen3_vl",
+                "qwen3_vl_moe",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "intern_s2_preview",
+            ]
             and video_timestamps is not None
         ):
             input_ids, offsets, modality_list = self.build_input_ids_with_timestamps(
@@ -522,6 +531,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "intern_s2_preview",
         ):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
                 base_output,

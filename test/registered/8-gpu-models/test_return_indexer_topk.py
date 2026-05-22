@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=270, stage="extra-b", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 class TestReturnIndexerTopk(CustomTestCase):
-    """Indexer-topk capture e2e test for DSv3.2 (NSA).
+    """Indexer-topk capture e2e test for DSv3.2 (DSA).
 
     Single server with `--enable-return-indexer-topk` and `index_topk_freq=2`.
     Validates the native `/generate` endpoint only — OpenAI-protocol surface

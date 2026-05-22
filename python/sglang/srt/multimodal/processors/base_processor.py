@@ -436,23 +436,25 @@ class BaseMultimodalProcessor(ABC):
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                kwargs["device"] = "cuda"
-            else:
-                # Note: for qwen-vl and glm-4.6v, processor has some reshape issue
-                # because of dims restriction on Ascend (10D tensor exceeds 8D limit).
+                base_gpu_id = get_global_server_args().base_gpu_id
+                kwargs["device"] = f"cuda:{base_gpu_id}"
+            elif processor.__class__.__name__ not in {
+                "Glm4vProcessor",
+                "Glm46VProcessor",
+            }:
+                # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
                     npu_apply_qwen_image_preprocess_patch,
                 )
 
                 npu_apply_qwen_image_preprocess_patch()
+                kwargs["device"] = "npu"
+            elif processor.__class__.__name__ == "Glm46VProcessor":
+                from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+                    npu_apply_glm46v_image_preprocess_patch,
+                )
 
-                if processor.__class__.__name__ == "Glm46VProcessor":
-                    from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                        npu_apply_glm46v_image_preprocess_patch,
-                    )
-
-                    npu_apply_glm46v_image_preprocess_patch()
-
+                npu_apply_glm46v_image_preprocess_patch()
                 kwargs["device"] = "npu"
 
         result = processor.__call__(
