@@ -4,7 +4,6 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import (
     ceil_align,
-    flatten_arrays_to_int64_tensor,
     is_pin_memory_available,
 )
 
@@ -1689,8 +1688,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             pt += req.extend_input_len
 
-        # Reassign
-        self.input_ids = flatten_arrays_to_int64_tensor(input_ids, self.device, _pin)
+        # Reassign: ED stripping rebuilds prefill_input_ids_cpu (CPU pinned,
+        # same numpy fast-path as prepare_for_extend); resolve_forward_inputs
+        # will H2D this on forward stream. self.input_ids stays None.
+        combined = np.concatenate([np.frombuffer(p, dtype=np.int64) for p in input_ids])
+        stripped = torch.from_numpy(combined)
+        if _pin:
+            stripped = stripped.pin_memory()
+        self.prefill_input_ids_cpu = stripped
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
         )
