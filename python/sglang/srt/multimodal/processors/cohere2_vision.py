@@ -40,17 +40,15 @@ class Cohere2VisionSGLangImageProcessor(SGLangBaseProcessor):
             line_break_token
         )
 
-        # Regex that matches the full expanded image block (BOI .. EOI).
-        image_token_regex = re.compile(
-            f"{re.escape(boi_token)}"
-            f"(?:(?:{re.escape(image_token)})*{re.escape(line_break_token)})*"
-            f"{re.escape(eoi_token)}"
-        )
-
+        # The chat template emits a single ``<|IMG_PATCH|>`` placeholder per
+        # image; the HF Cohere2VisionProcessor expands it into the full
+        # ``<|START_OF_IMG|> [<|IMG_PATCH|> * P^2 + <|IMG_LINE_BREAK|>] * N
+        # <|END_OF_IMG|>`` block once it knows each image's patch count. Match
+        # the unexpanded placeholder here so SGLang correctly pairs each
+        # placeholder with its image_data entry before processing.
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=image_token,
             image_token_id=self.image_token_id,
-            image_token_regex=image_token_regex,
         ).build(_processor)
 
     async def process_mm_data_async(
@@ -74,6 +72,7 @@ class Cohere2VisionSGLangImageProcessor(SGLangBaseProcessor):
         return MultimodalProcessorOutput(
             input_ids=input_ids.tolist(),
             mm_items=mm_items,
+            im_token_id=self.image_token_id,
             im_start_id=self.boi_token_id,
             im_end_id=self.eoi_token_id,
         )

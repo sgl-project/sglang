@@ -29,9 +29,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import add_prefix, get_compiler_backend, make_layers
+from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -168,6 +169,7 @@ class Cohere2MoeAttention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            reduce_results=False,
         )
 
         layer_types = getattr(config, "layer_types", None)
@@ -302,27 +304,60 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         )
         assert self.shared_expert_combination_strategy in ("average", "sum")
 
+        # Auxiliary CUDA stream so shared_experts and (gate + routed_experts)
+        # can execute in parallel inside a captured CUDA graph. Mirrors the
+        # vLLM SharedExperts MULTI_STREAM_OVERLAPPED path and the existing
+        # sglang olmo2 alt_stream pattern. Only used when we're capturing /
+        # replaying a CUDA graph; outside of capture, stream-sync overhead
+        # is usually larger than the work we'd overlap.
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if is_cuda() and self.shared_experts is not None
+            else None
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+
+        if self.shared_experts is None:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            final_hidden_states = self.experts(hidden_states, topk_output)
+            return final_hidden_states.view(orig_shape)
+
         # FusedMoE.experts can write back into the input buffer when the
         # MoeRunner reuses the input as its dispatcher scratch (observed for
         # the unquantized triton backend on BF16). Snapshot the post-norm
         # input so the shared-expert branch sees the original layernorm
         # output and not whatever the routed kernel left behind.
-        shared_input = hidden_states.clone() if self.shared_experts is not None else None
-        routed_out = self.experts(hidden_states, topk_output)
-        if self.shared_experts is not None:
-            shared_out = self.shared_experts(shared_input)
-            final_hidden_states = routed_out + shared_out
-            if self.shared_expert_combination_strategy == "average":
-                final_hidden_states = final_hidden_states / 2
+        shared_input = hidden_states.clone()
+
+        if self.alt_stream is not None and get_is_capture_mode():
+            # Multi-stream overlap: shared_experts on alt stream, in parallel
+            # with gate + topk + routed experts on the main stream.
+            current_stream = torch.cuda.current_stream()
+            shared_input.record_stream(self.alt_stream)
+            self.alt_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self.alt_stream):
+                shared_out = self.shared_experts(shared_input)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            routed_out = self.experts(hidden_states, topk_output)
+            current_stream.wait_stream(self.alt_stream)
         else:
-            final_hidden_states = routed_out
-        if self.tp_size > 1:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
+            routed_out = self.experts(hidden_states, topk_output)
+            shared_out = self.shared_experts(shared_input)
+
+        final_hidden_states = routed_out + shared_out
+        if self.shared_expert_combination_strategy == "average":
+            final_hidden_states = final_hidden_states / 2
+        # NOTE: caller (Cohere2MoeDecoderLayer) folds attention and MoE TP-partials
+        # into one all-reduce because the parallel residual structure makes the
+        # two allreduces redundant: norm(x) is shared by attn and mlp, and only
+        # the sum of their outputs is added to the residual.
         return final_hidden_states.view(orig_shape)
 
 
@@ -355,7 +390,9 @@ class Cohere2MoeDecoderLayer(nn.Module):
                     config, "prefix_dense_intermediate_size", config.intermediate_size
                 ),
                 quant_config=quant_config,
-                reduce_results=True,
+                # The decoder layer below folds attn+mlp TP-partials into one
+                # all-reduce, so the MLP itself must return un-reduced output.
+                reduce_results=False,
                 prefix=add_prefix("mlp", prefix),
             )
         else:
@@ -368,6 +405,7 @@ class Cohere2MoeDecoderLayer(nn.Module):
 
         norm_eps = getattr(config, "layer_norm_eps", 1e-5)
         self.input_layernorm = Cohere2MoeLayerNorm(config.hidden_size, eps=norm_eps)
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
         self,
@@ -375,6 +413,10 @@ class Cohere2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Cohere2 parallel structure: y = x + attn(norm(x)) + mlp(norm(x)).
+        # Because the residual is added once at the end, the two TP all-reduces
+        # (one in attn.o_proj, one in mlp) reduce to a single sum-then-allreduce.
+        # Folding here cuts the all-reduce count per layer from 2 to 1.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(
@@ -383,7 +425,10 @@ class Cohere2MoeDecoderLayer(nn.Module):
             forward_batch=forward_batch,
         )
         mlp_out = self.mlp(hidden_states)
-        return residual + attn_out + mlp_out
+        combined = attn_out + mlp_out
+        if self.tp_size > 1:
+            combined = tensor_model_parallel_all_reduce(combined)
+        return residual + combined
 
 
 class Cohere2MoeModel(nn.Module):

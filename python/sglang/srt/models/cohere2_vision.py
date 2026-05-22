@@ -147,9 +147,12 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         # prefix layout.  Must happen before any Linear is instantiated.
         _remap_quant_config_for_sglang(quant_config)
 
-        # The SiglipVisionModel is loaded via the standard transformers
-        # implementation. It does not need TP since the vision tower is small
-        # relative to the LM. Disable LM-style quant for the vision tower.
+        # TODO: switch to sglang.srt.models.siglip.SiglipVisionModel (uses
+        # VisionAttention) per the porting guide once sglang's SiglipMLP can
+        # be parameterized with gelu_pytorch_tanh (it hardcodes QuickGELU) and
+        # the qkv_proj weight loading is verified. The HF SiglipVisionModel
+        # below is correct and benchmarks faster than the in-tree path right
+        # now (221s vs 246s on MMMU 900-sample TP=8 B200 bf16).
         self.vision_tower = SiglipVisionModel(config.vision_config)
         self.multi_modal_projector = Cohere2VisionMultiModalProjector(config)
         self.language_model = Cohere2MoeForCausalLM(
@@ -157,6 +160,12 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        # Alias so SGLang's piecewise-CUDA-graph setup (model_runner.py:2800)
+        # can locate the transformer layers. The runner does
+        # ``hasattr(self.model, "model")`` to decide whether to capture
+        # piecewise graphs, and then walks ``model.model.layers`` through the
+        # text backbone.
+        self.model = self.language_model.model
 
     def pad_input_ids(
         self, input_ids: List[int], mm_inputs: MultimodalInputs
@@ -251,7 +260,6 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
             if stripped not in vt_params and stripped.startswith("vision_model."):
                 stripped = stripped[len("vision_model."):]
             if stripped not in vt_params:
-                # Helpful diagnostic: show the available keys' style.
                 sample = sorted(vt_params.keys())[:3]
                 raise ValueError(
                     f"Unexpected vision tower weight: {name} (looked for "
