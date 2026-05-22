@@ -459,9 +459,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         node = self._rollout_kv_pin_nodes.pop(pin_key, None)
         self._rollout_kv_pin_counts.pop(pin_key, None)
         if node is None or node is self.root_node:
-            logger.warning(
-                "RolloutKV attempted to release a missing pin: %s", pin_key
-            )
+            logger.warning("RolloutKV attempted to release a missing pin: %s", pin_key)
             return False
 
         self.dec_lock_ref(node)
