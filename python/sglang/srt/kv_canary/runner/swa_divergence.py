@@ -50,7 +50,9 @@ class SwaDivergenceReport:
         idx = _FULL_IDX if group.kind is PoolKind.FULL else _SWA_IDX
         # verify_num_valid is shape [1]; slice to a length-1 view so the in-place add
         # has matching ranks (else torch refuses the broadcast into shape []).
-        self._verify_total_count_device[idx : idx + 1].add_(verify_plan.verify_num_valid)
+        self._verify_total_count_device[idx : idx + 1].add_(
+            verify_plan.verify_num_valid
+        )
 
     def step(
         self,
