@@ -92,10 +92,21 @@ def split_for_parallel_decode(
     return x, expected_height
 
 
+def _maybe_contiguous_for_sp_gather(x: torch.Tensor) -> torch.Tensor:
+    if (
+        x.dim() == 5
+        and hasattr(torch, "channels_last_3d")
+        and x.is_contiguous(memory_format=torch.channels_last_3d)
+        and not x.is_contiguous()
+    ):
+        return x.contiguous()
+    return x
+
+
 def gather_and_trim_height(x: torch.Tensor, expected_height: int | None):
     if expected_height is None:
         return x
-    x = get_sp_group().all_gather(x.contiguous(), dim=-2)
+    x = get_sp_group().all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
     if x.shape[-2] != expected_height:
         x = x[..., :expected_height, :].contiguous()
     return x
@@ -486,7 +497,7 @@ class WanDistAttentionBlock(nn.Module):
 
     def forward(self, x):
         if self.world_size > 1:
-            x = self.sp_group.all_gather(x.contiguous(), dim=-2)
+            x = self.sp_group.all_gather(_maybe_contiguous_for_sp_gather(x), dim=-2)
             x = x.contiguous()
         x = attention_block_forward(self, x)
         if self.world_size > 1:
