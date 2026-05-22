@@ -548,6 +548,56 @@ class SchedulerRuntimeCheckerMixin:
         ):
             self.tree_cache.sanity_check()
 
+    def _check_hisparse_idle_invariant(self: Scheduler):
+        if not self.enable_hisparse or self.hisparse_coordinator is None:
+            return
+        if not (
+            self.running_batch.is_empty()
+            and len(self.waiting_queue) == 0
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and len(self.disagg_decode_prealloc_queue.queue) == 0
+            and len(self.disagg_decode_prealloc_queue.pending_reqs) == 0
+            and len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+            and len(self.disagg_decode_transfer_queue.queue) == 0
+        ):
+            return
+
+        logical_allocator = getattr(
+            self.token_to_kv_pool_allocator, "logical_attn_allocator", None
+        )
+        logical_used = 0
+        if logical_allocator is not None:
+            logical_used = logical_allocator.size - logical_allocator.available_size()
+        h = self.hisparse_coordinator.get_token_stats()
+        if logical_used != 0 or h.host_tokens != 0 or h.device_tokens != 0:
+            if logical_used == 0 and h.host_tokens == 0 and h.device_tokens > 0:
+                released = (
+                    self.hisparse_coordinator.cleanup_idle_orphan_device_buffers()
+                )
+                h_after = self.hisparse_coordinator.get_token_stats()
+                if h_after.device_tokens == 0:
+                    logger.warning(
+                        "Cleaned HiSparse idle orphan device buffers: "
+                        "released=%s, previous_device_tokens=%s",
+                        released,
+                        h.device_tokens,
+                    )
+                    return
+
+            last_state = getattr(self, "_last_hisparse_idle_violation", None)
+            state = (logical_used, h.host_tokens, h.device_tokens)
+            if last_state != state:
+                setattr(self, "_last_hisparse_idle_violation", state)
+                logger.error(
+                    "HiSparse idle invariant violated: logical_used=%s, "
+                    "host_tokens=%s, device_tokens=%s",
+                    logical_used,
+                    h.host_tokens,
+                    h.device_tokens,
+                )
+        else:
+            setattr(self, "_last_hisparse_idle_violation", None)
+
     def on_idle(self: Scheduler):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         if not self.is_fully_idle():
@@ -560,6 +610,8 @@ class SchedulerRuntimeCheckerMixin:
             if has_leak:
                 self._report_leak("pool", "\n".join(messages))
             self._check_req_pool()
+        else:
+            self._check_hisparse_idle_invariant()
 
         # tree cache sanity check
         self._check_tree_cache()

@@ -163,6 +163,7 @@ class HiSparseCoordinator:
         self.raw_indices_buffer = torch.full(
             (max_num_req_slots, self.top_k), -1, dtype=torch.int32, device=device
         )
+        self._non_decode_c4_fallback_warned = False
         # Scalar tensor: number of real (non-padded) requests in the batch.
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
@@ -1168,6 +1169,73 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.req_pool_idx, :] = -1
         self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
         self._skip_first_backup[req.req_pool_idx] = False
+
+    def cleanup_idle_orphan_device_buffers(self) -> int:
+        """Release side-buffer slots left without live logical/host ownership.
+
+        This is a defensive cleanup for warmup/capture or abnormal finish paths:
+        if logical and host pools are already idle, any per-request HiSparse
+        side-buffer capacity is no longer reachable from a live request.
+        """
+        self.wait_for_pending_backup()
+
+        req_indices = torch.nonzero(
+            (self.req_device_buffer_size > 0) | (self.req_draft_buffer_size > 0),
+            as_tuple=False,
+        ).flatten()
+        if req_indices.numel() == 0:
+            device_allocator = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            leaked = device_allocator.size - device_allocator.available_size()
+            if leaked <= 0:
+                return 0
+
+            # If there is no per-request owner but the allocator still reports
+            # used slots, the leak came from an abnormal warmup/capture path
+            # after req metadata was already cleared. At idle with logical/host
+            # pools empty, clearing the side allocator is safe and prevents
+            # repeated invariant spam.
+            device_allocator.clear()
+            mapping = getattr(
+                self.mem_pool_device, "full_to_hisparse_device_index_mapping", None
+            )
+            if mapping is not None:
+                mapping[:-1].fill_(0)
+            self.req_device_buffer_tokens[:, :, :] = -1
+            self.req_device_buffer_token_locs[:, :, :] = -1
+            self.req_to_device_buffer[:, :] = 0
+            self.lru_slots[:, :, :].copy_(self._lru_init)
+            return leaked
+
+        released = 0
+        for req_idx in req_indices.tolist():
+            current_cap = int(self.req_device_buffer_size[req_idx])
+            draft_cap = int(self.req_draft_buffer_size[req_idx])
+
+            bufs = []
+            if current_cap > 0:
+                bufs.append(self.req_to_device_buffer[req_idx, :current_cap])
+            if draft_cap > 0:
+                draft_start = self.device_buffer_size + 1
+                draft_end = draft_start + draft_cap
+                bufs.append(self.req_to_device_buffer[req_idx, draft_start:draft_end])
+
+            if bufs:
+                all_hi = torch.unique(torch.cat(bufs))
+                all_hi = all_hi[all_hi > 0]
+                if all_hi.numel() > 0:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+                    released += int(all_hi.numel())
+
+            self.req_device_buffer_tokens[:, req_idx, :] = -1
+            self.req_device_buffer_token_locs[:, req_idx, :] = -1
+            self.req_to_device_buffer[req_idx, :] = 0
+            self.req_device_buffer_size[req_idx] = 0
+            self.req_draft_buffer_size[req_idx] = 0
+            self.req_to_host_pool[req_idx, :] = -1
+            self.lru_slots[:, req_idx, :].copy_(self._lru_init)
+            self._skip_first_backup[req_idx] = False
+
+        return released
 
     def swap_in_selected_pages(
         self,

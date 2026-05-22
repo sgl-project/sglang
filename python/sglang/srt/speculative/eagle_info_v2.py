@@ -291,6 +291,39 @@ class EagleDraftInputV2Mixin:
             if batch.forward_mode.is_idle()
             else ForwardMode.DRAFT_EXTEND_V2
         )
+        # Use target worker's hisparse_coordinator (same instance that
+        # admit_request_direct() populated). Draft model runner has a separate
+        # coordinator whose req_device_buffer_size is never updated by admission.
+        target_model_runner = getattr(draft_model_runner, "_target_model_runner", None)
+        hisparse_coordinator = getattr(
+            target_model_runner, "hisparse_coordinator", None
+        ) if target_model_runner is not None else getattr(
+            draft_model_runner, "hisparse_coordinator", None
+        )
+        token_to_kv_pool_allocator = getattr(
+            target_model_runner, "token_to_kv_pool_allocator", None
+        ) if target_model_runner is not None else getattr(
+            draft_model_runner, "token_to_kv_pool_allocator", None
+        )
+        if (
+            hisparse_coordinator is not None
+            and token_to_kv_pool_allocator is not None
+            and hasattr(token_to_kv_pool_allocator, "bind_device_mapping")
+            and hisparse_coordinator.supports_hisparse_draft_slots()
+            and not batch.forward_mode.is_idle()
+        ):
+            bs = len(batch.req_pool_indices)
+            tokens_per_req_cpu = torch.full(
+                (bs,), num_draft_tokens, dtype=torch.int64, device="cpu"
+            )
+            device_slots = hisparse_coordinator.get_draft_device_slots_variable(
+                batch.req_pool_indices,
+                tokens_per_req_cpu,
+            )
+            token_to_kv_pool_allocator.bind_device_mapping(
+                batch.out_cache_loc,
+                device_slots,
+            )
         forward_batch = ForwardBatch.init_new(batch, draft_model_runner)
         can_cuda_graph = cuda_graph_runner and cuda_graph_runner.can_run(forward_batch)
         if not batch.forward_mode.is_idle() and not can_cuda_graph:

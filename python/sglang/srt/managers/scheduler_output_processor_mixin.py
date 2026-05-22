@@ -253,6 +253,8 @@ class SchedulerOutputProcessorMixin:
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
                         self.maybe_collect_indexer_topk(req)
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.request_finished(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -387,6 +389,8 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
+                        if self.enable_hisparse:
+                            self.hisparse_coordinator.request_finished(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:

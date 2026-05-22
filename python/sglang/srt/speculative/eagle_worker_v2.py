@@ -165,6 +165,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # Expose target model runner on draft runner so that HiSparse draft_extend
+        # can access the target coordinator (which is the one updated by admit_request_direct).
+        self.draft_runner._target_model_runner = self.target_worker.model_runner
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
