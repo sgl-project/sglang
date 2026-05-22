@@ -662,10 +662,10 @@ def launch_disagg_role(server_args: ServerArgs):
 
 def dispatch_launch(server_args: ServerArgs):
     """Route to the correct launch function based on --disagg-role."""
-    # FIXME: Temporary default for torch 2.12 / NCCL 2.29 diffusion CI.
-    # Disable NVLS by default. NCCL's default allows NVLS and activates it on
-    # compatible Hopper-or-newer NVSwitch systems, but CI runners can fail
-    # multicast binding when Fabric Manager / NVSwitch state is not ready.
+    # FIXME: Torch 2.12 bundles NCCL 2.29, which hard-fails NVLS multicast
+    # bind errors that NCCL 2.28 used to handle by disabling NVLS and
+    # continuing. Keep NVLS disabled by default until the runtime/CI setup can
+    # rely on the new NCCL behavior.
     # CI failure: https://github.com/sgl-project/sglang/actions/runs/26239210518/job/77224480316?pr=25984
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 
