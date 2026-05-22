@@ -67,15 +67,6 @@ except ImportError:
     flashinfer_cutlass_fused_moe = None
 
 
-def _should_use_batch_invariant_linear(x: torch.Tensor) -> bool:
-    if not x.is_cuda:
-        return False
-
-    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-
-    return is_batch_invariant_mode_enabled()
-
-
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
 
@@ -165,11 +156,6 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         elif _use_aiter and type(layer.weight.data) is torch.Tensor:
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
-
-        if _should_use_batch_invariant_linear(x):
-            from sglang.srt.batch_invariant_ops import batch_invariant_linear
-
-            return batch_invariant_linear(x, layer.weight, bias)
 
         return F.linear(x, layer.weight, bias)
 
