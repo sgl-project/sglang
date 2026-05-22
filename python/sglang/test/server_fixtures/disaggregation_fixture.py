@@ -92,12 +92,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             cls.prefill_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=prefill_args,
-            env=(dict(cls.extra_prefill_env) if cls.extra_prefill_env else None),
-            return_stdout_stderr=(
-                (cls._prefill_stdout_buf, cls._prefill_stderr_buf)
-                if cls._prefill_stdout_buf is not None
-                else None
-            ),
+            env=dict(cls.extra_prefill_env),
+            return_stdout_stderr=(cls._prefill_stdout_buf, cls._prefill_stderr_buf),
         )
 
     @classmethod
@@ -119,12 +115,8 @@ class PDDisaggregationServerBase(CustomTestCase):
             cls.decode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=decode_args,
-            env=(dict(cls.extra_decode_env) if cls.extra_decode_env else None),
-            return_stdout_stderr=(
-                (cls._decode_stdout_buf, cls._decode_stderr_buf)
-                if cls._decode_stdout_buf is not None
-                else None
-            ),
+            env=dict(cls.extra_decode_env),
+            return_stdout_stderr=(cls._decode_stdout_buf, cls._decode_stderr_buf),
         )
 
     @classmethod
