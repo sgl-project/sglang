@@ -211,12 +211,13 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
         bs = forward_batch.batch_size
-        num_tokens = bs
-        req_pool_indices = forward_batch.req_pool_indices
-        seq_lens = forward_batch.seq_lens
+        # Normalize to bs-length: replay callers may pass full padded buffers.
+        req_pool_indices = forward_batch.req_pool_indices[:bs]
+        seq_lens = forward_batch.seq_lens[:bs]
         encoder_lens = forward_batch.encoder_lens
         forward_mode = forward_batch.forward_mode
         spec_info = forward_batch.spec_info
+        num_tokens = bs
         if forward_mode.is_decode_or_idle():
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
