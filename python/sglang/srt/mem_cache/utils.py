@@ -147,6 +147,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
+        and get_dcp_world_size() <= 1
     ):
         jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return
