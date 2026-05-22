@@ -696,7 +696,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     # V2 overlap worker only
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
-    verify_done: Optional[torch.cuda.Event] = None
     # V2 reuses `EagleDraftInput` across phases (V1 has a separate
     # `EagleDraftExtendInput` for these). Set during V2's draft-extend.
     num_correct_drafts: Optional[torch.Tensor] = None
@@ -707,22 +706,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    def prepare_for_extend(self, batch: ScheduleBatch):
-
-        if batch.forward_mode.is_idle():
-            return
-
-        # Prefill only generate 1 token.
-        assert len(self.bonus_tokens) == len(batch.seq_lens)
-
-        pt = 0
-        for i, extend_len in enumerate(batch.extend_lens):
-            input_ids = batch.input_ids[pt : pt + extend_len]
-            batch.input_ids[pt : pt + extend_len] = torch.cat(
-                (input_ids[1:], self.bonus_tokens[i].reshape(1))
-            )
-            pt += extend_len
 
     @classmethod
     def hidden_size_for(cls, worker) -> Optional[int]:

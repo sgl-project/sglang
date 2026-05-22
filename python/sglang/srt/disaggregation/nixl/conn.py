@@ -1541,7 +1541,7 @@ class NixlKVManager(CommonKVManager):
                         dst_gpu_id,
                         comp_notif,
                     )
-            elif st in (StateType.SWA, StateType.NSA):
+            elif st in (StateType.SWA, StateType.DSA):
                 if not self.is_mla_backend and self.attn_tp_size != decode_tp_size:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."

@@ -2,26 +2,38 @@ name: PR States
 # Maintains the CI-states block at the bottom of the PR body. Uses
 # pull_request_target (not pull_request) for fork-PR write access; safe
 # because we never check out PR head code, only API-read and PATCH the body.
+#
+# Three triggers, each covering a gap:
+#   - pull_request_target: push / open / label change (all PRs incl forks).
+#   - workflow_run: initial pr-test* completion (incl fork PRs; the
+#     notify-job below can't fire on forks — their pull_request
+#     GITHUB_TOKEN is forced read-only). Does NOT re-fire for rerun
+#     attempts, which is why workflow_dispatch is needed too.
+#   - workflow_dispatch: rerun completions for non-fork PRs, dispatched by
+#     pr-test*'s notify-pr-states job. workflow_dispatch is the only event
+#     GITHUB_TOKEN can cascade-create.
 
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
   workflow_run:
-    # Listen to pr-test* lifecycle so reruns initiated by slash commands
-    # (run.rerun / run.rerun_failed_jobs via GITHUB_TOKEN) -- which don't
-    # refire pull_request_target -- still refresh the CI-states block.
     workflows: ["PR Test Base", "PR Test Extra"]
     types: [requested, completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number whose CI-states block should be refreshed.'
+        required: true
+        type: string
 
 permissions:
   pull-requests: write
   actions: read
 
 concurrency:
-  # Dedupe per commit SHA across both event sources so simultaneous
-  # synchronize + workflow_run firings on the same push queue instead
-  # of racing on the body PATCH.
-  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+  # Per-SHA dedupe (PR number for workflow_dispatch). Queues concurrent
+  # fires across the three triggers so they don't race on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -40,14 +52,16 @@ jobs:
 
             // Event-agnostic PR lookup.
             // - pull_request_target: PR is in the payload.
-            // - workflow_run: pull_requests[] is populated for same-repo PRs;
-            //   fork PRs need a head-ref reverse lookup ("forkOwner:branch")
-            //   because listPullRequestsAssociatedWithCommit requires the commit
-            //   to be in the default branch. Bail when no open PR matches.
+            // - workflow_run: pull_requests[] is populated for same-repo
+            //   PRs; fork PRs need a head-ref reverse lookup
+            //   ("forkOwner:branch") because
+            //   listPullRequestsAssociatedWithCommit requires the commit to
+            //   be in the default branch. Bail when no open PR matches.
+            // - workflow_dispatch: pr_number is an explicit input.
             let prNumber;
             if (context.payload.pull_request) {
               prNumber = context.payload.pull_request.number;
-            } else {
+            } else if (context.eventName === 'workflow_run') {
               const wr = context.payload.workflow_run;
               if (wr.pull_requests && wr.pull_requests.length > 0) {
                 prNumber = wr.pull_requests[0].number;
@@ -71,6 +85,18 @@ jobs:
                 core.info(`workflow_run has no PR linkage; skipping.`);
                 return;
               }
+            } else if (context.eventName === 'workflow_dispatch') {
+              // Reject non-digit pr_number; parseInt('123abc', 10) returns
+              // 123 and would silently truncate trailing garbage.
+              const raw = context.payload.inputs.pr_number;
+              if (!/^\d+$/.test(raw)) {
+                core.setFailed(`workflow_dispatch: invalid pr_number input '${raw}' (must be digits only)`);
+                return;
+              }
+              prNumber = parseInt(raw, 10);
+            } else {
+              core.info(`Unsupported event '${context.eventName}'; skipping.`);
+              return;
             }
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
