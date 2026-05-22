@@ -147,9 +147,9 @@ class Scheduler(SchedulerDisaggMixin):
         self._batch_metrics_enabled = server_args.enable_batching_metrics
         self._batch_metrics_window = BatchMetricsWindow()
         self._batch_admission = BatchAdmissionController(server_args, gpu_id=local_rank)
-        self._pending_output_results: deque[
-            tuple[bytes | None, OutputBatch, bool]
-        ] = deque()
+        self._pending_output_results: deque[tuple[bytes | None, OutputBatch, bool]] = (
+            deque()
+        )
         self._poller = zmq.Poller()
         if self.receiver is not None:
             self._poller.register(self.receiver, zmq.POLLIN)
@@ -656,9 +656,7 @@ class Scheduler(SchedulerDisaggMixin):
         while pending:
             identity, output_batch, is_warmup = pending.popleft()
             if not self._finish_output_save_if_ready(output_batch, wait=wait):
-                self._pending_output_results.append(
-                    (identity, output_batch, is_warmup)
-                )
+                self._pending_output_results.append((identity, output_batch, is_warmup))
                 continue
             try:
                 self.return_result(output_batch, identity, is_warmup=is_warmup)
