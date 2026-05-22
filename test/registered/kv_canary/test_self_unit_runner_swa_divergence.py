@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_runner
 
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.environ import envs
@@ -22,6 +21,7 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group
+from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_runner
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, stage="extra-a", runner_config="cpu-small")
@@ -193,9 +193,7 @@ class TestSwaDivergenceReport(CustomTestCase):
                 # Stage the dict at the interval-aligned step (no log emitted yet,
                 # DelayedDeviceHostHandler still has nothing to drain), then call
                 # step() again at the next counter to drain and emit the log.
-                stats.step(
-                    step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH
-                )
+                stats.step(step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH)
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
@@ -379,11 +377,15 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
                 req_to_token_pool=req_to_token_pool,
             )
             stats.observe_after_invoke_plan(
-                group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
+                group=make_buffer_group(
+                    device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                ),
                 verify_plan=_make_verify_plan(11),
             )
             stats.observe_after_invoke_plan(
-                group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
+                group=make_buffer_group(
+                    device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                ),
                 verify_plan=_make_verify_plan(3),
             )
 
