@@ -13,10 +13,8 @@ import json
 import logging
 import os
 import socket
-import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
 from sglang.srt.utils import kill_process_tree
@@ -25,7 +23,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
-    popen_with_error_check,
+    popen_launch_server,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,104 +43,28 @@ class _UDSConnection(http.client.HTTPConnection):
         self.sock.connect(self._uds_path)
 
 
-def _wait_for_uds_health(
-    uds_path: str, process: subprocess.Popen, timeout: float
-) -> None:
-    deadline = time.time() + timeout
-    last_err: Exception | None = None
-    while time.time() < deadline:
-        return_code = process.poll()
-        if return_code is not None:
-            raise RuntimeError(
-                f"Server process exited with code {return_code} before becoming "
-                f"healthy on {uds_path}; last probe error: {last_err}"
-            )
-        conn = _UDSConnection(uds_path, timeout=5.0)
-        try:
-            conn.request("GET", "/health")
-            resp = conn.getresponse()
-            resp.read()
-            if resp.status == 200:
-                return
-        except OSError as e:
-            last_err = e
-        finally:
-            conn.close()
-        time.sleep(1.0)
-    raise TimeoutError(
-        f"Server did not become healthy on {uds_path} within {timeout}s: " f"{last_err}"
-    )
-
-
 @unittest.skipIf(sys.platform == "win32", "UDS not supported on Windows")
 class TestUDSServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         # Keep the path short to stay under the SUN_PATH limit (~108 bytes).
-        tmpdir = tempfile.mkdtemp(prefix="sglang-uds-")
-        cls.uds_path = os.path.join(tmpdir, f"s{os.getpid()}.sock")
-        cls._tmpdir = tmpdir
+        cls._tmpdir = tempfile.mkdtemp(prefix="sglang-uds-")
+        cls.uds_path = os.path.join(cls._tmpdir, f"s{os.getpid()}.sock")
 
-        command = [
-            "sglang",
-            "serve",
-            "--model-path",
+        cls.process = popen_launch_server(
             cls.model,
-            "--uds",
-            cls.uds_path,
-        ]
-
-        # Mirror the offline-mode optimization that popen_launch_server applies:
-        # on CI runners with the model cache pre-populated, set HF_HUB_OFFLINE=1
-        # so the subprocess does not hit the HuggingFace Hub network. We mutate
-        # os.environ (which Popen inherits) and remember which keys to restore.
-        cls._restore_env: dict[str, str | None] = {}
-        try:
-            from sglang.utils import is_in_ci
-
-            if is_in_ci():
-                from sglang.test.test_utils import (
-                    _try_enable_offline_mode_if_cache_complete,
-                )
-
-                proxy_env: dict[str, str] = {}
-                _try_enable_offline_mode_if_cache_complete(
-                    cls.model, proxy_env, command[1:]
-                )
-                for key, value in proxy_env.items():
-                    cls._restore_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-        except (ImportError, OSError) as e:
-            # Non-fatal: live HF fetch will still work; we just lose the
-            # offline optimization for this test run.
-            logger.warning(
-                "UDS test CI cache validation failed (non-fatal): %s",
-                e,
-                exc_info=True,
-            )
-
-        cls.process = popen_with_error_check(command)
-        _wait_for_uds_health(
-            cls.uds_path, cls.process, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+            base_url=None,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            uds_path=cls.uds_path,
         )
 
     @classmethod
     def tearDownClass(cls):
-        # Each cleanup step is isolated so a failure in one (e.g. the server
-        # process already died) does not leak env mutations or tempdir.
         try:
             kill_process_tree(cls.process.pid)
         except Exception:
             logger.exception("Failed to kill UDS test server process")
-        for key, original in getattr(cls, "_restore_env", {}).items():
-            try:
-                if original is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = original
-            except Exception:
-                logger.exception("Failed to restore env var %s", key)
         try:
             os.unlink(cls.uds_path)
         except FileNotFoundError:
