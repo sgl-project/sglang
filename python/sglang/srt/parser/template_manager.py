@@ -23,7 +23,7 @@ import logging
 import os
 from typing import Dict, Optional
 
-from sglang.srt.managers.template_detection import (
+from sglang.srt.parser.template_detection import (
     REASONING_PARSER_RULES,
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,

@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.managers.template_detection import (
+from sglang.srt.parser.template_detection import (
     TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
     detect_reasoning_parser,

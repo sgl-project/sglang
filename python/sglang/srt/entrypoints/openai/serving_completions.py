@@ -34,8 +34,8 @@ from sglang.srt.parser.code_completion_parser import (
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.template_manager import TemplateManager
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
+    from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
 
