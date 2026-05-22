@@ -1415,6 +1415,7 @@ class ResponsesRequest(BaseModel):
         self,
         default_max_tokens: int,
         default_params: Optional[Dict] = None,
+        stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation."""
@@ -1444,7 +1445,7 @@ class ResponsesRequest(BaseModel):
             "top_p": get_param("top_p"),
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
-            "stop": self.stop,
+            "stop": self.stop if stop is None else stop,
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
             "repetition_penalty": get_param("repetition_penalty"),
@@ -1463,7 +1464,14 @@ class ResponsesRequest(BaseModel):
             if key not in params or params[key] is None:
                 params[key] = value
 
-        if tool_call_constraint and params.get("json_schema"):
+        has_existing_constraints = (
+            params.get("regex")
+            or params.get("ebnf")
+            or params.get("structural_tag")
+            or params.get("json_schema")
+        )
+
+        if tool_call_constraint and has_existing_constraints:
             logger.warning("Constrained decoding is not compatible with tool calls.")
         elif tool_call_constraint:
             constraint_type, constraint_value = tool_call_constraint

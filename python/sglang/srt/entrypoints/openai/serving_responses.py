@@ -189,7 +189,7 @@ def _normalize_responses_input(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": item.get("output", ""),
+                    "content": _normalize_content(item.get("output", "")),
                 }
             )
 
@@ -456,10 +456,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                     tool_sessions = {}
                 for i, engine_prompt in enumerate(engine_prompts):
                     # Calculate default max tokens from context length minus prompt length
-                    if hasattr(engine_prompt, "__len__"):
+                    if isinstance(engine_prompt, list):
                         prompt_length = len(engine_prompt)
-                    elif isinstance(engine_prompt, list):
-                        prompt_length = len(engine_prompt)
+                    elif isinstance(engine_prompt, str):
+                        prompt_length = len(tokenizer.encode(engine_prompt))
                     else:
                         prompt_length = 0
 
@@ -477,6 +477,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     sampling_params = request.to_sampling_params(
                         default_max_tokens=default_max_tokens,
                         default_params=self.default_sampling_params,
+                        stop=(
+                            processed_messages.stop
+                            if processed_messages
+                            else request.stop
+                        ),
                         tool_call_constraint=(
                             processed_messages.tool_call_constraint
                             if processed_messages
@@ -493,6 +498,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                     else:
                         context = SimpleContext()
 
+                    if isinstance(engine_prompt, str):
+                        prompt_kwargs = {"text": engine_prompt}
+                    else:
+                        prompt_kwargs = {"input_ids": engine_prompt}
+
                     should_return_logprobs = self._should_return_logprobs(request)
                     # Extract routed_dp_rank from header (has higher priority than body)
                     effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
@@ -501,7 +511,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
                     # Create GenerateReqInput for SGLang
                     adapted_request = GenerateReqInput(
-                        input_ids=engine_prompt,
+                        **prompt_kwargs,
                         sampling_params=sampling_params,
                         stream=request.stream,
                         rid=request.request_id,
@@ -629,12 +639,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 messages=messages,
                 stream=request.stream,
                 tools=function_tools,
-                tool_choice=request.tool_choice,
+                tool_choice=request.tool_choice if function_tools else "none",
                 parallel_tool_calls=request.parallel_tool_calls,
                 chat_template_kwargs=request.chat_template_kwargs,
                 reasoning_effort=(
                     request.reasoning.effort if request.reasoning else None
                 ),
+                stop=request.stop,
             )
 
             # Follow SGLang's _process_messages pattern
