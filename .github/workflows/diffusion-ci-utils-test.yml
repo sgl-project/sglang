@@ -17,6 +17,7 @@ on:
 
 jobs:
   test:
+    name: diffusion-ci-utils-test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
