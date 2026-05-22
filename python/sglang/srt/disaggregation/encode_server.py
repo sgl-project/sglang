@@ -351,8 +351,9 @@ class MMEncoder:
         return dims
 
     def _resolve_audio_sr(self) -> int:
-        # Must match MiMoProcessor.from_hf_config — drift causes mimo to
-        # re-resample already-target audio and warp the waveform.
+        # Must match MiMoProcessor.from_hf_config — on drift, mimo tags the
+        # ndarray with its own audio_sampling_rate and skips resample, so the
+        # waveform is interpreted at the wrong rate and warped.
         def _read(obj, attr):
             if obj is None:
                 return None
@@ -382,6 +383,11 @@ class MMEncoder:
         sr = audio_cfg.get("sampling_rate")
         if sr:
             return int(sr)
+        logger.warning(
+            "No audio sampling rate found in mm_config or hf_config; "
+            "falling back to 16000 Hz. If the model expects a different SR "
+            "(e.g. MiMo-V2 defaults to 24000), audio will be warped."
+        )
         return 16000
 
     def _build_vision_config(self, mm_process_config):
