@@ -1566,12 +1566,21 @@ class Scheduler(
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
         import gc
         import time as _gc_time
+        from collections import Counter
 
         def _gc_callback(phase, info):
             if phase == "start":
                 gc._debug_t0 = _gc_time.perf_counter()
                 gc._debug_gen = info.get("generation", -1)
-                gc._debug_count = gc.get_count()
+                # Snapshot object types in this generation before collection
+                gen = gc._debug_gen
+                try:
+                    objs = gc.get_objects(generation=gen)
+                    gc._debug_types = Counter(type(o).__name__ for o in objs)
+                    gc._debug_n_objs = len(objs)
+                except TypeError:
+                    gc._debug_types = Counter()
+                    gc._debug_n_objs = 0
             elif phase == "stop":
                 dur = (
                     _gc_time.perf_counter()
@@ -1579,25 +1588,23 @@ class Scheduler(
                 ) * 1000
                 gen = getattr(gc, "_debug_gen", -1)
                 collected = info.get("collected", 0)
-                uncollectable = info.get("uncollectable", 0)
-                count_before = getattr(gc, "_debug_count", (0, 0, 0))
-                logger.info(
-                    "[GC] gen=%d collected=%d uncollectable=%d dur=%.1fms "
-                    "count_before=%s ts=%.6f",
-                    gen,
-                    collected,
-                    uncollectable,
-                    dur,
-                    count_before,
-                    _gc_time.time(),
-                )
+                if collected > 10:
+                    types = getattr(gc, "_debug_types", Counter())
+                    top5 = types.most_common(5)
+                    n_objs = getattr(gc, "_debug_n_objs", 0)
+                    logger.info(
+                        "[GC] gen=%d collected=%d n_tracked=%d dur=%.1fms top_types=%s",
+                        gen,
+                        collected,
+                        n_objs,
+                        dur,
+                        top5,
+                    )
 
         gc.callbacks.append(_gc_callback)
-        gc.set_debug(gc.DEBUG_STATS)
         logger.info(
-            "[GC] debug+callback installed (overlap), thresholds=%s count=%s",
+            "[GC] callback installed (overlap), thresholds=%s",
             gc.get_threshold(),
-            gc.get_count(),
         )
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
