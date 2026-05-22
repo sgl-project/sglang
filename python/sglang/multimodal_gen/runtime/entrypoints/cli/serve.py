@@ -33,6 +33,9 @@ def add_multimodal_gen_serve_args(parser: argparse.ArgumentParser):
 def execute_serve_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None):
     """The entry point for the serve command."""
     server_args = ServerArgs.from_cli_args(args, unknown_args)
+    if not server_args.is_arg_explicitly_set("warmup"):
+        server_args.warmup = True
+        logger.info("Warmup is enabled by default for sglang serve.")
 
     dispatch_launch(server_args)
 
