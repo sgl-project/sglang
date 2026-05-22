@@ -263,14 +263,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
-        skip_init_workspace_buffer: bool = False,
     ):
         super().__init__(
             model_runner,
             skip_prefill,
             kv_indptr_buf,
             q_indptr_decode_buf,
-            skip_init_workspace_buffer=True,
         )
 
         config = model_runner.model_config
@@ -296,17 +294,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Workspace allocation
         self.workspace_size = DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
-        if skip_init_workspace_buffer:
-            self.workspace_buffer = None
-        else:
-            global global_zero_init_workspace_buffer
-            if global_zero_init_workspace_buffer is None:
-                global_zero_init_workspace_buffer = torch.zeros(
-                    self.workspace_size,
-                    dtype=torch.uint8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_zero_init_workspace_buffer
+        global global_zero_init_workspace_buffer
+        if global_zero_init_workspace_buffer is None:
+            global_zero_init_workspace_buffer = torch.zeros(
+                self.workspace_size,
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_zero_init_workspace_buffer
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -382,10 +377,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         return block_kv_indices
-
-    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
-        """Skip parent's flashinfer wrapper plan()."""
-        return None
 
     def init_cuda_graph_state(
         self,
@@ -681,6 +672,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             return super().init_forward_metadata(forward_batch)
 
+    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
+        super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
+
     def pad_draft_extend_query(
         self,
         q: torch.Tensor,
@@ -904,7 +898,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
@@ -930,7 +924,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             query = query.unsqueeze(1)
 
         # Prepare KV cache inline
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
         # Get metadata
@@ -1011,7 +1005,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+            self.token_to_kv_pool.set_mla_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
 
@@ -1052,7 +1046,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
-            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
             kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
 
             q = q.to(self.data_type)
@@ -1150,7 +1144,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert k_rope is None
             chunk_idx = forward_batch.prefix_chunk_idx
 
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 layer.tp_q_head_num,
                 layer.v_head_dim,
@@ -1193,7 +1187,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             return result
         else:
-            out = torch.zeros(
+            out = torch.empty(
                 q.shape[0],
                 q.shape[1],
                 v.shape[2],
