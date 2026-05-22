@@ -1177,6 +1177,7 @@ class CudaGraphRunner:
         dsv4 still consults those through the legacy side channel until
         step 04 fully covers them here.
         """
+        num_tokens = bs * self.num_tokens_per_bs
         return replace(
             forward_batch,
             forward_mode=self.capture_forward_mode,
@@ -1189,6 +1190,13 @@ class CudaGraphRunner:
             encoder_lens=(
                 buffers.encoder_lens[:bs] if self.is_encoder_decoder else None
             ),
+            # Backends (FA3, trtllm_mha, flashinfer, ...) derive
+            # ``num_tokens = positions.shape[0]`` and combine with ``bs`` to
+            # compute ``tokens_per_req = num_tokens // bs``. Without overriding
+            # ``positions`` here the view inherits the UNPADDED iteration
+            # tensor while ``bs`` is the padded bucket size -- ``tokens_per_req``
+            # becomes wrong (or 0, crashing ``torch.arange(step=0)``).
+            positions=buffers.positions[:num_tokens],
         )
 
     def replay_prepare(
@@ -1257,6 +1265,8 @@ class CudaGraphRunner:
         # Step 04 removes the side channel once the fb view below covers every
         # field dsv4 reads from it (out_cache_loc / forward_mode / IDLE
         # replacement). Step 03 keeps set/clear to preserve that coverage.
+        # TboAttnBackend additionally propagates the side channel onto each
+        # inner primary/child (see TboAttnBackend._propagate_replay_forward_batch).
         attn_backend._replay_forward_batch = forward_batch
         fb_view = self._build_replay_forward_batch_view(
             forward_batch=forward_batch,
