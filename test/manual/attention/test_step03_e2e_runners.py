@@ -706,11 +706,12 @@ class TestFA3EAGLE3(_ServerSmokeBase):
 
 
 class TestDPIdleRank(_ServerSmokeBase):
-    """DP=4 TP=1 with idle DP rank path — exercises IDLE forward mode.
+    """DP-attention with idle DP rank — exercises IDLE forward mode.
 
-    Uses DP=4 TP=1 (4 GPUs total) instead of DP=4 TP=4 (16 GPUs).
-    The IDLE path fires when some DP ranks have no requests; any DP>1
-    configuration exercises it.
+    Matches dp_idle.sh: --tp-size 4 --dp-size 4 --enable-dp-attention.
+    With DP-attention, tp_size GPUs act as both TP shards and DP ranks
+    (dp_size must equal tp_size). Only some DP groups receive tokens for
+    a given request, exercising the IDLE forward-mode path.
     """
 
     model = os.environ.get("DP_MODEL", "Qwen/Qwen3-30B-A3B")
@@ -719,9 +720,10 @@ class TestDPIdleRank(_ServerSmokeBase):
         "--attention-backend",
         "triton",
         "--tp-size",
-        "1",
+        str(_TP_SIZE_LARGE),
         "--dp-size",
-        "4",
+        str(_TP_SIZE_LARGE),
+        "--enable-dp-attention",
         "--disable-piecewise-cuda-graph",
         "--mem-fraction-static",
         "0.7",
