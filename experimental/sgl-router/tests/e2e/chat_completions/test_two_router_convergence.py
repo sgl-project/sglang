@@ -1,22 +1,38 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""HA-shaped convergence test for cache-aware-zmq.
+"""Content-based cross-router routing test for cache-aware-zmq.
 
 Two routers + two SGLang workers + one shared model. Each router runs an
 independent ``cache_aware_zmq`` policy whose ``KvEventIndex`` subscribes
-to **both** workers' KV publishers. The test drives an overlapping-prefix
-workload through router A first, lets the KV events propagate, then
-drives the same prefix through router B. Both routers' ``/metrics``
-endpoint must show the *same* dominant worker — the one whose KV cache
-holds the warm prefix.
+to **both** workers' KV publishers.
 
-This pins the v1 design assumption that two routers can reach a
-consistent cache-aware routing decision without any cross-router state
-sync (which is deferred to v2 per the slim-design spec). The only
-mechanism enforcing the agreement is ZMQ PUB/SUB fan-out: both routers'
-subscribers receive every BlockStored event from every worker, so their
-HashTrees converge on the same `(seq_hash → worker_set)` mapping.
+The test warms each worker with a DIFFERENT prefix DIRECTLY (bypassing
+both routers), then sends those prefixes through each router and
+asserts that routing follows the prefix CONTENT: ``PREFIX_X`` lands on
+the worker holding X, ``PREFIX_Y`` lands on the worker holding Y, on
+both routers.
+
+# Why content-based, not convergence
+
+An earlier version of this test asserted that both routers converged on
+the *same dominant worker* after a one-prefix warmup. That property
+sounds like it pins the ZMQ-fan-out contract, but it doesn't: when the
+KV-event path is broken (subscribers never opened, e.g. a worker's
+``/server_info`` lacks the ``kv_events`` block), ``cache_aware_zmq``
+silently degrades to **min-load** — which, with sequential requests
+holding ``active_load`` at zero, picks the same worker deterministically
+on every call within a router. Both routers' min-load picks happened to
+agree often enough (about half the time, modulo HashSet seed) to make
+the convergence assertion pass even when no event ever flowed.
+
+Content-based routing is uniquely sensitive to the KV-event path. Two
+disjoint prefixes warmed on two different workers can only be routed
+correctly if the router knows *which worker holds which content* — the
+only mechanism that supplies that information is the ``BlockStored``
+event stream. Under min-load fallback, both prefixes route to the same
+default worker on each router, so the ``PREFIX_Y → worker_y`` assertion
+fails regardless of which worker min-load defaults to.
 """
 
 from __future__ import annotations
@@ -27,47 +43,31 @@ import time
 import httpx
 import pytest
 from infra.gateway import Gateway
-from infra.model_pool import spawn_worker
+from infra.model_pool import PASSTHROUGH_CHAT_TEMPLATE_PATH, spawn_worker
 from infra.model_specs import get_model_spec
 
-# Long enough to span multiple SGLang blocks at the default block_size
-# (64 tokens). Below that, no BlockStored event is emitted and the
-# cache-aware policy degrades to round-robin — which would defeat the
-# convergence assertion below.
-_PREFIX_BODY = (
-    "The slim-router project replaces the legacy gateway with a focused "
-    "Rust binary whose only job is to route OpenAI-compatible chat "
-    "completions to a pool of SGLang workers. Cache-aware routing "
-    "depends on per-worker KV-event publishers feeding a hash-keyed "
-    "radix tree. "
+# Disjoint prefixes — share no common opening text, so block 0 hashes
+# differ from the first block onward and each worker's HashTree
+# contribution is uniquely identifying.
+#
+# Length matters: each prefix must span ≥2 SGLang blocks at the default
+# block_size of 64 tokens so the worker actually emits BlockStored
+# events. Below that, the publisher stays quiet and we'd be testing
+# min-load by accident — the exact failure mode this test exists to
+# rule out.
+_PREFIX_X_BODY = (
+    "Apricot bouquet cinnamon dewdrop elderflower fennel garlic "
+    "hibiscus indigo jasmine kumquat lavender mint nutmeg oregano "
+    "paprika quince rosemary saffron tarragon. "
 )
-WARM_PREFIX = (_PREFIX_BODY * 8).strip()
+PREFIX_X = (_PREFIX_X_BODY * 8).strip()
 
-# How many requests to drive through each router. Needs to be enough
-# that the cache-aware fast-path picks up the warm worker on every
-# subsequent request, and that the /metrics convergence ratio passes
-# the threshold below even if the first 1–2 requests round-robin.
-N_REQUESTS_PER_ROUTER = 10
-
-# Each router's dominant worker must absorb ≥ this fraction of its
-# successful requests. With N=10 and a 1–2 request warm-up tail, 0.8
-# leaves headroom for one stray pick before convergence.
-CONVERGENCE_RATIO = 0.8
-
-
-def _send_chat(router_url: str, model_id: str, suffix: str) -> int:
-    """Send one chat completion; return HTTP status code."""
-    r = httpx.post(
-        f"{router_url}/v1/chat/completions",
-        json={
-            "model": model_id,
-            "messages": [{"role": "user", "content": f"{WARM_PREFIX} {suffix}"}],
-            "max_tokens": 4,
-            "stream": False,
-        },
-        timeout=60.0,
-    )
-    return r.status_code
+_PREFIX_Y_BODY = (
+    "Zephyr yellow xylophone wombat vortex umbrella thistle saffron "
+    "quartz peppermint orchid nightshade marigold lemongrass kale "
+    "juniper iris hyacinth gardenia foxglove. "
+)
+PREFIX_Y = (_PREFIX_Y_BODY * 8).strip()
 
 
 _REQ_TOTAL_RE = re.compile(
@@ -77,11 +77,7 @@ _LABEL_RE = re.compile(r'(\w+)="([^"]*)"')
 
 
 def _success_counts_by_worker(router_url: str) -> dict[str, int]:
-    """Scrape ``/metrics`` and return ``{worker_url: success_count}``.
-
-    Only the ``outcome="success"`` slice is counted — error/cancelled
-    requests don't tell us anything about routing convergence.
-    """
+    """Scrape ``/metrics`` and return ``{worker_url: success_count}``."""
     r = httpx.get(f"{router_url}/metrics", timeout=5.0)
     r.raise_for_status()
     counts: dict[str, int] = {}
@@ -102,28 +98,120 @@ def _success_counts_by_worker(router_url: str) -> dict[str, int]:
     return counts
 
 
+def _send_chat(url: str, model_id: str, prompt: str) -> int:
+    """POST one chat completion; return the HTTP status."""
+    r = httpx.post(
+        f"{url}/v1/chat/completions",
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 4,
+            "stream": False,
+        },
+        timeout=60.0,
+    )
+    return r.status_code
+
+
+def _direct_warm(worker_url: str, model_id: str, prefix: str) -> None:
+    """Send one ``/v1/chat/completions`` request with ``prefix`` DIRECTLY to a worker.
+
+    The KV-event publisher emits ``BlockStored`` as the request's
+    prompt blocks commit to that worker's cache; routers subscribed to
+    the publisher receive the event and add ``(block_hash → worker)``
+    entries to their ``HashTree``. The test then exercises those
+    entries by routing through the router.
+
+    Direct-warming (rather than going through a router) is the load-
+    bearing detail: routing through a router would itself choose which
+    worker to populate, so the two workers' HashTree state would no
+    longer be uniquely identifying.
+
+    Token alignment with the router — ``cache_aware_zmq`` hashes
+    ``messages[*].content`` RAW (``cache_aware_zmq.rs::extract_prompt_text``)
+    using ``add_special_tokens=false``. By default SGLang's chat
+    endpoint would wrap ``prefix`` in the model's chat template before
+    tokenizing — adding role tags, end-of-turn markers, and a
+    generation prompt — and the resulting block hashes would never
+    match what the router computes from raw content.
+
+    The test launches each worker with ``--chat-template
+    <PASSTHROUGH_CHAT_TEMPLATE_PATH>``: a Jinja template that emits
+    only ``messages[*].content`` (the same shape the router extracts),
+    and which combines with Transformers' ``apply_chat_template(
+    tokenize=True, add_special_tokens=False)`` to produce the same
+    token stream the router will compute. So warm and route hash the
+    same blocks via the same endpoint.
+    """
+    r = httpx.post(
+        f"{worker_url}/v1/chat/completions",
+        json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": prefix}],
+            "max_tokens": 4,
+            "stream": False,
+        },
+        timeout=60.0,
+    )
+    assert (
+        r.status_code == 200
+    ), f"direct warm to {worker_url} failed: HTTP {r.status_code} {r.text!r}"
+
+
+def _route_through(router_url: str, model_id: str, prompt: str) -> str:
+    """Send one request through ``router_url``; return which worker handled it.
+
+    Computed by diffing the per-worker success-counter on ``/metrics``
+    around the call. Asserts exactly one worker absorbed the request
+    (no partial counts, no cancellation race).
+    """
+    before = _success_counts_by_worker(router_url)
+    code = _send_chat(router_url, model_id, prompt)
+    assert code == 200, f"request to {router_url} failed: HTTP {code}"
+    after = _success_counts_by_worker(router_url)
+    deltas = {w: after.get(w, 0) - before.get(w, 0) for w in set(after) | set(before)}
+    winners = [w for w, d in deltas.items() if d > 0]
+    assert (
+        len(winners) == 1
+    ), f"expected exactly one worker delta on {router_url}, got {deltas}"
+    return winners[0]
+
+
 @pytest.mark.real_gpu
 @pytest.mark.slow
-def test_two_routers_cache_aware_converge_to_same_worker(
+def test_two_routers_route_by_prefix_content(
     router_binary,  # noqa: ARG001 — fixture forces release-binary presence
     gpu_allocator,
 ):
-    """Two routers, two workers, identical cache-aware-zmq policy.
+    """Each router must route by prefix CONTENT, agreeing across routers.
 
-    With both routers' subscribers seeing the same KV-event stream from
-    both workers, an overlapping-prefix workload through one router
-    must steer subsequent traffic through the OTHER router to the same
-    worker. Validates the ZMQ-fan-out HA contract end-to-end.
+    With each worker direct-warmed by a different disjoint prefix, the
+    only way a router can route ``PREFIX_X → worker_x`` AND
+    ``PREFIX_Y → worker_y`` is by consulting a HashTree populated from
+    the BlockStored events the workers emit. Min-load fallback (the
+    failure mode when no SUB socket opened) is content-blind and would
+    route both prefixes to whichever worker its tiebreaker prefers.
     """
     spec = get_model_spec("qwen3-0.6b")
     gpus = gpu_allocator.acquire(2)
+    # Passthrough chat template — see _direct_warm for the rationale. Both
+    # workers must run with the same template; otherwise their KV blocks
+    # would hash template-wrapped tokens while the router hashes raw
+    # content, and every lookup would miss the tree.
+    worker_chat_template_args = ["--chat-template", PASSTHROUGH_CHAT_TEMPLATE_PATH]
     try:
         with (
             spawn_worker(
-                "qwen3-0.6b", gpu_ids=[gpus[0]], enable_kv_events=True
+                "qwen3-0.6b",
+                gpu_ids=[gpus[0]],
+                enable_kv_events=True,
+                extra_args=worker_chat_template_args,
             ) as worker_x,
             spawn_worker(
-                "qwen3-0.6b", gpu_ids=[gpus[1]], enable_kv_events=True
+                "qwen3-0.6b",
+                gpu_ids=[gpus[1]],
+                enable_kv_events=True,
+                extra_args=worker_chat_template_args,
             ) as worker_y,
             Gateway() as router_a,
             Gateway() as router_b,
@@ -138,105 +226,41 @@ def test_two_routers_cache_aware_converge_to_same_worker(
                     timeout=120.0,
                 )
 
-            # 1. Warm up via router A. The first 1–2 requests distribute
-            #    round-robin (the tree is empty); thereafter the
-            #    cache-aware policy should stick to whichever worker
-            #    absorbed the first traffic, because its KV cache now
-            #    holds the prefix and the publisher emitted BlockStored
-            #    events for those blocks.
-            for i in range(N_REQUESTS_PER_ROUTER):
-                code = _send_chat(router_a.base_url, spec["model"], f"a-{i}")
-                assert code == 200, f"router A request {i} failed: {code}"
+            # 1. Direct-warm each worker with its own prefix. Must happen
+            #    AFTER both routers have started — ZMQ PUB/SUB doesn't
+            #    replay messages emitted before SUB attaches, so any
+            #    BlockStored event predating subscription is lost and
+            #    the HashTree never sees it.
+            _direct_warm(worker_x.url, spec["model"], PREFIX_X)
+            _direct_warm(worker_y.url, spec["model"], PREFIX_Y)
 
-            # Snapshot router A's dominant worker BEFORE any traffic
-            # touches router B. The first-request assertion below uses
-            # this as ground truth — without snapshotting, the test
-            # would be testing "do both routers agree" (PROPERTY 1
-            # later), which can pass even if KV fan-out is broken (e.g.
-            # both routers independently round-robin to worker_x first).
-            counts_a_warm = _success_counts_by_worker(router_a.base_url)
-            assert counts_a_warm, "router A produced no metrics after warmup"
-            chosen_a_warm = max(counts_a_warm, key=counts_a_warm.get)
-
-            # 2. Give router B's KvEventIndex time to drain its SUB
-            #    queue + apply the events router A's traffic produced.
-            #    Loopback ZMQ + the subscriber mpsc are sub-second
-            #    under normal conditions; a 2s settle is generous.
+            # 2. Drain the SUB mpsc + pump-apply path. Sub-second under
+            #    loopback ZMQ; 2 s leaves comfortable headroom.
             time.sleep(2.0)
 
-            # 3. PROPERTY 0 — first-request convergence: router B's very
-            #    first request must land on the worker router A warmed.
-            #    cache_aware_zmq has nothing else to base this on
-            #    except the BlockStored events fanned out from worker A
-            #    to router B's subscriber. If ZMQ fan-out is broken
-            #    (single-subscriber socket, drop on backpressure,
-            #    silent subscribe failure, etc.), this fails — whereas
-            #    PROPERTY 1/2 below could still pass if router B
-            #    happened to round-robin its own traffic to the same
-            #    worker independently.
-            code = _send_chat(router_b.base_url, spec["model"], "b-0")
-            assert code == 200, f"router B first request failed: {code}"
-            counts_b_first = _success_counts_by_worker(router_b.base_url)
-            assert (
-                counts_b_first
-            ), "router B produced no metrics after its first request"
-            chosen_b_first = max(counts_b_first, key=counts_b_first.get)
-            assert chosen_b_first == chosen_a_warm, (
-                "router B's first request landed on a different worker "
-                "than router A warmed — KV-event fan-out is broken or "
-                "subscribers are not converging. "
-                f"chosen_a_warm={chosen_a_warm}, "
-                f"chosen_b_first={chosen_b_first}, "
-                f"counts_b_first={counts_b_first}"
-            )
-
-            # 4. Drive the remaining requests through router B. The
-            #    bulk assertions below exercise the steady-state
-            #    behaviour (1 stray pick out of N is tolerated).
-            for i in range(1, N_REQUESTS_PER_ROUTER):
-                code = _send_chat(router_b.base_url, spec["model"], f"b-{i}")
-                assert code == 200, f"router B request {i} failed: {code}"
-
-            # 4. Scrape /metrics on both routers. Each router only
-            #    counts the requests *it* dispatched, so router A's
-            #    dominant worker is computed independently of router B's.
-            counts_a = _success_counts_by_worker(router_a.base_url)
-            counts_b = _success_counts_by_worker(router_b.base_url)
-            assert counts_a, (
-                f"router A produced no successful request samples; "
-                f"raw counts: {counts_a}"
-            )
-            assert counts_b, (
-                f"router B produced no successful request samples; "
-                f"raw counts: {counts_b}"
-            )
-
-            chosen_a = max(counts_a, key=counts_a.get)
-            chosen_b = max(counts_b, key=counts_b.get)
-            total_a = sum(counts_a.values())
-            total_b = sum(counts_b.values())
-
-            # PROPERTY 1: both routers agree on the dominant worker.
-            assert chosen_a == chosen_b, (
-                "routers disagreed on dominant worker — KV-event "
-                f"convergence broken. router_a→{chosen_a} "
-                f"(counts {counts_a}); router_b→{chosen_b} "
-                f"(counts {counts_b})"
-            )
-
-            # PROPERTY 2: that worker absorbed the bulk of each router's
-            # traffic. The threshold is loose enough to tolerate the
-            # initial round-robin tail but tight enough to fail loudly
-            # if cache-aware degenerates to load-balanced selection.
-            ratio_a = counts_a[chosen_a] / total_a
-            ratio_b = counts_b[chosen_b] / total_b
-            assert ratio_a >= CONVERGENCE_RATIO, (
-                f"router A did not converge: {counts_a[chosen_a]}/{total_a} "
-                f"= {ratio_a:.2%} on {chosen_a} (threshold {CONVERGENCE_RATIO:.0%})"
-            )
-            assert ratio_b >= CONVERGENCE_RATIO, (
-                f"router B did not converge: {counts_b[chosen_b]}/{total_b} "
-                f"= {ratio_b:.2%} on {chosen_b} (threshold {CONVERGENCE_RATIO:.0%})"
-            )
+            # 3. Content-routing assertion (×4): each prefix must land
+            #    on the worker that holds it, on either router.
+            #
+            #    The four assertions below are independently strong:
+            #    min-load fallback routes both prefixes on a given
+            #    router to a single default worker, so for ANY broken-
+            #    fan-out scenario at least one of the four fails.
+            for router, label in ((router_a, "A"), (router_b, "B")):
+                landed = _route_through(router.base_url, spec["model"], PREFIX_X)
+                assert landed == worker_x.url, (
+                    f"router {label}: PREFIX_X must route to worker_x "
+                    f"({worker_x.url}); landed on {landed}. "
+                    f"Likely cause: HashTree is empty — KV-event "
+                    f"subscriber never opened, or BlockStored events "
+                    f"never reached the pump."
+                )
+                landed = _route_through(router.base_url, spec["model"], PREFIX_Y)
+                assert landed == worker_y.url, (
+                    f"router {label}: PREFIX_Y must route to worker_y "
+                    f"({worker_y.url}); landed on {landed}. "
+                    f"Likely cause: HashTree is empty — KV-event "
+                    f"subscriber never opened, or BlockStored events "
+                    f"never reached the pump."
+                )
     finally:
         gpu_allocator.release(gpus)
