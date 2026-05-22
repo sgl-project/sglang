@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.deepseek_v4_compress_state import (
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
         DeepseekV4HipRadixBackend,
     )
@@ -99,24 +100,26 @@ class CompressorHip(_CompressorBase):
     def use_hip_fused_compress(self) -> bool:
         return envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
 
-    def _get_states(self, forward_batch: ForwardBatch) -> KVAndScore:
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+    def _get_states(
+        self,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+    ) -> KVAndScore:
+        token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
             return token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
             return token_to_kv_pool.get_attention_compress_states(self.layer_id)
 
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+    def _get_state_pool(self, attn_backend: AttentionBackend) -> CompressStatePool:
+        token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
             ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
     def overlap_transform(self, tensor: torch.Tensor, fill_value: Any) -> torch.Tensor:
@@ -155,18 +158,19 @@ class CompressorHip(_CompressorBase):
         self,
         kv_and_scores: KVAndScore,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ):
-        backend = forward_batch.attn_backend
+        backend = attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4HipRadixBackend)
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        state_pool = self._get_state_pool(forward_batch)
+        state_pool = self._get_state_pool(backend)
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         extend_lens = forward_batch.extend_seq_lens_cpu
         req_pool_indices = forward_batch.req_pool_indices
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_to_token = backend.req_to_token_pool.req_to_token
         assert not self.forward_mode.is_target_verify()
 
         assert extend_lens is not None and prefix_lens is not None
@@ -289,18 +293,19 @@ class CompressorHip(_CompressorBase):
         self,
         kv_and_scores: KVAndScore,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ):
         """Paged and cudagraph compatible version of compress_decode"""
         assert self.ape_converted
-        state_pool = self._get_state_pool(forward_batch)
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        state_pool = self._get_state_pool(attn_backend)
+        token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         req_pool_indices = forward_batch.req_pool_indices
-        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_to_token = attn_backend.req_to_token_pool.req_to_token
         seq_lens = forward_batch.seq_lens
 
         if forward_batch.forward_mode.is_target_verify():
-            draft_tokens = forward_batch.attn_backend.speculative_num_draft_tokens
+            draft_tokens = attn_backend.speculative_num_draft_tokens
             offsets = torch.arange(1, draft_tokens + 1, device=seq_lens.device)
             seq_lens_2d = seq_lens[:, None] + offsets[None, :]
             seq_lens = seq_lens_2d.view(-1)
@@ -378,11 +383,12 @@ class CompressorHip(_CompressorBase):
         self,
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
-        backend = forward_batch.attn_backend
+        backend = attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4HipRadixBackend)
-        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = self._get_state_pool(backend)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
 
         return backend.forward_compress(
@@ -402,9 +408,12 @@ class CompressorHip(_CompressorBase):
         self,
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         if self.use_fused_compress:
-            return self.compress_fused(kv_score, forward_batch)
+            return self.compress_fused(
+                kv_score, forward_batch, attn_backend=attn_backend
+            )
 
         self.compress_decode = self.compress_decode_paged
         self.compress_extend = self.compress_extend_paged
@@ -420,11 +429,13 @@ class CompressorHip(_CompressorBase):
             result = self.compress_decode(
                 kv_and_scores=kv_and_scores,
                 forward_batch=forward_batch,
+                attn_backend=attn_backend,
             )
         elif forward_batch.forward_mode.is_extend():
             result = self.compress_extend(
                 kv_and_scores=kv_and_scores,
                 forward_batch=forward_batch,
+                attn_backend=attn_backend,
             )
         else:
             msg = f"Forward mode {forward_batch.forward_mode} not supported in Compressor."
@@ -445,11 +456,17 @@ class CompressorHip(_CompressorBase):
         setattr(forward_batch, attr, decoded)
         return decoded
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+    ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
-
         kv_score = self.compute_kv_score(x, forward_batch)
         self.forward_mode = forward_batch.forward_mode
-        return self.compress_dispatch(kv_score, forward_batch)
+        return self.compress_dispatch(
+            kv_score, forward_batch, attn_backend=attn_backend
+        )
