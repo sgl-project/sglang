@@ -191,316 +191,297 @@ class PlanInvariants:
         return derived
 
 
-class VerifyInvariants:
-    @staticmethod
-    def assert_all(
-        *,
-        canary_buf_before: torch.Tensor,
-        canary_buf_after: torch.Tensor,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-        plan: VerifyPlan,
-        kernel_kind: CanaryLaunchTag,
-    ) -> None:
-        VerifyInvariants._assert_canary_buf_unchanged(
-            canary_buf_before=canary_buf_before, canary_buf_after=canary_buf_after
-        )
-        VerifyInvariants._assert_violation_count_le_active_entries(
-            log_after=log_after, log_before=log_before, plan=plan
-        )
-        VerifyInvariants._assert_violation_rows_have_valid_slot_and_kernel_kind(
-            log_after=log_after,
-            log_before=log_before,
-            plan=plan,
-            kernel_kind=kernel_kind,
-        )
-        VerifyInvariants._assert_slot_run_counter_incremented_by_active_entries(
-            log_before=log_before, log_after=log_after, plan=plan
-        )
-        VerifyInvariants._assert_kernel_run_counter_incremented_by_one(
-            log_before=log_before, log_after=log_after
-        )
+def assert_verify_invariants(
+    *,
+    canary_buf_before: torch.Tensor,
+    canary_buf_after: torch.Tensor,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+    plan: VerifyPlan,
+    kernel_kind: CanaryLaunchTag,
+) -> None:
+    _assert_verify_canary_buf_unchanged(
+        canary_buf_before=canary_buf_before, canary_buf_after=canary_buf_after
+    )
+    _assert_verify_violation_count_le_active_entries(
+        log_after=log_after, log_before=log_before, plan=plan
+    )
+    _assert_verify_violation_rows_have_valid_slot_and_kernel_kind(
+        log_after=log_after,
+        log_before=log_before,
+        plan=plan,
+        kernel_kind=kernel_kind,
+    )
+    _assert_verify_slot_run_counter_incremented_by_active_entries(
+        log_before=log_before, log_after=log_after, plan=plan
+    )
+    _assert_verify_kernel_run_counter_incremented_by_one(
+        log_before=log_before, log_after=log_after
+    )
 
-    @staticmethod
-    def _assert_canary_buf_unchanged(
-        *,
-        canary_buf_before: torch.Tensor,
-        canary_buf_after: torch.Tensor,
-    ) -> None:
+
+def _assert_verify_canary_buf_unchanged(
+    *,
+    canary_buf_before: torch.Tensor,
+    canary_buf_after: torch.Tensor,
+) -> None:
+    assert torch.equal(
+        canary_buf_before, canary_buf_after
+    ), "verify kernel mutated canary_buf (must be read-only)"
+
+
+def _assert_verify_violation_count_le_active_entries(
+    *,
+    log_after: FakeViolationLog,
+    log_before: FakeViolationLog,
+    plan: VerifyPlan,
+) -> None:
+    delta = int(log_after.write_index[0].item()) - int(
+        log_before.write_index[0].item()
+    )
+    n_active = int(plan.verify_num_valid[0].item())
+    assert (
+        0 <= delta <= n_active
+    ), f"violation_write_index delta {delta} out of [0, {n_active}]"
+
+
+def _assert_verify_violation_rows_have_valid_slot_and_kernel_kind(
+    *,
+    log_after: FakeViolationLog,
+    log_before: FakeViolationLog,
+    plan: VerifyPlan,
+    kernel_kind: CanaryLaunchTag,
+) -> None:
+    write_idx_after = int(log_after.write_index[0].item())
+    write_idx_before = int(log_before.write_index[0].item())
+    if write_idx_after == write_idx_before:
+        return
+    ring_capacity = log_after.ring.shape[0]
+    visible_start = write_idx_before
+    visible_end = min(write_idx_after, ring_capacity)
+    if visible_end <= visible_start:
+        return
+    n_active = int(plan.verify_num_valid[0].item())
+    plan_slots = set(plan.verify_slot_indices[:n_active].detach().cpu().tolist())
+    rows = log_after.ring[visible_start:visible_end].detach().cpu()
+    for i in range(rows.shape[0]):
+        kind = int(rows[i, consts.VIOLATION_FIELD_KERNEL_KIND].item())
+        assert kind == int(
+            kernel_kind
+        ), f"row {visible_start + i} kernel_kind {kind} != expected {int(kernel_kind)}"
+        slot = int(rows[i, consts.VIOLATION_FIELD_SLOT_IDX].item())
+        assert (
+            slot in plan_slots
+        ), f"row {visible_start + i} slot {slot} not in plan_slots"
+
+
+def _assert_verify_slot_run_counter_incremented_by_active_entries(
+    *,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+    plan: VerifyPlan,
+) -> None:
+    n_active = int(plan.verify_num_valid[0].item())
+    delta = int(log_after.slot_run_counter[0].item()) - int(
+        log_before.slot_run_counter[0].item()
+    )
+    assert (
+        delta == n_active
+    ), f"slot_run_counter delta {delta} != active entries {n_active}"
+
+
+def _assert_verify_kernel_run_counter_incremented_by_one(
+    *,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+) -> None:
+    delta = int(log_after.kernel_run_counter[0].item()) - int(
+        log_before.kernel_run_counter[0].item()
+    )
+    assert delta == 1, f"kernel_run_counter delta {delta} != 1"
+
+
+def assert_write_invariants(
+    *,
+    canary_buf_before: torch.Tensor,
+    canary_buf_after: torch.Tensor,
+    plan: WritePlan,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    enable_write_verify_inputs: bool,
+    expected_input_tokens: Optional[torch.Tensor],
+    expected_input_positions: Optional[torch.Tensor],
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+) -> None:
+    _assert_write_slots_token_position_match_input(
+        canary_buf_after=canary_buf_after,
+        plan=plan,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+    )
+    _assert_write_slot_minus_one_skipped(
+        canary_buf_before=canary_buf_before,
+        canary_buf_after=canary_buf_after,
+        plan=plan,
+        out_cache_loc=out_cache_loc,
+    )
+    _assert_write_pseudo_violation_only_on_mismatch(
+        enable_write_verify_inputs=enable_write_verify_inputs,
+        log_before=log_before,
+        log_after=log_after,
+        expected_input_tokens=expected_input_tokens,
+        expected_input_positions=expected_input_positions,
+        input_ids=input_ids,
+        positions=positions,
+        out_cache_loc=out_cache_loc,
+        plan=plan,
+    )
+    _assert_write_slot_run_counter_incremented(
+        log_before=log_before,
+        log_after=log_after,
+        plan=plan,
+        out_cache_loc=out_cache_loc,
+    )
+    _assert_write_kernel_run_counter_incremented_by_one(
+        log_before=log_before, log_after=log_after
+    )
+
+
+def _assert_write_slots_token_position_match_input(
+    *,
+    canary_buf_after: torch.Tensor,
+    plan: WritePlan,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    n_active = int(plan.write_num_valid_reqs[0].item())
+    if n_active == 0:
+        return
+    offsets = plan.write_offsets[: n_active + 1].detach().cpu().tolist()
+    total = offsets[n_active]
+    slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
+    tokens_cpu = input_ids[:total].detach().cpu().tolist()
+    pos_cpu = positions[:total].detach().cpu().tolist()
+    view = canary_buf_after.view(torch.int64)
+    for i in range(total):
+        slot = slots_cpu[i]
+        if slot < 0:
+            continue
+        stored_token = int(view[slot, 0].item())
+        stored_position = int(view[slot, 1].item())
+        assert (
+            stored_token == tokens_cpu[i]
+        ), f"slot {slot}: stored token {stored_token} != input {tokens_cpu[i]}"
+        assert (
+            stored_position == pos_cpu[i]
+        ), f"slot {slot}: stored position {stored_position} != input {pos_cpu[i]}"
+
+
+def _assert_write_slot_minus_one_skipped(
+    *,
+    canary_buf_before: torch.Tensor,
+    canary_buf_after: torch.Tensor,
+    plan: WritePlan,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    n_active = int(plan.write_num_valid_reqs[0].item())
+    if n_active == 0:
+        return
+    total = int(plan.write_offsets[n_active].item())
+    slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
+    written_slots = {s for s in slots_cpu if s >= 0}
+    view_before = canary_buf_before.view(torch.int64)
+    view_after = canary_buf_after.view(torch.int64)
+    num_slots = canary_buf_after.shape[0]
+    for slot in range(num_slots):
+        if slot in written_slots:
+            continue
         assert torch.equal(
-            canary_buf_before, canary_buf_after
-        ), "verify kernel mutated canary_buf (must be read-only)"
+            view_before[slot], view_after[slot]
+        ), f"slot {slot} not in out_cache_loc but canary_buf changed"
 
-    @staticmethod
-    def _assert_violation_count_le_active_entries(
-        *,
-        log_after: FakeViolationLog,
-        log_before: FakeViolationLog,
-        plan: VerifyPlan,
-    ) -> None:
-        delta = int(log_after.write_index[0].item()) - int(
-            log_before.write_index[0].item()
-        )
-        n_active = int(plan.verify_num_valid[0].item())
+
+def _assert_write_pseudo_violation_only_on_mismatch(
+    *,
+    enable_write_verify_inputs: bool,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+    expected_input_tokens: Optional[torch.Tensor],
+    expected_input_positions: Optional[torch.Tensor],
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    plan: WritePlan,
+) -> None:
+    delta = int(log_after.write_index[0].item()) - int(
+        log_before.write_index[0].item()
+    )
+    if not enable_write_verify_inputs:
         assert (
-            0 <= delta <= n_active
-        ), f"violation_write_index delta {delta} out of [0, {n_active}]"
+            delta == 0
+        ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
+        return
+    if expected_input_tokens is None or expected_input_positions is None:
+        return
+    n_active = int(plan.write_num_valid_reqs[0].item())
+    if n_active == 0:
+        assert delta == 0, f"empty plan produced {delta} violations"
+        return
+    total = int(plan.write_offsets[n_active].item())
+    tok = input_ids[:total].detach().cpu().tolist()
+    pos = positions[:total].detach().cpu().tolist()
+    exp_tok = expected_input_tokens[:total].detach().cpu().tolist()
+    exp_pos = expected_input_positions[:total].detach().cpu().tolist()
+    slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
+    mismatch_entries = sum(
+        1
+        for i in range(total)
+        if slots_cpu[i] >= 0 and (tok[i] != exp_tok[i] or pos[i] != exp_pos[i])
+    )
+    no_mismatch = mismatch_entries == 0
+    if no_mismatch:
+        assert (
+            delta == 0
+        ), f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
+    else:
+        assert (
+            delta == mismatch_entries
+        ), f"write input mismatch count {mismatch_entries} produced {delta} violations"
 
-    @staticmethod
-    def _assert_violation_rows_have_valid_slot_and_kernel_kind(
-        *,
-        log_after: FakeViolationLog,
-        log_before: FakeViolationLog,
-        plan: VerifyPlan,
-        kernel_kind: CanaryLaunchTag,
-    ) -> None:
-        write_idx_after = int(log_after.write_index[0].item())
-        write_idx_before = int(log_before.write_index[0].item())
-        if write_idx_after == write_idx_before:
-            return
-        ring_capacity = log_after.ring.shape[0]
-        visible_start = write_idx_before
-        visible_end = min(write_idx_after, ring_capacity)
-        if visible_end <= visible_start:
-            return
-        n_active = int(plan.verify_num_valid[0].item())
-        plan_slots = set(plan.verify_slot_indices[:n_active].detach().cpu().tolist())
-        rows = log_after.ring[visible_start:visible_end].detach().cpu()
-        for i in range(rows.shape[0]):
-            kind = int(rows[i, consts.VIOLATION_FIELD_KERNEL_KIND].item())
-            assert kind == int(
-                kernel_kind
-            ), f"row {visible_start + i} kernel_kind {kind} != expected {int(kernel_kind)}"
-            slot = int(rows[i, consts.VIOLATION_FIELD_SLOT_IDX].item())
-            assert (
-                slot in plan_slots
-            ), f"row {visible_start + i} slot {slot} not in plan_slots"
 
-    @staticmethod
-    def _assert_slot_run_counter_incremented_by_active_entries(
-        *,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-        plan: VerifyPlan,
-    ) -> None:
-        n_active = int(plan.verify_num_valid[0].item())
+def _assert_write_slot_run_counter_incremented(
+    *,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+    plan: WritePlan,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    n_active = int(plan.write_num_valid_reqs[0].item())
+    if n_active == 0:
         delta = int(log_after.slot_run_counter[0].item()) - int(
             log_before.slot_run_counter[0].item()
         )
-        assert (
-            delta == n_active
-        ), f"slot_run_counter delta {delta} != active entries {n_active}"
-
-    @staticmethod
-    def _assert_kernel_run_counter_incremented_by_one(
-        *,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-    ) -> None:
-        delta = int(log_after.kernel_run_counter[0].item()) - int(
-            log_before.kernel_run_counter[0].item()
-        )
-        assert delta == 1, f"kernel_run_counter delta {delta} != 1"
+        assert delta == 0, f"empty plan incremented slot_run_counter by {delta}"
+        return
+    total = int(plan.write_offsets[n_active].item())
+    delta = int(log_after.slot_run_counter[0].item()) - int(
+        log_before.slot_run_counter[0].item()
+    )
+    assert (
+        delta == total
+    ), f"slot_run_counter delta {delta} != total write entries {total}"
 
 
-class WriteInvariants:
-    @staticmethod
-    def assert_all(
-        *,
-        canary_buf_before: torch.Tensor,
-        canary_buf_after: torch.Tensor,
-        plan: WritePlan,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        enable_write_verify_inputs: bool,
-        expected_input_tokens: Optional[torch.Tensor],
-        expected_input_positions: Optional[torch.Tensor],
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-    ) -> None:
-        WriteInvariants._assert_written_slots_token_position_match_input(
-            canary_buf_after=canary_buf_after,
-            plan=plan,
-            input_ids=input_ids,
-            positions=positions,
-            out_cache_loc=out_cache_loc,
-        )
-        WriteInvariants._assert_slot_minus_one_skipped(
-            canary_buf_before=canary_buf_before,
-            canary_buf_after=canary_buf_after,
-            plan=plan,
-            out_cache_loc=out_cache_loc,
-        )
-        if (
-            enable_write_verify_inputs
-            and expected_input_tokens is not None
-            and expected_input_positions is not None
-        ):
-            WriteInvariants._assert_pseudo_violation_only_on_mismatch(
-                enable_write_verify_inputs=enable_write_verify_inputs,
-                log_before=log_before,
-                log_after=log_after,
-                expected_input_tokens=expected_input_tokens,
-                expected_input_positions=expected_input_positions,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                plan=plan,
-            )
-        elif not enable_write_verify_inputs:
-            WriteInvariants._assert_pseudo_violation_only_on_mismatch(
-                enable_write_verify_inputs=enable_write_verify_inputs,
-                log_before=log_before,
-                log_after=log_after,
-                expected_input_tokens=input_ids,
-                expected_input_positions=positions,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                plan=plan,
-            )
-        WriteInvariants._assert_write_slot_run_counter_incremented(
-            log_before=log_before,
-            log_after=log_after,
-            plan=plan,
-            out_cache_loc=out_cache_loc,
-        )
-        WriteInvariants._assert_write_kernel_run_counter_incremented_by_one(
-            log_before=log_before, log_after=log_after
-        )
-
-    @staticmethod
-    def _assert_written_slots_token_position_match_input(
-        *,
-        canary_buf_after: torch.Tensor,
-        plan: WritePlan,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-    ) -> None:
-        n_active = int(plan.write_num_valid_reqs[0].item())
-        if n_active == 0:
-            return
-        offsets = plan.write_offsets[: n_active + 1].detach().cpu().tolist()
-        total = offsets[n_active]
-        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
-        tokens_cpu = input_ids[:total].detach().cpu().tolist()
-        pos_cpu = positions[:total].detach().cpu().tolist()
-        view = canary_buf_after.view(torch.int64)
-        for i in range(total):
-            slot = slots_cpu[i]
-            if slot < 0:
-                continue
-            stored_token = int(view[slot, 0].item())
-            stored_position = int(view[slot, 1].item())
-            assert (
-                stored_token == tokens_cpu[i]
-            ), f"slot {slot}: stored token {stored_token} != input {tokens_cpu[i]}"
-            assert (
-                stored_position == pos_cpu[i]
-            ), f"slot {slot}: stored position {stored_position} != input {pos_cpu[i]}"
-
-    @staticmethod
-    def _assert_slot_minus_one_skipped(
-        *,
-        canary_buf_before: torch.Tensor,
-        canary_buf_after: torch.Tensor,
-        plan: WritePlan,
-        out_cache_loc: torch.Tensor,
-    ) -> None:
-        n_active = int(plan.write_num_valid_reqs[0].item())
-        if n_active == 0:
-            return
-        total = int(plan.write_offsets[n_active].item())
-        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
-        written_slots = {s for s in slots_cpu if s >= 0}
-        view_before = canary_buf_before.view(torch.int64)
-        view_after = canary_buf_after.view(torch.int64)
-        num_slots = canary_buf_after.shape[0]
-        for slot in range(num_slots):
-            if slot in written_slots:
-                continue
-            assert torch.equal(
-                view_before[slot], view_after[slot]
-            ), f"slot {slot} not in out_cache_loc but canary_buf changed"
-
-    @staticmethod
-    def _assert_pseudo_violation_only_on_mismatch(
-        *,
-        enable_write_verify_inputs: bool,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-        expected_input_tokens: torch.Tensor,
-        expected_input_positions: torch.Tensor,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
-        plan: WritePlan,
-    ) -> None:
-        delta = int(log_after.write_index[0].item()) - int(
-            log_before.write_index[0].item()
-        )
-        if not enable_write_verify_inputs:
-            assert (
-                delta == 0
-            ), f"enable_write_verify_inputs=OFF must produce no violations, got {delta}"
-            return
-        n_active = int(plan.write_num_valid_reqs[0].item())
-        if n_active == 0:
-            assert delta == 0, f"empty plan produced {delta} violations"
-            return
-        total = int(plan.write_offsets[n_active].item())
-        tok = input_ids[:total].detach().cpu().tolist()
-        pos = positions[:total].detach().cpu().tolist()
-        exp_tok = expected_input_tokens[:total].detach().cpu().tolist()
-        exp_pos = expected_input_positions[:total].detach().cpu().tolist()
-        slots_cpu = out_cache_loc[:total].detach().cpu().tolist()
-        mismatch_entries = sum(
-            1
-            for i in range(total)
-            if slots_cpu[i] >= 0 and (tok[i] != exp_tok[i] or pos[i] != exp_pos[i])
-        )
-        no_mismatch = mismatch_entries == 0
-        if no_mismatch:
-            assert (
-                delta == 0
-            ), f"enable_write_verify_inputs=ON with no mismatch produced {delta} violations"
-        else:
-            assert (
-                delta == mismatch_entries
-            ), f"write input mismatch count {mismatch_entries} produced {delta} violations"
-
-    @staticmethod
-    def _assert_write_slot_run_counter_incremented(
-        *,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-        plan: WritePlan,
-        out_cache_loc: torch.Tensor,
-    ) -> None:
-        n_active = int(plan.write_num_valid_reqs[0].item())
-        if n_active == 0:
-            delta = int(log_after.slot_run_counter[0].item()) - int(
-                log_before.slot_run_counter[0].item()
-            )
-            assert delta == 0, f"empty plan incremented slot_run_counter by {delta}"
-            return
-        total = int(plan.write_offsets[n_active].item())
-        delta = int(log_after.slot_run_counter[0].item()) - int(
-            log_before.slot_run_counter[0].item()
-        )
-        assert (
-            delta == total
-        ), f"slot_run_counter delta {delta} != total write entries {total}"
-
-    @staticmethod
-    def _assert_write_kernel_run_counter_incremented_by_one(
-        *,
-        log_before: FakeViolationLog,
-        log_after: FakeViolationLog,
-    ) -> None:
-        delta = int(log_after.kernel_run_counter[0].item()) - int(
-            log_before.kernel_run_counter[0].item()
-        )
-        assert delta == 1, f"kernel_run_counter delta {delta} != 1"
+def _assert_write_kernel_run_counter_incremented_by_one(
+    *,
+    log_before: FakeViolationLog,
+    log_after: FakeViolationLog,
+) -> None:
+    delta = int(log_after.kernel_run_counter[0].item()) - int(
+        log_before.kernel_run_counter[0].item()
+    )
+    assert delta == 1, f"kernel_run_counter delta {delta} != 1"
