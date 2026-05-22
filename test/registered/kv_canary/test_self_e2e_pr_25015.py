@@ -75,12 +75,14 @@ class _EaglePositionsBase(CanaryE2EBase):
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
     """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
 
+    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = True
 
 
 class TestEaglePositionsMatchWithFix(_EaglePositionsBase):
     """With the PR #25015 fix in place, no canary fires."""
 
+    __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = False
 
 
