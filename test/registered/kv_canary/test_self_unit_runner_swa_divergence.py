@@ -123,20 +123,47 @@ class TestSwaDivergenceReport(CustomTestCase):
                 swa_allocator=None,
                 req_to_token_pool=None,
             )
-            for _ in range(4):
+            # First 3 forwards stay below the interval trigger (1, 2, 3 % 10 != 0) so
+            # step() just bumps forward_ct and stages nothing.
+            for forward_idx in range(3):
                 stats.observe_after_invoke_plan(
-                    group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
+                    group=make_buffer_group(
+                        device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                    ),
                     verify_plan=_make_verify_plan(10),
                 )
                 stats.observe_after_invoke_plan(
-                    group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
+                    group=make_buffer_group(
+                        device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                    ),
                     verify_plan=_make_verify_plan(3),
                 )
+                stats.step(
+                    step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH
+                )
+            # 4th forward lands on step_counter=10 = interval, so compute_on_device
+            # snapshots {forward_ct:4, verify_full:40, verify_swa:12} into the dict and
+            # the staged future hangs onto it. forward_ct is now 4.
+            stats.observe_after_invoke_plan(
+                group=make_buffer_group(
+                    device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                ),
+                verify_plan=_make_verify_plan(10),
+            )
+            stats.observe_after_invoke_plan(
+                group=make_buffer_group(
+                    device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                ),
+                verify_plan=_make_verify_plan(3),
+            )
+            stats.step(step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH)
 
+            # 5th step drains the previous stage and emits the log; forward_ct is now 5
+            # but the staged dict still carries the snapshot forward_ct=4 from step 4.
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH)
+                stats.step(step_counter=11, forward_batch=_EMPTY_FORWARD_BATCH)
 
             lines = [
                 line
@@ -162,11 +189,19 @@ class TestSwaDivergenceReport(CustomTestCase):
 
             snapshots: list[SwaDivergenceLog] = []
 
-            def _take_snapshot(step: int) -> None:
+            def _take_snapshot(stage_step: int, drain_step: int) -> None:
+                # Stage the dict at the interval-aligned step (no log emitted yet,
+                # DelayedDeviceHostHandler still has nothing to drain), then call
+                # step() again at the next counter to drain and emit the log.
+                stats.step(
+                    step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH
+                )
                 with self.assertLogs(
                     swa_div_module.logger.name, level=logging.INFO
                 ) as captured:
-                    stats.step(step_counter=step, forward_batch=_EMPTY_FORWARD_BATCH)
+                    stats.step(
+                        step_counter=drain_step, forward_batch=_EMPTY_FORWARD_BATCH
+                    )
                 matching = [
                     line
                     for line in captured.output
@@ -178,14 +213,19 @@ class TestSwaDivergenceReport(CustomTestCase):
             for batch in range(3):
                 for _ in range(5):
                     stats.observe_after_invoke_plan(
-                        group=make_buffer_group(device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1),
+                        group=make_buffer_group(
+                            device=_DEVICE, kind=PoolKind.FULL, has_v=False, num_slots=1
+                        ),
                         verify_plan=_make_verify_plan(7),
                     )
                     stats.observe_after_invoke_plan(
-                        group=make_buffer_group(device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1),
+                        group=make_buffer_group(
+                            device=_DEVICE, kind=PoolKind.SWA, has_v=False, num_slots=1
+                        ),
                         verify_plan=_make_verify_plan(2),
                     )
-                _take_snapshot(step=10 + 20 * batch)
+                stage_step = 10 + 20 * batch
+                _take_snapshot(stage_step=stage_step, drain_step=stage_step + 1)
 
             for idx in range(1, len(snapshots)):
                 self.assertGreaterEqual(
@@ -347,10 +387,13 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
                 verify_plan=_make_verify_plan(3),
             )
 
+            # Stage at the interval-aligned step, then drain on the next step so the
+            # DelayedDeviceHostHandler has a pending future to postprocess.
+            stats.step(step_counter=10, forward_batch=forward_batch)
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(step_counter=10, forward_batch=forward_batch)
+                stats.step(step_counter=11, forward_batch=forward_batch)
 
         matching = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None

@@ -4,7 +4,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -73,11 +73,15 @@ class SwaDivergenceReport:
         *,
         step_counter: int,
         forward_batch: "ForwardBatch",
-    ) -> Optional[dict[str, torch.Tensor]]:
+    ) -> Optional[dict[str, Any]]:
         if step_counter == 0 or step_counter % self._interval != 0:
             return None
 
-        result: dict[str, torch.Tensor] = {
+        # Bundle forward_ct in as an int pass-through so the host log line reports
+        # the forward at which the snapshot was staged, not the one at which the
+        # drain happens (DelayedDeviceHostHandler runs postprocess one tick later).
+        result: dict[str, Any] = {
+            "forward_ct": self._forward_ct,
             "verify_total_count": self._verify_total_count_device,
         }
         if self._swa_allocator is not None:
@@ -88,7 +92,7 @@ class SwaDivergenceReport:
             )
         return result
 
-    def _postprocess_on_host(self, host_data: dict[str, torch.Tensor]) -> None:
+    def _postprocess_on_host(self, host_data: dict[str, Any]) -> None:
         verify_totals = host_data["verify_total_count"].tolist()
         swa_full_idx_divergence = (
             int(host_data["swa_full_idx_divergence"].item())
@@ -97,7 +101,7 @@ class SwaDivergenceReport:
         )
         logger.info(
             SwaDivergenceLog(
-                forward_ct=self._forward_ct,
+                forward_ct=int(host_data["forward_ct"]),
                 verify_full=int(verify_totals[_FULL_IDX]),
                 verify_swa=int(verify_totals[_SWA_IDX]),
                 swa_full_idx_divergence=swa_full_idx_divergence,
