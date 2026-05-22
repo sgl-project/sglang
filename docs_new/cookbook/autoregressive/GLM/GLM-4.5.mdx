@@ -252,7 +252,7 @@ from sglang.srt.sampling.custom_logit_processor import Glm4MoeThinkingBudgetLogi
 
 client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
 response = client.chat.completions.create(
-    model="zai-org/GLM-4.6",
+    model="zai-org/GLM-4.5",
     messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
     max_tokens=1024,
     extra_body={

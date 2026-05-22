@@ -38,12 +38,32 @@ import { DeepSeekV3Deployment } from "/src/snippets/autoregressive/deepseek-v3-d
 
 **Recommended GPU configurations by weight type:**
 
-| Weight Type | Supported Hardware |
-|------------|-------------------|
-| **FP8** (recommended) | 8× H200, 8× B200, 8× MI300X, 2×8× H100/H800/H20 |
-| **BF16** (upcast from FP8) | 2×8× H200, 2×8× MI300X, 4×8× H100/H800, 4×8× A100/A800 |
-| **INT8** | 16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Atlas 800I A3 |
-| **W4A8 / AWQ / MXFP4 / NVFP4** | 8× H20/H100, 4× H200; 8× H100/A100; 8/4× MI355X/MI350X; 8/4× B200 |
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Weight Type</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Supported Hardware</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>FP8</strong> (recommended)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8× H200, 8× B200, 8× MI300X, 2×8× H100/H800/H20</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>BF16</strong> (upcast from FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2×8× H200, 2×8× MI300X, 4×8× H100/H800, 4×8× A100/A800</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>INT8</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16× A100/A800, 32× L40S, Xeon 6980P CPU, 4× Atlas 800I A3</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>W4A8 / AWQ / MXFP4 / NVFP4</strong></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8× H20/H100, 4× H200; 8× H100/A100; 8/4× MI355X/MI350X; 8/4× B200</td>
+    </tr>
+  </tbody>
+</table>
 
 > The official DeepSeek-V3 checkpoint is already in FP8 format — do **not** add `--quantization fp8` when serving it.
 

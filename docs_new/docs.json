@@ -706,25 +706,7 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params",
-              {
-                "group": "Popular Model Usage",
-                "pages": [
-                  "docs/basic_usage/popular_model_usage",
-                  "docs/basic_usage/deepseek_v3",
-                  "docs/basic_usage/deepseek_v32",
-                  "docs/basic_usage/deepseek_ocr",
-                  "docs/basic_usage/glm45",
-                  "docs/basic_usage/glmv",
-                  "docs/basic_usage/gpt_oss",
-                  "docs/basic_usage/kimi_k2_5",
-                  "docs/basic_usage/minimax_m2",
-                  "docs/basic_usage/qwen3",
-                  "docs/basic_usage/qwen3_5",
-                  "docs/basic_usage/qwen3_vl",
-                  "docs/basic_usage/llama4"
-                ]
-              }
+              "docs/basic_usage/sampling_params"
             ]
           },
           {

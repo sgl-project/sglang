@@ -491,10 +491,27 @@ Output throughput: 2405.505 token/s
 
 Accuracy on MMLU Pro matches [Meta's official benchmark numbers](https://ai.meta.com/blog/llama-4-multimodal-intelligence/) on 8×H100:
 
-| Model | Official | SGLang |
-|-------|---------|--------|
-| Llama-4-Scout-17B-16E-Instruct | 74.3 | 75.2 |
-| Llama-4-Maverick-17B-128E-Instruct | 80.5 | 80.7 |
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Model</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Official</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>SGLang</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-4-Scout-17B-16E-Instruct</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>74.3</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>75.2</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-4-Maverick-17B-128E-Instruct</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}>80.5</td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>80.7</td>
+    </tr>
+  </tbody>
+</table>
 
 ```bash Command
 # First start the server

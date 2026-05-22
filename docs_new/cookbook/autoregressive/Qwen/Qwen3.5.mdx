@@ -784,7 +784,7 @@ Evaluate using the industry-standard `lm-eval` harness for reproducible accuracy
 pip install lm-eval[api]
 
 lm_eval --model local-completions \
-    --model_args '{"base_url": "http://localhost:8000/v1/completions", "model": "Qwen/Qwen3.5-397B-A17B", "num_concurrent": 256, "max_retries": 10, "max_gen_toks": 2048}' \
+    --model_args '{"base_url": "http://localhost:30000/v1/completions", "model": "Qwen/Qwen3.5-397B-A17B", "num_concurrent": 256, "max_retries": 10, "max_gen_toks": 2048}' \
     --tasks gsm8k \
     --batch_size auto \
     --num_fewshot 5 \

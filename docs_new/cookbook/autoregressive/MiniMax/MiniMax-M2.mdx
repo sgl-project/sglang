@@ -73,17 +73,31 @@ This section provides a progressive guide from quick deployment to performance o
 
 Recommended configurations — actual requirements depend on workload:
 
-| GPUs | Context Length Support |
-|------|----------------------|
-| 4× 96 GB GPUs | Up to 400K tokens |
-| 8× 144 GB GPUs | Up to 3M tokens |
+<table style={{width: "100%", borderCollapse: "collapse"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>GPUs</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Context Length Support</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4× 96 GB GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 400K tokens</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>8× 144 GB GPUs</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 3M tokens</td>
+    </tr>
+  </tbody>
+</table>
 
 ### 3.3 Testing Deployment
 
 After the server starts, verify with:
 
 ```shell Command
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:30000/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
         "model": "MiniMaxAI/MiniMax-M2",
