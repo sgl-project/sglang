@@ -34,8 +34,8 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     write_slot_fields,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    empty_extras,
     clone_real_kv_sources,
+    empty_extras,
     make_req_to_token,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -75,7 +75,11 @@ def _run_pipeline(
     plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
     plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
 
-    plan_fn = launch_canary_plan_kernels if real else launch_canary_plan_kernels_torch_reference
+    plan_fn = (
+        launch_canary_plan_kernels
+        if real
+        else launch_canary_plan_kernels_torch_reference
+    )
     plan_fn(
         verify_plan_out=plan_v,
         write_plan_out=plan_w,

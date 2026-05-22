@@ -14,8 +14,8 @@ from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._differential import run_plan_diff
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     allocate_plan_pair,
-    empty_extras,
     derive_plan_capacity,
+    empty_extras,
     make_lut,
     make_req_to_token,
 )
