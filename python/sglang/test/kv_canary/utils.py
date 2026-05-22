@@ -22,9 +22,7 @@ def build_canary_server_args(
         *extra_server_args,
     ]
     if mode_cfg.json_model_override_args is not None:
-        args.extend(
-            ["--json-model-override-args", mode_cfg.json_model_override_args]
-        )
+        args.extend(["--json-model-override-args", mode_cfg.json_model_override_args])
     return args
 
 
