@@ -378,7 +378,14 @@ async def lifespan(fast_api_app: FastAPI):
         traceback = get_exception_traceback()
         logger.warning(f"Can not initialize OpenAIServingResponses, error: {traceback}")
 
-    if envs.SGLANG_GRANIAN_PARENT_PID.get() is not None and server_args.enable_grpc:
+    # Start the native gRPC sidecar from the lifespan so it inherits the
+    # already-running HTTP event loop. Skip multi-tokenizer-worker mode
+    # because every worker would try to bind the same gRPC port.
+    in_grpc_capable_worker = (
+        getattr(fast_api_app, "is_single_tokenizer_mode", False)
+        or envs.SGLANG_GRANIAN_PARENT_PID.get() is not None
+    )
+    if in_grpc_capable_worker and server_args.enable_grpc:
         grpc_handle = _start_native_grpc_server_for_runtime(
             server_args=server_args,
             tokenizer_manager=_global_state.tokenizer_manager,
@@ -2411,32 +2418,18 @@ def launch_server(
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
 
-    # Start native gRPC in the same process that owns the live TokenizerManager.
-    # Granian workers get their own TokenizerManager instances, so they start
-    # native gRPC from the worker lifespan instead of the parent process.
-    grpc_handle = None
-    if server_args.enable_grpc and not server_args.enable_http2:
-        grpc_handle = _start_native_grpc_server_for_runtime(
-            server_args,
-            tokenizer_manager,
-            template_manager,
-            (
-                scheduler_init_result.scheduler_infos[0]
-                if scheduler_init_result.scheduler_infos
-                else {}
-            ),
-        )
-
-    try:
-        _setup_and_run_http_server(
-            server_args,
-            tokenizer_manager,
-            template_manager,
-            port_args,
-            scheduler_init_result.scheduler_infos,
-            subprocess_watchdog,
-            execute_warmup_func=execute_warmup_func,
-            launch_callback=launch_callback,
-        )
-    finally:
-        _shutdown_native_grpc_server(grpc_handle)
+    # Native gRPC sidecar startup lives in the FastAPI lifespan so it
+    # inherits uvicorn/Granian's already-running event loop. The bridge's
+    # run_coroutine_threadsafe schedules onto that loop; starting gRPC
+    # before uvicorn (as we used to here) created a stale loop that
+    # nothing drove, causing every async gRPC RPC to hang.
+    _setup_and_run_http_server(
+        server_args,
+        tokenizer_manager,
+        template_manager,
+        port_args,
+        scheduler_init_result.scheduler_infos,
+        subprocess_watchdog,
+        execute_warmup_func=execute_warmup_func,
+        launch_callback=launch_callback,
+    )
