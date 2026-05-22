@@ -42,8 +42,7 @@ struct VecTypeTrait<fp16_t, 32> {
 };
 
 template <bool kCastXBeforeOutMul, typename packed_t>
-SGL_DEVICE packed_t rms(packed_t& val, packed_t& weight, float rsqrt_square_sum) {
-  float2 valf = device::cast<fp32x2_t, packed_t>(val);
+SGL_DEVICE packed_t rms(float2 valf, packed_t& weight, float rsqrt_square_sum) {
   float2 weightf = device::cast<fp32x2_t, packed_t>(weight);
   if constexpr (kCastXBeforeOutMul) {
     auto rounded = device::cast<packed_t, fp32x2_t>(make_float2(valf.x * rsqrt_square_sum, valf.y * rsqrt_square_sum));
@@ -63,10 +62,11 @@ __global__ void fused_add_rmsnorm_reg_kernel(
 
   using vec_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::vec_t;
   using packed_t = typename VecTypeTrait<T, VEC_SIZE_IN_BYTE>::packed_t;
-  vec_t v;         // Save input
-  vec_t v_res;     // Save residual
-  vec_t v_weight;  // Save weight
-  vec_t v_out;     // Save output
+  vec_t v;                           // Save input
+  vec_t v_res;                       // Save residual
+  vec_t v_weight;                    // Save weight
+  vec_t v_out;                       // Save output
+  float2 inp_res_cache[inner_loop];  // fp32 sum cache; only read when kCastXBeforeOutMul=true
 
   auto token_id = blockIdx.x;
   float2 acc_square = make_float2(0.0f, 0.0f);  // Sum of squares for each thread
@@ -89,6 +89,9 @@ __global__ void fused_add_rmsnorm_reg_kernel(
       acc_square.x += inp_res.x * inp_res.x;
       acc_square.y += inp_res.y * inp_res.y;
       v[i] = device::cast<packed_t, fp32x2_t>(inp_res);
+      if constexpr (kCastXBeforeOutMul) {
+        inp_res_cache[i] = inp_res;
+      }
     }
 
     // Store inp+res to residual
@@ -119,7 +122,14 @@ __global__ void fused_add_rmsnorm_reg_kernel(
   if (threadIdx.x < vec_hidden_size) {
     float rsqrt_square_sum = buffer[threadIdx.x / 32];  // Read rsqrt from Shared Memory(Broadcast)
     for (int i = 0; i < inner_loop; i++) {
-      v_out[i] = rms<kCastXBeforeOutMul>(v[i], v_weight[i], rsqrt_square_sum);
+      // HF parity needs the full fp32 sum (not the DType-rounded v[i]).
+      float2 valf;
+      if constexpr (kCastXBeforeOutMul) {
+        valf = inp_res_cache[i];
+      } else {
+        valf = device::cast<fp32x2_t, packed_t>(v[i]);
+      }
+      v_out[i] = rms<kCastXBeforeOutMul>(valf, v_weight[i], rsqrt_square_sum);
     }
     vec_t* p_out = reinterpret_cast<vec_t*>(input) + token_id * vec_hidden_size;
     p_out[threadIdx.x] = v_out;
