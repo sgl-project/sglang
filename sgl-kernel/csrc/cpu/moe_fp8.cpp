@@ -199,6 +199,7 @@ void fused_experts_fp_kernel_impl(
       at::native::cpublas::brgemm_release();
     }
   });
+
   // stage 3: out = intermediate_cache2.sum(dim=1)
   //   from [M, topk, K] to [M, K]
   at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {

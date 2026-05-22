@@ -650,6 +650,7 @@ void fused_experts_kernel_impl(
       at::native::cpublas::brgemm_release();
     }
   });
+
   // stage 2: intermediate_cache2 = intermediate_cache1 @ w2
   //   w2 : [E, K, N] as [E, OC, IC]
   const int64_t OC = K;  // rename K as OC
@@ -705,6 +706,7 @@ void fused_experts_kernel_impl(
             /* ldb   */ n_size,
             /* ldc   */ BLOCK_N);
       }
+
       if (with_bias) {
         for (int64_t m = 0; m < m_size; ++m) {
           add_bias_stub(C + m * BLOCK_N, B_bias, n_size);
@@ -1266,6 +1268,7 @@ at::Tensor fused_experts_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUActMethod::swiglu : CPUActMethod::silu_and_mul;
+
       fused_experts_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache1,

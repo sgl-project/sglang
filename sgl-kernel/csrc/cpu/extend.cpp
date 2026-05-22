@@ -125,6 +125,7 @@ void extend_attention_kernel_impl(
       fill_stub(v_prime, 0.f, m_size * head_size_v);
       fill_stub(s_prime, 0.f, m_size);
       fill_stub(m_prime, -std::numeric_limits<scalar_t>::infinity(), m_size);
+      // stage 1: compute scores with prefix
       int kv_start = 0;
       int kv_end = is_cross_attn ? encoder_lens[bs] : seq_len_prefix;
       for (int n = kv_start; n < kv_end; n += BLOCK_N) {
@@ -190,7 +191,7 @@ void extend_attention_kernel_impl(
             /* A     */ s_delta,
             /* B     */ Btmp,
             /* C     */ v_prime);
-      }
+      }  // loop with seq_len_prefix
       if (!is_cross_attn) {
         // stage 2: compute the triangle part
         int num_keys = std::min(seq_len_extend, m + BLOCK_M);

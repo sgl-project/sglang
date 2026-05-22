@@ -115,6 +115,7 @@ CPU_QUANTIZATION_METHODS = {
     "compressed-tensors": CompressedTensorsConfig,
     "awq": AWQCPUConfig,
     "gptq": CPUGPTQConfig,
+    "mxfp4": Mxfp4Config,
 }
 
 QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}

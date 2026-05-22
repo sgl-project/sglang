@@ -355,6 +355,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     Unroll<ROWS * COLS>{}(storec);
   }
 };
+
 template <int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2<at::BFloat16, BLOCK_M, BLOCK_N> {
   static inline void apply(
@@ -966,6 +967,7 @@ void tinygemm_kernel(
     bool brg) {
   tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
 }
+
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -1096,6 +1098,7 @@ inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t
   }
   return nullptr;
 }
+
 // FP8 and MXFP4 WoQ uses the same pattern:
 //   Btmp : [T, BLOCK_N * K]
 //   Ctmp : [T, BLOCK_M * BLOCK_N]

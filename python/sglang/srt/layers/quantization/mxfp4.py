@@ -1184,7 +1184,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         if self._fi_kernel == "cutlass_sm90":
             return self._apply_sm90_cutlass(layer, x, topk_output)
-
         if self.use_flashinfer:
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
