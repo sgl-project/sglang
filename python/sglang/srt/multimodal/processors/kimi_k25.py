@@ -233,7 +233,7 @@ class KimiGPUProcessorWrapper:
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
-        # - image_processor: checked via isinstance(..., BaseImageProcessorFast)
+        # - image_processor: checked via isinstance(..., BaseImageProcessor)
         # - tokenizer: used for tokenization
         # - media_processor: used by CPU fallback path
         self.image_processor = hf_processor.image_processor
@@ -312,7 +312,11 @@ class KimiGPUProcessorWrapper:
             # Convert to medias format for Kimi's HF processor
             kwargs["medias"] = [{"type": "image", "image": img} for img in images]
 
-        return self._hf_processor(text=[input_text], **kwargs)
+        out = self._hf_processor(text=[input_text], **kwargs)
+        grid_thws = out.pop("grid_thws", None)
+        if grid_thws is not None:
+            out["image_grid_thw"] = grid_thws
+        return out
 
     def _get_gpu_norm_tensors(self, device="cuda"):
         if self._gpu_norm_tensors is None:

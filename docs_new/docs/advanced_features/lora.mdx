@@ -29,7 +29,9 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `lora_target_modules`: The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters.
 
-* `--max-lora-chunk-size`: Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. Please tune this value based on your hardware and workload as needed. Defaults to 16.
+* `max_lora_chunk_size`: Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. Please tune this value based on your hardware and workload as needed. Defaults to 16.
+
+* `lora_drain_wait_threshold`: When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).
 
 * `tp_size`: LoRA serving along with Tensor Parallelism is supported by SGLang. `tp_size` controls the number of GPUs for tensor parallelism. More details on the tensor sharding strategy can be found in [S-Lora](https://arxiv.org/pdf/2311.03285) paper.
 
@@ -43,7 +45,7 @@ From client side, the user needs to provide a list of strings as input batch, an
 
 **Note:** SGLang supports LoRA adapters through two APIs:
 
-1. **OpenAI-Compatible API** (`/v1/chat/completions`, `/v1/completions`): Use the `model:adapter-name` syntax. See [OpenAI API with LoRA](../basic_usage/openai_api_completions.ipynb#Using-LoRA-Adapters) for examples.
+1. **OpenAI-Compatible API** (`/v1/chat/completions`, `/v1/completions`): Use the `model:adapter-name` syntax. See [OpenAI API with LoRA](../basic_usage/openai_api_completions#using-lora-adapters) for examples.
 
 2. **Native API** (`/generate`): Pass `lora_path` in the request body (shown below).
 
@@ -108,7 +110,7 @@ server_process, port = launch_server_cmd(
 python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --enable-lora \
     --lora-paths lora0=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
-    lora1=Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 \
+    lora1=Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json \
     --max-loras-per-batch 2 \
     --log-level warning \
 """
@@ -152,7 +154,7 @@ When using dynamic LoRA loading, it's recommended to explicitly specify both `--
 
 
 ```python Example
-lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"  # rank - 4, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj
+lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json"  # rank - 4, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj
 lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"  # rank - 64, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 lora0_new = "philschmid/code-llama-3-1-8b-text-to-sql-lora"  # rank - 256, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 
@@ -317,7 +319,7 @@ server_process, port = launch_server_cmd(
     --max-lora-rank 256 \
     --lora-target-modules all \
     --lora-paths \
-        {"lora_name":"lora0","lora_path":"Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16","pinned":true} \
+        {"lora_name":"lora0","lora_path":"Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json","pinned":true} \
         {"lora_name":"lora1","lora_path":"algoprog/fact-generation-llama-3.1-8b-instruct-lora"} \
         lora2=philschmid/code-llama-3-1-8b-text-to-sql-lora
     --log-level warning
@@ -418,7 +420,7 @@ By using the `--enable-lora-overlap-loading` server argument, the SGLang engine 
 
 
 ```python Example
-lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16"
+lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json"
 lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
 lora2 = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
 
@@ -429,7 +431,7 @@ server_process, port = launch_server_cmd(
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --enable-lora \
     --enable-lora-overlap-loading \
-    --lora-paths lora0=Nutanix/Meta-Llama-3.1-8B-Instruct_lora_4_alpha_16 \
+    --lora-paths lora0=Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json \
     lora1=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
     lora2=philschmid/code-llama-3-1-8b-text-to-sql-lora \
     --max-lora-rank 256 \

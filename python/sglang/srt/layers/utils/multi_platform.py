@@ -98,10 +98,7 @@ class MultiPlatformOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def forward_musa(self, *args, **kwargs):
-        # XXX (MUSA): MUSA kernels follow the CUDA path by default.
-        # At this stage, sgl-kernel support for MUSA is still under active
-        # development, so we fall back to the PyTorch-native implementation.
-        return self.forward_native(*args, **kwargs)
+        return self.forward_cuda(*args, **kwargs)
 
     def forward_hpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)

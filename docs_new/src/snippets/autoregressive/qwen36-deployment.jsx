@@ -10,6 +10,14 @@ export const Qwen36Deployment = () => {
         { id: 'b200', label: 'B200', default: false },
       ],
     },
+    modelSize: {
+      name: 'modelSize',
+      title: 'Model Size',
+      items: [
+        { id: '35b-a3b', label: '35B-A3B (MoE)', default: true },
+        { id: '27b', label: '27B (Dense)', default: false },
+      ],
+    },
     quantization: {
       name: 'quantization',
       title: 'Quantization',
@@ -66,9 +74,18 @@ export const Qwen36Deployment = () => {
   };
 
   const modelConfigs = {
-    h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-    h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
-    b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+    '35b-a3b': {
+      baseName: '35B-A3B',
+      h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+    },
+    '27b': {
+      baseName: '27B',
+      h100: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      h200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+      b200: { bf16: { tp: 1, mem: 0.8 }, fp8: { tp: 1, mem: 0.8 } },
+    },
   };
 
   const resolveItems = (option, vals) =>
@@ -126,14 +143,15 @@ export const Qwen36Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { hardware, quantization, speculative } = values;
-    const hwConfig = modelConfigs[hardware]?.[quantization];
+    const { hardware, modelSize, quantization, speculative } = values;
+    const sizeConfig = modelConfigs[modelSize];
+    const hwConfig = sizeConfig?.[hardware]?.[quantization];
     if (!hwConfig) {
       return '# Please select a valid hardware and quantization combination';
     }
 
     const quantSuffix = quantization === 'fp8' ? '-FP8' : '';
-    const modelName = `Qwen/Qwen3.6-35B-A3B${quantSuffix}`;
+    const modelName = `Qwen/Qwen3.6-${sizeConfig.baseName}${quantSuffix}`;
 
     let cmd = '';
     if (speculative === 'enabled') {
@@ -151,7 +169,7 @@ export const Qwen36Deployment = () => {
     };
 
     for (const [key, option] of Object.entries(options)) {
-      if (key === 'quantization' || key === 'hardware') continue;
+      if (key === 'quantization' || key === 'hardware' || key === 'modelSize') continue;
       if (!option.commandRule) continue;
       const rule = option.commandRule(adjustedValues[key]);
       if (rule) {

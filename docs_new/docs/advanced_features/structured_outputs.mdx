@@ -11,7 +11,7 @@ SGLang supports three grammar backends:
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 - [Llguidance](https://github.com/guidance-ai/llguidance): Supports JSON schema, regular expression, and EBNF constraints.
 
-We suggest using XGrammar for its better performance and utility. XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
+We suggest using XGrammar for its better performance and utility. XGrammar currently uses the [GGML BNF format](https://github.com/ggerganov/llama.cpp/blob/master/grammars/README.md). For more details, see [XGrammar technical overview](https://blog.mlc.ai/2024/11/22/achieving-efficient-flexible-portable-structured-generation-with-xgrammar).
 
 To use Outlines, simply add `--grammar-backend outlines` when launching the server.
 To use llguidance, add `--grammar-backend llguidance`  when launching the server.
@@ -247,9 +247,9 @@ If a you choose to call a function ONLY reply in the following format:
 where
 start_tag => `<function`
 parameters => a JSON dict with the function argument name as key and function argument value as value.
-end_tag => `&lt;/function&gt;`
+end_tag => `</function>`
 Here is an example,
-&lt;function=example_function_name>{{"example_name": "example_value"}}&lt;/function&gt;
+<function=example_function_name>{{"example_name": "example_value"}}</function>
 Reminder:
 - Function calls MUST follow the specified format
 - Required parameters MUST be specified
@@ -274,17 +274,17 @@ response = client.chat.completions.create(
         "type": "structural_tag",
         "structures": [
             {
-                "begin": "&lt;function=get_current_weather>",
+                "begin": "<function=get_current_weather>",
                 "schema": schema_get_current_weather,
-                "end": "&lt;/function&gt;",
+                "end": "</function>",
             },
             {
-                "begin": "&lt;function=get_current_date>",
+                "begin": "<function=get_current_date>",
                 "schema": schema_get_current_date,
-                "end": "&lt;/function&gt;",
+                "end": "</function>",
             },
         ],
-        "triggers": ["&lt;function="],
+        "triggers": ["<function="],
     },
 )
 
@@ -303,23 +303,23 @@ response = client.chat.completions.create(
         "type": "structural_tag",
         "format": {
             "type": "triggered_tags",
-            "triggers": ["&lt;function="],
+            "triggers": ["<function="],
             "tags": [
                 {
-                    "begin": "&lt;function=get_current_weather>",
+                    "begin": "<function=get_current_weather>",
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema_get_current_weather,
                     },
-                    "end": "&lt;/function&gt;",
+                    "end": "</function>",
                 },
                 {
-                    "begin": "&lt;function=get_current_date>",
+                    "begin": "<function=get_current_date>",
                     "content": {
                         "type": "json_schema",
                         "json_schema": schema_get_current_date,
                     },
-                    "end": "&lt;/function&gt;",
+                    "end": "</function>",
                 },
             ],
             "at_least_one": False,
@@ -506,17 +506,17 @@ payload = {
                 "type": "structural_tag",
                 "structures": [
                     {
-                        "begin": "&lt;function=get_current_weather>",
+                        "begin": "<function=get_current_weather>",
                         "schema": schema_get_current_weather,
-                        "end": "&lt;/function&gt;",
+                        "end": "</function>",
                     },
                     {
-                        "begin": "&lt;function=get_current_date>",
+                        "begin": "<function=get_current_date>",
                         "schema": schema_get_current_date,
-                        "end": "&lt;/function&gt;",
+                        "end": "</function>",
                     },
                 ],
-                "triggers": ["&lt;function="],
+                "triggers": ["<function="],
             }
         )
     },
@@ -541,23 +541,23 @@ payload = {
                 "type": "structural_tag",
                 "format": {
                     "type": "triggered_tags",
-                    "triggers": ["&lt;function="],
+                    "triggers": ["<function="],
                     "tags": [
                         {
-                            "begin": "&lt;function=get_current_weather>",
+                            "begin": "<function=get_current_weather>",
                             "content": {
                                 "type": "json_schema",
                                 "json_schema": schema_get_current_weather,
                             },
-                            "end": "&lt;/function&gt;",
+                            "end": "</function>",
                         },
                         {
-                            "begin": "&lt;function=get_current_date>",
+                            "begin": "<function=get_current_date>",
                             "content": {
                                 "type": "json_schema",
                                 "json_schema": schema_get_current_date,
                             },
-                            "end": "&lt;/function&gt;",
+                            "end": "</function>",
                         },
                     ],
                     "at_least_one": False,
@@ -727,17 +727,17 @@ sampling_params = {
             "type": "structural_tag",
             "structures": [
                 {
-                    "begin": "&lt;function=get_current_weather>",
+                    "begin": "<function=get_current_weather>",
                     "schema": schema_get_current_weather,
-                    "end": "&lt;/function&gt;",
+                    "end": "</function>",
                 },
                 {
-                    "begin": "&lt;function=get_current_date>",
+                    "begin": "<function=get_current_date>",
                     "schema": schema_get_current_date,
-                    "end": "&lt;/function&gt;",
+                    "end": "</function>",
                 },
             ],
-            "triggers": ["&lt;function="],
+            "triggers": ["<function="],
         }
     ),
 }
@@ -763,23 +763,23 @@ sampling_params = {
             "type": "structural_tag",
             "format": {
                 "type": "triggered_tags",
-                "triggers": ["&lt;function="],
+                "triggers": ["<function="],
                 "tags": [
                     {
-                        "begin": "&lt;function=get_current_weather>",
+                        "begin": "<function=get_current_weather>",
                         "content": {
                             "type": "json_schema",
                             "json_schema": schema_get_current_weather,
                         },
-                        "end": "&lt;/function&gt;",
+                        "end": "</function>",
                     },
                     {
-                        "begin": "&lt;function=get_current_date>",
+                        "begin": "<function=get_current_date>",
                         "content": {
                             "type": "json_schema",
                             "json_schema": schema_get_current_date,
                         },
-                        "end": "&lt;/function&gt;",
+                        "end": "</function>",
                     },
                 ],
                 "at_least_one": False,

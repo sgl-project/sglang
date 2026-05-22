@@ -25,86 +25,125 @@ To run DeepSeek V3.1/V3/R1 models, the recommended settings are as follows:
   </thead>
   <tbody>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={5}>**Full precision [FP8](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528)** *(recommended)*</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={5}><strong>Full precision <a href="https://huggingface.co/deepseek-ai/DeepSeek-R1-0528">FP8</a></strong>&lt;br&gt;*(recommended)*</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x H200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x B200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x MI300X</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2 x 8 x H100/800/20</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Xeon 6980P CPU</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={4}>**Full precision ([BF16](https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16))** (upcast from original FP8)</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={4}><strong>Full precision (<a href="https://huggingface.co/unsloth/DeepSeek-R1-0528-BF16">BF16</a>)</strong> (upcast from original FP8)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2 x 8 x H200</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>2 x 8 x MI300X</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 x 8 x H100/800/20</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 x 8 x A100/A800</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={4}>**Quantized weights ([INT8](https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8))**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={4}><strong>Quantized weights (<a href="https://huggingface.co/meituan/DeepSeek-R1-Channel-INT8">INT8</a>)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>16 x A100/800</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>32 x L40S</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Xeon 6980P CPU</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>4 x Atlas 800I A3</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Quantized weights ([W4A8](https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8))**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Quantized weights (<a href="https://huggingface.co/novita/Deepseek-R1-0528-W4AFP8">W4A8</a>)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x H20/100, 4 x H200</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={2}>**Quantized weights ([AWQ](https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ))**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}} rowSpan={2}><strong>Quantized weights (<a href="https://huggingface.co/QuixiAI/DeepSeek-R1-0528-AWQ">AWQ</a>)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x H100/800/20</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8 x A100/A800</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Quantized weights ([MXFP4](https://huggingface.co/amd/DeepSeek-R1-MXFP4-Preview))**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Quantized weights (<a href="https://huggingface.co/amd/DeepSeek-R1-MXFP4-Preview">MXFP4</a>)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8, 4 x MI355X/350X</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Quantized weights ([NVFP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2))**</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Quantized weights (<a href="https://huggingface.co/nvidia/DeepSeek-R1-0528-NVFP4-v2">NVFP4</a>)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>8, 4 x B200</td>
     </tr>
   </tbody>
 </table>
 
+<style>
+.md-typeset__table &#123;
+  width: 100%;
+&#125;
 
-<Callout icon="key" color="#FFC107" iconType="regular">
+.md-typeset__table table &#123;
+  border-collapse: collapse;
+  margin: 1em 0;
+  border: 2px solid var(--md-typeset-table-color);
+  table-layout: fixed;
+&#125;
+
+.md-typeset__table th &#123;
+  border: 1px solid var(--md-typeset-table-color);
+  border-bottom: 2px solid var(--md-typeset-table-color);
+  background-color: var(--md-default-bg-color--lighter);
+  padding: 12px;
+&#125;
+
+.md-typeset__table td &#123;
+  border: 1px solid var(--md-typeset-table-color);
+  padding: 12px;
+&#125;
+
+.md-typeset__table tr:nth-child(2n) &#123;
+  background-color: var(--md-default-bg-color--lightest);
+&#125;
+</style>
+
+<Warning>
 The official DeepSeek V3 is already in FP8 format, so you should not run it with any quantization arguments like `--quantization fp8`.
-</Callout>
+</Warning>
 
 Detailed commands for reference:
 
 - [8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#using-docker-recommended)
 - [4 x B200, 8 x B200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-one-b200-node)
-- [8 x MI300X](../hardware-platforms/amd-gpus#running-deepseek-v3)
-- [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes)
+- [8 x MI300X](../hardware-platforms/amd_gpu#running-deepseek-v3)
+- [2 x 8 x H200](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker)
 - [4 x 8 x A100](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-four-a1008-nodes)
 - [8 x A100 (AWQ)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-8-a100a800-with-awq-quantization)
 - [16 x A100 (INT8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-16-a100a800-with-int8-quantization)
 - [32 x L40S (INT8)](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-32-l40s-with-int8-quantization)
-- [Xeon 6980P CPU](../hardware-platforms/cpu-server#example-running-deepseek-v31-terminus)
-- [4 x Atlas 800I A3 (int8)](../hardware-platforms/ascend-npus/DeepSeek-Examples#running-deepseek-with-pd-disaggregation-on-4-x-atlas-800i-a3)
+- [Xeon 6980P CPU](../hardware-platforms/cpu_server#example-running-deepseek-r1)
+- [4 x Atlas 800I A3 (int8)](../hardware-platforms/ascend-npus/ascend_npu_deepseek_example#running-deepseek-with-pd-disaggregation-on-4-x-atlas-800i-a3)
 
 ### Download Weights
 If you encounter errors when starting the server, ensure the weights have finished downloading. It's recommended to download them beforehand or restart multiple times until all weights are downloaded. Please refer to [DeepSeek V3](https://huggingface.co/deepseek-ai/DeepSeek-V3-Base#61-inference-with-deepseek-infer-demo-example-only) official guide to download the weights.
@@ -116,7 +155,7 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 - [Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP](https://lmsys.org/blog/2025-06-16-gb200-part-1/) ([Part I](https://lmsys.org/blog/2025-06-16-gb200-part-1/), [Part II](https://lmsys.org/blog/2025-09-25-gb200-part-2/)) - Comprehensive guide on GB200 optimizations.
 
-- [Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs](https://lmsys.org/blog/2025-05-05-deepseek-pd-ep/) - Guide on PD disaggregation and large-scale EP.
+- [Deploying DeepSeek with PD Disaggregation and Large-Scale Expert Parallelism on 96 H100 GPUs](https://lmsys.org/blog/2025-05-05-large-scale-ep/) - Guide on PD disaggregation and large-scale EP.
 
 - [Serving with two H20*8 nodes](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h208-nodes).
 
@@ -144,9 +183,9 @@ Please refer to [the example](https://github.com/sgl-project/sglang/tree/main/be
 
 Overall, with these optimizations, we have achieved up to **7x** acceleration in output throughput compared to the previous version.
 
-<Frame>
-  <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models"/>
-</Frame>
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_3/deepseek_mla.svg" alt="Multi-head Latent Attention for DeepSeek Series Models" />
+</p>
 
 **Usage**: MLA optimization is enabled by default.
 
@@ -156,15 +195,15 @@ Overall, with these optimizations, we have achieved up to **7x** acceleration in
 
 **Description**: This optimization involves data parallelism (DP) for the MLA attention mechanism of DeepSeek Series Models, which allows for a significant reduction in the KV cache size, enabling larger batch sizes. Each DP worker independently handles different types of batches (prefill, decode, idle), which are then synchronized before and after processing through the Mixture-of-Experts (MoE) layer. If you do not use DP attention, KV cache will be duplicated among all TP ranks.
 
-<Frame>
-  <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models"/>
-</Frame>
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_4/dp_attention.svg" alt="Data Parallelism Attention for DeepSeek Series Models" />
+</p>
 
 With data parallelism attention enabled, we have achieved up to **1.9x** decoding throughput improvement compared to the previous version.
 
-<Frame>
-  <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison"/>
-</Frame>
+<p align="center">
+  <img src="https://lmsys.org/images/blog/sglang_v0_4/deepseek_coder_v2.svg" alt="Data Parallelism Attention Performance Comparison" />
+</p>
 
 **Usage**:
 - Append `--enable-dp-attention --tp 8 --dp 8` to the server arguments when using 8 H200 GPUs. This optimization improves peak throughput in high batch size scenarios where the server is limited by KV cache capacity.
@@ -180,7 +219,7 @@ Data parallelism attention is not recommended for low-latency, small-batch use c
 
 **Description**: For users with limited memory on a single node, SGLang supports serving DeepSeek Series Models, including DeepSeek V3, across multiple nodes using tensor parallelism. This approach partitions the model parameters across multiple GPUs or nodes to handle models that are too large for one node's memory.
 
-**Usage**: Check [here](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-2-h208) for usage examples.
+**Usage**: Check [here](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3#example-serving-with-two-h2008-nodes-and-docker) for usage examples.
 
 ### Block-wise FP8
 
@@ -215,7 +254,7 @@ python3 -m sglang.launch_server \
   --tp 8
 ```
 - The default configuration for DeepSeek models is `--speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`. The best configuration for `--speculative-num-steps`, `--speculative-eagle-topk` and `--speculative-num-draft-tokens` can be searched with [bench_speculative.py](https://github.com/sgl-project/sglang/blob/main/scripts/playground/bench_speculative.py) script for given batch size. The minimum configuration is `--speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2`, which can achieve speedup for larger batch sizes.
-- Most MLA attention backends fully support MTP usage. See [MLA Backends](../advanced_features/attention_backend.md#mla-backends) for details.
+- Most MLA attention backends fully support MTP usage. See [MLA Backends](../advanced_features/attention_backend#mla-backends) for details.
 
 <Note>
 To enable DeepSeek MTP for large batch sizes (>48), you need to adjust some parameters (Reference [this discussion](https://github.com/sgl-project/sglang/issues/4543#issuecomment-2737413756)):
@@ -250,10 +289,10 @@ python3 -m sglang.launch_server \
 
 Sample Request:
 
-```text Output
+```
 curl "http://127.0.0.1:30000/v1/chat/completions" \
 -H "Content-Type: application/json" \
--d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324", "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324", "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of a city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "How'\''s the weather like in Qingdao today"}]}'
 ```
 
 Expected Response
@@ -263,10 +302,10 @@ Expected Response
 
 ```
 Sample Streaming Request:
-```text Output
+```
 curl "http://127.0.0.1:30000/v1/chat/completions" \
 -H "Content-Type: application/json" \
--d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324","stream":true,"tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of an city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "Hows the weather like in Qingdao today"}]}'
+-d '{"temperature": 0, "max_tokens": 100, "model": "deepseek-ai/DeepSeek-V3-0324","stream":true,"tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of a city, the user should supply a city first", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city, e.g. Beijing"}}, "required": ["city"]}}}], "messages": [{"role": "user", "content": "How'\''s the weather like in Qingdao today"}]}'
 ```
 Expected Streamed Chunks (simplified for clarity):
 ```text Output
@@ -284,10 +323,11 @@ The client needs to concatenate all arguments fragments to reconstruct the compl
 ```text Output
 {"city": "Qingdao"}
 ```
-<Callout icon="key" color="#FFC107" iconType="regular">
+
+<Warning>
 1. Use a lower `"temperature"` value for better results.
 2. To receive more consistent tool call results, it is recommended to use `--chat-template examples/chat_template/tool_chat_template_deepseekv3.jinja`. It provides an improved unified prompt.
-</Callout>
+</Warning>
 
 
 ### Thinking Budget for DeepSeek R1
@@ -302,7 +342,6 @@ python3 -m sglang.launch_server --model deepseek-ai/DeepSeek-R1 --tp 8 --port 30
 
 Sample Request:
 
-<CodeGroup>
 ```python Sample Request
 import openai
 from rich.pretty import pprint
@@ -328,7 +367,6 @@ response = client.chat.completions.create(
 )
 pprint(response)
 ```
-</CodeGroup>
 
 ## FAQ
 

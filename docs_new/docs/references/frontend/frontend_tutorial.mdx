@@ -5,12 +5,9 @@ metatags:
 ---
 SGLang frontend language can be used to define simple and easy prompts in a convenient, structured way.
 
-
 ## Launch A Server
 
 Launch the server in your terminal and wait for it to initialize.
-
-
 
 ```python Example
 from sglang import assistant_begin, assistant_end
@@ -26,13 +23,11 @@ server_process, port = launch_server_cmd(
     "python -m sglang.launch_server --model-path Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --log-level warning"
 )
 
-wait_for_server(f"http://localhost:{port}")
+wait_for_server(f"http://localhost:{port}", process=server_process)
 print(f"Server started on http://localhost:{port}")
 ```
 
 Set the default backend. Note: Besides the local server, you may use also `OpenAI` or other API endpoints.
-
-
 
 ```python Example
 set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
@@ -42,8 +37,6 @@ set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
 
 The most simple way of using SGLang frontend language is a simple question answer dialog between a user and an assistant.
 
-
-
 ```python Example
 @function
 def basic_qa(s, question):
@@ -51,7 +44,6 @@ def basic_qa(s, question):
     s += user(question)
     s += assistant(gen("answer", max_tokens=512))
 ```
-
 
 ```python Example
 state = basic_qa("List 3 countries and their capitals.")
@@ -61,8 +53,6 @@ print_highlight(state["answer"])
 ## Multi-turn Dialog
 
 SGLang frontend language can also be used to define multi-turn dialogs.
-
-
 
 ```python Example
 @function
@@ -83,8 +73,6 @@ print_highlight(state["second_answer"])
 ## Control flow
 
 You may use any Python code within the function to define more complex control flows.
-
-
 
 ```python Example
 @function
@@ -111,8 +99,6 @@ print_highlight(state["expression"])
 ## Parallelism
 
 Use `fork` to launch parallel prompts. Because `sgl.gen` is non-blocking, the for loop below issues two generation calls in parallel.
-
-
 
 ```python Example
 @function
@@ -144,8 +130,6 @@ print_highlight(state["summary"])
 
 Use `regex` to specify a regular expression as a decoding constraint. This is only supported for local models.
 
-
-
 ```python Example
 @function
 def regular_expression_gen(s):
@@ -164,8 +148,6 @@ print_highlight(state["answer"])
 ```
 
 Use `regex` to define a `JSON` decoding schema.
-
-
 
 ```python Example
 character_regex = (
@@ -202,8 +184,6 @@ print_highlight(state["json_output"])
 
 Use `run_batch` to run a batch of prompts.
 
-
-
 ```python Example
 @function
 def text_qa(s, question):
@@ -228,8 +208,6 @@ for i, state in enumerate(states):
 
 Use `stream` to stream the output to the user.
 
-
-
 ```python Example
 @function
 def text_qa(s, question):
@@ -247,9 +225,7 @@ for out in state.text_iter():
 
 ## Complex Prompts
 
-You may use `{system|user|assistant}_{begin|end}` to define complex prompts.
-
-
+You may use `&#123;system|user|assistant&#125;_&#123;begin|end&#125;` to define complex prompts.
 
 ```python Example
 @function
@@ -269,7 +245,6 @@ state = chat_example()
 print_highlight(state["answer"])
 ```
 
-
 ```python Example
 terminate_process(server_process)
 ```
@@ -277,27 +252,22 @@ terminate_process(server_process)
 ## Multi-modal Generation
 
 You may use SGLang frontend language to define multi-modal prompts.
-See [here](../../supported-models/large-language-models) for supported models.
-
-
+See [here](../../supported-models/multimodal_language_models) for supported models.
 
 ```python Example
 server_process, port = launch_server_cmd(
     "python -m sglang.launch_server --model-path Qwen/Qwen2.5-VL-7B-Instruct --host 0.0.0.0 --log-level warning"
 )
 
-wait_for_server(f"http://localhost:{port}")
+wait_for_server(f"http://localhost:{port}", process=server_process)
 print(f"Server started on http://localhost:{port}")
 ```
-
 
 ```python Example
 set_default_backend(RuntimeEndpoint(f"http://localhost:{port}"))
 ```
 
 Ask a question about an image.
-
-
 
 ```python Example
 @function
@@ -306,12 +276,11 @@ def image_qa(s, image_file, question):
     s += assistant(gen("answer", max_tokens=256))
 
 
-image_url = "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
+image_url = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 image_bytes, _ = load_image(image_url)
 state = image_qa(image_bytes, "What is in the image?")
 print_highlight(state["answer"])
 ```
-
 
 ```python Example
 terminate_process(server_process)

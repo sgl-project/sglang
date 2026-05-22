@@ -5,28 +5,69 @@ metatags:
 ---
 ## Benchmark
 
-- Benchmark the latency of running a single static batch without a server. The arguments are the same as for `launch_server.py`.
-  Note that this is a simplified test script without a dynamic batching server, so it may run out of memory for a batch size that a real server can handle. A real server truncates the prefill into several batches, while this simplified script does not.
-  - Without a server (do not need to launch a server)
-    ```bash Command
-    python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32
-    ```
-  - With a server (please use `sglang.launch_server` to launch a server first and run the following command.)
-    ```bash Command
-    python -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
-    ```
+SGLang provides four benchmark tools that operate at different levels of the stack. The table below summarizes their key differences:
 
+<table>
+  <thead>
+    <tr>
+      <th>Tool</th>
+      <th>HTTP Server</th>
+      <th>Scheduler</th>
+      <th>Use Case</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>bench_serving</code></td>
+      <td>Yes (async HTTP client to a running server)</td>
+      <td>Yes (indirectly, via server)</td>
+      <td>Realistic online serving benchmarks with latency metrics (TTFT, TPOT, ITL)</td>
+    </tr>
+    <tr>
+      <td><code>bench_one_batch_server</code></td>
+      <td>Yes (sends HTTP requests to a running server)</td>
+      <td>Yes (indirectly, via server)</td>
+      <td>End-to-end single-batch latency including HTTP and scheduler overhead</td>
+    </tr>
+    <tr>
+      <td><code>bench_offline_throughput</code></td>
+      <td>No</td>
+      <td>Yes (directly uses <code>Engine</code> in-process)</td>
+      <td>Maximum throughput measurement without HTTP overhead</td>
+    </tr>
+    <tr>
+      <td><code>bench_one_batch</code></td>
+      <td>No</td>
+      <td>No (directly calls <code>ModelRunner</code>)</td>
+      <td>Kernel-level latency profiling of a single static batch</td>
+    </tr>
+  </tbody>
+</table>
 
-- Benchmark offline processing. This script will start an offline engine and run the benchmark.
+Use `bench_serving` by default unless there are specific needs.
+
+**`bench_serving`** is an async HTTP load-testing client that sends requests at controlled rates with configurable concurrency to a running server. It measures realistic online serving metrics including time-to-first-token (TTFT), time-per-output-token (TPOT), inter-token latency (ITL), and throughput. Use `num-prompts >= 5 * max-concurrency` to measure steady-state performance. Launch a server with `sglang.launch_server` first.
+
+  ```bash Command
+  python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
+  ```
+
+**`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
+
+  ```bash Command
+  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  ```
+
+**`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash Command
   python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
   ```
 
-- Benchmark online serving. Please use `sglang.launch_server` to launch a server first and run the following command.
+**`bench_one_batch`** is the lowest-level tool. It directly instantiates a `ModelRunner` and calls `extend()` / `decode()` on a fixed static batch, bypassing the scheduler entirely. The prefill and decode phases are run separately, making profiling easier but rendering the metrics unrealistic. Because there is no dynamic batching, it may run out of memory for batch sizes that a real server can handle (a real server chunks prefill into smaller batches). This is best suited for profiling individual kernel performance.
 
   ```bash Command
-  python3 -m sglang.bench_serving --backend sglang --num-prompt 10
+  python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 ## Profile with PyTorch Profiler
@@ -46,7 +87,10 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
-Please make sure that the `SGLANG_TORCH_PROFILER_DIR` should be set at both server and client side, otherwise the trace file cannot be generated correctly . A secure way will be setting `SGLANG_TORCH_PROFILER_DIR` in the `.*rc` file of shell (e.g. `~/.bashrc` for bash shells).
+For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
+If you call `/start_profile` directly and do not provide `output_dir`, the server uses its own `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`).
+
+Setting `SGLANG_TORCH_PROFILER_DIR` on both server and client is still recommended to avoid confusion about where traces are written.
 
 For more details, please refer to [Bench Serving Guide](./bench_serving).
 
@@ -147,7 +191,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 **Parameters:**
 
 - `output_dir` (optional): Directory where profile traces will be saved. If not specified, uses `SGLANG_TORCH_PROFILER_DIR` environment variable, or `/tmp` as the default
-- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/end_profile`
+- `num_steps` (optional): Number of steps to profile. If not specified, profiling continues until manually stopped with `/stop_profile`
 - `start_step` (optional): Step number at which to start profiling (inclusive). Useful for skipping warmup iterations
 - `activities` (optional): List of activities to profile, e.g., `["CPU", "GPU"]`. Default is `["CPU", "GPU"]`
 - `merge_profiles` (optional): Whether to merge distributed traces. Default is `false`
@@ -171,17 +215,17 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 **Continuous profiling (manual stop):**
 
 ```bash Command
-# Start profiling without num_steps - must manually stop with /end_profile
+# Start profiling without num_steps - must manually stop with /stop_profile
 curl -X POST http://127.0.0.1:30000/start_profile
 ```
 
-#### Using `/end_profile` endpoint
+#### Using `/stop_profile` endpoint
 
-The `/end_profile` endpoint stops an ongoing profiling session and saves the trace file.
+The `/stop_profile` endpoint stops an ongoing profiling session and saves the trace file.
 
 ```bash Command
 # Stop profiling and save traces
-curl -X POST http://127.0.0.1:30000/end_profile
+curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
@@ -204,7 +248,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 python -m sglang.bench_serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
-curl -X POST http://127.0.0.1:30000/end_profile
+curl -X POST http://127.0.0.1:30000/stop_profile
 ```
 
 ### Profiler Trace Merger for Distributed Traces
@@ -246,8 +290,8 @@ python -m sglang.profiler \
 #### Output Files
 
 The profile merger generates:
-- Individual rank trace files: `{profile_id}-TP-{tp}-DP-{dp}-PP-{pp}-EP-{ep}.trace.json.gz`
-- Merged trace file: `merged-{profile_id}.trace.json.gz`
+- Individual rank trace files: `&#123;profile_id&#125;-TP-&#123;tp&#125;-DP-&#123;dp&#125;-PP-&#123;pp&#125;-EP-&#123;ep&#125;.trace.json.gz`
+- Merged trace file: `merged-&#123;profile_id&#125;.trace.json.gz`
 
 ### Possible PyTorch bugs
 If in any cases you encounter the following error (for example, using qwen 2.5 VL):
@@ -398,10 +442,10 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 2: Only needed if num_steps was not specified
-   curl -X POST http://127.0.0.1:30000/end_profile
+   curl -X POST http://127.0.0.1:30000/stop_profile
    ```
 
-The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/end_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
+The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/stop_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
 
 **Method 2: Simpler approach without `/start_profile` API**
 

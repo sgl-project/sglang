@@ -43,6 +43,16 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Elastic EP serving.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>nixl</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://github.com/ai-dynamo/nixl/tree/main/examples/device/ep">NIXL-EP</a>, an elastic EP communication library built on NVIDIA's <a href="https://github.com/ai-dynamo/nixl">NIXL</a> framework with native RDMA and NVLink support.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Elastic EP serving with fault tolerance and dynamic scaling.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>mori</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MORI-EP, AMD's native all-to-all communication implementation optimized for ROCm.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>AMD GPU deployments.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`flashinfer`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flashinfer implementation of all-to-all.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Large-scale EP deployments.</td>
@@ -55,9 +65,9 @@ SGLang's EP integrates diverse, highly efficient backends for different use case
   </tbody>
 </table>
 
-DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
+DeepEP and Mooncake backends support two modes for token dispatch: `normal` mode (optimized for prefill workloads with high throughput) and `low_latency` mode (optimized for decode workloads with low latency and CUDA Graph compatibility). MORI backend only supports `normal` mode now. NIXL-EP currently operates in low-latency mode with CUDA Graph support. Users are recommended to set `--deepep-mode auto` to enable automatic dispatch mode switching during runtime. Setting `--deepep-mode normal` or `--deepep-mode low_latency` is useful for debugging or development purposes.
 
-Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
+Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep` and MORI only support cases where `ep_size = tp_size`. For hybrid EP and TP (i.e., `ep_size < tp_size`), only the `none` backend (All-Reduce or All-Gather-based dispatching) is supported.
 
 ### Backends for MoE Computation
 
@@ -82,7 +92,7 @@ Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton-based implementation for grouped GEMMs. To achieve higher performance, it's highly recommended to create [tuned configurations](https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/README).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Triton-based implementation for grouped GEMMs. To achieve higher performance, it's highly recommended to create <a href="https://github.com/sgl-project/sglang/blob/main/benchmark/kernels/fused_moe_triton/README.md">tuned configurations</a>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Custom kernel development or scenarios requiring high extensibility with Torch compilation support.</td>
     </tr>
     <tr>
@@ -98,6 +108,11 @@ Currently, DeepEP and Mooncake only support cases where `ep_size = tp_size`. For
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`flashinfer_trtllm`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer integrated with TensorRT-LLM for accelerated MoE computations, supporting FP4 communication operators and high-performance GEMMs.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell with TRT-LLM.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>flashinfer_trtllm_routed</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>FlashInfer integrated with TensorRT-LLM for accelerated routed MoE computations, consuming SGLang-computed top-k expert assignments and weights.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Blackwell with TRT-LLM.</td>
     </tr>
     <tr>
@@ -242,7 +257,7 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
 
 ## Ascend NPU Guidance
 ### Guidance on SGLang configuration in Ascend NPU
-- `--moe-a2a-backend` only supports deepep and ascend_fuseep backends,
+- `--moe-a2a-backend` only supports `deepep` and `ascend_fuseep` backends,
 
     - `deepep`: The mechanism is consistent with the above description.
 
@@ -252,12 +267,13 @@ For model like `nvidia/DeepSeek-R1-0528-NVFP4-v2`, the target model uses NVFP4 p
 
 - `--deepep-mode`:
 
-    - In PD mixed mode, please set `--deepep-mode` auto.
+    - In PD mixed mode, please set `--deepep-mode auto`.
 
-    - In PD Disaggregation Mode, prefill instance sets `--deepep-mode` normal, and decode instance sets `--deepep-mode` low_latency.
+    - In PD Disaggregation Mode, prefill instance sets `--deepep-mode normal`, and decode instance sets `--deepep-mode low_latency`.
 
 ### DeepEP Ascend Introduction
-DeepEP Ascend is the adapted version of the DeepEP communication library for Huawei Ascend NPUs, specifically designed for Mixture-of-Experts (MoE) model Expert Parallelism (EP). It supports the Ant-moving Function (Split the sequence length into rounds for streaming batch transmission) to optimize the buffer size occupied during collective communication in prefill stage, especially for long sequences.
+DeepEP Ascend is the adapted version of the DeepEP communication library for Huawei Ascend NPUs, specifically designed for Mixture-of-Experts (MoE) model Expert Parallelism (EP).
+It supports the Ant-moving Function (Split the sequence length into rounds for streaming batch transmission) to optimize the buffer size occupied during collective communication in prefill stage, especially for long sequences.
 
 Ant-moving Function can be enabled for both the dispatch and combine phases via the following environment variables:
 

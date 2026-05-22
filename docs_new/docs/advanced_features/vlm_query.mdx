@@ -9,7 +9,6 @@ This tutorial demonstrates how to use SGLang's **offline Engine API** to query V
 2. **Processor Output**: Use HuggingFace processor for data preprocessing.
 3. **Precomputed Embeddings**: Pre-calculate image features to improve inference efficiency.
 
-
 ## Understanding the Three Input Formats
 
 SGLang supports three ways to pass visual data, each optimized for different scenarios:
@@ -35,20 +34,19 @@ SGLang supports three ways to pass visual data, each optimized for different sce
 
 The examples below demonstrate all three approaches with both Qwen2.5-VL and Llama 4 models.
 
-
 ## Querying Qwen2.5-VL Model
-
-
 
 ```python Example
 import nest_asyncio
 
 nest_asyncio.apply()
 
+import sglang.test.doc_patch  # noqa: F401
+
 model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
 chat_template = "qwen2-vl"
+example_image_url = "https://raw.githubusercontent.com/sgl-project/sglang/main/examples/assets/example_image.png"
 ```
-
 
 ```python Example
 from io import BytesIO
@@ -57,13 +55,7 @@ from PIL import Image
 
 from sglang.srt.parser.conversation import chat_templates
 
-image = Image.open(
-    BytesIO(
-        requests.get(
-            "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
-        ).content
-    )
-)
+image = Image.open(BytesIO(requests.get(example_image_url).content))
 
 conv = chat_templates[chat_template].copy()
 conv.append_message(conv.roles[0], f"What's shown here: {conv.image_token}?")
@@ -78,15 +70,11 @@ image
 
 ### Basic Offline Engine API Call
 
-
-
 ```python Example
 from sglang import Engine
 
-
 llm = Engine(model_path=model_path, chat_template=chat_template, log_level="warning")
 ```
-
 
 ```python Example
 out = llm.generate(prompt=conv.get_prompt(), image_data=[image])
@@ -97,8 +85,6 @@ print(out["text"])
 ### Call with Processor Output
 
 Using a HuggingFace processor to preprocess text and images, and passing the `processor_output` directly into `Engine.generate`.
-
-
 
 ```python Example
 from transformers import AutoProcessor
@@ -120,18 +106,14 @@ print(out["text"])
 
 You can pre-calculate image features to avoid repeated visual encoding processes.
 
-
-
 ```python Example
 from transformers import AutoProcessor
 from transformers import Qwen2_5_VLForConditionalGeneration
 
 processor = AutoProcessor.from_pretrained(model_path, use_fast=True)
-vision = (
-    Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path).eval().visual.cuda()
-)
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_path).eval()
+vision = model.model.visual.cuda()
 ```
-
 
 ```python Example
 processor_output = processor(
@@ -143,6 +125,7 @@ input_ids = processor_output["input_ids"][0].detach().cpu().tolist()
 precomputed_embeddings = vision(
     processor_output["pixel_values"].cuda(), processor_output["image_grid_thw"].cuda()
 )
+precomputed_embeddings = precomputed_embeddings.pooler_output
 
 multi_modal_item = dict(
     processor_output,
@@ -170,13 +153,7 @@ from PIL import Image
 from sglang.srt.parser.conversation import chat_templates
 
 # Download the same example image
-image = Image.open(
-    BytesIO(
-        requests.get(
-            "https://github.com/sgl-project/sglang/blob/main/examples/assets/example_image.png?raw=true"
-        ).content
-    )
-)
+image = Image.open(BytesIO(requests.get(example_image_url).content))
 
 conv = chat_templates[chat_template].copy()
 conv.append_message(conv.roles[0], f"What's shown here: {conv.image_token}?")
@@ -189,7 +166,6 @@ print(f"Image size: {image.size}")
 
 image
 ```
-
 
 ### Llama 4 Basic Call
 
@@ -208,7 +184,6 @@ out = llm.generate(prompt=conv.get_prompt(), image_data=[image])
 print("Llama 4 response:")
 print(out["text"])
 ```
-
 
 ### Call with Processor Output
 
@@ -229,7 +204,6 @@ out = llm.generate(
 print("Response using processor output:")
 print(out)
 ```
-
 
 ### Call with Precomputed Embeddings
 

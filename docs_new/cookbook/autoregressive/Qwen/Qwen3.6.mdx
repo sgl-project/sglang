@@ -1,7 +1,7 @@
 ---
 title: Qwen3.6
 metatags:
-    description: "Deploy Qwen3.6 with SGLang - open-weight 35B MoE multimodal model with 3B active parameters, thinking preservation, tool calling, MTP, and long-context support."
+    description: "Deploy Qwen3.6 with SGLang - open-weight multimodal series with a 35B MoE (3B active) variant and a 27B dense variant, hybrid reasoning, tool calling, MTP, and long-context support."
 tag: NEW
 ---
 
@@ -9,18 +9,21 @@ import { Qwen36Deployment } from '/src/snippets/autoregressive/qwen36-deployment
 
 ## 1. Model Introduction
 
-[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) is the first open-weight variant of the Qwen3.6 series developed by Alibaba. Built on direct feedback from the community, Qwen3.6 prioritizes stability and real-world utility, delivering substantial upgrades in agentic coding and thinking preservation.
+The Qwen3.6 series is developed by Alibaba. Built on direct feedback from the community, Qwen3.6 prioritizes stability and real-world utility, delivering substantial upgrades in agentic coding and thinking preservation. Two size/sparsity variants are released:
 
-Qwen3.6 features a Gated Delta Networks combined with sparse Mixture-of-Experts architecture (35B total parameters, 3B activated), supporting multimodal inputs (text, image, video) and natively handles context lengths of up to 262,144 tokens, extensible to over 1M tokens.
+- [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) — **Sparse MoE** (35B total, 3B active) on a Gated Delta Networks backbone.
+- [Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) — **Dense** hybrid GDN; smaller weights footprint, single-GPU friendly.
+
+Both variants share the same hybrid reasoning, tool-calling, and multimodal interface and natively handle context lengths of up to 262,144 tokens, extensible to over 1M tokens.
 
 **Key Features:**
 
 - **Agentic Coding**: Handles frontend workflows and repository-level reasoning with greater fluency and precision
 - **Thinking Preservation**: New option to retain reasoning context from historical messages, streamlining iterative development
-- **Efficient Hybrid Architecture**: Gated Delta Networks + sparse MoE (35B total / 3B active) for high-throughput inference
+- **Efficient Hybrid Architecture**: Gated Delta Networks backbone; sparse MoE (35B / 3B active) or dense 27B variant
 - **Hybrid Reasoning**: Thinking mode enabled by default with step-by-step reasoning, can be disabled for direct responses
 - **Tool Calling**: Built-in tool calling support with `qwen3_coder` parser
-- **Multi-Token Prediction (MTP)**: Speculative decoding support for lower latency
+- **Multi-Token Prediction (MTP)**: Speculative decoding support for lower latency; both MoE and Dense variants ship `mtp.safetensors`
 - **Multimodal**: Unified vision-language model supporting text, image, and video inputs
 
 **Available Models:**
@@ -29,17 +32,30 @@ Qwen3.6 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
   <thead>
     <tr>
       <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Model</th>
+      <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Architecture</th>
       <th style={{padding: "9px 12px", textAlign: "left", borderBottom: "1px solid rgba(148,163,184,0.3)"}}>Weights</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-35B-A3B (BF16)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MoE 35B / 3B active</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.6-35B-A3B (FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>MoE 35B / 3B active</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.6-27B (BF16)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Dense 27B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>[Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.6-27B (FP8)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Dense 27B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)</td>
     </tr>
   </tbody>
 </table>
@@ -48,11 +64,11 @@ Qwen3.6 features a Gated Delta Networks combined with sparse Mixture-of-Experts 
 
 ## 2. SGLang Installation
 
-SGLang `>=0.5.10` is required for Qwen3.6. You can install from source or use a Docker image:
+SGLang `>=0.5.10` is required for Qwen3.6. You can install from PyPI, from source, or use a Docker image:
 
 ```bash Command
 # Install from PyPI
-uv pip install "sglang[all]"
+uv pip install sglang
 
 # Or install from source
 uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
@@ -61,7 +77,7 @@ uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=pytho
 docker pull lmsysorg/sglang:latest
 ```
 
-For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/installation).
+For the full Docker setup and other installation methods, please refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
 ## 3. Model Deployment
 
@@ -86,8 +102,12 @@ This section provides deployment configurations optimized for different hardware
 - **Multimodal Attention Backend**: Use `--mm-attention-backend fa3` on H100/H200 for better vision performance, or `--mm-attention-backend fa4` on B200.
 - For processing large images or videos, you may need to lower `--mem-fraction-static` to leave room for image feature tensors.
 - Hardware requirements:
-    - **BF16**: ~35B parameters require ~70GB of GPU memory for weights. TP=1 fits on all supported hardware.
-    - **FP8**: The FP8 quantized model requires ~35GB for weights. TP=1 fits on all supported hardware.
+    - **35B-A3B BF16**: ~70GB for weights. TP=1 fits on all supported hardware.
+    - **35B-A3B FP8**: ~35GB for weights. TP=1 fits on all supported hardware.
+    - **27B BF16**: ~54GB for weights. TP=1 fits on all supported hardware.
+    - **27B FP8**: ~27GB for weights. TP=1 fits on all supported hardware.
+
+All Qwen3.6 variants (MoE 35B-A3B and Dense 27B) fit on a single supported GPU at both precisions:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <thead>
@@ -123,7 +143,7 @@ This section provides deployment configurations optimized for different hardware
 
 ## 4. Model Invocation
 
-Deploy Qwen3.6-35B-A3B with the following command (H200, all features enabled):
+Deploy Qwen3.6 with the following command (H200, all features enabled). Swap `--model-path` to `Qwen/Qwen3.6-27B-FP8` for the dense 27B variant — all other flags carry over:
 
 ```shell Command
 SGLANG_ENABLE_SPEC_V2=1 sglang serve \
