@@ -205,7 +205,7 @@ class GlmImageAR(PipelineStage):
             - pixel_height: Image height in pixels
             - pixel_width: Image width in pixels
         """
-        device = self.vision_language_encoder.device
+        device = get_local_torch_device()
         height = (height // factor) * factor
         width = (width // factor) * factor
 
