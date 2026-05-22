@@ -37,8 +37,6 @@ __all__ = [
     "make_write_plan",
     "make_write_plan_pair",
     "read_slot_fields",
-    "splitmix64",
-    "splitmix64_mix4",
     "stamp_clean_chain",
     "stamp_pair",
     "to_signed_int64",

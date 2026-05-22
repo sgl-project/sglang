@@ -9,6 +9,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary import write as write_module
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
@@ -34,8 +35,6 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_write_plan,
     make_write_plan_pair,
     read_slot_fields,
-    splitmix64,
-    splitmix64_mix4,
     stamp_pair,
     to_signed_int64,
 )
