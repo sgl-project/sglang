@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from typing import Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union
 
 import torch
-from tvm_ffi.module import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
-    is_arch_support_pdl,
-    load_jit,
-    make_cpp_args,
-)
 
 from .utils import make_name
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 
 @cache_once
