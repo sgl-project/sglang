@@ -76,6 +76,7 @@ class MockModelRunner:
             device=self.device,
             enable_memory_saver=False,
         )
+        self.hisparse_coordinator = None
 
 
 class MockReqToTokenPool:
