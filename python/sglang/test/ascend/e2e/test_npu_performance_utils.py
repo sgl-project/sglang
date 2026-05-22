@@ -107,6 +107,9 @@ QWEN3_235B_W8A8_MODEL_PATH = (
 QWEN3_235B_A22B_EAGLE_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Qwen/Qwen3-235B-A22B-Eagle3"
 )
+QWEN3_235B_A22B_INSTRUCT_2507_W8A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/zcgy26/Qwen3-235B-A22B-Instruct-2507-w8a8"
+)
 QWEN3_480B_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot"
 )
