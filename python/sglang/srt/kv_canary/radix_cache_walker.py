@@ -19,6 +19,7 @@ class RadixCacheWalkResult:
     positions: torch.Tensor
     prev_slot_indices: torch.Tensor
 
+
 def walk_radix_cache_for_canary(
     *,
     radix_cache: "BasePrefixCache",

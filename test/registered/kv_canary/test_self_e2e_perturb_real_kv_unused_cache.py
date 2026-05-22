@@ -60,27 +60,21 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
         self.maybe_assert_swa_divergence_observed()
 
 
-class TestPerturbRealKvUnusedCacheMhaFull(
-    _PerturbRealKvUnusedCacheBase
-):
+class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
     model_mode = "mha"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUnusedCacheSwaFull(
-    _PerturbRealKvUnusedCacheBase
-):
+class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUnusedCacheSwaSwa(
-    _PerturbRealKvUnusedCacheBase
-):
+class TestPerturbRealKvUnusedCacheSwaSwa(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
     model_mode = "swa"
