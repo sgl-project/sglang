@@ -1083,12 +1083,21 @@ class BaseMultimodalProcessor(ABC):
 
         return collected_items, input_ids, ret
 
+    @staticmethod
+    def _as_input_ids_tensor(input_ids) -> Optional[torch.Tensor]:
+        if input_ids is None:
+            return None
+        if isinstance(input_ids, torch.Tensor):
+            return input_ids.flatten().to(dtype=torch.long)
+        return torch.tensor(input_ids, dtype=torch.long).flatten()
+
     def process_and_combine_mm_data(
         self,
         base_output: BaseMultiModalProcessorOutput,
         mm_tokens: MultimodalSpecialTokens,
+        preserve_input_ids_list: bool = False,
         **kwargs,
-    ) -> Tuple[List[MultimodalDataItem], torch.Tensor, dict]:
+    ) -> Tuple[List[MultimodalDataItem], Union[List[int], torch.Tensor], dict]:
         """
         Process multimodal data and return the combined multimodal items and input_ids.
         Supports mixed modalities (images and audio in the same request).
@@ -1155,6 +1164,23 @@ class BaseMultimodalProcessor(ABC):
                     )
                 )
         # Fallback tokenization if no raw items were processed
+        if (
+            input_ids is None
+            and preserve_input_ids_list
+            and isinstance(getattr(base_output, "input_ids", None), list)
+        ):
+            input_ids = base_output.input_ids
+
+        if input_ids is None:
+            for _, dict_item in dict_items:
+                dict_input_ids = dict_item.get("input_ids")
+                if preserve_input_ids_list and isinstance(dict_input_ids, list):
+                    input_ids = dict_input_ids
+                else:
+                    input_ids = self._as_input_ids_tensor(dict_input_ids)
+                if input_ids is not None:
+                    break
+
         if input_ids is None:
             input_ids = self._tokenizer(
                 base_output.input_text,
@@ -1164,6 +1190,8 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
+            if not isinstance(input_ids, torch.Tensor):
+                input_ids = self._as_input_ids_tensor(input_ids)
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")

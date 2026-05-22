@@ -538,10 +538,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 self.mm_tokens,
                 video_metadata=video_metadata,
                 do_sample_frames=False,
+                preserve_input_ids_list=True,
             )
         else:
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+                base_output, self.mm_tokens, preserve_input_ids_list=True
             )
 
         audio_feature_lengths = None
@@ -559,7 +560,12 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         process_time = time.perf_counter()
 
-        input_ids = input_ids.flatten()
+        if isinstance(input_ids, list):
+            input_ids_list = input_ids
+            input_ids = torch.tensor(input_ids, dtype=torch.long)
+        else:
+            input_ids = input_ids.flatten()
+            input_ids_list = input_ids.tolist()
 
         image_grid_thw = None
         if hasattr(ret, "image_grid_thw"):
@@ -611,7 +617,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids_list,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
