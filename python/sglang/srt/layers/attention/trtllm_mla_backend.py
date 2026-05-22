@@ -577,6 +577,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
+    def init_mha_chunk_metadata(self, forward_batch: "ForwardBatch") -> None:
+        has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+        fallback_to_flashinfer_impl = (
+            self.disable_chunked_prefix_cache and has_prefix
+        ) or is_in_piecewise_cuda_graph()
+        if fallback_to_flashinfer_impl:
+            super().init_mha_chunk_metadata(forward_batch)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
         # Delegate to parent for non-decode modes.
