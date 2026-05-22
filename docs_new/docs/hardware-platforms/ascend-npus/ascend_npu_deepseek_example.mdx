@@ -6,6 +6,10 @@ metatags:
 
 ## Running DeepSeek-V3
 
+<Warning>
+If you need to download model weights, check the model size at [ModelScope](https://www.modelscope.cn/models) to reserve enough space.
+</Warning>
+
 ### Running DeepSeek in PD mixed mode on 1 x Atlas 800I A3.
 
 W4A8 Model weights could be found [here](https://modelers.cn/models/Modelers_Park/DeepSeek-R1-0528-w4a8).
@@ -15,7 +19,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 
 #Deepep communication settings
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
 export HCCL_BUFFSIZE=1600
 
@@ -33,7 +36,6 @@ python3 -m sglang.launch_server \
     --trust-remote-code \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --watchdog-timeout 9000 \
     --cuda-graph-bs 8 16 24 28 32 \
     --mem-fraction-static 0.68 \
@@ -68,7 +70,6 @@ export STREAMS_PER_DEVICE=32
 export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:<PORT>"
 
 #Deepep communication settings
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1536
 
 #npu acceleration operator
@@ -90,7 +91,6 @@ python -m sglang.launch_server \
     --mem-fraction-static 0.6 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --load-balance-method round_robin \
     --max-running-requests 8 \
     --context-length 8192 \
@@ -146,7 +146,6 @@ python -m sglang.launch_server \
     --max-running-requests 352 \
     --attention-backend ascend \
     --device npu \
-    --quantization modelslim \
     --moe-a2a-backend deepep \
     --enable-dp-attention \
     --deepep-mode low_latency \
@@ -218,14 +217,13 @@ do
     then
         echo "${P_IP[$i]}"
         export HCCL_BUFFSIZE=1536
-        export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
         export TASK_QUEUE_ENABLE=2
 
         export HCCL_SOCKET_IFNAME=lo
         export GLOO_SOCKET_IFNAME=lo
         python -m sglang.launch_server --model-path ${MODEL_PATH}  --disaggregation-mode prefill --host ${P_IP[$i]} \
         --port 8000 --disaggregation-bootstrap-port $((8998+$i)) --trust-remote-code --nnodes 1 --node-rank 0 \
-        --tp-size 16 --mem-fraction-static 0.81 --attention-backend ascend --device npu --quantization modelslim \
+        --tp-size 16 --mem-fraction-static 0.81 --attention-backend ascend --device npu \
         --disaggregation-transfer-backend ascend --max-running-requests 8 --context-length 8192  --disable-radix-cache \
         --chunked-prefill-size -1 --max-prefill-tokens 28680 --moe-a2a-backend deepep --deepep-mode normal \
         --speculative-algorithm NEXTN --speculative-num-steps 1 --speculative-eagle-topk 1 --speculative-num-draft-tokens 2  \
@@ -251,7 +249,7 @@ do
         export GLOO_SOCKET_IFNAME=xxx
         python -m sglang.launch_server --model-path ${MODEL_PATH} --disaggregation-mode decode --host ${D_IP[$i]} \
         --port 8001 --trust-remote-code --dist-init-addr ${D_IP[0]}:5000 --nnodes 2 --node-rank $i --tp-size 32 --dp-size 32 \
-        --mem-fraction-static 0.815 --max-running-requests 832 --attention-backend ascend --device npu --quantization modelslim \
+        --mem-fraction-static 0.815 --max-running-requests 832 --attention-backend ascend --device npu \
         --moe-a2a-backend deepep --enable-dp-attention --deepep-mode low_latency --enable-dp-lm-head --moe-dense-tp 1 \
         --cuda-graph-bs 12 14 16 18 20 22 24 26 --disaggregation-transfer-backend ascend --watchdog-timeout 9000 --context-length 8192 \
         --speculative-algorithm NEXTN --speculative-num-steps 2 --speculative-eagle-topk 1 --speculative-num-draft-tokens 3  \
@@ -277,7 +275,11 @@ python -m sglang_router.launch_router \
     --mini-lb
 ```
 
-### test gsm8k
+## Testing the Service
+
+Once the server prints `The server is fired up and ready to roll!` in the logs, it is ready to accept requests. For testing examples (Health Check, Generate, Chat Completions, and port usage guidance), see [Testing the Service](/docs/hardware-platforms/ascend-npus/ascend_npu#testing-the-service).
+
+### Test GSM8K
 
 ```python Test GSM8K
 from types import SimpleNamespace

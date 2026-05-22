@@ -8,7 +8,7 @@ from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils import log_info_on_rank0, set_weight_attrs
 from sglang.srt.utils.common import is_sm90_supported
 
 if TYPE_CHECKING:
@@ -38,16 +38,61 @@ class Mxfp4MarlinMoEMethod:
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        # Delegate to the underlying FP8 method for weight creation —
-        # the raw weight shapes are the same; only post-loading processing differs.
-        self._fp8.create_weights(
-            layer,
-            num_experts,
-            hidden_size,
-            intermediate_size_per_partition,
-            params_dtype,
-            **extra_weight_attrs,
+        from sglang.srt.layers.moe.fused_moe_triton import (
+            FusedMoeWeightScaleSupported,
         )
+
+        fp4_block_k = 32
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // 2,
+                dtype=torch.int8,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                2 * intermediate_size_per_partition,
+                hidden_size // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition // fp4_block_k,
+                dtype=torch.float32,
+            ),
+            requires_grad=False,
+        )
+        w13_weight_scale.format_ue8m0 = False
+        w2_weight_scale.format_ue8m0 = False
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
+        layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
+        layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         from sglang.srt.layers.quantization.marlin_utils import (
@@ -102,8 +147,8 @@ class Mxfp4MarlinMoEMethod:
         quant_info = MarlinMoeQuantInfo(
             w13_qweight=layer.w13_weight,
             w2_qweight=layer.w2_weight,
-            w13_scales=layer.w13_weight_scale_inv,
-            w2_scales=layer.w2_weight_scale_inv,
+            w13_scales=layer.w13_weight_scale,
+            w2_scales=layer.w2_weight_scale,
             w13_g_idx_sort_indices=None,
             w2_g_idx_sort_indices=None,
             weight_bits=4,
