@@ -2127,6 +2127,11 @@ class UnifiedRadixCache(BasePrefixCache):
                         last_best_match_device_node,
                     )
 
+                logger.debug(
+                    "init_load_back success: loaded %d tokens for node %d",
+                    len(new_indices),
+                    best_match_node.id,
+                )
                 return new_indices, best_match_node
 
         return (

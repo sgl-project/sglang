@@ -219,6 +219,8 @@ class MambaComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         ct = self.component_type
+        if node is self.cache.root_node:
+            return result
         cd = node.component_data[ct]
         value = cd.host_value if lock_host else cd.value
         # A node in skip_lock_node_ids was a tombstone when this lock was acquired.
@@ -247,6 +249,8 @@ class MambaComponent(TreeComponent):
         lock_host: bool = False,
     ) -> None:
         ct = self.component_type
+        if node is self.cache.root_node:
+            return
         cd = node.component_data[ct]
         skip_lock_node_ids = params.skip_lock_node_ids.get(ct, ()) if params else ()
         if node.id in skip_lock_node_ids:
