@@ -13,10 +13,10 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.runner.swa_divergence import stats as swa_div_module
-from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 from sglang.srt.kv_canary.runner.swa_divergence.compute import (
     compute_swa_live_divergence,
 )
+from sglang.srt.kv_canary.runner.swa_divergence.log import SwaDivergenceLog
 from sglang.srt.kv_canary.runner.swa_divergence.stats import SwaDivergenceStats
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -265,9 +265,6 @@ class TestSwaDivergenceStatsWithCompute(CustomTestCase):
             ) as captured:
                 stats.emit_log_if_due(
                     step_counter=10, period=10, forward_batch=forward_batch
-                )
-                stats.emit_log_if_due(
-                    step_counter=20, period=10, forward_batch=forward_batch
                 )
 
         matching = [

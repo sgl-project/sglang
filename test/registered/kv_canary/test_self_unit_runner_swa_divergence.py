@@ -100,9 +100,6 @@ class TestSwaDivergenceStats(CustomTestCase):
                 stats.emit_log_if_due(
                     step_counter=10, period=10, forward_batch=_EMPTY_FORWARD_BATCH
                 )
-                stats.emit_log_if_due(
-                    step_counter=20, period=10, forward_batch=_EMPTY_FORWARD_BATCH
-                )
 
             lines = [
                 line
@@ -133,11 +130,6 @@ class TestSwaDivergenceStats(CustomTestCase):
                 ) as captured:
                     stats.emit_log_if_due(
                         step_counter=step, period=10, forward_batch=_EMPTY_FORWARD_BATCH
-                    )
-                    stats.emit_log_if_due(
-                        step_counter=step + 10,
-                        period=10,
-                        forward_batch=_EMPTY_FORWARD_BATCH,
                     )
                 matching = [
                     line
