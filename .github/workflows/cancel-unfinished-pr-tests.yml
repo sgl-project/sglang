@@ -117,13 +117,27 @@ jobs:
             echo "Workflow: $workflow_file"
             echo "========================================="
 
-            # Get all unfinished runs
-            all_runs=$(gh run list \
-              --repo "$REPO" \
-              --workflow "$workflow_file" \
-              --json databaseId,status,event,url,createdAt,displayTitle \
-              --limit 1000 \
-            | jq -c '.[] | select(.status=="queued" or .status=="waiting" or .status=="in_progress")')
+            # Get all unfinished runs.
+            # Use server-side --status filter: without it, `gh run list --limit 1000`
+            # only sees the most recent 1000 runs by createdAt, which on busy workflows
+            # like pr-test.yml is < 3 days. Old stuck runs would be missed.
+            all_runs=""
+            for status in queued in_progress waiting; do
+              batch=$(gh run list \
+                --repo "$REPO" \
+                --workflow "$workflow_file" \
+                --status "$status" \
+                --json databaseId,status,event,url,createdAt,displayTitle \
+                --limit 1000 \
+              | jq -c '.[]')
+              if [ -n "$batch" ]; then
+                if [ -n "$all_runs" ]; then
+                  all_runs="$all_runs"$'\n'"$batch"
+                else
+                  all_runs="$batch"
+                fi
+              fi
+            done
 
             if [ -z "$all_runs" ]; then
               echo "✅ No unfinished runs found"
