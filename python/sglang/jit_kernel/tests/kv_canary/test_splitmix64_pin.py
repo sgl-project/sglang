@@ -46,8 +46,8 @@ def test_splitmix64_independent_impl_matches_frozen_hex() -> None:
 
 
 def test_splitmix64_no_collision_in_1000_random_inputs() -> None:
-    random.seed(0)
-    inputs = random.sample(range(1 << 64), 1000)
+    rng = random.Random(0)
+    inputs = [rng.getrandbits(64) for _ in range(1000)]
     outputs = [splitmix64(x) for x in inputs]
     assert len(set(outputs)) == 1000
 
