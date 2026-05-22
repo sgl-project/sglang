@@ -476,8 +476,15 @@ class PiecewiseCudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
+        # ``model_capture_mode()`` is needed by Mamba/Lightning backends that
+        # gate ``_capture_metadata`` vs ``_replay_metadata`` via
+        # ``get_is_capture_mode()``; without it, capture takes the replay
+        # branch and expects per-iter padding the PCG synthetic fb doesn't have.
+        from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
+
         with (
             freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+            model_capture_mode(),
             graph_capture() as graph_capture_context,
         ):
             stream = graph_capture_context.stream

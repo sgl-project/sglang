@@ -75,6 +75,17 @@ class HybridAttnBackend(AttentionBackend):
         backend = self._select_backend(forward_batch.forward_mode)
         backend.init_forward_data_out_graph(forward_batch)
 
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Dispatcher in-graph init -- forward to the selected backend.
+
+        Required override: the ABC default is no-op, but if a follow-up
+        per-backend PR overrides ``_in_graph`` on either decode_backend or
+        prefill_backend, the hybrid dispatcher must reach that override
+        instead of silently swallowing it. Mirrors ``TboAttnBackend``.
+        """
+        backend = self._select_backend(forward_batch.forward_mode)
+        backend.init_forward_data_in_graph(forward_batch)
+
     def get_cuda_graph_seq_len_fill_value(self):
         return self.decode_backend.get_cuda_graph_seq_len_fill_value()
 

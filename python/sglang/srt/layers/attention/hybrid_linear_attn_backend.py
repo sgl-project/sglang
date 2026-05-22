@@ -802,6 +802,17 @@ class HybridLinearAttnBackend(AttentionBackend):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_data_out_graph(forward_batch)
 
+    def init_forward_data_in_graph(self, forward_batch: ForwardBatch) -> None:
+        """Dispatcher in-graph init -- fan out to all sub-backends.
+
+        Required override: the ABC default is no-op, but if a follow-up
+        per-backend PR overrides ``_in_graph`` on any sub-backend, the
+        hybrid dispatcher must reach that override. Mirrors
+        ``TboAttnBackend.init_forward_data_in_graph``.
+        """
+        for attn_backend in self.attn_backend_list:
+            attn_backend.init_forward_data_in_graph(forward_batch)
+
     def init_forward_metadata_capture_cpu_graph(
         self,
         bs: int,
