@@ -245,20 +245,24 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
 
 class FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base:
     backend = None
+    extra_env = {}
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        cls.model = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={**os.environ, **cls.extra_env, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
                 "--attention-backend",
                 "triton",
                 "--moe-runner-backend",
                 cls.backend,
+                "--cuda-graph-max-bs",
+                "128",
                 "--tp-size",
                 "4",
                 "--ep-size",
@@ -331,6 +335,12 @@ class TestFlashinferTrtllmGenMoeBackendPerTokenNVFP4Routed(
 class TestFlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4(
     FlashinferTrtllmGenMoeBackendOnlinePerTokenNVFP4Base, CustomTestCase
 ):
+    extra_env = {
+        "SGLANG_FP4_IGNORED_LAYERS": ",".join(
+            ["shared_expert"]
+            + [f"model.layers.{layer_id}" for layer_id in range(40, 48)]
+        )
+    }
     backend = "flashinfer_trtllm"
 
 

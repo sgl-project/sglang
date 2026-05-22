@@ -45,6 +45,7 @@ from sglang.srt.layers.quantization.fp4_utils import (
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    block_quant_dequant,
     cutlass_fp8_supported,
     is_blackwell_supported,
 )
@@ -1881,6 +1882,23 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale_2", w2_weight_scale_2)
 
+        if is_online_per_token_nvfp4 and self.quant_config.is_checkpoint_fp8_serialized:
+            # FP8 checkpoints usually store expert scales as weight_scale_inv.
+            # Online NVFP4 consumes them in the loader and writes the generated
+            # NVFP4 scales into w*_weight_scale / w*_weight_scale_2 instead.
+            w13_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter(
+                "w13_weight_scale_inv", w13_source_weight_scale_inv
+            )
+            w2_source_weight_scale_inv = PerTensorScaleParameter(
+                data=torch.empty(0, dtype=torch.float32),
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
+
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
         )
@@ -2451,7 +2469,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
 
 class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
-    """Online per-token NVFP4 MoE method for BF16/FP16 checkpoints."""
+    """Online per-token NVFP4 MoE method for BF16/FP16/FP8 checkpoints."""
 
     _quant_fast_math_env_lock = threading.Lock()
 
@@ -2533,6 +2551,53 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
         )
 
     @staticmethod
+    def _is_fp8_weight(weight: torch.Tensor) -> bool:
+        fp8_dtypes = {
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+                getattr(torch, "float8_e5m2", None),
+                getattr(torch, "float8_e5m2fnuz", None),
+            )
+            if dtype is not None
+        }
+        return weight.dtype in fp8_dtypes
+
+    @staticmethod
+    def _is_fp8_weight_scale_name(weight_name: str) -> bool:
+        return "weight_scale" in weight_name and "weight_scale_2" not in weight_name
+
+    def _dequantize_fp8_weight(
+        self,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if getattr(self.quant_config, "use_mxfp8", False):
+            raise ValueError(
+                "--quantization per_token_nvfp4 does not support online "
+                "requantization from MXFP8 expert checkpoints."
+            )
+
+        weight = weight.to(device).contiguous()
+        weight_scale = weight_scale.to(device=device, dtype=torch.float32).contiguous()
+
+        if weight_scale.numel() == 1 or self.quant_config.weight_block_size is None:
+            return (
+                per_tensor_dequantize(weight, weight_scale)
+                .to(torch.bfloat16)
+                .contiguous()
+            )
+
+        return block_quant_dequant(
+            weight,
+            weight_scale,
+            self.quant_config.weight_block_size,
+            torch.bfloat16,
+        ).contiguous()
+
+    @staticmethod
     def _should_skip_loaded_expert(
         layer: torch.nn.Module,
         param: torch.nn.Parameter,
@@ -2566,6 +2631,9 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
     def get_online_weight_loader(self, layer, original_weight_loader):
         pending_w13_weights = {}
         pending_w13_lock = threading.Lock()
+        pending_fp8_weights = {}
+        pending_fp8_weight_scales = {}
+        pending_fp8_lock = threading.Lock()
 
         def load_quantized_weight(
             param: torch.nn.Parameter,
@@ -2613,25 +2681,13 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 expert_id=expert_id,
             )
 
-        def online_per_token_nvfp4_weight_loader(
+        def process_loaded_weight(
             param: torch.nn.Parameter,
             loaded_weight: torch.Tensor,
             weight_name: str,
             shard_id: str,
             expert_id: Optional[int],
-        ):
-            if "weight" not in weight_name or shard_id not in ("w1", "w2", "w3"):
-                original_weight_loader(
-                    param,
-                    loaded_weight,
-                    weight_name=weight_name,
-                    shard_id=shard_id,
-                    expert_id=expert_id,
-                )
-                return
-            if self._should_skip_loaded_expert(layer, param, expert_id):
-                return
-
+        ) -> None:
             if shard_id == "w2":
                 load_quantized_weight(
                     param, loaded_weight, weight_name, shard_id, expert_id
@@ -2685,6 +2741,116 @@ class ModelOptPerTokenNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 weight_scale_2,
             )
 
+        def process_fp8_weight(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: Optional[int],
+        ) -> None:
+            if not self._is_fp8_weight(loaded_weight):
+                process_loaded_weight(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+                return
+            if not self.quant_config.is_checkpoint_fp8_serialized:
+                raise ValueError(
+                    "--quantization per_token_nvfp4 received an FP8 expert "
+                    "weight, but the checkpoint quantization config does not "
+                    "declare serialized FP8 weights."
+                )
+
+            key = (expert_id, shard_id)
+            with pending_fp8_lock:
+                weight_scale = pending_fp8_weight_scales.pop(key, None)
+                if weight_scale is None:
+                    pending_fp8_weights[key] = (
+                        param,
+                        loaded_weight.contiguous(),
+                        weight_name,
+                        shard_id,
+                        expert_id,
+                    )
+                    return
+
+            loaded_weight = self._dequantize_fp8_weight(
+                loaded_weight, weight_scale, param.device
+            )
+            process_loaded_weight(
+                param, loaded_weight, weight_name, shard_id, expert_id
+            )
+
+        def process_fp8_weight_scale(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: Optional[int],
+        ) -> None:
+            key = (expert_id, shard_id)
+            with pending_fp8_lock:
+                pending = pending_fp8_weights.pop(key, None)
+                if pending is None:
+                    pending_fp8_weight_scales[key] = loaded_weight.contiguous()
+                    return
+
+            (
+                pending_param,
+                pending_weight,
+                pending_name,
+                pending_shard_id,
+                pending_eid,
+            ) = pending
+            loaded_weight = self._dequantize_fp8_weight(
+                pending_weight, loaded_weight, pending_param.device
+            )
+            process_loaded_weight(
+                pending_param,
+                loaded_weight,
+                pending_name,
+                pending_shard_id,
+                pending_eid,
+            )
+
+        def online_per_token_nvfp4_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            weight_name: str,
+            shard_id: str,
+            expert_id: Optional[int],
+        ):
+            if shard_id not in ("w1", "w2", "w3"):
+                original_weight_loader(
+                    param,
+                    loaded_weight,
+                    weight_name=weight_name,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+                return
+            if self._should_skip_loaded_expert(layer, param, expert_id):
+                return
+
+            if self._is_fp8_weight_scale_name(weight_name):
+                process_fp8_weight_scale(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+                return
+
+            if "weight" in weight_name:
+                process_fp8_weight(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+                return
+
+            original_weight_loader(
+                param,
+                loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+
         return online_per_token_nvfp4_weight_loader
 
 
@@ -2695,24 +2861,49 @@ class PerTokenNvFp4Config(ModelOptQuantConfig):
     is_checkpoint_nvfp4_serialized = False
     group_size = 16
 
+    @staticmethod
+    def _normalize_ignored_layers(
+        ignored_layers: Optional[List[str]],
+    ) -> List[str]:
+        if not ignored_layers:
+            return []
+        normalized_ignored_layers = []
+        for layer in ignored_layers:
+            base = layer.removeprefix("model.")
+            normalized_ignored_layers.append(base)
+            normalized_ignored_layers.append(f"model.{base}")
+        return list(dict.fromkeys(normalized_ignored_layers))
+
     def __init__(
         self,
         exclude_modules: Optional[List[str]] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
+        is_checkpoint_fp8_serialized: bool = False,
+        activation_scheme: str = "dynamic",
+        weight_block_size: Optional[List[int]] = None,
+        use_mxfp8: bool = False,
     ) -> None:
-        ignored_layers = list(exclude_modules or [])
-        if ignored_layers_str := envs.SGLANG_FP8_IGNORED_LAYERS.get():
-            ignored_layers.extend(
+        source_ignored_layers = self._normalize_ignored_layers(exclude_modules)
+        fp4_ignored_layers = list(source_ignored_layers)
+        if ignored_layers_str := envs.SGLANG_FP4_IGNORED_LAYERS.get():
+            fp4_ignored_layers.extend(
                 layer.strip()
                 for layer in ignored_layers_str.split(",")
                 if layer.strip()
             )
+        fp4_ignored_layers = self._normalize_ignored_layers(fp4_ignored_layers)
         super().__init__(
             kv_cache_quant_algo=None,
-            exclude_modules=list(dict.fromkeys(ignored_layers)),
+            exclude_modules=source_ignored_layers,
             packed_modules_mapping=packed_modules_mapping or {},
         )
+        self.fp4_ignored_layers = fp4_ignored_layers
         self.use_per_token_activation = True
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
+        self.is_fp4_experts = False
+        self.activation_scheme = activation_scheme
+        self.weight_block_size = weight_block_size
+        self.use_mxfp8 = use_mxfp8
 
     @classmethod
     def get_name(cls) -> str:
@@ -2732,6 +2923,9 @@ class PerTokenNvFp4Config(ModelOptQuantConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> PerTokenNvFp4Config:
+        quant_method = str(config.get("quant_method", "")).lower()
+        use_mxfp8 = "mxfp8" in quant_method
+        is_checkpoint_fp8_serialized = "fp8" in quant_method or use_mxfp8
         ignored_layers = config.get("ignored_layers") or config.get(
             "modules_to_not_convert"
         )
@@ -2740,18 +2934,35 @@ class PerTokenNvFp4Config(ModelOptQuantConfig):
         return cls(
             exclude_modules=ignored_layers,
             packed_modules_mapping=config.get("packed_modules_mapping"),
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=config.get("activation_scheme", "dynamic"),
+            weight_block_size=config.get("weight_block_size"),
+            use_mxfp8=use_mxfp8,
         )
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod, Fp8MoEMethod
 
         if isinstance(layer, LinearBase):
+            if is_layer_skipped(
+                prefix, self.exclude_modules, self.packed_modules_mapping
+            ) or self.is_layer_excluded(prefix):
+                return UnquantizedLinearMethod()
+            if self.is_checkpoint_fp8_serialized:
+                return Fp8LinearMethod(self)
             return UnquantizedLinearMethod()
         if isinstance(layer, FusedMoE):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
+                return None
+            if is_layer_skipped(
+                prefix, self.fp4_ignored_layers, self.packed_modules_mapping
+            ):
+                if self.is_checkpoint_fp8_serialized:
+                    return Fp8MoEMethod(self)
                 return None
             return ModelOptPerTokenNvFp4FusedMoEMethod(self)
         return None

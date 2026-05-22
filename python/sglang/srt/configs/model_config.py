@@ -1175,6 +1175,7 @@ class ModelConfig:
             "modelopt_fp8": ["modelopt"],
             "modelopt_fp4": ["modelopt"],
             "modelopt_mixed": ["modelopt"],
+            "per_token_nvfp4": ["fp8"],
             "petit_nvfp4": ["modelopt"],
             "w8a8_int8": ["compressed-tensors", "compressed_tensors"],
             "w8a8_fp8": ["compressed-tensors", "compressed_tensors"],
