@@ -721,6 +721,29 @@ def _create_clean_subprocess_env(env: dict) -> dict:
     return child_env
 
 
+def _attach_tee_threads(
+    process: subprocess.Popen,
+    return_stdout_stderr: tuple,
+) -> None:
+    def _dump(src, sinks):
+        for line in iter(src.readline, ""):
+            for sink in sinks:
+                sink.write(line)
+                sink.flush()
+        src.close()
+
+    threading.Thread(
+        target=_dump,
+        args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_dump,
+        args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
+        daemon=True,
+    ).start()
+
+
 def _launch_server_process(
     command: List[str],
     env: dict,
@@ -752,24 +775,7 @@ def _launch_server_process(
             text=True,
             bufsize=1,
         )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(proc.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(proc.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
+        _attach_tee_threads(proc, return_stdout_stderr)
     else:
         proc = subprocess.Popen(command, stdout=None, stderr=None, env=child_env)
 
@@ -1032,24 +1038,7 @@ def popen_launch_pd_server(
             text=True,
             bufsize=1,
         )
-
-        def _dump(src, sinks):
-            for line in iter(src.readline, ""):
-                for sink in sinks:
-                    sink.write(line)
-                    sink.flush()
-            src.close()
-
-        threading.Thread(
-            target=_dump,
-            args=(process.stdout, [return_stdout_stderr[0], sys.stdout]),
-            daemon=True,
-        ).start()
-        threading.Thread(
-            target=_dump,
-            args=(process.stderr, [return_stdout_stderr[1], sys.stderr]),
-            daemon=True,
-        ).start()
+        _attach_tee_threads(process, return_stdout_stderr)
     else:
         process = subprocess.Popen(command, stdout=None, stderr=None, env=env)
 
