@@ -384,16 +384,10 @@ def stamp_clean_chain(
 def assert_canary_state_equal(
     *, log_a: FakeViolationLog, log_b: FakeViolationLog
 ) -> None:
-    assert torch.equal(log_a.ring, log_b.ring), "violation_ring diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.write_index, log_b.write_index
-    ), "violation_write_index diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.slot_run_counter, log_b.slot_run_counter
-    ), "slot_run_counter diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.kernel_run_counter, log_b.kernel_run_counter
-    ), "kernel_run_counter diverged (CUDA vs ref)"
+    for name in ("ring", "write_index", "slot_run_counter", "kernel_run_counter"):
+        assert torch.equal(
+            getattr(log_a, name), getattr(log_b, name)
+        ), f"{name} diverged (CUDA vs ref)"
 
 
 def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None:
