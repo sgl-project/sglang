@@ -573,12 +573,21 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # (dummy). Entries past `pages_held[req_idx]` for any req are stale.
         # Cols = c{N}_n_pages_kernel so a single req can in principle hold all
         # usable pages; memory cost is negligible (16 reqs * 128 pages * 4 B).
+        #
+        # Rows = max_num_reqs + 1 to match ReqToTokenPool's _alloc_size
+        # convention: that pool reserves req_pool_idx 0 as a dummy/padding
+        # slot for cuda-graph padded batches, so active req_pool_idx values
+        # range over [1, max_num_reqs]. Sizing this table to max_num_reqs
+        # without the +1 caused IndexError / silent OOB tensor reads on the
+        # max-index slot (the same latent bug existed in the original static
+        # arange slab; tensor OOB just didn't raise).
+        self._req_table_rows = max_num_reqs + 1
         self.req_to_token_c4_pages = torch.zeros(
-            max_num_reqs, max(1, c4_n_pages_kernel),
+            self._req_table_rows, max(1, c4_n_pages_kernel),
             dtype=torch.int32, device=device,
         )
         self.req_to_token_c128_pages = torch.zeros(
-            max_num_reqs, max(1, c128_n_pages_kernel),
+            self._req_table_rows, max(1, c128_n_pages_kernel),
             dtype=torch.int32, device=device,
         )
 
@@ -606,8 +615,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         # Per-req held-page counts. Plain Python lists (host-only); the
         # allocator decides diffs without device sync, then writes new page
         # ids into req_to_token_c{N}_pages in one batched index_put.
-        self._c4_pages_held_cpu = [0] * max_num_reqs
-        self._c128_pages_held_cpu = [0] * max_num_reqs
+        # Length matches _req_table_rows (= max_num_reqs + 1, see above).
+        self._c4_pages_held_cpu = [0] * self._req_table_rows
+        self._c128_pages_held_cpu = [0] * self._req_table_rows
 
         logger.info(
             "DeepSeekV4TokenToKVPool dynamic c-page allocator: "
