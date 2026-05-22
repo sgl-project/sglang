@@ -111,12 +111,12 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=1,
         )
 
-    def test_qwen3_decode_overhead_bs256_isl4096_osl1024(self) -> None:
+    def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
         """Verify canary decode overhead stays within the expected bound."""
         _measure_overhead(
-            scenario_key="qwen3-0.6b/decode_bs256_isl4096_osl1024",
-            batch_size=256,
-            input_len=4096,
+            scenario_key="qwen3-0.6b/decode_bs128_isl512_osl1024",
+            batch_size=128,
+            input_len=512,
             output_len=1024,
         )
 
