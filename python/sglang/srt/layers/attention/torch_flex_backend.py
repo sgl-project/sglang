@@ -27,6 +27,49 @@ class TorchFlexAttnBackend(AttentionBackend):
         torch._dynamo.config.cache_size_limit = 1024
         torch._dynamo.config.accumulated_cache_size_limit = 1024
 
+    def init_forward_data_out_graph(self, forward_batch: ForwardBatch) -> None:
+        """Init the metadata for a forward pass."""
+        # TODO: find a more elegant way to save memory
+        # Currently maintain the same memory as torch_native_backend
+        torch.cuda.empty_cache()
+
+        # Provide two block_mask Lists per seq_idx for lower latency, later will support per layer level mask generation
+        self.extend_block_masks = []
+        self.decode_block_masks = []
+
+        if forward_batch.forward_mode.is_extend():
+            for seq_idx in range(forward_batch.seq_lens.shape[0]):
+                seq_len_kv = forward_batch.seq_lens[seq_idx]
+                seq_len_q = seq_len_kv
+                self.extend_block_masks.append(
+                    create_block_mask(
+                        self._causal_mask,
+                        None,
+                        None,
+                        seq_len_q,
+                        seq_len_kv,
+                        device=self.device,
+                        _compile=False,
+                    )
+                )
+
+        elif forward_batch.forward_mode.is_decode():
+            for seq_idx in range(forward_batch.seq_lens.shape[0]):
+                seq_len_q = 1
+                seq_len_kv = forward_batch.seq_lens[seq_idx]
+
+                self.decode_block_masks.append(
+                    create_block_mask(
+                        self._decode_mask,
+                        None,
+                        None,
+                        seq_len_q,
+                        seq_len_kv,
+                        device=self.device,
+                        _compile=False,
+                    )
+                )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         # TODO: find a more elegant way to save memory
