@@ -383,7 +383,7 @@ class OutputBatch:
     Final output (after pipeline completion)
     """
 
-    output: torch.Tensor | None = None
+    output: Any | None = None
     audio: torch.Tensor | None = None
     audio_sample_rate: int | None = None
     trajectory_timesteps: torch.Tensor | None = None
