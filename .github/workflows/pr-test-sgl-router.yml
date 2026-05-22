@@ -24,8 +24,8 @@ env:
   SGLANG_IS_IN_CI: true
 
 jobs:
-  sgl-router-lint:
-    name: tier-1 — lint
+  sgl-router-source-check:
+    name: source check
     if: |
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
@@ -33,14 +33,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       router_present: ${{ steps.router-source.outputs.present }}
-    env:
-      # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage
-      # of self-hosted-runner pip installs that compile Rust extensions.
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-      # Supply-chain guard: deny.toml allowlists the dynamo git source but
-      # cannot pin a SHA. Bumps to this constant must be a deliberate PR.
-      DYNAMO_TOKENIZERS_EXPECTED_REV: "1efdd4dcb901caeae636131321094090d252c8d6"
     steps:
       - uses: actions/checkout@v4
 
@@ -54,8 +46,29 @@ jobs:
             echo "::notice::experimental/sgl-router/Cargo.toml is not present; skipping sgl-router CI."
           fi
 
+  sgl-router-lint:
+    name: tier-1 — lint
+    needs: sgl-router-source-check
+    if: |
+      needs.sgl-router-source-check.outputs.router_present == 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+      )
+    runs-on: ubuntu-latest
+    env:
+      # Scoped per-job (not workflow-wide) to avoid SMG's documented breakage
+      # of self-hosted-runner pip installs that compile Rust extensions.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+      # Supply-chain guard: deny.toml allowlists the dynamo git source but
+      # cannot pin a SHA. Bumps to this constant must be a deliberate PR.
+      DYNAMO_TOKENIZERS_EXPECTED_REV: "1efdd4dcb901caeae636131321094090d252c8d6"
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Verify dynamo-* SHA pin
-        if: steps.router-source.outputs.present == 'true'
         run: |
           set -euo pipefail
           revs=$(grep -E '^dynamo-[a-z]+[[:space:]]*=.*\brev[[:space:]]*=' experimental/sgl-router/Cargo.toml \
@@ -83,7 +96,6 @@ jobs:
       # we unset RUSTC_WRAPPER below and proceed without compile caching —
       # rust-cache still covers the bulk of warm-cache wins.
       - name: Configure sccache
-        if: steps.router-source.outputs.present == 'true'
         id: sccache
         continue-on-error: true
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -92,13 +104,12 @@ jobs:
           disable_annotations: true
 
       - name: Disable sccache if install failed
-        if: steps.router-source.outputs.present == 'true' && steps.sccache.outcome != 'success'
+        if: steps.sccache.outcome != 'success'
         run: |
           echo "::warning::sccache install failed (${{ steps.sccache.outcome }}); proceeding without compile caching"
           echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
       - name: Rust cache
-        if: steps.router-source.outputs.present == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: experimental/sgl-router
@@ -108,17 +119,14 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: cargo check
-        if: steps.router-source.outputs.present == 'true'
         working-directory: experimental/sgl-router
         run: cargo check --all-targets
 
       - name: cargo clippy
-        if: steps.router-source.outputs.present == 'true'
         working-directory: experimental/sgl-router
         run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo fmt
-        if: steps.router-source.outputs.present == 'true'
         working-directory: experimental/sgl-router
         run: |
           rustup toolchain install nightly --profile minimal --component rustfmt
@@ -126,23 +134,22 @@ jobs:
 
       # cargo-deny 0.19.6+ required for CVSS 4.0 parsing.
       - name: Install cargo-deny
-        if: steps.router-source.outputs.present == 'true'
         run: cargo install --locked cargo-deny@0.19.6
 
       - name: cargo deny check
-        if: steps.router-source.outputs.present == 'true'
         working-directory: experimental/sgl-router
         run: cargo deny check licenses bans sources advisories
 
       - name: Show sccache stats
-        if: always() && steps.router-source.outputs.present == 'true' && steps.sccache.outcome == 'success'
+        if: always() && steps.sccache.outcome == 'success'
         run: sccache --show-stats
 
   sgl-router-build-and-test:
     name: tier-2 — build + test
-    needs: sgl-router-lint
+    needs: [sgl-router-source-check, sgl-router-lint]
     if: |
-      needs.sgl-router-lint.outputs.router_present == 'true' &&
+      needs.sgl-router-source-check.outputs.router_present == 'true' &&
+      needs.sgl-router-lint.result == 'success' &&
       (
         github.event_name != 'pull_request' ||
         (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
