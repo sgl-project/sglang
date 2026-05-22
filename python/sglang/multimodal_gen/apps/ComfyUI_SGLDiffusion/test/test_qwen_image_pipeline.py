@@ -1,6 +1,7 @@
 """Test for ComfyUIQwenImagePipeline with pass-through scheduler."""
 
 import os
+import sys
 
 import pytest
 import torch
@@ -116,4 +117,4 @@ def test_comfyui_qwen_image_pipeline_direct() -> None:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    sys.exit(pytest.main([__file__, "-v"]))

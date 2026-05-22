@@ -5,10 +5,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+    from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
@@ -57,6 +58,15 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def on_after_cuda_graph_warmup(self):
+        """Hook between cuda graph warmup pass and the actual capture.
+
+        Override to undo state that warmup mutated or eagerly advanced
+        (e.g. dirty metadata buffers, raw->full upgrades) before capture
+        freezes the kernel pointers.
+        """
+        pass
+
     def get_verify_buffers_to_fill_after_draft(self):
         """
         Return buffers of verify attention kernels that needs to be filled after draft.
@@ -76,6 +86,7 @@ class AttentionBackend(ABC):
         """
         raise NotImplementedError()
 
+    @debug_kernel_api
     def forward(
         self,
         q: torch.Tensor,
@@ -128,6 +139,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for decode."""
         raise NotImplementedError()
@@ -140,6 +152,7 @@ class AttentionBackend(ABC):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        **kwargs,
     ):
         """Run a forward for extend."""
         raise NotImplementedError()

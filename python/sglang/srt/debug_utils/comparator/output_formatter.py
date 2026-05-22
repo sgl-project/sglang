@@ -116,16 +116,71 @@ def _format_config_rich_body(
 
 
 def _format_skip_body(record: ComparisonSkipRecord) -> str:
-    return f"Skip: {record.name}{record._format_location_suffix()} ({record.reason})"
+    text: str = (
+        f"Skip: {record.name}{record._format_location_suffix()} ({record.reason})"
+    )
+    if record.available_side is not None and record.available_tensor_info is not None:
+        info = record.available_tensor_info
+        text += f"\n  {record.available_side}: shape={info.shape} dtype={info.dtype}"
+        text += (
+            f" mean={info.stats.mean:.4f} std={info.stats.std:.4f}"
+            f" range=[{info.stats.min:.4f}, {info.stats.max:.4f}]"
+        )
+        if info.sample is not None:
+            text += f"\n  sample: {info.sample}"
+    return text
 
 
 def _format_skip_rich_body(
     record: ComparisonSkipRecord, verbosity: Verbosity = "normal"
 ) -> RenderableType:
     suffix: str = record._format_location_suffix()
-    return (
+    header: str = (
         f"[dim]⊘ {escape(record.name)}{suffix} ── skipped ({escape(record.reason)})[/]"
     )
+
+    if (
+        verbosity == "minimal"
+        or record.available_side is None
+        or record.available_tensor_info is None
+    ):
+        return header
+
+    info = record.available_tensor_info
+    side: str = record.available_side
+    dtype_str: str = info.dtype.replace("torch.", "")
+
+    lines: list[str] = [header]
+
+    # Bundle info line
+    if record.available_bundle_info is not None:
+        bi = record.available_bundle_info
+        shapes: list[list[int]] = [f.shape for f in bi.files]
+        unique_shapes: set[str] = {str(s) for s in shapes}
+        shape_desc: str = (
+            escape(str(shapes[0])) if len(unique_shapes) == 1 else "mixed shapes"
+        )
+        dims_part: str = f"  [dim]dims: {bi.dims}[/]" if bi.dims else ""
+        lines.append(
+            f"   {side:8s}  [cyan]{bi.num_files} files[/]"
+            f" × {shape_desc} {dtype_str}{dims_part}"
+        )
+    else:
+        lines.append(f"   {side:8s}  {escape(str(info.shape))} {dtype_str}")
+
+    # Stats line (compact single-side)
+    stats = info.stats
+    range_str: str = escape(f"[{stats.min:.4f}, {stats.max:.4f}]")
+    lines.append(
+        f"   [dim]stats[/]     mean={stats.mean:.4f}  std={stats.std:.4f}"
+        f"  range={range_str}"
+    )
+
+    # Sample
+    if info.sample is not None:
+        lines.append(f"   [dim]sample[/]    {escape(info.sample)}")
+
+    return "\n".join(lines)
 
 
 # ── ComparisonErrorRecord ────────────────────────────────────────────
@@ -135,6 +190,7 @@ def _format_error_body(record: ComparisonErrorRecord) -> str:
     prefix: str = record._format_location_prefix()
     return (
         f"{prefix}Error: {record.name} ({record.exception_type})\n"
+        f"{record.exception_message}\n"
         f"{record.traceback_str}"
     )
 
@@ -145,7 +201,8 @@ def _format_error_rich_body(
     prefix: str = record._format_location_prefix_rich()
     name: str = escape(record.name)
     header: str = (
-        f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)})[/]"
+        f"{prefix}[bold red]{name} ── errored ({escape(record.exception_type)}): "
+        f"{escape(record.exception_message)}[/]"
     )
     if verbosity == "minimal":
         return header
@@ -300,7 +357,17 @@ def _format_aligner_plan(traced_plan: TracedAlignerPlan) -> str:
 
 
 def _format_sub_plan_text(traced_sub: TracedSubPlan) -> str:
-    sub_desc: str = f"{traced_sub.plan.type}"
+    from sglang.srt.debug_utils.comparator.aligner.reorderer.types import ReordererPlan
+    from sglang.srt.debug_utils.comparator.aligner.unsharder.types import UnsharderPlan
+
+    sub = traced_sub.plan
+    qualifier: str = ""
+    if isinstance(sub, UnsharderPlan):
+        qualifier = f"({sub.axis.value})"
+    elif isinstance(sub, ReordererPlan):
+        qualifier = f"({sub.params.op})"
+
+    sub_desc: str = f"{sub.type}{qualifier}"
 
     if traced_sub.snapshot is not None:
         snap = traced_sub.snapshot

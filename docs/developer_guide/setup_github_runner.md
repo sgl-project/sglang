@@ -27,11 +27,11 @@ pip install --upgrade pip
 export RUNNER_ALLOW_RUNASROOT=1
 ```
 
-Then follow https://github.com/sgl-project/sglang/settings/actions/runners/new?arch=x64&os=linux to run `config.sh`
+Then follow https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners to run `config.sh`
 
 **Notes**
 - Do not need to specify the runner group
-- Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-runner`). The labels can be edited later in Github Settings.
+- Give it a name (e.g., `test-sgl-gpu-0`) and some labels (e.g., `1-gpu-h100`). The labels can be edited later in Github Settings.
 - Do not need to change the work folder.
 
 ### Step 3: Run the runner by `run.sh`

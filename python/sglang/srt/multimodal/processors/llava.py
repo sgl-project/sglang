@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -7,7 +8,11 @@ from transformers.models.auto.processing_auto import (
 )
 
 import sglang.srt.managers.multimodal_processor as sgl_mm_processor_utils
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalProcessorOutput,
+)
 from sglang.srt.models.llava import (
     LlavaForConditionalGeneration,
     LlavaLlamaForCausalLM,
@@ -16,7 +21,11 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
-from sglang.srt.multimodal.mm_utils import expand2square, process_anyres_image
+from sglang.srt.multimodal.mm_utils import (
+    ensure_numpy,
+    expand2square,
+    process_anyres_image,
+)
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import ImageData, load_image, logger
 from sglang.utils import get_exception_traceback
@@ -29,6 +38,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         LlavaQwenForCausalLM,
         LlavaMistralForCausalLM,
     ]
+    gpu_image_decode = False  # Llava processes loaded image as PIL image explicitly
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -45,13 +55,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
         try:
             url = image_data.url if isinstance(image_data, ImageData) else image_data
-            image, image_size = load_image(url)
+            image, image_size = load_image(url, False)
             if image_size is not None:
                 # It is a video with multiple images
                 image_hash = hash(url)
                 pixel_values = image_processor(image)["pixel_values"]
-                for _ in range(len(pixel_values)):
-                    pixel_values[_] = pixel_values[_].astype(np.float16)
+                for i in range(len(pixel_values)):
+                    pixel_values[i] = ensure_numpy(pixel_values[i]).astype(np.float16)
                 pixel_values = np.stack(pixel_values, axis=0)
                 return pixel_values, image_hash, image_size
             else:
@@ -75,6 +85,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 else:
                     pixel_values = image_processor(image)["pixel_values"][0]
 
+                pixel_values = ensure_numpy(pixel_values)
                 if isinstance(pixel_values, np.ndarray):
                     pixel_values = pixel_values.astype(np.float16)
 
@@ -90,7 +101,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
     ):
         if self.cpu_executor is not None:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(
+            fut = loop.run_in_executor(
                 self.cpu_executor,
                 LlavaImageProcessor._process_single_image_task,
                 image_data,
@@ -98,6 +109,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                 grid_pinpoints,
                 self._processor,
             )
+            timeout = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+            return await asyncio.wait_for(fut, timeout=timeout)
         else:
             return self._process_single_image_task(
                 image_data,
@@ -130,7 +143,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     model_specific_data=item,
                 )
             )
-        return {"mm_items": mm_items}
+        return MultimodalProcessorOutput(mm_items=mm_items)
 
     async def process_mm_data_async(
         self,
@@ -178,35 +191,40 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
                     pixel_values.append(pixel_v)
                     data_hashes.append(image_h)
                     image_sizes.append(image_s)
-
-                if isinstance(pixel_values[0], np.ndarray):
-                    pixel_values = np.stack(pixel_values, axis=0)
             else:
                 # A single image
                 pixel_values, image_hash, image_size = await self._process_single_image(
                     image_data[0], aspect_ratio, grid_pinpoints
                 )
+                pixel_values = [pixel_values]
                 image_sizes = [image_size]
         else:
             raise ValueError(f"Invalid image data: {image_data}")
         modality = Modality.IMAGE
         if isinstance(request_obj.modalities, list):
-            if request_obj.modalities[0] == "multi-images":
-                modality = Modality.MULTI_IMAGES
-            elif request_obj.modalities[0] == "video":
+            if request_obj.modalities[0] == "video":
                 modality = Modality.VIDEO
 
-        return {
-            "mm_items": [
+        # Create one item per image for better cache granularity
+        mm_items = []
+        for pixel_v, image_s in zip(pixel_values, image_sizes):
+            # Ensure ndim=4 so the model forward takes the correct encode branch
+            if isinstance(pixel_v, np.ndarray) and pixel_v.ndim == 3:
+                pixel_v = np.expand_dims(pixel_v, 0)
+            mm_items.append(
                 MultimodalDataItem(
-                    feature=pixel_values,
+                    feature=pixel_v,
                     model_specific_data={
-                        "image_sizes": image_sizes,
+                        "image_sizes": [image_s],
+                        "image_aspect_ratio": aspect_ratio,
                     },
                     modality=modality,
                 )
-            ],
-        }
+            )
+
+        return MultimodalProcessorOutput(
+            mm_items=mm_items,
+        )
 
 
 class LlavaMultimodalProcessor(BaseMultimodalProcessor):

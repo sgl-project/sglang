@@ -7,6 +7,8 @@ from einops import rearrange
 
 from sglang.srt.debug_utils.comparator.dims_spec import (
     _FUSED_NAME_SEP,
+    SEQ_DIM_NAME,
+    TOKEN_DIM_NAME,
     DimSpec,
     _SingletonDimUtil,
     parse_dims,
@@ -51,11 +53,27 @@ def compute_axis_aligner_plan(
     return AxisAlignerPlan(pattern=pattern)
 
 
+_SEQ_DIM_EQUIVALENCES: frozenset[frozenset[str]] = frozenset(
+    {
+        frozenset({SEQ_DIM_NAME, TOKEN_DIM_NAME}),  # s ≡ t
+    }
+)
+
+
+def _normalize_dim_name(name: str) -> str:
+    for equiv_set in _SEQ_DIM_EQUIVALENCES:
+        if name in equiv_set:
+            return min(equiv_set)
+    return name
+
+
 def _semantic_names_match(specs_pair: Pair[list[DimSpec]]) -> bool:
     """Check that both sides share the same semantic name set (ignoring squeeze dims)."""
     names_pair: Pair[list[str]] = specs_pair.map(_expand_and_skip_squeeze)
 
-    if set(names_pair.x) == set(names_pair.y):
+    if set(map(_normalize_dim_name, names_pair.x)) == set(
+        map(_normalize_dim_name, names_pair.y)
+    ):
         return True
 
     # Local import to avoid circular dependency:
@@ -136,7 +154,7 @@ def _build_canonical_order(specs_pair: Pair[list[DimSpec]]) -> Optional[list[str
             result.append(fused_placeholder)
             consumed.update(sibs)
         else:
-            result.append(spec.name)
+            result.append(_normalize_dim_name(spec.name))
             consumed.update(names)
 
     return result
@@ -153,18 +171,28 @@ def _build_side_pattern(
     """
     source_tokens: list[str] = [spec.sanitized_name for spec in specs]
 
+    # Map normalized dim names back to this side's original names so that
+    # einops patterns use consistent identifiers on LHS and RHS.
+    norm_to_original: dict[str, str] = {
+        _normalize_dim_name(spec.name): spec.name for spec in specs
+    }
+
+    def _to_side_name(token: str) -> str:
+        return norm_to_original.get(token, token)
+
     # Build per-side target: replace fused placeholders with ``(a b)`` only if this side
     # has the sub-dims as separate (non-fused) names in the source
     fused_placeholders: set[str] = {
         spec.sanitized_name for spec in specs if spec.is_fused
     }
+    translated_order: list[str] = [_to_side_name(t) for t in canonical_order]
     target_tokens: list[str] = [
         (
             f"({t.replace(_FUSED_NAME_SEP, ' ')})"
             if _FUSED_NAME_SEP in t and t not in fused_placeholders
             else t
         )
-        for t in canonical_order
+        for t in translated_order
     ]
 
     if source_tokens == target_tokens:

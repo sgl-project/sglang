@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 
 class MiniCPMMLP(nn.Module):
@@ -176,8 +177,7 @@ class MiniCPMDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = MiniCPMAttention(
             hidden_size=self.hidden_size,

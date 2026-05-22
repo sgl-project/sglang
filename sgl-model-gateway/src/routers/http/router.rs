@@ -9,7 +9,6 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error};
 
 use crate::{
@@ -38,7 +37,9 @@ use crate::{
     routers::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        streaming_utils::BreakerTrackedStream,
+        RouterTrait,
     },
 };
 
@@ -307,20 +308,21 @@ impl Router {
         let headers = Some(&headers_with_trace);
 
         let response = self
-            .send_typed_request(
-                headers,
-                typed_req,
-                route,
-                worker.url(),
-                is_stream,
-                load_guard,
-            )
+            .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
             .await;
 
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        worker.record_outcome(status.is_success());
+        // For streaming responses, the wrapped body (`BreakerTrackedStream`)
+        // records the circuit-breaker outcome once the stream actually
+        // terminates (success on clean end, failure on mid-stream error).
+        // Recording it eagerly here based on the initial status code would
+        // mask "200-then-broken" workers — every request would tick a
+        // success before the stream had a chance to error out.
+        if !is_stream {
+            worker.record_outcome(status.is_success());
+        }
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -487,13 +489,12 @@ impl Router {
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
-        worker_url: &str,
+        worker: &Arc<dyn Worker>,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
     ) -> Response {
-        // Get the worker once and reuse for API key and load tracking
-        let worker = self.worker_registry.get_by_url(worker_url);
-        let api_key = worker.as_ref().and_then(|w| w.api_key().clone());
+        let worker_url = worker.url();
+        let api_key = worker.api_key().clone();
 
         // Static key string to avoid per-request allocations
         const DP_RANK_KEY: &str = "data_parallel_rank";
@@ -570,6 +571,19 @@ impl Router {
                     worker_url, route, e
                 );
 
+                // For streaming requests the caller skips the eager
+                // `record_outcome` on the assumption that a
+                // `BreakerTrackedStream` will tick the breaker on drop —
+                // but no tracked stream is installed when send() fails
+                // before any response stream exists. Record the failure
+                // here so a worker flapping at the TCP layer doesn't
+                // stay permanently selectable. Non-streaming requests
+                // are already covered by the caller's
+                // `worker.record_outcome(status.is_success())`, so
+                // gating on `is_stream` avoids double-counting.
+                if is_stream {
+                    worker.record_outcome(false);
+                }
                 return convert_reqwest_error(e);
             }
         };
@@ -602,29 +616,26 @@ impl Router {
             // Ensure we set the correct content-type for SSE
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-            let stream = res.bytes_stream();
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e)));
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = UnboundedReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
+            // Pass the reqwest byte stream straight through as the response body.
+            // Dropping the response body drops this stream, which closes the
+            // upstream HTTP connection and lets the engine abort generation —
+            // no spawned task or channel needed. `BreakerTrackedStream`
+            // updates the worker's circuit breaker exactly once on drop:
+            // success on clean end, failure on stream error, neither on
+            // client disconnect. For non-2xx responses we pre-mark the
+            // wrapper as Errored — otherwise the small error body would
+            // stream cleanly to `None` and Drop would record a spurious
+            // success (and the streaming branch also skips the eager
+            // `record_outcome` above).
+            let mut tracked = BreakerTrackedStream::new(
+                res.bytes_stream(),
+                worker.clone(),
+                worker_url.to_string(),
+            );
+            if !status.is_success() {
+                tracked.mark_errored();
+            }
+            let body = Body::from_stream(tracked);
 
             let mut response = Response::new(body);
             *response.status_mut() = status;
@@ -724,7 +735,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_server_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "get_server_info").await
+        self.proxy_get_request(req, "server_info").await
     }
 
     async fn get_models(&self, req: Request<Body>) -> Response {
@@ -732,7 +743,7 @@ impl RouterTrait for Router {
     }
 
     async fn get_model_info(&self, req: Request<Body>) -> Response {
-        self.proxy_get_request(req, "get_model_info").await
+        self.proxy_get_request(req, "model_info").await
     }
 
     async fn route_generate(

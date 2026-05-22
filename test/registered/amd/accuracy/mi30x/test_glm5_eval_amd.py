@@ -1,6 +1,6 @@
 """AMD GLM-5 GSM8K Completion Evaluation Test (8-GPU)
 
-Tests GLM-5 with NSA attention backend using few-shot completion
+Tests GLM-5 with DSA attention backend using few-shot completion
 benchmark on MI325/MI300X.
 
 Registry: nightly-amd-accuracy-8-gpu-glm5 suite
@@ -55,20 +55,24 @@ class ModelConfig:
         return self.model_path
 
 
-# GLM-5 models for MI325/MI300X - NSA attention backend
+# GLM-5 models for MI325/MI300X - DSA attention backend
 GLM5_MODELS = [
-    # GLM-5 with NSA attention (TP=8)
+    # GLM-5 with DSA attention (TP=8)
     ModelConfig(
-        model_path="zai-org/GLM-5",
+        model_path="zai-org/GLM-5-FP8",
         tp_size=8,
         accuracy_threshold=0.93,
         timeout=3600,
-        variant="nsa",
+        variant="dsa",
         other_args=[
             "--trust-remote-code",
-            "--nsa-prefill-backend",
+            "--reasoning-parser",
+            "glm45",
+            "--tool-call-parser",
+            "glm47",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--chunked-prefill-size",
             "131072",
@@ -77,7 +81,7 @@ GLM5_MODELS = [
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
             "--watchdog-timeout",
-            "1200",  # 20 minutes for weight loading
+            "1200",
         ],
         env_vars={"SGLANG_USE_AITER": "1"},
     ),

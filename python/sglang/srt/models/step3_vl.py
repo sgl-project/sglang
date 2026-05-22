@@ -61,6 +61,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, log_info_on_rank0, make_layers
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -290,8 +291,7 @@ class Step3TextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads

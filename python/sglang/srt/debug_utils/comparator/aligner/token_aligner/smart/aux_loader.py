@@ -175,7 +175,7 @@ def _load_non_tensor_aux(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
-    loaded = filter_to_non_empty_dp_rank(loaded)
+    loaded = filter_to_non_empty_dp_rank(loaded, dp_axis=ParallelAxis.DP)
 
     if len(loaded) > 1:
         first_value = loaded[0].value
@@ -212,7 +212,7 @@ def _load_and_align_aux_tensor(
     loaded: list[ValueWithMeta] = [
         ValueWithMeta.load(dump_path / r["filename"]) for r in rows
     ]
-    loaded = filter_to_non_empty_dp_rank(loaded)
+    loaded = filter_to_non_empty_dp_rank(loaded, dp_axis=ParallelAxis.DP)
 
     tensors: list[torch.Tensor] = [
         item.value for item in loaded if isinstance(item.value, torch.Tensor)

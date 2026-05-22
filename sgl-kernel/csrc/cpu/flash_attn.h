@@ -134,9 +134,10 @@ struct flash_attn_softmax {
           v_prime + row * head_size_v,
           head_size_v);
 
-      // pad s_delta with 0 first and then convert to scalar_t
+      // Keep s_delta row-major for the following brgemm(P @ V), and only
+      // convert the columns that brgemm will consume.
       fill_stub(s_delta + row * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-      copy_stub<scalar_t, BLOCK_N>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N);
+      copy_stub<scalar_t>(s_delta2 + row * BLOCK_N, s_delta + row * BLOCK_N, 1.f, padded_n_size);
     }
   }
 };
@@ -190,6 +191,7 @@ struct flash_attn_softmax<at::BFloat16, BLOCK_M, BLOCK_N> {
 
       // m_i: max value per row
       float m_i = _mm512_reduce_max_ps(vmax);
+      m_i = std::max(m_i, m_prime[m]);
       vmax = _mm512_set1_ps(m_i);
 
       // m_delta <- exp(m' - m_i)

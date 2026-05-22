@@ -22,6 +22,7 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ class RadixLinearAttention(nn.Module):
             )
             return output
         else:
-            return forward_batch.attn_backend.forward(
+            return get_attn_backend().forward(
                 layer=self,
                 forward_batch=forward_batch,
                 mixed_qkv=mixed_qkv,
@@ -117,18 +118,21 @@ def unified_linear_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
 
-    ret = forward_batch.attn_backend.forward(
+    original_out_cache_loc = forward_batch.out_cache_loc
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+
+    ret = get_attn_backend().forward(
         layer=attention_layer,
         forward_batch=forward_batch,
-        mixed_qkv=mixed_qkv,
-        a=a,
-        b=b,
+        mixed_qkv=mixed_qkv[:real_num_tokens],
+        a=a[:real_num_tokens],
+        b=b[:real_num_tokens],
     )
+    forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
-
-    output.view(ret.shape).copy_(ret)
+    output[:, :real_num_tokens].copy_(ret)
     return
