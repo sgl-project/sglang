@@ -475,15 +475,14 @@ jobs:
           python3 scripts/ci/slurm/summarize.py results/ >> $GITHUB_STEP_SUMMARY
 
       - name: Print eval summary
-        # Surface gsm8k (and future lm-eval task) scores in the step summary
-        # whenever any eval artifact landed. summarize_evals.py scans the
-        # downloaded gb200-eval-* artifacts and emits one row per (config, task).
+        # Surface lm-eval task scores in the step summary whenever any eval
+        # artifact landed.
         run: |
           if compgen -G "results/gb200-eval-*/results*.json" > /dev/null; then
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "## Eval Summary" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            python3 scripts/ci/slurm/summarize_evals.py results/ >> $GITHUB_STEP_SUMMARY
+            python3 scripts/ci/slurm/collect_eval_results.py results/ gb200-${{ github.run_id }} >> $GITHUB_STEP_SUMMARY
           else
             echo "No eval results to summarize."
           fi
