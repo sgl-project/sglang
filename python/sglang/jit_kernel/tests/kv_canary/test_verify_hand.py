@@ -1358,23 +1358,19 @@ class TestLayoutAndScheduling:
         tokens = [77, 88]
         positions = [0, 1]
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
-        rkv_values: list[int] = []
-        for slot_idx in slot_indices:
-            page_id = slot_idx // sources_cuda[0].page_size
-            page_off = (slot_idx % sources_cuda[0].page_size) * sources_cuda[
-                0
-            ].num_bytes_per_token
-            row_bytes = (
-                sources_cuda[0]
-                .tensor[page_id, page_off : page_off + sources_cuda[0].read_bytes]
-                .detach()
-                .cpu()
-                .tolist()
+        # Use the reference fold (8-byte little-endian word pack + splitmix64), not a
+        # byte-by-byte loop, so the stamped real_kv_hash matches what the kernel /
+        # verify reference will recompute. A byte-by-byte fold was the previous bug
+        # here and triggered REAL_KV_HASH violations on otherwise clean chains.
+        rkv_values = [
+            _compute_real_kv_hash_scalar(
+                slot_idx=slot_idx,
+                real_kv_sources=sources_cuda,
+                real_kv_hash_mode=consts.RealKvHashMode.ALL,
+                work_device=_DEVICE,
             )
-            fold = 0
-            for b in row_bytes:
-                fold = splitmix64(fold ^ int(b))
-            rkv_values.append(fold)
+            for slot_idx in slot_indices
+        ]
 
         for slot_idx, token, position, rkv in zip(
             slot_indices, tokens, positions, rkv_values

@@ -45,23 +45,29 @@ class PlanInvariants:
             swa_window_size=swa_window_size,
             extras_count=extras_count,
         )
-        PlanInvariants._assert_extras_land_at_tail(
-            verify_plan=verify_plan,
-            derived_verify_count=derived,
-            extras_slot_indices=extras_slot_indices,
-            extras_positions=extras_positions,
-            extras_prev_slot_indices=extras_prev_slot_indices,
-            extras_count=extras_count,
-        )
         PlanInvariants._assert_padding_row_seed_is_minus_one(
             write_plan=write_plan,
             req_pool_indices=req_pool_indices,
         )
-        PlanInvariants._assert_prev_slot_minus_one_iff_chain_head(
-            verify_plan=verify_plan,
-            swa_window_size=swa_window_size,
-            derived_verify_count=derived,
-        )
+        # In overflow (derived + extras > verify_capacity) the plan kernel disables
+        # verify (enable=0) and the verify entries buffer is partially populated; the
+        # downstream entry-shape invariants only hold when the kernel actually emitted
+        # the full set, so guard them on enable=1.
+        verify_enabled = int(verify_plan.enable[0].item()) == 1
+        if verify_enabled:
+            PlanInvariants._assert_extras_land_at_tail(
+                verify_plan=verify_plan,
+                derived_verify_count=derived,
+                extras_slot_indices=extras_slot_indices,
+                extras_positions=extras_positions,
+                extras_prev_slot_indices=extras_prev_slot_indices,
+                extras_count=extras_count,
+            )
+            PlanInvariants._assert_prev_slot_minus_one_iff_chain_head(
+                verify_plan=verify_plan,
+                swa_window_size=swa_window_size,
+                derived_verify_count=derived,
+            )
 
     @staticmethod
     def _assert_write_offsets_monotone(write_plan: WritePlan) -> None:
@@ -183,11 +189,26 @@ class PlanInvariants:
                 derived += max(0, pfx - window_start)
             else:
                 derived += max(0, pfx)
-        expected = derived + extras_count
+        # The plan kernel clamps verify_num_valid to verify_capacity and turns enable
+        # off when (derived + extras) overflows the slot indices buffer. The invariant
+        # must match that: on overflow the kernel records the capacity, on no overflow
+        # it records the exact derived total (so the verify kernel scans every row).
+        verify_capacity = int(verify_plan.verify_slot_indices.shape[0])
+        expected_unclamped = derived + extras_count
+        expected = min(expected_unclamped, verify_capacity)
+        overflow = expected_unclamped > verify_capacity
         actual = int(verify_plan.verify_num_valid[0].item())
-        assert (
-            actual == expected
-        ), f"verify_num_valid {actual} != derived {derived} + extras {extras_count} = {expected}"
+        assert actual == expected, (
+            f"verify_num_valid {actual} != min(derived {derived} + extras {extras_count}, "
+            f"verify_capacity {verify_capacity}) = {expected}"
+        )
+        enable = int(verify_plan.enable[0].item())
+        expected_enable = 0 if overflow else 1
+        assert enable == expected_enable, (
+            f"verify_plan.enable {enable} != expected {expected_enable} "
+            f"(overflow={overflow}; derived+extras={expected_unclamped}, "
+            f"verify_capacity={verify_capacity})"
+        )
         return derived
 
 
