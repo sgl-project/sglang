@@ -9,7 +9,7 @@ import torch
 
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_plan
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    _allocate_plan_pair,
+    allocate_plan_pair,
     derive_plan_capacity,
     make_lut,
     make_padding_mask,
@@ -130,7 +130,7 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
 
 
 def _run_one(inputs: PlanFuzzInputs) -> tuple:
-    triton_v, triton_w, ref_v, ref_w = _allocate_plan_pair(
+    triton_v, triton_w, ref_v, ref_w = allocate_plan_pair(
         verify_capacity=inputs.verify_capacity,
         write_req_capacity=inputs.write_req_capacity,
     )

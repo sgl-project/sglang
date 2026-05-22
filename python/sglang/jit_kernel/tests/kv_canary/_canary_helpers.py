@@ -7,15 +7,15 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
-from sglang.jit_kernel.kv_canary.verify import (
-    CANARY_SLOT_BYTES,
-    CanaryLaunchTag,
-    RealKvSource,
-    VerifyOrWriteContext,
-    VerifyPlan,
-    launch_canary_verify_kernel,
+from sglang.jit_kernel.kv_canary.verify import VerifyPlan
+from sglang.jit_kernel.kv_canary.write import WritePlan
+from sglang.jit_kernel.tests.kv_canary._constants import (
+    DEFAULT_NUM_SLOTS,
+    DEFAULT_RING_CAPACITY,
+    DEFAULT_SLOT_STRIDE_BYTES,
+    _I64_SIGN_BIT,
+    _U64_MASK,
 )
-from sglang.jit_kernel.kv_canary.write import WritePlan, launch_canary_write_kernel
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
     make_real_kv_sources,
@@ -32,29 +32,16 @@ __all__ = [
     "make_log_pair",
     "make_real_kv_source",
     "make_real_kv_sources",
-    "launch_canary_verify_kernel_from_parts",
-    "launch_canary_write_kernel_from_parts",
     "make_verify_plan",
     "make_verify_plan_pair",
     "make_write_plan",
     "make_write_plan_pair",
     "read_slot_fields",
-    "splitmix64",
-    "splitmix64_mix4",
     "stamp_clean_chain",
     "stamp_pair",
     "to_signed_int64",
     "write_slot_fields",
 ]
-
-# Default fixture sizes — small enough for fast tests, large enough that ring overflow / multi-req cases
-# stay realistic without bloating the assertion surface.
-DEFAULT_RING_CAPACITY: int = 64
-DEFAULT_NUM_SLOTS: int = 32
-DEFAULT_SLOT_STRIDE_BYTES: int = CANARY_SLOT_BYTES
-
-_U64_MASK: int = (1 << 64) - 1
-_I64_SIGN_BIT: int = 1 << 63
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -76,72 +63,6 @@ class FakeViolationLog:
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
         )
-
-
-def launch_canary_verify_kernel_from_parts(
-    *,
-    canary_buf: torch.Tensor,
-    plan: VerifyPlan,
-    kernel_kind: CanaryLaunchTag,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-) -> None:
-    launch_canary_verify_kernel(
-        context=VerifyOrWriteContext(
-            canary_buf=canary_buf,
-            kernel_kind=kernel_kind,
-            violation_ring=violation_ring,
-            violation_write_index=violation_write_index,
-            slot_run_counter=slot_run_counter,
-            kernel_run_counter=kernel_run_counter,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
-        ),
-        plan=plan,
-    )
-
-
-def launch_canary_write_kernel_from_parts(
-    *,
-    canary_buf: torch.Tensor,
-    plan: WritePlan,
-    input_ids: torch.Tensor,
-    positions: torch.Tensor,
-    out_cache_loc: torch.Tensor,
-    kernel_kind: CanaryLaunchTag,
-    enable_write_verify_inputs: bool,
-    expected_input_tokens: torch.Tensor | None,
-    expected_input_positions: torch.Tensor | None,
-    violation_ring: torch.Tensor,
-    violation_write_index: torch.Tensor,
-    slot_run_counter: torch.Tensor,
-    kernel_run_counter: torch.Tensor,
-    real_kv_sources: tuple[RealKvSource, ...],
-    real_kv_hash_mode: consts.RealKvHashMode,
-) -> None:
-    launch_canary_write_kernel(
-        context=VerifyOrWriteContext(
-            canary_buf=canary_buf,
-            kernel_kind=kernel_kind,
-            violation_ring=violation_ring,
-            violation_write_index=violation_write_index,
-            slot_run_counter=slot_run_counter,
-            kernel_run_counter=kernel_run_counter,
-            real_kv_sources=real_kv_sources,
-            real_kv_hash_mode=real_kv_hash_mode,
-        ),
-        plan=plan,
-        input_ids=input_ids,
-        positions=positions,
-        out_cache_loc=out_cache_loc,
-        enable_assert_inputs=enable_write_verify_inputs,
-        expected_input_tokens=expected_input_tokens,
-        expected_input_positions=expected_input_positions,
-    )
 
 
 def make_canary_buf(
@@ -328,11 +249,7 @@ def stamp_pair(
     prev_hash: int,
     real_kv_hash: int = 0,
 ) -> None:
-    """Stamp the same slot fields into both (cuda, ref) canary buffers.
-
-    Replaces the ``for buf in (cuda_buf, ref_buf): write_slot_fields(...)`` loop that appears
-    dozens of times across the hand tests.
-    """
+    """Stamp the same slot fields into both (cuda, ref) canary buffers."""
     for buf in buf_pair:
         write_slot_fields(
             canary_buf=buf,
@@ -387,16 +304,10 @@ def stamp_clean_chain(
 def assert_canary_state_equal(
     *, log_a: FakeViolationLog, log_b: FakeViolationLog
 ) -> None:
-    assert torch.equal(log_a.ring, log_b.ring), "violation_ring diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.write_index, log_b.write_index
-    ), "violation_write_index diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.slot_run_counter, log_b.slot_run_counter
-    ), "slot_run_counter diverged (CUDA vs ref)"
-    assert torch.equal(
-        log_a.kernel_run_counter, log_b.kernel_run_counter
-    ), "kernel_run_counter diverged (CUDA vs ref)"
+    for name in ("ring", "write_index", "slot_run_counter", "kernel_run_counter"):
+        assert torch.equal(
+            getattr(log_a, name), getattr(log_b, name)
+        ), f"{name} diverged (CUDA vs ref)"
 
 
 def assert_canary_buf_equal(*, buf_a: torch.Tensor, buf_b: torch.Tensor) -> None:
