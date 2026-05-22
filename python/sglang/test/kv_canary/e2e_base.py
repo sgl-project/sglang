@@ -4,15 +4,13 @@ import io
 import os
 import string
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Optional
-
-import requests
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
+from sglang.test.kv_canary.parallel_request import post_parallel_generate
 from sglang.test.kv_canary.violation_log_utils import (
     assert_no_violation_in_log,
     find_violation_in_log,
@@ -112,32 +110,15 @@ class CanaryE2EBase(CustomTestCase):
         timeout: float = 60.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
-        prompts = self.make_prompts(n)
-
-        def _send(prompt: str) -> dict:
-            try:
-                resp = requests.post(
-                    self.base_url + "/generate",
-                    json={
-                        "text": prompt,
-                        "sampling_params": {
-                            "max_new_tokens": max_new_tokens,
-                            "temperature": 0.0,
-                        },
-                    },
-                    timeout=timeout,
-                )
-                return {"status_code": resp.status_code, "body": resp.text}
-            except requests.RequestException as exc:
-                return {"status_code": -1, "error": repr(exc)}
-
-        with ThreadPoolExecutor(max_workers=max(1, n)) as pool:
-            results = list(pool.map(_send, prompts))
-
+        results = post_parallel_generate(
+            url=self.base_url + "/generate",
+            prompts=self.make_prompts(n),
+            max_new_tokens=max_new_tokens,
+            timeout=timeout,
+        )
         if assert_all_success:
             for result in results:
                 self.assertEqual(result.get("status_code"), 200, result)
-
         return results
 
     def assert_per_forward_violation_reported(
