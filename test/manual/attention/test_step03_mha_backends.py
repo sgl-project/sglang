@@ -383,7 +383,9 @@ class TestFlashInferInit(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 _SM = gpu_arch_sm()
-_FA_OK = _CUDA and _SM is not None and _SM >= 80  # FA requires Ampere+
+_FA_OK = (
+    _CUDA and _SM is not None and 80 <= _SM < 100
+)  # FA3 requires SM80-90 (Ampere/Hopper); skip Blackwell/GB300
 
 
 @unittest.skipUnless(_FA_OK, "FlashAttention requires SM >= 80 (Ampere)")
