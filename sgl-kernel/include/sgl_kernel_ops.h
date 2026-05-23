@@ -27,6 +27,10 @@ limitations under the License.
 
 #include "scalar_type.hpp"
 
+#ifdef USE_MUSA
+#include "sgl_kernel_musa_ops.h"
+#endif
+
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 

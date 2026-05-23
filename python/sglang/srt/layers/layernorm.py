@@ -53,7 +53,26 @@ _flashinfer_layernorm_available = False
 if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
-            from flashinfer.norm import layernorm
+            import flashinfer.norm
+
+            from sglang.srt.utils.custom_op import register_custom_op
+
+            def _layernorm_fake_impl(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return torch.empty_like(input)
+
+            @register_custom_op(fake_impl=_layernorm_fake_impl)
+            def layernorm(
+                input: torch.Tensor,
+                gamma: torch.Tensor,
+                beta: torch.Tensor,
+                eps: float = 1e-6,
+            ) -> torch.Tensor:
+                return flashinfer.norm.layernorm(input, gamma, beta, eps)
 
             _flashinfer_layernorm_available = True
         except (ImportError, AttributeError):
@@ -344,9 +363,6 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if not get_global_server_args().disable_piecewise_cuda_graph:
-            return self.forward_native(x, residual, post_residual_addition)
-
         if not x.is_contiguous():
             x = x.contiguous()
 
@@ -439,6 +455,17 @@ class RMSNorm(MultiPlatformOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if is_batch_invariant_mode_enabled():
+            if (
+                residual is not None
+                or get_global_server_args().rl_on_policy_target == "fsdp"
+            ):
+                return self.forward_native(x, residual, post_residual_addition)
+            return rms_norm_batch_invariant(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+            )
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition

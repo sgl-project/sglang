@@ -79,9 +79,6 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Build Docker image
         run: |
           PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}

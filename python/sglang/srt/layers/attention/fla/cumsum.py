@@ -70,9 +70,10 @@ def chunk_local_cumsum_scalar_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
+        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )

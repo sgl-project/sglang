@@ -85,5 +85,7 @@ jobs:
 
           # rocm.Dockerfile expects SGL_BRANCH with 'v' prefix for git tag checkout
           # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
-          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 -t lmsysorg/sglang:${tag} --no-cache
+          # UBUNTU_MIRROR forces apt over HTTPS to dodge port-80 reachability flakes
+          # to Canonical's archive.ubuntu.com mirror IPs from the amd-docker-scale runner.
+          docker build . -f docker/rocm.Dockerfile --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }}${gpu_arch_suffix} --build-arg SGL_BRANCH=v${version} --build-arg ENABLE_MORI=1 --build-arg UBUNTU_MIRROR=https://archive.ubuntu.com -t lmsysorg/sglang:${tag} --no-cache
           docker push lmsysorg/sglang:${tag}

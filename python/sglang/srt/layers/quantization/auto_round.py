@@ -258,8 +258,8 @@ class AutoRoundConfig(QuantizationConfig):
             use_marlin = False
         if use_marlin:
             from sglang.srt.layers.quantization.awq import (
+                AWQLinearMethod,
                 AWQMarlinConfig,
-                AWQMarlinLinearMethod,
                 AWQMoEMethod,
             )
 
@@ -282,6 +282,7 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, FusedMoE):
             if use_marlin:
+                layer.scheme = quant_args_marlin.get_moe_scheme(layer)
                 return AWQMoEMethod(quant_args_marlin)
             from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 
@@ -296,8 +297,10 @@ class AutoRoundConfig(QuantizationConfig):
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             if use_marlin:
-                return AWQMarlinLinearMethod(quant_args_marlin)
+                layer.scheme = quant_args_marlin.get_linear_scheme(layer)
+                return AWQLinearMethod(quant_args_marlin)
             else:
+                layer.scheme = quant_args.get_linear_scheme(layer)
                 return AWQLinearMethod(quant_args)
         return None
 
