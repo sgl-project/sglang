@@ -102,34 +102,34 @@ __global__ void plan_entries_persistent_kernel(
     const int64_t rp = params.req_pool_indices[req_id];
     const int64_t prefix_len = params.prefix_lens[req_id];
     const int64_t window_start = (swa_window > 0) ? (prefix_len - swa_window > 0 ? prefix_len - swa_window : 0) : 0;
-    const int64_t position = window_start + entry_idx;
+    const int64_t out_position = window_start + entry_idx;
 
     // 3) Gather slot + prev_slot via req_to_token.
     const int64_t row_base = rp * req_to_token_stride0;
-    const int32_t slot_raw = params.req_to_token[row_base + position];
-    int64_t slot;
+    const int32_t slot_raw = params.req_to_token[row_base + out_position];
+    int64_t out_slot;
     if constexpr (HAS_SWA_LUT) {
-      slot = swa_translate(params.full_to_swa_lut, lut_len, static_cast<int64_t>(slot_raw));
+      out_slot = swa_translate(params.full_to_swa_lut, lut_len, static_cast<int64_t>(slot_raw));
     } else {
-      slot = static_cast<int64_t>(slot_raw);
+      out_slot = static_cast<int64_t>(slot_raw);
     }
 
-    int64_t prev_slot;
-    if (position > 0) {
-      const int32_t prev_raw = params.req_to_token[row_base + position - 1];
+    int64_t out_prev_slot;
+    if (out_position > 0) {
+      const int32_t prev_raw = params.req_to_token[row_base + out_position - 1];
       if constexpr (HAS_SWA_LUT) {
-        prev_slot = swa_translate(params.full_to_swa_lut, lut_len, static_cast<int64_t>(prev_raw));
+        out_prev_slot = swa_translate(params.full_to_swa_lut, lut_len, static_cast<int64_t>(prev_raw));
       } else {
-        prev_slot = static_cast<int64_t>(prev_raw);
+        out_prev_slot = static_cast<int64_t>(prev_raw);
       }
     } else {
-      prev_slot = -1;
+      out_prev_slot = -1;
     }
 
     // 4) Scatter. out_idx == tid since verify_offsets[req_id] + entry_idx == tid by construction.
-    params.out_verify_slot_indices[tid] = slot;
-    params.out_verify_positions[tid] = position;
-    params.out_verify_prev_slot_indices[tid] = prev_slot;
+    params.out_verify_slot_indices[tid] = out_slot;
+    params.out_verify_positions[tid] = out_position;
+    params.out_verify_prev_slot_indices[tid] = out_prev_slot;
   }
 }
 
