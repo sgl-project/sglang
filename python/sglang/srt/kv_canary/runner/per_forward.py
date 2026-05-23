@@ -17,6 +17,10 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
+from sglang.srt.kv_canary.runner.phase_checker import (
+    CanaryPerForwardPhase,
+    CanaryPerForwardPhaseChecker,
+)
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
@@ -99,9 +103,16 @@ class PerForwardOrchestrator:
             d2h_stream=d2h_stream,
         )
 
+        self._phase_checker = CanaryPerForwardPhaseChecker(device=device)
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
+
+        self._phase_checker.update(
+            expect_phase=CanaryPerForwardPhase.IDLE,
+            next_phase=CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
+        )
 
         bs = int(forward_batch.batch_size)
         num_tokens = int(forward_batch.positions.shape[0])
@@ -142,6 +153,11 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
 
+        self._phase_checker.update(
+            expect_phase=CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
+            next_phase=CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+        )
+
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
@@ -180,6 +196,11 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
 
+        self._phase_checker.update(
+            expect_phase=CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            next_phase=CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+        )
+
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
@@ -204,6 +225,12 @@ class PerForwardOrchestrator:
     def end_of_step(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
+
+        self._phase_checker.update(
+            expect_phase=CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            next_phase=CanaryPerForwardPhase.IDLE,
+        )
+
         self._perturb_manager.end_of_forward(forward_batch)
         self._enable_warner.tick(self._verify_plan_per_forward.enable)
 
