@@ -604,6 +604,15 @@ class SchedulerBatchResultProcessor:
             spec_v1_hs_offsets = [0]
             for c in result.num_correct_drafts_per_req_cpu:
                 spec_v1_hs_offsets.append(spec_v1_hs_offsets[-1] + c + 1)
+            # Lock the cross-file contract: every V1 worker that populates
+            # both fields must keep them in sync. Misalignment here means a
+            # worker silently drifted from the flat-accept-gather layout.
+            assert (
+                spec_v1_hs_offsets[-1] == logits_output.hidden_states.shape[0]
+            ), (
+                f"spec-v1 hidden_states offset total {spec_v1_hs_offsets[-1]} "
+                f"!= hidden_states.shape[0] {logits_output.hidden_states.shape[0]}"
+            )
 
         for i, req in enumerate(batch.reqs):
             req: Req

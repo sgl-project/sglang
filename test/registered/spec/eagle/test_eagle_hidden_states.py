@@ -19,7 +19,6 @@ its hidden_states is always None and this fix never fires for it.
 import unittest
 
 import sglang as sgl
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
@@ -33,29 +32,23 @@ register_cuda_ci(est_time=120, stage="extra-a", runner_config="1-gpu-large")
 class TestEagleReturnHiddenStates(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        try:
-            cls.engine = sgl.Engine(
-                model_path=DEFAULT_TARGET_MODEL_EAGLE,
-                speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
-                speculative_algorithm="EAGLE",
-                speculative_num_steps=5,
-                speculative_eagle_topk=8,
-                speculative_num_draft_tokens=64,
-                enable_return_hidden_states=True,
-                mem_fraction_static=0.7,
-                cuda_graph_max_bs=8,
-            )
-        except Exception:
-            envs.SGLANG_ENABLE_SPEC_V2.clear()
-            raise
+        # speculative_eagle_topk=8 (>1) forces spec V1 in speculative_hook.py
+        # regardless of SGLANG_ENABLE_SPEC_V2 — no env-var management needed.
+        cls.engine = sgl.Engine(
+            model_path=DEFAULT_TARGET_MODEL_EAGLE,
+            speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=5,
+            speculative_eagle_topk=8,
+            speculative_num_draft_tokens=64,
+            enable_return_hidden_states=True,
+            mem_fraction_static=0.7,
+            cuda_graph_max_bs=8,
+        )
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            cls.engine.shutdown()
-        finally:
-            envs.SGLANG_ENABLE_SPEC_V2.clear()
+        cls.engine.shutdown()
 
     def test_eagle_with_return_hidden_states(self):
         prompts = [

@@ -21,7 +21,6 @@ from typing import List
 import torch
 
 import sglang as sgl
-from sglang.srt.environ import envs
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_TARGET_MODEL_EAGLE,
@@ -64,32 +63,25 @@ def _assert_per_req_invariant(self, outputs, *, allow_zero_hs=False):
 class TestEagleHiddenStatesStress(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        try:
-            # mem_fraction_static=0.45 leaves headroom for the value-equivalence
-            # test to instantiate a temporary non-spec baseline engine without
-            # exceeding GPU memory.
-            cls.engine = sgl.Engine(
-                model_path=DEFAULT_TARGET_MODEL_EAGLE,
-                speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
-                speculative_algorithm="EAGLE",
-                speculative_num_steps=5,
-                speculative_eagle_topk=8,
-                speculative_num_draft_tokens=64,
-                enable_return_hidden_states=True,
-                mem_fraction_static=0.45,
-                cuda_graph_max_bs=32,
-            )
-        except Exception:
-            envs.SGLANG_ENABLE_SPEC_V2.clear()
-            raise
+        # speculative_eagle_topk=8 (>1) forces spec V1 in speculative_hook.py.
+        # mem_fraction_static=0.45 leaves headroom for the value-equivalence
+        # test to instantiate a temporary non-spec baseline engine without
+        # exceeding GPU memory.
+        cls.engine = sgl.Engine(
+            model_path=DEFAULT_TARGET_MODEL_EAGLE,
+            speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=5,
+            speculative_eagle_topk=8,
+            speculative_num_draft_tokens=64,
+            enable_return_hidden_states=True,
+            mem_fraction_static=0.45,
+            cuda_graph_max_bs=32,
+        )
 
     @classmethod
     def tearDownClass(cls):
-        try:
-            cls.engine.shutdown()
-        finally:
-            envs.SGLANG_ENABLE_SPEC_V2.clear()
+        cls.engine.shutdown()
 
     def test_bs_1_high_accept(self):
         outputs = self.engine.generate(
@@ -122,8 +114,15 @@ class TestEagleHiddenStatesStress(CustomTestCase):
     def test_high_concurrent_batch(self):
         # 32 concurrent reqs (matches cuda_graph_max_bs). Exercises offset
         # loop over a non-trivial bs and ensures rows are correctly attributed
-        # across many simultaneous slices.
-        prompts = (HIGH_ACCEPT_PROMPTS * 8 + LOW_ACCEPT_PROMPTS * 4)[:32]
+        # across many simultaneous slices. Interleave HIGH and LOW so a single
+        # batch carries reqs with very different acceptance counts side-by-side
+        # — that's the configuration most likely to expose per-req slice
+        # off-by-ones, since uniform-acceptance batches mask shift bugs.
+        interleaved = []
+        for h, l in zip(HIGH_ACCEPT_PROMPTS * 8, LOW_ACCEPT_PROMPTS * 11):
+            interleaved.append(h)
+            interleaved.append(l)
+        prompts = interleaved[:32]
         outputs = self.engine.generate(
             prompts,
             sampling_params={"temperature": 0, "max_new_tokens": 24},
