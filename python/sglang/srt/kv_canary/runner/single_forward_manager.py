@@ -415,6 +415,11 @@ class _SnapshotBuffers:
         self.seq_lens[:bs].copy_(forward_batch.seq_lens)
         num_tokens = int(forward_batch.positions.shape[0])
         self.positions[:num_tokens].copy_(forward_batch.positions)
+        # Tail-fill out_cache_loc with -1 BEFORE the partial copy below so
+        # the snapshot picker's "negative entries are padding" filter
+        # treats the unwritten suffix as skip rather than as slot 0.
+        # ``fill_`` is capture-safe (in-place op, no allocation).
+        self.out_cache_loc.fill_(-1)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
 
 
