@@ -20,6 +20,7 @@ The radix tree data structure for managing the hybrid (full and Mamba) KV cache.
 """
 
 import heapq
+from array import array
 from collections import defaultdict
 from functools import lru_cache
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -204,6 +205,9 @@ class LRUList:
         setattr(
             getattr(node, self.nxt), self.prv, getattr(node, self.prv)
         )  # node.next.prev = node.prev
+        # Clear self pointers to break reference cycles among evicted nodes.
+        setattr(node, self.prv, None)
+        setattr(node, self.nxt, None)
 
     def _get_lru(self) -> Optional[TreeNode]:
         """
@@ -453,7 +457,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def reset(self) -> None:
         self.root_node = TreeNode()
-        self.root_node.key = RadixKey([], None)
+        self.root_node.key = RadixKey(array("q"), None)
         self.root_node.value = []
         self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
@@ -488,6 +492,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                 ),
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
+                best_match_node=self.root_node,
             )
 
         value, last_node, best_value_len = self._match_prefix_helper(key)
@@ -638,45 +643,44 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         page_aligned_token_ids = token_ids[:page_aligned_len]
 
+        # Donate the mamba index to the radix cache instead of copying.
+        # This avoids a data copy that would race with the forward stream.
         if self.enable_mamba_extra_buffer:
-            # copy from the ping pong track buffer
             mamba_ping_pong_track_buffer_to_keep = (
                 self.req_to_token_pool.get_mamba_ping_pong_other_idx(
                     req.mamba_next_track_idx
                 )
             )
-            mamba_value = (
+            mamba_value_donated = (
                 req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep]
                 .unsqueeze(-1)
                 .clone()
             )
-        else:
-            mamba_value = self.req_to_token_pool.get_mamba_indices(
-                req.req_pool_idx
-            ).unsqueeze(-1)
-        # radix tree mamba value is forked from req space
-        mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(mamba_value)
-
-        # if alloc mamba cache failed, do evict and alloc again
-        if mamba_value_forked is None:
-            self.evict(EvictParams(num_tokens=0, mamba_num=1))
-            mamba_value_forked = self.req_to_token_pool.mamba_pool.fork_from(
-                mamba_value
+            new_slot = self._alloc_mamba_slot()
+            req.mamba_ping_pong_track_buffer[mamba_ping_pong_track_buffer_to_keep] = (
+                new_slot[0]
             )
-            assert mamba_value_forked is not None, "Can not alloc mamba cache"
+            self.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
+                req.req_pool_idx
+            ] = req.mamba_ping_pong_track_buffer
+        else:
+            mamba_value_donated = self._alloc_mamba_slot()
+            self.req_to_token_pool.mamba_pool.copy_from(
+                req.mamba_pool_idx.unsqueeze(0), mamba_value_donated
+            )
+
         result = self.insert(
             InsertParams(
                 key=RadixKey(page_aligned_token_ids, req.extra_key),
                 value=page_aligned_kv_indices,
-                mamba_value=mamba_value_forked,
+                mamba_value=mamba_value_donated,
                 prev_prefix_len=req.cache_protected_len,
                 chunked=chunked,
             )
         )
         new_prefix_len, mamba_exist = result.prefix_len, result.mamba_exist
-        # there is a mamba cache in radix cache, release it
         if mamba_exist:
-            self.req_to_token_pool.mamba_pool.free(mamba_value_forked)
+            self.req_to_token_pool.mamba_pool.free(mamba_value_donated)
 
         # The prefix indices could be updated, reuse it
         match_result = self.match_prefix(
@@ -688,7 +692,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         if not mamba_exist:
-            assert torch.equal(new_last_node.mamba_value, mamba_value_forked)
+            assert torch.equal(new_last_node.mamba_value, mamba_value_donated)
 
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
@@ -950,6 +954,15 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        """Allocate one mamba pool slot, evicting if necessary."""
+        slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        if slot is None:
+            self.evict(EvictParams(num_tokens=0, mamba_num=1))
+            slot = self.req_to_token_pool.mamba_pool.alloc(1)
+            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
     def _match_prefix_helper(
         self, key: RadixKey
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
@@ -1042,25 +1055,19 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             mamba_branching_seqlen = None
 
-        # Copy mamba state to req local space if cow is true
+        # Defer COW to forward stream: record source index, allocate destination
         if cow_mamba and last_node.mamba_value is not None:
-            # for reqs without mamba cache
             if req.mamba_pool_idx is None:
                 dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
-                # try to alloc again, protect last_node from eviction
                 if dst_index is None:
                     self.inc_lock_ref(last_node)
                     self.evict(EvictParams(num_tokens=0, mamba_num=1))
                     dst_index = self.req_to_token_pool.mamba_pool.alloc(1)
                     self.dec_lock_ref(last_node)
                     assert dst_index is not None, "Can not alloc mamba cache"
-                src_index = last_node.mamba_value
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
                 req.mamba_pool_idx = dst_index[0]
-            else:
-                src_index = last_node.mamba_value
-                dst_index = req.mamba_pool_idx.unsqueeze(0)
-                self.req_to_token_pool.mamba_pool.copy_from(src_index, dst_index)
+            req.mamba_cow_src_index = last_node.mamba_value
+            req.mamba_needs_clear = False
 
         value = value[:best_value_len]
         if value:
@@ -1072,6 +1079,7 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_node,
+            best_match_node=last_node,
             mamba_branching_seqlen=mamba_branching_seqlen,
         )
 
