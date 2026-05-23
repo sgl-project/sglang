@@ -20,6 +20,9 @@ def _host_debug(msg: str) -> None:
         print(msg, flush=True)
 
 
+# debug=True so tl.device_assert below actually raises. Without it the assert
+# is stripped at compile time and only tl.device_print fires (the assert is
+# gated on the TRITON_DEBUG env var by default — see tl.device_assert docstring).
 @triton.jit(debug=True)
 def _phase_check_kernel(
     phase_ptr,
