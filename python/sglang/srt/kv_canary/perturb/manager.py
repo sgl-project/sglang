@@ -14,9 +14,6 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.utils import WarmupGate
 
 if TYPE_CHECKING:
-    from sglang.srt.kv_canary.runner.single_forward_manager import (
-        PostOpsInsideGraphOutputSnapshot,
-    )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -69,14 +66,16 @@ class PerturbManager:
         self.perturb_real_kv_used(maybe_non_mature_forward_batch)
         self.perturb_real_kv_unused_cache(maybe_non_mature_forward_batch)
 
-    def consume_snapshot(
+    def perturb_post_forward(
         self,
         *,
-        snapshot: "PostOpsInsideGraphOutputSnapshot",
+        maybe_non_mature_forward_batch: Optional["ForwardBatch"],
     ) -> None:
-        """Phase 4 entrypoint. Reads ONLY the dead post-step snapshot, never
-        the live ForwardBatch (which the outer cycle may have advanced)."""
-        self.perturb_real_kv_post_forward_from_snapshot(snapshot)
+        """Phase 4 entrypoint. Fires the real_kv_post_forward perturb against
+        the same ForwardBatch the outer cycle handed in at phase 1 (possibly
+        mutated by inner forwards in between). Tail-after ordering means
+        this MUST fire after the captured forward writes have completed."""
+        self.perturb_real_kv_post_forward(maybe_non_mature_forward_batch)
 
     def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
@@ -110,12 +109,11 @@ class PerturbManager:
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_post_forward_from_snapshot(
-        self,
-        snapshot: "PostOpsInsideGraphOutputSnapshot",
+    def perturb_real_kv_post_forward(
+        self, forward_batch: Optional["ForwardBatch"]
     ) -> None:
-        real_kv_post_forward.run_from_snapshot(
-            snapshot=snapshot,
+        real_kv_post_forward.run(
+            forward_batch=forward_batch,
             config=self._config,
             buffer_groups=self._buffer_groups,
             warmup_gate=self._warmup_gate,

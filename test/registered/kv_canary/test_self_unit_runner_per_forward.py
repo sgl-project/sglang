@@ -51,7 +51,10 @@ class TestManagerPerForward(CanaryManagerTestCase):
             with manager.with_single_forward_manager_index(0):
                 sfm.pre_ops_maybe_inside_graph(forward_batch)
                 sfm.post_ops_maybe_inside_graph(forward_batch)
-            sfm.post_ops_outside_graph(snapshot=sfm.snapshot)
+            sfm.post_ops_outside_graph(
+                snapshot=sfm.snapshot,
+                maybe_non_mature_forward_batch=forward_batch,
+            )
 
         self.assertEqual(calls[0], "plan")
         self.assertTrue(
@@ -229,7 +232,10 @@ def _drive_one_cycle(manager, forward_batch) -> None:
     with manager.with_single_forward_manager_index(0):
         sfm.pre_ops_maybe_inside_graph(forward_batch)
         sfm.post_ops_maybe_inside_graph(forward_batch)
-    sfm.post_ops_outside_graph(snapshot=sfm.snapshot)
+    sfm.post_ops_outside_graph(
+        snapshot=sfm.snapshot,
+        maybe_non_mature_forward_batch=forward_batch,
+    )
 
 
 class TestCanaryManagerActiveSfmDispatch(CanaryManagerTestCase):

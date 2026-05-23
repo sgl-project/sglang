@@ -3201,7 +3201,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         if canary_sfm is not None:
-            canary_sfm.post_ops_outside_graph(snapshot=canary_sfm.snapshot)
+            canary_sfm.post_ops_outside_graph(
+                snapshot=canary_sfm.snapshot,
+                maybe_non_mature_forward_batch=forward_batch,
+            )
             canary_manager.step_shared_facilities()
         if self.enable_elastic_ep:
             output = self._maybe_rebalance_after_rank_fault(

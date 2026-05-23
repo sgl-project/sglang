@@ -21,10 +21,7 @@ from sglang.srt.kv_canary.perturb.config import (
     _parse_target_group_kind,
 )
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.perturb.slot_picker import (
-    collect_active_slots,
-    pick_out_cache_loc_slot_from_tensor,
-)
+from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
@@ -140,10 +137,10 @@ class TestPickTargetGroup(CustomTestCase):
 
 
 class TestPerturbManager(CustomTestCase):
-    def test_perturb_manager_consume_snapshot_dispatches_real_kv_post_forward(
+    def test_perturb_manager_perturb_post_forward_dispatches_real_kv_post_forward(
         self,
     ) -> None:
-        """Verify consume_snapshot() routes only to the post_forward-from-snapshot dispatch."""
+        """Verify perturb_post_forward() routes only to the post_forward dispatch."""
         device = DEFAULT_DEVICE
         manager = PerturbManager(
             config=PerturbConfig(
@@ -158,22 +155,13 @@ class TestPerturbManager(CustomTestCase):
             buffer_groups=(),
             step_counter_getter=lambda: 10,
         )
-        # Build a minimal snapshot-shaped namespace so the dispatch fires
-        # without needing the full SingleForwardManager allocation path.
-        snapshot = cast(
-            "object",
-            type(
-                "FakeSnapshot",
-                (),
-                {"out_cache_loc": torch.zeros(1, dtype=torch.int64, device=device)},
-            )(),
-        )
+        forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
 
         with patch.object(
             manager,
-            "perturb_real_kv_post_forward_from_snapshot",
-            lambda snap: calls.append("real_kv_post_forward"),
+            "perturb_real_kv_post_forward",
+            lambda batch: calls.append("real_kv_post_forward"),
         ), patch.object(
             manager,
             "perturb_req_to_token",
@@ -187,7 +175,7 @@ class TestPerturbManager(CustomTestCase):
             "perturb_real_kv_unused_cache",
             lambda batch: calls.append("real_kv_unused_cache"),
         ):
-            manager.consume_snapshot(snapshot=snapshot)
+            manager.perturb_post_forward(maybe_non_mature_forward_batch=forward_batch)
 
         self.assertEqual(calls, ["real_kv_post_forward"])
 
@@ -525,31 +513,6 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             manager.perturb_real_kv_unused_cache(None)
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
-
-
-class TestPickOutCacheLocSlotFromTensor(CustomTestCase):
-    def test_excludes_negative_padding_entries(self) -> None:
-        """Verify negative entries are treated as padding and never picked."""
-        device = DEFAULT_DEVICE
-        buffer = torch.tensor([5, 7, -1, -1, -1], dtype=torch.int64, device=device)
-        seen: set[int] = set()
-        for _ in range(200):
-            slot = pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer)
-            self.assertIsNotNone(slot)
-            seen.add(int(slot))
-        self.assertEqual(seen, {5, 7})
-
-    def test_returns_none_when_all_padding(self) -> None:
-        """Verify an all-padding buffer yields no pick."""
-        device = DEFAULT_DEVICE
-        buffer = torch.full((8,), -1, dtype=torch.int64, device=device)
-        self.assertIsNone(pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer))
-
-    def test_returns_none_when_empty(self) -> None:
-        """Verify a zero-element buffer yields no pick."""
-        device = DEFAULT_DEVICE
-        buffer = torch.empty(0, dtype=torch.int64, device=device)
-        self.assertIsNone(pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer))
 
 
 class TestPerturbUtils(CustomTestCase):

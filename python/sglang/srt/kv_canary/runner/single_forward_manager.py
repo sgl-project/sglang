@@ -16,7 +16,7 @@ Lifecycle (per SFM, enforced by ``SimplePhaseChecker``):
       ── (original model.forward runs)
       ── post_ops_maybe_inside_graph(forward_batch)
       → AFTER_POST_MAYBE_IN
-      ── post_ops_outside_graph(snapshot=self.snapshot)
+      ── post_ops_outside_graph(snapshot, maybe_non_mature_forward_batch)
       → IDLE
 
 Phase 1 and 4 are host-side outside any cuda graph; phase 2 and 3 are
@@ -77,18 +77,15 @@ class _SingleForwardPhase(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PostOpsInsideGraphOutputSnapshot:
-    """Per-SFM cloned view of the tensors produced by phases 2-3.
+    """Per-SFM cloned view of the in-graph signals produced by phases 2-3.
 
     The snapshot is written by phase 3 (``post_ops_maybe_inside_graph``)
-    and read by phase 4 (``post_ops_outside_graph``). Phase 4 must NOT
-    read ``ForwardBatch`` directly — by then the outer cycle may have
-    advanced the batch to the next inner step, mutating shared fields
-    (seq_lens, out_cache_loc, positions).
-
-    All fields are device tensors holding immutable cloned snapshots of
-    the per-step output. We prefer over-cloning to guarantee phase 4 sees
-    a dead snapshot of "what this SFM produced", not a live view that
-    later steps might overwrite.
+    and read by phase 4 (``post_ops_outside_graph``). It captures the
+    in-graph signals (verify-plan enable flag, kernel/slot counters,
+    violation write index, swa verify totals) whose live device-state
+    might be mutated by later steps in the same cycle. ForwardBatch
+    fields are NOT cloned here — perturb / divergence consumers in
+    phase 4 read the live (possibly inaccurate) ``ForwardBatch`` instead.
     """
 
     verify_plan_enable: torch.Tensor
@@ -96,10 +93,6 @@ class PostOpsInsideGraphOutputSnapshot:
     slot_run_counters: torch.Tensor
     violation_write_index: torch.Tensor
     swa_verify_total_count: torch.Tensor | None
-    req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
-    out_cache_loc: torch.Tensor
-    positions: torch.Tensor
 
 
 class SingleForwardManager:
@@ -173,12 +166,10 @@ class SingleForwardManager:
         )
 
         # Pre-allocated snapshot buffers populated by ``post_ops_maybe_inside_graph``.
-        # We over-clone (per the design: "宁可多 clone 也要保证 immutable") so phase 4
-        # never reads a live ForwardBatch / device_state tensor.
+        # Snapshot captures only the in-graph signals whose live device-state
+        # might be mutated by later steps in the cycle (verify-plan enable,
+        # kernel / slot counters, violation write index, swa verify totals).
         self._snapshot_buffers = _allocate_snapshot_buffers(
-            verify_capacity=per_forward_verify_capacity,
-            write_entry_capacity=per_forward_write_entry_capacity,
-            write_req_capacity=per_forward_write_req_capacity,
             num_kernel_tags=int(device_state.kernel_run_counters.shape[0]),
             num_slot_tags=int(device_state.slot_run_counters.shape[0]),
             swa_verify_total_count_shape=(
@@ -340,15 +331,22 @@ class SingleForwardManager:
         self._snapshot_buffers.copy_from(
             verify_plan=self._verify_plan,
             device_state=self._device_state,
-            forward_batch=forward_batch,
             swa_divergence_report=self._swa_divergence_report,
         )
 
     def post_ops_outside_graph(
-        self, *, snapshot: PostOpsInsideGraphOutputSnapshot
+        self,
+        *,
+        snapshot: PostOpsInsideGraphOutputSnapshot,
+        maybe_non_mature_forward_batch: "ForwardBatch",
     ) -> None:
-        """Phase 4. Host-side outside cuda graph. Reads ONLY ``snapshot``,
-        NEVER the live ForwardBatch."""
+        """Phase 4. Host-side outside cuda graph. Reads in-graph signals
+        from ``snapshot`` (immune to later-step mutation) plus the live
+        (possibly already-advanced) ``ForwardBatch`` for the tail-after
+        perturb that needs to flip a byte in the slot the forward just
+        wrote to. The forward_batch arg is named ``maybe_non_mature_``
+        because by phase 4 the outer cycle may already have mutated its
+        step-specific fields."""
         if self._config.mode == "off":
             return
 
@@ -358,7 +356,9 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.post_ops_outside_graph",
         )
 
-        self._perturb_manager.consume_snapshot(snapshot=snapshot)
+        self._perturb_manager.perturb_post_forward(
+            maybe_non_mature_forward_batch=maybe_non_mature_forward_batch
+        )
         self._enable_warner.tick(snapshot.verify_plan_enable)
 
 
@@ -375,10 +375,6 @@ class _SnapshotBuffers:
     slot_run_counters: torch.Tensor
     violation_write_index: torch.Tensor
     swa_verify_total_count: torch.Tensor | None
-    req_pool_indices: torch.Tensor
-    seq_lens: torch.Tensor
-    out_cache_loc: torch.Tensor
-    positions: torch.Tensor
 
     def as_snapshot(self) -> PostOpsInsideGraphOutputSnapshot:
         return PostOpsInsideGraphOutputSnapshot(
@@ -387,10 +383,6 @@ class _SnapshotBuffers:
             slot_run_counters=self.slot_run_counters,
             violation_write_index=self.violation_write_index,
             swa_verify_total_count=self.swa_verify_total_count,
-            req_pool_indices=self.req_pool_indices,
-            seq_lens=self.seq_lens,
-            out_cache_loc=self.out_cache_loc,
-            positions=self.positions,
         )
 
     def copy_from(
@@ -398,7 +390,6 @@ class _SnapshotBuffers:
         *,
         verify_plan: VerifyPlan,
         device_state: CanaryDeviceState,
-        forward_batch: "ForwardBatch",
         swa_divergence_report: Optional[SwaDivergenceReport],
     ) -> None:
         self.verify_plan_enable.copy_(verify_plan.enable)
@@ -415,26 +406,9 @@ class _SnapshotBuffers:
                 swa_divergence_report.verify_total_count_device
             )
 
-        # ForwardBatch slices: bs and num_tokens are capture-time constants
-        # for any given graph, so the static-sized clones below are valid.
-        bs = int(forward_batch.req_pool_indices.shape[0])
-        self.req_pool_indices[:bs].copy_(forward_batch.req_pool_indices)
-        self.seq_lens[:bs].copy_(forward_batch.seq_lens)
-        num_tokens = int(forward_batch.positions.shape[0])
-        self.positions[:num_tokens].copy_(forward_batch.positions)
-        # Tail-fill out_cache_loc with -1 BEFORE the partial copy below so
-        # the snapshot picker's "negative entries are padding" filter
-        # treats the unwritten suffix as skip rather than as slot 0.
-        # ``fill_`` is capture-safe (in-place op, no allocation).
-        self.out_cache_loc.fill_(-1)
-        self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
-
 
 def _allocate_snapshot_buffers(
     *,
-    verify_capacity: int,
-    write_entry_capacity: int,
-    write_req_capacity: int,
     num_kernel_tags: int,
     num_slot_tags: int,
     swa_verify_total_count_shape: tuple[int, ...] | None,
@@ -454,14 +428,6 @@ def _allocate_snapshot_buffers(
                 swa_verify_total_count_shape, dtype=torch.int32, device=device
             )
         ),
-        req_pool_indices=torch.zeros(
-            write_req_capacity, dtype=torch.int64, device=device
-        ),
-        seq_lens=torch.zeros(write_req_capacity, dtype=torch.int64, device=device),
-        out_cache_loc=torch.zeros(
-            write_entry_capacity, dtype=torch.int64, device=device
-        ),
-        positions=torch.zeros(write_entry_capacity, dtype=torch.int64, device=device),
     )
 
 
