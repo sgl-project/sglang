@@ -20,7 +20,7 @@ def _host_debug(msg: str) -> None:
         print(msg, flush=True)
 
 
-@triton.jit
+@triton.jit(debug=True)
 def _phase_check_kernel(
     phase_ptr,
     EXPECT_PHASE: tl.constexpr,
