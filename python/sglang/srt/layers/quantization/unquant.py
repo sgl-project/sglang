@@ -62,7 +62,7 @@ if _is_npu:
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
-except ImportError:
+except (ImportError, AssertionError, Exception):
     flashinfer_cutlass_fused_moe = None
 
 
