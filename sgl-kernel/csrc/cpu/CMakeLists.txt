@@ -127,7 +127,6 @@ if(${MY_ARCH_DIR} STREQUAL "x86_64")
         -mamx-int8
         -fopenmp
     )
-    message(STATUS "Enabling AVX512 & AMX for x86.")
 else()
     add_compile_options(
         -O3
