@@ -834,6 +834,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
+        # All init-time work (warmup, cuda graph capture, piecewise compile) is
+        # done. Turn on the canary phase-checker assert so the post-init
+        # forward lifecycle is enforced.
+        if self.canary_runner is not None:
+            self.canary_runner.mark_init_finished()
+
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
             return

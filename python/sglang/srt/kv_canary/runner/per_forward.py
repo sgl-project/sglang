@@ -30,36 +30,48 @@ if TYPE_CHECKING:
 
 
 class _CanaryPerForwardPhase(IntEnum):
-    """Lifecycle phases of one canary per-forward-pass. Used as ``int`` inputs
+    """Lifecycle phases of one canary outer cuda-graph cycle. Used as ``int`` inputs
     to a :class:`SimplePhaseChecker` so the checker stays canary-agnostic.
+
+    One outer cycle may contain 1 inner forward (target) or N inner forwards
+    (EAGLE draft). Inside the cycle, each inner forward is one head/tail pair.
+    ``launch_tail_kernels`` cycles the phase back to ``AWAITING_HEAD`` so the
+    next inner head can fire; ``outer_post_kernels`` then returns the phase to
+    ``IDLE`` after the last tail.
 
     Enforced order::
 
         IDLE
-          -> AFTER_BEFORE_FORWARD      (PerForwardOrchestrator.before_forward)
-          -> AFTER_HEAD_KERNELS        (PerForwardOrchestrator.launch_head_kernels)
-          -> AFTER_TAIL_KERNELS        (PerForwardOrchestrator.launch_tail_kernels)
-          -> IDLE                      (PerForwardOrchestrator.end_of_step)
+          -> AWAITING_HEAD     (PerForwardOrchestrator.outer_pre_kernels)
+          -> AWAITING_TAIL     (PerForwardOrchestrator.launch_head_kernels)
+          -> AWAITING_HEAD     (PerForwardOrchestrator.launch_tail_kernels)
+          -> ... AWAITING_HEAD <-> AWAITING_TAIL repeats N-1 more times ...
+          -> IDLE              (PerForwardOrchestrator.outer_post_kernels)
     """
 
     IDLE = 0
-    AFTER_BEFORE_FORWARD = 1
-    AFTER_HEAD_KERNELS = 2
-    AFTER_TAIL_KERNELS = 3
+    AWAITING_HEAD = 1
+    AWAITING_TAIL = 2
 
 
 class PerForwardOrchestrator:
-    """Per-forward orchestrator. Split into three phases tightly aligned with the cuda-graph
-    capture boundary:
+    """Per-forward orchestrator. Split into four phases aligned with the OUTER
+    cuda-graph boundary. "Outer" means the outermost cuda-graph boundary
+    around the run, NOT a literal "per inner ``model.forward``":
 
-    - ``before_forward(forward_batch)`` runs HOST-SIDE (called by ModelRunner.forward outside the
-      captured region): perturb hooks, fill the static expected_input buffers, fill the static
-      per-forward PlanInput buffers.
-    - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region (called by the
-      monkey-patched model.forward, before the original forward): plan sub-kernels + HEAD endpoint launches.
-    - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region (called by the
-      monkey-patched model.forward, after the original forward): TAIL endpoint launches reusing
-      the plan staged in launch_head_kernels.
+    - ``outer_pre_kernels(forward_batch)`` runs HOST-SIDE OUTSIDE the captured
+      region (called once per outer cycle): capacity checks, perturb hooks,
+      fill the static expected_input buffers.
+    - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region,
+      once per inner forward (called by the monkey-patched model.forward
+      before the original forward): per-step PlanInput fill, plan sub-kernels,
+      HEAD endpoint launches.
+    - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region,
+      once per inner forward (called after the original forward): TAIL
+      endpoint launches reusing the plan staged in launch_head_kernels.
+    - ``outer_post_kernels(forward_batch)`` runs HOST-SIDE OUTSIDE the
+      captured region (called once per outer cycle): perturb end-of-forward,
+      enable-warner tick.
     """
 
     def __init__(
@@ -128,14 +140,14 @@ class PerForwardOrchestrator:
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
 
-    def before_forward(self, forward_batch: "ForwardBatch") -> None:
+    def outer_pre_kernels(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.IDLE,
-            next_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
-            caller_name="PerForwardOrchestrator.before_forward",
+            next_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
+            caller_name="PerForwardOrchestrator.outer_pre_kernels",
         )
 
         bs = int(forward_batch.batch_size)
@@ -169,18 +181,21 @@ class PerForwardOrchestrator:
                 expected_inputs_out=self._expected_inputs,
             )
 
-        self._plan_input_per_forward.fill_from_forward_batch(
-            forward_batch=forward_batch,
-        )
-
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
-            next_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            expect_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
+            next_phase=_CanaryPerForwardPhase.AWAITING_TAIL,
             caller_name="PerForwardOrchestrator.launch_head_kernels",
+        )
+
+        # Per-step PlanInput fill (inside the captured region). Each inner
+        # head/tail pair gets its own plan_input snapshot, so EAGLE draft's N
+        # inner forwards stay correct across replays.
+        self._plan_input_per_forward.fill_from_forward_batch(
+            forward_batch=forward_batch,
         )
 
         violation_log = self._device_state.violation_log
@@ -221,9 +236,11 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
 
+        # Cycle back to AWAITING_HEAD: the next inner head (in EAGLE draft's
+        # N>1 case) can fire from the same start state as the first head.
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
-            next_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            expect_phase=_CanaryPerForwardPhase.AWAITING_TAIL,
+            next_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
             caller_name="PerForwardOrchestrator.launch_tail_kernels",
         )
 
@@ -248,14 +265,14 @@ class PerForwardOrchestrator:
                 input_check_mode=input_check_mode,
             )
 
-    def end_of_step(self, forward_batch: "ForwardBatch") -> None:
+    def outer_post_kernels(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            expect_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
             next_phase=_CanaryPerForwardPhase.IDLE,
-            caller_name="PerForwardOrchestrator.end_of_step",
+            caller_name="PerForwardOrchestrator.outer_post_kernels",
         )
 
         self._perturb_manager.end_of_forward(forward_batch)

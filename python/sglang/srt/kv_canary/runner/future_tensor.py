@@ -60,6 +60,12 @@ class FutureTensors:
             event = torch.cuda.Event()
             event.record()
 
+        # Re-join d2h_stream back into the current stream so cuda-graph capture
+        # does not raise cudaErrorStreamCaptureUnjoined (every stream forked
+        # during capture must be joined back before capture ends). The host
+        # copy itself is still async via the recorded event.
+        torch.cuda.current_stream(device).wait_stream(d2h_stream)
+
         return cls(_data=tensors_host | non_tensors_device, _event=event)
 
     def wait(self) -> _TensorOrDict:
@@ -87,10 +93,19 @@ class DelayedDeviceHostHandler:
     ``postprocess_on_host`` against the host snapshot) and then asks ``compute_on_device``
     for fresh device data to stage. ``compute_on_device`` may return ``None`` to skip
     staging (e.g. period gating). Both callables are passed per-call so the caller can
-    capture step-local state in a closure instead of stashing it on ``self``."""
+    capture step-local state in a closure instead of stashing it on ``self``.
+
+    Capture-aware: when the current stream is being captured into a cuda graph,
+    the host-syncing drain is skipped (it would raise
+    cudaErrorStreamCaptureUnsupported) and only the device-side staging runs.
+    The pending drain + matching postprocess are stashed on ``self`` and run on
+    the next non-capturing :meth:`step` (or via :meth:`drain_pending`)."""
 
     d2h_stream: torch.cuda.Stream
     _future: Optional[FutureTensors] = field(default=None)
+    _pending_postprocess: Optional[Callable[[_TensorOrDict], None]] = field(
+        default=None
+    )
 
     def step(
         self,
@@ -98,16 +113,34 @@ class DelayedDeviceHostHandler:
         compute_on_device: Callable[[], Optional[_TensorOrDict]],
         postprocess_on_host: Callable[[_TensorOrDict], None],
     ) -> None:
-        if (pending := self._future) is not None:
-            postprocess_on_host(pending.wait())
-            self._future = None
+        if not torch.cuda.is_current_stream_capturing():
+            self._drain()
 
         # Must run on current stream, not d2h stream
         device_data = compute_on_device()
 
         if device_data is None:
-            self._future = None
-        else:
-            self._future = FutureTensors.device_to_host(
-                device_data, d2h_stream=self.d2h_stream
-            )
+            return
+
+        self._future = FutureTensors.device_to_host(
+            device_data, d2h_stream=self.d2h_stream
+        )
+        self._pending_postprocess = postprocess_on_host
+
+    def drain_pending(self) -> None:
+        """Explicitly drain any pending future. No-op inside cuda-graph capture."""
+        if torch.cuda.is_current_stream_capturing():
+            return
+        self._drain()
+
+    def _drain(self) -> None:
+        pending = self._future
+        postprocess = self._pending_postprocess
+        if pending is None:
+            return
+        self._future = None
+        self._pending_postprocess = None
+        assert (
+            postprocess is not None
+        ), "DelayedDeviceHostHandler: pending future without matching postprocess"
+        postprocess(pending.wait())

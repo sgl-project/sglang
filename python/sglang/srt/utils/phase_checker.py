@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import contextlib
-from collections.abc import Iterator
 from enum import IntEnum
 
 import torch
@@ -28,43 +26,65 @@ def _host_debug(msg: str) -> None:
 @triton.jit(debug=True)
 def _phase_check_kernel(
     phase_ptr,
+    enable_assert_ptr,
     EXPECT_PHASE: tl.constexpr,
     NEXT_PHASE: tl.constexpr,
     CALLER_TAG: tl.constexpr,
 ):
     cur = tl.load(phase_ptr)
-    if cur != EXPECT_PHASE:
-        # constexpr values get baked into the prefix string at compile time;
-        # only `cur` is runtime and shown as "(operand 0) <int>".
-        tl.device_print(
-            f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
-            f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
-            cur,
-        )
-    tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
+    enable_assert = tl.load(enable_assert_ptr)
+    if enable_assert != 0:
+        if cur != EXPECT_PHASE:
+            # constexpr values get baked into the prefix string at compile time;
+            # only `cur` is runtime and shown as "(operand 0) <int>".
+            tl.device_print(
+                f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
+                f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
+                cur,
+            )
+        tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
     tl.store(phase_ptr, NEXT_PHASE)
 
 
 class SimplePhaseChecker:
-    """GPU-side state machine for any int-keyed phase sequence."""
+    """GPU-side state machine for any int-keyed phase sequence.
+
+    The check kernel is launched unconditionally on every ``update()`` call so
+    it is safely captured into cuda graphs. Whether the kernel actually
+    asserts on a phase mismatch is decided by a device-side flag
+    (``_enable_assert_device``), which can be toggled without re-recording any
+    graph. The flag is OFF at construction so init-time work (warmup, graph
+    capture, piecewise compile) that legitimately violates the strict
+    lifecycle does not raise. Call :meth:`enable_assert` once initialization
+    is finished to turn it on.
+    """
 
     def __init__(self, *, initial_phase: int | IntEnum, device: torch.device) -> None:
-        self._phase = torch.tensor(int(initial_phase), dtype=torch.int32, device=device)
+        self._initial_phase = int(initial_phase)
+        self._phase = torch.tensor(
+            self._initial_phase, dtype=torch.int32, device=device
+        )
+        self._enable_assert_device = torch.zeros(1, dtype=torch.int32, device=device)
         self._caller_tag_registry: dict[str, int] = {}
-        self._suspended: bool = False
         _host_debug(
             f"[SimplePhaseChecker.__init__] device={device} "
-            f"initial_phase={_phase_repr(initial_phase)}"
+            f"initial_phase={_phase_repr(initial_phase)} "
+            f"enable_assert=OFF (call enable_assert() after init is done)"
         )
 
-    @contextlib.contextmanager
-    def suspend(self) -> Iterator[None]:
-        prev = self._suspended
-        self._suspended = True
-        try:
-            yield
-        finally:
-            self._suspended = prev
+    def enable_assert(self) -> None:
+        """Turn on the device-side assert and reset phase to ``initial_phase``.
+
+        Called once after all init-time work (warmup, cuda graph capture,
+        piecewise compile, etc.) so the post-init phase sequence starts from a
+        known state regardless of what captured kernels left in the phase
+        tensor during init."""
+        self._phase.fill_(self._initial_phase)
+        self._enable_assert_device.fill_(1)
+        _host_debug(
+            f"[SimplePhaseChecker.enable_assert] phase reset to "
+            f"{self._initial_phase}, assert ENABLED"
+        )
 
     def _resolve_caller_tag(self, caller_name: str) -> int:
         registry = self._caller_tag_registry
@@ -83,8 +103,6 @@ class SimplePhaseChecker:
         next_phase: int | IntEnum,
         caller_name: str = "",
     ) -> None:
-        if self._suspended:
-            return
         caller_tag = self._resolve_caller_tag(caller_name)
         _host_debug(
             f"[SimplePhaseChecker.update] caller={caller_name!r} "
@@ -95,6 +113,7 @@ class SimplePhaseChecker:
         )
         _phase_check_kernel[(1,)](
             self._phase,
+            self._enable_assert_device,
             EXPECT_PHASE=int(expect_phase),
             NEXT_PHASE=int(next_phase),
             CALLER_TAG=caller_tag,

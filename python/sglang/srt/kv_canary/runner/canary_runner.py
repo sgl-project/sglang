@@ -164,13 +164,15 @@ class CanaryRunner:
     def active_tag_count(self) -> int:
         return len(self._active_tags)
 
-    def suspend_per_forward(self) -> contextlib.AbstractContextManager[None]:
-        """Suspend the per-forward phase-checker assertion for the duration of the block.
-
-        Head/tail kernels still fire (they MUST be captured into cuda graphs); only the
-        phase_checker.update() calls inside the orchestrator become no-ops, so the
-        broken-lifecycle assertion during cuda-graph warmup / capture does not raise."""
-        return self._per_forward_orchestrator.phase_checker.suspend()
+    def mark_init_finished(self) -> None:
+        """Enable the per-forward phase-checker assert. Called once by the
+        ModelRunner after all init-time work (kernel warmup, cuda graph
+        capture, piecewise compile, ...) is done. Before this call the phase
+        checker still launches its kernel into every captured region (so the
+        graph shape stays uniform across init and post-init), but the
+        device-side assert is a no-op so warmup's incomplete lifecycle does
+        not raise."""
+        self._per_forward_orchestrator.phase_checker.enable_assert()
 
     def _get_step_counter(self) -> int:
         return self._step_counter
@@ -181,54 +183,64 @@ class CanaryRunner:
 
     @contextlib.contextmanager
     def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
-        """Bracket one forward pass: host-side prep before, host-side end-of-step after.
+        """Bracket one OUTER cuda-graph cycle: host hook BEFORE kernels, host
+        hook AFTER kernels.
 
-        Caller in ``ModelRunner.forward`` writes::
+        "Outer" means the outermost cuda-graph boundary surrounding the run,
+        NOT a literal "one model.forward". The body may run 1 inner forward
+        (target case, cuda graph captures only ``model.forward``) or N inner
+        forwards (EAGLE draft case, the body runs the multi-step draft cuda
+        graph). The per-step head/tail kernel launches are dispatched from
+        inside the captured region (via the monkey-patched ``model.forward``)
+        and replay correctly for every inner step.
 
+        Caller examples::
+
+            # Target ModelRunner.forward — body runs one model.forward, captured.
             with canary_runner.with_forward_pass(forward_batch):
                 output = self._forward_raw(...)
 
-        The body is whatever invokes ``graph_runner.replay()`` / ``model.forward()``. Cuda-graph
-        capture happens inside the body; the in-graph HEAD/TAIL kernel launches are dispatched
-        from the monkey-patched ``model.forward`` so they are captured (and auto-replayed) the
-        same way the model itself is.
+            # EAGLE draft worker — body runs the multi-step draft cuda graph.
+            with draft_runner.canary_runner.with_forward_pass(forward_batch):
+                self.cuda_graph_runner.replay(forward_batch)
 
-        Re-entry is forbidden: each forward pass must bracket exactly one ``_end_of_step``.
-        EAGLE wraps the draft entry point with this ctx and also disables the inner
-        ``ModelRunner.forward`` canary_ctx via ``is_draft_worker`` — the assert catches
-        any future caller that breaks that invariant.
-        """
+        Re-entry is forbidden: each cycle is bracketed exactly once. EAGLE
+        disables the inner ``ModelRunner.forward`` canary_ctx via
+        ``is_draft_worker`` and wraps the draft entry instead, so the outer
+        cycle stays unique."""
         assert (
             not self._in_forward_pass
         ), "CanaryRunner.with_forward_pass cannot be re-entered"
         self._in_forward_pass = True
-        self._before_forward(forward_batch)
+        self._outer_pre_kernels(forward_batch)
         try:
             yield
         finally:
             try:
-                self._end_of_step(forward_batch)
+                self._outer_post_kernels(forward_batch)
             finally:
                 self._in_forward_pass = False
 
-    def _before_forward(self, forward_batch: "ForwardBatch") -> None:
-        self._per_forward_orchestrator.before_forward(forward_batch)
+    def _outer_pre_kernels(self, forward_batch: "ForwardBatch") -> None:
+        self._per_forward_orchestrator.outer_pre_kernels(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
-        """Plan sub-kernels + HEAD endpoint launches. Caller is the monkey-patched
-        ``model.forward`` - kernels here are captured into the cuda graph.
-        """
+        """Per-step PlanInput fill + plan sub-kernels + HEAD endpoint launches.
+        Caller is the monkey-patched ``model.forward`` — fires once per inner
+        forward, captured into the cuda graph (or replayed)."""
         self._per_forward_orchestrator.launch_head_kernels(forward_batch)
 
     def launch_tail_kernels(self, forward_batch: "ForwardBatch") -> None:
-        """TAIL endpoint launches. Same captured region as ``launch_head_kernels``."""
+        """TAIL endpoint launches reusing the plan staged in
+        ``launch_head_kernels``. Same captured region; fires once per inner
+        forward."""
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def _end_of_step(self, forward_batch: "ForwardBatch") -> None:
+    def _outer_post_kernels(self, forward_batch: "ForwardBatch") -> None:
         if self.config.mode == "off":
             return
 
-        self._per_forward_orchestrator.end_of_step(forward_batch)
+        self._per_forward_orchestrator.outer_post_kernels(forward_batch)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()

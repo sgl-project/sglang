@@ -800,12 +800,6 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        canary_suspend_ctx = (
-            c.suspend_per_forward()
-            if (c := self.model_runner.canary_runner) is not None
-            else empty_context()
-        )
-
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -847,10 +841,7 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with (
-            freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
-            canary_suspend_ctx,
-        ):
+        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
             if not self.enable_pdmux:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
