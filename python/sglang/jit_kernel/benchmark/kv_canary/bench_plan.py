@@ -166,13 +166,16 @@ def _build_plan_inputs(
         verify_capacity = max(1, verify_capacity_override)
     else:
         verify_capacity = max(1, bs * verify_per_req)
-    write_req_capacity = max(1, bs)
 
     effective_bs = bs_padded if bs_padded is not None else bs
     if effective_bs < bs:
         raise ValueError(
             f"kv-canary bench: bs_padded={bs_padded} must be >= bs={bs}"
         )
+    # The plan kernels read the request-axis size from ``req_pool_indices.shape[0]``
+    # (= effective_bs once padded), so the WritePlan / write_offsets row
+    # capacities have to match that, not the active-bs count.
+    write_req_capacity = max(1, effective_bs)
 
     verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=device)
     write_plan = WritePlan.allocate(
