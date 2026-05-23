@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -19,6 +19,10 @@ class TorchNativeAttnBackend(AttentionBackend):
         super().__init__()
         self.forward_metadata = None
         self.device = model_runner.device
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -35,9 +39,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         extend_prefix_lens: torch.Tensor,
         extend_seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor] = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
+        is_cross_attn=False,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -48,12 +54,14 @@ class TorchNativeAttnBackend(AttentionBackend):
             v_cache: [max_total_num_tokens, num_heads, head_size]
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
+            encoder_lens: [num_seqs] or None
             seq_lens: [num_seqs]
             extend_prefix_lens: [num_seqs]
             extend_seq_lens: [num_seqs]
             scaling: float or None
             enable_gqa: bool
             causal: bool
+            is_cross_attn: bool
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -75,8 +83,16 @@ class TorchNativeAttnBackend(AttentionBackend):
 
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
-
+            if encoder_lens is not None:
+                if is_cross_attn:
+                    start_kv = 0
+                    end_kv = encoder_lens[seq_idx]
+                else:
+                    start_kv = encoder_lens[seq_idx]
+                    end_kv = start_kv + seq_len_kv
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
                 (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
@@ -89,7 +105,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -123,9 +139,11 @@ class TorchNativeAttnBackend(AttentionBackend):
         req_to_token: torch.Tensor,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor] = None,
         scaling=None,
         enable_gqa=False,
         causal=False,
+        is_cross_attn=False,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -137,9 +155,11 @@ class TorchNativeAttnBackend(AttentionBackend):
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
+            encoder_lens: [num_seqs] or None
             scaling: float or None
             enable_gqa: bool
             causal: bool
+            is_cross_attn: bool
 
         Returns:
             output: [num_tokens, num_heads, head_size]
@@ -156,14 +176,24 @@ class TorchNativeAttnBackend(AttentionBackend):
             seq_len_q = 1
             seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
+            if encoder_lens is not None:
+                if is_cross_attn:
+                    start_kv = 0
+                    end_kv = encoder_lens[seq_idx]
+                else:
+                    start_kv = encoder_lens[seq_idx]
+                    end_kv = start_kv + seq_len_kv
+            else:
+                start_kv = 0
+                end_kv = start_kv + seq_len_kv
 
             per_req_query = query[:, start_q:end_q, :]
 
             # get key and value from cache. per_req_tokens contains the kv cache
             # index for each token in the sequence.
+
             req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_pool_idx, start_kv:end_kv]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
@@ -208,8 +238,8 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             cache_loc = forward_batch.out_cache_loc
 
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        if save_kv_cache and k is not None and v is not None:
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -223,16 +253,18 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_extend(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
             forward_batch.extend_seq_lens,
+            forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
+            is_cross_attn=layer.is_cross_attention,
         )
         return o
 
@@ -253,14 +285,19 @@ class TorchNativeAttnBackend(AttentionBackend):
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
         else:
             o = torch.empty_like(q)
+        cache_loc = (
+            forward_batch.out_cache_loc
+            if not layer.is_cross_attention
+            else forward_batch.encoder_out_cache_loc
+        )
 
         if layer.is_cross_attention:
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
 
-        if save_kv_cache:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        if save_kv_cache and k is not None and v is not None:
+            self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
 
@@ -270,14 +307,16 @@ class TorchNativeAttnBackend(AttentionBackend):
         self._run_sdpa_forward_decode(
             q_,
             o_,
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            self.req_to_token_pool.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
+            forward_batch.encoder_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
+            is_cross_attn=layer.is_cross_attention,
         )
 
         return o

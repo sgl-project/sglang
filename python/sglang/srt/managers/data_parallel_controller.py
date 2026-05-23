@@ -135,9 +135,6 @@ class DataParallelController:
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
-        # For DP balance
-        self.global_balance_id = 0
-
         # Init inter-process communication
         self.context = zmq.Context(1 + server_args.dp_size)
         if server_args.node_rank == 0:
@@ -483,7 +480,7 @@ class DataParallelController:
 
                 if server_args.enable_dp_attention:
                     # dp attention has different sharding logic
-                    _, _, dp_rank = compute_dp_attention_world_info(
+                    _, _, dp_rank, _ = compute_dp_attention_world_info(
                         server_args.enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
@@ -545,8 +542,9 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                        server_args, gpu_id
+                    with (
+                        memory_saver_adapter.configure_subprocess(),
+                        numa_utils.configure_subprocess(server_args, gpu_id),
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
