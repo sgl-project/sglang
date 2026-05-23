@@ -1948,6 +1948,15 @@ class FlashAttentionBackend(AttentionBackend):
             )
             return
 
+        if forward_mode.is_target_verify() and self.topk > 1:
+            # topk>1 target verify: replay needs spec_info.positions and .custom_mask
+            # which are not populated at capture time.
+            self.forward_metadata = self.target_verify_metadata_topk_normal[bs]
+            self.forward_metadata_spec_decode_expand = (
+                self.target_verify_metadata_topk_expand[bs]
+            )
+            return
+
         self.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=req_pool_indices,
