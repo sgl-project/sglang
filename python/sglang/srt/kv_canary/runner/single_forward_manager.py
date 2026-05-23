@@ -9,14 +9,14 @@ context manager.
 Lifecycle (per SFM, enforced by ``SimplePhaseChecker``):
 
     IDLE
-      ── pre_ops_outside_graph(maybe_non_mature_forward_batch)
+      ── pre_ops_outside_graph(maybe_inaccurate_forward_batch)
       → AFTER_PRE_OUT
       ── pre_ops_maybe_inside_graph(forward_batch)
       → AFTER_PRE_MAYBE_IN
       ── (original model.forward runs)
       ── post_ops_maybe_inside_graph(forward_batch)
       → AFTER_POST_MAYBE_IN
-      ── post_ops_outside_graph(snapshot, maybe_non_mature_forward_batch)
+      ── post_ops_outside_graph(snapshot, maybe_inaccurate_forward_batch)
       → IDLE
 
 Phase 1 and 4 are host-side outside any cuda graph; phase 2 and 3 are
@@ -189,15 +189,15 @@ class SingleForwardManager:
         return self._phase_checker
 
     def pre_ops_outside_graph(
-        self, *, maybe_non_mature_forward_batch: "ForwardBatch"
+        self, *, maybe_inaccurate_forward_batch: "ForwardBatch"
     ) -> None:
         """Phase 1. Host-side outside any cuda graph.
 
-        The input ``maybe_non_mature_forward_batch`` may be the OUTER batch
+        The input ``maybe_inaccurate_forward_batch`` may be the OUTER batch
         for an EAGLE draft step — its step-specific fields (seq_lens after
-        increment, out_cache_loc slice for step i, ...) are NOT yet mature.
-        Callers in this phase must only consume batch-level fields
-        (``req_pool_indices``, batch_size, base out_cache_loc).
+        increment, out_cache_loc slice for step i, ...) may not yet hold
+        the values this SFM will actually see by phase 2. Callers in this
+        phase should treat the batch as a coarse cycle-level view.
         """
         if self._config.mode == "off":
             return
@@ -208,8 +208,8 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_outside_graph",
         )
 
-        bs = int(maybe_non_mature_forward_batch.batch_size)
-        num_tokens = int(maybe_non_mature_forward_batch.positions.shape[0])
+        bs = int(maybe_inaccurate_forward_batch.batch_size)
+        num_tokens = int(maybe_inaccurate_forward_batch.positions.shape[0])
         if bs > self._write_req_capacity:
             raise RuntimeError(
                 f"kv-canary: forward_batch.batch_size={bs} exceeds pre-allocated "
@@ -225,7 +225,7 @@ class SingleForwardManager:
             )
 
         self._perturb_manager.perturb(
-            maybe_non_mature_forward_batch=maybe_non_mature_forward_batch
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
         )
 
     def pre_ops_maybe_inside_graph(self, forward_batch: "ForwardBatch") -> None:
@@ -338,13 +338,13 @@ class SingleForwardManager:
         self,
         *,
         snapshot: PostOpsInsideGraphOutputSnapshot,
-        maybe_non_mature_forward_batch: "ForwardBatch",
+        maybe_inaccurate_forward_batch: "ForwardBatch",
     ) -> None:
         """Phase 4. Host-side outside cuda graph. Reads in-graph signals
         from ``snapshot`` (immune to later-step mutation) plus the live
         (possibly already-advanced) ``ForwardBatch`` for the tail-after
         perturb that needs to flip a byte in the slot the forward just
-        wrote to. The forward_batch arg is named ``maybe_non_mature_``
+        wrote to. The forward_batch arg is named ``maybe_inaccurate_``
         because by phase 4 the outer cycle may already have mutated its
         step-specific fields."""
         if self._config.mode == "off":
@@ -357,7 +357,7 @@ class SingleForwardManager:
         )
 
         self._perturb_manager.perturb_post_forward(
-            maybe_non_mature_forward_batch=maybe_non_mature_forward_batch
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
         )
         self._enable_warner.tick(snapshot.verify_plan_enable)
 

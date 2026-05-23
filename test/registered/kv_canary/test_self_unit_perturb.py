@@ -175,7 +175,7 @@ class TestPerturbManager(CustomTestCase):
             "perturb_real_kv_unused_cache",
             lambda batch: calls.append("real_kv_unused_cache"),
         ):
-            manager.perturb_post_forward(maybe_non_mature_forward_batch=forward_batch)
+            manager.perturb_post_forward(maybe_inaccurate_forward_batch=forward_batch)
 
         self.assertEqual(calls, ["real_kv_post_forward"])
 
@@ -398,7 +398,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             "_pick_sweep_slot_for_group",
             return_value=3,
         ):
-            manager.perturb(maybe_non_mature_forward_batch=forward_batch)
+            manager.perturb(maybe_inaccurate_forward_batch=forward_batch)
 
         self.assertTrue(torch.equal(pool.req_to_token, pool_snapshot))
         self.assertTrue(torch.equal(source.tensor, source_snapshot))

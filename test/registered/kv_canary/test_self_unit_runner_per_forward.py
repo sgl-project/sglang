@@ -47,13 +47,13 @@ class TestManagerPerForward(CanaryManagerTestCase):
             manager = make_manager(device=self.device)
             forward_batch = make_forward_batch(self.device)
             sfm = manager.get_single_forward_manager(0)
-            sfm.pre_ops_outside_graph(maybe_non_mature_forward_batch=forward_batch)
+            sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
             with manager.with_single_forward_manager_index(0):
                 sfm.pre_ops_maybe_inside_graph(forward_batch)
                 sfm.post_ops_maybe_inside_graph(forward_batch)
             sfm.post_ops_outside_graph(
                 snapshot=sfm.snapshot,
-                maybe_non_mature_forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
             )
 
         self.assertEqual(calls[0], "plan")
@@ -228,13 +228,13 @@ class TestManagerBeforeForward(CanaryManagerTestCase):
 
 def _drive_one_cycle(manager, forward_batch) -> None:
     sfm = manager.get_single_forward_manager(0)
-    sfm.pre_ops_outside_graph(maybe_non_mature_forward_batch=forward_batch)
+    sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
     with manager.with_single_forward_manager_index(0):
         sfm.pre_ops_maybe_inside_graph(forward_batch)
         sfm.post_ops_maybe_inside_graph(forward_batch)
     sfm.post_ops_outside_graph(
         snapshot=sfm.snapshot,
-        maybe_non_mature_forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=forward_batch,
     )
 
 

@@ -359,7 +359,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if canary_manager is not None:
             for i in range(n_inner):
                 canary_manager.get_single_forward_manager(i).pre_ops_outside_graph(
-                    maybe_non_mature_forward_batch=forward_batch
+                    maybe_inaccurate_forward_batch=forward_batch
                 )
 
         # Run draft
@@ -384,7 +384,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 sfm = canary_manager.get_single_forward_manager(i)
                 sfm.post_ops_outside_graph(
                     snapshot=sfm.snapshot,
-                    maybe_non_mature_forward_batch=forward_batch,
+                    maybe_inaccurate_forward_batch=forward_batch,
                 )
             canary_manager.step_shared_facilities()
 
@@ -602,7 +602,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if canary_sfm is not None:
             canary_sfm.pre_ops_outside_graph(
-                maybe_non_mature_forward_batch=forward_batch
+                maybe_inaccurate_forward_batch=forward_batch
             )
         sfm_index_ctx = (
             canary_manager.with_single_forward_manager_index(0)
@@ -614,7 +614,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
                 snapshot=canary_sfm.snapshot,
-                maybe_non_mature_forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities()
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -677,7 +677,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
         if canary_sfm is not None:
             canary_sfm.pre_ops_outside_graph(
-                maybe_non_mature_forward_batch=forward_batch
+                maybe_inaccurate_forward_batch=forward_batch
             )
         sfm_index_ctx = (
             canary_manager.with_single_forward_manager_index(0)
@@ -696,7 +696,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
                 snapshot=canary_sfm.snapshot,
-                maybe_non_mature_forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities()
 

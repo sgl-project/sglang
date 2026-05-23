@@ -56,26 +56,26 @@ class PerturbManager:
     def perturb(
         self,
         *,
-        maybe_non_mature_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
         """Phase 1 entrypoint. The argument name flags that only batch-level
         fields (active req set, base out_cache_loc) are safe to consume —
         step-specific ForwardBatch fields may not yet be filled when an
         EAGLE outer cycle calls this before any inner draft step has run."""
-        self.perturb_req_to_token(maybe_non_mature_forward_batch)
-        self.perturb_real_kv_used(maybe_non_mature_forward_batch)
-        self.perturb_real_kv_unused_cache(maybe_non_mature_forward_batch)
+        self.perturb_req_to_token(maybe_inaccurate_forward_batch)
+        self.perturb_real_kv_used(maybe_inaccurate_forward_batch)
+        self.perturb_real_kv_unused_cache(maybe_inaccurate_forward_batch)
 
     def perturb_post_forward(
         self,
         *,
-        maybe_non_mature_forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
         """Phase 4 entrypoint. Fires the real_kv_post_forward perturb against
         the same ForwardBatch the outer cycle handed in at phase 1 (possibly
         mutated by inner forwards in between). Tail-after ordering means
         this MUST fire after the captured forward writes have completed."""
-        self.perturb_real_kv_post_forward(maybe_non_mature_forward_batch)
+        self.perturb_real_kv_post_forward(maybe_inaccurate_forward_batch)
 
     def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(

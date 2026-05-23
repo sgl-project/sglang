@@ -3177,7 +3177,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         if canary_sfm is not None:
             canary_sfm.pre_ops_outside_graph(
-                maybe_non_mature_forward_batch=forward_batch
+                maybe_inaccurate_forward_batch=forward_batch
             )
         canary_index_ctx = (
             canary_manager.with_single_forward_manager_index(0)
@@ -3203,7 +3203,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
                 snapshot=canary_sfm.snapshot,
-                maybe_non_mature_forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities()
         if self.enable_elastic_ep:

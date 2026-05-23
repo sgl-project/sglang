@@ -25,13 +25,13 @@ def _run_one_cycle(manager, forward_batch) -> None:
     phase 4 -> step_shared_facilities. Mirrors the production caller
     sequence for SFM(0) (target / single-step case)."""
     sfm = manager.get_single_forward_manager(0)
-    sfm.pre_ops_outside_graph(maybe_non_mature_forward_batch=forward_batch)
+    sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
     with manager.with_single_forward_manager_index(0):
         sfm.pre_ops_maybe_inside_graph(forward_batch)
         sfm.post_ops_maybe_inside_graph(forward_batch)
     sfm.post_ops_outside_graph(
         snapshot=sfm.snapshot,
-        maybe_non_mature_forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=forward_batch,
     )
     manager.step_shared_facilities()
 
@@ -63,7 +63,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
         sfm = manager.get_single_forward_manager(0)
-        sfm.pre_ops_outside_graph(maybe_non_mature_forward_batch=forward_batch)
+        sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
         with manager.with_single_forward_manager_index(0):
             sfm.pre_ops_maybe_inside_graph(forward_batch)
 
