@@ -29,16 +29,23 @@ class FutureTensors:
         non_tensors_device = {k: v for k, v in xs_device.items() if not isinstance(v, torch.Tensor)}
         del xs_device
 
-        tensors_host: _PayloadDict = {}
-        for key, tensor_device in tensors_device.items():
-            tensors_host[key] = torch.empty(
+        # Must happen in current stream, not d2h stream
+        tensors_device_cloned = {
+            key: tensors_device.detach().clone()
+            for key, tensor_device in tensors_device.items()
+        }
+
+        tensors_host = {
+            key: torch.empty(
                 tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
             )
+            for key, tensor_device in tensors_device.items()
+        }
 
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
-            for key, tensor_device in tensors_device.items():
-                _clone_and_copy_to_host(x_device=tensor_device, x_host=tensors_host[key])
+            for key in tensors_device_cloned:
+                tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)
             event = torch.cuda.Event()
             event.record()
 
