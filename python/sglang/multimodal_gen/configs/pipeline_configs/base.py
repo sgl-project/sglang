@@ -56,6 +56,7 @@ class ModelTaskType(Enum):
     TI2V = auto()  # Text and Image to Video
 
     T2I = auto()  # Text to Image
+    T2T = auto()  # Text to Text (text diffusion models)
     I2I = auto()  # Image to Image
     TI2I = auto()  # Image to Image or Text-Image to Image
     I2M = auto()  # Image to Mesh
@@ -106,6 +107,8 @@ class ModelTaskType(Enum):
             return DataType.ACTION
         if self.is_mesh_gen():
             return DataType.MESH
+        if self == ModelTaskType.T2T:
+            return DataType.TEXT
         if self.is_image_gen():
             return DataType.IMAGE
         return DataType.VIDEO
