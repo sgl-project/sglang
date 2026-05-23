@@ -165,7 +165,7 @@ class DeepseekOCRNoRepeatNGramLogitProcessor(CustomLogitProcessor):
             if ngram_size <= 0 or window_size <= 0:
                 continue
 
-            sequence: List[int] = list(req.all_ids())
+            sequence: List[int] = [*req.origin_input_ids, *req.output_ids]
             if len(sequence) < ngram_size:
                 continue
 

@@ -134,7 +134,7 @@ class DecodeKVCacheOffloadManager:
             return False
 
         # Prefill side offloads page-aligned origin_input_ids, decode side offloads the incremental part
-        all_tokens = req.all_ids()[:-1]
+        all_tokens = req.origin_input_ids + req.output_ids[:-1]
         prefill_offloaded_len = (
             len(req.origin_input_ids) // self.page_size * self.page_size
         )

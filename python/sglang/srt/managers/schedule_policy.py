@@ -91,7 +91,7 @@ def match_prefix_for_req(
     include_req: bool = False,
 ):
     if token_ids is None:
-        token_ids = req.all_ids()
+        token_ids = req.origin_input_ids + req.output_ids
 
     match_result = tree_cache.match_prefix(
         MatchPrefixParams(
@@ -235,7 +235,7 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
-            prefix_ids = r.all_ids()
+            prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
