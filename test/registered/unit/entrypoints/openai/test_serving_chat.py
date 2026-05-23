@@ -1684,7 +1684,7 @@ class TestQwen3AutoToolCallsAfterReasoning(unittest.TestCase):
         ]
 
         self.assertEqual(tool_deltas[0]["function"]["name"], "get_current_weather")
-        arguments = "".join(delta["function"]["arguments"] for delta in tool_deltas)
+        arguments = "".join(t_delta["function"]["arguments"] or "" for t_delta in tool_deltas)
         self.assertEqual(json.loads(arguments), {"location": "Boston"})
 
 
