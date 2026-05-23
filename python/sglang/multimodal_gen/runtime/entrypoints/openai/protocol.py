@@ -168,6 +168,34 @@ class MeshListResponse(BaseModel):
     object: str = "list"
 
 
+# Text API protocol models
+class TextResponse(BaseModel):
+    id: str
+    object: str = "text"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    text: str = ""
+    prompt: str = ""
+    peak_memory_mb: Optional[float] = None
+    inference_time_s: Optional[float] = None
+
+
+class TextGenerationsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    prompt: str
+    model: Optional[str] = None
+    max_new_tokens: Optional[int] = None
+    num_inference_steps: Optional[int] = None
+    guidance_scale: Optional[float] = None
+    temperature: Optional[float] = None
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
+    seed: Optional[int] = None
+    # Performance profiling
+    perf_dump_path: Optional[str] = None
+
+
 @dataclass
 class BaseReq(ABC):
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)

@@ -203,6 +203,17 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
 
+    # Print text output for text generation models
+    if results is not None:
+        result_list = results if isinstance(results, list) else [results]
+        for result in result_list:
+            if result.text is not None:
+                print(f"\n{'='*60}")
+                print(f"Prompt: {prompt}")
+                print(f"{'='*60}")
+                print(f"Generated text:\n{result.text}")
+                print(f"{'='*60}")
+
 
 class GenerateSubcommand(CLISubcommand):
     """The `generate` subcommand for the sglang-diffusion CLI"""
