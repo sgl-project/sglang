@@ -707,7 +707,7 @@ class SchedulerMetricsReporter:
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
 
-            if self.enable_metrics:
+            if self.current_scheduler_metrics_enabled:
                 spec_snapshot = self._active_spec_config_snapshot()
                 spec_num_steps = spec_snapshot["num_steps"]
                 spec_num_draft_tokens = spec_snapshot["num_draft_tokens"]
