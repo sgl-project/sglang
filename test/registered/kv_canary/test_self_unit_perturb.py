@@ -21,7 +21,10 @@ from sglang.srt.kv_canary.perturb.config import (
     _parse_target_group_kind,
 )
 from sglang.srt.kv_canary.perturb.manager import PerturbManager
-from sglang.srt.kv_canary.perturb.slot_picker import collect_active_slots
+from sglang.srt.kv_canary.perturb.slot_picker import (
+    collect_active_slots,
+    pick_out_cache_loc_slot_from_tensor,
+)
 from sglang.srt.kv_canary.perturb.utils import (
     WarmupGate,
     flip_first_byte_in_source,
@@ -522,6 +525,31 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             manager.perturb_real_kv_unused_cache(None)
 
         self.assertTrue(torch.equal(source.tensor, snapshot))
+
+
+class TestPickOutCacheLocSlotFromTensor(CustomTestCase):
+    def test_excludes_negative_padding_entries(self) -> None:
+        """Verify negative entries are treated as padding and never picked."""
+        device = DEFAULT_DEVICE
+        buffer = torch.tensor([5, 7, -1, -1, -1], dtype=torch.int64, device=device)
+        seen: set[int] = set()
+        for _ in range(200):
+            slot = pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer)
+            self.assertIsNotNone(slot)
+            seen.add(int(slot))
+        self.assertEqual(seen, {5, 7})
+
+    def test_returns_none_when_all_padding(self) -> None:
+        """Verify an all-padding buffer yields no pick."""
+        device = DEFAULT_DEVICE
+        buffer = torch.full((8,), -1, dtype=torch.int64, device=device)
+        self.assertIsNone(pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer))
+
+    def test_returns_none_when_empty(self) -> None:
+        """Verify a zero-element buffer yields no pick."""
+        device = DEFAULT_DEVICE
+        buffer = torch.empty(0, dtype=torch.int64, device=device)
+        self.assertIsNone(pick_out_cache_loc_slot_from_tensor(out_cache_loc=buffer))
 
 
 class TestPerturbUtils(CustomTestCase):
