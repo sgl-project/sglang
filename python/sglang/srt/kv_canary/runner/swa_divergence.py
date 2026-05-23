@@ -44,6 +44,13 @@ class SwaDivergenceReport:
         )
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
+    @property
+    def verify_total_count_device(self) -> torch.Tensor:
+        """Per-group running total of verify entries (shape ``[2]``, int32).
+        Exposed so :class:`SingleForwardManager` can snapshot it into its
+        per-step buffer at phase 3."""
+        return self._verify_total_count_device
+
     def observe_after_invoke_plan(
         self, *, group: CanaryBufferGroup, verify_plan: VerifyPlan
     ) -> None:
