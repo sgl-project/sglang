@@ -55,23 +55,48 @@ def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
     return cases
 
 
-# Pool-capacity axis: production sets ``verify_capacity`` from the KV pool token
-# count (canary install path multiplies pool tokens by a small factor), so it is
-# unrelated to the per-request ``prefix_len``. ``_plan_entries_kernel``'s grid is
-# ``(bs, ceil(verify_capacity / 64))``; tiles past ``request_verify_len`` short-
-# circuit via the entry mask, but the program still launches and pays for the
-# scalar loads of ``verify_offsets[r]`` and ``verify_offsets[r+1]``. The other
-# benchmark axes couple capacity to ``bs * prefix_len`` and miss this regime.
-# Values picked to bracket a Qwen3-0.6B + H200 8 GB allocation, where the
-# install path produced ``verify_capacity = 1,398,028`` (pool = 1,026,076).
+# Pool-capacity axis: production sizes ``verify_capacity`` from the KV pool
+# token count (canary install ~= pool * 1.2), and ALSO pads the request-axis
+# input tensors to ``_PLAN_BS_BLOCK_SIZE`` (the runner statically allocates
+# ``req_pool_indices`` etc. at ``max(cuda_graph_max_bs, req_to_token_pool_size)``
+# rows, which for the e2e bench_speed scenario equals 4096). Both knobs are
+# unrelated to the per-request ``prefix_len`` and the count of currently-active
+# requests; the other benchmark axes couple capacity to ``bs * prefix_len`` and
+# never grow the request-axis padding, so they massively under-measure the real
+# kernel cost.
+#
+# ``_plan_entries_kernel``'s grid is ``(bs_padded, ceil(verify_capacity / 64))``;
+# tiles past ``request_verify_len`` short-circuit via the entry mask, and
+# padding rows (req_pool_indices == REQ_POOL_IDX_PADDING) early-return, but
+# every program is still launched and consumes 2 scalar loads. With bs_padded =
+# 4096 and verify_capacity = 1,398,028 that is ~89 M programs per launch, which
+# is what produces the ~54 ms-per-step kernel time observed in the bs=1 decode
+# torch profile for Qwen3-0.6B on H200.
 _POOL_CAPACITY_VERIFY_CAP_AXIS: list[int] = [16384, 262144, 1398028]
 _POOL_CAPACITY_BS_AXIS: list[int] = [1, 4, 32]
 _POOL_CAPACITY_PREFIX_LEN: int = 512
+# 4096 matches the value of `_PLAN_BS_BLOCK_SIZE` and, empirically, the
+# `req_to_token_pool_size` the runner allocated for the e2e bench_speed bs=1
+# scenario (visible in the production trace as the first grid dim).
+_POOL_CAPACITY_BS_PADDED_AXIS: list[Optional[int]] = [None, 4096]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PoolCapacityBenchCase:
+    """One pool-capacity bench point.
+
+    Attributes:
+        bs: Number of active (non-padding) requests in the launch.
+        bs_padded: Total request-axis size of the input tensors. ``None`` means
+            no padding (``bs_padded == bs``); a concrete value pads ``req_pool_indices``
+            with ``REQ_POOL_IDX_PADDING`` sentinels in rows ``[bs, bs_padded)``.
+        prefix_len: Per-active-request prefix length.
+        verify_capacity: Plan tensor row capacity (and thus the second grid dim).
+        pool_kind: "full" or "swa_window_128".
+    """
+
     bs: int
+    bs_padded: Optional[int]
     prefix_len: int
     verify_capacity: int
     pool_kind: str
@@ -81,14 +106,18 @@ def _build_pool_capacity_cases() -> list[_PoolCapacityBenchCase]:
     cases: list[_PoolCapacityBenchCase] = []
     for bs in _POOL_CAPACITY_BS_AXIS:
         for verify_capacity in _POOL_CAPACITY_VERIFY_CAP_AXIS:
-            cases.append(
-                _PoolCapacityBenchCase(
-                    bs=bs,
-                    prefix_len=_POOL_CAPACITY_PREFIX_LEN,
-                    verify_capacity=verify_capacity,
-                    pool_kind="full",
+            for bs_padded in _POOL_CAPACITY_BS_PADDED_AXIS:
+                if bs_padded is not None and bs_padded < bs:
+                    continue
+                cases.append(
+                    _PoolCapacityBenchCase(
+                        bs=bs,
+                        bs_padded=bs_padded,
+                        prefix_len=_POOL_CAPACITY_PREFIX_LEN,
+                        verify_capacity=verify_capacity,
+                        pool_kind="full",
+                    )
                 )
-            )
     return cases
 
 
@@ -114,9 +143,9 @@ _X_VALS_MATRIX = _cases_to_matrix_x_vals(
 _X_NAMES_TT = ["bs", "total_tokens", "pool_kind"]
 _X_VALS_TT = [(c.bs, c.total_tokens, c.pool_kind) for c in _build_total_tokens_cases()]
 
-_X_NAMES_PC = ["bs", "prefix_len", "verify_capacity", "pool_kind"]
+_X_NAMES_PC = ["bs", "bs_padded", "prefix_len", "verify_capacity", "pool_kind"]
 _X_VALS_PC = [
-    (c.bs, c.prefix_len, c.verify_capacity, c.pool_kind)
+    (c.bs, c.bs_padded if c.bs_padded is not None else c.bs, c.prefix_len, c.verify_capacity, c.pool_kind)
     for c in _build_pool_capacity_cases()
 ]
 
@@ -129,6 +158,7 @@ def _build_plan_inputs(
     pool_kind: str,
     device: torch.device,
     verify_capacity_override: Optional[int] = None,
+    bs_padded: Optional[int] = None,
 ) -> dict:
     swa_window_size = SWA_WINDOW if pool_kind == "swa_window_128" else 0
     verify_per_req = min(prefix_len, SWA_WINDOW) if swa_window_size > 0 else prefix_len
@@ -138,17 +168,31 @@ def _build_plan_inputs(
         verify_capacity = max(1, bs * verify_per_req)
     write_req_capacity = max(1, bs)
 
+    effective_bs = bs_padded if bs_padded is not None else bs
+    if effective_bs < bs:
+        raise ValueError(
+            f"kv-canary bench: bs_padded={bs_padded} must be >= bs={bs}"
+        )
+
     verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=device)
     write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=device
     )
 
-    req_pool_indices = torch.arange(1, bs + 1, dtype=torch.int64, device=device)
-    prefix_lens = torch.full((bs,), prefix_len, dtype=torch.int64, device=device)
-    extend_seq_lens = torch.full((bs,), extend_len, dtype=torch.int64, device=device)
+    # Active rows [0, bs) carry real req-pool slot ids (1..bs); padding rows
+    # [bs, effective_bs) stay at the REQ_POOL_IDX_PADDING (=0) sentinel that the
+    # plan kernels short-circuit on. prefix_lens / extend_seq_lens for padding
+    # rows hold 0 -- their value is irrelevant once req_pool_indices is the
+    # sentinel, but 0 keeps the offsets kernel happy.
+    req_pool_indices = torch.zeros(effective_bs, dtype=torch.int64, device=device)
+    req_pool_indices[:bs] = torch.arange(1, bs + 1, dtype=torch.int64, device=device)
+    prefix_lens = torch.zeros(effective_bs, dtype=torch.int64, device=device)
+    prefix_lens[:bs] = prefix_len
+    extend_seq_lens = torch.zeros(effective_bs, dtype=torch.int64, device=device)
+    extend_seq_lens[:bs] = extend_len
 
     max_seq_len = max(prefix_len + extend_len, 1)
-    req_to_token_rows = bs + 1
+    req_to_token_rows = effective_bs + 1
     req_to_token = torch.zeros(
         req_to_token_rows,
         max_seq_len,
@@ -160,10 +204,10 @@ def _build_plan_inputs(
         col_idx = torch.arange(max_seq_len, dtype=torch.int32, device=device).unsqueeze(
             0
         )
-        req_to_token[1:] = (row_idx - 1) * max_seq_len + col_idx
+        req_to_token[1 : bs + 1] = (row_idx - 1) * max_seq_len + col_idx
 
     if swa_window_size > 0:
-        full_pool_size = bs * max_seq_len + 1
+        full_pool_size = effective_bs * max_seq_len + 1
         full_to_swa: Optional[torch.Tensor] = torch.arange(
             full_pool_size + 1, dtype=torch.int64, device=device
         )
@@ -291,16 +335,25 @@ def benchmark_total_tokens(
 )
 def benchmark_pool_capacity(
     bs: int,
+    bs_padded: int,
     prefix_len: int,
     verify_capacity: int,
     pool_kind: str,
     provider: str,
 ) -> Tuple[float, float, float]:
-    """Measure the plan kernels when ``verify_capacity`` is decoupled from
-    ``bs * prefix_len`` and instead reflects the KV-pool-scaled capacity that
-    production installs. ``bs=1, prefix=512, verify_capacity=1398028, full``
-    reproduces the bs=1 decode regime that triggered the e2e bench_speed D-class
-    failure (~55 ms per plan step on H200).
+    """Measure the plan kernels under production-realistic input shapes.
+
+    Production decouples three axes that the other benchmarks tie together:
+        - ``verify_capacity`` is the KV-pool-scaled row capacity (independent of
+          actual prefix usage).
+        - ``bs_padded`` is the static buffer size for ``req_pool_indices`` etc.
+          (rows ``[bs, bs_padded)`` carry the REQ_POOL_IDX_PADDING sentinel).
+        - ``bs`` is the count of actually-active requests in the step.
+
+    ``bs=1, bs_padded=4096, prefix=512, verify_capacity=1398028, full``
+    reproduces the bs=1 decode regime that drives the e2e bench_speed D-class
+    failure (the production torch profile shows ``_plan_entries_kernel`` at
+    ~54 ms per step with grid ``(4096, 21845, 1)``).
     """
     device = torch.device(DEFAULT_DEVICE)
     if provider == "canary":
@@ -311,6 +364,7 @@ def benchmark_pool_capacity(
             pool_kind=pool_kind,
             device=device,
             verify_capacity_override=verify_capacity,
+            bs_padded=bs_padded,
         )
         fn = _make_plan_callable(inputs)
     else:
