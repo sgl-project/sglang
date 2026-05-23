@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from multiprocessing import shared_memory
 from types import SimpleNamespace
@@ -60,10 +61,12 @@ class TestPreprocessedInputFastPath(unittest.TestCase):
             "image_grid_thw": torch.tensor([[1, 1, 2]]),
         }
 
-        base_output = processor.load_mm_data(
-            prompt=input_ids,
-            multimodal_tokens=MultimodalSpecialTokens(image_token_id=42),
-            image_data=[processor_output],
+        base_output = asyncio.run(
+            processor.load_mm_data(
+                prompt=input_ids,
+                multimodal_tokens=MultimodalSpecialTokens(image_token_id=42),
+                image_data=[processor_output],
+            )
         )
 
         self.assertEqual(base_output.input_ids, input_ids)
