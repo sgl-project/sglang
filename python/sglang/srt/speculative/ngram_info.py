@@ -203,7 +203,7 @@ class NgramVerifyInput(SpecInput):
         logits_output.next_token_logits = logits_output.next_token_logits[
             self.accept_indices
         ]
-        if logits_output.hidden_states:
+        if logits_output.hidden_states is not None:
             logits_output.hidden_states = logits_output.hidden_states[
                 self.accept_indices
             ]
