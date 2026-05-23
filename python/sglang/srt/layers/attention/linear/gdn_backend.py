@@ -453,13 +453,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 [layer.q_dim, layer.k_dim, layer.v_dim],
                 dim=-1,
             )
-            query = query.view(
-                1, actual_seq_len, layer.num_q_heads, layer.head_q_dim
-            )
+            query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
             key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
-            value = value.view(
-                1, actual_seq_len, layer.num_v_heads, layer.head_v_dim
-            )
+            value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
 
         if is_target_verify:
             core_attn_out = self.kernel_dispatcher.target_verify(
