@@ -35,10 +35,10 @@ from sglang.srt.kv_canary.runner.health import (
     KernelRunCounterHealthChecker,
     PeriodicCanaryStatsLogger,
 )
-from sglang.srt.kv_canary.runner.single_forward_manager import SingleForwardManager
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
+from sglang.srt.kv_canary.single_forward_manager.manager import SingleForwardManager
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
