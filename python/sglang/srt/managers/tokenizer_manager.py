@@ -13,6 +13,8 @@
 # ==============================================================================
 """TokenizerManager is a process that tokenizes the text."""
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import dataclasses
@@ -24,6 +26,7 @@ import signal
 import socket
 import sys
 import threading
+from array import array
 from collections import deque
 from contextlib import nullcontext
 from datetime import datetime
@@ -215,6 +218,16 @@ class InputFormat(Enum):
 
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
+
+    @property
+    def serving_chat_class(self):
+        """Return the serving chat class for OpenAI API.
+
+        Override in subclass to provide custom serving behavior.
+        """
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        return OpenAIServingChat
 
     def __init__(
         self,
@@ -444,7 +457,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        start_disagg_service(self.server_args)
+        # Keep a reference so the bootstrap server is not garbage-collected.
+        self.bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
 
@@ -453,6 +467,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.mm_receiver = create_mm_receiver(
                 self.server_args,
                 dtype=self.model_config.dtype,
+                hf_config=self.model_config.hf_config,
             )
 
     def init_metric_collector_watchdog(self):
@@ -975,12 +990,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         input_text: str,
-        input_ids: List[int],
+        input_ids: Optional[List[int]],
         input_embeds: Optional[Union[List[float], None]] = None,
         mm_inputs=None,
         token_type_ids: Optional[List[int]] = None,
     ) -> Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput]:
         """Create a tokenized request object from common parameters."""
+        input_ids_arr: Optional[array[int]] = (
+            array("q", input_ids) if input_ids is not None else None
+        )
         # Parse sampling parameters
         # Note: if there are preferred sampling params, we use them if they are not
         # explicitly passed in sampling_params
@@ -1008,7 +1026,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 sampling_params,
                 obj.return_logprob,
@@ -1050,12 +1068,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and obj.embed_override_token_id is not None
             ):
                 positional_embed_overrides = self._resolve_embed_overrides(
-                    input_ids, obj.embed_override_token_id, obj.embed_overrides
+                    input_ids_arr, obj.embed_override_token_id, obj.embed_overrides
                 )
 
             tokenized_obj = TokenizedEmbeddingReqInput(
                 input_text,
-                input_ids,
+                input_ids_arr,
                 mm_inputs,
                 token_type_ids,
                 sampling_params,
@@ -1076,7 +1094,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     @staticmethod
     def _resolve_embed_overrides(
-        input_ids: List[int],
+        input_ids: array[int],
         token_id: int,
         embeds: List[torch.Tensor],
     ) -> PositionalEmbeds:
@@ -1443,6 +1461,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 tokenized_obj = copy.copy(tokenized_objs[i])
+                # Ensure independent mm_items so wrap_shm_features won't mutate the original
+                if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                    tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                    tokenized_obj.mm_inputs.mm_items = [
+                        copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                    ]
                 tokenized_obj.rid = tmp_obj.regenerate_rid()
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
@@ -1456,6 +1480,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for _ in range(obj.parallel_sample_num):
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
+                    # Ensure independent mm_items so wrap_shm_features won't mutate the original
+                    if hasattr(tokenized_obj, "mm_inputs") and tokenized_obj.mm_inputs:
+                        tokenized_obj.mm_inputs = copy.copy(tokenized_obj.mm_inputs)
+                        tokenized_obj.mm_inputs.mm_items = [
+                            copy.copy(item) for item in tokenized_obj.mm_inputs.mm_items
+                        ]
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
                     self._init_req_state(tmp_obj)
                     tokenized_obj.time_stats = self.rid_to_state[tmp_obj.rid].time_stats
@@ -1763,7 +1793,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self.server_args.incremental_streaming_output and is_stream
                 )
                 delta_text = recv_obj.output_strs[i]
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.append_text(delta_text)
                 state.output_ids.extend(delta_output_ids)
@@ -1806,7 +1836,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 incremental = (
                     self.server_args.incremental_streaming_output and is_stream
                 )
-                delta_output_ids = recv_obj.output_ids[i]
+                delta_output_ids = list(recv_obj.output_ids[i])
                 output_offset = state.last_output_offset
                 state.output_ids.extend(delta_output_ids)
 
@@ -2475,6 +2505,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             "output_ids": output_ids,
             "meta_info": meta_info,
         }
+        del self.rid_to_state[recv_obj.rid]
+
         state.out_list.append(out)
         state.event.set()
 

@@ -1304,8 +1304,9 @@ class ServerArgs(DisaggArgsMixin):
                 "auto-detected from the checkpoint config or safetensors metadata when "
                 "possible. Applies to both pre-quantized checkpoints and online "
                 "quantization. Use this flag to override auto-detection. "
-                "Options: 'fp8', 'mxfp8', 'mxfp4', 'modelslim'. "
-                "Note: MXFP4 requires ROCm and MI350+ (gfx95x)."
+                "Options: 'fp8', 'mxfp8', 'mxfp4', 'mxfp4_npu', 'modelslim'. "
+                "Note: 'mxfp4' targets ROCm + MI350+ (gfx95x); "
+                "'mxfp4_npu' / 'mxfp8' target Ascend NPU (A5 series for mxfp4_npu)."
             ),
         )
         parser.add_argument(
