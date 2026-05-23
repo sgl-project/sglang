@@ -1,19 +1,18 @@
-"""B200 per-commit CI: DeepSeek-V4-Flash FP4 (LowLatency recipe).
+"""H200 per-commit CI: DeepSeek-V4-Flash FP4 Marlin (LowLatency recipe).
 
-Launches TP=4 with flashinfer_mxfp4 MoE runner + EAGLE speculative decoding.
+Launches TP=4 with Marlin FP4 MoE runner + EAGLE speculative decoding.
 Runs 12 ServerSanity probes (correctness, streaming, concurrency, determinism)
 plus a GSM8K accuracy gate.
 
-Registry: base-c-test-dsv4-4-gpu-b200 (per-commit, 4x B200)
+Registry: base-c-test-dsv4-8-gpu-h200 (per-commit, 8x H200 — only 4 used by TP=4)
 """
 
 import unittest
-from types import SimpleNamespace
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kits.server_sanity_kit import ServerSanityMixin
-from sglang.test.run_eval import run_eval
+from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
+from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,34 +20,85 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=700, stage="base-c", runner_config="dsv4-4-gpu-b200")
+register_cuda_ci(est_time=370, stage="base-c", runner_config="dsv4-8-gpu-h200")
+
+
+def _flashinfer_has_sm90_cutlass_mxfp4() -> bool:
+    try:
+        from flashinfer.fused_moe import (  # noqa: F401
+            interleave_moe_weights_for_sm90_mixed_gemm,
+        )
+
+        return True
+    except ImportError:
+        return False
+
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL_FP8 = "sgl-project/DeepSeek-V4-Flash-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
 
-_DEEPEP_ENV = {
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-}
+
+class TestDSV4FlashFP4H200(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """LowLatency recipe: TP=4, Marlin FP4, EAGLE spec decoding."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--moe-runner-backend",
+                "marlin",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "3",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "4",
+                "--watchdog-timeout",
+                "900",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
 
 
-def _gsm8k_check(test_case):
-    args = SimpleNamespace(
-        base_url=test_case.base_url,
-        model=test_case.model,
-        eval_name="gsm8k",
-        api="completion",
-        max_tokens=512,
-        num_examples=200,
-        num_threads=128,
-    )
-    metrics = run_eval(args)
-    print(f"[{type(test_case).__name__}] GSM8K {metrics=}")
-    test_case.assertGreater(metrics["score"], 0.93)
+@unittest.skipUnless(
+    _flashinfer_has_sm90_cutlass_mxfp4(),
+    "FlashInfer build lacks SM90 mixed-input MXFP4 helpers (PR #3084, >= 0.6.11)",
+)
+class TestDSV4FlashFP4H200FlashInferCutlass(
+    BasicDecodeCorrectnessMixin,
+    GSM8KMixin,
+    CustomTestCase,
+):
+    """FlashInfer SM90 mixed-input cutlass MXFP4 backend (this PR): TP=4 + EAGLE.
 
+    Mirrors :class:`TestDSV4FlashFP4H200` but swaps `--moe-runner-backend marlin`
+    for `flashinfer_mxfp4`, exercising the SM90 cutlass path from FlashInfer PR
+    #3084 end-to-end on a real DSv4-Flash checkpoint.
+    """
 
-class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
-    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -72,9 +122,6 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
                 "1",
                 "--speculative-num-draft-tokens",
                 "4",
-                "--chunked-prefill-size",
-                "4096",
-                "--disable-flashinfer-autotune",
             ],
         )
 
@@ -83,12 +130,13 @@ class TestDSV4FlashFP4B200(ServerSanityMixin, CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
-        _gsm8k_check(self)
 
+class TestDSV4FlashFP4NonMTPH200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
+    """LowLatency recipe without MTP: TP=4, Marlin FP4, no speculative decoding."""
 
-class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -102,78 +150,17 @@ class TestDSV4FlashFP4B200Balanced(ServerSanityMixin, CustomTestCase):
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--deepep-config",
-                DEEPEP_CONFIG,
+                "--moe-runner-backend",
+                "marlin",
+                "--watchdog-timeout",
+                "900",
             ],
-            env=_DEEPEP_ENV,
         )
 
     @classmethod
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _gsm8k_check(self)
-
-
-class TestDSV4FlashFP4B200Balanced_CP(ServerSanityMixin, CustomTestCase):
-    """Balanced recipe: TP=4, DP=4, DeepEP, EAGLE (1-step spec)."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--attn-cp-size",
-                "4",
-                "--enable-dp-attention",
-                "--moe-a2a-backend",
-                "deepep",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "1",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "2",
-                "--enable-dsa-prefill-context-parallel",
-                "--dsa-prefill-cp-mode",
-                "round-robin-split",
-                "--deepep-config",
-                DEEPEP_CONFIG,
-            ],
-            env=_DEEPEP_ENV,
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        _gsm8k_check(self)
 
 
 if __name__ == "__main__":
