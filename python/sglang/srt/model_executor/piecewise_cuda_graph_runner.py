@@ -60,6 +60,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.utils import (
+    empty_context,
     get_available_gpu_memory,
     is_musa,
     is_npu,
@@ -472,12 +473,18 @@ class PiecewiseCudaGraphRunner:
         return False
 
     def capture(self) -> None:
+        canary_suspend_ctx = (
+            c.suspend_per_forward()
+            if (c := self.model_runner.canary_runner) is not None
+            else empty_context()
+        )
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with (
             freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
             graph_capture() as graph_capture_context,
+            canary_suspend_ctx,
         ):
             stream = graph_capture_context.stream
             with set_pcg_capture_stream(stream):

@@ -61,7 +61,7 @@ from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     freeze_gc,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import empty_context, get_available_gpu_memory, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -334,10 +334,16 @@ class BreakableCudaGraphRunner:
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
+        canary_suspend_ctx = (
+            c.suspend_per_forward()
+            if (c := self.model_runner.canary_runner) is not None
+            else empty_context()
+        )
         with (
             freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
             graph_capture() as graph_capture_context,
             enable_breakable_cuda_graph(),
+            canary_suspend_ctx,
         ):
             stream = graph_capture_context.stream
             pool = get_global_graph_memory_pool()
