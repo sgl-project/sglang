@@ -108,21 +108,10 @@ def _patch_model_forward(
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
-        # During server startup the cuda graph runners (target + draft_extend)
-        # invoke model.forward directly without a SingleForwardManager
-        # bracket. There is no active SingleForwardManager in that window,
-        # and post-init the caller MUST bracket (otherwise the asserting
-        # helper below would have caught it). Skip phase 2/3 entirely when
-        # there is no active SingleForwardManager — the per-
-        # SingleForwardManager phase tensor is not advanced, matching the
-        # old runner's behavior of leaving the device-side phase assert
-        # disabled until init finishes.
-        single_forward_manager = manager.maybe_get_current_single_forward_manager()
-        if single_forward_manager is not None:
-            single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
+        single_forward_manager = manager.get_current_single_forward_manager()
+        single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
         output = original(*args, **kwargs)
-        if single_forward_manager is not None:
-            single_forward_manager.post_ops_maybe_inside_graph(forward_batch)
+        single_forward_manager.post_ops_maybe_inside_graph(forward_batch)
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)

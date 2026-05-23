@@ -243,37 +243,24 @@ def _drive_one_cycle(manager, forward_batch) -> None:
 
 
 class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
-    def test_maybe_get_current_single_forward_manager_returns_none_outside_bracket(
+    def test_get_current_single_forward_manager_returns_active_inside_bracket(
         self,
     ) -> None:
-        """Verify the wrap-friendly accessor returns None before any
-        with_single_forward_manager_index(i) bracket is entered.
-
-        This is the contract the monkey-patched model.forward wrap relies
-        on to skip phase 2/3 during cuda graph capture, where the runner
-        invokes model.forward without a SingleForwardManager bracket."""
-        manager = make_manager(device=self.device)
-        self.assertIsNone(manager.maybe_get_current_single_forward_manager())
-
-    def test_maybe_get_current_single_forward_manager_returns_active_inside_bracket(
-        self,
-    ) -> None:
-        """Verify the wrap-friendly accessor returns the bracketed SingleForwardManager."""
+        """Verify the strict accessor returns the bracketed SingleForwardManager."""
         manager = make_manager(device=self.device, speculative_num_steps=3)
         with manager.with_single_forward_manager_index(1):
             self.assertIs(
-                manager.maybe_get_current_single_forward_manager(),
+                manager.get_current_single_forward_manager(),
                 manager.get_single_forward_manager(1),
             )
-        self.assertIsNone(manager.maybe_get_current_single_forward_manager())
 
-    def test_get_current_single_forward_manager_still_asserts_outside_bracket(
+    def test_get_current_single_forward_manager_asserts_outside_bracket(
         self,
     ) -> None:
-        """Verify the strict accessor still asserts when no SingleForwardManager is active.
-
-        Post-init the runtime callers MUST bracket every forward, so the
-        strict accessor protects against silent contract violations."""
+        """Every call to the patched model.forward must be inside a
+        with_single_forward_manager_index(i) bracket — including cuda
+        graph capture/warmup. The strict accessor protects against silent
+        contract violations."""
         manager = make_manager(device=self.device)
         with self.assertRaises(AssertionError):
             manager.get_current_single_forward_manager()
