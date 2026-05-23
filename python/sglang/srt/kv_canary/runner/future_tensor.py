@@ -26,10 +26,13 @@ class FutureTensors:
 
         device = next(x.device for x in xs_device.values() if isinstance(x, torch.Tensor))
 
-        xs_host: _PayloadDict = {}
+        tensors_device = {k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)}
+        non_tensors_device = {k: v for k, v in xs_device.items() if not isinstance(v, torch.Tensor)}
+
+        tensors_host: _PayloadDict = {}
         for key, tensor_device in xs_device.items():
             if isinstance(tensor_device, torch.Tensor):
-                xs_host[key] = torch.empty(
+                tensors_host[key] = torch.empty(
                     tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
                 )
             else:
@@ -37,17 +40,17 @@ class FutureTensors:
                 # can bundle host metadata (e.g. the step at which the snapshot was
                 # staged) alongside the device tensors and recover that context in
                 # postprocess without reaching back into the producer.
-                xs_host[key] = tensor_device
+                tensors_host[key] = tensor_device
 
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             for key, tensor_device in xs_device.items():
                 if isinstance(tensor_device, torch.Tensor):
-                    _clone_and_copy_to_host(x_device=tensor_device, x_host=xs_host[key])
+                    _clone_and_copy_to_host(x_device=tensor_device, x_host=tensors_host[key])
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_data=xs_host, _event=event)
+        return cls(_data=tensors_host | non_tensors_device, _event=event)
 
     def wait(self) -> _TensorOrDict:
         data = self._data
