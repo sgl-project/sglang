@@ -9,65 +9,75 @@ import torch
 _PayloadDict = dict[str, Any]
 _TensorOrDict = Union[torch.Tensor, _PayloadDict]
 
+_DUMMY_DICT_KEY = "__dummy_key__"
+
 
 @dataclass(slots=True, kw_only=True)
 class FutureTensors:
-    _tensors: Optional[_TensorOrDict]
+    _tensors: Optional[_PayloadDict]
     _event: Optional[torch.cuda.Event]
 
     @classmethod
     def device_to_host(
         cls, src_device: _TensorOrDict, *, stream: torch.cuda.Stream
     ) -> "FutureTensors":
-        if isinstance(src_device, dict):
-            host: _PayloadDict = {}
-            ref_device: Optional[torch.device] = None
-            for key, value in src_device.items():
-                if isinstance(value, torch.Tensor):
-                    host[key] = torch.empty(
-                        value.shape, dtype=value.dtype, pin_memory=True
-                    )
-                    if ref_device is None:
-                        ref_device = value.device
-                else:
-                    # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
-                    # can bundle host metadata (e.g. the step at which the snapshot was
-                    # staged) alongside the device tensors and recover that context in
-                    # postprocess without reaching back into the producer.
-                    host[key] = value
-            if ref_device is None:
-                raise ValueError(
-                    "FutureTensors.device_to_host requires at least one torch.Tensor in "
-                    "the source dict to anchor the d2h stream sync"
+        if not isinstance(src_device, dict):
+            src_device = {_DUMMY_DICT_KEY: src_device}
+
+        host: _PayloadDict = {}
+        ref_device: Optional[torch.device] = None
+        for key, value in src_device.items():
+            if isinstance(value, torch.Tensor):
+                host[key] = torch.empty(
+                    value.shape, dtype=value.dtype, pin_memory=True
                 )
-        else:
-            host = torch.empty(
-                src_device.shape, dtype=src_device.dtype, pin_memory=True
+                if ref_device is None:
+                    ref_device = value.device
+            else:
+                # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
+                # can bundle host metadata (e.g. the step at which the snapshot was
+                # staged) alongside the device tensors and recover that context in
+                # postprocess without reaching back into the producer.
+                host[key] = value
+        if ref_device is None:
+            raise ValueError(
+                "FutureTensors.device_to_host requires at least one torch.Tensor in "
+                "the source dict to anchor the d2h stream sync"
             )
-            ref_device = src_device.device
 
         stream.wait_stream(torch.cuda.current_stream(ref_device))
         with torch.cuda.stream(stream):
             if isinstance(src_device, dict):
                 for key, value in src_device.items():
                     if isinstance(value, torch.Tensor):
-                        host[key].copy_(value, non_blocking=True)
+                        _clone_and_copy_to_host(x_device=value, x_host=host)
             else:
-                host.copy_(src_device, non_blocking=True)
+                _clone_and_copy_to_host(x_device=src_device, x_host=host)
             event = torch.cuda.Event()
             event.record()
+
         return cls(_tensors=host, _event=event)
 
     def wait(self) -> _TensorOrDict:
         tensors = self._tensors
         event = self._event
+        self._tensors = None
+        self._event = None
+
         if tensors is None or event is None:
             raise RuntimeError("FutureTensors.wait() was called more than once")
 
         event.synchronize()
-        self._tensors = None
-        self._event = None
+
+        if _DUMMY_DICT_KEY in tensors:
+            tensors = tensors[_DUMMY_DICT_KEY]
+
         return tensors
+
+
+def _clone_and_copy_to_host(x_device: torch.Tensor, x_host: torch.Tensor) -> torch.Tensor:
+    x_device_cloned = x_device.detach().clone()
+    x_host.copy_(x_device_cloned, non_blocking=True)
 
 
 @dataclass(slots=True, kw_only=True)
