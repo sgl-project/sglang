@@ -29,12 +29,12 @@ def _phase_check_kernel(
 ):
     cur = tl.load(phase_ptr)
     if cur != EXPECT_PHASE:
+        # constexpr values get baked into the prefix string at compile time;
+        # only `cur` is runtime and shown as "(operand 0) <int>".
         tl.device_print(
-            "[SimplePhaseChecker FAIL] caller_tag / actual / expect / next:",
-            CALLER_TAG,
+            f"[SimplePhaseChecker FAIL] caller_tag={CALLER_TAG} "
+            f"expect={EXPECT_PHASE} next={NEXT_PHASE} actual=",
             cur,
-            EXPECT_PHASE,
-            NEXT_PHASE,
         )
     tl.device_assert(cur == EXPECT_PHASE, "SimplePhaseChecker: phase mismatch")
     tl.store(phase_ptr, NEXT_PHASE)
