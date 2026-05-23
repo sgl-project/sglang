@@ -361,6 +361,113 @@ class _PendingRelayWeightUpdate:
     total_bytes: int
 
 
+class _RelayWeightUpdateLoader:
+    def __init__(
+        self,
+        *,
+        device: str,
+        gpu_id: int,
+        tp_rank: int,
+        max_pending_bytes: int,
+        apply_update: Callable[[_PendingRelayWeightUpdate], None],
+    ):
+        self._device = device
+        self._gpu_id = gpu_id
+        self._tp_rank = tp_rank
+        self._max_pending_bytes = max_pending_bytes
+        self._apply_update = apply_update
+        self._pending_updates: deque[_PendingRelayWeightUpdate] = deque()
+        self._pending_count = 0
+        self._pending_cond = threading.Condition()
+        self._pending_bytes = 0
+        self._pending_error: str | None = None
+        self._worker: threading.Thread | None = None
+
+    def reserve(self, total_bytes: int):
+        with self._pending_cond:
+            while (
+                self._max_pending_bytes > 0
+                and self._pending_bytes > 0
+                and self._pending_bytes + total_bytes > self._max_pending_bytes
+            ):
+                self._check_error_locked()
+                self._pending_cond.wait()
+            self._check_error_locked()
+            self._pending_bytes += total_bytes
+
+    def release(self, total_bytes: int):
+        with self._pending_cond:
+            self._pending_bytes -= total_bytes
+            self._pending_cond.notify_all()
+
+    def enqueue(self, weights: List[Tuple[str, torch.Tensor]], total_bytes: int):
+        self._get_worker()
+        with self._pending_cond:
+            self._pending_updates.append(
+                _PendingRelayWeightUpdate(
+                    weights=weights,
+                    total_bytes=total_bytes,
+                )
+            )
+            self._pending_count += 1
+            self._pending_cond.notify_all()
+
+    def flush(self):
+        if self._worker is not None and threading.current_thread() is self._worker:
+            return
+        with self._pending_cond:
+            while self._pending_count > 0:
+                self._check_error_locked()
+                self._pending_cond.wait()
+            self._check_error_locked()
+
+    def _check_error_locked(self):
+        if self._pending_error is not None:
+            raise RuntimeError(self._pending_error)
+
+    def _get_worker(self):
+        if self._worker is not None:
+            return
+        self._worker = threading.Thread(
+            target=self._worker_loop,
+            name=f"miles-relay-weight-load-tp{self._tp_rank}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _worker_loop(self):
+        torch.get_device_module(self._device).set_device(self._gpu_id)
+        while True:
+            with self._pending_cond:
+                while not self._pending_updates:
+                    self._pending_cond.wait()
+                update = self._pending_updates.popleft()
+            try:
+                with self._pending_cond:
+                    has_error = self._pending_error is not None
+                if not has_error:
+                    self._apply_update(update)
+            except Exception as exc:
+                error_message = (
+                    f"Failed to finish pending relay weight load on TP rank "
+                    f"{self._tp_rank}: {exc}"
+                )
+                logger.exception(error_message)
+                with self._pending_cond:
+                    if self._pending_error is None:
+                        self._pending_error = error_message
+                    self._pending_cond.notify_all()
+            finally:
+                update.weights.clear()
+                self._finish_update(update)
+
+    def _finish_update(self, update: _PendingRelayWeightUpdate):
+        with self._pending_cond:
+            self._pending_bytes -= update.total_bytes
+            self._pending_count -= 1
+            self._pending_cond.notify_all()
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -602,19 +709,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
-        self._relay_weight_pending_updates: deque[_PendingRelayWeightUpdate] = deque()
-        self._relay_weight_pending_count = 0
-        self._relay_weight_load_worker: threading.Thread | None = None
-        self._relay_weight_pending_cond = threading.Condition()
-        self._relay_weight_dist_lock = threading.Lock()
-        self._relay_weight_pending_bytes = 0
-        self._relay_weight_pending_error: str | None = None
-        self._relay_weight_max_pending_bytes = int(
-            os.environ.get(
-                "WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES",
-                _DEFAULT_MAX_PENDING_RELAY_BYTES,
-            )
-        )
+        self._relay_weight_dist_lock: threading.Lock | None = None
+        self._relay_weight_loader: _RelayWeightUpdateLoader | None = None
 
         if not hasattr(self, "hisparse_coordinator"):
             self.hisparse_coordinator = None
@@ -1985,7 +2081,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ports,
         group_name,
     ):
-        self._flush_pending_relay_weight_updates()
+        self._synchronize_pending_weight_updates()
         assert (
             torch.distributed.is_initialized()
         ), "Default torch process group must be initialized"
@@ -2027,91 +2123,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         torch.cuda.empty_cache()
         return success, message
 
-    def _check_relay_weight_load_error_locked(self):
-        if self._relay_weight_pending_error is not None:
-            raise RuntimeError(self._relay_weight_pending_error)
-
-    def _reserve_relay_weight_memory(self, total_bytes):
-        with self._relay_weight_pending_cond:
-            max_pending_bytes = self._relay_weight_max_pending_bytes
-            while (
-                max_pending_bytes > 0
-                and self._relay_weight_pending_bytes > 0
-                and self._relay_weight_pending_bytes + total_bytes > max_pending_bytes
-            ):
-                self._check_relay_weight_load_error_locked()
-                self._relay_weight_pending_cond.wait()
-            self._check_relay_weight_load_error_locked()
-            self._relay_weight_pending_bytes += total_bytes
-
-    def _ensure_relay_weight_load_worker(self):
-        if self._relay_weight_load_worker is not None:
-            return
-        self._relay_weight_load_worker = threading.Thread(
-            target=self._relay_weight_load_worker_loop,
-            name=f"miles-relay-weight-load-tp{self.tp_rank}",
-            daemon=True,
+    def _get_relay_weight_loader(self) -> _RelayWeightUpdateLoader:
+        """Get the relay-only async update loader, creating it on first use."""
+        if self._relay_weight_loader is not None:
+            return self._relay_weight_loader
+        self._relay_weight_dist_lock = threading.Lock()
+        self._relay_weight_loader = _RelayWeightUpdateLoader(
+            device=self.device,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            max_pending_bytes=int(
+                os.environ.get(
+                    "WEIGHT_SYNC_MAX_PENDING_RELAY_BYTES",
+                    _DEFAULT_MAX_PENDING_RELAY_BYTES,
+                )
+            ),
+            apply_update=self._apply_relay_weight_update,
         )
-        self._relay_weight_load_worker.start()
+        return self._relay_weight_loader
 
-    def _relay_weight_load_worker_loop(self):
-        torch.get_device_module(self.device).set_device(self.gpu_id)
-        while True:
-            with self._relay_weight_pending_cond:
-                while not self._relay_weight_pending_updates:
-                    self._relay_weight_pending_cond.wait()
-                update = self._relay_weight_pending_updates.popleft()
-            try:
-                with self._relay_weight_pending_cond:
-                    has_error = self._relay_weight_pending_error is not None
-                if not has_error:
-                    self._apply_relay_weight_update(update)
-            except Exception as exc:
-                error_message = (
-                    f"Failed to finish pending relay weight load on TP rank "
-                    f"{self.tp_rank}: {exc}"
-                )
-                logger.exception(error_message)
-                with self._relay_weight_pending_cond:
-                    if self._relay_weight_pending_error is None:
-                        self._relay_weight_pending_error = error_message
-                    self._relay_weight_pending_cond.notify_all()
-            finally:
-                update.weights.clear()
-                with self._relay_weight_pending_cond:
-                    self._relay_weight_pending_bytes -= update.total_bytes
-                    self._relay_weight_pending_count -= 1
-                    self._relay_weight_pending_cond.notify_all()
+    def _synchronize_pending_weight_updates(self):
+        """Wait for pending async weight updates.
 
-    def _enqueue_relay_weight_update(self, weights, total_bytes):
-        self._ensure_relay_weight_load_worker()
-        with self._relay_weight_pending_cond:
-            self._relay_weight_pending_updates.append(
-                _PendingRelayWeightUpdate(
-                    weights=weights,
-                    total_bytes=total_bytes,
-                )
-            )
-            self._relay_weight_pending_count += 1
-            self._relay_weight_pending_cond.notify_all()
-
-    def _flush_pending_relay_weight_updates(self):
-        if (
-            self._relay_weight_load_worker is not None
-            and threading.current_thread() is self._relay_weight_load_worker
-        ):
+        Relay mode queues received tensors into _relay_weight_loader. Other
+        weight update modes do not have an async loader, so this is a no-op.
+        """
+        if self._relay_weight_loader is None:
             return
-        with self._relay_weight_pending_cond:
-            while self._relay_weight_pending_count > 0:
-                self._check_relay_weight_load_error_locked()
-                self._relay_weight_pending_cond.wait()
-            self._check_relay_weight_load_error_locked()
+        self._relay_weight_loader.flush()
 
     def _apply_relay_weight_update(self, update: _PendingRelayWeightUpdate):
         weights = update.weights
 
         if self.tp_size > 1:
             src_rank = self.tp_group.ranks[0]
+            assert self._relay_weight_dist_lock is not None
             with self._relay_weight_dist_lock:
                 for _, weight in weights:
                     dist.broadcast(
@@ -2256,7 +2302,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             shape: the shape of the parameter to be updated.
         """
 
-        self._flush_pending_relay_weight_updates()
         assert group_name in self._model_update_group, (
             f"Group {group_name} not in {list(self._model_update_group.keys())}. "
             "Please call `init_weights_update_group` first."
@@ -2313,6 +2358,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         reserved_pending_bytes = False
         try:
+            relay_weight_loader = self._get_relay_weight_loader()
             is_receiver = self.tp_rank == 0
             if is_receiver:
                 if group_name not in self._model_update_group:
@@ -2324,7 +2370,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     return False, message
                 send_group = self._model_update_group[group_name]
 
-            self._reserve_relay_weight_memory(total_bytes)
+            relay_weight_loader.reserve(total_bytes)
             reserved_pending_bytes = True
             weights = []
             recv_ops = []
@@ -2341,6 +2387,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 weights.append((name, weight))
             if recv_ops:
+                assert self._relay_weight_dist_lock is not None
                 with self._relay_weight_dist_lock:
                     _run_weight_sync_p2p_ops(recv_ops)
                 # The background loader runs in another Python thread with its
@@ -2348,14 +2395,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # the tensors to that thread.
                 torch.get_device_module(self.device).synchronize()
 
-            self._enqueue_relay_weight_update(weights, total_bytes)
+            relay_weight_loader.enqueue(weights, total_bytes)
             reserved_pending_bytes = False
             return True, "Succeeded to receive parameter online and queue relay load."
         except Exception as e:
             if reserved_pending_bytes:
-                with self._relay_weight_pending_cond:
-                    self._relay_weight_pending_bytes -= total_bytes
-                    self._relay_weight_pending_cond.notify_all()
+                relay_weight_loader.release(total_bytes)
             error_msg = (
                 f"Failed to update parameter online: {e}. "
                 f"The full weights of the ModelRunner are partially updated. "
@@ -3904,7 +3949,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
     def check_weights(self, action: str):
-        self._flush_pending_relay_weight_updates()
+        self._synchronize_pending_weight_updates()
         return self._weight_checker.handle(action=action)
 
     def update_weights_from_ipc(self, recv_req):
@@ -3981,7 +4026,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         from sglang.srt.model_loader.loader import device_loading_context
 
-        self._flush_pending_relay_weight_updates()
+        self._synchronize_pending_weight_updates()
         target_device = torch.device("cuda", torch.cuda.current_device())
 
         if recv_req.post_load_weights:
