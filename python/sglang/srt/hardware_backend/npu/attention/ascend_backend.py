@@ -458,36 +458,17 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _init_cuda_graph_metadata(
         self,
         bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-    ):
+        seq_lens: torch.Tensor,
+    ) -> "ForwardMetadata":
+        """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-
         metadata.block_tables = self.graph_metadata["block_tables"][:bs, :]
-        if self.is_dllm_model:
-            max_len = int(seq_lens[:bs].max().item())
-            max_seq_pages = (max_len + self.page_size - 1) // self.page_size
-            metadata.block_tables[:bs, :max_seq_pages].copy_(
-                (
-                    self.req_to_token[req_pool_indices[:bs], :max_len][
-                        :, :: self.page_size
-                    ]
-                    // self.page_size
-                ).to(torch.int32)
-            )
-            metadata.block_tables[:bs, max_seq_pages:].fill_(0)
-            metadata.block_tables[bs:, :].fill_(0)
-
         if self.is_hybrid_swa:
             metadata.block_tables_swa = self.graph_metadata["block_tables_swa"][:bs, :]
-        metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
         metadata.seq_lens = seq_lens
         if (
             forward_mode.is_target_verify()
@@ -504,26 +485,15 @@ class AscendAttnBackend(AttentionBackend):
             )
         else:
             metadata.actual_seq_lengths_q = torch.tensor(
-                [1 + i * 1 for i in range(bs)],
+                [1 + i for i in range(bs)],
                 dtype=torch.int32,
                 device=seq_lens.device,
             )
-        if forward_mode.is_dllm_extend():
-            extend_seq_lens_cpu_int = torch.tensor(
-                [self.dllm_block_size for i in range(bs)],
-                dtype=torch.int32,
-                device=seq_lens.device,
-            )
-            metadata.seq_lens_list_cumsum = (
-                torch.cumsum(extend_seq_lens_cpu_int, dim=0).int().tolist()
-            )
-
         if (
             self.q_head_num_padding is not None
             and self.q_head_num_padding > self.tp_q_head_num
         ):
-            # In the MLA architecture, the FIA kernel requires the head count to be a power of 2.
-            # Therefore, we pad the head dimension accordingly and initialize an empty tensor for padding.
+            dtype = self.model_dtype if self.model_dtype is not None else torch.bfloat16
             metadata.nope_padding = torch.empty(
                 [
                     bs,
@@ -531,9 +501,7 @@ class AscendAttnBackend(AttentionBackend):
                     self.q_head_num_padding - self.tp_q_head_num,
                     self.kv_lora_rank,
                 ],
-                dtype=(
-                    self.model_dtype if self.model_dtype is not None else torch.bfloat16
-                ),
+                dtype=dtype,
                 device=seq_lens.device,
             )
             metadata.rope_padding = torch.empty(
@@ -543,16 +511,33 @@ class AscendAttnBackend(AttentionBackend):
                     self.q_head_num_padding - self.tp_q_head_num,
                     self.qk_rope_head_dim,
                 ],
-                dtype=(
-                    self.model_dtype if self.model_dtype is not None else torch.bfloat16
-                ),
+                dtype=dtype,
                 device=seq_lens.device,
             )
-
         self.graph_metadata[bs] = metadata
-        self.forward_metadata = metadata
+        return metadata
 
-        self.graph_mode = True
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        self._init_cuda_graph_metadata(bs, forward_mode, seq_lens)
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
