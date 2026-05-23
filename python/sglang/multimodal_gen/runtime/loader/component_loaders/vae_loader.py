@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
@@ -18,6 +17,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_diffusers_component_config,
 )
@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+VAE_CHANNELS_LAST_3D_ENV = "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D"
 
 
 def _backfill_ltx2_audio_vae_latent_stats(
@@ -57,6 +58,19 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
                 # Best-effort; skip unsupported cases.
                 continue
     return num_converted
+
+
+def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -> bool:
+    if component_name not in (
+        "vae",
+        "video_vae",
+    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+        return False
+
+    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
+    if override is None or override.strip().lower() == "auto":
+        return True
+    return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
 
 
 class VAELoader(ComponentLoader):
@@ -120,11 +134,7 @@ class VAELoader(ComponentLoader):
                     trust_remote_code=server_args.trust_remote_code,
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
-            if (
-                component_name in ("vae", "video_vae")
-                and torch.cuda.is_available()
-                and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
-            ):
+            if _should_use_channels_last_3d(server_args, component_name):
                 n = _convert_conv3d_weights_to_channels_last_3d(vae)
                 if n > 0:
                     logger.info(
@@ -167,11 +177,7 @@ class VAELoader(ComponentLoader):
         if unexpected_keys:
             logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
-        if (
-            component_name in ("vae", "video_vae")
-            and torch.cuda.is_available()
-            and getattr(envs, "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", False)
-        ):
+        if _should_use_channels_last_3d(server_args, component_name):
             n = _convert_conv3d_weights_to_channels_last_3d(vae)
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)

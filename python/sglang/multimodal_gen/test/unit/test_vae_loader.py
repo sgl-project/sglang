@@ -1,10 +1,12 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
     _backfill_ltx2_audio_vae_latent_stats,
 )
+from sglang.multimodal_gen.runtime.models.vaes.parallel import wan_common_utils
 
 
 class TestVAELoader(unittest.TestCase):
@@ -42,6 +44,48 @@ class TestVAELoader(unittest.TestCase):
 
         self.assertNotIn("latents_mean", loaded)
         self.assertNotIn("latents_std", loaded)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_skips_non_cuda_platforms(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(
+                wan_common_utils.current_platform, "is_cuda", return_value=False
+            ),
+            patch.object(
+                wan_common_utils.current_platform, "is_rocm", return_value=False
+            ),
+        ):
+            out = wan_common_utils.match_conv3d_input_format(x, weight)
+
+        self.assertIs(out, x)
+
+    @unittest.skipUnless(
+        hasattr(torch, "channels_last_3d"), "channels_last_3d is unavailable"
+    )
+    def test_match_conv3d_input_format_uses_channels_last_3d_on_cuda(self):
+        x = torch.randn(1, 3, 2, 4, 4)
+        weight = torch.randn(3, 3, 1, 1, 1).contiguous(
+            memory_format=torch.channels_last_3d
+        )
+
+        with (
+            patch.object(
+                wan_common_utils.current_platform, "is_cuda", return_value=True
+            ),
+            patch.object(
+                wan_common_utils.current_platform, "is_rocm", return_value=False
+            ),
+        ):
+            out = wan_common_utils.match_conv3d_input_format(x, weight)
+
+        self.assertTrue(out.is_contiguous(memory_format=torch.channels_last_3d))
 
 
 if __name__ == "__main__":
