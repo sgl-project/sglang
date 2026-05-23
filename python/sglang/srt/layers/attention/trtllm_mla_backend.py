@@ -583,7 +583,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
-        ) or is_in_piecewise_cuda_graph()
+        ) or is_in_tc_piecewise_cuda_graph()
         if fallback_to_flashinfer_impl:
             super().init_mha_chunk_metadata(forward_batch)
 
