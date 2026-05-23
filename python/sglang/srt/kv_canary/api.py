@@ -61,6 +61,7 @@ def install_canary(
     )
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
+    _patch_cuda_graph_capture_for_warmup_suspend_once()
 
     logger.info("install_canary: config=%s", config)
     return runner
@@ -78,12 +79,44 @@ def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
+        if runner.per_forward_suspended:
+            return original(*args, **kwargs)
+
         runner.launch_head_kernels(forward_batch)
         output = original(*args, **kwargs)
         runner.launch_tail_kernels(forward_batch)
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
+
+
+_CUDA_GRAPH_CAPTURE_PATCHED = False
+
+
+def _patch_cuda_graph_capture_for_warmup_suspend_once() -> None:
+    """Wrap ``CudaGraphRunner.capture`` so the warmup loop (which calls model.forward
+    directly, bypassing ModelRunner.forward's canary_ctx) runs with canary's
+    per-forward suspended. Otherwise the monkey-patched head/tail fire without a
+    preceding ``before_forward`` and the phase checker observes a broken lifecycle.
+
+    Idempotent: applied class-wide on first call, becomes a no-op thereafter.
+    Subclasses (EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner) explicitly
+    call ``CudaGraphRunner.capture(self)`` so they inherit the wrap."""
+    global _CUDA_GRAPH_CAPTURE_PATCHED
+    if _CUDA_GRAPH_CAPTURE_PATCHED:
+        return
+
+    from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+
+    def wrapper(original: Callable, self_runner, *args: Any, **kwargs: Any) -> Any:
+        canary = self_runner.model_runner.canary_runner
+        if canary is None:
+            return original(self_runner, *args, **kwargs)
+        with canary.suspend_per_forward():
+            return original(self_runner, *args, **kwargs)
+
+    wrap_method(CudaGraphRunner, "capture", wrapper=wrapper)
+    _CUDA_GRAPH_CAPTURE_PATCHED = True
 
 
 def _extract_forward_batch(args, kwargs) -> Optional[ForwardBatch]:

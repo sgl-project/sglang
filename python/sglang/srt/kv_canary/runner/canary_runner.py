@@ -66,6 +66,7 @@ class CanaryRunner:
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
         self._in_forward_pass: bool = False
+        self._per_forward_suspended: bool = False
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -162,6 +163,26 @@ class CanaryRunner:
     @property
     def active_tag_count(self) -> int:
         return len(self._active_tags)
+
+    @property
+    def per_forward_suspended(self) -> bool:
+        return self._per_forward_suspended
+
+    @contextlib.contextmanager
+    def suspend_per_forward(self) -> Iterator[None]:
+        """Suspend the per-forward canary kernels (head/tail) for the duration of the block.
+
+        Used to skip canary work during cuda-graph warmup, where ``model.forward`` is
+        called directly (bypassing ``ModelRunner.forward``'s canary_ctx) so
+        ``before_forward`` / ``end_of_step`` never fire. Without suspension the
+        monkey-patched ``model.forward`` would still launch head/tail kernels and the
+        phase-checker would observe a broken lifecycle (head with phase=IDLE)."""
+        prev = self._per_forward_suspended
+        self._per_forward_suspended = True
+        try:
+            yield
+        finally:
+            self._per_forward_suspended = prev
 
     def _get_step_counter(self) -> int:
         return self._step_counter
