@@ -59,11 +59,11 @@ def _logical_shr(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def _uint64_mod(x: torch.Tensor, mod: int) -> torch.Tensor:
-    # ``offset`` is a Python int, passed as a scalar to ``torch.where`` /
-    # arithmetic so PyTorch broadcasts it without allocating a fresh device
-    # tensor each call (the previous ``torch.tensor(..., device=x.device)``
-    # form was capture-unsafe inside cuda-graph regions).
     offset = (1 << 64) % mod
     base = x % mod
-    corrected = torch.where(x < 0, base + offset, base)
-    return corrected % mod
+    correction = torch.where(
+        x < 0,
+        torch.tensor(offset, dtype=torch.int64, device=x.device),
+        torch.tensor(0, dtype=torch.int64, device=x.device),
+    )
+    return (base + correction) % mod
