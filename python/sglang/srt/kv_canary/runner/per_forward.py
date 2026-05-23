@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import IntEnum
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -17,18 +18,34 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     invoke_plan,
     launch_endpoints_per_forward,
 )
-from sglang.srt.kv_canary.runner.phase_checker import (
-    CanaryPerForwardPhase,
-    CanaryPerForwardPhaseChecker,
-)
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.speculative.spec_info import SpecInputType
+from sglang.srt.utils.phase_checker import SimplePhaseChecker
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+class _CanaryPerForwardPhase(IntEnum):
+    """Lifecycle phases of one canary per-forward-pass. Used as ``int`` inputs
+    to a :class:`SimplePhaseChecker` so the checker stays canary-agnostic.
+
+    Enforced order::
+
+        IDLE
+          -> AFTER_BEFORE_FORWARD      (PerForwardOrchestrator.before_forward)
+          -> AFTER_HEAD_KERNELS        (PerForwardOrchestrator.launch_head_kernels)
+          -> AFTER_TAIL_KERNELS        (PerForwardOrchestrator.launch_tail_kernels)
+          -> IDLE                      (PerForwardOrchestrator.end_of_step)
+    """
+
+    IDLE = 0
+    AFTER_BEFORE_FORWARD = 1
+    AFTER_HEAD_KERNELS = 2
+    AFTER_TAIL_KERNELS = 3
 
 
 class PerForwardOrchestrator:
@@ -103,15 +120,17 @@ class PerForwardOrchestrator:
             d2h_stream=d2h_stream,
         )
 
-        self._phase_checker = CanaryPerForwardPhaseChecker(device=device)
+        self._phase_checker = SimplePhaseChecker(
+            initial_phase=_CanaryPerForwardPhase.IDLE, device=device
+        )
 
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
-            expect_phase=CanaryPerForwardPhase.IDLE,
-            next_phase=CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
+            expect_phase=_CanaryPerForwardPhase.IDLE,
+            next_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
         )
 
         bs = int(forward_batch.batch_size)
@@ -154,8 +173,8 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
-            next_phase=CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            expect_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
+            next_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
         )
 
         violation_log = self._device_state.violation_log
@@ -197,8 +216,8 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
-            next_phase=CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            expect_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            next_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
         )
 
         violation_log = self._device_state.violation_log
@@ -227,8 +246,8 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
-            next_phase=CanaryPerForwardPhase.IDLE,
+            expect_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            next_phase=_CanaryPerForwardPhase.IDLE,
         )
 
         self._perturb_manager.end_of_forward(forward_batch)
