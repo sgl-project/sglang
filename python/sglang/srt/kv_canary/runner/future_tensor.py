@@ -66,11 +66,6 @@ class FutureTensors:
         return data
 
 
-def _clone_and_copy_to_host(x_device: torch.Tensor, x_host: torch.Tensor) -> torch.Tensor:
-    x_device_cloned = x_device.detach().clone()
-    x_host.copy_(x_device_cloned, non_blocking=True)
-
-
 @dataclass(slots=True, kw_only=True)
 class DelayedDeviceHostHandler:
     """Stage device-side compute at step T, drain + postprocess host copy at step T+1.
