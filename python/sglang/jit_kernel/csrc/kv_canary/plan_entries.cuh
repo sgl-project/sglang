@@ -46,7 +46,7 @@ struct PlanEntriesParams {
 
 // Binary search for the largest req_id such that verify_offsets[req_id] <= tid. Pre-condition: tid is
 // strictly less than verify_offsets[bs_padded] = total_verify; bs_padded >= 1; verify_offsets[0] = 0.
-__device__ __forceinline__ int32_t
+SGL_DEVICE int32_t
 find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64_t tid) {
   int32_t lo = 0;
   int32_t hi = bs_padded;  // exclusive upper bound; verify_offsets[hi] > tid
@@ -63,7 +63,7 @@ find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64
 
 // Translate raw slot value via the SWA LUT. Sentinel passthrough (-1 stays -1). Clamp slot to
 // ``lut_len - 1`` defensively; in practice the caller never produces out-of-range slots.
-__device__ __forceinline__ int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_len, int64_t raw_slot) {
+SGL_DEVICE int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_len, int64_t raw_slot) {
   if (raw_slot < 0) {
     return raw_slot;
   }
