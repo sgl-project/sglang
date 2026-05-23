@@ -30,11 +30,11 @@ namespace canary_plan_entries {
 // Per-launch device-side params struct. Passed via __grid_constant__.
 struct PlanEntriesParams {
   // Inputs.
-  const int64_t* __restrict__ req_pool_indices;       // [bs_padded] int64
-  const int64_t* __restrict__ prefix_lens;            // [bs_padded] int64
-  const int32_t* __restrict__ req_to_token;           // [max_reqs, max_seq_len] int32
-  const int64_t* __restrict__ full_to_swa_lut;        // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
-  const int64_t* __restrict__ verify_offsets_scratch; // [bs_padded + 1] int64 (cumulative prefix sum)
+  const int64_t* __restrict__ req_pool_indices;        // [bs_padded] int64
+  const int64_t* __restrict__ prefix_lens;             // [bs_padded] int64
+  const int32_t* __restrict__ req_to_token;            // [max_reqs, max_seq_len] int32
+  const int64_t* __restrict__ full_to_swa_lut;         // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
+  const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;       // [verify_capacity] int64
   int64_t* __restrict__ out_verify_positions;          // [verify_capacity] int64
@@ -65,8 +65,7 @@ find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64
 // Translate raw slot value via the SWA LUT. Sentinel passthrough (-1 stays -1). Clamp slot to lut_len-1
 // to mirror the Triton _swa_translate_tile boundary behavior, but in practice the caller never produces
 // out-of-range slots; the clamp is purely defensive.
-__device__ __forceinline__ int64_t
-swa_translate(const int64_t* __restrict__ lut, int64_t lut_len, int64_t raw_slot) {
+__device__ __forceinline__ int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_len, int64_t raw_slot) {
   if (raw_slot < 0) {
     return raw_slot;
   }
@@ -105,9 +104,7 @@ __global__ void plan_entries_persistent_kernel(
     // the live range can never land on a padding req; no explicit padding-row check needed.
     const int64_t rp = params.req_pool_indices[req_id];
     const int64_t prefix_len = params.prefix_lens[req_id];
-    const int64_t window_start = (swa_window > 0)
-                                     ? (prefix_len - swa_window > 0 ? prefix_len - swa_window : 0)
-                                     : 0;
+    const int64_t window_start = (swa_window > 0) ? (prefix_len - swa_window > 0 ? prefix_len - swa_window : 0) : 0;
     const int64_t position = window_start + entry_idx;
 
     // 3) Gather slot + prev_slot via req_to_token.
@@ -232,12 +229,9 @@ struct PlanEntriesKernel {
         .prefix_lens = unwrap_data_ptr<int64_t>(prefix_lens, "prefix_lens"),
         .req_to_token = unwrap_data_ptr<int32_t>(req_to_token, "req_to_token"),
         .full_to_swa_lut = lut_ptr,
-        .verify_offsets_scratch =
-            unwrap_data_ptr<int64_t>(verify_offsets_scratch, "verify_offsets_scratch"),
-        .out_verify_slot_indices =
-            unwrap_data_ptr_mut<int64_t>(out_verify_slot_indices, "out_verify_slot_indices"),
-        .out_verify_positions =
-            unwrap_data_ptr_mut<int64_t>(out_verify_positions, "out_verify_positions"),
+        .verify_offsets_scratch = unwrap_data_ptr<int64_t>(verify_offsets_scratch, "verify_offsets_scratch"),
+        .out_verify_slot_indices = unwrap_data_ptr_mut<int64_t>(out_verify_slot_indices, "out_verify_slot_indices"),
+        .out_verify_positions = unwrap_data_ptr_mut<int64_t>(out_verify_positions, "out_verify_positions"),
         .out_verify_prev_slot_indices =
             unwrap_data_ptr_mut<int64_t>(out_verify_prev_slot_indices, "out_verify_prev_slot_indices"),
         .bs_padded = static_cast<int32_t>(bs_padded),

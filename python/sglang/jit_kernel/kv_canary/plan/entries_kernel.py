@@ -6,10 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.kv_canary.consts import (
-    REQ_POOL_IDX_PADDING,
-    TOKEN_TO_KV_SLOT_PADDING,
-)
 from sglang.jit_kernel.kv_canary.plan.entries_kernel_cuda import (
     launch_plan_entries_cuda,
 )
