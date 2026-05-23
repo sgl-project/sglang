@@ -124,6 +124,18 @@ impl BasicWorkerBuilder {
         self
     }
 
+    fn url_for_bootstrap_metadata(url: &str) -> &str {
+        let Some((base_url, rank)) = url.rsplit_once('@') else {
+            return url;
+        };
+
+        if rank.parse::<usize>().is_ok() {
+            base_url
+        } else {
+            url
+        }
+    }
+
     /// Build the BasicWorker instance
     pub fn build(self) -> BasicWorker {
         use std::sync::{
@@ -133,15 +145,16 @@ impl BasicWorkerBuilder {
 
         use tokio::sync::OnceCell;
 
-        let bootstrap_host = match url::Url::parse(&self.url) {
+        let metadata_url = Self::url_for_bootstrap_metadata(&self.url);
+        let bootstrap_host = match url::Url::parse(metadata_url) {
             Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
-            Err(_) if !self.url.contains("://") => {
-                match url::Url::parse(&format!("http://{}", self.url)) {
+            Err(_) if !metadata_url.contains("://") => {
+                match url::Url::parse(&format!("http://{}", metadata_url)) {
                     Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
                     Err(_) => {
                         tracing::warn!(
                             "Failed to parse URL '{}', defaulting to localhost",
-                            self.url
+                            metadata_url
                         );
                         "localhost".to_string()
                     }
@@ -150,7 +163,7 @@ impl BasicWorkerBuilder {
             Err(_) => {
                 tracing::warn!(
                     "Failed to parse URL '{}', defaulting to localhost",
-                    self.url
+                    metadata_url
                 );
                 "localhost".to_string()
             }
@@ -474,6 +487,7 @@ mod tests {
         let worker = DPAwareWorkerBuilder::new("http://localhost:8080", 2, 8).build();
 
         assert_eq!(worker.url(), "http://localhost:8080@2");
+        assert_eq!(worker.bootstrap_host(), "localhost");
         assert_eq!(worker.dp_rank(), Some(2));
         assert_eq!(worker.dp_size(), Some(8));
         assert_eq!(worker.worker_type(), &WorkerType::Regular);
@@ -504,6 +518,8 @@ mod tests {
             .build();
 
         assert_eq!(worker.url(), "http://localhost:8080@3");
+        assert_eq!(worker.bootstrap_host(), "localhost");
+        assert_eq!(worker.bootstrap_port(), Some(9090));
         assert_eq!(worker.dp_rank(), Some(3));
         assert_eq!(worker.dp_size(), Some(16));
         assert_eq!(worker.metadata().labels, labels);
@@ -538,6 +554,7 @@ mod tests {
             .build();
 
         assert_eq!(worker.url(), "grpc://cluster.local@1");
+        assert_eq!(worker.bootstrap_host(), "cluster.local");
         assert_eq!(worker.dp_rank(), Some(1));
         assert_eq!(worker.dp_size(), Some(4));
         assert_eq!(worker.worker_type(), &WorkerType::Decode);
@@ -549,5 +566,18 @@ mod tests {
             worker.metadata().labels.get("transport"),
             Some(&"grpc".to_string())
         );
+    }
+
+    #[test]
+    fn test_dp_aware_worker_builder_ipv4_bootstrap_host_uses_base_url() {
+        let worker = DPAwareWorkerBuilder::new("http://10.66.5.115:20664", 3, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        assert_eq!(worker.url(), "http://10.66.5.115:20664@3");
+        assert_eq!(worker.bootstrap_host(), "10.66.5.115");
+        assert_eq!(worker.bootstrap_port(), Some(8998));
     }
 }

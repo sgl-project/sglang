@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{borrow::Cow, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -83,10 +83,10 @@ impl PDRouter {
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
         let workers = self.worker_registry.get_prefill_workers();
-        let first_worker_url = workers.first().map(|w| w.url().to_string());
 
-        if let Some(worker_url) = first_worker_url {
-            self.proxy_to_worker(worker_url, endpoint, headers).await
+        if let Some(worker) = workers.first() {
+            self.proxy_to_worker(worker.as_ref(), endpoint, headers)
+                .await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -94,11 +94,11 @@ impl PDRouter {
 
     async fn proxy_to_worker(
         &self,
-        worker_url: String,
+        worker: &dyn Worker,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{}", worker_url, endpoint);
+        let url = api_path(worker.base_url(), endpoint);
         let mut request_builder = self.client.get(&url);
 
         if let Some(headers) = headers {
@@ -587,22 +587,34 @@ impl PDRouter {
         let headers = Some(&headers_with_trace);
 
         // Build both requests
-        let prefill_request = self.build_post_with_headers(
-            &self.client,
-            prefill.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
-        let decode_request = self.build_post_with_headers(
-            &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
-            headers,
-            false,
-        );
+        let prefill_request = match self
+            .build_post_with_headers(
+                &self.client,
+                prefill.as_ref(),
+                context.route,
+                &json_request,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(e) => return error::internal_error("prepare_worker_request_failed", e),
+        };
+        let decode_request = match self
+            .build_post_with_headers(
+                &self.client,
+                decode.as_ref(),
+                context.route,
+                &json_request,
+                headers,
+                false,
+            )
+            .await
+        {
+            Ok(request) => request,
+            Err(e) => return error::internal_error("prepare_worker_request_failed", e),
+        };
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
@@ -1176,16 +1188,28 @@ impl PDRouter {
         Ok((prefill_status, prefill_body))
     }
 
-    fn build_post_with_headers(
+    async fn build_post_with_headers(
         &self,
         client: &Client,
-        url: &str,
+        worker: &dyn Worker,
         route: &'static str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
-    ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let request_body = if worker.is_dp_aware() {
+            Cow::Owned(
+                worker
+                    .prepare_request(json_request.clone())
+                    .await
+                    .map_err(|e| e.to_string())?,
+            )
+        } else {
+            Cow::Borrowed(json_request)
+        };
+        let mut request = client
+            .post(api_path(worker.base_url(), route))
+            .json(&request_body);
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1198,7 +1222,7 @@ impl PDRouter {
                 }
             }
         }
-        request
+        Ok(request)
     }
 
     // Helper to merge logprobs from prefill and decode responses
@@ -1293,12 +1317,11 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = api_path(prefill.base_url(), "health_generate");
+        let decode_url = api_path(decode.base_url(), "health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
-            self.client
-                .get(format!("{}/health_generate", decode.url()))
-                .send()
+            self.client.get(&decode_url).send()
         );
 
         // Check results
