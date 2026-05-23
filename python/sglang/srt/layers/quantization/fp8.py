@@ -1435,10 +1435,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         ):
             num_experts, m, k = weight_shape
             aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
+            expected_k_groups = k // 32
+            scale = scale.contiguous()
+            scale_mn = num_experts * aligned_m
+            if scale.numel() % scale_mn != 0:
+                raise ValueError(
+                    "MXFP8 MoE scale size is not divisible by the padded expert rows: "
+                    f"scale_numel={scale.numel()} {scale_mn=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            actual_k_groups = scale.numel() // scale_mn
+            if actual_k_groups < expected_k_groups:
+                raise ValueError(
+                    "MXFP8 MoE scale has fewer K groups than the weight shard: "
+                    f"{actual_k_groups=} {expected_k_groups=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.shape)}."
+                )
+            scale = scale.view(num_experts, aligned_m, actual_k_groups)
+            if actual_k_groups > expected_k_groups:
+                scale = scale[:, :, :expected_k_groups].contiguous()
             num_warps = 8
             scale = _swizzle_mxfp8_sf(scale, num_warps)
-            scale = scale.data.view(num_experts, aligned_m, k // 32)
+            actual_k_groups = scale.data.numel() // scale_mn
+            if actual_k_groups < expected_k_groups:
+                raise ValueError(
+                    "MXFP8 MoE swizzled scale has fewer K groups than the weight shard: "
+                    f"{actual_k_groups=} {expected_k_groups=} {weight_shape=} "
+                    f"scale_shape={tuple(scale.data.shape)}."
+                )
+            scale = scale.data.view(num_experts, aligned_m, actual_k_groups)
+            if actual_k_groups > expected_k_groups:
+                scale = scale[:, :, :expected_k_groups].contiguous()
             return scale
 
         def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
