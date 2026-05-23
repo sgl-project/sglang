@@ -224,6 +224,12 @@ class TestQwen3Detector(CustomTestCase):
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
 
+    def test_detect_and_parse_tool_interrupt(self):
+        text = "<think>I should call a tool<tool_call>tool call data"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "I should call a tool")
+        self.assertEqual(result.normal_text, "<tool_call>tool call data")
+
 
 class TestQwen3ForcedReasoningDetector(CustomTestCase):
     def setUp(self):
@@ -253,6 +259,12 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
 
+    def test_detect_and_parse_tool_only_output(self):
+        text = "<tool_call>\n<function=get_weather></function>\n</tool_call>"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, text)
+
     def test_streaming_qwen3_forced_reasoning_format(self):
         """Test streaming parse of Qwen3-ForcedReasoning format."""
         # First chunk without <think> start
@@ -269,6 +281,19 @@ class TestQwen3ForcedReasoningDetector(CustomTestCase):
         result = self.detector.parse_streaming_increment("</think>The answer is 42.")
         self.assertEqual(result.reasoning_text, "")  # Buffer cleared
         self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_streaming_tool_interrupt(self):
+        result = self.detector.parse_streaming_increment("I need a weather lookup")
+        self.assertEqual(result.reasoning_text, "I need a weather lookup")
+
+        result = self.detector.parse_streaming_increment("<tool_call>")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "<tool_call>")
+        self.assertFalse(self.detector._in_reasoning)
+
+        result = self.detector.parse_streaming_increment("<function=get_weather>")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "<function=get_weather>")
 
 
 class TestKimiDetector(CustomTestCase):
