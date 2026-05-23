@@ -31,15 +31,13 @@ class FutureTensors:
 
         # Must happen in current stream, not d2h stream
         tensors_device_cloned = {
-            key: tensors_device.detach().clone()
-            for key, tensor_device in tensors_device.items()
+            key: x.detach().clone()
+            for key, x in tensors_device.items()
         }
 
         tensors_host = {
-            key: torch.empty(
-                tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
-            )
-            for key, tensor_device in tensors_device.items()
+            key: torch.empty(x.shape, dtype=x.dtype, pin_memory=True)
+            for key, x in tensors_device.items()
         }
 
         d2h_stream.wait_stream(torch.cuda.current_stream(device))
