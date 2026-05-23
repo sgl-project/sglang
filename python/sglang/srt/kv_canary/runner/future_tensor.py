@@ -21,6 +21,12 @@ class FutureTensors:
     def device_to_host(
         cls, xs_device: _TensorOrDict, *, d2h_stream: torch.cuda.Stream
     ) -> "FutureTensors":
+        assert not torch.cuda.is_current_stream_capturing(), (
+            "FutureTensors.device_to_host must not be called during cuda-graph "
+            "capture: the d2h side-stream copy + pinned-host alloc cannot be "
+            "captured. Callers should gate via DelayedDeviceHostHandler.step, "
+            "which is capture-aware and skips staging inside capture."
+        )
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
 
@@ -59,12 +65,6 @@ class FutureTensors:
                 tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)
             event = torch.cuda.Event()
             event.record()
-
-        # Re-join d2h_stream back into the current stream so cuda-graph capture
-        # does not raise cudaErrorStreamCaptureUnjoined (every stream forked
-        # during capture must be joined back before capture ends). The host
-        # copy itself is still async via the recorded event.
-        torch.cuda.current_stream(device).wait_stream(d2h_stream)
 
         return cls(_data=tensors_host | non_tensors_device, _event=event)
 
