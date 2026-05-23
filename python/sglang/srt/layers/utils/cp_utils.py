@@ -171,6 +171,12 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
+def cp_round_robin_input_ids(input_ids):
+    cp_size = get_attention_cp_size()
+    input_ids = input_ids.reshape(-1, cp_size).T.flatten()
+    return input_ids
+
+
 def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
     """
     Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
