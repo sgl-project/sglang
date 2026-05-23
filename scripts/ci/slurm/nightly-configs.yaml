@@ -1,0 +1,46 @@
+# Nightly benchmark configurations for srt-slurm powered runners.
+#
+# Structure mirrors InferenceX nvidia-master.yaml but only includes fields
+# actually needed by the runner — prefill/decode topology details are already
+# encoded in each srt-slurm recipe YAML and are not duplicated here.
+#
+# To add/remove concurrencies: edit conc-list for the relevant search-space entry.
+# To add a new runner:         add a new top-level block and create a corresponding
+#                              nightly-test-<runner>.yml workflow.
+# Never edit workflow YAML files directly for these changes.
+
+dsr1-fp8-gb200-dynamo-sglang:
+  model: deepseek-ai/DeepSeek-R1-0528
+  model-prefix: dsr1
+  runner: gb200
+  precision: fp8
+  framework: dynamo-sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1024, 2048, 4096, 6144]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/max-tpt.yaml
+          config_file: recipes/gb200-fp8/1k1k/max-tpt.yaml
+
+        - conc-list: [4096]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp8/1k1k/ultra-tpt.yaml
+          config_file: recipes/gb200-fp8/1k1k/ultra-tpt.yaml
+
+dsr1-fp4-gb200-dynamo-sglang:
+  model: nvidia/DeepSeek-R1-0528-NVFP4-v2
+  model-prefix: dsr1
+  runner: gb200
+  precision: fp4
+  framework: dynamo-sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [512, 2048, 4096, 8192]
+          # https://github.com/NVIDIA/srt-slurm/blob/sglang-nightly-regression/recipes/gb200-fp4/1k1k/mid-curve.yaml
+          config_file: recipes/gb200-fp4/1k1k/mid-curve.yaml

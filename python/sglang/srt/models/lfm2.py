@@ -40,6 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -263,9 +264,10 @@ class Lfm2ShortConv(nn.Module):
         if forward_batch.forward_mode.is_idle():
             return hidden_states
 
-        layer_cache = forward_batch.req_to_token_pool.mamba2_layer_cache(self.layer_idx)
+        layer_cache = get_req_to_token_pool().mamba2_layer_cache(self.layer_idx)
         conv_state = layer_cache.conv[0]
         req_pool_indices = forward_batch.req_pool_indices
+        mamba_indices = get_req_to_token_pool().get_mamba_indices(req_pool_indices)
 
         # Project and split into gates: B (pre-conv), C (post-conv), x (input)
         proj, _ = self.in_proj(hidden_states)
@@ -280,7 +282,7 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_weight,
                 self.conv_bias,
                 activation=None,
-                conv_state_indices=req_pool_indices.to(torch.int32),
+                conv_state_indices=mamba_indices.to(torch.int32),
             )
         else:
             # Prefill: multiple tokens, use varlen kernel
@@ -298,12 +300,14 @@ class Lfm2ShortConv(nn.Module):
                         ),
                     ]
                 )
-                cache_indices = req_pool_indices.to(torch.int32)
+                cache_indices = mamba_indices.to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens > 0
             else:
                 query_start_loc = torch.tensor(
                     [0, T], dtype=torch.int32, device=hidden_states.device
                 )
-                cache_indices = req_pool_indices[:1].to(torch.int32)
+                cache_indices = mamba_indices[:1].to(torch.int32)
+                has_initial_state = forward_batch.extend_prefix_lens[:1] > 0
 
             conv_out = causal_conv1d_fn(
                 Bx_t,
@@ -311,7 +315,7 @@ class Lfm2ShortConv(nn.Module):
                 self.conv_bias,
                 query_start_loc=query_start_loc,
                 cache_indices=cache_indices,
-                has_initial_state=None,
+                has_initial_state=has_initial_state,
                 conv_states=conv_state,
                 activation=None,
             ).transpose(0, 1)
@@ -424,10 +428,10 @@ class Lfm2Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = (
-            inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
+            input_embeds if input_embeds is not None else self.embed_tokens(input_ids)
         )
 
         residual = None
@@ -474,16 +478,19 @@ class Lfm2ForCausalLM(nn.Module):
     def get_num_kv_cache_layers(self) -> int:
         return self.num_attention_layers
 
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
     @torch.no_grad()
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
-        hidden_states = self.model(input_ids, positions, forward_batch, inputs_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

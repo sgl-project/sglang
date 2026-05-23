@@ -269,6 +269,8 @@ async def flush_cache():
     return Response(status_code=200)
 
 
+# TODO: Remove `/get_server_info` alias after one release-cycle deprecation window.
+@app.get("/server_info")
 @app.get("/get_server_info")
 async def get_server_info():
     prefill_infos = []
@@ -277,10 +279,10 @@ async def get_server_info():
 
     async with aiohttp.ClientSession() as session:
         for server in lb.prefill_urls:
-            server_info = await session.get(f"{server}/get_server_info")
+            server_info = await session.get(f"{server}/server_info")
             prefill_infos.append(await server_info.json())
         for server in lb.decode_urls:
-            server_info = await session.get(f"{server}/get_server_info")
+            server_info = await session.get(f"{server}/server_info")
             info_json = await server_info.json()
             decode_infos.append(info_json)
             # Extract internal_states from decode servers

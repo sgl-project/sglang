@@ -183,6 +183,8 @@ class StorageBackendFactory:
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)
         elif backend_name == "eic":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "simm":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -220,4 +222,10 @@ StorageBackendFactory.register_backend(
     "eic",
     "sglang.srt.mem_cache.storage.eic.eic_storage",
     "EICStorage",
+)
+
+StorageBackendFactory.register_backend(
+    "simm",
+    "sglang.srt.mem_cache.storage.simm.hicache_simm",
+    "HiCacheSiMM",
 )

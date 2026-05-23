@@ -113,14 +113,13 @@ def rmsnorm(
     # See: https://github.com/flashinfer-ai/flashinfer/issues/2734
     #      https://github.com/flashinfer-ai/flashinfer/pull/2733
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
-    else:
         return _flashinfer_norm.rmsnorm(input, weight, eps, out, enable_pdl)
+    else:
+        return _rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
 
 def fused_add_rmsnorm(
@@ -153,16 +152,14 @@ def fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
-    else:
         _flashinfer_norm.fused_add_rmsnorm(input, residual, weight, eps, enable_pdl)
+    else:
+        _fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
 def gemma_rmsnorm(
@@ -196,16 +193,14 @@ def gemma_rmsnorm(
     output: torch.Tensor
         Gemma Normalized tensor, shape (batch_size, hidden_size).
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
-    else:
         return _flashinfer_norm.gemma_rmsnorm(input, weight, eps, out, enable_pdl)
+    else:
+        return _gemma_rmsnorm_internal(input, weight, eps, out, enable_pdl)
 
 
 def gemma_fused_add_rmsnorm(
@@ -238,18 +233,16 @@ def gemma_fused_add_rmsnorm(
         <https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programmatic-dependent-launch-and-synchronization>`_
         If None, will be automatically enabled on Hopper architecture.
     """
-    # See is_dynamo_compiling() comment in rmsnorm() above.
     if (
-        input.device.type == "musa"
-        or not _has_flashinfer
-        or input.dtype not in _FLASHINFER_NORM_SUPPORTED_DTYPES
-        or torch.compiler.is_dynamo_compiling()
+        _has_flashinfer
+        and input.dtype in _FLASHINFER_NORM_SUPPORTED_DTYPES
+        and not torch.compiler.is_dynamo_compiling()
     ):
-        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
-    else:
         _flashinfer_norm.gemma_fused_add_rmsnorm(
             input, residual, weight, eps, enable_pdl
         )
+    else:
+        _gemma_fused_add_rmsnorm_internal(input, residual, weight, eps, enable_pdl)
 
 
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:

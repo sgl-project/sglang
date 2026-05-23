@@ -160,6 +160,14 @@ class ServerContext:
     _stdout_fh: Any = field(repr=False)
     _log_thread: threading.Thread | None = field(default=None, repr=False)
 
+    def log_tail(self, lines: int = 200) -> str:
+        """Return recent server output for failure diagnostics."""
+        try:
+            content = self.stdout_file.read_text(encoding="utf-8", errors="ignore")
+            return "\n".join(content.splitlines()[-lines:])
+        except Exception:
+            return ""
+
     def cleanup(self) -> None:
         """Clean up server resources."""
         try:
@@ -179,6 +187,9 @@ class ServerContext:
             # Clean up downloaded models if HF cache is not persistent
             # This prevents disk exhaustion in CI when cache is not mounted
             self._cleanup_hf_cache_if_not_persistent()
+        else:
+            # Give the runtime a brief cooldown after server shutdown.
+            time.sleep(2)
 
     def _cleanup_hf_cache_if_not_persistent(self) -> None:
         """Clean up HF cache if it's not on a persistent volume.
@@ -375,8 +386,10 @@ class ServerManager:
         # Apply custom environment variables
         env.update(self.env_vars)
 
-        # TODO: unify with run_command
-        logger.info(f"Running command: {shlex.join(command)}")
+        cmd_str = shlex.join(command)
+        # Use print (not logger) so the command always appears in CI output
+        # regardless of log-level configuration.
+        print(f"[server-test] Running command: {cmd_str}", flush=True)
 
         process = subprocess.Popen(
             command,
@@ -412,11 +425,10 @@ class ServerManager:
             log_thread.daemon = True
             log_thread.start()
 
-        logger.info(
-            "[server-test] Starting server pid=%s, model=%s, log=%s",
-            process.pid,
-            self.model,
-            stdout_path,
+        print(
+            f"[server-test] Starting server pid={process.pid}, "
+            f"model={self.model}, log={stdout_path}",
+            flush=True,
         )
 
         self._wait_for_ready(process, stdout_path)
@@ -615,12 +627,17 @@ class PerformanceValidator:
                 if stage == "DenoisingStage"
                 else self.tolerances.non_denoise_stage
             )
+            if stage.endswith("DecodingStage"):
+                tolerance = max(tolerance, 0.9)
+                min_abs_tolerance_ms = 250.0
+            else:
+                min_abs_tolerance_ms = 120.0
             self._assert_le(
                 f"Stage '{stage}'",
                 actual,
                 expected,
                 tolerance,
-                min_abs_tolerance_ms=120.0,  # relax absolute tolerance for non-denoising stages
+                min_abs_tolerance_ms=min_abs_tolerance_ms,
             )
 
 

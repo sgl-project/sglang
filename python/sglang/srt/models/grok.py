@@ -983,6 +983,9 @@ def _prepare_presharded_weights(
     for pattern in allow_patterns:
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
 
+    if not hf_weights_files:
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
+
     if hf_weights_files[0].endswith("safetensors"):
         use_safetensors = True
     else:

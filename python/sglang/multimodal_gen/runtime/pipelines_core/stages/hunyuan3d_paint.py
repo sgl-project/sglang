@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
 
@@ -300,16 +301,26 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
                 local_path = None
 
         if local_path and os.path.exists(local_path):
+            # Resolve precision from config with a simple fallback for CPU/MPS
+            dit_dtype = PRECISION_TO_TYPE.get(
+                getattr(self.config, "dit_precision", "fp16"), torch.float16
+            )
+            if self.device.type in ("cpu", "mps") and dit_dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                # Avoid half/bfloat on CPU/MPS to be safe
+                dit_dtype = torch.float32
             pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
                 local_path,
-                torch_dtype=torch.float16,
+                torch_dtype=dit_dtype,
                 safety_checker=None,
             )
             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(
                 pipeline.scheduler.config
             )
             pipeline.set_progress_bar_config(disable=True)
-            self._delight_pipeline = pipeline.to(self.device, torch.float16)
+            self._delight_pipeline = pipeline.to(self.device, dit_dtype)
             logger.info("Delight model loaded successfully")
         else:
             logger.warning(
@@ -347,6 +358,7 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
 
         image = self._delight_pipeline(
             prompt=self.config.delight_prompt,
+            negative_prompt=getattr(self.config, "delight_negative_prompt", ""),
             image=image,
             generator=torch.manual_seed(42),
             height=512,
@@ -559,10 +571,28 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         else:
             raise FileNotFoundError(f"No VAE weights in {vae_dir}")
         self.vae.load_state_dict(state_dict)
-        self.vae = self.vae.to(device=self.device, dtype=torch.float16).eval()
+        # Resolve VAE/DiT dtypes from config with simple CPU/MPS fallback
+        vae_dtype = PRECISION_TO_TYPE.get(
+            getattr(self.config, "vae_precision", "fp32"), torch.float32
+        )
+        if self.device.type in ("cpu", "mps") and vae_dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            vae_dtype = torch.float32
+        dit_dtype = PRECISION_TO_TYPE.get(
+            getattr(self.config, "dit_precision", "fp16"), torch.float16
+        )
+        if self.device.type in ("cpu", "mps") and dit_dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            dit_dtype = torch.float32
+
+        self.vae = self.vae.to(device=self.device, dtype=vae_dtype).eval()
         self.transformer = UNet2p5DConditionModel.from_pretrained(
             os.path.join(local_path, "unet"),
-            torch_dtype=torch.float16,
+            torch_dtype=dit_dtype,
         ).to(self.device)
         self.is_turbo = bool(getattr(self.config, "paint_turbo_mode", False))
         sched_path = os.path.join(local_path, "scheduler", "scheduler_config.json")
@@ -775,16 +805,17 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
 
         prompt_embeds = self.transformer.learned_text_clip_gen.repeat(1, 1, 1)
         negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+        scheduler = self.scheduler
 
         if self.is_turbo:
             bsz = 3
             index = torch.arange(29, -1, -bsz, device=device).long()
             timesteps = self.solver.ddim_timesteps[index]
-            self.scheduler.set_timesteps(timesteps=timesteps.cpu(), device=device)
-            timesteps = self.scheduler.timesteps
+            scheduler.set_timesteps(timesteps=timesteps.cpu(), device=device)
+            timesteps = scheduler.timesteps
         else:
             timesteps, num_steps = retrieve_timesteps(
-                self.scheduler, num_steps, device, None, None
+                scheduler, num_steps, device, None, None
             )
 
         num_channels_latents = self.transformer.config.in_channels
@@ -797,9 +828,10 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         latents = randn_tensor(
             latent_shape, generator=generator, device=device, dtype=prompt_embeds.dtype
         )
-        latents = latents * self.scheduler.init_noise_sigma
+        latents = latents * scheduler.init_noise_sigma
 
         return {
+            "scheduler": scheduler,
             "timesteps": timesteps,
             "latents": latents,
             "prompt_embeds": prompt_embeds,
@@ -826,6 +858,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
         do_cfg: bool,
         generator: torch.Generator,
         num_channels_latents: int,
+        scheduler: Any,
     ) -> torch.Tensor:
         import inspect
 
@@ -833,9 +866,9 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
         extra_step_kwargs = {}
-        if "eta" in inspect.signature(self.scheduler.step).parameters:
+        if "eta" in inspect.signature(scheduler.step).parameters:
             extra_step_kwargs["eta"] = 0.0
-        if "generator" in inspect.signature(self.scheduler.step).parameters:
+        if "generator" in inspect.signature(scheduler.step).parameters:
             extra_step_kwargs["generator"] = generator
 
         for step_idx, t in enumerate(timesteps):
@@ -844,7 +877,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
             latent_model_input = rearrange(
                 latent_model_input, "b n c h w -> (b n) c h w"
             )
-            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+            latent_model_input = scheduler.scale_model_input(latent_model_input, t)
             latent_model_input = rearrange(
                 latent_model_input, "(b n) c h w -> b n c h w", n=num_in_batch
             )
@@ -872,7 +905,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
                     noise_pred_text - noise_pred_uncond
                 )
 
-            latents = self.scheduler.step(
+            latents = scheduler.step(
                 noise_pred,
                 t,
                 latents[:, :num_channels_latents, :, :],
@@ -915,6 +948,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
                     do_cfg=prepared["do_cfg"],
                     generator=prepared["generator"],
                     num_channels_latents=prepared["num_channels_latents"],
+                    scheduler=prepared["scheduler"],
                 )
 
                 multiview_textures = self._decode_latents(latents)

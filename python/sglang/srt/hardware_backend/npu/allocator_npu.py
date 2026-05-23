@@ -33,17 +33,21 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         extend_num_tokens: int,
+        num_new_pages: int = None,
     ):
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
             )
 
-        num_new_pages = (
-            (seq_lens + self.roundup) // self.page_size
-            - (prefix_lens + self.roundup) // self.page_size
-        ).sum()
-        num_new_pages_item = num_new_pages.item()
+        if num_new_pages is None:
+            num_new_pages_tensor = (
+                (seq_lens + self.roundup) // self.page_size
+                - (prefix_lens + self.roundup) // self.page_size
+            ).sum()
+            num_new_pages_item = num_new_pages_tensor.item()
+        else:
+            num_new_pages_item = num_new_pages
         if self.need_sort and num_new_pages_item > len(self.free_pages):
             self.merge_and_sort_free()
 
