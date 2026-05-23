@@ -159,8 +159,7 @@ struct PlanEntriesKernel {
     const bool has_swa_lut = full_to_swa_index_mapping.has_value();
     const int64_t* lut_ptr =
         has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
-    const int64_t lut_len =
-        has_swa_lut ? static_cast<int64_t>(full_to_swa_index_mapping.value().shape()[0]) : 0;
+    const int64_t lut_len = has_swa_lut ? static_cast<int64_t>(full_to_swa_index_mapping.value().shape()[0]) : 0;
 
     const PlanEntriesParams params = PlanEntriesParams{
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
