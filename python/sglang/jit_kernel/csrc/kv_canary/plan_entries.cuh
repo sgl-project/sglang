@@ -158,7 +158,7 @@ struct PlanEntriesKernel {
     using namespace host;
 
     SymbolicSize Nbs = {"bs_padded"};
-    SymbolicSize NbsP1 = {"bs_padded_plus_one"};
+    SymbolicSize Nscratch = {"verify_offsets_scratch_len"};
     SymbolicSize Ncap = {"verify_capacity"};
     SymbolicSize Nmax_reqs = {"max_reqs"};
     SymbolicSize Nmax_seq_len = {"max_seq_len"};
@@ -171,7 +171,7 @@ struct PlanEntriesKernel {
         .with_device<kDLCUDA>(device_)
         .verify(req_pool_indices)
         .verify(prefix_lens);
-    TensorMatcher({NbsP1})  //
+    TensorMatcher({Nscratch})  //
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device_)
         .verify(verify_offsets_scratch);
@@ -192,7 +192,8 @@ struct PlanEntriesKernel {
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
-    RuntimeCheck(NbsP1.unwrap() == Nbs.unwrap() + 1, "verify_offsets_scratch length must equal bs_padded + 1");
+    RuntimeCheck(
+        Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
 
     const int64_t bs_padded = Nbs.unwrap();
     if (bs_padded <= 0) {
