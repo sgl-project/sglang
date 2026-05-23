@@ -70,10 +70,24 @@ class CanaryViolationAssertMixin:
         ):
             return
         side_label = "" if side is None else f" on side={side}"
+        # DEBUG: dump both sides' buffer sizes and violation-line counts so we can tell whether
+        # the per-side capture is correctly routing canary violations.
+        debug_summary = ""
+        for dbg_side in ("prefill", "decode"):
+            try:
+                dbg_text = self._captured_log_text(dbg_side)
+                v_count = dbg_text.count("kv_canary violation:")
+                debug_summary += (
+                    f"  [debug] side={dbg_side} len={len(dbg_text)} "
+                    f"violation_lines={v_count}\n"
+                )
+            except Exception as exc:  # noqa: BLE001
+                debug_summary += f"  [debug] side={dbg_side} unavailable: {exc!r}\n"
         raise AssertionError(
             f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r}{side_label}. Log tail:\n"
-            f"{log_text[-2000:]}"
+            f"fail_reason={fail_reason!r}{side_label}.\n"
+            f"{debug_summary}"
+            f"Log tail:\n{log_text[-2000:]}"
         )
 
     def assert_no_violation(
