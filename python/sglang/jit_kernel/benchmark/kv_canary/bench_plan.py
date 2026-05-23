@@ -55,6 +55,43 @@ def _build_total_tokens_cases() -> list[_TotalTokensBenchCase]:
     return cases
 
 
+# Pool-capacity axis: production sets ``verify_capacity`` from the KV pool token
+# count (canary install path multiplies pool tokens by a small factor), so it is
+# unrelated to the per-request ``prefix_len``. ``_plan_entries_kernel``'s grid is
+# ``(bs, ceil(verify_capacity / 64))``; tiles past ``request_verify_len`` short-
+# circuit via the entry mask, but the program still launches and pays for the
+# scalar loads of ``verify_offsets[r]`` and ``verify_offsets[r+1]``. The other
+# benchmark axes couple capacity to ``bs * prefix_len`` and miss this regime.
+# Values picked to bracket a Qwen3-0.6B + H200 8 GB allocation, where the
+# install path produced ``verify_capacity = 1,398,028`` (pool = 1,026,076).
+_POOL_CAPACITY_VERIFY_CAP_AXIS: list[int] = [16384, 262144, 1398028]
+_POOL_CAPACITY_BS_AXIS: list[int] = [1, 4, 32]
+_POOL_CAPACITY_PREFIX_LEN: int = 512
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PoolCapacityBenchCase:
+    bs: int
+    prefix_len: int
+    verify_capacity: int
+    pool_kind: str
+
+
+def _build_pool_capacity_cases() -> list[_PoolCapacityBenchCase]:
+    cases: list[_PoolCapacityBenchCase] = []
+    for bs in _POOL_CAPACITY_BS_AXIS:
+        for verify_capacity in _POOL_CAPACITY_VERIFY_CAP_AXIS:
+            cases.append(
+                _PoolCapacityBenchCase(
+                    bs=bs,
+                    prefix_len=_POOL_CAPACITY_PREFIX_LEN,
+                    verify_capacity=verify_capacity,
+                    pool_kind="full",
+                )
+            )
+    return cases
+
+
 _X_NAMES_MATRIX = ["scenario", "bs", "prefix_len", "mode", "extend_len", "pool_kind"]
 
 
@@ -77,6 +114,12 @@ _X_VALS_MATRIX = _cases_to_matrix_x_vals(
 _X_NAMES_TT = ["bs", "total_tokens", "pool_kind"]
 _X_VALS_TT = [(c.bs, c.total_tokens, c.pool_kind) for c in _build_total_tokens_cases()]
 
+_X_NAMES_PC = ["bs", "prefix_len", "verify_capacity", "pool_kind"]
+_X_VALS_PC = [
+    (c.bs, c.prefix_len, c.verify_capacity, c.pool_kind)
+    for c in _build_pool_capacity_cases()
+]
+
 
 def _build_plan_inputs(
     *,
@@ -85,10 +128,14 @@ def _build_plan_inputs(
     extend_len: int,
     pool_kind: str,
     device: torch.device,
+    verify_capacity_override: Optional[int] = None,
 ) -> dict:
     swa_window_size = SWA_WINDOW if pool_kind == "swa_window_128" else 0
     verify_per_req = min(prefix_len, SWA_WINDOW) if swa_window_size > 0 else prefix_len
-    verify_capacity = max(1, bs * verify_per_req)
+    if verify_capacity_override is not None:
+        verify_capacity = max(1, verify_capacity_override)
+    else:
+        verify_capacity = max(1, bs * verify_per_req)
     write_req_capacity = max(1, bs)
 
     verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=device)
@@ -229,6 +276,49 @@ def benchmark_total_tokens(
     return run_benchmark(fn)
 
 
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=_X_NAMES_PC,
+        x_vals=_X_VALS_PC,
+        line_arg="provider",
+        line_vals=["canary", "naive"],
+        line_names=["canary_plan_step", "naive torch.cumsum"],
+        styles=[("blue", "-"), ("red", "--")],
+        ylabel="us",
+        plot_name="kv-canary-plan-pool-capacity-perf",
+        args={},
+    )
+)
+def benchmark_pool_capacity(
+    bs: int,
+    prefix_len: int,
+    verify_capacity: int,
+    pool_kind: str,
+    provider: str,
+) -> Tuple[float, float, float]:
+    """Measure the plan kernels when ``verify_capacity`` is decoupled from
+    ``bs * prefix_len`` and instead reflects the KV-pool-scaled capacity that
+    production installs. ``bs=1, prefix=512, verify_capacity=1398028, full``
+    reproduces the bs=1 decode regime that triggered the e2e bench_speed D-class
+    failure (~55 ms per plan step on H200).
+    """
+    device = torch.device(DEFAULT_DEVICE)
+    if provider == "canary":
+        inputs = _build_plan_inputs(
+            bs=bs,
+            prefix_len=prefix_len,
+            extend_len=1,
+            pool_kind=pool_kind,
+            device=device,
+            verify_capacity_override=verify_capacity,
+        )
+        fn = _make_plan_callable(inputs)
+    else:
+        fn = naive_cumsum_fn(bs=bs, device=device)
+    return run_benchmark(fn)
+
+
 if __name__ == "__main__":
     benchmark_matrix.run(print_data=True)
     benchmark_total_tokens.run(print_data=True)
+    benchmark_pool_capacity.run(print_data=True)
