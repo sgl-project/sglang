@@ -21,8 +21,8 @@ from sglang.test.test_utils import (
 
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
-# fixtures (gemma-3-1b sliding_window = 512); short prompts would never exercise
-# the SWA-windowed verify path. Token count is roughly 6k after BPE.
+# fixtures (gemma-4-E2B); short prompts would never exercise the SWA-windowed
+# verify path. Token count is roughly 6k after BPE.
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
@@ -73,7 +73,7 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
             # silently lose all violation signal. Size the pool to cover the worst
             # case sum_r prefix_lens across send_parallel_requests' default n=8 long
             # prompts (8 * ~7000 = ~56000, → pool >= ~47k). 65536 leaves headroom
-            # and still fits Qwen3-0.6B / gemma-3-1b KV cache on an H200.
+            # and still fits Qwen3-0.6B / gemma-4-E2B KV cache on an H200.
             extra_server_args=("--max-total-tokens", "65536", *cls.extra_server_args),
         )
         cls.process = popen_launch_server(

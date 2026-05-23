@@ -17,10 +17,11 @@ def build_canary_server_args(
     args = [
         "--kv-canary",
         kv_canary_mode.value,
-        # The shared _LONG_PROMPT_BODY tokenizes to ~7000 tokens for Qwen3 and ~7100
-        # for gemma-3-1b; combined with the 2048-token default max_new_tokens the
-        # per-request total reaches ~9050, so the context window must stay above
-        # that (was 8192 → caused 400 "exceeds max context length" rejects).
+        # The shared _LONG_PROMPT_BODY tokenizes to ~7000 tokens for Qwen3 and
+        # similar for gemma-4-E2B; combined with the 2048-token default
+        # max_new_tokens the per-request total reaches ~9050, so the context
+        # window must stay above that (was 8192 → caused 400 "exceeds max
+        # context length" rejects).
         "--context-length",
         "16384",
         *extra_server_args,
