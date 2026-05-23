@@ -209,6 +209,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.common import ceil_align, require_mlp_sync
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -2454,10 +2455,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         num_tokens = batch_size * num_tokens_per_bs
 
-        if require_gathered_buffer(self.server_args):
+        # Keep warmup aligned with scheduler MLP-sync padding.
+        if require_mlp_sync(self.server_args):
             attn_tp_size = get_attention_tp_size()
             if attn_tp_size > 1 and num_tokens % attn_tp_size != 0:
-                num_tokens = num_tokens // attn_tp_size * attn_tp_size
+                num_tokens = ceil_align(num_tokens, attn_tp_size)
                 batch_size = num_tokens // num_tokens_per_bs
 
         seq_len_fill_value = self.attn_backend.get_cuda_graph_seq_len_fill_value()

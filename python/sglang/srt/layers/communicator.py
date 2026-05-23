@@ -742,6 +742,11 @@ class LayerCommunicator:
             else 0
         )
 
+        # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
+        # all-reduce, so there is nothing to fuse with the next layer.
+        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+            return False
+
         return (
             (
                 apply_flashinfer_allreduce_fusion(batch_size)
