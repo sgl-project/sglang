@@ -10,6 +10,9 @@ from sglang.jit_kernel.kv_canary.consts import (
     REQ_POOL_IDX_PADDING,
     TOKEN_TO_KV_SLOT_PADDING,
 )
+from sglang.jit_kernel.kv_canary.plan.entries_kernel_cuda import (
+    launch_plan_entries_cuda,
+)
 from sglang.jit_kernel.kv_canary.plan.utils import (
     _compute_window_start,
     _require_2d,
@@ -65,27 +68,20 @@ def launch_plan_entries_kernel(
     if bs == 0 or verify_capacity == 0:
         return
 
-    max_verify_entry_tiles = (
-        verify_capacity + _PLAN_VERIFY_INNER_BLOCK - 1
-    ) // _PLAN_VERIFY_INNER_BLOCK
-    grid_entries = (bs, max_verify_entry_tiles)
-    _plan_entries_kernel[grid_entries](
-        req_pool_indices,
-        prefix_lens,
-        req_to_token,
-        lut_tensor,
-        verify_offsets_scratch,
-        out_verify_slot_indices,
-        out_verify_positions,
-        out_verify_prev_slot_indices,
-        req_to_token_stride0,
-        lut_len,
-        verify_capacity,
-        INNER_BLOCK=_PLAN_VERIFY_INNER_BLOCK,
-        SWA_WINDOW=int(swa_window_size),
-        HAS_SWA_LUT=has_swa_lut,
-        REQ_POOL_IDX_PADDING=REQ_POOL_IDX_PADDING,
-        TOKEN_TO_KV_SLOT_PADDING=TOKEN_TO_KV_SLOT_PADDING,
+    # Dispatch to the CUDA persistent kernel. The Triton kernel below is kept for reference / fallback;
+    # the CUDA path collapses the (bs, verify_capacity/INNER_BLOCK) Triton grid (89M programs for D-case)
+    # to a fixed persistent grid sized to ``num_sms * blocks_per_sm`` (~135K threads on H200), one
+    # thread per real verify entry.
+    launch_plan_entries_cuda(
+        req_pool_indices=req_pool_indices,
+        prefix_lens=prefix_lens,
+        req_to_token=req_to_token,
+        full_to_swa_index_mapping=full_to_swa_index_mapping,
+        verify_offsets_scratch=verify_offsets_scratch,
+        out_verify_slot_indices=out_verify_slot_indices,
+        out_verify_positions=out_verify_positions,
+        out_verify_prev_slot_indices=out_verify_prev_slot_indices,
+        swa_window_size=int(swa_window_size),
     )
 
 
