@@ -14,10 +14,11 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
+    import torch
+    from mlx_lm.models.cache import ArraysCache
+
     import mlx.core as mx
     import mlx.nn as nn
-    import torch
-
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,
@@ -359,6 +360,52 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(calls, [(2, [[20], [21]])])
         self.assertEqual(pending.lazy_tokens.tolist(), [4, 5])
+
+    def test_auxiliary_layer_batches_mergeable_native_cache(self):
+        runner = object.__new__(MlxModelRunner)
+        layer = FakeBatchableAuxiliaryLayer()
+        cache0 = ArraysCache(size=1)
+        cache1 = ArraysCache(size=1)
+
+        out = runner._decode_auxiliary_layer(
+            layer,
+            mx.zeros((2, 1, 4), dtype=mx.float32),
+            [cache0, cache1],
+        )
+        mx.eval(out, cache0[0], cache1[0])
+
+        self.assertEqual(layer.input_layernorm.seen_shapes, [(2, 1, 4)])
+        self.assertEqual(layer.linear_attn.seen_shapes, [(2, 1, 4)])
+        self.assertEqual(layer.post_attention_layernorm.seen_shapes, [(2, 1, 4)])
+        self.assertEqual(layer.mlp.seen_shapes, [(2, 1, 4)])
+        self.assertEqual(layer.linear_attn.cache_type, "ArraysCache")
+        self.assertEqual(
+            out.tolist(),
+            [[[2.0, 2.0, 2.0, 2.0]], [[2.0, 2.0, 2.0, 2.0]]],
+        )
+        self.assertEqual(cache0[0].tolist(), [[0.0]])
+        self.assertEqual(cache1[0].tolist(), [[1.0]])
+
+    def test_auxiliary_layer_split_back_copies_cache_metadata(self):
+        runner = object.__new__(MlxModelRunner)
+        layer = FakeBatchableAuxiliaryLayer()
+        cache0 = FakeMergeableAuxiliaryCache(tag="old0")
+        cache1 = FakeMergeableAuxiliaryCache(tag="old1")
+
+        out = runner._decode_auxiliary_layer(
+            layer,
+            mx.zeros((2, 1, 4), dtype=mx.float32),
+            [cache0, cache1],
+        )
+        mx.eval(out, cache0[0], cache1[0])
+
+        self.assertEqual(layer.linear_attn.cache_type, "FakeMergeableAuxiliaryCache")
+        self.assertEqual(cache0.tag, "split-0")
+        self.assertEqual(cache1.tag, "split-1")
+        self.assertEqual(cache0.extra_metadata, {"idx": 0})
+        self.assertEqual(cache1.extra_metadata, {"idx": 1})
+        self.assertEqual(cache0[0].tolist(), [[0.0]])
+        self.assertEqual(cache1[0].tolist(), [[1.0]])
 
     def test_auxiliary_state_prefill_restores_prefix_state(self):
         runner = object.__new__(MlxModelRunner)
@@ -882,6 +929,74 @@ if _HAS_MLX:
             self.q_norm = IdentityNorm()
             self.k_norm = IdentityNorm()
             self.rope = IdentityRope()
+
+    class RecordingIdentity(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_shapes = []
+
+        def __call__(self, x):
+            self.seen_shapes.append(x.shape)
+            return x
+
+    class FakeMergeableLinearAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen_shapes = []
+            self.cache_type = None
+
+        def __call__(self, x, mask=None, cache=None):
+            self.seen_shapes.append(x.shape)
+            self.cache_type = type(cache).__name__
+            cache[0] = mx.arange(x.shape[0], dtype=mx.float32).reshape(x.shape[0], 1)
+            return x + 1
+
+    class FakeBatchableAuxiliaryLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.is_linear = True
+            self.input_layernorm = RecordingIdentity()
+            self.linear_attn = FakeMergeableLinearAttention()
+            self.post_attention_layernorm = RecordingIdentity()
+            self.mlp = RecordingIdentity()
+
+    class FakeMergeableAuxiliaryCache:
+        def __init__(self, state=None, tag="init", extra_metadata=None):
+            self.cache = [state]
+            self.tag = tag
+            self.extra_metadata = extra_metadata or {}
+
+        def __getitem__(self, idx):
+            return self.cache[idx]
+
+        def __setitem__(self, idx, value):
+            self.cache[idx] = value
+
+        @classmethod
+        def merge(cls, caches):
+            merged = cls(tag="merged")
+            values = [cache[0] for cache in caches]
+            if all(value is None for value in values):
+                return merged
+            merged[0] = mx.concatenate(
+                [
+                    (
+                        value
+                        if value is not None
+                        else mx.zeros_like(next(v for v in values if v is not None))
+                    )
+                    for value in values
+                ],
+                axis=0,
+            )
+            return merged
+
+        def extract(self, idx):
+            return type(self)(
+                self.cache[0][idx : idx + 1],
+                tag=f"split-{idx}",
+                extra_metadata={"idx": idx},
+            )
 
     class FakeNativeCache:
         def __init__(self, value=None, meta_state=None):

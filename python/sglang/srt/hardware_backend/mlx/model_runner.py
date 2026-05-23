@@ -868,11 +868,12 @@ class MlxModelRunner:
         batched_input: mx.array,
         req_ids: list[str],
     ) -> mx.array:
-        """Layer-by-layer hybrid decode: batch attention, serialize DeltaNet.
+        """Layer-by-layer hybrid decode for attention plus auxiliary state.
 
         Attention layers run with batched hidden states via
-        ``BatchedDecodeContext``. Auxiliary (DeltaNet) layers run
-        per-request since their recurrent state is not batchable.
+        ``BatchedDecodeContext``. Auxiliary layers run batched when their
+        native cache implements mlx-lm's merge/extract protocol, otherwise
+        they fall back to per-request execution.
         """
         batch_size = len(caches)
 
@@ -894,28 +895,114 @@ class MlxModelRunner:
         seq_lens = ctx.seq_lens
         max_offset = max(seq_lens)
 
-        for layer_idx in range(self._cache_layout.num_layers):
-            layer = self._cache_layout.layers[layer_idx]
+        set_context(ctx)
+        try:
+            for layer_idx in range(self._cache_layout.num_layers):
+                layer = self._cache_layout.layers[layer_idx]
 
-            if self._cache_layout.attention_attrs[layer_idx] is not None:
-                set_context(ctx)
-                try:
+                if self._cache_layout.attention_attrs[layer_idx] is not None:
                     shim = AttentionOffsetCache(offset=max_offset)
                     hidden_states = layer(hidden_states, mask=None, cache=shim)
-                finally:
-                    clear_context()
-            else:
-                per_req = [hidden_states[i : i + 1] for i in range(batch_size)]
-                results = []
-                for i in range(batch_size):
-                    results.append(
-                        layer(per_req[i], mask=None, cache=caches[i][layer_idx])
+                else:
+                    layer_caches = [caches[i][layer_idx] for i in range(batch_size)]
+                    hidden_states = self._decode_auxiliary_layer(
+                        layer,
+                        hidden_states,
+                        layer_caches,
                     )
-                hidden_states = mx.concatenate(results, axis=0)
+        finally:
+            clear_context()
 
         hidden_states = self._model_norm(hidden_states)
         logits = self._extract_logits(self._model_lm_head(hidden_states))
         return mx.argmax(logits[:, -1, :], axis=-1)
+
+    def _decode_auxiliary_layer(
+        self,
+        layer: Any,
+        hidden_states: mx.array,
+        layer_caches: list[Any],
+    ) -> mx.array:
+        """Decode one auxiliary layer, batching when native cache supports it."""
+        if self._can_batch_auxiliary_layer(layer, layer_caches):
+            return self._decode_auxiliary_layer_batched(
+                layer,
+                hidden_states,
+                layer_caches,
+            )
+
+        results = []
+        for i, cache in enumerate(layer_caches):
+            results.append(layer(hidden_states[i : i + 1], mask=None, cache=cache))
+        return mx.concatenate(results, axis=0)
+
+    @staticmethod
+    def _can_batch_auxiliary_layer(layer: Any, layer_caches: list[Any]) -> bool:
+        """Return whether an auxiliary layer can run with merged cache state.
+
+        Qwen3.5/Qwen3-Next DeltaNet layers use the mlx-lm DecoderLayer shape
+        below with ``ArraysCache``. Its ``merge``/``extract`` helpers can batch
+        native state temporarily and split it back to per-request cache objects.
+        """
+        if not layer_caches:
+            return False
+        if not (
+            getattr(layer, "is_linear", False)
+            and hasattr(layer, "input_layernorm")
+            and hasattr(layer, "linear_attn")
+            and hasattr(layer, "post_attention_layernorm")
+            and hasattr(layer, "mlp")
+        ):
+            return False
+
+        cache_type = type(layer_caches[0])
+        if not callable(getattr(cache_type, "merge", None)) or not all(
+            isinstance(cache, cache_type) and callable(getattr(cache, "extract", None))
+            for cache in layer_caches
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _decode_auxiliary_layer_batched(
+        layer: Any,
+        hidden_states: mx.array,
+        layer_caches: list[Any],
+    ) -> mx.array:
+        residual = hidden_states
+        normed = layer.input_layernorm(hidden_states)
+
+        cache_type = type(layer_caches[0])
+        batched_cache = cache_type.merge(layer_caches)
+        mixed = layer.linear_attn(normed, mask=None, cache=batched_cache)
+
+        extract = getattr(batched_cache, "extract", None)
+        if not callable(extract):
+            raise RuntimeError(
+                f"{type(batched_cache).__name__}.merge() returned a cache "
+                "without extract(); cannot split auxiliary decode state"
+            )
+        for i, cache in enumerate(layer_caches):
+            split_cache = extract(i)
+            MlxModelRunner._replace_cache_contents(cache, split_cache)
+
+        hidden_states = residual + mixed
+        return hidden_states + layer.mlp(layer.post_attention_layernorm(hidden_states))
+
+    @staticmethod
+    def _replace_cache_contents(cache: Any, new_cache: Any) -> None:
+        """Replace cache contents while preserving the original cache object."""
+        if type(cache) is type(new_cache) and hasattr(cache, "__dict__"):
+            cache.__dict__.clear()
+            cache.__dict__.update(new_cache.__dict__)
+            return
+        if hasattr(cache, "state") and hasattr(new_cache, "state"):
+            cache.state = new_cache.state
+            return
+        raise RuntimeError(
+            f"Cannot copy {type(new_cache).__name__} state into "
+            f"{type(cache).__name__}"
+        )
 
     def _decode_with_native_cache(
         self,
