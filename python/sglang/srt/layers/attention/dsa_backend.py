@@ -821,19 +821,21 @@ class DeepseekSparseAttnBackend(
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _build_forward_metadata_cuda_graph(
         self,
         bs: int,
         num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
+        seq_lens_cpu: Optional[torch.Tensor],
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        out_cache_loc: Optional[torch.Tensor] = None,
+        actual_forward_mode: Optional["ForwardMode"] = None,
     ):
+        """Create and store DSAMetadata for a new batch size during CUDA graph capture."""
         self.set_dsa_prefill_impl(forward_batch=None)
 
-        """Initialize forward metadata for capturing CUDA graph."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             # Get sequence information
@@ -977,6 +979,28 @@ class DeepseekSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -992,6 +1016,20 @@ class DeepseekSparseAttnBackend(
     ):
         """Initialize forward metadata for replaying CUDA graph."""
         assert seq_lens_cpu is not None
+
+        if bs not in self.decode_cuda_graph_metadata:
+            self._build_forward_metadata_cuda_graph(
+                bs,
+                None,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_cpu,
+                forward_mode,
+                spec_info,
+                out_cache_loc,
+                actual_forward_mode,
+            )
+            return
 
         self.set_dsa_prefill_impl(forward_batch=None)
 
