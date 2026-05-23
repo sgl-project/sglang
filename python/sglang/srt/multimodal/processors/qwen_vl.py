@@ -559,7 +559,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         input_ids = input_ids.flatten()
         base_input_ids = getattr(base_output, "input_ids", None)
-        if isinstance(base_input_ids, list) and len(base_input_ids) == input_ids.numel():
+        if (
+            isinstance(base_input_ids, list)
+            and len(base_input_ids) == input_ids.numel()
+        ):
             input_ids_list = base_input_ids
         else:
             input_ids_list = input_ids.tolist()
