@@ -108,13 +108,8 @@ class SWAKVPool(BaseSWAKVPool):
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
 
-    def register_mapping(
-        self,
-        full_to_swa_index_mapping: torch.Tensor,
-        full_to_swa_canary_mapping: Optional[torch.Tensor] = None,
-    ):
+    def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
-        self.full_to_swa_canary_mapping = full_to_swa_canary_mapping
         self.invalidate_loc_cache()
 
     def invalidate_loc_cache(self) -> None:
@@ -407,10 +402,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         self._kvcache = kvcache
         self.clear()
-        self._kvcache.register_mapping(
-            self.full_to_swa_index_mapping,
-            self.full_to_swa_canary_mapping,
-        )
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+        # Side-channel canary attribute, set directly to avoid extending the
+        # register_mapping ABI across all KV pool subclasses (DSv4, hisparse, ...).
+        self._kvcache.full_to_swa_canary_mapping = self.full_to_swa_canary_mapping
 
     def available_size(self):
         return min(

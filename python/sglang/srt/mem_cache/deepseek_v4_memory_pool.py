@@ -504,8 +504,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None
+        out = self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+        # CANARY observer (debug): async GPU assert when forward reads a slot that
+        # schedule had just freed. See swa_memory_pool._SWA_CANARY_FREED_SENTINEL.
+        canary = getattr(self, "full_to_swa_canary_mapping", None)
+        if canary is not None:
+            from sglang.srt.mem_cache.swa_memory_pool import _SWA_CANARY_FREED_SENTINEL
 
-        return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
+            canary_at_read = canary[kv_indices]
+            torch._assert_async(
+                (canary_at_read != _SWA_CANARY_FREED_SENTINEL).all(),
+                "SWA mapping race: forward read a slot that schedule freed",
+            )
+        return out
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
