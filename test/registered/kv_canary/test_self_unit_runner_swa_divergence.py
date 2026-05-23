@@ -72,12 +72,17 @@ def _make_forward_batch(
 
 
 def _patch_future_tensor():
+    def _stage(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        return value
+
     def _fake_device_to_host(src_device, *, d2h_stream=None) -> _RecordingFuture:
         if isinstance(src_device, dict):
             return _RecordingFuture(
-                value={k: v.detach().cpu().clone() for k, v in src_device.items()}
+                value={k: _stage(v) for k, v in src_device.items()}
             )
-        return _RecordingFuture(value=src_device.detach().cpu().clone())
+        return _RecordingFuture(value=_stage(src_device))
 
     return patch.object(
         future_tensor_module.FutureTensors, "device_to_host", _fake_device_to_host
