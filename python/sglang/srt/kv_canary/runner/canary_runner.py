@@ -66,7 +66,7 @@ class CanaryRunner:
         self._swa_window_size = swa_window_size
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
-        self._active_with_kernels_outside_cuda_graph: bool = False
+        self._active_with_kernels_outside_graph: bool = False
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -182,15 +182,15 @@ class CanaryRunner:
         self._perturb_manager.attach_radix_cache(radix_cache)
 
     @contextlib.contextmanager
-    def with_kernels_outside_cuda_graph(
+    def with_kernels_outside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> Iterator[None]:
         """Launch the outside-cuda-graph kernels around a body that runs the
         cuda-graph capture / replay region.
 
-        Fires :meth:`PerForwardOrchestrator.pre_kernels_outside_cuda_graph`
+        Fires :meth:`PerForwardOrchestrator.pre_kernels_outside_graph`
         before the body and
-        :meth:`PerForwardOrchestrator.post_kernels_outside_cuda_graph` after.
+        :meth:`PerForwardOrchestrator.post_kernels_outside_graph` after.
         The body itself contains 1 inner forward (target case, cuda graph
         captures only ``model.forward``) or N inner forwards (EAGLE draft
         case, the body runs the multi-step draft cuda graph). Per-step
@@ -201,11 +201,11 @@ class CanaryRunner:
         Caller examples::
 
             # Target ModelRunner.forward — body runs one model.forward, captured.
-            with canary_runner.with_kernels_outside_cuda_graph(forward_batch):
+            with canary_runner.with_kernels_outside_graph(forward_batch):
                 output = self._forward_raw(...)
 
             # EAGLE draft worker — body runs the multi-step draft cuda graph.
-            with draft_runner.canary_runner.with_kernels_outside_cuda_graph(
+            with draft_runner.canary_runner.with_kernels_outside_graph(
                 forward_batch
             ):
                 self.cuda_graph_runner.replay(forward_batch)
@@ -215,20 +215,20 @@ class CanaryRunner:
         ``is_draft_worker`` and wraps the draft entry instead, so the outer
         cycle stays unique."""
         assert (
-            not self._active_with_kernels_outside_cuda_graph
-        ), "CanaryRunner.with_kernels_outside_cuda_graph cannot be re-entered"
-        self._active_with_kernels_outside_cuda_graph = True
-        self._pre_kernels_outside_cuda_graph(forward_batch)
+            not self._active_with_kernels_outside_graph
+        ), "CanaryRunner.with_kernels_outside_graph cannot be re-entered"
+        self._active_with_kernels_outside_graph = True
+        self._pre_kernels_outside_graph(forward_batch)
         try:
             yield
         finally:
             try:
-                self._post_kernels_outside_cuda_graph(forward_batch)
+                self._post_kernels_outside_graph(forward_batch)
             finally:
-                self._active_with_kernels_outside_cuda_graph = False
+                self._active_with_kernels_outside_graph = False
 
-    def _pre_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
-        self._per_forward_orchestrator.pre_kernels_outside_cuda_graph(forward_batch)
+    def _pre_kernels_outside_graph(self, forward_batch: "ForwardBatch") -> None:
+        self._per_forward_orchestrator.pre_kernels_outside_graph(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """Per-step PlanInput fill + plan sub-kernels + HEAD endpoint launches.
@@ -242,11 +242,11 @@ class CanaryRunner:
         forward."""
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def _post_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
+    def _post_kernels_outside_graph(self, forward_batch: "ForwardBatch") -> None:
         if self.config.mode == "off":
             return
 
-        self._per_forward_orchestrator.post_kernels_outside_cuda_graph(forward_batch)
+        self._per_forward_orchestrator.post_kernels_outside_graph(forward_batch)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()

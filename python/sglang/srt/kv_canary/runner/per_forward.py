@@ -38,10 +38,10 @@ class _CanaryPerForwardPhase(IntEnum):
     Enforced order::
 
         IDLE
-          -> AFTER_PRE     (PerForwardOrchestrator.pre_kernels_outside_cuda_graph)
+          -> AFTER_PRE     (PerForwardOrchestrator.pre_kernels_outside_graph)
           -> AFTER_HEAD_KERNELS    (PerForwardOrchestrator.launch_head_kernels)
           -> AFTER_TAIL_KERNELS    (PerForwardOrchestrator.launch_tail_kernels)
-          -> IDLE          (PerForwardOrchestrator.post_kernels_outside_cuda_graph)
+          -> IDLE          (PerForwardOrchestrator.post_kernels_outside_graph)
     """
 
     IDLE = 0
@@ -53,7 +53,7 @@ class _CanaryPerForwardPhase(IntEnum):
 class PerForwardOrchestrator:
     """One canary cycle = pre -> head -> tail -> post.
 
-    - ``pre_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE
+    - ``pre_kernels_outside_graph(forward_batch)`` runs HOST-SIDE OUTSIDE
       any cuda-graph capture: capacity checks, perturb hooks, fill the static
       expected_input buffers.
     - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region
@@ -63,7 +63,7 @@ class PerForwardOrchestrator:
     - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region
       (called after the original forward): TAIL endpoint launches reusing
       the plan staged in launch_head_kernels.
-    - ``post_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE
+    - ``post_kernels_outside_graph(forward_batch)`` runs HOST-SIDE
       OUTSIDE any cuda-graph capture: perturb end-of-forward, enable-warner
       tick.
     """
@@ -134,14 +134,14 @@ class PerForwardOrchestrator:
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
 
-    def pre_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
+    def pre_kernels_outside_graph(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.IDLE,
             next_phase=_CanaryPerForwardPhase.AFTER_PRE,
-            caller_name="PerForwardOrchestrator.pre_kernels_outside_cuda_graph",
+            caller_name="PerForwardOrchestrator.pre_kernels_outside_graph",
         )
 
         bs = int(forward_batch.batch_size)
@@ -254,14 +254,14 @@ class PerForwardOrchestrator:
                 input_check_mode=input_check_mode,
             )
 
-    def post_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
+    def post_kernels_outside_graph(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
             next_phase=_CanaryPerForwardPhase.IDLE,
-            caller_name="PerForwardOrchestrator.post_kernels_outside_cuda_graph",
+            caller_name="PerForwardOrchestrator.post_kernels_outside_graph",
         )
 
         self._perturb_manager.end_of_forward(forward_batch)

@@ -3170,7 +3170,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         canary_ctx = (
-            c.with_kernels_outside_cuda_graph(forward_batch)
+            c.with_kernels_outside_graph(forward_batch)
             if (c := self.canary_runner) is not None and not self.is_draft_worker
             else contextlib.nullcontext()
         )
