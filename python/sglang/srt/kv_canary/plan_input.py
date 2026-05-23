@@ -105,18 +105,14 @@ def _extract_prefix_lens_and_extend_seq_lens(
         # Evidence: ForwardBatch.init_new leaves extend_* fields unset for decode/idle, while
         # attention backends treat decode as one query token whose cache length is seq_lens.
         # Therefore the covered span is prefix seq_lens - 1 plus one extend token.
-        # ``copy_`` does its own dtype conversion in-place, so we pass a same-dtype slice
-        # plus an in-place subtract-one to avoid the capture-unsafe temporary that
-        # ``(t - 1).to(int64)`` would allocate.
-        out_prefix_lens.copy_(forward_batch.seq_lens[:bs])
-        out_prefix_lens.sub_(1)
+        out_prefix_lens.copy_((forward_batch.seq_lens[:bs] - 1).to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
         # Evidence: EagleVerifyInputV2Mixin.prepare_for_v2_verify assigns out_cache_loc in
         # [seq_lens, seq_lens + draft_token_num) without bumping seq_lens. The target-verify
         # branch in TRTLLMHAAttnBackend.init_forward_metadata uses seq_lens as the prefix and
         # tokens_per_req as the query length, so mirror that as seq_lens plus draft_token_num.
-        out_prefix_lens.copy_(forward_batch.seq_lens[:bs])
+        out_prefix_lens.copy_(forward_batch.seq_lens[:bs].to(torch.int64))
         out_extend_seq_lens.fill_(int(spec_info.draft_token_num))
     elif forward_mode.is_draft_extend_v2():
         # Evidence: EagleDraftInputV2Mixin.prepare_for_extend_to_fill_draft_kvcache bumps
@@ -124,15 +120,17 @@ def _extract_prefix_lens_and_extend_seq_lens(
         # draft-extend-v2 query length from spec_info.extend_seq_lens_tensor when available.
         # CUDA-graph replay passes extend_seq_lens but omits extend_prefix_lens, so derive the
         # prefix as seq_lens - extend_seq_lens.
-        out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs])
-        out_prefix_lens.copy_(forward_batch.seq_lens[:bs])
-        out_prefix_lens.sub_(out_extend_seq_lens)
+        extend_seq_lens = forward_batch.extend_seq_lens[:bs].to(torch.int64)
+        out_extend_seq_lens.copy_(extend_seq_lens)
+        out_prefix_lens.copy_(
+            forward_batch.seq_lens[:bs].to(torch.int64) - extend_seq_lens
+        )
     elif forward_mode.is_extend():
         # Evidence: ForwardBatch.init_new copies batch.prefix_lens and batch.extend_lens into
         # extend_prefix_lens / extend_seq_lens for non-decode, non-idle modes, matching regular
         # extend metadata builders that consume those tensors directly.
-        out_prefix_lens.copy_(forward_batch.extend_prefix_lens[:bs])
-        out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs])
+        out_prefix_lens.copy_(forward_batch.extend_prefix_lens[:bs].to(torch.int64))
+        out_extend_seq_lens.copy_(forward_batch.extend_seq_lens[:bs].to(torch.int64))
     else:
         raise NotImplementedError(
             f"Unsupported forward mode for kv-canary: {forward_mode}"
