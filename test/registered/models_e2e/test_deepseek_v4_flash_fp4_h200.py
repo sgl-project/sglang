@@ -131,8 +131,12 @@ class TestDSV4FlashFP4H200FlashInferCutlass(
             kill_process_tree(cls.process.pid)
 
 
-class TestDSV4FlashFP4NonMTPH200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4NonMTPH200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
     """LowLatency recipe without MTP: TP=4, Marlin FP4, no speculative decoding."""
+
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
@@ -157,20 +161,6 @@ class TestDSV4FlashFP4NonMTPH200(ServerSanityMixin, CustomTestCase):
     def tearDownClass(cls):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
-
-    def test_gsm8k(self):
-        args = SimpleNamespace(
-            base_url=self.base_url,
-            model=self.model,
-            eval_name="gsm8k",
-            api="completion",
-            max_tokens=512,
-            num_examples=200,
-            num_threads=128,
-        )
-        metrics = run_eval(args)
-        print(f"[DSV4 Flash FP4 NonMTP H200] GSM8K {metrics=}")
-        self.assertGreater(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":

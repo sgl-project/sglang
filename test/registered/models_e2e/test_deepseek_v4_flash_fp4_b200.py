@@ -100,6 +100,14 @@ class TestDSV4FlashFP4B200Balanced(
                 "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
+                "--speculative-algorithm",
+                "EAGLE",
+                "--speculative-num-steps",
+                "1",
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                "2",
                 "--deepep-config",
                 DEEPEP_CONFIG,
             ],
@@ -111,12 +119,13 @@ class TestDSV4FlashFP4B200Balanced(
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_gsm8k(self):
-        _gsm8k_check(self)
 
-
-class TestDSV4FlashFP4NonMTPB200(ServerSanityMixin, CustomTestCase):
+class TestDSV4FlashFP4NonMTPB200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
     """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
+
+    gsm8k_accuracy_thres = 0.93
 
     @classmethod
     def setUpClass(cls):
