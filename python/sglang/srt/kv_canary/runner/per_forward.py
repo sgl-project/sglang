@@ -36,17 +36,17 @@ class _CanaryPerForwardPhase(IntEnum):
     One outer cycle may contain 1 inner forward (target) or N inner forwards
     (EAGLE draft). Inside the cycle, each inner forward is one head/tail pair.
     ``launch_tail_kernels`` cycles the phase back to ``AWAITING_HEAD`` so the
-    next inner head can fire; ``outer_post_kernels`` then returns the phase to
+    next inner head can fire; ``post_kernels_outside_cuda_graph`` then returns the phase to
     ``IDLE`` after the last tail.
 
     Enforced order::
 
         IDLE
-          -> AWAITING_HEAD     (PerForwardOrchestrator.outer_pre_kernels)
+          -> AWAITING_HEAD     (PerForwardOrchestrator.pre_kernels_outside_cuda_graph)
           -> AWAITING_TAIL     (PerForwardOrchestrator.launch_head_kernels)
           -> AWAITING_HEAD     (PerForwardOrchestrator.launch_tail_kernels)
           -> ... AWAITING_HEAD <-> AWAITING_TAIL repeats N-1 more times ...
-          -> IDLE              (PerForwardOrchestrator.outer_post_kernels)
+          -> IDLE              (PerForwardOrchestrator.post_kernels_outside_cuda_graph)
     """
 
     IDLE = 0
@@ -59,7 +59,7 @@ class PerForwardOrchestrator:
     cuda-graph boundary. "Outer" means the outermost cuda-graph boundary
     around the run, NOT a literal "per inner ``model.forward``":
 
-    - ``outer_pre_kernels(forward_batch)`` runs HOST-SIDE OUTSIDE the captured
+    - ``pre_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE the captured
       region (called once per outer cycle): capacity checks, perturb hooks,
       fill the static expected_input buffers.
     - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region,
@@ -69,7 +69,7 @@ class PerForwardOrchestrator:
     - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region,
       once per inner forward (called after the original forward): TAIL
       endpoint launches reusing the plan staged in launch_head_kernels.
-    - ``outer_post_kernels(forward_batch)`` runs HOST-SIDE OUTSIDE the
+    - ``post_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE the
       captured region (called once per outer cycle): perturb end-of-forward,
       enable-warner tick.
     """
@@ -140,14 +140,14 @@ class PerForwardOrchestrator:
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
 
-    def outer_pre_kernels(self, forward_batch: "ForwardBatch") -> None:
+    def pre_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.IDLE,
             next_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
-            caller_name="PerForwardOrchestrator.outer_pre_kernels",
+            caller_name="PerForwardOrchestrator.pre_kernels_outside_cuda_graph",
         )
 
         bs = int(forward_batch.batch_size)
@@ -265,14 +265,14 @@ class PerForwardOrchestrator:
                 input_check_mode=input_check_mode,
             )
 
-    def outer_post_kernels(self, forward_batch: "ForwardBatch") -> None:
+    def post_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
             next_phase=_CanaryPerForwardPhase.IDLE,
-            caller_name="PerForwardOrchestrator.outer_post_kernels",
+            caller_name="PerForwardOrchestrator.post_kernels_outside_cuda_graph",
         )
 
         self._perturb_manager.end_of_forward(forward_batch)

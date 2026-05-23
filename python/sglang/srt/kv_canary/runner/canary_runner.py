@@ -212,17 +212,17 @@ class CanaryRunner:
             not self._in_forward_pass
         ), "CanaryRunner.with_forward_pass cannot be re-entered"
         self._in_forward_pass = True
-        self._outer_pre_kernels(forward_batch)
+        self._pre_kernels_outside_cuda_graph(forward_batch)
         try:
             yield
         finally:
             try:
-                self._outer_post_kernels(forward_batch)
+                self._post_kernels_outside_cuda_graph(forward_batch)
             finally:
                 self._in_forward_pass = False
 
-    def _outer_pre_kernels(self, forward_batch: "ForwardBatch") -> None:
-        self._per_forward_orchestrator.outer_pre_kernels(forward_batch)
+    def _pre_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
+        self._per_forward_orchestrator.pre_kernels_outside_cuda_graph(forward_batch)
 
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         """Per-step PlanInput fill + plan sub-kernels + HEAD endpoint launches.
@@ -236,11 +236,11 @@ class CanaryRunner:
         forward."""
         self._per_forward_orchestrator.launch_tail_kernels(forward_batch)
 
-    def _outer_post_kernels(self, forward_batch: "ForwardBatch") -> None:
+    def _post_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
         if self.config.mode == "off":
             return
 
-        self._per_forward_orchestrator.outer_post_kernels(forward_batch)
+        self._per_forward_orchestrator.post_kernels_outside_cuda_graph(forward_batch)
         self._sweep_orchestrator.maybe_run_sweep()
         self._step_counter += 1
         self._violation_manager.step()
