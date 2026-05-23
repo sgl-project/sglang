@@ -460,7 +460,11 @@ DataEmbeddingFunc = Callable[
 
 
 def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """qwen-vl visual forward already moves batched features to the target device."""
+    """qwen-vl visual forward already moves batched features to the target device.
+
+    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
+    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
+    """
     owner = getattr(data_embedding_func, "__self__", None)
     if owner is None:
         return False
