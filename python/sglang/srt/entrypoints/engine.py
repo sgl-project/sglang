@@ -87,9 +87,9 @@ from sglang.srt.managers.multi_tokenizer_mixin import (
 )
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
 from sglang.srt.parser.template_manager import TemplateManager
-from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
