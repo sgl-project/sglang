@@ -39,15 +39,15 @@ class _CanaryPerForwardPhase(IntEnum):
 
         IDLE
           -> AFTER_PRE     (PerForwardOrchestrator.pre_kernels_outside_cuda_graph)
-          -> AFTER_HEAD    (PerForwardOrchestrator.launch_head_kernels)
-          -> AFTER_TAIL    (PerForwardOrchestrator.launch_tail_kernels)
+          -> AFTER_HEAD_KERNELS    (PerForwardOrchestrator.launch_head_kernels)
+          -> AFTER_TAIL_KERNELS    (PerForwardOrchestrator.launch_tail_kernels)
           -> IDLE          (PerForwardOrchestrator.post_kernels_outside_cuda_graph)
     """
 
     IDLE = 0
     AFTER_PRE = 1
-    AFTER_HEAD = 2
-    AFTER_TAIL = 3
+    AFTER_HEAD_KERNELS = 2
+    AFTER_TAIL_KERNELS = 3
 
 
 class PerForwardOrchestrator:
@@ -181,7 +181,7 @@ class PerForwardOrchestrator:
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AFTER_PRE,
-            next_phase=_CanaryPerForwardPhase.AFTER_HEAD,
+            next_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
             caller_name="PerForwardOrchestrator.launch_head_kernels",
         )
 
@@ -231,8 +231,8 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AFTER_HEAD,
-            next_phase=_CanaryPerForwardPhase.AFTER_TAIL,
+            expect_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            next_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
             caller_name="PerForwardOrchestrator.launch_tail_kernels",
         )
 
@@ -262,7 +262,7 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AFTER_TAIL,
+            expect_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
             next_phase=_CanaryPerForwardPhase.IDLE,
             caller_name="PerForwardOrchestrator.post_kernels_outside_cuda_graph",
         )
