@@ -137,10 +137,10 @@ class TestPickTargetGroup(CustomTestCase):
 
 
 class TestPerturbManager(CustomTestCase):
-    def test_perturb_manager_end_of_forward_dispatches_real_kv_post_forward(
+    def test_perturb_manager_consume_snapshot_dispatches_real_kv_post_forward(
         self,
     ) -> None:
-        """Verify end_of_forward() routes only to perturb_real_kv_post_forward."""
+        """Verify consume_snapshot() routes only to the post_forward-from-snapshot dispatch."""
         device = DEFAULT_DEVICE
         manager = PerturbManager(
             config=PerturbConfig(
@@ -155,13 +155,22 @@ class TestPerturbManager(CustomTestCase):
             buffer_groups=(),
             step_counter_getter=lambda: 10,
         )
-        forward_batch = make_forward_batch(device)
+        # Build a minimal snapshot-shaped namespace so the dispatch fires
+        # without needing the full SingleForwardManager allocation path.
+        snapshot = cast(
+            "object",
+            type(
+                "FakeSnapshot",
+                (),
+                {"out_cache_loc": torch.zeros(1, dtype=torch.int64, device=device)},
+            )(),
+        )
         calls: list[str] = []
 
         with patch.object(
             manager,
-            "perturb_real_kv_post_forward",
-            lambda batch: calls.append("real_kv_post_forward"),
+            "perturb_real_kv_post_forward_from_snapshot",
+            lambda snap: calls.append("real_kv_post_forward"),
         ), patch.object(
             manager,
             "perturb_req_to_token",
@@ -175,7 +184,7 @@ class TestPerturbManager(CustomTestCase):
             "perturb_real_kv_unused_cache",
             lambda batch: calls.append("real_kv_unused_cache"),
         ):
-            manager.end_of_forward(forward_batch)
+            manager.consume_snapshot(snapshot=snapshot)
 
         self.assertEqual(calls, ["real_kv_post_forward"])
 
@@ -398,7 +407,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             "_pick_sweep_slot_for_group",
             return_value=3,
         ):
-            manager.perturb(forward_batch)
+            manager.perturb(maybe_non_mature_forward_batch=forward_batch)
 
         self.assertTrue(torch.equal(pool.req_to_token, pool_snapshot))
         self.assertTrue(torch.equal(source.tensor, source_snapshot))
