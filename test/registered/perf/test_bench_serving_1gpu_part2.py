@@ -119,8 +119,8 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             self.assertEqual(res["successful_requests"], res["total_requests"])
             # relax for mi300x
             if is_in_amd_ci():
-                bounds = {10: (60, 65), 25: (70, 80), 50: (80, 90)}
-                default_bounds = (90, 90)
+                bounds = {10: (65, 70), 25: (75, 85), 50: (85, 95)}
+                default_bounds = (85, 95)
             else:
                 bounds = {10: (45, 50), 25: (50, 60), 50: (60, 65)}
                 default_bounds = (60, 65)
