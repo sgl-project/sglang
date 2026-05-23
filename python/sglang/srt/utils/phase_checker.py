@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from enum import IntEnum
 
 import torch
@@ -49,10 +51,20 @@ class SimplePhaseChecker:
     def __init__(self, *, initial_phase: int | IntEnum, device: torch.device) -> None:
         self._phase = torch.tensor(int(initial_phase), dtype=torch.int32, device=device)
         self._caller_tag_registry: dict[str, int] = {}
+        self._suspended: bool = False
         _host_debug(
             f"[SimplePhaseChecker.__init__] device={device} "
             f"initial_phase={_phase_repr(initial_phase)}"
         )
+
+    @contextlib.contextmanager
+    def suspend(self) -> Iterator[None]:
+        prev = self._suspended
+        self._suspended = True
+        try:
+            yield
+        finally:
+            self._suspended = prev
 
     def _resolve_caller_tag(self, caller_name: str) -> int:
         registry = self._caller_tag_registry
@@ -71,6 +83,8 @@ class SimplePhaseChecker:
         next_phase: int | IntEnum,
         caller_name: str = "",
     ) -> None:
+        if self._suspended:
+            return
         caller_tag = self._resolve_caller_tag(caller_name)
         _host_debug(
             f"[SimplePhaseChecker.update] caller={caller_name!r} "

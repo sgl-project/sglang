@@ -124,6 +124,10 @@ class PerForwardOrchestrator:
             initial_phase=_CanaryPerForwardPhase.IDLE, device=device
         )
 
+    @property
+    def phase_checker(self) -> SimplePhaseChecker:
+        return self._phase_checker
+
     def before_forward(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return

@@ -66,7 +66,6 @@ class CanaryRunner:
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
         self._in_forward_pass: bool = False
-        self._per_forward_suspended: bool = False
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -164,25 +163,13 @@ class CanaryRunner:
     def active_tag_count(self) -> int:
         return len(self._active_tags)
 
-    @property
-    def per_forward_suspended(self) -> bool:
-        return self._per_forward_suspended
+    def suspend_per_forward(self) -> contextlib.AbstractContextManager[None]:
+        """Suspend the per-forward phase-checker assertion for the duration of the block.
 
-    @contextlib.contextmanager
-    def suspend_per_forward(self) -> Iterator[None]:
-        """Suspend the per-forward canary kernels (head/tail) for the duration of the block.
-
-        Used to skip canary work during cuda-graph warmup, where ``model.forward`` is
-        called directly (bypassing ``ModelRunner.forward``'s canary_ctx) so
-        ``before_forward`` / ``end_of_step`` never fire. Without suspension the
-        monkey-patched ``model.forward`` would still launch head/tail kernels and the
-        phase-checker would observe a broken lifecycle (head with phase=IDLE)."""
-        prev = self._per_forward_suspended
-        self._per_forward_suspended = True
-        try:
-            yield
-        finally:
-            self._per_forward_suspended = prev
+        Head/tail kernels still fire (they MUST be captured into cuda graphs); only the
+        phase_checker.update() calls inside the orchestrator become no-ops, so the
+        broken-lifecycle assertion during cuda-graph warmup / capture does not raise."""
+        return self._per_forward_orchestrator.phase_checker.suspend()
 
     def _get_step_counter(self) -> int:
         return self._step_counter

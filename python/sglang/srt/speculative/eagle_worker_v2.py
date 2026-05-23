@@ -354,14 +354,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        # ModelRunner.forward skips its own canary wrapper when is_draft_worker
-        # is True (otherwise the wrapper's host-syncing _end_of_step lands inside
-        # the EAGLEDraftCudaGraphRunner capture region and trips
-        # cudaErrorStreamCaptureUnsupported). Wrap here so the canary
-        # _end_of_step runs *outside* cuda graph capture/replay.
         canary_ctx = (
-            self.draft_runner.canary_runner.with_forward_pass(forward_batch)
-            if self.draft_runner.canary_runner is not None
+            c.with_forward_pass(forward_batch)
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
         with canary_ctx:
@@ -579,11 +574,9 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        # See draft() above for why the canary wrapper sits here, not inside
-        # ModelRunner.forward.
         canary_ctx = (
-            self.draft_runner.canary_runner.with_forward_pass(forward_batch)
-            if self.draft_runner.canary_runner is not None
+            c.with_forward_pass(forward_batch)
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
         with canary_ctx:
@@ -640,11 +633,9 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
-        # See draft() above for why the canary wrapper sits here, not inside
-        # ModelRunner.forward.
         canary_ctx = (
-            self.draft_runner.canary_runner.with_forward_pass(forward_batch)
-            if self.draft_runner.canary_runner is not None
+            c.with_forward_pass(forward_batch)
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
         with canary_ctx:

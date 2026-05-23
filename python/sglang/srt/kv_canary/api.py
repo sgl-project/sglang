@@ -78,9 +78,6 @@ def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
-        if runner.per_forward_suspended:
-            return original(*args, **kwargs)
-
         runner.launch_head_kernels(forward_batch)
         output = original(*args, **kwargs)
         runner.launch_tail_kernels(forward_batch)

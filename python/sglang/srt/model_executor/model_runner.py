@@ -3166,15 +3166,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        # EAGLE draft runs forward inside a cuda-graph capture region
-        # (EAGLEDraftCudaGraphRunner captures ModelRunner.forward). Canary's
-        # _end_of_step does host syncs (event.synchronize()) which crash with
-        # cudaErrorStreamCaptureUnsupported in that context. Instead, EAGLE
-        # wraps the *outer* draft entry point with canary.with_forward_pass
-        # so the host-side end-of-step runs outside the cuda graph.
         canary_ctx = (
-            self.canary_runner.with_forward_pass(forward_batch)
-            if self.canary_runner is not None and not self.is_draft_worker
+            c.with_forward_pass(forward_batch)
+            if (c := self.canary_runner) is not None and not self.is_draft_worker
             else contextlib.nullcontext()
         )
 

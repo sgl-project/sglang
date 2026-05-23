@@ -800,17 +800,9 @@ class CudaGraphRunner:
         if self.enable_profile_cuda_graph:
             profile_context = self._init_profile_context_and_memory_record()
 
-        # The warmup loop (and the with-torch.cuda.graph capture inside
-        # capture_one_batch_size) calls model.forward directly, bypassing
-        # ModelRunner.forward's canary_ctx. Without suspending the per-forward
-        # canary the monkey-patched model.forward would still fire head/tail
-        # kernels here, but with no preceding before_forward — phase=IDLE when
-        # head_kernels expects AFTER_BEFORE_FORWARD, and the canary phase
-        # checker raises. Suspend for the duration of capture.
-        canary_runner = self.model_runner.canary_runner
         canary_suspend_ctx = (
-            canary_runner.suspend_per_forward()
-            if canary_runner is not None
+            c.suspend_per_forward()
+            if (c := self.model_runner.canary_runner) is not None
             else empty_context()
         )
 
