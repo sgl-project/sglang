@@ -59,6 +59,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_audiodit import (
+    LongCatAudioDiTPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
@@ -104,6 +107,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_audiodit import (
+    LongCatAudioDiTSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
@@ -999,6 +1005,17 @@ def _register_configs():
         model_detectors=[
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
         ],
+    )
+
+    # LongCat-AudioDiT
+    register_configs(
+        sampling_param_cls=LongCatAudioDiTSamplingParams,
+        pipeline_config_cls=LongCatAudioDiTPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-AudioDiT-1B",
+            "meituan-longcat/LongCat-AudioDiT-3.5B",
+        ],
+        model_detectors=[lambda hf_id: "longcat-audiodit" in hf_id.lower()],
     )
 
 

@@ -60,6 +60,8 @@ class ModelTaskType(Enum):
     TI2I = auto()  # Image to Image or Text-Image to Image
     I2M = auto()  # Image to Mesh
 
+    T2A = auto()  # Text to Audio
+
     def is_image_gen(self) -> bool:
         return (
             self == ModelTaskType.T2I
@@ -86,6 +88,8 @@ class ModelTaskType(Enum):
     def data_type(self) -> DataType:
         if self == ModelTaskType.I2M:
             return DataType.MESH
+        if self == ModelTaskType.T2A:
+            return DataType.AUDIO
         if self.is_image_gen():
             return DataType.IMAGE
         else:
