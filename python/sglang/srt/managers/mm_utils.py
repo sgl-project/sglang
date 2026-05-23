@@ -804,6 +804,7 @@ def embed_mm_inputs(
     input_ids: torch.Tensor,
     input_embedding: nn.Embedding,
     multimodal_model: nn.Module = None,
+    forward_batch: Optional[ForwardBatch] = None,
     data_embedding_func_mapping: Dict[Modality, DataEmbeddingFunc] = None,
     placeholder_tokens: dict[Modality, List[int]] = None,
     use_deepstack: Dict[Modality, bool] = {},
@@ -870,17 +871,28 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
             items_size = torch.cumsum(items_size, dim=0).tolist()
-
-            embedding, mask, input_ids = get_embedding_and_mask(
-                data_embedding_func=embedder,
-                embedding_items=items,
-                placeholder_tensor=placeholder_tensor,
-                input_ids=input_ids,
-                items_size=items_size,
-                prefix_length=extend_prefix_lens,
-                extend_length=extend_seq_lens,
-                items_offset_list=items_offsets,
-            )
+            
+            time_stats_list = getattr(forward_batch, "time_stats", None)
+            
+            if modality == Modality.IMAGE and time_stats_list is not None:
+                for time_stats in time_stats_list:
+                    time_stats.set_vit_encode_start_time()
+                    
+            try:
+                embedding, mask, input_ids = get_embedding_and_mask(
+                    data_embedding_func=embedder,
+                    embedding_items=items,
+                    placeholder_tensor=placeholder_tensor,
+                    input_ids=input_ids,
+                    items_size=items_size,
+                    prefix_length=extend_prefix_lens,
+                    extend_length=extend_seq_lens,
+                    items_offset_list=items_offsets,
+                )
+            finally:
+                if modality == Modality.IMAGE and time_stats_list is not None:
+                    for time_stats in time_stats_list:
+                        time_stats.set_vit_encode_end_time()
 
             if use_deepstack.get(modality, None) and embedding is not None:
                 embedding, deepstack_embedding = (
@@ -962,6 +974,7 @@ def _embed_mm_inputs_with_split(
     embed_kwargs = dict(
         multimodal_model=multimodal_model,
         input_embedding=input_embedding,
+        forward_batch=forward_batch,
         data_embedding_func_mapping=data_embedding_func_mapping,
         placeholder_tokens=placeholder_tokens,
         use_deepstack=use_deepstack,
@@ -1115,6 +1128,7 @@ def general_mm_embed_routine(
                     input_ids=input_ids,
                     input_embedding=embed_tokens,
                     multimodal_model=multimodal_model,
+                    forward_batch=forward_batch,
                     data_embedding_func_mapping=data_embedding_funcs,
                     placeholder_tokens=placeholder_tokens,
                     use_deepstack=use_deepstack,
