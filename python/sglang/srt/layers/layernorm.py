@@ -303,6 +303,12 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Fix dsv4 dp attenton issue
+        # the symptom is torch.AcceleratorError: HIP error: invalid configuration argument
+        if x.shape[0] == 0:
+            if residual is not None:
+                return x, residual
+            return x
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.

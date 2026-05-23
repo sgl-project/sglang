@@ -172,7 +172,44 @@ void fast_topk_transform_ragged_interface(
 
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
+
+void deepseek_v4_topk_transform_512(
+    const at::Tensor& scores,
+    const at::Tensor& seq_lens,
+    const at::Tensor& page_table,
+    at::Tensor& page_indices,
+    int64_t page_size,
+    std::optional<at::Tensor> raw_indices_opt = std::nullopt);
 #endif
+
+/*
+ * From csrc/elementwise (DeepSeek-V4 norm + rope)
+ */
+void dsv4_fused_q_norm_rope(
+    const at::Tensor& q_input,
+    at::Tensor& q_output,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    double eps);
+
+void dsv4_fused_k_norm_rope_flashmla(
+    const at::Tensor& kv,
+    const at::Tensor& kv_weight,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& out_loc,
+    at::Tensor& kvcache,
+    double eps,
+    int64_t page_size);
+
+void dsv4_fused_q_indexer_rope_hadamard_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp8,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
 
 /*
  * From csrc/gemm
