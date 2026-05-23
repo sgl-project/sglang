@@ -68,6 +68,7 @@ RUN --mount=type=secret,id=github_token \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
     pip install --no-deps xgrammar==0.1.33 && \
+    pip install apache-tvm-ffi && \
     pip install triton-xpu==3.7.1 --index-url https://download.pytorch.org/whl/xpu --force-reinstall && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; cd /home/sdp" >> /home/sdp/.bashrc

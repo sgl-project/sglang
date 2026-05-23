@@ -291,7 +291,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
-        audio_token_id = getattr(self, "audio_token_id", None)
         spatial_merge_size = getattr(self, "spatial_merge_size", 1)
         vision_start_token_id = getattr(self, "vision_start_token_id", None)
         vision_end_token_id = getattr(self, "vision_end_token_id", None)
@@ -310,7 +309,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         img_idx = 0
         video_idx = 0
-        model_type = getattr(self, "model_type", None)
         for mm_start_idx, modality in vision_start_indices:
             modality_list.append(modality)
             video_tokens = None
@@ -505,7 +503,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
-        base_output = self.load_mm_data(
+        base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
             video_data=request_obj.video_data,
@@ -560,6 +558,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+        base_input_ids = getattr(base_output, "input_ids", None)
+        if isinstance(base_input_ids, list) and len(base_input_ids) == input_ids.numel():
+            input_ids_list = base_input_ids
+        else:
+            input_ids_list = input_ids.tolist()
 
         image_grid_thw = None
         if hasattr(ret, "image_grid_thw"):

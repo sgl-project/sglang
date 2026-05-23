@@ -463,7 +463,7 @@ class DeepSeekV4SingleKVPoolHost(HiSparseHostPoolMixin):
         if io_backend != "kernel":
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-        from sglang.jit_kernel.deepseek_v4 import hisparse_offload_to_host
+        from sglang.jit_kernel.dsv4 import hisparse_offload_to_host
 
         if host_indices.device != device_indices.device:
             host_indices = host_indices.to(device=device_indices.device)
