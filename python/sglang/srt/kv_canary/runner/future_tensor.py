@@ -24,36 +24,37 @@ class FutureTensors:
         if not isinstance(src_device, dict):
             src_device = {_DUMMY_DICT_KEY: src_device}
 
-        host: _PayloadDict = {}
-        ref_device: Optional[torch.device] = None
+        dst_host: _PayloadDict = {}
+        device: Optional[torch.device] = None
         for key, value in src_device.items():
             if isinstance(value, torch.Tensor):
-                host[key] = torch.empty(
+                dst_host[key] = torch.empty(
                     value.shape, dtype=value.dtype, pin_memory=True
                 )
-                if ref_device is None:
-                    ref_device = value.device
+                if device is None:
+                    device = value.device
             else:
                 # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
                 # can bundle host metadata (e.g. the step at which the snapshot was
                 # staged) alongside the device tensors and recover that context in
                 # postprocess without reaching back into the producer.
-                host[key] = value
-        if ref_device is None:
+                dst_host[key] = value
+
+        if device is None:
             raise ValueError(
                 "FutureTensors.device_to_host requires at least one torch.Tensor in "
                 "the source dict to anchor the d2h stream sync"
             )
 
-        stream.wait_stream(torch.cuda.current_stream(ref_device))
+        stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             for key, value in src_device.items():
                 if isinstance(value, torch.Tensor):
-                    _clone_and_copy_to_host(x_device=value, x_host=host)
+                    _clone_and_copy_to_host(x_device=value, x_host=dst_host)
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_tensors=host, _event=event)
+        return cls(_tensors=dst_host, _event=event)
 
     def wait(self) -> _TensorOrDict:
         tensors = self._tensors
