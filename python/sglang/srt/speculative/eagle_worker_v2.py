@@ -355,7 +355,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         canary_ctx = (
-            c.with_forward_pass(forward_batch)
+            c.with_kernels_outside_cuda_graph(forward_batch)
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
@@ -575,7 +575,7 @@ class EagleDraftWorker(BaseDraftWorker):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         canary_ctx = (
-            c.with_forward_pass(forward_batch)
+            c.with_kernels_outside_cuda_graph(forward_batch)
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
@@ -634,7 +634,7 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         canary_ctx = (
-            c.with_forward_pass(forward_batch)
+            c.with_kernels_outside_cuda_graph(forward_batch)
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )

@@ -182,26 +182,32 @@ class CanaryRunner:
         self._perturb_manager.attach_radix_cache(radix_cache)
 
     @contextlib.contextmanager
-    def with_forward_pass(self, forward_batch: "ForwardBatch") -> Iterator[None]:
-        """Bracket one OUTER cuda-graph cycle: host hook BEFORE kernels, host
-        hook AFTER kernels.
+    def with_kernels_outside_cuda_graph(
+        self, forward_batch: "ForwardBatch"
+    ) -> Iterator[None]:
+        """Launch the outside-cuda-graph kernels around a body that runs the
+        cuda-graph capture / replay region.
 
-        "Outer" means the outermost cuda-graph boundary surrounding the run,
-        NOT a literal "one model.forward". The body may run 1 inner forward
-        (target case, cuda graph captures only ``model.forward``) or N inner
-        forwards (EAGLE draft case, the body runs the multi-step draft cuda
-        graph). The per-step head/tail kernel launches are dispatched from
-        inside the captured region (via the monkey-patched ``model.forward``)
-        and replay correctly for every inner step.
+        Fires :meth:`PerForwardOrchestrator.pre_kernels_outside_cuda_graph`
+        before the body and
+        :meth:`PerForwardOrchestrator.post_kernels_outside_cuda_graph` after.
+        The body itself contains 1 inner forward (target case, cuda graph
+        captures only ``model.forward``) or N inner forwards (EAGLE draft
+        case, the body runs the multi-step draft cuda graph). Per-step
+        head/tail kernel launches are dispatched from inside the captured
+        region (via the monkey-patched ``model.forward``) and replay
+        correctly for every inner step.
 
         Caller examples::
 
             # Target ModelRunner.forward — body runs one model.forward, captured.
-            with canary_runner.with_forward_pass(forward_batch):
+            with canary_runner.with_kernels_outside_cuda_graph(forward_batch):
                 output = self._forward_raw(...)
 
             # EAGLE draft worker — body runs the multi-step draft cuda graph.
-            with draft_runner.canary_runner.with_forward_pass(forward_batch):
+            with draft_runner.canary_runner.with_kernels_outside_cuda_graph(
+                forward_batch
+            ):
                 self.cuda_graph_runner.replay(forward_batch)
 
         Re-entry is forbidden: each cycle is bracketed exactly once. EAGLE
@@ -210,7 +216,7 @@ class CanaryRunner:
         cycle stays unique."""
         assert (
             not self._in_forward_pass
-        ), "CanaryRunner.with_forward_pass cannot be re-entered"
+        ), "CanaryRunner.with_kernels_outside_cuda_graph cannot be re-entered"
         self._in_forward_pass = True
         self._pre_kernels_outside_cuda_graph(forward_batch)
         try:
