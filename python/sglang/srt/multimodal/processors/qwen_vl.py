@@ -415,7 +415,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         device: torch.device,
     ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         """instead of calling get_rope_index, build mrope position from mm_items.offsets and image_grid_thw of each image
-           basically a simplified version of get_rope_index for image-only reqs
+        basically a simplified version of get_rope_index for image-only reqs
         """
         if self.model_type not in (
             "qwen3_vl",
