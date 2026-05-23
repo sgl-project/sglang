@@ -532,16 +532,13 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             ),
         }
 
-    def init_forward_metadata_capture_cuda_graph(
+    def _bind_metadata_buffers(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
         forward_mode: ForwardMode,
-        spec_info: Optional[None],
     ):
+        """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = DualChunkFlashAttentionMetadata()
 
         if forward_mode.is_decode_or_idle():
@@ -579,6 +576,36 @@ class DualChunkFlashAttentionBackend(AttentionBackend):
             self.decode_metadata[bs] = metadata
 
         self.forward_metadata = metadata
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[None],
+    ):
+        self._bind_metadata_buffers(bs, req_pool_indices, forward_mode)
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens.cpu(),
+        )
+        # Restore max_seq_len scalars — replay sets actual values but CUDA graph
+        # needs the safe upper bound baked in at capture time.
+        if forward_mode.is_decode_or_idle():
+            md = self.forward_metadata
+            md.max_seq_len = self.max_context_len
+            md.max_seq_len_intra = self.max_context_len
+            md.max_seq_len_succ = self.max_context_len
+            md.max_seq_len_inter = self.max_context_len
 
     def init_forward_metadata_replay_cuda_graph(
         self,
