@@ -266,7 +266,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         base = moe_layer.base_layer
         top_k = base.top_k
-        device = moe_layer._quant_info.w13_weight.device
+        device = next(base.parameters()).device
         num_experts = base.num_experts
 
         block_size_m = 64
