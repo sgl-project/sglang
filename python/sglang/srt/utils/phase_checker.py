@@ -72,6 +72,19 @@ class SimplePhaseChecker:
             f"enable_assert=OFF (call enable_assert() after init is done)"
         )
 
+    def reset_to_idle(self) -> None:
+        """Reset the phase tensor to ``initial_phase`` without touching the
+        assert flag.
+
+        Useful for callers (such as ``CanaryManager.mark_init_finished``)
+        that need to bulk-reset many checkers and then enable asserts in a
+        separate loop, or to recover after a non-throwing lifecycle hiccup."""
+        self._phase.fill_(self._initial_phase)
+        _host_debug(
+            f"[SimplePhaseChecker.reset_to_idle] phase reset to "
+            f"{self._initial_phase}"
+        )
+
     def enable_assert(self) -> None:
         """Turn on the device-side assert and reset phase to ``initial_phase``.
 
@@ -79,11 +92,10 @@ class SimplePhaseChecker:
         piecewise compile, etc.) so the post-init phase sequence starts from a
         known state regardless of what captured kernels left in the phase
         tensor during init."""
-        self._phase.fill_(self._initial_phase)
+        self.reset_to_idle()
         self._enable_assert_device.fill_(1)
         _host_debug(
-            f"[SimplePhaseChecker.enable_assert] phase reset to "
-            f"{self._initial_phase}, assert ENABLED"
+            f"[SimplePhaseChecker.enable_assert] assert ENABLED"
         )
 
     def _resolve_caller_tag(self, caller_name: str) -> int:
