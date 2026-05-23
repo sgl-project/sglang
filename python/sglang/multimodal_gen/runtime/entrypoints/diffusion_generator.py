@@ -279,6 +279,23 @@ class DiffGenerator:
                                     output_file_path=path,
                                 )
                             )
+                    elif requests[0].data_type == DataType.TEXT:
+                        # Text output: output_batch.output contains text strings
+                        self._validate_output_count(
+                            len(output_batch.output), len(requests)
+                        )
+                        for idx in range(len(output_batch.output)):
+                            req = requests[idx]
+                            text_output = output_batch.output[idx]
+                            results.append(
+                                GenerationResult(
+                                    **self._result_common(
+                                        req, output_batch, timer.duration, idx
+                                    ),
+                                    prompt_index=global_output_index + idx,
+                                    text=text_output,
+                                )
+                            )
                     elif requests[0].data_type == DataType.MESH:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
