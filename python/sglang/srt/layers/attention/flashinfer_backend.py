@@ -132,20 +132,20 @@ def _spec_prefix_lens(
       (Q_len = 0 at this level). Matches the triton backend's target_verify
       path, which computes ``min(seq_lens, SW)``.
 
-    - ``is_draft_extend``: ``seq_lens`` equals
-      ``spec_info.seq_lens_for_draft_extend`` (post-verify length) and
-      ``spec_info.accept_length`` counts the Q tokens this forward pass
-      produces (``+1``'d in ``prepare_extend_after_decode``), so
-      ``prefix_lens = seq_lens - accept_length``.
+    - ``is_draft_extend``: ``seq_lens`` is the post-verify length (verify
+      advances ``batch.seq_lens`` by ``num_accept_tokens`` per request),
+      and ``spec_info.num_accept_tokens`` counts the Q tokens this forward
+      pass produces (drafts + 1 bonus), so
+      ``prefix_lens = seq_lens - num_accept_tokens``.
     """
     if forward_mode.is_target_verify():
         return seq_lens
     if forward_mode.is_draft_extend():
-        assert (spec_info.accept_length <= seq_lens).all(), (
-            "accept_length must be <= seq_lens "
+        assert (spec_info.num_accept_tokens <= seq_lens).all(), (
+            "num_accept_tokens must be <= seq_lens "
             "(invariant from prepare_extend_after_decode)"
         )
-        return seq_lens - spec_info.accept_length
+        return seq_lens - spec_info.num_accept_tokens
     raise ValueError(f"_spec_prefix_lens called with unsupported mode: {forward_mode}")
 
 
