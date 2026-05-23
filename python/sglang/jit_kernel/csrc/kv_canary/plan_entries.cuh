@@ -46,8 +46,7 @@ struct PlanEntriesParams {
 
 // Binary search for the largest req_id such that verify_offsets[req_id] <= tid. Pre-condition: tid is
 // strictly less than verify_offsets[bs_padded] = total_verify; bs_padded >= 1; verify_offsets[0] = 0.
-SGL_DEVICE int32_t
-find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64_t tid) {
+SGL_DEVICE int32_t find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64_t tid) {
   int32_t lo = 0;
   int32_t hi = bs_padded;  // exclusive upper bound; verify_offsets[hi] > tid
   while (hi - lo > 1) {
@@ -193,8 +192,7 @@ struct PlanEntriesKernel {
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
-    RuntimeCheck(
-        NbsP1.unwrap() == Nbs.unwrap() + 1, "verify_offsets_scratch length must equal bs_padded + 1");
+    RuntimeCheck(NbsP1.unwrap() == Nbs.unwrap() + 1, "verify_offsets_scratch length must equal bs_padded + 1");
 
     const int64_t bs_padded = Nbs.unwrap();
     if (bs_padded <= 0) {
