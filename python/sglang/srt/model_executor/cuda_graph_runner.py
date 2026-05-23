@@ -1105,20 +1105,27 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
-            attn_backend.on_after_cuda_graph_warmup()
-
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
-
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+        canary_manager = self.model_runner.canary_runner
+        canary_ctx = (
+            canary_manager.with_single_forward_manager_index(0)
+            if canary_manager is not None
+            else contextlib.nullcontext()
         )
+        with canary_ctx:
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
+                attn_backend.on_after_cuda_graph_warmup()
+
+            if get_global_graph_memory_pool() is None:
+                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+            # Set graph pool id globally to be able to use symmetric memory
+            set_graph_pool_id(get_global_graph_memory_pool())
+
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
 
         return graph, out
 
