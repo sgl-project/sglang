@@ -26,9 +26,17 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 # CANARY observer for SWA mapping race (debug-only, see SWAKVPool.translate_loc_from_full_to_swa).
-# free_swa writes this sentinel into a side-channel canary mapping; production mapping still
-# writes 0. If forward reads -2 from the canary, schedule freed a slot that forward was still
-# using, i.e. cross-stream RAW/WAR race in the SWA index mapping.
+#
+# Storage layout: a 2-row mapping_stack [[prod], [canary]] sharing one CUDA tensor.
+#   - row 0 (prod):   live SWA index mapping used by the model
+#   - row 1 (canary): mirrors row 0 except free_swa writes _SWA_CANARY_FREED_SENTINEL
+#                     here instead of 0
+#
+# Writes to BOTH rows happen via single-kernel `stack[:, idx] = ...` ops so prod and
+# canary update atomically. Reads also use single-kernel `stack[:, idx]` -> [2, N]
+# so prod and canary snapshots are taken in the same kernel — no detector window.
+#
+# Real race iff (canary == _SWA_CANARY_FREED_SENTINEL) AND (prod == 0).
 _SWA_CANARY_FREED_SENTINEL = -2
 
 
@@ -99,6 +107,7 @@ class SWAKVPool(BaseSWAKVPool):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
         self.full_to_swa_canary_mapping: Optional[torch.Tensor] = None
+        self.full_to_swa_mapping_stack: Optional[torch.Tensor] = None
         self._cached_swa_loc: Optional[torch.Tensor] = None
         self._cached_loc_key: Optional[tuple] = None
 
@@ -184,16 +193,27 @@ class SWAKVPool(BaseSWAKVPool):
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
-            self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
-                torch.int32
-            )
-            # CANARY: assert forward never reads a slot that schedule has freed.
-            # Async GPU assert, no host sync; raises on next cudaStreamSynchronize.
-            if self.full_to_swa_canary_mapping is not None:
-                canary_at_read = self.full_to_swa_canary_mapping[kv_indices]
+            if self.full_to_swa_mapping_stack is not None:
+                # CANARY combined read: single advanced-indexing kernel snapshots
+                # both prod (row 0) and canary (row 1) atomically. A real race is
+                # canary == sentinel AND prod == 0 (free_swa is the only writer
+                # that produces this pair). canary == sentinel with prod != 0 is
+                # impossible because every write to the stack is also a single
+                # kernel, so prod and canary are never observed out-of-sync.
+                combined = self.full_to_swa_mapping_stack[:, kv_indices]
+                prod_at_read = combined[0]
+                canary_at_read = combined[1]
+                self._cached_swa_loc = prod_at_read.to(torch.int32)
+                real_race = (canary_at_read == _SWA_CANARY_FREED_SENTINEL) & (
+                    prod_at_read == 0
+                )
                 torch._assert_async(
-                    (canary_at_read != _SWA_CANARY_FREED_SENTINEL).all(),
+                    (~real_race).all(),
                     "SWA mapping race: forward read a slot that schedule freed",
+                )
+            else:
+                self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
+                    torch.int32
                 )
             self._cached_loc_key = key
         return self._cached_swa_loc
@@ -376,23 +396,27 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
-        self.full_to_swa_index_mapping = torch.cat(
-            [
-                torch.zeros(
-                    size + self.page_size,
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
-            ]
+        # CANARY: prod and canary mappings share one [2, N] tensor. Row 0 is the
+        # live mapping; row 1 mirrors it except free_swa writes the sentinel.
+        # Last column is -1 so kv_indices == -1 maps to swa_idx == -1 (needed by
+        # alloc_extend's last_loc plumbing).
+        mapping_len = size + self.page_size + 1
+        self.full_to_swa_mapping_stack = torch.zeros(
+            2,
+            mapping_len,
+            dtype=torch.int64,
+            device=device,
         )
-        # CANARY mirror: starts identical to production; free_swa writes
-        # _SWA_CANARY_FREED_SENTINEL here instead of 0 so observers can detect
-        # forward reads of freed-but-not-yet-realloced slots.
-        self.full_to_swa_canary_mapping = self.full_to_swa_index_mapping.clone()
+        self.full_to_swa_mapping_stack[:, -1] = -1
+        self.full_to_swa_index_mapping = self.full_to_swa_mapping_stack[0]
+        self.full_to_swa_canary_mapping = self.full_to_swa_mapping_stack[1]
+        # Pre-built constant for free_swa's single-kernel dual write:
+        # broadcast [2, 1] -> [2, len(free_index)] when assigning to stack[:, idx].
+        self._free_fill_value = torch.tensor(
+            [[0], [_SWA_CANARY_FREED_SENTINEL]],
+            dtype=torch.int64,
+            device=device,
+        )
 
         self.need_sort = need_sort
         self.free_pages = None
@@ -403,8 +427,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache = kvcache
         self.clear()
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
-        # Side-channel canary attribute, set directly to avoid extending the
-        # register_mapping ABI across all KV pool subclasses (DSv4, hisparse, ...).
+        # Expose the 2-row stack so SWAKVPool/DSv4 pool can do single-kernel
+        # combined reads (see translate_loc_from_full_to_swa). setattr avoids
+        # extending the register_mapping ABI across all KV pool subclasses.
+        self._kvcache.full_to_swa_mapping_stack = self.full_to_swa_mapping_stack
         self._kvcache.full_to_swa_canary_mapping = self.full_to_swa_canary_mapping
 
     def available_size(self):
@@ -459,16 +485,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
+        # CANARY: single-kernel write to both rows; alloc_swa_indices ([K])
+        # broadcasts across the [2] row dim -> LHS shape [2, K].
         if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-            self.full_to_swa_canary_mapping[alloc_full_indices.to(torch.int64)] = (
+            self.full_to_swa_mapping_stack[:, alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-            self.full_to_swa_canary_mapping[alloc_full_indices] = alloc_swa_indices
+            self.full_to_swa_mapping_stack[:, alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
 
     def alloc_extend(
@@ -514,16 +538,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
+        # CANARY: single-kernel combined write.
         if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-            self.full_to_swa_canary_mapping[alloc_full_indices.to(torch.int64)] = (
+            self.full_to_swa_mapping_stack[:, alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-            self.full_to_swa_canary_mapping[alloc_full_indices] = alloc_swa_indices
+            self.full_to_swa_mapping_stack[:, alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -588,15 +609,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_swa_indices is not None
 
-        self.full_to_swa_index_mapping[alloc_full_indices[-swa_tail_len:]] = (
-            alloc_swa_indices
-        )
-        self.full_to_swa_canary_mapping[alloc_full_indices[-swa_tail_len:]] = (
+        # CANARY: single-kernel combined writes.
+        self.full_to_swa_mapping_stack[:, alloc_full_indices[-swa_tail_len:]] = (
             alloc_swa_indices
         )
         if swa_tail_len < extend_num_tokens:
-            self.full_to_swa_index_mapping[alloc_full_indices[:-swa_tail_len]] = 0
-            self.full_to_swa_canary_mapping[alloc_full_indices[:-swa_tail_len]] = 0
+            self.full_to_swa_mapping_stack[:, alloc_full_indices[:-swa_tail_len]] = 0
         return alloc_full_indices
 
     def alloc_decode(
@@ -619,16 +637,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if alloc_full_indices is None or alloc_swa_indices is None:
             return None
 
+        # CANARY: single-kernel combined write.
         if _is_npu:
-            self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
-                alloc_swa_indices.to(torch.int64)
-            )
-            self.full_to_swa_canary_mapping[alloc_full_indices.to(torch.int64)] = (
+            self.full_to_swa_mapping_stack[:, alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-            self.full_to_swa_canary_mapping[alloc_full_indices] = alloc_swa_indices
+            self.full_to_swa_mapping_stack[:, alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
 
@@ -658,26 +673,23 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
         assert full_indices.numel() == swa_indices.numel()
         self._kvcache.invalidate_loc_cache()
+        # CANARY: single-kernel combined write.
         if _is_npu:
-            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
-                swa_indices.to(torch.int64)
-            )
-            self.full_to_swa_canary_mapping[full_indices.to(torch.int64)] = (
+            self.full_to_swa_mapping_stack[:, full_indices.to(torch.int64)] = (
                 swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[full_indices] = swa_indices
-            self.full_to_swa_canary_mapping[full_indices] = swa_indices
+            self.full_to_swa_mapping_stack[:, full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
-        # Canary records the "freed but not yet realloced" window so observers
-        # can flag stale reads from forward_stream.
-        self.full_to_swa_canary_mapping[free_index] = _SWA_CANARY_FREED_SENTINEL
+        # CANARY: single-kernel write to both rows. _free_fill_value is [[0],
+        # [SENTINEL]] shape [2, 1]; broadcasts to [2, len(free_index)] so prod
+        # gets 0 and canary gets the sentinel in one kernel.
+        self.full_to_swa_mapping_stack[:, free_index] = self._free_fill_value
 
     def backup_state(self):
         return [
@@ -694,9 +706,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self._kvcache.invalidate_loc_cache()
         self.swa_attn_allocator.clear()
         self.full_attn_allocator.clear()
-        # Note: the last item is -1, we don't clear it, see the comment in __init__
-        self.full_to_swa_index_mapping[:-1].fill_(0)
-        self.full_to_swa_canary_mapping[:-1].fill_(0)
+        # Note: the last column is -1 (see __init__); clear everything else.
+        # CANARY: single-kernel fill clears both rows.
+        self.full_to_swa_mapping_stack[:, :-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
 
