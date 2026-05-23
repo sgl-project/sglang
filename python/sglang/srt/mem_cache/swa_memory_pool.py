@@ -670,6 +670,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_canary_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
+        # DEBUG fix: device-wide sync forces schedule_stream to wait until forward_stream
+        # has drained all in-flight mapping reads from fwd_n. Removes the cross-stream
+        # RAW/WAR race on full_to_swa_index_mapping at the cost of overlap.
+        torch.cuda.synchronize()
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
