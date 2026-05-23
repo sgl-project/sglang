@@ -50,6 +50,7 @@ class CanaryRunner:
         self,
         *,
         config: CanaryConfig,
+        perturb_config: PerturbConfig,
         buffer_groups: tuple[CanaryBufferGroup, ...],
         device: torch.device,
         tp_group: Optional["GroupCoordinator"] = None,
@@ -120,7 +121,7 @@ class CanaryRunner:
             step_counter_getter=self._get_step_counter,
         )
         self._perturb_manager = PerturbManager(
-            config=PerturbConfig.from_env(),
+            config=perturb_config,
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
             step_counter_getter=self._get_step_counter,
