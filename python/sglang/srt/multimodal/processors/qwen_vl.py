@@ -24,6 +24,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
 )
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
@@ -247,6 +248,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
     ]
@@ -397,6 +399,42 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             video_grid_thw=video_grid_thw,
         )
         return mrope_positions.squeeze(1), mrope_position_delta
+
+    # TODO: consider moving it to SGLangBaseProcessor
+    @staticmethod
+    def _get_processor_output_value(ret, key):
+        """get value with key from returned value of processor"""
+        if ret is None:
+            return None
+        if hasattr(ret, "get"):
+            value = ret.get(key)
+            if value is not None:
+                return value
+        return getattr(ret, key, None)
+
+    def _get_precomputed_mrope_from_output(self, ret):
+        """get the precomputed mrope from processor output"""
+        mrope_positions = self._get_processor_output_value(ret, "mrope_positions")
+        mrope_position_delta = self._get_processor_output_value(
+            ret, "mrope_position_delta"
+        )
+        if mrope_positions is None or mrope_position_delta is None:
+            return None
+
+        mrope_positions = torch.as_tensor(mrope_positions)
+        if mrope_positions.ndim == 3:
+            if mrope_positions.shape[1] != 1:
+                return None
+            mrope_positions = mrope_positions.squeeze(1)
+        if mrope_positions.ndim != 2 or mrope_positions.shape[0] != 3:
+            return None
+
+        mrope_position_delta = torch.as_tensor(mrope_position_delta)
+        if mrope_position_delta.ndim == 0:
+            mrope_position_delta = mrope_position_delta.reshape(1, 1)
+        elif mrope_position_delta.ndim == 1:
+            mrope_position_delta = mrope_position_delta.reshape(-1, 1)
+        return mrope_positions, mrope_position_delta
 
     @staticmethod
     def _as_grid_batch(value):
@@ -579,7 +617,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 embedding_start : embedding_start + num_tokens
             ]
             consumed_per_modality[modality] = embedding_start + num_tokens
-            logger.info(f"Get embedding slice for {modality}, num_tokens={num_tokens}")
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
@@ -664,6 +701,27 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         process_time = time.perf_counter()
 
         input_ids = input_ids.flatten()
+        base_input_ids = getattr(base_output, "input_ids", None)
+        if (
+            isinstance(base_input_ids, list)
+            and len(base_input_ids) == input_ids.numel()
+        ):
+            # reuse preprocess input if it already carries list of input_ids
+            input_ids_list = base_input_ids
+        else:
+            input_ids_list = input_ids.tolist()
+
+        # look for if padded_input_ids already exists before computing
+        padded_input_ids = self._get_processor_output_value(ret, "padded_input_ids")
+        if padded_input_ids is None:
+            padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids_list, mm_items
+            )
+        elif isinstance(padded_input_ids, torch.Tensor):
+            # reuse existing padded_input_ids
+            padded_input_ids = padded_input_ids.flatten().tolist()
+        else:
+            padded_input_ids = list(padded_input_ids)
 
         image_grid_thw = None
         if hasattr(ret, "image_grid_thw"):
@@ -681,20 +739,21 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             if isinstance(first_video, dict):
                 video_grid_thw = first_video.get("video_grid_thw")
 
-        mrope_result = None
-        if (
-            video_grid_thw is None
-            and second_per_grid_ts is None
-            and audio_feature_lengths is None
-        ):
-            mrope_result = self._compute_image_only_mrope_positions_from_offsets(
-                input_len=input_ids.numel(),
-                mm_items=mm_items,
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
+        mrope_result = self._get_precomputed_mrope_from_output(ret)
         if mrope_result is None:
-            mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+            if (
+                video_grid_thw is None
+                and second_per_grid_ts is None
+                and audio_feature_lengths is None
+            ):
+                mrope_result = self._compute_image_only_mrope_positions_from_offsets(
+                    input_len=input_ids.numel(),
+                    mm_items=mm_items,
+                    dtype=input_ids.dtype,
+                    device=input_ids.device,
+                )
+        if mrope_result is None:
+            mrope_result = MRotaryEmbedding.get_rope_index(
                 spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
                 image_token_id=self.mm_tokens.image_token_id,
                 video_token_id=self.mm_tokens.video_token_id,
@@ -716,9 +775,10 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     self.hf_config, "position_id_per_seconds", None
                 ),
             )
-        else:
-            mrope_positions, mrope_position_delta = mrope_result
+
+        mrope_positions, mrope_position_delta = mrope_result
         mrope_positions = mrope_positions.squeeze(1)
+
         get_rope_index_time = time.perf_counter()
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
@@ -730,7 +790,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
 
         return MultimodalProcessorOutput(
-            input_ids=input_ids.tolist(),
+            input_ids=input_ids_list,
+            padded_input_ids=padded_input_ids,
             mm_items=mm_items,
             im_start_id=self.vision_start_token_id,
             im_end_id=self.vision_end_token_id,
