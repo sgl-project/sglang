@@ -459,7 +459,11 @@ DataEmbeddingFunc = Callable[
 ]
 
 
-def _embedder_handles_feature_device(data_embedding_func: DataEmbeddingFunc) -> bool:
+def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
+    """instead of performing H2D for each feature tensor from mm_items before vit forward, sometimes keep them on CPU first can save these H2D calls
+
+    this is only applicable for models like qwen-vl, which calls H2D in visual forward
+    """
     owner = getattr(data_embedding_func, "__self__", None)
     if owner is None:
         return False
@@ -503,7 +507,8 @@ def _get_chunked_embedding_full(
     embedding_per_req = embedding_cache.get(item_hashes)
 
     if embedding_per_req is None:
-        if not _embedder_handles_feature_device(data_embedding_func):
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
+            # skip move to save H2D calls for each mm feature tensor
             _move_items_to_device(embedding_items_per_req, device)
         embedding = data_embedding_func(embedding_items_per_req)
         embedding_per_req = (
@@ -577,7 +582,7 @@ def _get_chunked_embedding_by_item(
     # 3. Batch encode all cache-miss items in one ViT call
     if miss_items:
         miss_item_list = [item for _, item, _, _ in miss_items]
-        if not _embedder_handles_feature_device(data_embedding_func):
+        if not _can_skip_pre_embed_feature_move(data_embedding_func):
             _move_items_to_device(miss_item_list, device)
         all_miss_embedding = data_embedding_func(miss_item_list)
         all_miss_embedding = all_miss_embedding.reshape(
