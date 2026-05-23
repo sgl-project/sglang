@@ -3266,6 +3266,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.graph_runner.replay(
@@ -3291,9 +3294,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.adjust_num_token_non_padded_for_attn_tp(
                     server_args=self.server_args,
                 )
-
-            if self.is_hybrid_swa:
-                self.token_to_kv_pool.invalidate_loc_cache()
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if self.hisparse_coordinator is not None:
