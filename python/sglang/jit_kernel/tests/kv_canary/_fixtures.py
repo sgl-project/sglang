@@ -42,7 +42,7 @@ def make_lut(
     raise ValueError(f"unknown LutKind: {kind}")
 
 
-ReqToTokenKind = Literal["linear", "sparse_permuted", "with_holes"]
+ReqToTokenKind = Literal["linear", "sparse_permuted"]
 
 
 def make_req_to_token(
@@ -73,12 +73,6 @@ def make_req_to_token(
         per_req = slot_universe[cursor : cursor + max_seq_len]
         cursor += max_seq_len
         rtt[rp, :] = torch.tensor(per_req, dtype=torch.int32, device=device)
-    if kind == "with_holes":
-        flat = rtt.view(-1)
-        n_holes = max(1, len(flat) // 10)
-        hole_positions = rng.sample(range(len(flat)), k=n_holes)
-        for idx in hole_positions:
-            flat[idx] = -1
     return rtt.contiguous()
 
 

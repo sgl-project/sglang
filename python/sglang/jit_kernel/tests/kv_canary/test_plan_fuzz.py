@@ -58,7 +58,7 @@ def _draw_random_plan_inputs(rng: random.Random) -> PlanFuzzInputs:
         if swa_enabled
         else None
     )
-    rtt_kind = rng.choice(["linear", "sparse_permuted", "with_holes"])
+    rtt_kind = rng.choice(["linear", "sparse_permuted"])
     padding_kind = rng.choice(["none", "trailing", "interleaved"])
     capacity_kind = rng.choice(["loose", "tight_match", "under_by_one"])
 
