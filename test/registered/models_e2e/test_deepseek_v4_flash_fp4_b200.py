@@ -120,6 +120,42 @@ class TestDSV4FlashFP4B200Balanced(
             kill_process_tree(cls.process.pid)
 
 
+class TestDSV4FlashFP4NonMTPB200(
+    BasicDecodeCorrectnessMixin, GSM8KMixin, CustomTestCase
+):
+    """Non-MTP recipe: TP=4, DP=4, DeepEP, no speculative decoding."""
+
+    gsm8k_accuracy_thres = 0.93
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = try_cached_model(MODEL)
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "4",
+                "--dp",
+                "4",
+                "--enable-dp-attention",
+                "--moe-a2a-backend",
+                "deepep",
+                "--deepep-config",
+                DEEPEP_CONFIG,
+            ],
+            env=_DEEPEP_ENV,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process") and cls.process:
+            kill_process_tree(cls.process.pid)
+
+
 class TestDSV4FlashFP4B200Balanced_CP(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,
