@@ -52,6 +52,16 @@ class PerturbConfig:
 
     @classmethod
     def from_env(cls) -> "PerturbConfig":
+        import os as _os_dbg
+        print(
+            "DEBUG_PERTURB_ENV:"
+            f" REAL_KV_POST_FORWARD_PROB={_os_dbg.environ.get('SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB')!r}"
+            f" REAL_KV_USED_PROB={_os_dbg.environ.get('SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB')!r}"
+            f" REAL_KV_UNUSED_CACHE_PROB={_os_dbg.environ.get('SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB')!r}"
+            f" REQ_TO_TOKEN_PROB={_os_dbg.environ.get('SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB')!r}"
+            f" TARGET_GROUP={_os_dbg.environ.get('SGLANG_KV_CANARY_PERTURB_TARGET_GROUP')!r}",
+            flush=True,
+        )
         real_kv_used_prob = envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB.get()
         real_kv_unused_cache_prob = (
             envs.SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB.get()
