@@ -48,6 +48,25 @@ class TestLoadBalanceMethod(unittest.TestCase):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="decode")
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
+    def test_dp_cache_affinity_defaults_to_none(self):
+        server_args = ServerArgs(model_path="dummy")
+        self.assertEqual(server_args.dp_cache_affinity, "none")
+
+    def test_dp_shorthand_works_with_dp_cache_affinity_flag(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--dp",
+                "2",
+                "--dp-cache-affinity",
+                "routing_key",
+            ]
+        )
+
+        self.assertEqual(server_args.dp_size, 2)
+        self.assertEqual(server_args.dp_cache_affinity, "routing_key")
+
     def test_pd_decode_radix_cache_rejects_hisparse(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(
@@ -126,7 +145,6 @@ class TestPortArgs(unittest.TestCase):
         self.assertIsInstance(port_args.nccl_port, int)
 
     def test_init_new_with_single_node_dp_attention(self):
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None

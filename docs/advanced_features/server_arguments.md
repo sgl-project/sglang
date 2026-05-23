@@ -233,6 +233,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | --- | --- | --- | --- |
 | `--data-parallel-size`<br>`--dp-size` | The data parallelism size. | `1` | Type: int |
 | `--load-balance-method` | The load balancing strategy for data parallelism. The `total_tokens` algorithm can only be used when DP attention is applied. This algorithm performs load balancing based on the real-time token load of the DP workers. | `auto` | `auto`, `round_robin`, `follow_bootstrap_room`, `total_requests`, `total_tokens` |
+| `--dp-cache-affinity` | The cache affinity strategy for data parallel dispatch. `routing_key` keeps requests with the same routing key on the same DP rank before falling back to `--load-balance-method` for new keys. | `none` | `none`, `routing_key` |
 
 ## Multi-node distributed serving
 | Argument | Description | Defaults | Options |

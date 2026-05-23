@@ -982,6 +982,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>` auto`, `round_robin`, `follow_bootstrap_room`, `total_requests`, `total_tokens`</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>` --dp-cache-affinity`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The cache affinity strategy for data parallel dispatch. `routing_key` keeps requests with the same routing key on the same DP rank before falling back to `--load-balance-method` for new keys.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>` none`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>` none`, `routing_key`</td>
+    </tr>
   </tbody>
 </table>
 

@@ -395,6 +395,7 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
+            "dp_cache_affinity": self.server_args.dp_cache_affinity,
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -531,10 +532,9 @@ class CommonKVManager(BaseKVManager):
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
-        assert end_layer is not None, (
-            "KVArgs.prefill_end_layer must be set when using "
-            "compressed-MLA PD with PP"
-        )
+        assert (
+            end_layer is not None
+        ), "KVArgs.prefill_end_layer must be set when using compressed-MLA PD with PP"
 
         c4_full = sum(1 for r in mla_ratios if r == 4)
         c128_full = sum(1 for r in mla_ratios if r == 128)
@@ -711,7 +711,10 @@ class CommonKVSender(BaseKVSender):
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
         if self.kv_mgr.server_args.dp_size > 1:
-            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
+            if (
+                self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room"
+                or self.kv_mgr.server_args.dp_cache_affinity != "none"
+            ):
                 self._register_prefill_dp_rank()
             elif (
                 self.kv_mgr.attn_dp_rank
@@ -1185,7 +1188,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             load_balance_method = data.get(
                 "load_balance_method", "follow_bootstrap_room"
             )
-            self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
+            dp_cache_affinity = data.get("dp_cache_affinity", "none")
+            self.follow_bootstrap_room = (
+                load_balance_method == "follow_bootstrap_room"
+                and dp_cache_affinity == "none"
+            )
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
