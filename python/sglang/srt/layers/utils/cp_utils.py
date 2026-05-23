@@ -51,19 +51,41 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def is_mla_prefill_cp_enabled() -> bool:
+    sa = get_global_server_args()
+    return sa.enable_prefill_context_parallel and sa.use_mla_backend
+
+
+def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
+    if mla_enable_prefill_cp is None:
+        mla_enable_prefill_cp = is_mla_prefill_cp_enabled()
+    return (
+        forward_batch.attn_cp_metadata is not None
+        and mla_enable_prefill_cp
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
-    # CP metadata (zigzag split) only supports batch=1 for now.
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
+    # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
+    # the seq data needs to be divided and recombined at twice the size of cp_size.
     cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
+    return (
         cur_cp_seq_len != 0
         and cp_size > 1
+        # prepare_context_parallel_metadata hard-codes bs_per_cp_group = 1;
+        # guard explicitly to avoid silent mis-partitioning under continuous batching.
+        # TODO: remove this guard once we support multi-batch-cp-split
+        and forward_batch.batch_size == 1
         and forward_batch.forward_mode.is_context_parallel_extend()
+        # is_context_parallel_extend() returns True for MIXED (prefill+decode
+        # in one step), but the zigzag split only makes sense on pure extend.
+        and forward_batch.forward_mode != ForwardMode.MIXED
         and is_prefill_context_parallel_enabled()
-        and forward_batch.seq_lens_cpu.shape[0] == 1
-    ):
-        return True
-    else:
-        return False
+    )
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
@@ -395,6 +417,7 @@ def prepare_context_parallel_metadata(
     cp_rank,
     cp_size,
     seqs_len,
+    extend_lens,
 ):
     from sglang.srt.layers.attention.dsa.utils import (
         is_dsa_prefill_cp_round_robin_split,
@@ -449,18 +472,12 @@ def prepare_context_parallel_metadata(
     bs_per_cp_group = 1
     kv_len_origin = kv_len
 
-    # Derive prefix offset from the full sequence length on CPU.
-    # NOTE: forward_batch.seq_lens_cpu includes cached prefix + extend tokens.
-    # In CP we only split the extend tokens, but cache_seqlens passed to FA must
-    # include the cached prefix.
-    prefix_len = 0
-    try:
-        if seqs_len is not None and len(seqs_len) == 1:
-            prefix_len = int(seqs_len[0]) - int(kv_len_origin.item())
-            if prefix_len < 0:
-                prefix_len = 0
-    except Exception:
-        prefix_len = 0
+    # Derive prefix offset from unpadded CPU tensors. Both `seqs_len` and `extend_lens` are unpadded by the caller
+    # Using the padded `kv_len` here would undercount `prefix_len` by the padding amount and shift the FA causal horizon.
+    assert (
+        len(seqs_len) == 1 and len(extend_lens) == 1
+    ), "Prefill Context Parallel only supports batch_size == 1 for now"
+    prefix_len = max(0, int(seqs_len[0]) - int(extend_lens[0]))
     # get zigzag index
     cp_segment_num = cp_size * 2
     seq_per_batch = kv_len // cp_segment_num  # seq_len for each batch and segment
