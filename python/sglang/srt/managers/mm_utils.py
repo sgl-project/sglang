@@ -1375,10 +1375,12 @@ def get_new_expanded_mm_items(original_mm_items):
                         expanded_mm_items.append(item)
                     continue
 
-                patches_per_item = []
-                for grid in image_grid_thw:
-                    grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                    patches_per_item.append(int(torch.prod(grid_tensor).item()))
+                if isinstance(image_grid_thw, torch.Tensor):
+                    patches_per_item = (
+                        torch.prod(image_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_item = [int(np.prod(grid)) for grid in image_grid_thw]
 
                 cumulative = torch.cumsum(
                     torch.tensor(patches_per_item, dtype=torch.long), dim=0
@@ -1428,17 +1430,11 @@ def get_new_expanded_mm_items(original_mm_items):
                 num_videos = grid_len
 
                 # Calculate total frames and frames per video
-                frames_per_video = []
-                total_frames = 0
-                for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        T = int(grid[0].item())  # T is the first element [T, H, W]
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        T = int(grid_tensor[0].item())
-                    frames_per_video.append(T)
-                    total_frames += T
+                if isinstance(video_grid_thw, torch.Tensor):
+                    frames_per_video = video_grid_thw[:, 0].long().tolist()
+                else:
+                    frames_per_video = [int(grid[0]) for grid in video_grid_thw]
+                total_frames = sum(frames_per_video)
 
                 # num_items should equal total_frames when T > 1
                 if num_items != total_frames:
@@ -1446,14 +1442,12 @@ def get_new_expanded_mm_items(original_mm_items):
                     continue
 
                 # Calculate patches per video: T * H * W for each video
-                patches_per_video = []
-                for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        patches_per_video.append(int(torch.prod(grid).item()))
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        patches_per_video.append(int(torch.prod(grid_tensor).item()))
+                if isinstance(video_grid_thw, torch.Tensor):
+                    patches_per_video = (
+                        torch.prod(video_grid_thw, dim=-1).long().tolist()
+                    )
+                else:
+                    patches_per_video = [int(np.prod(grid)) for grid in video_grid_thw]
 
                 # Calculate cumulative patches to get slice indices for each video
                 cumulative = torch.cumsum(
