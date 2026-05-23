@@ -294,6 +294,15 @@ jobs:
             python/${{ env.OUTPUT_NAME }}/official_ltx23_manifest.json
           retention-days: 7
 
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
       - name: Publish official GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -394,6 +403,15 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
       - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -460,6 +478,15 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
+
       - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
@@ -525,6 +552,15 @@ jobs:
           name: ${{ env.OUTPUT_NAME }}-b200-part${{ matrix.part }}
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
+
+      - name: Validate generated GT images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+        run: |
+          python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
+            --source-dir python/${{ env.OUTPUT_NAME }} \
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}" \
+            --check-only
 
       - name: Publish GT images to sgl-project/ci-data
         env:
