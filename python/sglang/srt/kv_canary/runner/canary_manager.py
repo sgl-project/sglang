@@ -194,6 +194,25 @@ class CanaryManager:
         )
         return self._single_forward_managers[self._active_index]
 
+    def maybe_get_current_single_forward_manager(
+        self,
+    ) -> Optional[SingleForwardManager]:
+        """Like :meth:`get_current_single_forward_manager` but returns
+        ``None`` instead of asserting when no SFM is currently active.
+
+        Used by the monkey-patched ``model.forward`` wrap during server
+        startup, where cuda graph capture calls into ``model.forward``
+        directly (without an SFM bracket) before :meth:`mark_init_finished`
+        has enabled the per-SFM phase asserts. In that window the wrap
+        should skip phase 2/3 work — the canary lifecycle does not yet
+        govern these init-time captures, matching the old behavior in
+        which the device-side phase assert was disabled until init was
+        finished.
+        """
+        if self._active_index is None:
+            return None
+        return self._single_forward_managers[self._active_index]
+
     @contextlib.contextmanager
     def with_single_forward_manager_index(self, index: int) -> Iterator[None]:
         """Mark SFM ``index`` as active for the duration of the with-block.
