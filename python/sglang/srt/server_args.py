@@ -3078,7 +3078,7 @@ class ServerArgs:
     def _handle_context_parallelism(self):
         if (
             self.enable_prefill_context_parallel
-            and self.enable_nsa_prefill_context_parallel
+            and self.enable_dsa_prefill_context_parallel
         ):
             raise ValueError(
                 "--enable-prefill-context-parallel and "
