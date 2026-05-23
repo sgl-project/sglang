@@ -131,6 +131,7 @@ class PerForwardOrchestrator:
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.IDLE,
             next_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
+            caller_name="PerForwardOrchestrator.before_forward",
         )
 
         bs = int(forward_batch.batch_size)
@@ -175,6 +176,7 @@ class PerForwardOrchestrator:
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AFTER_BEFORE_FORWARD,
             next_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
+            caller_name="PerForwardOrchestrator.launch_head_kernels",
         )
 
         violation_log = self._device_state.violation_log
@@ -218,6 +220,7 @@ class PerForwardOrchestrator:
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
             next_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
+            caller_name="PerForwardOrchestrator.launch_tail_kernels",
         )
 
         violation_log = self._device_state.violation_log
@@ -248,6 +251,7 @@ class PerForwardOrchestrator:
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.AFTER_TAIL_KERNELS,
             next_phase=_CanaryPerForwardPhase.IDLE,
+            caller_name="PerForwardOrchestrator.end_of_step",
         )
 
         self._perturb_manager.end_of_forward(forward_batch)
