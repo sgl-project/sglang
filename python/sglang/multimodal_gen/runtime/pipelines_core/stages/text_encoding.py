@@ -306,6 +306,65 @@ class TextEncodingStage(PipelineStage):
                 )
             )
 
+    def _split_cfg_text_outputs(
+        self,
+        *,
+        prompt_count: int,
+        prompt_embeds_list,
+        prompt_masks_list,
+        pooler_embeds_list,
+        prompt_embeds_masks_list,
+        prompt_seq_lens_list,
+    ):
+        return (
+            [tensor[:prompt_count] for tensor in prompt_embeds_list],
+            [tensor[:prompt_count] for tensor in prompt_masks_list],
+            [tensor[:prompt_count] for tensor in pooler_embeds_list],
+            [tensor[:prompt_count] for tensor in prompt_embeds_masks_list],
+            [seq_lens[:prompt_count] for seq_lens in prompt_seq_lens_list],
+            [tensor[prompt_count:] for tensor in prompt_embeds_list],
+            [tensor[prompt_count:] for tensor in prompt_masks_list],
+            [tensor[prompt_count:] for tensor in pooler_embeds_list],
+            [tensor[prompt_count:] for tensor in prompt_embeds_masks_list],
+            [seq_lens[prompt_count:] for seq_lens in prompt_seq_lens_list],
+        )
+
+    def _encode_cfg_text_batch(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        prompt_text: str | list[str],
+        all_indices: list[int],
+        max_seq_length: int | None,
+    ):
+        assert isinstance(batch.negative_prompt, str)
+        prompts = [prompt_text] if isinstance(prompt_text, str) else list(prompt_text)
+        outputs = self.encode_text(
+            prompts + [batch.negative_prompt],
+            server_args,
+            encoder_index=all_indices,
+            return_attention_mask=True,
+            max_length=max_seq_length,
+        )
+        return self._split_cfg_text_outputs(
+            prompt_count=len(prompts),
+            prompt_embeds_list=outputs[0],
+            prompt_masks_list=outputs[1],
+            pooler_embeds_list=outputs[2],
+            prompt_embeds_masks_list=outputs[3],
+            prompt_seq_lens_list=outputs[4],
+        )
+
+    def _should_encode_cfg_text_batch(
+        self, batch: Req, server_args: ServerArgs
+    ) -> bool:
+        if not batch.do_classifier_free_guidance:
+            return False
+        if not isinstance(batch.negative_prompt, str):
+            return False
+        # TurboWan/DMD validation output changes when the two prompts share a batch
+        return not hasattr(server_args.pipeline_config, "dmd_denoising_steps")
+
     @torch.no_grad()
     def forward(
         self,
@@ -329,31 +388,86 @@ class TextEncodingStage(PipelineStage):
         # Get max_sequence_length from batch if available
         max_seq_length = getattr(batch, "max_sequence_length", None)
 
-        (
-            prompt_embeds_list,
-            prompt_masks_list,
-            pooler_embeds_list,
-            prompt_embeds_masks_list,
-            prompt_seq_lens_list,
-        ) = self.encode_text(
-            prompt_text,
-            server_args,
-            encoder_index=all_indices,
-            return_attention_mask=True,
-            max_length=max_seq_length,
-        )
-
+        negative_cache_key = None
+        cached_negative = None
         if batch.do_classifier_free_guidance:
-            assert isinstance(batch.negative_prompt, str)
+            negative_cache_key = self._build_negative_text_cache_key(
+                batch, server_args, all_indices
+            )
+            cached_negative = self._get_cached_negative_text_embedding(
+                negative_cache_key
+            )
+
+        if cached_negative is not None:
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+            ) = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+                max_length=max_seq_length,
+            )
             (
                 neg_embeds_list,
                 neg_masks_list,
                 neg_pooler_embeds_list,
                 neg_embeds_masks_list,
                 neg_seq_lens_list,
-            ) = self.get_or_compute_negative_text_embedding(
-                batch, server_args, all_indices
+            ) = cached_negative
+        elif self._should_encode_cfg_text_batch(batch, server_args):
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+                neg_embeds_list,
+                neg_masks_list,
+                neg_pooler_embeds_list,
+                neg_embeds_masks_list,
+                neg_seq_lens_list,
+            ) = self._encode_cfg_text_batch(
+                batch, server_args, prompt_text, all_indices, max_seq_length
             )
+            self._maybe_cache_negative_text_embedding(
+                negative_cache_key,
+                (
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                ),
+            )
+        else:
+            (
+                prompt_embeds_list,
+                prompt_masks_list,
+                pooler_embeds_list,
+                prompt_embeds_masks_list,
+                prompt_seq_lens_list,
+            ) = self.encode_text(
+                prompt_text,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
+                max_length=max_seq_length,
+            )
+            if batch.do_classifier_free_guidance:
+                (
+                    neg_embeds_list,
+                    neg_masks_list,
+                    neg_pooler_embeds_list,
+                    neg_embeds_masks_list,
+                    neg_seq_lens_list,
+                ) = self.get_or_compute_negative_text_embedding(
+                    batch, server_args, all_indices
+                )
 
         self._append_positive_text_outputs(
             batch,
