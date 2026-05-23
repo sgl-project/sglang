@@ -19,16 +19,16 @@ class FutureTensors:
 
     @classmethod
     def device_to_host(
-        cls, tensors_device: _TensorOrDict, *, stream: torch.cuda.Stream
+        cls, xs_device: _TensorOrDict, *, stream: torch.cuda.Stream
     ) -> "FutureTensors":
-        if not isinstance(tensors_device, dict):
-            tensors_device = {_DUMMY_DICT_KEY: tensors_device}
+        if not isinstance(xs_device, dict):
+            xs_device = {_DUMMY_DICT_KEY: xs_device}
 
-        tensors_host: _PayloadDict = {}
+        xs_host: _PayloadDict = {}
         device: Optional[torch.device] = None
-        for key, tensor_device in tensors_device.items():
+        for key, tensor_device in xs_device.items():
             if isinstance(tensor_device, torch.Tensor):
-                tensors_host[key] = torch.empty(
+                xs_host[key] = torch.empty(
                     tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
                 )
                 if device is None:
@@ -38,7 +38,7 @@ class FutureTensors:
                 # can bundle host metadata (e.g. the step at which the snapshot was
                 # staged) alongside the device tensors and recover that context in
                 # postprocess without reaching back into the producer.
-                tensors_host[key] = tensor_device
+                xs_host[key] = tensor_device
 
         if device is None:
             raise ValueError(
@@ -48,13 +48,13 @@ class FutureTensors:
 
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
-            for key, tensor_device in tensors_device.items():
+            for key, tensor_device in xs_device.items():
                 if isinstance(tensor_device, torch.Tensor):
-                    _clone_and_copy_to_host(x_device=tensor_device, x_host=tensors_host[key])
+                    _clone_and_copy_to_host(x_device=tensor_device, x_host=xs_host[key])
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_tensors=tensors_host, _event=event)
+        return cls(_tensors=xs_host, _event=event)
 
     def wait(self) -> _TensorOrDict:
         tensors = self._tensors
