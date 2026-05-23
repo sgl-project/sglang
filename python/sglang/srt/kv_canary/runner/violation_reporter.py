@@ -57,12 +57,12 @@ class ViolationReporter:
         # log mode: always surface every violation as WARNING. Never rate-limit or demote to
         # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever
         # is producing them, not a reason to hide them.
+        combined = "\n".join(messages)
         if self._config.mode == "log":
-            for message in messages:
-                logger.warning(message)
+            logger.warning(combined)
             return
         self._raised = True
-        raise RuntimeError("\n\n".join(messages))
+        raise RuntimeError(combined)
 
 
 def _canary_kind_label(tag: CanaryLaunchTag) -> str:
