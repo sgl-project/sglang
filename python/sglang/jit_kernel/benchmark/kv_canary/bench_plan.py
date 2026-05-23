@@ -145,7 +145,13 @@ _X_VALS_TT = [(c.bs, c.total_tokens, c.pool_kind) for c in _build_total_tokens_c
 
 _X_NAMES_PC = ["bs", "bs_padded", "prefix_len", "verify_capacity", "pool_kind"]
 _X_VALS_PC = [
-    (c.bs, c.bs_padded if c.bs_padded is not None else c.bs, c.prefix_len, c.verify_capacity, c.pool_kind)
+    (
+        c.bs,
+        c.bs_padded if c.bs_padded is not None else c.bs,
+        c.prefix_len,
+        c.verify_capacity,
+        c.pool_kind,
+    )
     for c in _build_pool_capacity_cases()
 ]
 
@@ -169,9 +175,7 @@ def _build_plan_inputs(
 
     effective_bs = bs_padded if bs_padded is not None else bs
     if effective_bs < bs:
-        raise ValueError(
-            f"kv-canary bench: bs_padded={bs_padded} must be >= bs={bs}"
-        )
+        raise ValueError(f"kv-canary bench: bs_padded={bs_padded} must be >= bs={bs}")
     # The plan kernels read the request-axis size from ``req_pool_indices.shape[0]``
     # (= effective_bs once padded), so the WritePlan / write_offsets row
     # capacities have to match that, not the active-bs count.
