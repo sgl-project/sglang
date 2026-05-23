@@ -15,7 +15,6 @@ state.
 """
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 
@@ -25,6 +24,7 @@ from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.utils import quantize_model as mlx_lm_quantize_model
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.aot import (
     MLX_AOT_KERNEL_REGISTRY,
     MlxAOTKernelSet,
@@ -271,7 +271,7 @@ class MlxModelRunner:
         # into the gate matmul via a custom Metal kernel. Activated by
         # SGLANG_MLX_FUSE_SWIGLU=1. Mutually exclusive with FUSE_SWITCHGLU.
         # See: python/sglang/srt/hardware_backend/mlx/moe/fused_swiglu.py
-        if os.environ.get("SGLANG_MLX_FUSE_SWIGLU", "0") == "1":
+        if envs.SGLANG_MLX_FUSE_SWIGLU.get():
             from sglang.srt.hardware_backend.mlx.moe.fused_swiglu import (
                 patch_switch_glu_with_fused_swiglu,
             )
