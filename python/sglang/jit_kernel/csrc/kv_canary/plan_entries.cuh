@@ -132,37 +132,6 @@ __global__ void plan_entries_persistent_kernel(
   }
 }
 
-// Type-checking ptr extractor (mirrors the elementwise/fused_metadata_copy.cuh helpers).
-template <typename T>
-inline const T* unwrap_data_ptr(const tvm::ffi::TensorView& tensor, const char* name) {
-  using namespace host;
-  if (tensor.data_ptr()) {
-    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have the expected dtype");
-  }
-  return static_cast<const T*>(tensor.data_ptr());
-}
-
-template <typename T>
-inline T* unwrap_data_ptr_mut(const tvm::ffi::TensorView& tensor, const char* name) {
-  using namespace host;
-  if (tensor.data_ptr()) {
-    RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have the expected dtype");
-  }
-  return static_cast<T*>(tensor.data_ptr());
-}
-
-template <typename T>
-inline const T*
-unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optional_tensor, const char* name) {
-  using namespace host;
-  if (!optional_tensor.has_value()) {
-    return nullptr;
-  }
-  const auto& tensor = optional_tensor.value();
-  RuntimeCheck(is_type<T>(tensor.dtype()), "Tensor ", name, " must have the expected dtype");
-  return static_cast<const T*>(tensor.data_ptr());
-}
-
 // JIT-callable host launcher. Selects the templated kernel via the HAS_SWA_LUT bool. The persistent grid
 // is sized to ``num_sms * kBlocksPerSm`` blocks of ``kBlockSize`` threads. For the H200 we expect 132
 // SMs which yields 132 * 8 = 1056 blocks of 128 threads = 135,168 persistent threads.
@@ -187,25 +156,21 @@ struct PlanEntriesKernel {
       int64_t req_to_token_stride0,
       int64_t bs_padded,
       int32_t swa_window_size) {
-    using namespace host;
-
-    const int64_t* lut_ptr = unwrap_optional_data_ptr<int64_t>(full_to_swa_index_mapping, "full_to_swa_lut");
-    const bool has_swa_lut = (lut_ptr != nullptr);
-    int64_t lut_len = 0;
-    if (has_swa_lut) {
-      lut_len = static_cast<int64_t>(full_to_swa_index_mapping.value().shape()[0]);
-    }
+    const bool has_swa_lut = full_to_swa_index_mapping.has_value();
+    const int64_t* lut_ptr =
+        has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
+    const int64_t lut_len =
+        has_swa_lut ? static_cast<int64_t>(full_to_swa_index_mapping.value().shape()[0]) : 0;
 
     const PlanEntriesParams params = PlanEntriesParams{
-        .req_pool_indices = unwrap_data_ptr<int64_t>(req_pool_indices, "req_pool_indices"),
-        .prefix_lens = unwrap_data_ptr<int64_t>(prefix_lens, "prefix_lens"),
-        .req_to_token = unwrap_data_ptr<int32_t>(req_to_token, "req_to_token"),
+        .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        .prefix_lens = static_cast<const int64_t*>(prefix_lens.data_ptr()),
+        .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .full_to_swa_lut = lut_ptr,
-        .verify_offsets_scratch = unwrap_data_ptr<int64_t>(verify_offsets_scratch, "verify_offsets_scratch"),
-        .out_verify_slot_indices = unwrap_data_ptr_mut<int64_t>(out_verify_slot_indices, "out_verify_slot_indices"),
-        .out_verify_positions = unwrap_data_ptr_mut<int64_t>(out_verify_positions, "out_verify_positions"),
-        .out_verify_prev_slot_indices =
-            unwrap_data_ptr_mut<int64_t>(out_verify_prev_slot_indices, "out_verify_prev_slot_indices"),
+        .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
+        .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
+        .out_verify_positions = static_cast<int64_t*>(out_verify_positions.data_ptr()),
+        .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),
         .bs_padded = static_cast<int32_t>(bs_padded),
         .req_to_token_stride0 = req_to_token_stride0,
         .swa_window_size = static_cast<int32_t>(swa_window_size),
