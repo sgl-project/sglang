@@ -23,31 +23,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
+_BOUNDARY_INT_DTYPES = (torch.int32, torch.int64)
 _INPUT_IDS = "forward_batch.input_ids"
 _OUT_LOC = "forward_batch.out_cache_loc"
 _POSITIONS = "forward_batch.positions"
-
-
-def _assert_boundary_int64(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    """Assert (not convert) the boundary tensor is int64 + contiguous.
-
-    The previous helper performed ``tensor.to(torch.int64).contiguous()``,
-    which silently allocates fresh storage inside the cuda-graph capture
-    region when the source dtype/layout differs. SFM-era phase 2/3 must be
-    capture-safe, so we now require upstream callers (phase 1 outside the
-    graph) to deliver int64 contiguous tensors and only assert here.
-    """
-    assert tensor.dtype == torch.int64, (
-        f"kv-canary: {name} must have dtype torch.int64, got {tensor.dtype}; "
-        "the upstream phase-1 hook must canonicalize before entering the "
-        "cuda-graph region"
-    )
-    assert tensor.is_contiguous(), (
-        f"kv-canary: {name} must be contiguous, got non-contiguous; "
-        "the upstream phase-1 hook must canonicalize before entering the "
-        "cuda-graph region"
-    )
-    return tensor
 
 
 def invoke_plan(
@@ -86,9 +65,9 @@ def launch_endpoints_per_forward(
     real_kv_hash_mode: RealKvHashMode,
     input_check_mode: bool,
 ) -> None:
-    positions = _assert_boundary_int64(forward_batch.positions, _POSITIONS)
-    out_cache_loc = _assert_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
-    input_ids = _assert_boundary_int64(forward_batch.input_ids, _INPUT_IDS)
+    positions = _canonicalize_boundary_int64(forward_batch.positions, _POSITIONS)
+    out_cache_loc = _canonicalize_boundary_int64(forward_batch.out_cache_loc, _OUT_LOC)
+    input_ids = _canonicalize_boundary_int64(forward_batch.input_ids, _INPUT_IDS)
 
     num_tokens = int(positions.shape[0])
     if expected_inputs.tokens.shape[0] != num_tokens:
@@ -163,3 +142,15 @@ def _endpoint_belongs_to_group(
 ) -> bool:
     suffix = endpoint.kernel_kind.name.rsplit("_", 1)[1]
     return suffix == group.kind.name
+
+
+def _canonicalize_boundary_int64(
+    tensor: torch.Tensor | None, name: str
+) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.dtype not in _BOUNDARY_INT_DTYPES:
+        raise TypeError(
+            f"kv-canary: {name} must have dtype torch.int32 or torch.int64, got {tensor.dtype}"
+        )
+    return tensor.to(torch.int64).contiguous()

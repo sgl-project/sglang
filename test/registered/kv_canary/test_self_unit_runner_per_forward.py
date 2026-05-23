@@ -121,13 +121,15 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             )
         )
 
-    def test_launch_endpoints_per_forward_rejects_int32_boundary_tensors(self) -> None:
-        """Phase 2 must fail fast on int32 ForwardBatch tensors.
+    def test_launch_endpoints_per_forward_promotes_int32_boundary_tensors_to_int64(
+        self,
+    ) -> None:
+        """Verify int32 boundary tensors are promoted to int64 at the launch boundary.
 
-        Under the SFM design the kernel-launch boundary asserts int64
-        contiguous rather than silently allocating a converted copy
-        (capture-unsafe). This pins the new fail-fast behavior so the
-        contract cannot regress to the old promote-and-copy form.
+        The canonicalize helper runs ``.to(torch.int64).contiguous()`` on
+        each boundary tensor. Allocation inside cuda graph capture is
+        legal (the graph memory pool absorbs it — see qwen3.py forward
+        for the same pattern with ``.to(dtype)`` conversions).
         """
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
@@ -141,30 +143,34 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7], dtype=torch.int32, device=self.device
         )
+        forward_batch.num_token_non_padded_cpu = 1
 
-        with self.assertRaises(AssertionError):
-            kernel_launch_module.launch_endpoints_per_forward(
-                endpoints=(endpoint,),
-                group=group,
-                tag_filter=lambda tag: True,
-                verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
-                write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
-                forward_batch=forward_batch,
-                expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
-                violation_log=ViolationLog.allocate(
-                    ring_capacity=2, device=self.device
-                ),
-                real_kv_hash_mode=RealKvHashMode.OFF,
-                input_check_mode=False,
-            )
+        kernel_launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            input_check_mode=False,
+        )
 
-    def test_launch_endpoints_per_forward_rejects_strided_boundary_tensors(
+        self.assertEqual(len(endpoint.calls), 1)
+        call = endpoint.calls[0]
+        self.assertEqual(call["input_ids"].dtype, torch.int64)
+        self.assertEqual(call["positions"].dtype, torch.int64)
+        self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
+
+    def test_launch_endpoints_per_forward_materializes_strided_boundary_tensors(
         self,
     ) -> None:
-        """Phase 2 must fail fast on non-contiguous ForwardBatch views.
+        """Verify non-contiguous boundary views are materialized contiguous at launch.
 
-        Same rationale as the int32 case — capture-safety requires the
-        upstream phase-1 hook to provide already-contiguous tensors.
+        ``.contiguous()`` allocates a fresh copy; that allocation is fine
+        inside cuda graph capture (graph memory pool absorbs it).
         """
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
@@ -178,22 +184,26 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [[7, 8]], dtype=torch.int64, device=self.device
         )[:, 0]
+        forward_batch.num_token_non_padded_cpu = 1
 
-        with self.assertRaises(AssertionError):
-            kernel_launch_module.launch_endpoints_per_forward(
-                endpoints=(endpoint,),
-                group=group,
-                tag_filter=lambda tag: True,
-                verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
-                write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
-                forward_batch=forward_batch,
-                expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
-                violation_log=ViolationLog.allocate(
-                    ring_capacity=2, device=self.device
-                ),
-                real_kv_hash_mode=RealKvHashMode.OFF,
-                input_check_mode=False,
-            )
+        kernel_launch_module.launch_endpoints_per_forward(
+            endpoints=(endpoint,),
+            group=group,
+            tag_filter=lambda tag: True,
+            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
+            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            forward_batch=forward_batch,
+            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+            real_kv_hash_mode=RealKvHashMode.OFF,
+            input_check_mode=False,
+        )
+
+        self.assertEqual(len(endpoint.calls), 1)
+        call = endpoint.calls[0]
+        self.assertTrue(call["input_ids"].is_contiguous())
+        self.assertTrue(call["positions"].is_contiguous())
+        self.assertTrue(call["out_cache_loc"].is_contiguous())
 
 
 class TestManagerBeforeForward(CanaryManagerTestCase):
