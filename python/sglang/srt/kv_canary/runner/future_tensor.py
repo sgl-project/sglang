@@ -19,26 +19,26 @@ class FutureTensors:
 
     @classmethod
     def device_to_host(
-        cls, src_device: _TensorOrDict, *, stream: torch.cuda.Stream
+        cls, tensors_device: _TensorOrDict, *, stream: torch.cuda.Stream
     ) -> "FutureTensors":
-        if not isinstance(src_device, dict):
-            src_device = {_DUMMY_DICT_KEY: src_device}
+        if not isinstance(tensors_device, dict):
+            tensors_device = {_DUMMY_DICT_KEY: tensors_device}
 
-        dst_host: _PayloadDict = {}
+        tensors_host: _PayloadDict = {}
         device: Optional[torch.device] = None
-        for key, value in src_device.items():
-            if isinstance(value, torch.Tensor):
-                dst_host[key] = torch.empty(
-                    value.shape, dtype=value.dtype, pin_memory=True
+        for key, tensor_device in tensors_device.items():
+            if isinstance(tensor_device, torch.Tensor):
+                tensors_host[key] = torch.empty(
+                    tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
                 )
                 if device is None:
-                    device = value.device
+                    device = tensor_device.device
             else:
                 # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
                 # can bundle host metadata (e.g. the step at which the snapshot was
                 # staged) alongside the device tensors and recover that context in
                 # postprocess without reaching back into the producer.
-                dst_host[key] = value
+                tensors_host[key] = tensor_device
 
         if device is None:
             raise ValueError(
@@ -48,13 +48,13 @@ class FutureTensors:
 
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
-            for key, value in src_device.items():
-                if isinstance(value, torch.Tensor):
-                    _clone_and_copy_to_host(x_device=value, x_host=dst_host)
+            for key, tensor_device in tensors_device.items():
+                if isinstance(tensor_device, torch.Tensor):
+                    _clone_and_copy_to_host(x_device=tensor_device, x_host=tensors_host[key])
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_tensors=dst_host, _event=event)
+        return cls(_tensors=tensors_host, _event=event)
 
     def wait(self) -> _TensorOrDict:
         tensors = self._tensors

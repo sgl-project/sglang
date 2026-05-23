@@ -21,14 +21,14 @@ class TestFutureTensors(CustomTestCase):
 
         src_first = torch.tensor([41], dtype=torch.int32, device=device)
         future_first = FutureTensors.device_to_host(
-            src_device=src_first, stream=alt_stream
+            tensors_device=src_first, stream=alt_stream
         )
         result_first = future_first.wait()
         self.assertEqual(int(result_first.item()), 41)
 
         src_second = torch.tensor([97], dtype=torch.int32, device=device)
         future_second = FutureTensors.device_to_host(
-            src_device=src_second, stream=alt_stream
+            tensors_device=src_second, stream=alt_stream
         )
         result_second = future_second.wait()
         self.assertEqual(int(result_second.item()), 97)
@@ -38,7 +38,7 @@ class TestFutureTensors(CustomTestCase):
         device = torch.device("cuda")
         alt_stream = torch.cuda.Stream(device=device)
         src = torch.tensor([5], dtype=torch.int32, device=device)
-        future = FutureTensors.device_to_host(src_device=src, stream=alt_stream)
+        future = FutureTensors.device_to_host(tensors_device=src, stream=alt_stream)
         self.assertTrue(future._tensors.is_pinned())
         self.assertEqual(int(future.wait().item()), 5)
 
@@ -48,8 +48,8 @@ class TestFutureTensors(CustomTestCase):
         alt_stream = torch.cuda.Stream(device=device)
         src_a = torch.tensor([13], dtype=torch.int32, device=device)
         src_b = torch.tensor([29], dtype=torch.int32, device=device)
-        future_a = FutureTensors.device_to_host(src_device=src_a, stream=alt_stream)
-        future_b = FutureTensors.device_to_host(src_device=src_b, stream=alt_stream)
+        future_a = FutureTensors.device_to_host(tensors_device=src_a, stream=alt_stream)
+        future_b = FutureTensors.device_to_host(tensors_device=src_b, stream=alt_stream)
         self.assertNotEqual(future_a._tensors.data_ptr(), future_b._tensors.data_ptr())
         self.assertEqual(int(future_a.wait().item()), 13)
         self.assertEqual(int(future_b.wait().item()), 29)
@@ -62,7 +62,7 @@ class TestFutureTensors(CustomTestCase):
             "x": torch.tensor([11, 22], dtype=torch.int64, device=device),
             "y": torch.tensor([99], dtype=torch.int32, device=device),
         }
-        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        future = FutureTensors.device_to_host(tensors_device=src, stream=stream)
         out = future.wait()
         self.assertIsInstance(out, dict)
         self.assertEqual(out["x"].tolist(), [11, 22])
@@ -81,7 +81,7 @@ class TestFutureTensors(CustomTestCase):
             "extra": sentinel_obj,
             "counter": torch.tensor([7], dtype=torch.int32, device=device),
         }
-        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        future = FutureTensors.device_to_host(tensors_device=src, stream=stream)
         out = future.wait()
         self.assertEqual(out["step"], 42)
         self.assertEqual(out["label"], "decode")
@@ -96,7 +96,7 @@ class TestFutureTensors(CustomTestCase):
         stream = torch.cuda.Stream(device=device)
         src_tensor = torch.tensor([3], dtype=torch.int32, device=device)
         src = {"step": 100, "buf": src_tensor}
-        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        future = FutureTensors.device_to_host(tensors_device=src, stream=stream)
         out = future.wait()
         # Tensor is staged to a fresh pinned-host buffer (different storage from src).
         self.assertNotEqual(out["buf"].data_ptr(), src_tensor.data_ptr())
@@ -111,7 +111,7 @@ class TestFutureTensors(CustomTestCase):
         stream = torch.cuda.Stream(device=device)
         with self.assertRaises(ValueError):
             FutureTensors.device_to_host(
-                src_device={"step": 0, "label": "decode"}, stream=stream
+                tensors_device={"step": 0, "label": "decode"}, stream=stream
             )
 
     def test_wait_called_twice_raises(self) -> None:
@@ -119,7 +119,7 @@ class TestFutureTensors(CustomTestCase):
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         src = torch.tensor([3], dtype=torch.int32, device=device)
-        future = FutureTensors.device_to_host(src_device=src, stream=stream)
+        future = FutureTensors.device_to_host(tensors_device=src, stream=stream)
         self.assertEqual(int(future.wait().item()), 3)
         with self.assertRaises(RuntimeError):
             future.wait()
@@ -132,7 +132,7 @@ class TestFutureTensors(CustomTestCase):
             "step": 5,
             "buf": torch.tensor([17], dtype=torch.int32, device=device),
         }
-        out = FutureTensors.device_to_host(src_device=src, stream=stream).wait()
+        out = FutureTensors.device_to_host(tensors_device=src, stream=stream).wait()
         self.assertEqual(out["step"], 5)
         self.assertEqual(int(out["buf"].item()), 17)
 
