@@ -65,6 +65,7 @@ class CanaryRunner:
         self._swa_window_size = swa_window_size
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
+        self._in_forward_pass: bool = False
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -182,12 +183,24 @@ class CanaryRunner:
         capture happens inside the body; the in-graph HEAD/TAIL kernel launches are dispatched
         from the monkey-patched ``model.forward`` so they are captured (and auto-replayed) the
         same way the model itself is.
+
+        Re-entry is forbidden: each forward pass must bracket exactly one ``_end_of_step``.
+        EAGLE wraps the draft entry point with this ctx and also disables the inner
+        ``ModelRunner.forward`` canary_ctx via ``is_draft_worker`` — the assert catches
+        any future caller that breaks that invariant.
         """
+        assert (
+            not self._in_forward_pass
+        ), "CanaryRunner.with_forward_pass cannot be re-entered"
+        self._in_forward_pass = True
         self._before_forward(forward_batch)
         try:
             yield
         finally:
-            self._end_of_step(forward_batch)
+            try:
+                self._end_of_step(forward_batch)
+            finally:
+                self._in_forward_pass = False
 
     def _before_forward(self, forward_batch: "ForwardBatch") -> None:
         self._per_forward_orchestrator.before_forward(forward_batch)
