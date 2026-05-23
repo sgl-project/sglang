@@ -386,7 +386,9 @@ class EagleDraftWorker(BaseDraftWorker):
                     snapshot=sfm.snapshot,
                     maybe_inaccurate_forward_batch=forward_batch,
                 )
-            canary_manager.step_shared_facilities()
+            canary_manager.step_shared_facilities(
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -616,7 +618,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 snapshot=canary_sfm.snapshot,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            canary_manager.step_shared_facilities()
+            canary_manager.step_shared_facilities(
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
@@ -698,7 +702,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 snapshot=canary_sfm.snapshot,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            canary_manager.step_shared_facilities()
+            canary_manager.step_shared_facilities(
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

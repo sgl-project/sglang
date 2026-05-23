@@ -3205,7 +3205,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 snapshot=canary_sfm.snapshot,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            canary_manager.step_shared_facilities()
+            canary_manager.step_shared_facilities(
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
         if self.enable_elastic_ep:
             output = self._maybe_rebalance_after_rank_fault(
                 output,

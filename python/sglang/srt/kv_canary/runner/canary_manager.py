@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -244,10 +245,21 @@ class CanaryManager:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)
 
-    def step_shared_facilities(self) -> None:
+    def step_shared_facilities(
+        self,
+        *,
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"] = None,
+    ) -> None:
         """Fire the per-cycle shared facilities (sweep, violation drain,
         health, stats, swa-divergence). Caller invokes this once after all
         SFMs in the cycle have finished phase 4.
+
+        ``maybe_inaccurate_forward_batch`` is the same instance handed to
+        phase 4; the swa-divergence report reads its req_pool_indices /
+        seq_lens to compute the FULL-vs-SWA index divergence. By cycle
+        end the outer scheduler may already have advanced this batch,
+        but the divergence metric is a coarse trend signal and tolerates
+        the slight staleness.
         """
         if self.config.mode == "off":
             return
@@ -258,15 +270,9 @@ class CanaryManager:
         self._health_checker.step()
         self._stats_logger.step()
         if self._swa_divergence_report is not None:
-            # TODO(SFM): the swa_divergence report currently consumes a live
-            # ForwardBatch; under the SFM design phase 4 must not. Until
-            # the report is refactored to consume a snapshot, fall back to
-            # forward_batch=None — the FULL/SWA verify totals are still
-            # accumulated correctly inside phase 2 via observe_after_invoke_plan;
-            # only the swa_full_idx_divergence stat is suppressed.
             self._swa_divergence_report.step(
                 step_counter=self._step_counter,
-                forward_batch=None,
+                forward_batch=maybe_inaccurate_forward_batch,
             )
 
     def _get_step_counter(self) -> int:

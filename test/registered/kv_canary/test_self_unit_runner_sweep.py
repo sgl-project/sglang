@@ -33,7 +33,7 @@ def _run_one_cycle(manager, forward_batch) -> None:
         snapshot=sfm.snapshot,
         maybe_inaccurate_forward_batch=forward_batch,
     )
-    manager.step_shared_facilities()
+    manager.step_shared_facilities(maybe_inaccurate_forward_batch=forward_batch)
 
 
 class TestSelfUnitManagerSweep(CanaryManagerTestCase):
