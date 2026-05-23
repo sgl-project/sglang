@@ -3723,8 +3723,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(self.model, "post_load_weights"):
                 self.model.post_load_weights()
 
+        # LoRA wrappers forward `quant_method` for forward-path dispatch but
+        # don't own the packed params; skip them here so the inner base layer
+        # (yielded separately by `named_modules`) handles post-processing.
+        from sglang.srt.lora.layers import BaseLayerWithLoRA
+
         if recv_req.restore_weights_before_load:
             for _, module in self.model.named_modules():
+                if isinstance(module, BaseLayerWithLoRA):
+                    continue
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None and hasattr(
                     quant_method, "restore_weights_before_loading"
@@ -3734,6 +3741,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if recv_req.post_process_quantization:
             for _, module in self.model.named_modules():
+                if isinstance(module, BaseLayerWithLoRA):
+                    continue
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None and hasattr(
                     quant_method, "process_weights_after_loading"

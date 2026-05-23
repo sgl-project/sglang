@@ -515,7 +515,7 @@ def _merged_experts_fused_moe_lora_add_impl(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
     lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
+    lora_b: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     token_lora_mapping: torch.Tensor,
@@ -524,13 +524,30 @@ def _merged_experts_fused_moe_lora_add_impl(
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
 ) -> None:
+    """Fused virtual-experts LoRA delta add.
+
+    ``lora_b`` accepts either a single tensor or a sequence of tensors stacked
+    along the output dim. Length-2 is the gate_up case where A has rank ``2*r``
+    (gate's A and up's A concatenated along rank) and each B has rank ``r``.
+    The shrink runs once over the full ``2*r`` rank; the expand runs once per
+    B, each reading its half of the intermediate and writing to its slice of
+    ``output``.
     """
-    1. Prepare virtual expert routing metadata from topk_ids + token_lora_mapping * num_experts.
-    2. Flatten LoRA weights from [max_loras, num_experts, ...] to [max_loras * num_experts, ...].
-    3. Run regular SGLang fused-MoE kernels for LoRA A and LoRA B.
-    4. Mask out tokens with token_lora_mapping == -1 on the add path.
-    """
+    lora_b_list: list[torch.Tensor] = (
+        list(lora_b) if isinstance(lora_b, (list, tuple)) else [lora_b]
+    )
+    n_b = len(lora_b_list)
+    assert n_b in (1, 2), f"lora_b must be length 1 or 2, got {n_b}"
+    b_rank = lora_b_list[0].shape[3]
+    for b in lora_b_list[1:]:
+        assert b.shape == lora_b_list[0].shape, (
+            f"all lora_b tensors must share shape; got {[tuple(t.shape) for t in lora_b_list]}"
+        )
+
     max_loras, _, max_lora_rank, _ = lora_a.shape
+    assert max_lora_rank == n_b * b_rank, (
+        f"lora_a rank {max_lora_rank} != n_b ({n_b}) * lora_b rank {b_rank}"
+    )
     input_top_k = 1 if hidden_states.shape[0] == topk_ids.numel() else topk_ids.shape[1]
 
     def _merge_lora_expert_weight(t: torch.Tensor) -> torch.Tensor:
@@ -642,9 +659,10 @@ def _merged_experts_fused_moe_lora_add_impl(
     )
 
     lora_a_virtual = _merge_lora_expert_weight(lora_a)
-    lora_b_virtual = _merge_lora_expert_weight(lora_b)
+    lora_b_virtuals = [_merge_lora_expert_weight(b) for b in lora_b_list]
     num_experts_a = lora_a.shape[1]
-    num_experts_b = lora_b.shape[1]
+    num_experts_b = lora_b_list[0].shape[1]
+    half_out = lora_b_list[0].shape[2]
 
     intermediate = torch.zeros(
         [token_lora_mapping.shape[0], topk_ids.shape[1], max_lora_rank],
@@ -678,7 +696,7 @@ def _merged_experts_fused_moe_lora_add_impl(
         a_stage_config,
     )
 
-    b_stage_config = _get_stage_config(lora_b_virtual, 1)
+    b_stage_config = _get_stage_config(lora_b_virtuals[0], 1)
     (
         sorted_token_ids,
         expert_ids,
@@ -692,33 +710,47 @@ def _merged_experts_fused_moe_lora_add_impl(
         b_stage_config["BLOCK_SIZE_M"],
     )
 
-    invoke_fused_moe_kernel(
-        intermediate.view(-1, max_lora_rank),
-        lora_b_virtual,
-        None,
-        output,
-        None,
-        None,
-        None,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        mul_routed_weight,
-        1,
-        b_stage_config,
-        tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
-        False,
-        False,
-        False,
-        False,
-        False,
-        None,
-        fuse_add_to_output=True,
-        add_output_mask=token_lora_mask,
-        router_topk=topk_ids.shape[1],
-    )
+    # n_b expands. For len 1: K=b_rank covers full intermediate, write full output.
+    # For len 2 (gate_up): split intermediate along rank into [gate, up] halves
+    # (each contiguous, K=b_rank=r) and output along last dim into [gate, up]
+    # halves (each of width half_out). Each B in lora_b_virtuals is its own
+    # half's weight tensor, naturally K=b_rank.
+    for b_idx, b_virtual in enumerate(lora_b_virtuals):
+        if n_b == 1:
+            inter_arg = intermediate.view(-1, b_rank)
+            out_arg = output
+        else:
+            inter_arg = intermediate[..., b_idx * b_rank : (b_idx + 1) * b_rank].contiguous().view(-1, b_rank)
+            out_arg = output[..., b_idx * half_out : (b_idx + 1) * half_out].contiguous()
+        invoke_fused_moe_kernel(
+            inter_arg,
+            b_virtual,
+            None,
+            out_arg,
+            None,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight,
+            1,
+            b_stage_config,
+            tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16,
+            False,
+            False,
+            False,
+            False,
+            False,
+            None,
+            fuse_add_to_output=True,
+            add_output_mask=token_lora_mask,
+            router_topk=topk_ids.shape[1],
+        )
+        if n_b != 1:
+            output[..., b_idx * half_out : (b_idx + 1) * half_out].copy_(out_arg)
 
 
 def _merged_experts_fused_moe_lora_add_op(
@@ -761,7 +793,7 @@ def merged_experts_fused_moe_lora_add(
     output: torch.Tensor,
     hidden_states: torch.Tensor,
     lora_a: torch.Tensor,
-    lora_b: torch.Tensor,
+    lora_b: torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, ...],
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     token_lora_mapping: torch.Tensor,
@@ -770,7 +802,12 @@ def merged_experts_fused_moe_lora_add(
     experts_shared_outer_loras_b: bool,
     routing_cache: dict | None = None,
 ) -> None:
-    """Public API: wraps the registered op with routing_cache support."""
+    """Public API: wraps the registered op with routing_cache support.
+
+    ``lora_b`` accepts a sequence of length 2 for the gate_up case (each B
+    holds one half of the stacked output, rank ``r``, with A's rank ``2*r``);
+    a single tensor is used for the down case.
+    """
     _merged_experts_fused_moe_lora_add_impl(
         output,
         hidden_states,
