@@ -4,7 +4,10 @@
 # https://github.com/vllm-project/vllm/blob/7193774b1ff8603ad5bf4598e5efba0d9a39b436/vllm/model_executor/models/mllama.py
 """PyTorch Mllama model."""
 
+from __future__ import annotations
+
 import math
+from array import array
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -823,9 +826,11 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.text_config)
 
-    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+    def pad_input_ids(
+        self, input_ids: array[int], mm_inputs: MultimodalInputs
+    ) -> array[int]:
         pixel_values = torch.cat([item.feature for item in mm_inputs.mm_items], dim=0)
-        pad_values = [item.pad_value for item in mm_inputs.mm_items]
+        pad_values = array("q", (item.pad_value for item in mm_inputs.mm_items))
 
         num_concurrent_media, num_tiles = pixel_values.shape[1:3]
         num_patches = self.vision_model.num_patches
