@@ -33,9 +33,6 @@ def install_canary(
     if config.mode == "off":
         return None
 
-    # Piecewise cuda graph splits the model forward into many small captured
-    # sub-graphs, each of which would need its own canary bracket — not
-    # supported under the current SingleForwardManager design. Fail fast at install time.
     assert server_args.disable_piecewise_cuda_graph, (
         "kv-canary: piecewise cuda graph is not supported by the current "
         "SingleForwardManager design; pass --disable-piecewise-cuda-graph "
