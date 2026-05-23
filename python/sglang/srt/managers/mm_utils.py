@@ -1271,6 +1271,24 @@ def _slice_value(value, start, end):
         return value
 
 
+def _grid_rows_to_cpu_list(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.device.type != "cpu":
+            value = value.cpu()
+        return value.tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
+
+
+def _prod_grid_values(grid):
+    result = 1
+    for value in grid:
+        result *= int(value)
+    return result
+
+
 def _slice_model_data(
     data: dict,
     index: int,
@@ -1356,10 +1374,10 @@ def get_new_expanded_mm_items(original_mm_items):
                         expanded_mm_items.append(item)
                     continue
 
+                image_grid_rows = _grid_rows_to_cpu_list(image_grid_thw)
                 patches_per_item = []
-                for grid in image_grid_thw:
-                    grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                    patches_per_item.append(int(torch.prod(grid_tensor).item()))
+                for grid in image_grid_rows:
+                    patches_per_item.append(_prod_grid_values(grid))
 
                 cumulative = torch.cumsum(
                     torch.tensor(patches_per_item, dtype=torch.long), dim=0
@@ -1407,17 +1425,14 @@ def get_new_expanded_mm_items(original_mm_items):
                 # grid_len = num_videos, num_items = sum(T for each video) = total frames
                 grid_len = _get_length(video_grid_thw)
                 num_videos = grid_len
+                video_grid_rows = _grid_rows_to_cpu_list(video_grid_thw)
 
                 # Calculate total frames and frames per video
                 frames_per_video = []
                 total_frames = 0
                 for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        T = int(grid[0].item())  # T is the first element [T, H, W]
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        T = int(grid_tensor[0].item())
+                    grid = video_grid_rows[i]
+                    T = int(grid[0])  # T is the first element [T, H, W]
                     frames_per_video.append(T)
                     total_frames += T
 
@@ -1429,12 +1444,8 @@ def get_new_expanded_mm_items(original_mm_items):
                 # Calculate patches per video: T * H * W for each video
                 patches_per_video = []
                 for i in range(num_videos):
-                    grid = video_grid_thw[i]
-                    if isinstance(grid, torch.Tensor):
-                        patches_per_video.append(int(torch.prod(grid).item()))
-                    else:
-                        grid_tensor = torch.as_tensor(grid, dtype=torch.long)
-                        patches_per_video.append(int(torch.prod(grid_tensor).item()))
+                    grid = video_grid_rows[i]
+                    patches_per_video.append(_prod_grid_values(grid))
 
                 # Calculate cumulative patches to get slice indices for each video
                 cumulative = torch.cumsum(
