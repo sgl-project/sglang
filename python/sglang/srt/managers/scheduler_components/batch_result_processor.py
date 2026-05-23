@@ -585,21 +585,21 @@ class SchedulerBatchResultProcessor:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
-        # NGRAM verify flattens logits_output.hidden_states to
+        # Spec-V1 verify (NGRAM, EAGLE, EAGLE3, STANDALONE, multi-layer EAGLE,
+        # FROZEN_KV_MTP) flattens logits_output.hidden_states to
         # [sum(num_accept_per_req), hidden_dim] (one row per accepted token, incl.
         # bonus, in batch-row order). To attribute rows back to their request we
         # need per-req boundaries; the legacy `hidden_states[i]` indexing only
         # ever pulled one row per step.
-        ngram_hs_offsets = None
+        spec_v1_hs_offsets = None
         if (
             is_spec_v1
-            and batch.spec_algorithm.is_ngram()
             and logits_output.hidden_states is not None
             and result.num_correct_drafts_per_req_cpu is not None
         ):
-            ngram_hs_offsets = [0]
+            spec_v1_hs_offsets = [0]
             for c in result.num_correct_drafts_per_req_cpu:
-                ngram_hs_offsets.append(ngram_hs_offsets[-1] + c + 1)
+                spec_v1_hs_offsets.append(spec_v1_hs_offsets[-1] + c + 1)
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -616,8 +616,8 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
-                    if ngram_hs_offsets is not None:
-                        start, end = ngram_hs_offsets[i], ngram_hs_offsets[i + 1]
+                    if spec_v1_hs_offsets is not None:
+                        start, end = spec_v1_hs_offsets[i], spec_v1_hs_offsets[i + 1]
                         req.hidden_states.extend(
                             logits_output.hidden_states[start:end]
                             .cpu()
