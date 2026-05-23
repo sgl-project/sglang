@@ -23,13 +23,11 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
-# When set, every bench scenario captures a 30-step torch profile for the
-# canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. The
-# canary-off run is never profiled because the baseline trace is the upstream
-# attn kernel timeline and is not what we are investigating.
-# The 200% overhead assertion is skipped in this mode since profiler
-# instrumentation inflates step latency by ~10x and the comparison is no
-# longer meaningful.
+# When set, every bench scenario captures a 30-step torch profile of the
+# canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. In this
+# mode the canary-off baseline run is skipped entirely (no overhead is
+# computed and the 200% assertion does not fire), so the bench finishes in
+# roughly half the time and the on-side trace is what you read.
 _PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
 
@@ -118,26 +116,36 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )
     profile_root = _resolve_profile_root()
-    scenario_slug = scenario_key.replace("/", "_")
 
-    def _profile_dir(canary_on: bool) -> Optional[Path]:
-        if profile_root is None or not canary_on:
-            return None
-        return profile_root / f"{scenario_slug}_on"
+    if profile_root is not None:
+        scenario_slug = scenario_key.replace("/", "_")
+        profile_output_dir = profile_root / f"{scenario_slug}_on"
+        on = _run_one_canary_setting(
+            canary_on=True,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+            profile_output_dir=profile_output_dir,
+        )
+        print(
+            f"[canary self-bench] {scenario_key} profile mode: "
+            f"on={on.latency:.4f}s (trace under {profile_output_dir}); "
+            f"off baseline + overhead assertion skipped.",
+            flush=True,
+        )
+        return
 
     off = _run_one_canary_setting(
         canary_on=False,
         batch_size=batch_size,
         input_len=input_len,
         output_len=output_len,
-        profile_output_dir=_profile_dir(canary_on=False),
     )
     on = _run_one_canary_setting(
         canary_on=True,
         batch_size=batch_size,
         input_len=input_len,
         output_len=output_len,
-        profile_output_dir=_profile_dir(canary_on=True),
     )
     overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
     print(
@@ -145,16 +153,6 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
         f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%",
         flush=True,
     )
-
-    if profile_root is not None:
-        print(
-            f"[canary self-bench] profile mode active ({_PROFILE_DIR_ENV}="
-            f"{profile_root}); overhead assertion skipped because profiler "
-            f"instrumentation inflates step latency.",
-            flush=True,
-        )
-        return
-
     assert overhead_pct < 200.0, (
         f"canary overhead {overhead_pct:.1f}% suspiciously high for "
         f"{scenario_key} (off={off.latency:.4f}s, on={on.latency:.4f}s)"
