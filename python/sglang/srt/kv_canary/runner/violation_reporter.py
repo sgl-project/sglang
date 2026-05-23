@@ -40,21 +40,29 @@ class ViolationReporter:
         if write_index == 0:
             return
         ring = violation_log.violation_ring.cpu()
-        ring_overflow = write_index > int(ring.shape[0])
-        message = _format_violation(
-            row=ring[0].tolist(),
-            total=write_index,
-            ring_overflow=ring_overflow,
-            step_when_pumped=step_counter,
-        )
+        ring_capacity = int(ring.shape[0])
+        valid_count = min(write_index, ring_capacity)
+        ring_overflow = write_index > ring_capacity
+
+        messages: list[str] = [
+            _format_violation(
+                row=ring[i].tolist(),
+                total=write_index,
+                ring_overflow=ring_overflow,
+                step_when_pumped=step_counter,
+            )
+            for i in range(valid_count)
+        ]
+
         # log mode: always surface every violation as WARNING. Never rate-limit or demote to
         # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever
         # is producing them, not a reason to hide them.
         if self._config.mode == "log":
-            logger.warning(message)
+            for message in messages:
+                logger.warning(message)
             return
         self._raised = True
-        raise RuntimeError(message)
+        raise RuntimeError("\n\n".join(messages))
 
 
 def _canary_kind_label(tag: CanaryLaunchTag) -> str:
