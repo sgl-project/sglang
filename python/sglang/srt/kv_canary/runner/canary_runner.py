@@ -66,7 +66,7 @@ class CanaryRunner:
         self._swa_window_size = swa_window_size
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._step_counter: int = 0
-        self._in_forward_pass: bool = False
+        self._active_with_kernels_outside_cuda_graph: bool = False
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -215,9 +215,9 @@ class CanaryRunner:
         ``is_draft_worker`` and wraps the draft entry instead, so the outer
         cycle stays unique."""
         assert (
-            not self._in_forward_pass
+            not self._active_with_kernels_outside_cuda_graph
         ), "CanaryRunner.with_kernels_outside_cuda_graph cannot be re-entered"
-        self._in_forward_pass = True
+        self._active_with_kernels_outside_cuda_graph = True
         self._pre_kernels_outside_cuda_graph(forward_batch)
         try:
             yield
@@ -225,7 +225,7 @@ class CanaryRunner:
             try:
                 self._post_kernels_outside_cuda_graph(forward_batch)
             finally:
-                self._in_forward_pass = False
+                self._active_with_kernels_outside_cuda_graph = False
 
     def _pre_kernels_outside_cuda_graph(self, forward_batch: "ForwardBatch") -> None:
         self._per_forward_orchestrator.pre_kernels_outside_cuda_graph(forward_batch)
