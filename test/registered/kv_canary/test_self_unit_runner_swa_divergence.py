@@ -72,7 +72,7 @@ def _make_forward_batch(
 
 
 def _patch_future_tensor():
-    def _fake_device_to_host(src_device, *, stream=None) -> _RecordingFuture:
+    def _fake_device_to_host(src_device, *, d2h_stream=None) -> _RecordingFuture:
         if isinstance(src_device, dict):
             return _RecordingFuture(
                 value={k: v.detach().cpu().clone() for k, v in src_device.items()}
