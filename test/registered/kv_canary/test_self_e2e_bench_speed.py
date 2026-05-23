@@ -23,10 +23,13 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
-# When set, every bench scenario captures a 30-step torch profile for both the
-# canary-off and canary-on runs under `${KV_CANARY_PROFILE_DIR}/<scenario>_<off|on>/`.
-# The 200% overhead assertion is skipped in this mode since profiler instrumentation
-# inflates step latency by ~10x and the comparison is no longer meaningful.
+# When set, every bench scenario captures a 30-step torch profile for the
+# canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. The
+# canary-off run is never profiled because the baseline trace is the upstream
+# attn kernel timeline and is not what we are investigating.
+# The 200% overhead assertion is skipped in this mode since profiler
+# instrumentation inflates step latency by ~10x and the comparison is no
+# longer meaningful.
 _PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
 
@@ -118,9 +121,9 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
     scenario_slug = scenario_key.replace("/", "_")
 
     def _profile_dir(canary_on: bool) -> Optional[Path]:
-        if profile_root is None:
+        if profile_root is None or not canary_on:
             return None
-        return profile_root / f"{scenario_slug}_{'on' if canary_on else 'off'}"
+        return profile_root / f"{scenario_slug}_on"
 
     off = _run_one_canary_setting(
         canary_on=False,
