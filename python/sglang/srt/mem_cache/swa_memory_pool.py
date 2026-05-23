@@ -670,9 +670,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_canary_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        # DEBUG fix: device-wide sync forces schedule_stream to wait until forward_stream
-        # has drained all in-flight mapping reads from fwd_n. Removes the cross-stream
-        # RAW/WAR race on full_to_swa_index_mapping at the cost of overlap.
+        # DEBUG fix: device-wide sync on BOTH sides of the mapping write to cover
+        # the two directions of the C2 race independently.
+        #   - sync before write: drains fwd_n's in-flight reads of mapping (WAR)
+        #   - sync after write:  ensures write is visible before fwd_n+1's reads (RAW)
         torch.cuda.synchronize()
         self._kvcache.invalidate_loc_cache()
         swa_indices = self.full_to_swa_index_mapping[free_index]
@@ -682,6 +683,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # Canary records the "freed but not yet realloced" window so observers
         # can flag stale reads from forward_stream.
         self.full_to_swa_canary_mapping[free_index] = _SWA_CANARY_FREED_SENTINEL
+        torch.cuda.synchronize()
 
     def backup_state(self):
         return [
