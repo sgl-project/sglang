@@ -1455,6 +1455,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For chunked prefill in PP
     chunked_req: Optional[Req] = None
+    contains_last_prefill_chunk: bool = True
 
     # Sampling info
     sampling_info: SamplingBatchInfo = None
