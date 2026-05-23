@@ -21,6 +21,8 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+    # DEBUG: serialize every CUDA kernel launch to eliminate cross-stream races
+    "CUDA_LAUNCH_BLOCKING": "1",
 }
 
 _EAGLE_SPEC_ARGS = [
