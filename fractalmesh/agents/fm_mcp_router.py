@@ -140,22 +140,84 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     32,
-        "ports":      {"mcp_router": PORT, "web_terminal": 7777, "api_bridge": 7780,
-                       "strategy_engine": 7786, "revenue_aggregator": 7787},
+        "agents":     39,
+        "ports": {
+            "mcp_router":        PORT,
+            "web_terminal":      7777,
+            "api_bridge":        7780,
+            "strategy_engine":   7786,
+            "revenue_aggregator":7787,
+            "zapier_bridge":     7788,
+            "canva":             7789,
+            "huggingface":       7790,
+            "openrouter":        7791,
+            "devto_hub":         7792,
+            "supabase":          7793,
+        },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
     }
 
+def _handle_figma_sync(args, kwargs) -> dict:
+    file_key = kwargs.get("file_key", os.getenv("FIGMA_FILE_KEY", ""))
+    return {"action": "figma_sync_queued", "file_key": file_key or "default_tokens"}
+
+def _handle_canva_design(args, kwargs) -> dict:
+    template = kwargs.get("template_id", args[0] if args else "social_post_square")
+    title    = kwargs.get("title", "FractalMesh Design")
+    return {"action": "canva_design_queued", "template": template, "title": title}
+
+def _handle_hf_infer(args, kwargs) -> dict:
+    task   = kwargs.get("task", "text_generation")
+    inputs = kwargs.get("inputs", args[0] if args else "")
+    return {"action": "hf_infer_queued", "task": task, "input_len": len(str(inputs))}
+
+def _handle_openrouter_route(args, kwargs) -> dict:
+    prompt = kwargs.get("prompt", args[0] if args else "")
+    task   = kwargs.get("task", "draft")
+    tier   = kwargs.get("tier", "balanced")
+    return {"action": "or_route_queued", "task": task, "tier": tier,
+            "prompt_len": len(prompt)}
+
+def _handle_devto_publish(args, kwargs) -> dict:
+    title  = kwargs.get("title", args[0] if args else "")
+    series = kwargs.get("series", "fractalmesh_build")
+    return {"action": "devto_publish_queued", "title": title, "series": series}
+
+def _handle_zapier_fire(args, kwargs) -> dict:
+    zap     = kwargs.get("zap", args[0] if args else "")
+    payload = kwargs.get("payload", {})
+    return {"action": "zapier_fire_queued", "zap": zap, "payload_keys": list(payload.keys())}
+
+def _handle_supabase_sync(args, kwargs) -> dict:
+    table = kwargs.get("table", args[0] if args else "all")
+    return {"action": "supabase_sync_queued", "table": table}
+
+def _handle_generate_content(args, kwargs) -> dict:
+    topic  = kwargs.get("topic", args[0] if args else "")
+    series = kwargs.get("series", "fractalmesh_build")
+    tier   = kwargs.get("tier", "balanced")
+    return {"action": "content_gen_queued", "topic": topic, "series": series, "tier": tier}
+
 _INTENTS = {
-    "sync_samsung_calendar":  _handle_sync_calendar,
-    "sync_samsung_reminder":  _handle_sync_reminder,
-    "sync_google_workspace":  _handle_sync_workspace,
-    "device_utilities_pulse": _handle_device_pulse,
-    "send_samsung_message":   _handle_send_message,
-    "extract_research":       _handle_extract_research,
-    "apply_synthid_watermark":_handle_apply_watermark,
-    "mesh_status":            _handle_mesh_status,
+    # ── core ──────────────────────────────────────────────────────────────────
+    "sync_samsung_calendar":   _handle_sync_calendar,
+    "sync_samsung_reminder":   _handle_sync_reminder,
+    "sync_google_workspace":   _handle_sync_workspace,
+    "device_utilities_pulse":  _handle_device_pulse,
+    "send_samsung_message":    _handle_send_message,
+    "extract_research":        _handle_extract_research,
+    "apply_synthid_watermark": _handle_apply_watermark,
+    "mesh_status":             _handle_mesh_status,
+    # ── platform integrations ─────────────────────────────────────────────────
+    "figma_sync":              _handle_figma_sync,
+    "canva_design":            _handle_canva_design,
+    "hf_infer":                _handle_hf_infer,
+    "openrouter_route":        _handle_openrouter_route,
+    "devto_publish":           _handle_devto_publish,
+    "zapier_fire":             _handle_zapier_fire,
+    "supabase_sync":           _handle_supabase_sync,
+    "generate_content":        _handle_generate_content,
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
