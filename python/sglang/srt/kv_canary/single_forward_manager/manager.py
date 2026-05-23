@@ -48,6 +48,9 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
     launch_endpoints_per_forward,
 )
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
+from sglang.srt.kv_canary.single_forward_manager.data import (
+    PostOpsInsideGraphOutputSnapshot,
+)
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.speculative.spec_info import SpecInputType
@@ -74,26 +77,6 @@ class _SingleForwardPhase(IntEnum):
     AFTER_PRE_OUT = 1
     AFTER_PRE_MAYBE_IN = 2
     AFTER_POST_MAYBE_IN = 3
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PostOpsInsideGraphOutputSnapshot:
-    """Per-SingleForwardManager cloned view of the in-graph signals produced by phases 2-3.
-
-    The snapshot is written by phase 3 (``post_ops_maybe_inside_graph``)
-    and read by phase 4 (``post_ops_outside_graph``). It captures the
-    in-graph signals (verify-plan enable flag, kernel/slot counters,
-    violation write index, swa verify totals) whose live device-state
-    might be mutated by later steps in the same cycle. ForwardBatch
-    fields are NOT cloned here — perturb / divergence consumers in
-    phase 4 read the live (possibly inaccurate) ``ForwardBatch`` instead.
-    """
-
-    verify_plan_enable: torch.Tensor
-    kernel_run_counters: torch.Tensor
-    slot_run_counters: torch.Tensor
-    violation_write_index: torch.Tensor
-    swa_verify_total_count: torch.Tensor | None
 
 
 class SingleForwardManager:
