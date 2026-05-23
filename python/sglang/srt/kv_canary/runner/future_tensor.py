@@ -94,6 +94,7 @@ class DelayedDeviceHostHandler:
     ) -> None:
         if (pending := self._future) is not None:
             postprocess_on_host(pending.wait())
+            self._future = None
 
         # Must run on current stream, not d2h stream
         device_data = compute_on_device()
