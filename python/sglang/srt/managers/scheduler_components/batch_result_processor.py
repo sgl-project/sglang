@@ -585,12 +585,16 @@ class SchedulerBatchResultProcessor:
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
-        # Spec-V1 verify (NGRAM, EAGLE, EAGLE3, STANDALONE, multi-layer EAGLE,
-        # FROZEN_KV_MTP) flattens logits_output.hidden_states to
-        # [sum(num_accept_per_req), hidden_dim] (one row per accepted token, incl.
-        # bonus, in batch-row order). To attribute rows back to their request we
-        # need per-req boundaries; the legacy `hidden_states[i]` indexing only
-        # ever pulled one row per step.
+        # Spec-V1 verify (NGRAM, EAGLE, EAGLE3, multi-layer EAGLE, FROZEN_KV_MTP)
+        # flattens logits_output.hidden_states to [sum(num_accept_per_req),
+        # hidden_dim] (one row per accepted token, incl. bonus, in batch-row
+        # order). To attribute rows back to their request we need per-req
+        # boundaries; the legacy `hidden_states[i]` indexing only ever pulled
+        # one row per step. STANDALONE uses CaptureHiddenMode.NULL on target
+        # verify (eagle_worker.py target_capture_mode), so hidden_states is
+        # None and this branch is skipped — STANDALONE + return_hidden_states
+        # is unsupported today. DFLASH nulls hidden_states in dflash_info.py
+        # for the same reason; the `is not None` guard below excludes both.
         spec_v1_hs_offsets = None
         if (
             is_spec_v1

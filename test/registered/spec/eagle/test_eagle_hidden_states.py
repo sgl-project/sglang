@@ -9,9 +9,11 @@ per-request slice (see issue #26163). Prompts here repeat verbatim phrases
 so the drafter lands long accept streaks and actually exercises the
 multi-row slice.
 
-This test transitively covers STANDALONE (subclass of EAGLEWorker) and
-EAGLE3 (same EAGLEWorker code path) since all three land in the same
-`is_spec_v1` branch of `process_batch_result_decode`.
+EAGLE3 lands in the same `is_spec_v1` branch and uses the same slicing
+arithmetic, though it returns concatenated aux hidden_states with a
+different shape[-1] than plain EAGLE — explicit EAGLE3 coverage is a
+follow-up. STANDALONE uses CaptureHiddenMode.NULL on target verify, so
+its hidden_states is always None and this fix never fires for it.
 """
 
 import unittest
@@ -32,22 +34,28 @@ class TestEagleReturnHiddenStates(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        cls.engine = sgl.Engine(
-            model_path=DEFAULT_TARGET_MODEL_EAGLE,
-            speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
-            speculative_algorithm="EAGLE",
-            speculative_num_steps=5,
-            speculative_eagle_topk=8,
-            speculative_num_draft_tokens=64,
-            enable_return_hidden_states=True,
-            mem_fraction_static=0.7,
-            cuda_graph_max_bs=8,
-        )
+        try:
+            cls.engine = sgl.Engine(
+                model_path=DEFAULT_TARGET_MODEL_EAGLE,
+                speculative_draft_model_path=DEFAULT_DRAFT_MODEL_EAGLE,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=5,
+                speculative_eagle_topk=8,
+                speculative_num_draft_tokens=64,
+                enable_return_hidden_states=True,
+                mem_fraction_static=0.7,
+                cuda_graph_max_bs=8,
+            )
+        except Exception:
+            envs.SGLANG_ENABLE_SPEC_V2.clear()
+            raise
 
     @classmethod
     def tearDownClass(cls):
-        cls.engine.shutdown()
-        envs.SGLANG_ENABLE_SPEC_V2.clear()
+        try:
+            cls.engine.shutdown()
+        finally:
+            envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_eagle_with_return_hidden_states(self):
         prompts = [
