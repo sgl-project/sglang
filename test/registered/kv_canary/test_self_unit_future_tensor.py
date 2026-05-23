@@ -39,7 +39,11 @@ class TestFutureTensors(CustomTestCase):
         alt_stream = torch.cuda.Stream(device=device)
         src = torch.tensor([5], dtype=torch.int32, device=device)
         future = FutureTensors.device_to_host(xs_device=src, d2h_stream=alt_stream)
-        self.assertTrue(future._data.is_pinned())
+        staged_tensors = [
+            v for v in future._data.values() if isinstance(v, torch.Tensor)
+        ]
+        self.assertTrue(staged_tensors)
+        self.assertTrue(all(t.is_pinned() for t in staged_tensors))
         self.assertEqual(int(future.wait().item()), 5)
 
     def test_cuda_each_call_allocates_fresh_host(self) -> None:
@@ -50,7 +54,14 @@ class TestFutureTensors(CustomTestCase):
         src_b = torch.tensor([29], dtype=torch.int32, device=device)
         future_a = FutureTensors.device_to_host(xs_device=src_a, d2h_stream=alt_stream)
         future_b = FutureTensors.device_to_host(xs_device=src_b, d2h_stream=alt_stream)
-        self.assertNotEqual(future_a._data.data_ptr(), future_b._data.data_ptr())
+        ptrs_a = {
+            v.data_ptr() for v in future_a._data.values() if isinstance(v, torch.Tensor)
+        }
+        ptrs_b = {
+            v.data_ptr() for v in future_b._data.values() if isinstance(v, torch.Tensor)
+        }
+        self.assertTrue(ptrs_a and ptrs_b)
+        self.assertFalse(ptrs_a & ptrs_b)
         self.assertEqual(int(future_a.wait().item()), 13)
         self.assertEqual(int(future_b.wait().item()), 29)
 
