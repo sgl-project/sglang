@@ -898,10 +898,23 @@ class ServerArgs:
                 raise ValueError(
                     "--uds must be a non-empty path; received an empty string"
                 )
+            if not os.path.isabs(self.uds):
+                raise ValueError(
+                    f"--uds must be an absolute path; received {self.uds!r}. "
+                    "Relative paths bind relative to the process working "
+                    "directory, which is service-launcher-dependent and "
+                    "surprising for operators."
+                )
             if sys.platform == "win32":
                 raise ValueError(
                     "--uds is only supported on Linux and macOS; "
                     f"current platform: {sys.platform}"
+                )
+            if self.grpc_mode:
+                raise ValueError(
+                    "--uds is not supported in --grpc-mode; the gRPC server "
+                    "binds via its own listener and does not consult --uds. "
+                    "Drop one of --uds or --grpc-mode."
                 )
             # Compare against dataclass defaults to detect "user explicitly set
             # --host or --port alongside --uds". Argparse cannot distinguish

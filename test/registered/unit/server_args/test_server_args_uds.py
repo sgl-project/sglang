@@ -67,6 +67,29 @@ class TestServerArgsUDS(unittest.TestCase):
         self.assertIn("--uds", str(cm.exception))
         self.assertIn("non-empty", str(cm.exception))
 
+    def test_uds_relative_path_rejected(self):
+        # AF_UNIX accepts relative paths but the cwd is service-launcher
+        # dependent (systemd unit's WorkingDirectory, Docker WORKDIR, etc).
+        # Reject so the operator sees a clear error rather than a socket
+        # showing up in an unexpected directory.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(model_path="dummy", uds="sglang.sock")
+        self.assertIn("--uds", str(cm.exception))
+        self.assertIn("absolute path", str(cm.exception))
+
+    def test_uds_with_grpc_mode_rejected(self):
+        # The gRPC server binds via its own listener and never reads
+        # server_args.uds; silently ignoring --uds here would mask a
+        # user configuration mistake.
+        with self.assertRaises(ValueError) as cm:
+            ServerArgs(
+                model_path="dummy",
+                uds="/tmp/sglang-test.sock",
+                grpc_mode=True,
+            )
+        self.assertIn("--uds", str(cm.exception))
+        self.assertIn("--grpc-mode", str(cm.exception))
+
     def test_uds_cli_flag_parsed(self):
         from sglang.srt.server_args import prepare_server_args
         from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
