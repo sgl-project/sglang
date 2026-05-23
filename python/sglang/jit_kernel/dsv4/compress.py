@@ -6,6 +6,10 @@ import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 from .utils import make_name
 
