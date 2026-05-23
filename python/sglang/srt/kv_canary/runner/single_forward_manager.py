@@ -103,8 +103,11 @@ class SingleForwardManager:
     them outside the graph; phase 2/3 read/write them inside the captured
     region; phase 4 consumes the snapshot outside the graph.
 
-    KV-cache / device-state / endpoints / buffer groups / perturb manager
-    are shared with the owning :class:`CanaryManager`.
+    KV-cache / device-state / endpoints / buffer groups are shared with
+    the owning :class:`CanaryManager`. The perturb manager is only
+    installed on SFM(0) (the perturb owner for the outer cycle); SFM(i>0)
+    receives ``perturb_manager=None`` so that perturb fires exactly once
+    per cycle regardless of speculative-num-steps.
     """
 
     def __init__(
@@ -117,7 +120,7 @@ class SingleForwardManager:
         endpoints: tuple[CanaryEndpoint, ...],
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
-        perturb_manager: PerturbManager,
+        perturb_manager: Optional[PerturbManager],
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
@@ -132,7 +135,7 @@ class SingleForwardManager:
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._perturb_manager = perturb_manager
+        self._perturb_manager: Optional[PerturbManager] = perturb_manager
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
         self._swa_divergence_report: Optional[SwaDivergenceReport] = (
@@ -224,9 +227,10 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
-        self._perturb_manager.perturb(
-            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
-        )
+        if self._perturb_manager is not None:
+            self._perturb_manager.perturb(
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+            )
 
     def pre_ops_maybe_inside_graph(self, forward_batch: "ForwardBatch") -> None:
         """Phase 2. Capture-safe ops only (DECODE path is inside cuda graph;
@@ -356,9 +360,10 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.post_ops_outside_graph",
         )
 
-        self._perturb_manager.perturb_post_forward(
-            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
-        )
+        if self._perturb_manager is not None:
+            self._perturb_manager.perturb_post_forward(
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+            )
         self._enable_warner.tick(snapshot.verify_plan_enable)
 
 

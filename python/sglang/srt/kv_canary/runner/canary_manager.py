@@ -156,6 +156,11 @@ class CanaryManager:
         )
 
         num_sfms = max(1, speculative_num_steps - 1)
+        # Perturb fires once per outer cycle (not once per SFM). Only SFM(0)
+        # owns the perturb dispatch — its phase 1 fires pre-forward perturbs
+        # and its phase 4 fires the post-forward perturb. SFM(i>0) skips
+        # perturb entirely. This matches the target case (one SFM) which
+        # already fires perturb exactly once per cycle.
         self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
             SingleForwardManager(
                 config=config,
@@ -165,7 +170,7 @@ class CanaryManager:
                 endpoints=self._endpoints,
                 req_to_token_pool=req_to_token_pool,
                 swa_window_size=self._swa_window_size,
-                perturb_manager=self._perturb_manager,
+                perturb_manager=self._perturb_manager if i == 0 else None,
                 per_forward_verify_capacity=launch_capacities.per_forward_verify_capacity,
                 per_forward_write_req_capacity=launch_capacities.per_forward_write_req_capacity,
                 per_forward_write_entry_capacity=launch_capacities.per_forward_write_entry_capacity,
@@ -173,7 +178,7 @@ class CanaryManager:
                 token_oracle_manager=token_oracle_manager,
                 swa_divergence_report=self._swa_divergence_report,
             )
-            for _ in range(num_sfms)
+            for i in range(num_sfms)
         )
 
     @property
