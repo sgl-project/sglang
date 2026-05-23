@@ -206,6 +206,7 @@ def _build_mm_aux_data(mm_inputs, model_type=None):
         for attr in video_meta_attrs_for(model_type)
     }
 
+
 class MMEncoder:
     def __init__(
         self,
