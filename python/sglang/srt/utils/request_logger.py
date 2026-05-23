@@ -205,6 +205,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                     "sampling_params",
                 }
@@ -217,6 +218,7 @@ class RequestLogger:
                     "input_embeds",
                     "image_data",
                     "audio_data",
+                    "video_data",
                     "lora_path",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}

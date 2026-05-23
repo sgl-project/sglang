@@ -63,7 +63,7 @@ This repo now contains:
 
 Validated documentation and CI coverage currently center on these ModelOpt diffusion transformer override families:
 
-- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, Qwen Image, Qwen Image Edit
+- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, HunyuanVideo, Qwen Image, Qwen Image Edit
 - NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
@@ -71,26 +71,26 @@ Before writing CLI examples, re-read the active branch's `docs/diffusion/quantiz
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
 
-Mainline documentation now uses `lmsys/*` for the five converted ModelOpt
+Mainline documentation now uses `lmsys/*` for the eight converted ModelOpt
 checkpoint repos; the FLUX.2 NVFP4 raw export remains
 `black-forest-labs/FLUX.2-dev-NVFP4`. Do not use older `BBuf/*` examples unless
 you are explicitly testing a historical branch.
 
-## Open PR Watchlist
+## Related PR Watchlist
 
-As of 2026-05-02, these related SGLang PRs were open. Treat them as future
-support or migration work until they merge and the docs/CI matrix is updated.
+As of 2026-05-04, these related SGLang PRs are relevant to ModelOpt diffusion
+support. Treat unmerged items as future support or migration work until the
+docs/CI matrix is updated.
 
-- #23155 adds Qwen Image ModelOpt FP8 support.
+- #23155 added Qwen Image ModelOpt FP8 support.
 - #23199 adds HunyuanVideo ModelOpt FP8 support.
 - #23373 adds a runtime quantization flag; keep PTQ/export workflows separate from runtime quant examples until the CLI behavior is merged.
 - #24024 adds transformer FP8-cast compatibility mode.
 - #24186 re-enables B200 multimodal CI with NVFP4 fixes for FLUX.2 and Wan2.2.
 
-Do not expand the validated matrix beyond FLUX.1, FLUX.2, and Wan2.2 solely
-because one of these PRs exists. Add a row only after the exact checkpoint,
-loader path, accuracy check, and benchmark scope are validated on the active
-branch.
+Do not expand the validated matrix beyond the documented rows solely because a
+related PR exists. Add a row only after the exact checkpoint, loader path,
+accuracy check, and benchmark scope are validated on the active branch.
 
 ## Documentation Maintenance
 
@@ -193,6 +193,28 @@ For `FLUX.1-dev`, the validated fallback set currently keeps these modules in BF
 - `single_transformer_blocks.*.proj_mlp`
 
 Use `--model-type flux1` to force that profile, or rely on `--model-type auto` when the export config identifies `FluxTransformer2DModel`.
+
+HunyuanVideo uses `HunyuanVideoTransformer3DModel`, so the validated
+HunyuanVideo FP8 fallback preset keeps these modules in BF16:
+
+- `context_embedder.*`
+- `x_embedder.proj`
+- `time_text_embed.(timestep_embedder|guidance_embedder|text_embedder).linear_[12]`
+- `norm_out.linear`
+- `proj_out`
+- `transformer_blocks.*.norm1.linear`
+- `transformer_blocks.*.norm1_context.linear`
+- `single_transformer_blocks.*.norm.linear`
+
+Use `--model-type hunyuan-video` to force that profile, or rely on
+`--model-type auto` when the export config identifies
+`HunyuanVideoTransformer3DModel`.
+
+HunyuanVideo ModelOpt exports use diffusers module names that differ from
+SGLang runtime names for fused QKV and fused QKV+MLP layers. Keep the
+diffusers-to-runtime mapping in `build_modelopt_fp8_transformer.py` in sync
+with `runtime/models/dits/hunyuanvideo.py` before trusting converted scale
+tensors.
 
 Qwen Image and Qwen Image Edit share `QwenImageTransformer2DModel`, so one
 ModelOpt FP8 fallback preset covers both. The validated Qwen Image fallback set
