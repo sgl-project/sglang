@@ -19,7 +19,7 @@ class FakeEvent:
 def test_wait_clears_fields_and_rejects_second_wait() -> None:
     tensor = torch.tensor([1, 2, 3])
     event = FakeEvent()
-    future = FutureTensors(_tensors=tensor, _event=cast(torch.cuda.Event, event))
+    future = FutureTensors(_data=tensor, _event=cast(torch.cuda.Event, event))
 
     assert future.wait() is tensor
 

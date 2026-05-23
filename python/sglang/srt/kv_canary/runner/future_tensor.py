@@ -14,7 +14,7 @@ _DUMMY_DICT_KEY = "__dummy_key__"
 
 @dataclass(slots=True, kw_only=True)
 class FutureTensors:
-    _tensors: Optional[_PayloadDict]
+    _data: Optional[_PayloadDict]
     _event: Optional[torch.cuda.Event]
 
     @classmethod
@@ -47,23 +47,23 @@ class FutureTensors:
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_tensors=xs_host, _event=event)
+        return cls(_data=xs_host, _event=event)
 
     def wait(self) -> _TensorOrDict:
-        tensors = self._tensors
+        data = self._data
         event = self._event
-        self._tensors = None
+        self._data = None
         self._event = None
 
-        if tensors is None or event is None:
+        if data is None or event is None:
             raise RuntimeError("FutureTensors.wait() was called more than once")
 
         event.synchronize()
 
-        if _DUMMY_DICT_KEY in tensors:
-            tensors = tensors[_DUMMY_DICT_KEY]
+        if _DUMMY_DICT_KEY in data:
+            data = data[_DUMMY_DICT_KEY]
 
-        return tensors
+        return data
 
 
 def _clone_and_copy_to_host(x_device: torch.Tensor, x_host: torch.Tensor) -> torch.Tensor:
