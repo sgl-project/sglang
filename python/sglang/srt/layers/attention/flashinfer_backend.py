@@ -126,7 +126,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
-        # Store multi-item scoring flag for efficient access
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_mis = model_runner.server_args.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
@@ -558,6 +559,81 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
+    def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
+        return [
+            BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer,
+                "NHD",
+                backend=self.decode_backend,
+                use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+            )
+            for i in range(self.num_wrappers)
+        ]
+
+    def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
+        # FlashInfer's prefill wrapper decides mask mode based on whether
+        # `custom_mask_buf` is initialized (not whether a custom mask is provided).
+        # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
+        # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
+        # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+        wrappers = []
+        for i in range(self.num_wrappers):
+            extra = (
+                {
+                    "custom_mask_buf": self.cuda_graph_custom_mask,
+                    "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                }
+                if use_custom_mask
+                else {}
+            )
+            wrappers.append(
+                BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    "NHD",
+                    use_cuda_graph=True,
+                    backend=self.prefill_backend,
+                    qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                    paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                    paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                    paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                    **extra,
+                )
+            )
+        return wrappers
+
+    def _prepare_cuda_graph_metadata(
+        self,
+        bs: int,
+        num_tokens: int,
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ) -> None:
+        if forward_mode.is_decode_or_idle():
+            decode_wrappers = self._create_decode_wrappers(bs, num_tokens)
+            self.decode_cuda_graph_metadata[bs] = decode_wrappers
+            self.forward_metadata = DecodeMetadata(decode_wrappers)
+        elif (
+            forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend()
+            or forward_mode.is_dllm_extend()
+        ):
+            use_custom_mask = (
+                forward_mode.is_target_verify()
+                and spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            )
+            prefill_wrappers = self._create_prefill_wrappers(bs, use_custom_mask)
+            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            self.forward_metadata = PrefillMetadata(
+                prefill_wrappers, forward_mode.is_dllm_extend(), False
+            )
+        else:
+            raise ValueError(f"Invalid mode: {forward_mode=}")
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -568,148 +644,24 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        seq_lens_sum = seq_lens.sum().item()
+        seq_lens_cpu = seq_lens.cpu()
+        self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=seq_lens_sum,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        # fast_decode_plan requires _cached_module set by the initial full
+        # begin_forward call above; install it only after that first plan runs.
         if forward_mode.is_decode_or_idle():
-            decode_wrappers = []
-            for i in range(self.num_wrappers):
-                decode_wrappers.append(
-                    BatchDecodeWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.decode_backend,
-                        use_cuda_graph=True,
-                        use_tensor_cores=self.decode_use_tensor_cores,
-                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                            :num_tokens
-                        ],
-                    )
-                )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_decode.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                decode_wrappers=decode_wrappers,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
-            self.decode_cuda_graph_metadata[bs] = decode_wrappers
-            self.forward_metadata = DecodeMetadata(decode_wrappers)
-            for i in range(self.num_wrappers):
-                decode_wrappers[i].begin_forward = partial(
-                    fast_decode_plan, decode_wrappers[i]
-                )
-        elif forward_mode.is_target_verify():
-            # FlashInfer's prefill wrapper decides mask mode based on whether
-            # `custom_mask_buf` is initialized (not whether a custom mask is provided).
-            # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
-            # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
-            # FlashInfer will treat the (zero) buffer as a real mask and block attention.
-            use_custom_mask = (
-                spec_info is not None
-                and getattr(spec_info, "custom_mask", None) is not None
-            )
-            prefill_wrappers = []
-            for i in range(self.num_wrappers):
-                wrapper_kwargs = {}
-                if use_custom_mask:
-                    wrapper_kwargs = {
-                        "custom_mask_buf": self.cuda_graph_custom_mask,
-                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
-                    }
-
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        use_cuda_graph=True,
-                        backend=self.prefill_backend,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        **wrapper_kwargs,
-                    )
-                )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=False,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-        elif forward_mode.is_draft_extend():
-            prefill_wrappers = []
-            for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    )
-                )
-
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=False,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
-        elif forward_mode.is_dllm_extend():
-            prefill_wrappers = []
-            for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend=self.prefill_backend,
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                    )
-                )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=seq_lens - self.dllm_config.block_size,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=not self.use_paged,
-                encoder_lens=encoder_lens,
-                spec_info=None,
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
-        else:
-            raise ValueError(f"Invalid mode: {forward_mode=}")
+            for w in self.decode_cuda_graph_metadata[bs]:
+                w.begin_forward = partial(fast_decode_plan, w)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -734,19 +686,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 fixed_split_size=None,
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
-        elif forward_mode.is_target_verify():
-            self.indices_updater_prefill.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=False,
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
-            )
-        elif forward_mode.is_draft_extend():
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -802,7 +742,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
@@ -812,7 +752,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -836,12 +776,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
-            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+            # `self.token_to_kv_pool` for this layer. This enables attention over
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
-                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+                k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+                v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
@@ -875,7 +815,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -884,7 +824,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -912,14 +852,14 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
@@ -1547,6 +1487,7 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     def common_template(
         self,
@@ -1562,7 +1503,7 @@ class FlashInferMultiStepDraftBackend:
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
