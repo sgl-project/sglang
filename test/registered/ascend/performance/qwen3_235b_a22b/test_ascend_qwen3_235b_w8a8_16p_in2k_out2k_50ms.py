@@ -29,6 +29,7 @@ MODEL_CONFIG = {
         "HCCL_OP_EXPANSION_MODE": "AIV",
         "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
         "SGLANG_ENABLE_SPEC_V2": "1",
+        "TRANSFORMERS_VERBOSITY": "error",
     },
     "other_args": [
         "--trust-remote-code",
