@@ -89,9 +89,15 @@ class LightningAttentionBackend(MambaAttnBackendBase):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
-        metadata = self._capture_metadata(bs, req_pool_indices, forward_mode, spec_info)
-        self.forward_metadata = BailingLinearMetadata.prepare_decode(
-            metadata.query_start_loc, metadata.mamba_cache_indices, bs, seq_lens
+        self.init_forward_metadata_replay_cuda_graph(
+            bs=bs,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_sum=None,
+            encoder_lens=encoder_lens,
+            forward_mode=forward_mode,
+            spec_info=spec_info,
+            seq_lens_cpu=None,
         )
 
     def init_forward_metadata_replay_cuda_graph(
