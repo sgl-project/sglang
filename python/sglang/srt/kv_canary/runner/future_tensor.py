@@ -98,15 +98,6 @@ class DelayedDeviceHostHandler:
         compute_on_device: Callable[[], Optional[_TensorOrDict]],
         postprocess_on_host: Callable[[_TensorOrDict], None],
     ) -> None:
-        # EAGLE draft cuda graph runner captures the whole ModelRunner.forward
-        # including with_forward_pass.__exit__ -> _end_of_step -> this step().
-        # Inside a cuda graph capture, event.synchronize() (via pending.wait())
-        # raises cudaErrorStreamCaptureUnsupported. Skip both drain and stage:
-        # capture warmup runs a few times and any stale pending future from
-        # pre-capture warmup gets drained on the next out-of-capture step.
-        if torch.cuda.is_current_stream_capturing():
-            return
-
         if (pending := self._future) is not None:
             postprocess_on_host(pending.wait())
             self._future = None
