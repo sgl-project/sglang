@@ -19,12 +19,15 @@ class FakeEvent:
 def test_wait_clears_fields_and_rejects_second_wait() -> None:
     tensor = torch.tensor([1, 2, 3])
     event = FakeEvent()
-    future = FutureTensors(_data=tensor, _event=cast(torch.cuda.Event, event))
+    future = FutureTensors(
+        _data={"x": tensor}, _event=cast(torch.cuda.Event, event)
+    )
 
-    assert future.wait() is tensor
+    result = future.wait()
+    assert result["x"] is tensor
 
     assert event.synchronize_count == 1
-    assert future._tensor is None
+    assert future._data is None
     assert future._event is None
     with pytest.raises(RuntimeError, match="called more than once"):
         future.wait()
