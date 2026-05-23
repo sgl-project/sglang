@@ -150,3 +150,21 @@ def pick_out_cache_loc_slot(*, forward_batch: "ForwardBatch") -> Optional[int]:
     if slot < 0:
         return None
     return slot
+
+
+def pick_out_cache_loc_slot_from_tensor(
+    *, out_cache_loc: torch.Tensor
+) -> Optional[int]:
+    """Snapshot-driven variant of :func:`pick_out_cache_loc_slot`.
+
+    Operates on a pre-cloned out_cache_loc tensor without consulting any
+    ForwardBatch state (callers in phase 4 must not read the live batch).
+    Negative entries are treated as padding/skip and filtered out.
+    """
+    if out_cache_loc.numel() == 0:
+        return None
+    host = out_cache_loc.detach().to("cpu").tolist()
+    valid: list[int] = [slot for raw in host if (slot := int(raw)) >= 0]
+    if not valid:
+        return None
+    return valid[random.randrange(len(valid))]
