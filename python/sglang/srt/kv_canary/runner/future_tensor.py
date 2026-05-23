@@ -24,9 +24,15 @@ class FutureTensors:
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
 
-        device = next(
-            x.device for x in xs_device.values() if isinstance(x, torch.Tensor)
+        first_tensor = next(
+            (x for x in xs_device.values() if isinstance(x, torch.Tensor)), None
         )
+        if first_tensor is None:
+            raise ValueError(
+                f"FutureTensors.device_to_host requires at least one tensor entry; "
+                f"got dict with keys={list(xs_device)} containing no Tensor"
+            )
+        device = first_tensor.device
         tensors_device = {
             k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)
         }
