@@ -906,6 +906,8 @@ class ServerArgs:
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
+        if self.mamba_scheduler_strategy == "auto":
+            self.mamba_scheduler_strategy = "no_buffer"
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -1160,12 +1162,6 @@ class ServerArgs:
         # Handle ModelScope model downloads
         if envs.SGLANG_USE_MODELSCOPE.get():
             self._handle_modelscope_paths()
-
-        # Mamba scheduler strategy
-        if self.mamba_scheduler_strategy == "auto":
-            # TODO: when extra_buffer is more verified, we can set the default path based on
-            #       [overlap, non-overlap]
-            self.mamba_scheduler_strategy = "no_buffer"
 
         # In speculative scenario:
         # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
@@ -2333,6 +2329,10 @@ class ServerArgs:
             ]:
                 sm100_default_attn_backend = "triton"
                 if is_sm100_supported():
+                    mamba_extra_buffer_enabled = (
+                        self.mamba_scheduler_strategy == "auto"
+                        or self.enable_mamba_extra_buffer()
+                    )
                     # trtllm_mha requires speculative_eagle_topk == 1 and page_size > 1.
                     # _get_default_attn_backend handles the eagle_topk check.
                     # There is only one case where page_size=1 is required,
@@ -2343,7 +2343,7 @@ class ServerArgs:
                         model_config=self.get_model_config(),
                     )
                     if default_attn_backend == "trtllm_mha" and not (
-                        not self.enable_mamba_extra_buffer()
+                        not mamba_extra_buffer_enabled
                         and not self.disable_radix_cache
                         and self.speculative_algorithm is None
                     ):
@@ -2506,6 +2506,16 @@ class ServerArgs:
             self.attention_backend = sm100_default_attention_backend
             logger.info(
                 f"Use {sm100_default_attention_backend} as attention backend on sm100 for {model_arch}"
+            )
+
+        if self.mamba_scheduler_strategy == "auto":
+            self.mamba_scheduler_strategy = (
+                "extra_buffer"
+                if support_mamba_cache
+                and support_mamba_cache_extra_buffer
+                and not self.disable_radix_cache
+                and (is_cuda() or is_musa() or is_npu())
+                else "no_buffer"
             )
 
         if not support_mamba_cache:
