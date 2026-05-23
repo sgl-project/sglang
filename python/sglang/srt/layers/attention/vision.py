@@ -484,9 +484,15 @@ class VisionFlash4Attention(nn.Module):
                 )
             cu_seqlens = cu_seqlens.get_data()
 
-        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        max_seqlen = seq_lens.max().item()
+        _precomputed_max = kwargs.get("max_seqlen", None)
+        if _precomputed_max is not None:
+            max_seqlen = int(_precomputed_max) if not isinstance(_precomputed_max, int) else _precomputed_max
+            if cu_seqlens.dtype != torch.int32 or cu_seqlens.device != q.device:
+                cu_seqlens = cu_seqlens.to(dtype=torch.int32, device=q.device)
+        else:
+            cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+            seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = seq_lens.max().item()
 
         output = flash_attn_varlen_func(
             q,
@@ -1035,11 +1041,14 @@ class VisionAttention(nn.Module):
     ) -> torch.Tensor:
         r"""
         Args:
-            x: [b, s, embed_dim]
+            x: [b, s, embed_dim] or [s, b, embed_dim] if input_layout="sb"
             cu_seqlens: [b]
         Returns:
-             [s, b, head * head_size]
+             [b, s, head * head_size] or [s, b, head * head_size] if input_layout="sb"
         """
+        input_layout = kwargs.pop("input_layout", None)
+        if input_layout == "sb":
+            x = x.transpose(0, 1)
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
@@ -1205,5 +1214,8 @@ class VisionAttention(nn.Module):
 
             # [s, b, h * head_size] --> [b, s, h * head_size]
             output = output.view(bsz, s, -1)
+
+        if input_layout == "sb":
+            output = output.transpose(0, 1)
 
         return output
