@@ -271,6 +271,15 @@ class MooncakeKVManager(CommonKVManager):
     def register_buffer_to_engine(self):
         # Batch register KV data buffers
         if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
+            logger.warning(
+                "kv_canary PD register probe: side=%s n_ptrs=%d lens=%s "
+                "first3_ptrs=%s last3_ptrs=%s",
+                self.disaggregation_mode,
+                len(self.kv_args.kv_data_ptrs),
+                self.kv_args.kv_data_lens,
+                [hex(p) for p in self.kv_args.kv_data_ptrs[:3]],
+                [hex(p) for p in self.kv_args.kv_data_ptrs[-3:]],
+            )
             self.engine.batch_register(
                 self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
             )
@@ -654,6 +663,19 @@ class MooncakeKVManager(CommonKVManager):
                 for layer_id in range(layers_current_pp_stage)
             ]
         assert layers_params is not None
+
+        if not getattr(self, "_kv_canary_probe_logged", False):
+            self._kv_canary_probe_logged = True
+            logger.warning(
+                "kv_canary PD layers_params probe: n=%d item_lens=%s "
+                "first3_ptrs=%s last3_ptrs=%s prefill_block0=%s dst_block0=%s",
+                len(layers_params),
+                [t[2] for t in layers_params],
+                [(hex(t[0]), hex(t[1])) for t in layers_params[:3]],
+                [(hex(t[0]), hex(t[1])) for t in layers_params[-3:]],
+                prefill_kv_blocks[0].tolist() if len(prefill_kv_blocks) else [],
+                dst_kv_blocks[0].tolist() if len(dst_kv_blocks) else [],
+            )
 
         def set_transfer_blocks(
             src_ptr: int, dst_ptr: int, item_len: int

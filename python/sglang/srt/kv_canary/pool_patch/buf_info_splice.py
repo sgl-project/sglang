@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, List, Tuple
 
 import torch
 
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.pool_patch.utils import wrap_method
+
+logger = logging.getLogger(__name__)
 
 BufInfoTriple = Tuple[List[int], List[int], List[int]]
 
@@ -65,7 +68,18 @@ def splice_kv_buf_info(
         mid = len(entries) // 2
         out = [k_head, *entries[:mid], k_tail, v_head, *entries[mid:], v_tail]
 
-    return _untranspose_entries(out)
+    triple = _untranspose_entries(out)
+    logger.warning(
+        "kv_canary PD buf_infos probe: n_ptrs=%d item_lens[:6]=%s item_lens[-6:]=%s "
+        "canary_k_head_ptr=%#x canary_k_head_nbytes=%d canary_k_head_item_len=%d",
+        len(triple[0]),
+        triple[2][:6],
+        triple[2][-6:],
+        k_head[0],
+        k_head[1],
+        k_head[2],
+    )
+    return triple
 
 
 def _entry_triple(buf: torch.Tensor, *, page_size: int) -> Tuple[int, int, int]:
