@@ -8,6 +8,7 @@ import torch
 from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patch.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
@@ -32,6 +33,7 @@ def install_canary(
     if config.mode == "off":
         return None
 
+    perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
     buffer_groups = attach_canary_buffers(
         pool=model_runner.token_to_kv_pool,
@@ -42,27 +44,43 @@ def install_canary(
     swa_allocator = (
         allocator if isinstance(allocator, SWATokenToKVPoolAllocator) else None
     )
+    launch_capacities = CanaryLaunchCapacities.from_args(
+        server_args=model_runner.server_args,
+        req_to_token_pool_size=model_runner.req_to_token_pool.size,
+        max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],
+        pool_slot_count=model_runner.max_total_num_tokens,
+    )
+    swa_window_size = model_runner.sliding_window_size or 0
     runner = CanaryRunner(
         config=config,
+        perturb_config=perturb_config,
         buffer_groups=buffer_groups,
         device=device,
         tp_group=get_tp_group(),
         pp_group=get_pp_group(),
         req_to_token_pool=model_runner.req_to_token_pool,
-        launch_capacities=CanaryLaunchCapacities.from_args(
-            server_args=model_runner.server_args,
-            req_to_token_pool_size=model_runner.req_to_token_pool.size,
-            max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],
-            pool_slot_count=model_runner.max_total_num_tokens,
-        ),
-        swa_window_size=model_runner.sliding_window_size or 0,
+        launch_capacities=launch_capacities,
+        swa_window_size=swa_window_size,
         token_oracle_manager=token_oracle_manager,
         swa_allocator=swa_allocator,
     )
 
     _patch_model_forward(model_runner=model_runner, runner=runner)
 
-    logger.info("install_canary: config=%s", config)
+    # Single-line summary of every knob that controls canary behavior at boot time.
+    # Disaggregation mode is included so PD logs are unambiguous about which side this is.
+    logger.info(
+        "install_canary: disaggregation_mode=%s config=%s perturb_config=%s "
+        "launch_capacities=%s n_buffer_groups=%d buffer_group_kinds=%s "
+        "swa_window_size=%d",
+        server_args.disaggregation_mode,
+        config,
+        perturb_config,
+        launch_capacities,
+        len(buffer_groups),
+        [g.kind.name for g in buffer_groups],
+        swa_window_size,
+    )
     return runner
 
 
