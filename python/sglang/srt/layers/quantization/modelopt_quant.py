@@ -107,11 +107,12 @@ try:
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
-except ImportError:
+except (ImportError, AssertionError, Exception):
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
+
 
 # Initialize logger for the module
 logger = logging.getLogger(__name__)
