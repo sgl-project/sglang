@@ -56,7 +56,15 @@ class TestVLMPerf5090(CustomTestCase):
             dataset_name="mmmu",
         )
 
-        if is_in_ci():
+        if is_in_amd_ci():
+            write_github_step_summary(
+                f"### test_vlm_online_latency\n"
+                f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"
+            )
+            self.assertLess(res["median_e2e_latency_ms"], 450000)
+            self.assertLess(res["median_ttft_ms"], 300000)
+            self.assertLess(res["median_itl_ms"], 8)
+        elif is_in_ci():
             write_github_step_summary(
                 f"### test_vlm_online_latency (5090)\n"
                 f"median_e2e_latency_ms: {res['median_e2e_latency_ms']:.2f} ms\n"

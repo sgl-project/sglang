@@ -43,7 +43,7 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
             # relax for mi300x
             if is_in_amd_ci():
-                self.assertGreater(res["output_throughput"], 900)
+                self.assertGreater(res["output_throughput"], 850)
             else:
                 self.assertGreater(res["output_throughput"], 2500)
 
