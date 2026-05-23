@@ -738,11 +738,27 @@ def _subprocess_popen_with_outputs(
     )
 
     def _dump(src, sinks):
-        for line in iter(src.readline, ""):
-            for sink in sinks:
-                sink.write(line)
-                sink.flush()
-        src.close()
+        try:
+            for line in iter(src.readline, ""):
+                for sink in sinks:
+                    try:
+                        sink.write(line)
+                        sink.flush()
+                    except Exception as exc:
+                        # One dead sink (e.g. StringIO closed by a prior tearDown) must not
+                        # take the whole pump down; log to fd=2 so the failure is visible and
+                        # keep dumping into the other sinks.
+                        os.write(
+                            2,
+                            f"_dump sink.write failed: sink={sink!r} exc={exc!r}\n".encode(
+                                "utf-8", "replace"
+                            ),
+                        )
+        finally:
+            try:
+                src.close()
+            except Exception:
+                pass
 
     threading.Thread(
         target=_dump,
