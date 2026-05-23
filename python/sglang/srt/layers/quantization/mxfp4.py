@@ -817,6 +817,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 shuffled_w2_scale, requires_grad=False
             )
 
+            # PATCH 1 (gpt-oss-120b MXFP4 on aiter/gfx950):
+            # Lines above already shuffle the weight storage into the
+            # gate/up-interleaved layout via shuffle_weight_a16w4(...). Mark
+            # that fact on the Parameter so aiter's runtime check
+            # ``getattr(w1, "is_shuffled", False)`` returns True and the
+            # dispatcher picks the preshuffle-aware kernel branch. Without
+            # this attribute aiter falls back to a non-preshuffled kernel
+            # (e.g. module_moe_ck2stages_*_preshuffle_off_*) that reads our
+            # already-shuffled tiles at the wrong positions -> garbage tokens.
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
+
             return
 
         if self.use_triton_kernels:
@@ -1206,6 +1218,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w13_weight = layer.w13_weight
                 w2_weight = layer.w2_weight
 
+            # PATCH 2 (gpt-oss-120b MXFP4 on aiter/gfx950):
+            # Tensor.view() returns a NEW Python tensor object that does not
+            # inherit attributes from the source. Without this re-tagging,
+            # the Parameter-level ``is_shuffled = True`` set in
+            # process_weights_after_loading is lost the moment we view as
+            # float4_e2m1fn_x2 to hand the tensor to aiter, and aiter then
+            # sees ``is_shuffled == False`` again. Re-attach so the
+            # preshuffle-aware kernel branch is actually used at runtime.
+            if hasattr(layer.w13_weight, "is_shuffled"):
+                w13_weight.is_shuffled = True
+                w2_weight.is_shuffled = True
+
             x_padded = torch.nn.functional.pad(
                 x, (0, self.hidden_pad), mode="constant", value=0.0
             )
@@ -1221,6 +1245,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
+                # PATCH 3c (gpt-oss-120b MXFP4 on aiter/gfx950):
+                # process_weights_after_loading shuffled w13/w2 into the
+                # gate/up-interleaved layout via
+                # ``shuffle_weight_a16w4(gate_up=...)``. Tell aiter so its
+                # dispatcher picks the matching INTERLEAVE kernel family
+                # (FlyDSL ``*_gui_fp8`` at M >= 256, CK 2-stage
+                # ``*_preshuffle_on_*`` at M < 256). Without this aiter
+                # defaults to SEPARATED and reads tiles with the wrong
+                # gate/up pairing -> garbage output.
+                gate_mode="interleave",
             )
             return self.runner.run(
                 dispatch_output._replace(hidden_states=x_padded), quant_info
