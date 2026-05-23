@@ -1954,6 +1954,13 @@ class FlashAttentionBackend(AttentionBackend):
                     self._sched_meta_buf[n:] = 0
                     metadata.scheduler_metadata = self._sched_meta_buf[:n]
 
+        if forward_mode.is_draft_extend(include_v2=True):
+            # CUDA graph bakes max_seq_len_q as a constant.  replay() sets it to
+            # max(num_accept_tokens_cpu) which is None/empty at capture time,
+            # falling back to 1.  Restore the correct upper bound so the kernel
+            # sees num_tokens_per_bs (not 1) for all replays of this graph.
+            self.forward_metadata.max_seq_len_q = num_tokens // bs
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
