@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import os
 import unittest
-from typing import ClassVar
+from pathlib import Path
+from typing import ClassVar, Optional
 
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
@@ -19,6 +22,13 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
+
+# When set, every bench scenario captures a 30-step torch profile for both the
+# canary-off and canary-on runs under `${KV_CANARY_PROFILE_DIR}/<scenario>_<off|on>/`.
+# The 200% overhead assertion is skipped in this mode since profiler instrumentation
+# inflates step latency by ~10x and the comparison is no longer meaningful.
+_PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
+_PROFILE_STEPS = 30
 
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
@@ -54,12 +64,26 @@ def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> Ben
 
 
 def _run_one_canary_setting(
-    *, canary_on: bool, batch_size: int, input_len: int, output_len: int
+    *,
+    canary_on: bool,
+    batch_size: int,
+    input_len: int,
+    output_len: int,
+    profile_output_dir: Optional[Path] = None,
 ) -> BenchOneCaseResult:
     server_args = _make_server_args(canary_on=canary_on)
     bench_args = _make_bench_args(
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )
+    if profile_output_dir is not None:
+        profile_output_dir.mkdir(parents=True, exist_ok=True)
+        bench_args = dataclasses.replace(
+            bench_args,
+            profile=True,
+            profile_steps=_PROFILE_STEPS,
+            profile_output_dir=str(profile_output_dir),
+        )
+
     results, _server_info = run_benchmark_internal(
         server_args=server_args,
         bench_args=bench_args,
@@ -81,21 +105,36 @@ def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> s
     )
 
 
+def _resolve_profile_root() -> Optional[Path]:
+    raw = os.getenv(_PROFILE_DIR_ENV)
+    return Path(raw).expanduser().resolve() if raw else None
+
+
 def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> None:
     scenario_key = _make_scenario_key(
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )
+    profile_root = _resolve_profile_root()
+    scenario_slug = scenario_key.replace("/", "_")
+
+    def _profile_dir(canary_on: bool) -> Optional[Path]:
+        if profile_root is None:
+            return None
+        return profile_root / f"{scenario_slug}_{'on' if canary_on else 'off'}"
+
     off = _run_one_canary_setting(
         canary_on=False,
         batch_size=batch_size,
         input_len=input_len,
         output_len=output_len,
+        profile_output_dir=_profile_dir(canary_on=False),
     )
     on = _run_one_canary_setting(
         canary_on=True,
         batch_size=batch_size,
         input_len=input_len,
         output_len=output_len,
+        profile_output_dir=_profile_dir(canary_on=True),
     )
     overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
     print(
@@ -103,6 +142,16 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
         f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%",
         flush=True,
     )
+
+    if profile_root is not None:
+        print(
+            f"[canary self-bench] profile mode active ({_PROFILE_DIR_ENV}="
+            f"{profile_root}); overhead assertion skipped because profiler "
+            f"instrumentation inflates step latency.",
+            flush=True,
+        )
+        return
+
     assert overhead_pct < 200.0, (
         f"canary overhead {overhead_pct:.1f}% suspiciously high for "
         f"{scenario_key} (off={off.latency:.4f}s, on={on.latency:.4f}s)"
