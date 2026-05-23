@@ -667,17 +667,13 @@ class ReasoningParser:
             kwargs["continue_final_message"] = True
             last_message = request.messages[-1]
             previous_content = last_message.content
-            # Normalize None to "" so the detector's len()/`in` checks don't
-            # blow up on reasoning-only or tool-call-only prefills. The dsv4
-            # encoder path applies the same normalization before rendering.
+            # Avoid len(None)/`in` TypeError for reasoning-only prefills.
             if previous_content is None:
                 previous_content = ""
-            # DSV4-only: the encoder's wo_eos render (default for
-            # continue_final_message) injects </think> ahead of visible
-            # content, so prepend it here to keep _in_reasoning aligned with
-            # the actual prompt boundary. Skip when wo_eos was explicitly
-            # disabled — that path falls back to legacy strip-and-append and
-            # the prompt no longer has the encoder-injected </think>.
+            # Mirror the DSV4 encoder's wo_eos render (which injects
+            # </think> ahead of visible content) so _in_reasoning starts
+            # past the boundary. wo_eos=False routes to legacy
+            # strip-and-append where no </think> is emitted.
             if (
                 model_type.lower() == "deepseek-v4"
                 and getattr(last_message, "wo_eos", None) is not False

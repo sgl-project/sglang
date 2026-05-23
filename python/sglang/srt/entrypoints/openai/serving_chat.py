@@ -224,11 +224,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if isinstance(last_content, str):
                 if request.continue_final_message:
                     if self.chat_encoding_spec == "dsv4":
-                        # DSV4 must render the prefill inside the encoder so the
-                        # thinking block closes before visible content and any
-                        # reasoning_content on the final message is preserved.
-                        # Default wo_eos to True for the final turn; an explicit
-                        # False falls through to the legacy strip-and-append path.
+                        # Let the encoder render the prefill (it closes
+                        # </think> first); wo_eos=False opts out to the
+                        # legacy strip-and-append path below.
                         wo_eos = messages[-1].get("wo_eos")
                         if wo_eos is None:
                             messages[-1]["wo_eos"] = wo_eos = True
