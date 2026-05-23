@@ -164,37 +164,15 @@ unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optiona
 }
 
 // JIT-callable host launcher. Selects the templated kernel via the HAS_SWA_LUT bool. The persistent grid
-// is sized to ``num_sms * BLOCKS_PER_SM`` blocks of BLOCK_SIZE threads; we read ``num_sms`` once per
-// launch from cudaGetDeviceProperties through TVM FFI's device context, but for cuda-graph safety we
-// avoid querying the device every call -- ``num_sms`` is cached in a function-local static and only
-// looked up once per (device_id) the launcher sees. For the H200 we expect 132 SMs which yields
-// 132 * 8 = 1056 blocks of 128 threads = 135,168 persistent threads.
-//
-// Tuning rationale (per the plan note):
-//   - BLOCK_SIZE = 128: small enough to keep occupancy headroom on SM89/90, large enough that the binary
-//     search fits in warp-uniform branches (within a warp, contiguous tids usually share a req_id).
-//   - BLOCKS_PER_SM = 8: target occupancy of 8 ctas per SM with 128 threads each = 1024 active threads
-//     per SM (well within the H200 / Hopper 2048-thread-per-SM limit). The actual runtime occupancy may
-//     differ; this is the "embarrassingly parallel cap" rather than a hard tuning point.
+// is sized to ``num_sms * kBlocksPerSm`` blocks of ``kBlockSize`` threads. For the H200 we expect 132
+// SMs which yields 132 * 8 = 1056 blocks of 128 threads = 135,168 persistent threads.
 struct PlanEntriesKernel {
   static constexpr int kBlockSize = 128;
   static constexpr int kBlocksPerSm = 8;
 
-  static int get_num_sms(DLDevice device) {
-    // Lazy + cached per call site; cudaGetDeviceProperties is fast enough but we still avoid hitting it
-    // on every launch by storing the (device_id, multiProcessorCount) result.
-    static int cached_device_id = -1;
-    static int cached_num_sms = 0;
-    if (device.device_id != cached_device_id) {
-      int num_sms = 0;
-      cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device.device_id);
-      if (num_sms <= 0) {
-        num_sms = 80;  // sane fallback (V100 / A30 baseline)
-      }
-      cached_device_id = device.device_id;
-      cached_num_sms = num_sms;
-    }
-    return cached_num_sms;
+  static auto get_num_sms(DLDevice device) {
+    static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
+    return kNumSM;
   }
 
   static void
