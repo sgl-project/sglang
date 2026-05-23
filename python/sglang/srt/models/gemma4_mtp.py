@@ -21,6 +21,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
@@ -72,6 +73,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         self.assistant_config = config
         self.config = text_config
         self.quant_config = quant_config
+        self.pp_group = get_pp_group()
 
         self.vocab_size = text_config.vocab_size
         self.hidden_size = text_config.hidden_size
