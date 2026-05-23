@@ -84,6 +84,7 @@ class FullComponent(TreeComponent):
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         child_cd = child.component_data[ct]
+        new_parent.component_data[ct].host_lock_ref = child_cd.host_lock_ref
         split_len = len(new_parent.key)
         if child_cd.value is not None:
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()

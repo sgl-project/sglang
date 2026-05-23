@@ -34,6 +34,7 @@ class TreeCacheBuildContext:
     is_hybrid_swa: bool
     is_hybrid_ssm: bool
     enable_hierarchical_cache: bool
+    enable_hisparse: bool
     disable_radix_cache: bool
     effective_chunked_prefill_size: Optional[int]
     tp_worker: Any
@@ -86,6 +87,15 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
         from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
         return SWAChunkCache(params)
+
+    if ctx.enable_hisparse and not ctx.disable_radix_cache:
+        from sglang.srt.mem_cache.unified_cache_components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        params.tree_components = (ComponentType.FULL,)
+        cache = UnifiedRadixCache(params)
+        cache.enable_hisparse_mode()
+        return cache
 
     if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
         # lazy import to avoid JIT overhead
