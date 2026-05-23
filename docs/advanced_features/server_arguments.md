@@ -25,16 +25,16 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   python -m sglang.launch_server --config config.yaml
   ```
 
-- To enable multi-GPU tensor parallelism, add `--tp-size 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
+- To enable multi-GPU tensor parallelism, add `--tp 2`. If it reports the error "peer access is not supported between these two devices", add `--enable-p2p-check` to the server launch command.
 
   ```bash
-  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp-size 2
+  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
   ```
 
-- To enable multi-GPU data parallelism, add `--dp-size 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md) for data parallelism.
+- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway.md) for data parallelism.
 
   ```bash
-  python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp-size 2 --tp-size 2
+  python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
   ```
 
 - If you see out-of-memory errors during serving, try to reduce the memory usage of the KV cache pool by setting a smaller value of `--mem-fraction-static`. The default value is computed automatically based on GPU memory capacity and model configuration.
@@ -60,7 +60,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   # Node 0
   python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3-8B-Instruct \
-    --tp-size 4 \
+    --tp 4 \
     --dist-init-addr sgl-dev-0:50000 \
     --nnodes 2 \
     --node-rank 0
@@ -68,7 +68,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   # Node 1
   python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3-8B-Instruct \
-    --tp-size 4 \
+    --tp 4 \
     --dist-init-addr sgl-dev-0:50000 \
     --nnodes 2 \
     --node-rank 1
