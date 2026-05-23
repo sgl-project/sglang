@@ -32,6 +32,18 @@ class _PDPerturbBase(CanaryPDFixture):
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
+        # Explicitly zero out every perturb knob on the decode side so that no env value
+        # inherited from the parent process (whether from the pytest shell or from sglang's
+        # own subprocess env merge) can switch perturb on for D. The PD perturb scenario
+        # under test is "P-side flip, both sides surface the mismatch via verify on the
+        # transferred KV"; if D were also flipping its own KV it would silently rewrite
+        # canary metadata to match the local perturb and break that contract.
+        cls.extra_decode_env = {
+            "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
+            "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",
+            "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0",
+            "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0",
+        }
         super().setUpClass()
 
     def test_p_side_perturb_surfaces_real_kv_hash_violation_on_both_sides(
