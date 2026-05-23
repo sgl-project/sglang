@@ -970,7 +970,9 @@ class ServingChatTestCase(unittest.TestCase):
         prompt = "".join(result.prompt_ids)
         self.assertIn('<｜Assistant｜><think></think>{"answer":', prompt)
 
-    def test_dsv4_continue_final_message_explicit_wo_eos_false_falls_back_to_strip(self):
+    def test_dsv4_continue_final_message_explicit_wo_eos_false_falls_back_to_strip(
+        self,
+    ):
         """wo_eos=False opts out of the wo_eos render and falls back to the
         legacy strip-and-append path (two encode calls)."""
         self._setup_dsv4_prompt_capture()

@@ -1390,9 +1390,7 @@ class TestReasoningParserAdvanced(CustomTestCase):
             model="test",
             messages=[
                 ChatCompletionMessageUserParam(role="user", content="Hi"),
-                ChatCompletionMessageGenericParam(
-                    role="assistant", **assistant_kwargs
-                ),
+                ChatCompletionMessageGenericParam(role="assistant", **assistant_kwargs),
             ],
             continue_final_message=True,
         )
@@ -1423,7 +1421,9 @@ class TestReasoningParserAdvanced(CustomTestCase):
         self.assertEqual(parser.detector.previous_content, "</think>")
         self.assertFalse(parser.detector._in_reasoning)
 
-    def test_continue_final_message_deepseek_v4_explicit_wo_eos_false_skips_prepend(self):
+    def test_continue_final_message_deepseek_v4_explicit_wo_eos_false_skips_prepend(
+        self,
+    ):
         """Explicit wo_eos=False routes to legacy strip-and-append, so parser must not prepend."""
         request = self._make_continue_request(content='{"answer":', wo_eos=False)
         parser = ReasoningParser("deepseek-v4", request=request)
