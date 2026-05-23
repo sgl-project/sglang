@@ -12,12 +12,13 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
 
-#include <sgl_kernel/runtime.cuh>
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/runtime.cuh>  // For host::runtime::get_sm_count
+#include <sgl_kernel/utils.cuh>    // For LaunchKernel, SGL_DEVICE
 
+#include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
