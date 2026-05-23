@@ -33,6 +33,8 @@ class FutureTensors:
                 f"got dict with keys={list(xs_device)} containing no Tensor"
             )
         device = first_tensor.device
+        del first_tensor
+
         tensors_device = {
             k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)
         }
