@@ -20,7 +20,15 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
 
     model_mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[CanaryMode] = CanaryMode.LOG
-    extra_server_args: ClassVar[tuple[str, ...]] = ("--kv-canary-real-data", "partial")
+    # --skip-server-warmup: the sglang HTTP warmup uses FAKE_BOOTSTRAP_HOST to bypass real
+    # mooncake transfer, which leaves decode-side canary buffers uninitialised and makes
+    # HEAD_K_FULL verify fire false-positive chain_hash violations during boot. Until the
+    # canary runner learns to mask fake-transfer batches, skip the HTTP warmup on both sides.
+    extra_server_args: ClassVar[tuple[str, ...]] = (
+        "--kv-canary-real-data",
+        "partial",
+        "--skip-server-warmup",
+    )
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
