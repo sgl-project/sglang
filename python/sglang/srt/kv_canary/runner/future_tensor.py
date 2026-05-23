@@ -47,12 +47,9 @@ class FutureTensors:
 
         stream.wait_stream(torch.cuda.current_stream(ref_device))
         with torch.cuda.stream(stream):
-            if isinstance(src_device, dict):
-                for key, value in src_device.items():
-                    if isinstance(value, torch.Tensor):
-                        _clone_and_copy_to_host(x_device=value, x_host=host)
-            else:
-                _clone_and_copy_to_host(x_device=src_device, x_host=host)
+            for key, value in src_device.items():
+                if isinstance(value, torch.Tensor):
+                    _clone_and_copy_to_host(x_device=value, x_host=host)
             event = torch.cuda.Event()
             event.record()
 
