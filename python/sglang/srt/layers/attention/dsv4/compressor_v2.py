@@ -480,11 +480,11 @@ class CompressorBackendMixin:
             return
 
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
         kv_score_input = compressor.compute_kv_score(x, forward_batch)
-        state_pool = compressor.get_state_pool(forward_batch)
 
+        state_pool = compressor.get_state_pool(self)
         if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
             self._forward_unified_hip(
                 token_to_kv_pool=token_to_kv_pool,

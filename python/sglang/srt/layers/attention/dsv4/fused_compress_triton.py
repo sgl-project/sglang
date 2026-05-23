@@ -18,7 +18,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import CompressorDecodePlan, CompressorPrefillPlan
+from sglang.jit_kernel.dsv4.compress_old import (
+    CompressorDecodePlan,
+    CompressorPrefillPlan,
+)
 
 
 @triton.jit

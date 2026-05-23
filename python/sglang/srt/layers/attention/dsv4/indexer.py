@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     fused_q_indexer_rope_hadamard_quant,
     topk_transform_512,
     topk_transform_512_v2,
@@ -22,6 +22,7 @@ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )
@@ -373,7 +374,7 @@ class C4IndexerBackendMixin:
         # PREP_IN_CG lazy upgrade: this runs from MQALayer._forward_prepare,
         # before attn_backend.forward() would trigger the upgrade.
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
 
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -454,7 +455,7 @@ class C4IndexerBackendMixin:
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
 
-        hisparse_coordinator = forward_batch.hisparse_coordinator
+        hisparse_coordinator = self.hisparse_coordinator
         hisparse_decode = (
             hisparse_coordinator is not None and forward_batch.forward_mode.is_decode()
         )
@@ -597,11 +598,12 @@ class C4Indexer(nn.Module):
         x: torch.Tensor,
         q_lora: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
     ) -> None:
-        return forward_batch.attn_backend.forward_c4_indexer(
+        return attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
             forward_batch=forward_batch,
