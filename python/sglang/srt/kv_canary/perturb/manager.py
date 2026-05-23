@@ -14,6 +14,9 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.perturb.utils import WarmupGate
 
 if TYPE_CHECKING:
+    from sglang.srt.kv_canary.runner.single_forward_manager import (
+        PostOpsInsideGraphOutputSnapshot,
+    )
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -53,13 +56,27 @@ class PerturbManager:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._radix_cache = radix_cache
 
-    def perturb(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        self.perturb_req_to_token(forward_batch)
-        self.perturb_real_kv_used(forward_batch)
-        self.perturb_real_kv_unused_cache(forward_batch)
+    def perturb(
+        self,
+        *,
+        maybe_non_mature_forward_batch: Optional["ForwardBatch"],
+    ) -> None:
+        """Phase 1 entrypoint. The argument name flags that only batch-level
+        fields (active req set, base out_cache_loc) are safe to consume —
+        step-specific ForwardBatch fields may not yet be filled when an
+        EAGLE outer cycle calls this before any inner draft step has run."""
+        self.perturb_req_to_token(maybe_non_mature_forward_batch)
+        self.perturb_real_kv_used(maybe_non_mature_forward_batch)
+        self.perturb_real_kv_unused_cache(maybe_non_mature_forward_batch)
 
-    def end_of_forward(self, forward_batch: Optional["ForwardBatch"]) -> None:
-        self.perturb_real_kv_post_forward(forward_batch)
+    def consume_snapshot(
+        self,
+        *,
+        snapshot: "PostOpsInsideGraphOutputSnapshot",
+    ) -> None:
+        """Phase 4 entrypoint. Reads ONLY the dead post-step snapshot, never
+        the live ForwardBatch (which the outer cycle may have advanced)."""
+        self.perturb_real_kv_post_forward_from_snapshot(snapshot)
 
     def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
@@ -93,11 +110,12 @@ class PerturbManager:
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_post_forward(
-        self, forward_batch: Optional["ForwardBatch"]
+    def perturb_real_kv_post_forward_from_snapshot(
+        self,
+        snapshot: "PostOpsInsideGraphOutputSnapshot",
     ) -> None:
-        real_kv_post_forward.run(
-            forward_batch=forward_batch,
+        real_kv_post_forward.run_from_snapshot(
+            snapshot=snapshot,
             config=self._config,
             buffer_groups=self._buffer_groups,
             warmup_gate=self._warmup_gate,
