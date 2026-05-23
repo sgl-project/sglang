@@ -175,6 +175,10 @@ class PerForwardOrchestrator:
                 expected_inputs_out=self._expected_inputs,
             )
 
+        self._plan_input_per_forward.fill_from_forward_batch(
+            forward_batch=forward_batch,
+        )
+
     def launch_head_kernels(self, forward_batch: "ForwardBatch") -> None:
         if self._config.mode == "off":
             return
@@ -183,13 +187,6 @@ class PerForwardOrchestrator:
             expect_phase=_CanaryPerForwardPhase.AFTER_PRE,
             next_phase=_CanaryPerForwardPhase.AFTER_HEAD_KERNELS,
             caller_name="PerForwardOrchestrator.launch_head_kernels",
-        )
-
-        # Per-step PlanInput fill (inside the captured region). Each inner
-        # head/tail pair gets its own plan_input snapshot, so EAGLE draft's N
-        # inner forwards stay correct across replays.
-        self._plan_input_per_forward.fill_from_forward_batch(
-            forward_batch=forward_batch,
         )
 
         violation_log = self._device_state.violation_log
