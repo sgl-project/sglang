@@ -304,7 +304,12 @@ class PiecewiseCudaGraphRunner:
         # Set graph pool id globally to be able to use symmetric memory
         set_graph_pool_id(get_global_graph_memory_pool())
 
-        with enable_piecewise_cuda_graph():
+        canary_suspend_ctx = (
+            c.suspend_per_forward()
+            if (c := self.model_runner.canary_runner) is not None
+            else empty_context()
+        )
+        with enable_piecewise_cuda_graph(), canary_suspend_ctx:
             language_model = getattr(
                 self.model_runner.model, "language_model", self.model_runner.model
             )

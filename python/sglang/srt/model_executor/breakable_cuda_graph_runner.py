@@ -159,10 +159,16 @@ class BreakableCudaGraphRunner:
         set_graph_pool_id(get_global_graph_memory_pool())
 
         # Warmup then capture
-        self._warmup()
-        self.device_module.synchronize()
-        self.model_runner.tp_group.barrier()
-        self._capture_all()
+        canary_suspend_ctx = (
+            c.suspend_per_forward()
+            if (c := self.model_runner.canary_runner) is not None
+            else empty_context()
+        )
+        with canary_suspend_ctx:
+            self._warmup()
+            self.device_module.synchronize()
+            self.model_runner.tp_group.barrier()
+            self._capture_all()
 
         self.raw_num_tokens = 0
 
