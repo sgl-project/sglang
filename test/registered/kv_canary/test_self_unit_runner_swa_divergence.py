@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group
-from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_runner
+from sglang.test.kv_canary.runner_test_base import CanaryManagerTestCase, make_manager
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
@@ -369,21 +369,21 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
         self.assertEqual(parsed.verify_swa, 3)
 
 
-class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
+class TestCanaryManagerSwaDivergenceWiring(CanaryManagerTestCase):
     def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
             0
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
-            runner = make_runner(device=self.device)
-        self.assertIsNone(runner._swa_divergence_report)
+            manager = make_manager(device=self.device)
+        self.assertIsNone(manager._swa_divergence_report)
 
     def test_swa_divergence_report_present_when_env_enabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
             20
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
-            runner = make_runner(device=self.device)
-        self.assertIsNotNone(runner._swa_divergence_report)
-        self.assertIsInstance(runner._swa_divergence_report, SwaDivergenceReport)
+            manager = make_manager(device=self.device)
+        self.assertIsNotNone(manager._swa_divergence_report)
+        self.assertIsInstance(manager._swa_divergence_report, SwaDivergenceReport)
 
 
 if __name__ == "__main__":
