@@ -155,15 +155,55 @@ struct PlanEntriesKernel {
       const tvm::ffi::TensorView out_verify_slot_indices,
       const tvm::ffi::TensorView out_verify_positions,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
-      int64_t req_to_token_stride0,
-      int64_t bs_padded,
       int32_t swa_window_size) {
     using namespace host;
 
+    SymbolicSize Nbs = {"bs_padded"};
+    SymbolicSize NbsP1 = {"bs_padded_plus_one"};
+    SymbolicSize Ncap = {"verify_capacity"};
+    SymbolicSize Nmax_reqs = {"max_reqs"};
+    SymbolicSize Nmax_seq_len = {"max_seq_len"};
+    SymbolicSize Nlut = {"lut_len"};
+    SymbolicDevice device_;
+    device_.set_options<kDLCUDA>();
+
+    TensorMatcher({Nbs})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(req_pool_indices)
+        .verify(prefix_lens);
+    TensorMatcher({NbsP1})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(verify_offsets_scratch);
+    TensorMatcher({Ncap})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(out_verify_slot_indices)
+        .verify(out_verify_positions)
+        .verify(out_verify_prev_slot_indices);
+    TensorMatcher({Nmax_reqs, Nmax_seq_len})  //
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(req_to_token);
     const bool has_swa_lut = full_to_swa_index_mapping.has_value();
+    if (has_swa_lut) {
+      TensorMatcher({Nlut})  //
+          .with_dtype<int64_t>()
+          .with_device<kDLCUDA>(device_)
+          .verify(full_to_swa_index_mapping.value());
+    }
+    RuntimeCheck(
+        NbsP1.unwrap() == Nbs.unwrap() + 1, "verify_offsets_scratch length must equal bs_padded + 1");
+
+    const int64_t bs_padded = Nbs.unwrap();
+    if (bs_padded <= 0) {
+      return;
+    }
+
     const int64_t* lut_ptr =
         has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
-    const int64_t lut_len = has_swa_lut ? static_cast<int64_t>(full_to_swa_index_mapping.value().shape()[0]) : 0;
+    const int64_t lut_len = has_swa_lut ? static_cast<int64_t>(Nlut.unwrap()) : 0;
 
     const PlanEntriesParams params = PlanEntriesParams{
         .req_pool_indices = static_cast<const int64_t*>(req_pool_indices.data_ptr()),
@@ -175,15 +215,11 @@ struct PlanEntriesKernel {
         .out_verify_positions = static_cast<int64_t*>(out_verify_positions.data_ptr()),
         .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),
         .bs_padded = static_cast<int32_t>(bs_padded),
-        .req_to_token_stride0 = req_to_token_stride0,
-        .swa_window_size = static_cast<int32_t>(swa_window_size),
+        .req_to_token_stride0 = static_cast<int64_t>(Nmax_seq_len.unwrap()),
+        .swa_window_size = swa_window_size,
     };
 
-    if (bs_padded <= 0) {
-      return;
-    }
-
-    const DLDevice device = req_pool_indices.device();
+    const DLDevice device = device_.unwrap();
     const int num_sms = get_num_sms(device);
     const int num_blocks = num_sms * kBlocksPerSm;
 

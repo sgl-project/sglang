@@ -44,7 +44,5 @@ def launch_plan_entries_kernel(
         out_verify_slot_indices,
         out_verify_positions,
         out_verify_prev_slot_indices,
-        int(req_to_token.stride(0)),
-        int(req_pool_indices.shape[0]),
         int(swa_window_size),
     )
