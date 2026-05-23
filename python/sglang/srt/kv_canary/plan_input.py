@@ -24,16 +24,16 @@ class PlanInput:
         extend_seq_lens: Per-req tokens being written this step, shape [bs_capacity], int64.
             Extend length or all-ones for decode.
 
-    Allocated up front by CanaryRunner. ForwardBatch token/position/slot tensors may arrive as int32
-    or int64 at the boundary; canary canonicalizes them to int64 internally.
+    Allocated up front by :class:`SingleForwardManager`. The boundary
+    ForwardBatch token/position/slot tensors must already be int64
+    contiguous (upstream phase-1 hook is responsible).
 
-    **Static-buffer contract (cuda-graph correctness)**: the PlanInput's tensors are allocated once
-    during CanaryRunner.__init__ (sized for the worst-case per-forward batch). The per-forward
-    builder MUTATES those tensors in place each step via ``.copy_()`` / ``.fill_()`` / index-assign
-    on the default stream. The captured cuda-graph reads them by address; therefore: (a) never
-    reallocate, (b) all writes complete on the default stream before the captured region runs (i.e.
-    the writes happen in ``CanaryRunner.before_forward`` which the caller invokes in
-    ``ModelRunner.forward`` BEFORE ``graph_runner.replay()`` or ``model.forward()``).
+    **Static-buffer contract (cuda-graph correctness)**: the PlanInput's
+    tensors are allocated once at SFM construction time (sized for the
+    worst-case per-forward batch). The per-forward builder MUTATES those
+    tensors in place each step via ``.copy_()`` / ``.fill_()`` / in-place
+    arithmetic. The captured cuda-graph reads them by address; therefore
+    no reallocation is permitted.
     """
 
     req_pool_indices: torch.Tensor
@@ -75,7 +75,7 @@ class PlanInput:
         if bs > capacity:
             raise RuntimeError(
                 f"kv-canary: per-forward batch size {bs} exceeds static capacity {capacity}; "
-                "raise the buffer size in CanaryRunner.__init__"
+                "raise the buffer size in CanaryLaunchCapacities"
             )
 
         self.zero_()

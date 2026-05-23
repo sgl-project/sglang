@@ -21,11 +21,12 @@ class TokenOracleManager:
         forward_batch: "ForwardBatch",
         expected_inputs_out: ExpectedInputs,
     ) -> None:
-        """Called by CanaryRunner BEFORE its per-forward write launch when
-        CanaryConfig.input_check_mode is ON. Layout of the output tensors mirrors
-        forward_batch.input_ids / forward_batch.positions — flat, indexed by the same
-        write_offsets canary uses. Capacity of the placeholders is sized at CanaryRunner install
-        time to max per-forward write capacity (cuda-graph safe).
+        """Called by SingleForwardManager (phase 2) BEFORE its per-forward write
+        launch when CanaryConfig.input_check_mode is ON. Layout of the output
+        tensors mirrors forward_batch.input_ids / forward_batch.positions —
+        flat, indexed by the same write_offsets canary uses. Capacity of the
+        placeholders is sized at install time to max per-forward write
+        capacity (cuda-graph safe).
 
         For positions outside [0, current_seq_len) the value is undefined — caller is expected to
         keep mock-model running such that every (generalized_req_id, position) hit by the canary

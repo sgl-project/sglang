@@ -59,7 +59,7 @@ class ViolationLog:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryDeviceState:
-    """Device-side state owned by one CanaryRunner instance.
+    """Device-side state owned by one CanaryManager instance.
 
     One instance per ModelRunner. Held on the same device as the KV pool. All tensors are allocated up
     front (sizes fixed by CanaryConfig + cuda-graph capture capacity) and reused across forward steps —
