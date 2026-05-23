@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-namespace canary_plan_entries {
+namespace {
 
 // Per-launch device-side params struct. Passed via __grid_constant__.
 struct PlanEntriesParams {
@@ -198,4 +198,4 @@ struct PlanEntriesKernel {
   }
 };
 
-}  // namespace canary_plan_entries
+}  // namespace

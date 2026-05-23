@@ -17,7 +17,7 @@ def _jit_plan_entries_module() -> "Module":
         "kv_canary_plan_entries",
         cuda_files=["kv_canary/plan_entries.cuh"],
         cuda_wrappers=[
-            ("plan_entries", "canary_plan_entries::PlanEntriesKernel::run"),
+            ("plan_entries", "PlanEntriesKernel::run"),
         ],
     )
 
