@@ -368,14 +368,23 @@ def dispatch_w8a8_block_fp8_linear() -> Callable:
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     """Dispatch MXFP8 linear kernel by --fp8-gemm-backend.
 
-    For MXFP8, Triton remains the default path. We only route to FlashInfer
-    when backend is explicitly set to flashinfer_cutlass or flashinfer_trtllm.
+    For MXFP8, Triton remains the default path. We only route to another
+    backend when it is explicitly requested.
     """
     backend = get_fp8_gemm_runner_backend()
     if backend.is_flashinfer_trtllm():
         return flashinfer_mxfp8_blockscaled_linear
     elif backend.is_flashinfer_cutlass():
         return flashinfer_mxfp8_blockscaled_linear
+    elif backend.is_deep_gemm():
+        if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            raise RuntimeError(
+                "DeepGEMM MXFP8 requested via --fp8-gemm-backend=deep_gemm, "
+                "but DeepGEMM is not available. This usually means the deep_gemm "
+                "package is not installed or has been disabled via "
+                "SGLANG_ENABLE_JIT_DEEPGEMM=0."
+            )
+        return deepgemm_w8a8_mxfp8_linear
     return triton_mxfp8_blockscaled_linear
 
 
@@ -1023,6 +1032,109 @@ def triton_mxfp8_blockscaled_linear(
     )
 
 
+@register_custom_op(
+    op_name="deepgemm_mxfp8_block_scaled_matmul",
+    mutates_args=[],
+    fake_impl=lambda q_input, weight, x_scale, weight_scale, output_dtype: (
+        q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=output_dtype)
+    ),
+)
+def deepgemm_mxfp8_block_scaled_matmul(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    output = q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=output_dtype)
+    deep_gemm_wrapper.gemm_nt_f8f8bf16(
+        (q_input, x_scale),
+        (weight, weight_scale),
+        output,
+        recipe_a=(1, 32),
+        recipe_b=(1, 32),
+    )
+    return output
+
+
+def deepgemm_w8a8_mxfp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear via DeepGEMM's SM100 1D1D FP8 kernel."""
+    if not (_is_cuda and _is_sm100_supported):
+        raise RuntimeError("DeepGEMM MXFP8 dense linear requires SM100 GPUs.")
+
+    input_2d = input.view(-1, input.shape[-1]).contiguous()
+    output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    m, k = input_2d.shape
+    n, k_w = weight.shape
+    if k != k_w:
+        raise ValueError(f"Input K={k} does not match weight K={k_w}.")
+    if k % 128 != 0:
+        raise ValueError(f"K={k} must be divisible by 128 for DeepGEMM MXFP8.")
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError("MXFP8 weight must be FP8 E4M3.")
+    if weight_scale.dtype != torch.int32:
+        raise TypeError("DeepGEMM MXFP8 weight_scale must be packed UE8M0 int32.")
+    if weight_scale.shape != (n, k // 128):
+        raise ValueError(
+            "DeepGEMM MXFP8 weight_scale must have shape "
+            f"{(n, k // 128)}, got {tuple(weight_scale.shape)}."
+        )
+
+    if output_dtype is None:
+        output_dtype = (
+            input_2d.dtype if input_2d.dtype == torch.bfloat16 else torch.bfloat16
+        )
+    if output_dtype != torch.bfloat16:
+        raise TypeError("DeepGEMM MXFP8 dense linear currently supports BF16 output.")
+
+    if input_scale is None:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            32,
+            column_major_scales=True,
+            scale_tma_aligned=True,
+            scale_ue8m0=True,
+        )
+    else:
+        q_input = input_2d
+        if input_scale.dtype == torch.uint8:
+            if input_scale.shape != (m, k // 32):
+                raise ValueError(
+                    "Canonical MXFP8 input_scale must have shape "
+                    f"{(m, k // 32)}, got {tuple(input_scale.shape)}."
+                )
+            x_scale = transform_mxfp8_scale_ue8m0(input_scale)
+        elif input_scale.dtype == torch.int32:
+            x_scale = input_scale
+        else:
+            raise TypeError("DeepGEMM MXFP8 input_scale must be uint8 or int32.")
+
+    if x_scale.shape != (m, k // 128):
+        raise ValueError(
+            "DeepGEMM MXFP8 input scale must have shape "
+            f"{(m, k // 128)}, got {tuple(x_scale.shape)}."
+        )
+
+    output = deepgemm_mxfp8_block_scaled_matmul(
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        output_dtype,
+    )
+    if bias is not None:
+        output += bias
+    return output.to(dtype=output_dtype).view(*output_shape)
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1274,19 +1386,9 @@ def transform_scale_ue8m0_inplace(param, mn):
     param.data = transform_scale_ue8m0(param.data, mn=mn)
 
 
-# NOTE copy and modified from DeepGEMM
-def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
-    import deep_gemm.utils.layout
-
-    get_mn_major_tma_aligned_packed_ue8m0_tensor = (
-        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
-        if use_torch_impl
-        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
-    )
-
-    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
-    sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
-
+def _fix_packed_ue8m0_tma_stride(
+    sf: torch.Tensor, use_torch_impl: bool
+) -> torch.Tensor:
     # In sgl-deep-gemm, the C++ deepgemm path returns through DLPack which collapses the stride
     # of size-1 trailing dims to 1 (happens when packed_sf_k == 1, i.e.
     # K <= block_k * 4). Restore the TMA-aligned stride so the deepgemm
@@ -1300,6 +1402,45 @@ def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
             new_stride[-1] = aligned_mn
             sf = sf.as_strided(sf.shape, tuple(new_stride))
     return sf
+
+
+# NOTE copy and modified from DeepGEMM
+def transform_scale_ue8m0(sf, mn, use_torch_impl: bool = False):
+    import deep_gemm.utils.layout
+
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = (
+        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
+        if use_torch_impl
+        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
+    )
+
+    sf = sf.index_select(-2, torch.arange(mn, device=sf.device) // 128)
+    sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf)
+
+    return _fix_packed_ue8m0_tma_stride(sf, use_torch_impl)
+
+
+def transform_mxfp8_scale_ue8m0(
+    sf_u8: torch.Tensor,
+    use_torch_impl: bool = False,
+) -> torch.Tensor:
+    """Pack canonical MXFP8 UE8M0 uint8 scales for DeepGEMM SM100 kernels."""
+    if sf_u8.dtype == torch.int32:
+        return sf_u8
+    assert sf_u8.dtype == torch.uint8, f"{sf_u8.dtype=}"
+    assert sf_u8.dim() in (2, 3), f"{sf_u8.shape=}"
+
+    import deep_gemm.utils.layout
+
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = (
+        _get_mn_major_tma_aligned_packed_ue8m0_tensor_torch_impl
+        if use_torch_impl
+        else deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor
+    )
+
+    sf_fp32 = (sf_u8.contiguous().to(torch.int32) << 23).view(torch.float32)
+    sf = get_mn_major_tma_aligned_packed_ue8m0_tensor(sf_fp32)
+    return _fix_packed_ue8m0_tma_stride(sf, use_torch_impl)
 
 
 # Copied from DeepGEMM tests

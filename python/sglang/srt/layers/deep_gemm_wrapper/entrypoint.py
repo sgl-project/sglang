@@ -46,7 +46,15 @@ def grouped_gemm_nt_f8f8bf16_masked(
     rhs = _ensure_cuda(rhs)
 
     with compile_utils.deep_gemm_execution_hook(
-        expected_m, n, k, num_groups, kernel_type
+        expected_m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
     ):
         with configure_deep_gemm_num_sms(
             overlap_args.num_sms if overlap_args is not None else None
@@ -133,7 +141,17 @@ def grouped_gemm_nt_f8f8bf16_contig(
     if recipe_b is not None:
         fp4_kwargs["recipe_b"] = recipe_b
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
+    ):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
             lhs, rhs, out, m_indices, **fp4_kwargs
         )
@@ -154,6 +172,11 @@ def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+    compiled_dims: str = "nk",
+    disable_ue8m0_cast: bool = False,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
@@ -163,11 +186,35 @@ def gemm_nt_f8f8bf16(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+    fp8_kwargs = {}
+    if recipe is not None:
+        fp8_kwargs["recipe"] = recipe
+    if recipe_a is not None:
+        fp8_kwargs["recipe_a"] = recipe_a
+    if recipe_b is not None:
+        fp8_kwargs["recipe_b"] = recipe_b
+    if compiled_dims != "nk":
+        fp8_kwargs["compiled_dims"] = compiled_dims
+    if disable_ue8m0_cast:
+        fp8_kwargs["disable_ue8m0_cast"] = disable_ue8m0_cast
+
+    with compile_utils.deep_gemm_execution_hook(
+        m,
+        n,
+        k,
+        num_groups,
+        kernel_type,
+        recipe=recipe,
+        recipe_a=recipe_a,
+        recipe_b=recipe_b,
+        sf_dtype_a=lhs[1].dtype,
+        sf_dtype_b=rhs[1].dtype,
+    ):
         deep_gemm.fp8_gemm_nt(
             lhs,
             rhs,
             out,
+            **fp8_kwargs,
         )
 
 

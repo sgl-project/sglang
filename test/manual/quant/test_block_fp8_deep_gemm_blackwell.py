@@ -5,6 +5,11 @@ from typing import List, Tuple
 import torch
 from deep_gemm import fp8_gemm_nt
 
+from sglang.srt.layers.quantization.fp8_utils import (
+    deepgemm_w8a8_mxfp8_linear,
+    mxfp8_group_quantize,
+    transform_mxfp8_scale_ue8m0,
+)
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
@@ -165,6 +170,18 @@ def block_quant_dequant(
     return x_dq_block
 
 
+def mxfp8_dequant(
+    x_q: torch.Tensor,
+    x_s_u8: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    *batch_dims, k = x_q.shape
+    assert x_s_u8.shape == (*batch_dims, k // 32)
+    x_s = (x_s_u8.to(torch.int32) << 23).view(torch.float32)
+    x_dq = x_q.to(torch.float32).view(*batch_dims, -1, 32) * x_s.unsqueeze(-1)
+    return x_dq.view_as(x_q).to(dtype)
+
+
 class TestDeepGemmBlackwell(CustomTestCase):
 
     if not _is_cuda:
@@ -245,6 +262,33 @@ class TestDeepGemmBlackwell(CustomTestCase):
                 seed=params[4],
             ):
                 self._test_deep_gemm_blackwell(*params)
+
+    def test_deep_gemm_mxfp8_linear(self):
+        torch.manual_seed(0)
+        m, n, k = 128, 2112, 7168
+        a = torch.empty((m, k), dtype=torch.bfloat16).normal_(0, 0.2)
+        b = torch.empty((n, k), dtype=torch.bfloat16).normal_(0, 0.2)
+
+        a_q, a_s = mxfp8_group_quantize(a)
+        b_q, b_s = mxfp8_group_quantize(b)
+        b_s_deepgemm = transform_mxfp8_scale_ue8m0(b_s)
+
+        with torch.inference_mode():
+            out = deepgemm_w8a8_mxfp8_linear(
+                a_q,
+                b_q,
+                b_s_deepgemm,
+                input_scale=a_s,
+                output_dtype=torch.bfloat16,
+            )
+            ref_out = (
+                mxfp8_dequant(a_q, a_s, torch.float32)
+                @ mxfp8_dequant(b_q, b_s, torch.float32).t()
+            )
+
+        torch.testing.assert_close(
+            out, ref_out.to(torch.bfloat16), atol=1e-1, rtol=1e-2
+        )
 
 
 if __name__ == "__main__":

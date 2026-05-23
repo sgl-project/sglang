@@ -64,6 +64,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     mxfp8_group_quantize,
     normalize_e4m3fn_to_e4m3fnuz,
     requant_weight_ue8m0_inplace,
+    transform_mxfp8_scale_ue8m0,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
@@ -607,6 +608,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif get_fp8_gemm_runner_backend().is_deep_gemm():
+            copy_or_rebind_param(
+                layer,
+                "weight_scale_inv_deepgemm",
+                transform_mxfp8_scale_ue8m0(layer.weight_scale_inv.data),
+            )
         else:
             # Triton path consumes canonical 2D UE8M0 scales directly.
             return
@@ -759,7 +766,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.use_mxfp8:
-            if get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
+            if get_fp8_gemm_runner_backend().is_deep_gemm():
+                weight_scale = layer.weight_scale_inv_deepgemm
+            elif get_fp8_gemm_runner_backend().is_flashinfer_cutlass():
                 weight_scale = layer.weight_scale_inv_swizzled
             else:
                 weight_scale = layer.weight_scale_inv

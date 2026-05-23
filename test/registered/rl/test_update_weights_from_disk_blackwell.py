@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=320, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=640, stage="extra-b", runner_config="4-gpu-b200")
 
 import unittest
 
@@ -170,6 +170,19 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
                 "flashinfer_trtllm_routed",
+            ),
+        },
+        {
+            "name": "deep_gemm_dense_cutlass_mxfp8",
+            "other_args": (
+                "--base-gpu-id",
+                "0",
+                "--tp-size",
+                "4",
+                "--fp8-gemm-backend",
+                "deep_gemm",
+                "--moe-runner-backend",
+                "cutlass",
             ),
         },
     )
