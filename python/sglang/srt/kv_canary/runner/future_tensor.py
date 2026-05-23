@@ -19,7 +19,7 @@ class FutureTensors:
 
     @classmethod
     def device_to_host(
-        cls, xs_device: _TensorOrDict, *, stream: torch.cuda.Stream
+        cls, xs_device: _TensorOrDict, *, d2h_stream: torch.cuda.Stream
     ) -> "FutureTensors":
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
@@ -42,8 +42,8 @@ class FutureTensors:
             for key, tensor_device in tensors_device.items()
         }
 
-        stream.wait_stream(torch.cuda.current_stream(device))
-        with torch.cuda.stream(stream):
+        d2h_stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(d2h_stream):
             for key in tensors_device_cloned:
                 tensors_host[key].copy_(tensors_device_cloned[key], non_blocking=True)
             event = torch.cuda.Event()
@@ -102,5 +102,5 @@ class DelayedDeviceHostHandler:
             self._future = None
         else:
             self._future = FutureTensors.device_to_host(
-                device_data, stream=self.d2h_stream
+                device_data, d2h_stream=self.d2h_stream
             )
