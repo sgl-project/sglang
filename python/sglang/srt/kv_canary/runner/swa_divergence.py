@@ -65,7 +65,7 @@ class SwaDivergenceReport:
         self,
         *,
         step_counter: int,
-        forward_batch: "ForwardBatch",
+        forward_batch: Optional["ForwardBatch"],
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
@@ -79,7 +79,7 @@ class SwaDivergenceReport:
         self,
         *,
         step_counter: int,
-        forward_batch: "ForwardBatch",
+        forward_batch: Optional["ForwardBatch"],
     ) -> Optional[dict[str, Any]]:
         if step_counter == 0 or step_counter % self._interval != 0:
             return None
@@ -91,7 +91,11 @@ class SwaDivergenceReport:
             "forward_ct": self._forward_ct,
             "verify_total_count": self._verify_total_count_device,
         }
-        if self._swa_allocator is not None:
+        # The SFM-era manager invokes step() with forward_batch=None (phase 4
+        # must not touch a live ForwardBatch); the swa_full_idx_divergence
+        # stat is suppressed in that case until the divergence report is
+        # ported onto a snapshot input.
+        if self._swa_allocator is not None and forward_batch is not None:
             result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
                 swa_allocator=self._swa_allocator,
                 req_to_token_pool=self._req_to_token_pool,
