@@ -16,9 +16,7 @@ class _PDPerturbBase(CanaryPDFixture):
     Both servers run kv-canary in log mode. P-side detects the flip when its
     post-forward bonus-token forward re-verifies the prompt prefix (canary verify plan
     covers the full prefix_len, not only out_cache_loc). D-side detects the same flip
-    when its decode forwards re-verify the transferred prefix slots. ``max_new_tokens``
-    is bumped well above one so D actually runs decode forwards that exercise the
-    verify path.
+    when its decode forwards re-verify the transferred prefix slots.
     """
 
     __test__ = (
@@ -39,10 +37,9 @@ class _PDPerturbBase(CanaryPDFixture):
     def test_p_side_perturb_surfaces_real_kv_hash_violation_on_both_sides(
         self,
     ) -> None:
-        # max_new_tokens=100 forces D-side to actually run decode forwards (not just
-        # return the prefill bonus token), giving canary verify on the transferred
-        # prefix many chances to fire.
-        self.send_parallel_short_requests(n=4, max_new_tokens=100)
+        # send_parallel_short_requests defaults to max_new_tokens=100 so D-side runs
+        # decode forwards that exercise canary verify on the transferred prefix.
+        self.send_parallel_short_requests(n=4)
         for side in ("prefill", "decode"):
             self.assert_per_forward_violation_reported(
                 fail_reason="real_kv_hash",

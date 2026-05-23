@@ -52,23 +52,20 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
         n: int,
         *,
         assert_all_success: bool = True,
-        max_new_tokens: int = 1,
+        max_new_tokens: int = 100,
         timeout: float = 60.0,
     ) -> list[dict]:
-        """Fan out n parallel /generate requests with short, unique-prefix prompts.
+        """Fan out n parallel /generate requests with short prompts.
 
-        Each prompt is salted with the request index so the radix tree cannot share prefix
-        slots across requests. Without the unique prefix, a same-prompt fan-out would let a
-        follow-up prefill batch on side P read the prefix slots written by an earlier
-        batch, which would also re-trigger canary verify on those slots. That side-P
-        re-verification can race a post-forward perturb and surface the violation on P
-        instead of on D, breaking PD canary tests that assert detection happens on D after
-        the mooncake transfer.
+        ``max_new_tokens`` defaults to 100 so D-side actually runs decode forwards rather
+        than only returning the prefill bonus token. At max_new_tokens=1, the prefill
+        bonus-token forward is the only generation step and D has no opportunity to run
+        canary verify on the transferred prefix slots; tests asserting D-side detection
+        would silently never exercise that code path.
         """
-        prompts = [f"Sample {i}: {_SHORT_PROMPT_BODY}" for i in range(n)]
         results = post_parallel_generate(
             url=self.lb_url + "/generate",
-            prompts=prompts,
+            prompts=[_SHORT_PROMPT_BODY] * n,
             max_new_tokens=max_new_tokens,
             timeout=timeout,
         )
