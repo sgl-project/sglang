@@ -1476,9 +1476,17 @@ def update_sliding_window_buffer(
     )
     if hasattr(token_to_kv_pool_allocator, "translate_loc_from_full_to_swa"):
         kv_last_index = window_kv_indptr[-1]
+        # window_kv_indices is always a different tensor from out_cache_loc; clear
+        # the per-batch cache before translating so we don't warn about a
+        # mid-forward loc change, and clear it after so subsequent set_kv_buffer
+        # calls (with out_cache_loc) start from a clean slate.
+        if hasattr(token_to_kv_pool_allocator, "invalidate_loc_cache"):
+            token_to_kv_pool_allocator.invalidate_loc_cache()
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
             )
         )
+        if hasattr(token_to_kv_pool_allocator, "invalidate_loc_cache"):
+            token_to_kv_pool_allocator.invalidate_loc_cache()
     return window_kv_indptr, window_kv_indices, window_kv_lens, window_kv_start_idx
