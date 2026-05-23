@@ -76,6 +76,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_cuda_version,
+    get_device,
     is_blackwell_supported,
     is_cpu,
     is_cuda,
@@ -1002,8 +1004,12 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
         for name, weight in weights:
+<<<<<<< HEAD
             if _is_cuda:
                 weight = weight.cuda()
+=======
+            weight = weight.to(get_device())
+>>>>>>> 6249d51e16 ([XPU] Add MXFP4 W4A16 MoE inference support for Intel Xe2 (GPT-OSS))
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1392,9 +1398,10 @@ def _dequant_mlp_weight(debug_name, w_blocks, w_scales):
         logger.info(f"Dequantize {debug_name} start")
 
     original_device = w_blocks.device
+    _target_device = get_device()
 
-    w_blocks = w_blocks.cuda()
-    w_scales = w_scales.cuda()
+    w_blocks = w_blocks.to(_target_device)
+    w_scales = w_scales.to(_target_device)
 
     w_bf16 = dequant_mxfp4(w_block=w_blocks, w_scale=w_scales, out_dtype=torch.bfloat16)
     w_bf16 = w_bf16.transpose(-2, -1).contiguous()
