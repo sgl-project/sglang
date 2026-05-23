@@ -42,9 +42,14 @@ from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -148,6 +153,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -168,9 +174,12 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        # Fuse Q/K/V into a single linear when using NVFP4: the checkpoint stores them
-        # packed as one tensor, so a fused layer avoids splitting during weight loading.
-        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config)
+        # Some FLUX.2 NVFP4 checkpoints store Q/K/V packed as a single tensor, while
+        # ModelOpt's standard diffusers export keeps the original to_q/to_k/to_v layout.
+        # Only enable the fused loader path for the packed checkpoint family.
+        self.use_fused_qkv = isinstance(quant_config, ModelOptFp4Config) and getattr(
+            quant_config, "checkpoint_uses_packed_qkv", False
+        )
         self.use_fused_added_qkv = self.use_fused_qkv
 
         if self.use_fused_qkv:
@@ -278,6 +287,7 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(
@@ -286,9 +296,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        query, key, value, encoder_query, encoder_key, encoder_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
-        )
+        (
+            query,
+            key,
+            value,
+            encoder_query,
+            encoder_key,
+            encoder_value,
+        ) = _get_qkv_projections(self, hidden_states, encoder_hidden_states)
 
         query = query.unflatten(-1, (self.local_heads, -1))
         key = key.unflatten(-1, (self.local_heads, -1))
@@ -400,6 +415,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -459,6 +475,7 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def _patch_to_out_weight_loader(self) -> None:
@@ -477,7 +494,10 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
                 param.data.copy_(loaded_weight)
 
         self.to_out.weight_loader = _loader
-        self.to_out.weight.weight_loader = _loader
+        if hasattr(self.to_out.weight, "_weight_loader"):
+            self.to_out.weight._weight_loader = _loader
+        else:
+            self.to_out.weight.weight_loader = _loader
 
     def forward(
         self,
@@ -545,6 +565,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -565,6 +586,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
+            supported_attention_backends=supported_attention_backends,
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
@@ -621,6 +643,7 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
+        supported_attention_backends: set[AttentionBackendEnum] | None = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -640,6 +663,7 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
+            supported_attention_backends=supported_attention_backends,
             quant_config=quant_config,
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
@@ -815,9 +839,13 @@ class Flux2PosEmbed(nn.Module):
             use_real=False,
             repeat_interleave_real=False,
             dtype=(
-                torch.float32
-                if current_platform.is_mps() or current_platform.is_musa()
-                else torch.float64
+                torch.float64
+                if (
+                    current_platform.is_float64_supported()
+                    if hasattr(current_platform, "is_float64_supported")
+                    else True
+                )
+                else torch.float32
             ),
         )
 
@@ -829,7 +857,7 @@ class Flux2PosEmbed(nn.Module):
         return freqs_cos.contiguous().float(), freqs_sin.contiguous().float()
 
 
-class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
+class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     """
     The Transformer model introduced in Flux 2.
 
@@ -839,6 +867,14 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
 
     param_names_mapping = FluxConfig().arch_config.param_names_mapping
     scale_shift_swap_params = ("norm_out.linear.weight", "norm_out.linear.bias")
+    # FLUX.2 stays closer to the official diffusers output with Torch SDPA.
+    # The generic FA path still produces a measurable image-level drift here.
+    _supported_attention_backends = {
+        AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.FA,
+        AttentionBackendEnum.AITER,
+        AttentionBackendEnum.AITER_SAGE,
+    }
 
     def post_load_weights(self) -> None:
         if not isinstance(getattr(self, "quant_config", None), ModelOptFp4Config):
@@ -932,6 +968,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,
                     prefix=f"transformer_blocks.{i}",
                 )
@@ -949,6 +986,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
+                    supported_attention_backends=self._supported_attention_backends,
                     quant_config=quant_config,
                     prefix=f"single_transformer_blocks.{i}",
                 )
@@ -1010,7 +1048,7 @@ class Flux2Transformer2DModel(CachableDiT, OffloadableDiTMixin):
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype)
         if guidance is not None:
-            guidance = guidance.to(hidden_states.dtype)
+            guidance = guidance.to(hidden_states.dtype) * 1000
 
         temb = self.time_guidance_embed(timestep, guidance)
 

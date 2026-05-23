@@ -130,15 +130,14 @@ class Step3p5AMultiTokenPredictor(nn.Module):
         return self.embed_tokens(input_ids)
 
 
-# The current implementation differs slightly from the standard MTP implementation in Step3.5 Flash.
-# In the standard multi-layer MTP design of Step3.5 Flash,
-# the hidden states of each MTP layer are passed from the preceding MTP layer
-# (the hidden states of the initial (layer-0) MTP still being provided by the target model).
-# In contrast, the current SGL implementation obtains hidden states directly from the target model for all MTP layers.
-# Empirical evaluations indicate that the overall performance remains strong;
-# however, this design choice may lead to a slight reduction in acceptance rate in certain scenarios.
-# This behavior will be corrected shortly, and we expect to implement the standard multi-layer MTP design of Step3.5 Flash in the near future.
-# FIXME(yhyang201)
+# Chain-style multi-layer MTP (standard Step-3.5 Flash design):
+# each MTP layer consumes the hidden states produced by the preceding MTP layer,
+# while layer-0 consumes the hidden states from the target model.
+# The chain propagation is driven by MultiLayerEagleDraftWorker via the
+# ``chain_mtp_hidden_states`` flag: between speculative steps it overwrites
+# ``forward_batch.spec_info.hidden_states`` (and the CUDA-graph hidden_states
+# buffer in the draft-extend graph) with the previous layer's
+# ``hidden_states_before_norm`` returned by ``Step3p5AMultiTokenPredictor``.
 class Step3p5MTP(Step3p5ForCausalLM):
     def __init__(
         self,

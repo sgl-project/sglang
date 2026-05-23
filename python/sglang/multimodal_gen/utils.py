@@ -35,25 +35,21 @@ logger = init_logger(__name__)
 T = TypeVar("T")
 
 
-def _expand_path_value(field_name: str, value: Any) -> Any:
-    eu = os.path.expanduser
-    if field_name.endswith("_path") and isinstance(value, str):
-        return eu(value)
-    if field_name.endswith("_path") and isinstance(value, list):
-        return [eu(x) if isinstance(x, str) else x for x in value]
-    if field_name.endswith("_paths") and isinstance(value, dict):
-        return {k: eu(p) if isinstance(p, str) else p for k, p in value.items()}
-    return value
-
-
-def expand_path_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {key: _expand_path_value(key, value) for key, value in kwargs.items()}
-
-
 def expand_path_fields(obj) -> None:
     """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    eu = os.path.expanduser
     for f in fields(obj):
-        setattr(obj, f.name, _expand_path_value(f.name, getattr(obj, f.name)))
+        v = getattr(obj, f.name)
+        if f.name.endswith("_path") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_path") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
+        elif f.name.endswith("_paths") and isinstance(v, dict):
+            setattr(
+                obj,
+                f.name,
+                {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
+            )
 
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a

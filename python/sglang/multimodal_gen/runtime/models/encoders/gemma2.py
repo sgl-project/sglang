@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
+from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+    LayerwiseOffloadableModuleMixin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,31 +181,22 @@ class Gemma2Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        attn_mask = torch.zeros(
-            (seq_len, seq_len), device=hidden_states.device, dtype=torch.float32
-        )
-        causal = torch.triu(
+        attn_mask = torch.tril(
             torch.ones(
                 (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
-            ),
-            diagonal=1,
+            )
         )
-        attn_mask = attn_mask.masked_fill(causal, float("-inf"))
         if self.is_sliding and self.sliding_window is not None:
             idx = torch.arange(seq_len, device=hidden_states.device)
             dist = idx[None, :] - idx[:, None]
             too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, float("-inf"))
+            attn_mask = attn_mask.masked_fill(too_far, False)
 
         if attention_mask is not None:
-            key_pad = ~attention_mask.to(torch.bool)
             attn_mask = attn_mask[None, None, :, :].expand(
                 batch_size, 1, seq_len, seq_len
             )
-            attn_mask = attn_mask.masked_fill(
-                key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-                float("-inf"),
-            )
+            attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
         attn_kwargs = {
             "attn_mask": attn_mask,
@@ -289,10 +283,12 @@ class Gemma2DecoderLayer(nn.Module):
         return hidden_states
 
 
-class Gemma2Model(nn.Module):
+class Gemma2Model(nn.Module, LayerwiseOffloadableModuleMixin):
     """Gemma2 text encoder model for SANA pipeline."""
 
     _fsdp_shard_conditions = []
+    layerwise_offload_dit_group_enabled = False
+    layer_names = ["layers"]
 
     def __init__(self, config: Gemma2Config, **kwargs):
         super().__init__()

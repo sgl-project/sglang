@@ -125,24 +125,22 @@ class _TritonFinder:
     ``triton.*`` sub-module that isn't already in ``sys.modules``.
     """
 
-    def find_module(self, fullname, path=None):
+    def find_spec(self, fullname, path=None, target=None):
+        """PEP 451 meta-path finder for ``triton.*`` sub-modules."""
         if fullname == "triton" or fullname.startswith("triton."):
-            return self
+            if fullname in sys.modules:
+                return getattr(sys.modules[fullname], "__spec__", None)
+            # Create and register the mock so the import machinery finds it
+            mod = _MockModule(fullname)
+            sys.modules[fullname] = mod
+            parts = fullname.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_name, child_name = parts
+                parent = sys.modules.get(parent_name)
+                if parent is not None:
+                    setattr(parent, child_name, mod)
+            return mod.__spec__
         return None
-
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        mod = _MockModule(fullname)
-        sys.modules[fullname] = mod
-        # Wire up the parent relationship
-        parts = fullname.rsplit(".", 1)
-        if len(parts) == 2:
-            parent_name, child_name = parts
-            parent = sys.modules.get(parent_name)
-            if parent is not None:
-                setattr(parent, child_name, mod)
-        return mod
 
 
 def _make_mock(name: str) -> _MockModule:

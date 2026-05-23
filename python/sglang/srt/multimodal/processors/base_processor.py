@@ -1,3 +1,4 @@
+import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
@@ -10,12 +11,13 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessorFast
+from transformers import BaseImageProcessor
 
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
     MultimodalInputFormat,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -47,6 +49,10 @@ _IPC_POOL_HANDLE_CACHE = envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
     input_text: str
+
+    # original pre-tokenized ids, useful for processor_output/precomputed inputs,
+    # when they already carry the input ids
+    input_ids: Optional[Union[List[int], torch.Tensor]] = None
 
     # frames loaded from image, in given order
     images: Optional[list[Union[Image.Image, dict]]] = dataclasses.field(
@@ -137,7 +143,6 @@ class MultimodalSpecialTokens:
     def get_token_id_by_modality(self, modality: Modality) -> Optional[int]:
         return {
             Modality.IMAGE: self.image_token_id,
-            Modality.MULTI_IMAGES: self.image_token_id,
             Modality.VIDEO: self.video_token_id,
             Modality.AUDIO: self.audio_token_id,
         }.get(modality)
@@ -183,6 +188,11 @@ class BaseMultimodalProcessor(ABC):
         self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+
+        mm_process_config = self.server_args.mm_process_config
+        self.image_config = mm_process_config.get("image", {})
+        self.video_config = mm_process_config.get("video", {})
+        self.audio_config = mm_process_config.get("audio", {})
 
         # Resolve tokenizer: some processors (e.g. InternVL) pass a tokenizer
         # directly as _processor rather than a processor that wraps a tokenizer.
@@ -249,8 +259,23 @@ class BaseMultimodalProcessor(ABC):
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
 
         if SGL_USE_CUDA_IPC and not skip_mm_pool:
+            # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
+            # tokenizer workers. Each worker gets an equal share so that adding
+            # workers doesn't multiply the GPU-side footprint.
+            worker_num = self.server_args.tokenizer_worker_num
+            per_worker_pool_size = max(
+                MM_FEATURE_CACHE_SIZE // worker_num,
+                128 * 1024 * 1024,
+            )
+            logger.info(
+                "MmItemMemoryPool size per tokenizer worker: %.0f MiB "
+                "(budget %.0f MiB / %d worker(s))",
+                per_worker_pool_size / (1024 * 1024),
+                MM_FEATURE_CACHE_SIZE / (1024 * 1024),
+                worker_num,
+            )
             self.cudaipc_mmfeature_pool = MmItemMemoryPool(
-                MM_FEATURE_CACHE_SIZE,
+                per_worker_pool_size,
                 MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
             )
 
@@ -359,19 +384,19 @@ class BaseMultimodalProcessor(ABC):
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    offsets=offset,
+                    offsets=[offset],
                     precomputed_embeddings=embedding_slice,
                 )
             )
 
-        return {
-            "input_ids": input_ids,
-            "mm_items": mm_items,
-            "im_start_id": self.IM_START_TOKEN_ID,
-            "im_end_id": self.IM_END_TOKEN_ID,
-            "im_token_id": self.IM_TOKEN_ID,
-            "video_token_id": getattr(self, "VIDEO_TOKEN_ID", None),
-        }
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            im_token_id=self.IM_TOKEN_ID,
+            video_token_id=getattr(self, "VIDEO_TOKEN_ID", None),
+        )
 
     def process_mm_data(
         self, input_text, images=None, videos=None, audios=None, **kwargs
@@ -381,26 +406,34 @@ class BaseMultimodalProcessor(ABC):
         """
         if images:
             kwargs["images"] = images
+            if self.image_config:
+                kwargs.setdefault("images_kwargs", {}).update(self.image_config)
         if videos:
             kwargs["videos"] = videos
+            if self.video_config:
+                kwargs.setdefault("videos_kwargs", {}).update(self.video_config)
         if audios:
             if self._processor.__class__.__name__ in {
                 "Gemma3nProcessor",
+                "Gemma4Processor",
                 "GlmAsrProcessor",
                 "Qwen2AudioProcessor",
+                "Qwen3ASRProcessor",
                 "Qwen3OmniMoeProcessor",
             }:
                 # Note(Xinyuan): for gemma3n, ref: https://github.com/huggingface/transformers/blob/ccf2ca162e33f381e454cdb74bf4b41a51ab976d/src/transformers/models/gemma3n/processing_gemma3n.py#L107
                 kwargs["audio"] = audios
-                kwargs["audio_kwargs"] = {}
+                kwargs.setdefault("audio_kwargs", {})
                 kwargs["audio_kwargs"].setdefault("truncation", False)
             else:
                 kwargs["audios"] = audios
+            if self.audio_config:
+                kwargs.setdefault("audio_kwargs", {}).update(self.audio_config)
 
         processor = self._processor
         if (
             hasattr(processor, "image_processor")
-            and isinstance(processor.image_processor, BaseImageProcessorFast)
+            and isinstance(processor.image_processor, BaseImageProcessor)
             and not self.server_args.disable_fast_image_processor
         ):
             if _is_cpu or get_global_server_args().rl_on_policy_target is not None:
@@ -408,8 +441,11 @@ class BaseMultimodalProcessor(ABC):
             elif _is_xpu:
                 kwargs["device"] = "xpu"
             elif not _is_npu:
-                kwargs["device"] = "cuda"
-            else:
+                base_gpu_id = get_global_server_args().base_gpu_id
+                kwargs["device"] = f"cuda:{base_gpu_id}"
+            elif processor.__class__.__name__ not in {
+                "Glm4vProcessor",
+            }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
                     npu_apply_qwen_image_preprocess_patch,
@@ -486,15 +522,8 @@ class BaseMultimodalProcessor(ABC):
 
         Class method that can be pickled for multiprocessing
         """
-        if isinstance(data, dict):
-            data_format = data.get("format")
-            if data_format in (
-                MultimodalInputFormat.PROCESSOR_OUTPUT.name,
-                MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
-                "processor_output",
-                "precomputed_embedding",
-            ):
-                return data
+        if cls._is_preprocessed_input(data):
+            return data
         try:
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
@@ -513,6 +542,49 @@ class BaseMultimodalProcessor(ABC):
 
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
+
+    @staticmethod
+    def _get_preprocessed_input_format(data):
+        """returns the detailed format if the provided data is already preprocessed.
+        returns none if the provided data is not preprocessed
+        """
+        if not isinstance(data, dict):
+            return None
+        data_format = data.get("format")
+        if isinstance(data_format, MultimodalInputFormat):
+            return data_format
+        if data_format in (
+            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
+            "processor_output",
+        ):
+            return MultimodalInputFormat.PROCESSOR_OUTPUT
+        if data_format in (
+            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
+            "precomputed_embedding",
+        ):
+            return MultimodalInputFormat.PRECOMPUTED_EMBEDDING
+        return None
+
+    @classmethod
+    def _is_preprocessed_input(cls, data):
+        """returns if the data is already preprocessed (by the vlm processor)"""
+        return cls._get_preprocessed_input_format(data) is not None
+
+    @classmethod
+    def _all_mm_data_is_preprocessed(cls, *data_lists):
+        has_mm_data = False
+        for data_list in data_lists:
+            if not data_list:
+                continue
+            if not isinstance(data_list, list):
+                data_list = [data_list]
+            for item in data_list:
+                if item is None:
+                    continue
+                has_mm_data = True
+                if not cls._is_preprocessed_input(item):
+                    return False
+        return has_mm_data
 
     def _submit_mm_data_loading_tasks_simple(
         self,
@@ -638,10 +710,8 @@ class BaseMultimodalProcessor(ABC):
 
         formatted_indices = []
         for idx, item in enumerate(data_list):
-            if isinstance(item, dict):
-                fmt = item.get("format")
-                if fmt in {"processor_output", "precomputed_embedding"}:
-                    formatted_indices.append(idx)
+            if BaseMultimodalProcessor._is_preprocessed_input(item):
+                formatted_indices.append(idx)
 
         if formatted_indices:
             if len(data_list) != 1:
@@ -676,12 +746,7 @@ class BaseMultimodalProcessor(ABC):
     def _process_loaded_mm_data(self, modality, raw_data, result):
         images, videos, audios = [], [], []
 
-        is_precomputed = isinstance(raw_data, dict) and raw_data.get("format") in [
-            MultimodalInputFormat.PROCESSOR_OUTPUT.name,
-            MultimodalInputFormat.PRECOMPUTED_EMBEDDING.name,
-            "processor_output",
-            "precomputed_embedding",
-        ]
+        is_precomputed = self._is_preprocessed_input(raw_data)
 
         if modality == Modality.IMAGE:
             if is_precomputed:
@@ -698,7 +763,7 @@ class BaseMultimodalProcessor(ABC):
 
         return is_precomputed, images, videos, audios
 
-    def load_mm_data(
+    async def load_mm_data(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
@@ -711,6 +776,19 @@ class BaseMultimodalProcessor(ABC):
     ) -> BaseMultiModalProcessorOutput:
 
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
+
+        input_ids = prompt if isinstance(prompt, list) else None
+        if input_ids is not None and self._all_mm_data_is_preprocessed(
+            image_data, video_data, audio_data
+        ):
+            # fast path for preprocessed data: early return
+            return BaseMultiModalProcessorOutput(
+                input_text="",
+                input_ids=input_ids,
+                images=list(image_data or []),
+                videos=list(video_data or []),
+                audios=list(audio_data or []),
+            )
 
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
         if isinstance(prompt, list) and return_text:
@@ -741,7 +819,7 @@ class BaseMultimodalProcessor(ABC):
             or cnt[Modality.AUDIO] != n_audio
             or getattr(self, "support_dynamic_frame_expansion", False)
         ):
-            return self.legacy_load_mm_data(
+            return await self.legacy_load_mm_data(
                 prompt=prompt,
                 multimodal_tokens=multimodal_tokens,
                 image_data=image_data,
@@ -750,10 +828,11 @@ class BaseMultimodalProcessor(ABC):
                 return_text=return_text,
                 discard_alpha_channel=discard_alpha_channel,
                 audio_sample_rate=audio_sample_rate,
+                input_ids=input_ids,
             )
         # For models other than MiniCPMO and MiniCPMV,
         # totally align multimodal_tokens, fast path
-        return self.fast_load_mm_data(
+        return await self.fast_load_mm_data(
             prompt=prompt,
             multimodal_tokens=multimodal_tokens,
             image_data=image_data,
@@ -762,9 +841,10 @@ class BaseMultimodalProcessor(ABC):
             return_text=return_text,
             discard_alpha_channel=discard_alpha_channel,
             audio_sample_rate=audio_sample_rate,
+            input_ids=input_ids,
         )
 
-    def fast_load_mm_data(
+    async def fast_load_mm_data(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
@@ -774,6 +854,7 @@ class BaseMultimodalProcessor(ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        input_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         A fast version of `load_mm_data` that loads multimodal data directly.
@@ -816,7 +897,7 @@ class BaseMultimodalProcessor(ABC):
 
         for modality, idx, future in futures:
             try:
-                result = future.result()
+                result = await asyncio.wrap_future(future)
             except Exception as e:
                 logger.exception(
                     "[load_mm_data(simple)] error loading %s data at index=%d",
@@ -846,9 +927,10 @@ class BaseMultimodalProcessor(ABC):
             audios=audios,
             videos=videos,
             input_text=prompt_str,
+            input_ids=input_ids,
         )
 
-    def legacy_load_mm_data(
+    async def legacy_load_mm_data(
         self,
         prompt: str,
         multimodal_tokens: MultimodalSpecialTokens,
@@ -858,6 +940,7 @@ class BaseMultimodalProcessor(ABC):
         return_text: Optional[bool] = True,
         discard_alpha_channel: bool = True,
         audio_sample_rate: Optional[int] = None,
+        input_ids: Optional[Union[List[int], torch.Tensor]] = None,
     ) -> BaseMultiModalProcessorOutput:
         """
         Each frame of video/image will be replaced by a single image token
@@ -908,7 +991,7 @@ class BaseMultimodalProcessor(ABC):
             try:
                 if multimodal_tokens_pattern.match(text_part):
                     modality, raw_data, frame_limit = next(task_info_iter)
-                    result = next(futures_iter).result()
+                    result = await asyncio.wrap_future(next(futures_iter))
 
                     is_precomputed, new_imgs, new_vids, new_auds = (
                         self._process_loaded_mm_data(modality, raw_data, result)
@@ -965,6 +1048,7 @@ class BaseMultimodalProcessor(ABC):
             audios=audios,
             videos=videos,
             input_text="".join(new_text_parts),
+            input_ids=input_ids,
         )
 
     @staticmethod
@@ -996,7 +1080,8 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items directly from processor output, with one item for each modality
+        Create mm_items from processor output. Initially creates one item per modality;
+        these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be passed via offline engine api
         """
@@ -1049,6 +1134,15 @@ class BaseMultimodalProcessor(ABC):
         collected_items = self.collect_mm_items_from_processor_output(ret)
 
         return collected_items, input_ids, ret
+
+    @staticmethod
+    def _ensure_input_ids_is_tensor(input_ids) -> Optional[torch.Tensor]:
+        """make sure the input_ids is a flattened tensor"""
+        if input_ids is None:
+            return None
+        if isinstance(input_ids, torch.Tensor):
+            return input_ids.flatten().to(dtype=torch.long)
+        return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def process_and_combine_mm_data(
         self,
@@ -1103,16 +1197,19 @@ class BaseMultimodalProcessor(ABC):
             ret = None
 
         # Handle dict items (processed or precomputed)
+        dict_ret = None
         for modality, dict_item in dict_items:
-            input_format = dict_item.get("format", None)
-            if input_format == "processor_output":
+            input_format = self._get_preprocessed_input_format(dict_item)
+            if input_format is not None and dict_ret is None:
+                dict_ret = dict_item
+            if input_format == MultimodalInputFormat.PROCESSOR_OUTPUT:
                 items = self.collect_mm_items_from_processor_output(dict_item)
                 for item in items:
                     item.format = MultimodalInputFormat.PROCESSOR_OUTPUT
                 all_collected_items.extend(items)
-            elif input_format == "precomputed_embedding":
-                feature = dict_item["feature"]
-                del dict_item["feature"]
+            elif input_format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+                dict_item = dict(dict_item)
+                feature = dict_item.pop("feature")
                 all_collected_items.append(
                     MultimodalDataItem(
                         modality=modality,
@@ -1122,6 +1219,18 @@ class BaseMultimodalProcessor(ABC):
                     )
                 )
         # Fallback tokenization if no raw items were processed
+        if ret is None and dict_ret is not None:
+            ret = dict_ret
+
+        if input_ids is None:
+            input_ids = self._ensure_input_ids_is_tensor(base_output.input_ids)
+
+        if input_ids is None:
+            for _, dict_item in dict_items:
+                input_ids = self._ensure_input_ids_is_tensor(dict_item.get("input_ids"))
+                if input_ids is not None:
+                    break
+
         if input_ids is None:
             input_ids = self._tokenizer(
                 base_output.input_text,
@@ -1138,6 +1247,11 @@ class BaseMultimodalProcessor(ABC):
                 input_ids=input_ids,
                 mm_token_id=mm_token_id,
             )
+
+        # Split bundled items into per-image/video items for better cache granularity
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        all_collected_items = get_new_expanded_mm_items(all_collected_items)
 
         """
         solution for cuda-ipc memory-leak:

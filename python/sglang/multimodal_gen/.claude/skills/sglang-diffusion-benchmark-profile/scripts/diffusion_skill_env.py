@@ -9,7 +9,6 @@ from pathlib import Path
 OUTPUT_DIR_NAMES = {
     "benchmarks": Path("outputs/diffusion_benchmarks"),
     "profiles": Path("outputs/diffusion_profiles"),
-    "ncu": Path("outputs/ncu_reports"),
 }
 
 
