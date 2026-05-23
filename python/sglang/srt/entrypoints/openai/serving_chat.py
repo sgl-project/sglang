@@ -223,6 +223,17 @@ class OpenAIServingChat(OpenAIServingBase):
             # Only process string content, ignore multimodal content (lists)
             if isinstance(last_content, str):
                 if request.continue_final_message:
+                    if self.chat_encoding_spec == "dsv4":
+                        # DSV4 must render the prefill inside the encoder so the
+                        # thinking block closes before visible content and any
+                        # reasoning_content on the final message is preserved.
+                        # Default wo_eos to True for the final turn; an explicit
+                        # False falls through to the legacy strip-and-append path.
+                        wo_eos = messages[-1].get("wo_eos")
+                        if wo_eos is None:
+                            messages[-1]["wo_eos"] = wo_eos = True
+                        if wo_eos:
+                            return messages, None
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
                     messages = messages[:-1]

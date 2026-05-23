@@ -567,6 +567,12 @@ class ChatCompletionMessageGenericParam(BaseModel):
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    # DSV4-encoder-specific: when True, render this assistant turn without the
+    # trailing end-of-sentence token so generation can continue from it. Only
+    # honored by the deepseek-v4 chat encoder; ignored by other encoders.
+    # Server may default this to True for the final assistant turn when
+    # continue_final_message is requested on a DSV4 deployment.
+    wo_eos: Optional[bool] = None
 
     @field_validator("role", mode="before")
     @classmethod

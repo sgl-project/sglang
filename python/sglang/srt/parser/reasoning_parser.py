@@ -665,7 +665,26 @@ class ReasoningParser:
             and request.messages[-1].role == "assistant"
         ):
             kwargs["continue_final_message"] = True
-            kwargs["previous_content"] = request.messages[-1].content
+            last_message = request.messages[-1]
+            previous_content = last_message.content
+            # Normalize None to "" so the detector's len()/`in` checks don't
+            # blow up on reasoning-only or tool-call-only prefills. The dsv4
+            # encoder path applies the same normalization before rendering.
+            if previous_content is None:
+                previous_content = ""
+            # DSV4-only: the encoder's wo_eos render (default for
+            # continue_final_message) injects </think> ahead of visible
+            # content, so prepend it here to keep _in_reasoning aligned with
+            # the actual prompt boundary. Skip when wo_eos was explicitly
+            # disabled — that path falls back to legacy strip-and-append and
+            # the prompt no longer has the encoder-injected </think>.
+            if (
+                model_type.lower() == "deepseek-v4"
+                and getattr(last_message, "wo_eos", None) is not False
+                and isinstance(previous_content, str)
+            ):
+                previous_content = "</think>" + previous_content
+            kwargs["previous_content"] = previous_content
 
         chat_template_kwargs = getattr(request, "chat_template_kwargs", None) or {}
         if chat_template_kwargs.get("force_nonempty_content") is True:
