@@ -82,7 +82,7 @@ try:
         op_name="flashinfer_fp4_quantize",
         fake_impl=_flashinfer_fp4_quantize_fake,
     )
-except ImportError:
+except (ImportError, AssertionError, Exception):
     fp4_quantize = None
 
 

@@ -78,7 +78,7 @@ try:
     from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_sf_a
 
     enable_flashinfer_fp4_gemm = True
-except ImportError:
+except (ImportError, AssertionError, Exception):
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
     shuffle_matrix_a = None
@@ -95,7 +95,7 @@ else:
 try:
     from flashinfer.fused_moe import cutlass_fused_moe as flashinfer_cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
-except ImportError:
+except (ImportError, AssertionError, Exception):
     flashinfer_cutlass_fused_moe = None
 
     # Define a minimal ActivationType enum if flashinfer is not available

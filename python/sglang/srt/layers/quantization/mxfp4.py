@@ -45,6 +45,7 @@ from sglang.srt.utils import (
     is_sm100_supported,
     is_sm120_supported,
     is_triton_kernels_available,
+    is_xpu,
     mxfp_supported,
     next_power_of_2,
     round_up,
@@ -365,6 +366,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, triton_kernels_padding_alignment
             )
+        elif is_xpu():
+            # Match vLLM XPU alignment: intermediate must be multiple of 64
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 64
+            )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
 
@@ -683,6 +689,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
+        if is_xpu():
+            # XPU: sgl_kernel fused_experts handles mxfp4 natively on-device.
+            # Weights stay as packed uint8 in VRAM - no CPU dequant needed.
+            return
+
         if self.use_triton_kernels:
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
@@ -901,6 +912,61 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_precision_config=getattr(self, "w2_precision_config", None),
             )
         else:
+            if is_xpu():
+                # XPU mxfp4: use sgl_kernel native Xe2 SYCL fused_experts.
+                # Packed int8 weights stay in VRAM; kernel dequants on-device.
+                from sgl_kernel import fused_experts as sgl_fused_experts
+
+                from sglang.srt.layers.moe.token_dispatcher import (
+                    StandardCombineInput,
+                )
+                from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+                if TopKOutputChecker.format_is_bypassed(topk_output):
+                    topk_output = topk_output.to_standard()
+                topk_weights = topk_output.topk_weights
+                topk_ids = topk_output.topk_ids
+                # Convert UE8M0 uint8 scales to float32 direct multipliers:
+                # scale_f32 = 2^(uint8_exponent - 127)
+                w1_scale_f32 = torch.exp2(
+                    (layer.w13_weight_scale.to(torch.int32) - 127).to(torch.float32)
+                )
+                w2_scale_f32 = torch.exp2(
+                    (layer.w2_weight_scale.to(torch.int32) - 127).to(torch.float32)
+                )
+                # gemm1_alpha / gemm1_clamp_limit are per-expert Parameters;
+                # extract scalar (all experts share the same value).
+                gemm1_alpha = 1.702
+                gemm1_limit = 7.0
+                if hasattr(layer, "gemm1_alpha") and layer.gemm1_alpha is not None:
+                    gemm1_alpha = float(layer.gemm1_alpha.flatten()[0].item())
+                if (
+                    hasattr(layer, "gemm1_clamp_limit")
+                    and layer.gemm1_clamp_limit is not None
+                ):
+                    gemm1_limit = float(layer.gemm1_clamp_limit.flatten()[0].item())
+                output = sgl_fused_experts(
+                    hidden_states=x,
+                    w1=layer.w13_weight.view(torch.int8),
+                    w2=layer.w2_weight.view(torch.int8),
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    b1=getattr(layer, "w13_weight_bias", None),
+                    b2=getattr(layer, "w2_weight_bias", None),
+                    # GPT-OSS MXFP4 weights use interleaved [g0,u0,g1,u1,...] layout;
+                    # ACT_SWIGLU_GPT_OSS=2 is required.  "silu" (ActType=0)
+                    # assumes block-split layout and produces garbage for this model.
+                    activation="silu",
+                    use_mxfp4_w4a16=True,
+                    w1_scale=w1_scale_f32,
+                    w2_scale=w2_scale_f32,
+                    routed_scaling_factor=getattr(
+                        self.runner.config, "routed_scaling_factor", None
+                    ),
+                    gemm1_alpha=gemm1_alpha,
+                    gemm1_limit=gemm1_limit,
+                )
+                return StandardCombineInput(hidden_states=output)
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,

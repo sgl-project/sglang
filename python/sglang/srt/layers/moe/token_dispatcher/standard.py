@@ -51,7 +51,7 @@ try:
     from sglang.srt.layers.quantization.modelopt_quant import (
         fp4_quantize as fp4_quantize_flashinfer,
     )
-except ImportError:
+except (ImportError, AssertionError, Exception):
     fp4_quantize_flashinfer = None
     nvfp4_block_scale_interleave_flashinfer = None
 
