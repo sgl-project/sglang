@@ -29,7 +29,7 @@ class PlanInput:
     contiguous (upstream phase-1 hook is responsible).
 
     **Static-buffer contract (cuda-graph correctness)**: the PlanInput's
-    tensors are allocated once at SFM construction time (sized for the
+    tensors are allocated once at SingleForwardManager construction time (sized for the
     worst-case per-forward batch). The per-forward builder MUTATES those
     tensors in place each step via ``.copy_()`` / ``.fill_()`` / in-place
     arithmetic. The captured cuda-graph reads them by address; therefore

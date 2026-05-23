@@ -35,7 +35,7 @@ def install_canary(
 
     # Piecewise cuda graph splits the model forward into many small captured
     # sub-graphs, each of which would need its own canary bracket — not
-    # supported under the current SFM design. Fail fast at install time.
+    # supported under the current SingleForwardManager design. Fail fast at install time.
     assert server_args.disable_piecewise_cuda_graph, (
         "kv-canary: piecewise cuda graph is not supported by the current "
         "SingleForwardManager design; pass --disable-piecewise-cuda-graph "
@@ -112,18 +112,20 @@ def _patch_model_forward(
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
         # During server startup the cuda graph runners (target + draft_extend)
-        # invoke model.forward directly without an SFM bracket. There is no
-        # active SFM in that window, and post-init the caller MUST bracket
-        # (otherwise the asserting helper below would have caught it). Skip
-        # phase 2/3 entirely when there is no active SFM — the per-SFM phase
-        # tensor is not advanced, matching the old runner's behavior of
-        # leaving the device-side phase assert disabled until init finishes.
-        sfm = manager.maybe_get_current_single_forward_manager()
-        if sfm is not None:
-            sfm.pre_ops_maybe_inside_graph(forward_batch)
+        # invoke model.forward directly without a SingleForwardManager
+        # bracket. There is no active SingleForwardManager in that window,
+        # and post-init the caller MUST bracket (otherwise the asserting
+        # helper below would have caught it). Skip phase 2/3 entirely when
+        # there is no active SingleForwardManager — the per-
+        # SingleForwardManager phase tensor is not advanced, matching the
+        # old runner's behavior of leaving the device-side phase assert
+        # disabled until init finishes.
+        single_forward_manager = manager.maybe_get_current_single_forward_manager()
+        if single_forward_manager is not None:
+            single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
         output = original(*args, **kwargs)
-        if sfm is not None:
-            sfm.post_ops_maybe_inside_graph(forward_batch)
+        if single_forward_manager is not None:
+            single_forward_manager.post_ops_maybe_inside_graph(forward_batch)
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)

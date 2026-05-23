@@ -381,9 +381,9 @@ class EagleDraftWorker(BaseDraftWorker):
 
         if canary_manager is not None:
             for i in range(n_inner):
-                sfm = canary_manager.get_single_forward_manager(i)
-                sfm.post_ops_outside_graph(
-                    snapshot=sfm.snapshot,
+                single_forward_manager = canary_manager.get_single_forward_manager(i)
+                single_forward_manager.post_ops_outside_graph(
+                    snapshot=single_forward_manager.snapshot,
                     maybe_inaccurate_forward_batch=forward_batch,
                 )
             canary_manager.step_shared_facilities(
@@ -490,7 +490,7 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            # Run forward. SFM index ``i`` tells the monkey-patched
+            # Run forward. SingleForwardManager index ``i`` tells the monkey-patched
             # model.forward wrap which SingleForwardManager owns this step.
             sfm_index_ctx = (
                 canary_manager.with_single_forward_manager_index(i)

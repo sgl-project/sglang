@@ -21,16 +21,18 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 def _run_one_cycle(manager, forward_batch) -> None:
     """Drive one full outer canary cycle on the manager: phase 1 ->
-    phase 2 (via the SFM's pre_ops_maybe_inside_graph) -> phase 3 ->
+    phase 2 (via the SingleForwardManager's pre_ops_maybe_inside_graph) -> phase 3 ->
     phase 4 -> step_shared_facilities. Mirrors the production caller
-    sequence for SFM(0) (target / single-step case)."""
-    sfm = manager.get_single_forward_manager(0)
-    sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
+    sequence for SingleForwardManager(0) (target / single-step case)."""
+    single_forward_manager = manager.get_single_forward_manager(0)
+    single_forward_manager.pre_ops_outside_graph(
+        maybe_inaccurate_forward_batch=forward_batch
+    )
     with manager.with_single_forward_manager_index(0):
-        sfm.pre_ops_maybe_inside_graph(forward_batch)
-        sfm.post_ops_maybe_inside_graph(forward_batch)
-    sfm.post_ops_outside_graph(
-        snapshot=sfm.snapshot,
+        single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
+        single_forward_manager.post_ops_maybe_inside_graph(forward_batch)
+    single_forward_manager.post_ops_outside_graph(
+        snapshot=single_forward_manager.snapshot,
         maybe_inaccurate_forward_batch=forward_batch,
     )
     manager.step_shared_facilities(maybe_inaccurate_forward_batch=forward_batch)
@@ -62,10 +64,12 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         config = make_config(sweep_interval=1)
         manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
-        sfm = manager.get_single_forward_manager(0)
-        sfm.pre_ops_outside_graph(maybe_inaccurate_forward_batch=forward_batch)
+        single_forward_manager = manager.get_single_forward_manager(0)
+        single_forward_manager.pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
         with manager.with_single_forward_manager_index(0):
-            sfm.pre_ops_maybe_inside_graph(forward_batch)
+            single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)

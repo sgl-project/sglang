@@ -1,4 +1,5 @@
-"""CanaryManager: top-level canary state holder under the SFM design.
+"""CanaryManager: top-level canary state holder under the
+SingleForwardManager design.
 
 Holds a static list of :class:`SingleForwardManager` instances (one per
 inner forward step) and the per-cycle shared facilities (sweep,
@@ -7,8 +8,8 @@ violation, health, stats, swa-divergence). Replaces the previous
 
 Dispatch model: the monkey-patched ``model.forward`` wrap calls into
 ``get_current_single_forward_manager()`` to fire phase 2/3 on the
-currently-active SFM. The caller marks the active SFM with
-``with_single_forward_manager_index(i)``.
+currently-active SingleForwardManager. The caller marks the active
+SingleForwardManager with ``with_single_forward_manager_index(i)``.
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 class CanaryManager:
-    """Owns canary state for one ModelRunner: a static list of SFMs plus
+    """Owns canary state for one ModelRunner: a static list of SingleForwardManagers plus
     the per-cycle shared facilities (violation / health / stats / sweep /
     swa-divergence).
     """
@@ -157,10 +158,10 @@ class CanaryManager:
         )
 
         num_sfms = max(1, speculative_num_steps - 1)
-        # Perturb fires once per outer cycle (not once per SFM). Only SFM(0)
+        # Perturb fires once per outer cycle (not once per SingleForwardManager). Only SingleForwardManager(0)
         # owns the perturb dispatch — its phase 1 fires pre-forward perturbs
-        # and its phase 4 fires the post-forward perturb. SFM(i>0) skips
-        # perturb entirely. This matches the target case (one SFM) which
+        # and its phase 4 fires the post-forward perturb. SingleForwardManager(i>0) skips
+        # perturb entirely. This matches the target case (one SingleForwardManager) which
         # already fires perturb exactly once per cycle.
         self._single_forward_managers: tuple[SingleForwardManager, ...] = tuple(
             SingleForwardManager(
@@ -191,11 +192,11 @@ class CanaryManager:
 
     def get_current_single_forward_manager(self) -> SingleForwardManager:
         """Used by the monkey-patched ``model.forward`` wrap to find the
-        active SFM. Asserts the caller has bracketed the call with
+        active SingleForwardManager. Asserts the caller has bracketed the call with
         :meth:`with_single_forward_manager_index`."""
         assert self._active_index is not None, (
             "kv-canary: monkey-patched model.forward fired without an active "
-            "SFM index; the caller must wrap the forward in "
+            "SingleForwardManager index; the caller must wrap the forward in "
             "CanaryManager.with_single_forward_manager_index(i)"
         )
         return self._single_forward_managers[self._active_index]
@@ -204,16 +205,17 @@ class CanaryManager:
         self,
     ) -> Optional[SingleForwardManager]:
         """Like :meth:`get_current_single_forward_manager` but returns
-        ``None`` instead of asserting when no SFM is currently active.
+        ``None`` instead of asserting when no SingleForwardManager is
+        currently active.
 
         Used by the monkey-patched ``model.forward`` wrap during server
         startup, where cuda graph capture calls into ``model.forward``
-        directly (without an SFM bracket) before :meth:`mark_init_finished`
-        has enabled the per-SFM phase asserts. In that window the wrap
-        should skip phase 2/3 work — the canary lifecycle does not yet
-        govern these init-time captures, matching the old behavior in
-        which the device-side phase assert was disabled until init was
-        finished.
+        directly (without a SingleForwardManager bracket) before
+        :meth:`mark_init_finished` has enabled the per-SingleForwardManager
+        phase asserts. In that window the wrap should skip phase 2/3 work
+        — the canary lifecycle does not yet govern these init-time
+        captures, matching the old behavior in which the device-side phase
+        assert was disabled until init was finished.
         """
         if self._active_index is None:
             return None
@@ -221,7 +223,7 @@ class CanaryManager:
 
     @contextlib.contextmanager
     def with_single_forward_manager_index(self, index: int) -> Iterator[None]:
-        """Mark SFM ``index`` as active for the duration of the with-block.
+        """Mark SingleForwardManager ``index`` as active for the duration of the with-block.
         Used by callers around each inner ``model.forward`` call."""
         assert (
             self._active_index is None
@@ -233,13 +235,13 @@ class CanaryManager:
             self._active_index = None
 
     def mark_init_finished(self) -> None:
-        """Reset every SFM's phase tensor and enable its assert. Called
+        """Reset every SingleForwardManager's phase tensor and enable its assert. Called
         once after warmup / cuda graph capture / piecewise compile so any
         residual phase state left by captured (init-time) kernels is
         cleared and post-init lifecycle starts from a known good IDLE."""
-        for sfm in self._single_forward_managers:
-            sfm.phase_checker.reset_to_idle()
-            sfm.phase_checker.enable_assert()
+        for single_forward_manager in self._single_forward_managers:
+            single_forward_manager.phase_checker.reset_to_idle()
+            single_forward_manager.phase_checker.enable_assert()
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
@@ -252,7 +254,7 @@ class CanaryManager:
     ) -> None:
         """Fire the per-cycle shared facilities (sweep, violation drain,
         health, stats, swa-divergence). Caller invokes this once after all
-        SFMs in the cycle have finished phase 4.
+        SingleForwardManagers in the cycle have finished phase 4.
 
         ``maybe_inaccurate_forward_batch`` is the same instance handed to
         phase 4; the swa-divergence report reads its req_pool_indices /

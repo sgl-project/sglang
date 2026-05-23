@@ -1,12 +1,13 @@
-"""SingleForwardManager (SFM) and its per-step snapshot dataclass.
+"""SingleForwardManager and its per-step snapshot dataclass.
 
-One SFM owns the per-step state of one inner ``model.forward`` invocation
-inside an outer canary cycle. The outer ``CanaryManager`` holds a static
-list of SFMs (length ``max(1, speculative_num_steps - 1)``) and dispatches
-the monkey-patched ``model.forward`` wrap to the active SFM through a
+One SingleForwardManager owns the per-step state of one inner
+``model.forward`` invocation inside an outer canary cycle. The outer
+``CanaryManager`` holds a static list of SingleForwardManagers (length
+``max(1, speculative_num_steps - 1)``) and dispatches the monkey-patched
+``model.forward`` wrap to the active SingleForwardManager through a
 context manager.
 
-Lifecycle (per SFM, enforced by ``SimplePhaseChecker``):
+Lifecycle (per SingleForwardManager, enforced by ``SimplePhaseChecker``):
 
     IDLE
       ── pre_ops_outside_graph(maybe_inaccurate_forward_batch)
@@ -58,7 +59,7 @@ if TYPE_CHECKING:
 
 
 class _SingleForwardPhase(IntEnum):
-    """Per-SFM 4-state lifecycle used with :class:`SimplePhaseChecker`.
+    """Per-SingleForwardManager 4-state lifecycle used with :class:`SimplePhaseChecker`.
 
     Enforced order::
 
@@ -77,7 +78,7 @@ class _SingleForwardPhase(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PostOpsInsideGraphOutputSnapshot:
-    """Per-SFM cloned view of the in-graph signals produced by phases 2-3.
+    """Per-SingleForwardManager cloned view of the in-graph signals produced by phases 2-3.
 
     The snapshot is written by phase 3 (``post_ops_maybe_inside_graph``)
     and read by phase 4 (``post_ops_outside_graph``). It captures the
@@ -105,9 +106,10 @@ class SingleForwardManager:
 
     KV-cache / device-state / endpoints / buffer groups are shared with
     the owning :class:`CanaryManager`. The perturb manager is only
-    installed on SFM(0) (the perturb owner for the outer cycle); SFM(i>0)
-    receives ``perturb_manager=None`` so that perturb fires exactly once
-    per cycle regardless of speculative-num-steps.
+    installed on SingleForwardManager(0) (the perturb owner for the outer
+    cycle); SingleForwardManager(i>0) receives ``perturb_manager=None`` so
+    that perturb fires exactly once per cycle regardless of
+    speculative-num-steps.
     """
 
     def __init__(
@@ -199,8 +201,9 @@ class SingleForwardManager:
         The input ``maybe_inaccurate_forward_batch`` may be the OUTER batch
         for an EAGLE draft step — its step-specific fields (seq_lens after
         increment, out_cache_loc slice for step i, ...) may not yet hold
-        the values this SFM will actually see by phase 2. Callers in this
-        phase should treat the batch as a coarse cycle-level view.
+        the values this SingleForwardManager will actually see by phase 2.
+        Callers in this phase should treat the batch as a coarse cycle-
+        level view.
         """
         if self._config.mode == "off":
             return
@@ -299,7 +302,7 @@ class SingleForwardManager:
         ``model.forward`` wrap AFTER the original forward.
 
         Launches TAIL kernels reusing the plan staged in phase 2, then copies
-        every observable into the per-SFM snapshot so phase 4 sees a dead
+        every observable into the per-SingleForwardManager snapshot so phase 4 sees a dead
         view immune to later step mutation.
         """
         if self._config.mode == "off":
@@ -369,7 +372,7 @@ class SingleForwardManager:
 
 @dataclass(slots=True, kw_only=True)
 class _SnapshotBuffers:
-    """Mutable storage for the per-SFM snapshot. ``copy_from`` is called
+    """Mutable storage for the per-SingleForwardManager snapshot. ``copy_from`` is called
     from phase 3 (inside cuda graph capture on DECODE), so every write
     must be an in-place ``copy_`` into pre-allocated tensors — no
     allocation, no shape change.

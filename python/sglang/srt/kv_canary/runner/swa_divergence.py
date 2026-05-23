@@ -91,10 +91,8 @@ class SwaDivergenceReport:
             "forward_ct": self._forward_ct,
             "verify_total_count": self._verify_total_count_device,
         }
-        # The SFM-era manager invokes step() with forward_batch=None (phase 4
-        # must not touch a live ForwardBatch); the swa_full_idx_divergence
-        # stat is suppressed in that case until the divergence report is
-        # ported onto a snapshot input.
+        # ``forward_batch`` is the same (possibly already-advanced) instance
+        # passed to phase 4 — accurate enough for the coarse trend metric.
         if self._swa_allocator is not None and forward_batch is not None:
             result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
                 swa_allocator=self._swa_allocator,
