@@ -247,8 +247,6 @@ class GenerateReqInput(BaseReq):
     external_trace_header: Optional[Dict] = None
     received_time: Optional[float] = None
     prompt_render_finish_time: Optional[float] = None
-    # Durations (seconds) for chat_template sub-buckets; only set for OpenAI
-    # chat completions, propagated to time_stats in _init_req_state.
     chat_template_render_duration: Optional[float] = None
     chat_template_encode_duration: Optional[float] = None
 

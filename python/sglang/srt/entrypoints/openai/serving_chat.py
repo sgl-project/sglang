@@ -747,11 +747,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
-            # Split apply_chat_template(tokenize=True) into render + encode so
-            # /metrics can attribute time to each stage, and so we can skip
-            # add_special_tokens=False on tokenizers that don't auto-add
-            # specials. Chat templates already include role/special tokens, so
-            # the encode must avoid double BOS on tokenizers that would add it.
+            # Split apply_chat_template(tokenize=True) into render + encode for
+            # per-stage timing. add_special_tokens=False avoids double BOS on
+            # tokenizers that auto-add it (chat template already includes them).
             encode_kwargs = (
                 {"add_special_tokens": False}
                 if self._tokenizer_auto_adds_specials
