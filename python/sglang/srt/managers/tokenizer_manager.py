@@ -2647,6 +2647,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if rid in self.rid_to_state:
                 raise ValueError(f"Duplicate request ID detected: {rid}")
             time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+            if self.enable_metrics:
+                time_stats.set_metrics_collector(self.metrics_collector)
             state = ReqState([], False, asyncio.Event(), sub_obj, time_stats)
             self.rid_to_state[rid] = state
             if self.server_args.enable_trace:

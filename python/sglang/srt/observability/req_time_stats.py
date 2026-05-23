@@ -387,17 +387,15 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     chat_template_encode_duration: float = 0.0
 
     def __getstate__(self) -> object:
-        # send to DP controller or Scheduler. These timestamps + durations are
-        # used by SchedulerReqTimeStats.set_scheduler_recv_time to emit
-        # per-stage histograms (chat_template / chat_template_render /
-        # chat_template_encode / tokenize_manager_prep / zmq_wire).
+        # send to DP controller or Scheduler. The pre-scheduler stage
+        # histograms (chat_template / chat_template_render / chat_template_encode /
+        # tokenize_manager_prep) are emitted in set_api_server_dispatch_time on
+        # the tokenizer side, so those timestamps don't need to cross the wire.
+        # Only api_server_dispatch_time is propagated, so the scheduler can emit
+        # zmq_wire. created_time is kept for downstream tracing.
         state = {
             "created_time": self.created_time,
-            "prompt_render_finish_time": self.prompt_render_finish_time,
-            "tokenize_finish_time": self.tokenize_finish_time,
             "api_server_dispatch_time": self.api_server_dispatch_time,
-            "chat_template_render_duration": self.chat_template_render_duration,
-            "chat_template_encode_duration": self.chat_template_encode_duration,
         }
         state.update(super().__getstate__())
         return state
@@ -439,6 +437,31 @@ class APIServerReqTimeStats(ReqTimeStatsBase):
     def set_api_server_dispatch_time(self, ts=None):
         ts = ts or time.perf_counter()
         self.api_server_dispatch_time = ts
+
+        # All pre-scheduler timing is finalized by the time we dispatch to the
+        # scheduler. Emit per-stage histograms here so the tokenizer-side
+        # timestamps don't need to cross the ZMQ wire (only api_server_dispatch_time
+        # still does, for the scheduler-side ZMQ_WIRE histogram).
+        if self.created_time > 0.0 and self.prompt_render_finish_time > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE,
+                self.prompt_render_finish_time - self.created_time,
+            )
+        if self.chat_template_render_duration > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE_RENDER,
+                self.chat_template_render_duration,
+            )
+        if self.chat_template_encode_duration > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.CHAT_TEMPLATE_ENCODE,
+                self.chat_template_encode_duration,
+            )
+        if self.prompt_render_finish_time > 0.0 and self.tokenize_finish_time > 0.0:
+            self.observe_per_stage_req_latency(
+                RequestStage.TOKENIZE_MANAGER_PREP,
+                self.tokenize_finish_time - self.prompt_render_finish_time,
+            )
 
         if self.trace_ctx.tracing_enable:
             self.trace_ctx.trace_slice_start(
@@ -591,18 +614,14 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     """
 
     # Propagated from tokenizer/grpc_server or dp controller, used to emit
-    # per-stage histograms (chat_template / chat_template_render /
-    # chat_template_encode / tokenize_manager_prep / zmq_wire) at scheduler
-    # receive time.
+    # the zmq_wire histogram at scheduler receive time. The tokenizer-side
+    # pre-scheduler histograms (chat_template / chat_template_render /
+    # chat_template_encode / tokenize_manager_prep) are emitted in
+    # APIServerReqTimeStats.set_api_server_dispatch_time, so their source
+    # timestamps don't need to cross the wire.
     created_time: float = 0.0
-    prompt_render_finish_time: float = 0.0
-    tokenize_finish_time: float = 0.0
     api_server_dispatch_time: float = 0.0
     dpc_dispatch_time: float = 0.0
-    # Durations (seconds) for the two sub-buckets of chat_template; only set
-    # for /v1/chat/completions requests.
-    chat_template_render_duration: float = 0.0
-    chat_template_encode_duration: float = 0.0
 
     # common, get by time.perf_counter()
     wait_queue_entry_time: float = 0.0
@@ -663,29 +682,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
 
-        # Emit per-stage histograms covering the time before the request
-        # reached the scheduler. Source timestamps come from
-        # APIServerReqTimeStats and are propagated via __getstate__.
-        if self.created_time > 0.0 and self.prompt_render_finish_time > 0.0:
-            self.observe_per_stage_req_latency(
-                RequestStage.CHAT_TEMPLATE,
-                self.prompt_render_finish_time - self.created_time,
-            )
-        if self.chat_template_render_duration > 0.0:
-            self.observe_per_stage_req_latency(
-                RequestStage.CHAT_TEMPLATE_RENDER,
-                self.chat_template_render_duration,
-            )
-        if self.chat_template_encode_duration > 0.0:
-            self.observe_per_stage_req_latency(
-                RequestStage.CHAT_TEMPLATE_ENCODE,
-                self.chat_template_encode_duration,
-            )
-        if self.prompt_render_finish_time > 0.0 and self.tokenize_finish_time > 0.0:
-            self.observe_per_stage_req_latency(
-                RequestStage.TOKENIZE_MANAGER_PREP,
-                self.tokenize_finish_time - self.prompt_render_finish_time,
-            )
+        # ZMQ_WIRE is the only pre-scheduler stage that needs scheduler-side
+        # timing (tokenizer dispatch -> scheduler recv). The other pre-scheduler
+        # stages are emitted in APIServerReqTimeStats.set_api_server_dispatch_time.
         if self.api_server_dispatch_time > 0.0:
             self.observe_per_stage_req_latency(
                 RequestStage.ZMQ_WIRE,
