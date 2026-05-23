@@ -895,6 +895,66 @@ module.exports = {
             time:       true,
         },
 
+        // ── MCP INTENT ROUTER (port 7785) ────────────────────────────
+        {
+            name:              'fm-mcp-router',
+            script:            'agents/fm_mcp_router.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'40M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                MCP_PORT:         '7785',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-mcp-router-error.log`,
+            out_file:   `${ROOT}/logs/fm-mcp-router-out.log`,
+            time:       true,
+        },
+
+        // ── STRATEGY ENGINE (port 7786) ───────────────────────────
+        {
+            name:              'fm-strategy-engine',
+            script:            'agents/fm_strategy_engine.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                STRATEGY_PORT:    '7786',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-strategy-engine-error.log`,
+            out_file:   `${ROOT}/logs/fm-strategy-engine-out.log`,
+            time:       true,
+        },
+
+        // ── REVENUE AGGREGATOR (port 7787) ────────────────────────
+        {
+            name:              'fm-revenue-aggregator',
+            script:            'agents/fm_revenue_aggregator.py',
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'40M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REVENUE_PORT:     '7787',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-revenue-aggregator-error.log`,
+            out_file:   `${ROOT}/logs/fm-revenue-aggregator-out.log`,
+            time:       true,
+        },
+
         // ── APEX OMNI-MATRIX EXTENDED SWARM ──────────────────────────
 
         ...[
