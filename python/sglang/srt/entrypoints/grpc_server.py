@@ -13,6 +13,7 @@ is set.
 import inspect
 import json
 import logging
+import os
 import time
 
 from aiohttp import web
@@ -155,6 +156,19 @@ def _add_admin_routes(app, request_manager):
 
 async def serve_grpc(server_args, model_info=None):
     """Start the standalone gRPC server with integrated scheduler."""
+    # Torch 2.12 bundles NCCL 2.29, which hard-fails NVLS multicast bind
+    # errors that NCCL 2.28 used to handle by disabling NVLS and continuing.
+    # The legacy gRPC entrypoint delegates scheduler launch to smg-grpc-servicer
+    # before the normal SRT engine environment defaults apply.
+    if (
+        "NCCL_NVLS_ENABLE" not in os.environ
+        or server_args.enable_nccl_nvls
+        or server_args.enable_symm_mem
+    ):
+        os.environ["NCCL_NVLS_ENABLE"] = str(
+            int(server_args.enable_nccl_nvls or server_args.enable_symm_mem)
+        )
+
     try:
         from smg_grpc_servicer.sglang.server import serve_grpc as _serve_grpc
     except ImportError as e:
