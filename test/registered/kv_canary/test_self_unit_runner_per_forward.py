@@ -46,7 +46,7 @@ class TestRunnerPerForward(CanaryRunnerTestCase):
         ):
             runner = make_runner(device=self.device)
             forward_batch = make_forward_batch(self.device)
-            with runner.with_forward_pass(forward_batch):
+            with runner.with_kernels_outside_graph(forward_batch):
                 runner.launch_head_kernels(forward_batch)
                 runner.launch_tail_kernels(forward_batch)
 
@@ -194,7 +194,7 @@ class TestRunnerBeforeForward(CanaryRunnerTestCase):
         # verify kernel skips the step on-device; host logs a throttled warning instead.
         runner = make_runner(device=self.device, per_forward_verify_capacity=4)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with runner.with_forward_pass(forward_batch):
+        with runner.with_kernels_outside_graph(forward_batch):
             pass
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self) -> None:
@@ -202,7 +202,7 @@ class TestRunnerBeforeForward(CanaryRunnerTestCase):
         # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
         runner = make_runner(device=self.device, per_forward_verify_capacity=16)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with runner.with_forward_pass(forward_batch):
+        with runner.with_kernels_outside_graph(forward_batch):
             pass
 
 

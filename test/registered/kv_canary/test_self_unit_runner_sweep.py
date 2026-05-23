@@ -37,7 +37,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
 
         with patch.object(runner._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
-                with runner.with_forward_pass(forward_batch):
+                with runner.with_kernels_outside_graph(forward_batch):
                     pass
         self.assertEqual(sweep_calls, [0, 4, 8])
 
@@ -46,7 +46,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
         config = make_config(sweep_interval=1)
         runner = make_runner(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
-        with runner.with_forward_pass(forward_batch):
+        with runner.with_kernels_outside_graph(forward_batch):
             runner.launch_head_kernels(forward_batch)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
