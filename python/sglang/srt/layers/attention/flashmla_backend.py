@@ -284,7 +284,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 self.cuda_graph_mla_metadata_view = self.cuda_graph_mla_metadata[
                     :actual_num_sm_parts
                 ]
-                self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
+            # num_splits has shape (bs+1,) — always update for the current bs.
+            self.cuda_graph_num_splits_view = self.cuda_graph_num_splits[: bs + 1]
 
             self.cuda_graph_mla_metadata[:actual_num_sm_parts].copy_(mla_metadata)
             self.cuda_graph_num_splits[: bs + 1].copy_(num_splits)
