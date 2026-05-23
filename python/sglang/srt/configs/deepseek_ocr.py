@@ -198,6 +198,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
         ignore_id: int = -100,
         ocr2_mode: bool = False,
         **kwargs,
+
     ):
 
         self.candidate_resolutions = candidate_resolutions
