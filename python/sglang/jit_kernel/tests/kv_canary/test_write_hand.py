@@ -42,8 +42,8 @@ from sglang.jit_kernel.tests.kv_canary._differential import (
     run_write_diff,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
-    dummy_pseudo_tensors,
     clone_real_kv_sources,
+    dummy_pseudo_tensors,
 )
 from sglang.jit_kernel.tests.kv_canary._hand_oracle import (
     _hand_fold_all,

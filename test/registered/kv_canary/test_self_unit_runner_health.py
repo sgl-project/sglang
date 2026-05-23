@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 import unittest
 
-from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_config, make_runner
-
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.runner import canary_runner as runner_module
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.runner_test_base import (
+    CanaryRunnerTestCase,
+    make_config,
+    make_runner,
+)
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 

@@ -179,9 +179,7 @@ def make_forward_batch(
 ) -> SimpleNamespace:
     seq_lens_default = list(seq_lens_list[:bs])
     if req_pool_indices is None:
-        req_pool_indices = torch.tensor(
-            [1, 2][:bs], dtype=torch.int64, device=device
-        )
+        req_pool_indices = torch.tensor([1, 2][:bs], dtype=torch.int64, device=device)
     if seq_lens is None:
         seq_lens = torch.tensor(seq_lens_default, dtype=torch.int32, device=device)
     if seq_lens_sum is None:
@@ -234,7 +232,9 @@ def make_buffer_group(
     num_slots: int = 4,
 ) -> CanaryBufferGroup:
     def _zero() -> torch.Tensor:
-        return torch.zeros(num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
+        return torch.zeros(
+            num_slots, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device
+        )
 
     if has_real_kv:
         source = real_kv_source or RealKvSource(

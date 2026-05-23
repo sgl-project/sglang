@@ -4,11 +4,6 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from sglang.test.kv_canary.runner_test_base import (
-    CanaryRunnerTestCase,
-    RecordingEndpoint,
-    make_runner,
-)
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag, VerifyPlan
@@ -19,6 +14,11 @@ from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
+from sglang.test.kv_canary.runner_test_base import (
+    CanaryRunnerTestCase,
+    RecordingEndpoint,
+    make_runner,
+)
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 

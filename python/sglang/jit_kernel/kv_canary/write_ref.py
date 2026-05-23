@@ -4,8 +4,6 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.verify import (
-    CanaryLaunchTag,
-    RealKvSource,
     VerifyOrWriteContext,
 )
 from sglang.jit_kernel.kv_canary.verify_ref import (

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 

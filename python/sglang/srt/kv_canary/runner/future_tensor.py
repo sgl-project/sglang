@@ -24,15 +24,20 @@ class FutureTensors:
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
 
-        device = next(x.device for x in xs_device.values() if isinstance(x, torch.Tensor))
-        tensors_device = {k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)}
-        non_tensors_device = {k: v for k, v in xs_device.items() if not isinstance(v, torch.Tensor)}
+        device = next(
+            x.device for x in xs_device.values() if isinstance(x, torch.Tensor)
+        )
+        tensors_device = {
+            k: v for k, v in xs_device.items() if isinstance(v, torch.Tensor)
+        }
+        non_tensors_device = {
+            k: v for k, v in xs_device.items() if not isinstance(v, torch.Tensor)
+        }
         del xs_device
 
         # Must happen in current stream, not d2h stream
         tensors_device_cloned = {
-            key: x.detach().clone()
-            for key, x in tensors_device.items()
+            key: x.detach().clone() for key, x in tensors_device.items()
         }
 
         tensors_host = {

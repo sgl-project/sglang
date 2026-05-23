@@ -467,7 +467,9 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         """Verify unused-cache SWA perturbation translates full slots to physical SWA slots."""
         device = DEFAULT_DEVICE
         lut = torch.tensor([-1, 2], dtype=torch.int64, device=device)
-        group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut)
+        group = make_buffer_group(
+            kind=PoolKind.SWA, has_real_kv=True, swa_index_lut=lut
+        )
         cache = make_radix_cache([[], [1]], device=device)
 
         with patch.object(torch, "randint", return_value=torch.tensor(0)):

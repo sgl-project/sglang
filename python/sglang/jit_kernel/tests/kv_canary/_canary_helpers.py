@@ -10,11 +10,11 @@ from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._constants import (
+    _I64_SIGN_BIT,
+    _U64_MASK,
     DEFAULT_NUM_SLOTS,
     DEFAULT_RING_CAPACITY,
     DEFAULT_SLOT_STRIDE_BYTES,
-    _I64_SIGN_BIT,
-    _U64_MASK,
 )
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_real_kv_source,
