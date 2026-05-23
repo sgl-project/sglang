@@ -195,8 +195,6 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight) {
 
 // conv3d mapped to gemm in embedding
 at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni) {
-  RECORD_FUNCTION("sgl_kernel::conv3d_embed_cpu", std::vector<c10::IValue>({input, weight, bias}));
-
   auto packed_w = is_vnni ? weight : conv3d_embed_weight_pack(weight);
 
   CHECK_CONTIGUOUS(input);

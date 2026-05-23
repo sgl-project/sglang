@@ -126,6 +126,7 @@ class TritonRunnerCore(MoeRunnerCore):
             gemm1_limit=self.config.gemm1_clamp_limit,
             filter_expert=filter_expert,
             hooks=hooks,
+            swiglu_limit=self.config.swiglu_limit,
         )
 
         return TritonRunnerOutput(hidden_states=out)
