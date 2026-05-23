@@ -1,10 +1,8 @@
 """CUDA persistent-kernel launcher for the kv_canary plan-entries step.
 
-Replaces the per-tile Triton kernel in ``entries_kernel.py`` with a 1-D persistent CUDA kernel: each
-thread services one verify entry (binary-searching the offsets prefix-sum to find its req_id), and the
-grid is fixed at ``num_sms * blocks_per_sm`` blocks so the launch fits inside a cuda graph without any
-host-side feedback. See ``csrc/kv_canary/plan_entries.cuh`` for the kernel body and the plan note at
-``lab/docs/pkgs/sglang/notes/2026-05-23-cuda-persistent-plan-entries-kernel.md`` for the algorithm.
+Each thread services one verify entry (binary-searching the offsets prefix-sum to find its req_id),
+and the grid is fixed at ``num_sms * blocks_per_sm`` blocks so the launch fits inside a cuda graph
+without any host-side feedback. See ``csrc/kv_canary/plan_entries.cuh`` for the kernel body.
 """
 
 from __future__ import annotations
@@ -52,9 +50,6 @@ def launch_plan_entries_cuda(
     swa_window_size: int,
 ) -> None:
     """Launch the CUDA persistent plan-entries kernel.
-
-    All tensors and dtypes must match what ``launch_plan_entries_kernel`` (Triton) accepts; the input /
-    output ABI is identical so the Triton and CUDA paths are drop-in interchangeable.
 
     Args:
         req_pool_indices: ``[bs_padded]`` int64. Rows past the actual ``bs`` carry REQ_POOL_IDX_PADDING.

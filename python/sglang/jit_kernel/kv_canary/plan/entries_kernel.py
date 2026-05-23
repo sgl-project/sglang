@@ -3,27 +3,19 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.kv_canary.plan.entries_kernel_cuda import (
     launch_plan_entries_cuda,
 )
 from sglang.jit_kernel.kv_canary.plan.utils import (
-    _compute_window_start,
     _require_2d,
     _require_dtype,
     _require_len,
     _require_min_len,
     _require_same_device,
     _resolve_swa_lut,
-    _swa_translate_tile,
 )
 from sglang.jit_kernel.kv_canary.verify import _assert_contiguous
-
-# Inner-tile width for _plan_entries_kernel. Each (req, verify-entry tile) program owns this many entries along
-# the per-req verify-entry axis of the (bs, max_verify_per_req) logical grid.
-_PLAN_VERIFY_INNER_BLOCK: int = 64
 
 
 def launch_plan_entries_kernel(
@@ -64,10 +56,6 @@ def launch_plan_entries_kernel(
     if bs == 0 or verify_capacity == 0:
         return
 
-    # Dispatch to the CUDA persistent kernel. The Triton kernel below is kept for reference / fallback;
-    # the CUDA path collapses the (bs, verify_capacity/INNER_BLOCK) Triton grid (89M programs for D-case)
-    # to a fixed persistent grid sized to ``num_sms * blocks_per_sm`` (~135K threads on H200), one
-    # thread per real verify entry.
     launch_plan_entries_cuda(
         req_pool_indices=req_pool_indices,
         prefix_lens=prefix_lens,
@@ -167,173 +155,4 @@ def _validate_entries_kernel_inputs(
             (out_verify_positions, "out_verify_positions"),
             (out_verify_prev_slot_indices, "out_verify_prev_slot_indices"),
         ),
-    )
-
-
-@triton.jit
-def _plan_entries_kernel(
-    # Input pointers.
-    req_pool_indices_ptr,
-    prefix_lens_ptr,
-    req_to_token_ptr,
-    full_to_swa_lut_ptr,
-    verify_offsets_ptr,
-    # Output pointers.
-    out_verify_slot_indices_ptr,
-    out_verify_positions_ptr,
-    out_verify_prev_slot_indices_ptr,
-    # Runtime sizes.
-    req_to_token_stride0,
-    swa_lut_len,
-    verify_capacity,
-    # Compile-time constants.
-    INNER_BLOCK: tl.constexpr,
-    SWA_WINDOW: tl.constexpr,
-    HAS_SWA_LUT: tl.constexpr,
-    REQ_POOL_IDX_PADDING: tl.constexpr,
-    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
-):
-    """Entries kernel: materialize per-req verify entries. Grid = (bs, verify_entry_tiles).
-
-    Each program owns one (request, verify-entry tile) cell. Verify capacity is the upper bound on entries per
-    request used to pick the grid; the actual per-request count comes from adjacent entries in
-    ``verify_offsets``.
-    """
-    request_offset = tl.program_id(0)  # scalar
-    verify_tile_index = tl.program_id(1)  # scalar
-
-    request_pool_index = tl.load(req_pool_indices_ptr + request_offset)  # scalar
-    prefix_lens = tl.load(prefix_lens_ptr + request_offset)  # scalar
-
-    if request_pool_index == REQ_POOL_IDX_PADDING:
-        return
-
-    window_start = _compute_window_start(prefix_lens, SWA_WINDOW)  # scalar
-
-    verify_start = tl.load(verify_offsets_ptr + request_offset)  # scalar
-    verify_end = tl.load(verify_offsets_ptr + request_offset + 1)  # scalar
-    request_verify_len = verify_end - verify_start  # scalar
-
-    if request_verify_len <= 0:
-        return
-
-    entry_offsets = verify_tile_index * INNER_BLOCK + tl.arange(0, INNER_BLOCK)
-    entry_mask = entry_offsets < request_verify_len  # [INNER_BLOCK] bool
-
-    positions = window_start + entry_offsets  # [INNER_BLOCK]
-    slot, previous_slot = _load_verify_entry_slots(
-        req_to_token_ptr,
-        full_to_swa_lut_ptr,
-        request_pool_index,
-        positions,
-        entry_mask,
-        req_to_token_stride0,
-        swa_lut_len,
-        INNER_BLOCK,
-        HAS_SWA_LUT,
-        TOKEN_TO_KV_SLOT_PADDING,
-    )
-
-    _store_verify_entries(
-        out_verify_slot_indices_ptr,
-        out_verify_positions_ptr,
-        out_verify_prev_slot_indices_ptr,
-        slot,
-        positions,
-        previous_slot,
-        verify_start,
-        entry_offsets,
-        entry_mask,
-        verify_capacity,
-    )
-
-
-@triton.jit
-def _load_verify_entry_slots(
-    req_to_token_ptr,
-    full_to_swa_lut_ptr,
-    request_pool_index,
-    positions,
-    entry_mask,
-    req_to_token_stride0,
-    swa_lut_len,
-    INNER_BLOCK: tl.constexpr,
-    HAS_SWA_LUT: tl.constexpr,
-    TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
-):
-    request_pool_index_i64 = request_pool_index.to(tl.int64)  # scalar
-    stride_i64 = req_to_token_stride0  # scalar
-    positions_i64 = positions.to(tl.int64)  # [INNER_BLOCK]
-
-    slot_full = tl.load(  # [INNER_BLOCK]
-        req_to_token_ptr + request_pool_index_i64 * stride_i64 + positions_i64,
-        mask=entry_mask,
-        other=TOKEN_TO_KV_SLOT_PADDING,
-    )
-
-    previous_position_valid = (positions > 0) & entry_mask  # [INNER_BLOCK] bool
-    previous_positions_i64 = (positions - 1).to(tl.int64)  # [INNER_BLOCK]
-    safe_previous_positions_i64 = tl.where(
-        previous_position_valid, previous_positions_i64, 0
-    )  # [INNER_BLOCK]
-    previous_slot_full = tl.load(  # [INNER_BLOCK]
-        req_to_token_ptr
-        + request_pool_index_i64 * stride_i64
-        + safe_previous_positions_i64,
-        mask=previous_position_valid,
-        other=TOKEN_TO_KV_SLOT_PADDING,
-    )
-
-    if HAS_SWA_LUT:
-        slot = _swa_translate_tile(
-            slot_full, entry_mask, full_to_swa_lut_ptr, swa_lut_len
-        )  # [INNER_BLOCK]
-        previous_translated = _swa_translate_tile(  # [INNER_BLOCK]
-            previous_slot_full,
-            previous_position_valid,
-            full_to_swa_lut_ptr,
-            swa_lut_len,
-        )
-    else:
-        slot = slot_full
-        previous_translated = previous_slot_full
-
-    chain_head_tile = tl.full((INNER_BLOCK,), -1, dtype=slot.dtype)  # [INNER_BLOCK]
-    previous_slot = tl.where(
-        previous_position_valid, previous_translated, chain_head_tile
-    )  # [INNER_BLOCK]
-    return slot, previous_slot
-
-
-@triton.jit
-def _store_verify_entries(
-    out_verify_slot_indices_ptr,
-    out_verify_positions_ptr,
-    out_verify_prev_slot_indices_ptr,
-    slot,
-    positions,
-    previous_slot,
-    verify_start,
-    entry_offsets,
-    entry_mask,
-    verify_capacity,
-):
-    out_offsets = verify_start + entry_offsets  # [INNER_BLOCK]
-    capacity_mask = out_offsets < verify_capacity  # [INNER_BLOCK] bool
-    write_mask = entry_mask & capacity_mask  # [INNER_BLOCK] bool
-
-    tl.store(
-        out_verify_slot_indices_ptr + out_offsets,
-        slot.to(tl.int64),
-        mask=write_mask,
-    )
-    tl.store(
-        out_verify_positions_ptr + out_offsets,
-        positions.to(tl.int64),
-        mask=write_mask,
-    )
-    tl.store(
-        out_verify_prev_slot_indices_ptr + out_offsets,
-        previous_slot.to(tl.int64),
-        mask=write_mask,
     )

@@ -1,6 +1,5 @@
 // Persistent CUDA kernel for the kv_canary plan-entries step.
 //
-// Replaces _plan_entries_kernel (Triton) for the bs_padded=4096 / verify_capacity~=1.4M D-scenario:
 //   - 1 thread = 1 verify entry (embarrassingly parallel; no atomics / sync / shmem).
 //   - 1-D grid sized to num_sms * blocks_per_sm; each thread strides over total_verify entries via a
 //     persistent loop. ``total_verify`` is read on-device from verify_offsets_scratch[bs_padded] so the
@@ -9,9 +8,7 @@
 //     a few global loads + 3 scatter stores.
 //
 // Byte-equality contract: the (slot, position, prev_slot) triples this kernel writes must match the
-// Triton _plan_entries_kernel (and the python reference in kv_canary/plan_ref.py) row-for-row. See the
-// plan note (lab/docs/pkgs/sglang/notes/2026-05-23-cuda-persistent-plan-entries-kernel.md) for the
-// algorithm derivation.
+// python reference in ``kv_canary/plan_ref.py`` row-for-row.
 
 #pragma once
 
@@ -62,9 +59,8 @@ find_req_id(const int64_t* __restrict__ verify_offsets, int32_t bs_padded, int64
   return lo;
 }
 
-// Translate raw slot value via the SWA LUT. Sentinel passthrough (-1 stays -1). Clamp slot to lut_len-1
-// to mirror the Triton _swa_translate_tile boundary behavior, but in practice the caller never produces
-// out-of-range slots; the clamp is purely defensive.
+// Translate raw slot value via the SWA LUT. Sentinel passthrough (-1 stays -1). Clamp slot to
+// ``lut_len - 1`` defensively; in practice the caller never produces out-of-range slots.
 __device__ __forceinline__ int64_t swa_translate(const int64_t* __restrict__ lut, int64_t lut_len, int64_t raw_slot) {
   if (raw_slot < 0) {
     return raw_slot;
