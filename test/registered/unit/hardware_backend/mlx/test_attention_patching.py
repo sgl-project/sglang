@@ -14,11 +14,11 @@ _HAS_MLX = importlib.util.find_spec("mlx") is not None
 _SKIP_REASON = "requires mlx"
 
 if _HAS_MLX:
+    import mlx.core as mx
+    import mlx.nn as nn
     import torch
     from mlx_lm.models.cache import ArraysCache
 
-    import mlx.core as mx
-    import mlx.nn as nn
     from sglang.srt.hardware_backend.mlx.kv_cache import (
         BatchedDecodeContext,
         ContiguousAttentionKVCache,

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import DynamicGradMode
 

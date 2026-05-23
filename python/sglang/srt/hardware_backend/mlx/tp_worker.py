@@ -15,9 +15,9 @@ normal ``GenerationBatchResult``.
 import logging
 from typing import Optional, Union
 
+import mlx.core as mx
 import torch
 
-import mlx.core as mx
 from sglang.srt.hardware_backend.mlx.model_runner import (
     MlxPendingDecode,
     MlxPendingExtend,

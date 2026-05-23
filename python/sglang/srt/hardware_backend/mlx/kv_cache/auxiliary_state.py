@@ -12,9 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+import mlx.core as mx
 import torch
 
-import mlx.core as mx
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
