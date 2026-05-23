@@ -56,9 +56,14 @@ class SWAComponent(TreeComponent):
     component_type = ComponentType.SWA
 
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
-        return self.cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
-            full_indices
-        )
+        allocator = self.cache.token_to_kv_pool_allocator
+        # One-shot translation: flush before so a stale forward-pass key does
+        # not trigger a spurious warning, and after so the next forward starts
+        # from a clean cache.
+        allocator.invalidate_loc_cache()
+        result = allocator.translate_loc_from_full_to_swa(full_indices)
+        allocator.invalidate_loc_cache()
+        return result
 
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         ct = self.component_type

@@ -572,6 +572,8 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         forward_batch.spec_info.positions = buffers.positions[:num_tokens]
         forward_batch.spec_info.extend_seq_lens_tensor = buffers.extend_seq_lens[:bs]
 
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         self.eagle_worker.draft_extend_attn_backend_list[
             self.step
         ].init_forward_metadata_replay_cuda_graph(

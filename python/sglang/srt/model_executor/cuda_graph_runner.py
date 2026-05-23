@@ -1232,6 +1232,8 @@ class CudaGraphRunner:
         # FIXME: implicit channel for backends (dsv4) that need forward_batch
         # in replay metadata prep. Should become a real param on the interface.
         attn_backend._replay_forward_batch = forward_batch
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],

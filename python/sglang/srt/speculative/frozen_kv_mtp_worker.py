@@ -298,6 +298,8 @@ class FrozenKVMTPWorker(TpModelWorker):
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
+        if self.target_worker.model_runner.is_hybrid_swa:
+            self.target_worker.model_runner.token_to_kv_pool.invalidate_loc_cache()
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
                 bs,

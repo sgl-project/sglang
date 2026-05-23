@@ -464,6 +464,8 @@ class BreakableCudaGraphRunner:
             self.layer_model.forward = replay_layer_forward
             try:
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                if self.model_runner.is_hybrid_swa:
+                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
                 with set_forward_context(
                     static_forward_batch,
                     self.attention_layers,

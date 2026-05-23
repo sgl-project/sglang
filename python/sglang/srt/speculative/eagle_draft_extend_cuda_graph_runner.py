@@ -519,6 +519,8 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.num_correct_drafts = buffers.num_correct_drafts[:bs]
             forward_batch.spec_info.num_accept_tokens = buffers.num_accept_tokens[:bs]
 
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,

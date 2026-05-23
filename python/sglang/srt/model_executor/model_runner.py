@@ -3004,6 +3004,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pdmux_override = True
             else:
                 self.attn_backend.init_forward_metadata(forward_batch)
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = {}
         if self.support_pp:
@@ -3085,6 +3087,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3108,6 +3112,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # metadata causes batch_size mismatch in attention kernel(e.g. DSA Indexer).
         if forward_batch.batch_size > 0:
             self.attn_backend.init_forward_metadata(forward_batch)
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
 
         kwargs = {}
         if self.support_pp:
@@ -3133,6 +3139,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
             self.attn_backend.init_forward_metadata(forward_batch)
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
         next_split_index = min(
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,

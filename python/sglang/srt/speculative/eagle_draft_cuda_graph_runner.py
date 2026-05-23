@@ -467,6 +467,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )

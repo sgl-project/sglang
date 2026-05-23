@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+from sglang.utils import is_in_ci
 
 _is_npu = is_npu()
 
@@ -173,10 +174,13 @@ class SWAKVPool(BaseSWAKVPool):
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
-                logger.warning(
+                msg = (
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
+                if is_in_ci():
+                    raise RuntimeError(msg)
+                logger.warning(msg)
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
             )
@@ -423,6 +427,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def invalidate_loc_cache(self) -> None:
+        self._kvcache.invalidate_loc_cache()
 
     def alloc(self, need_size: int):
         self._kvcache.invalidate_loc_cache()

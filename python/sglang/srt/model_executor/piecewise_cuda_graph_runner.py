@@ -420,7 +420,11 @@ class PiecewiseCudaGraphRunner:
             )
 
         # Attention backend
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        if self.model_runner.is_hybrid_swa:
+            self.model_runner.token_to_kv_pool.invalidate_loc_cache()
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
@@ -596,6 +600,8 @@ class PiecewiseCudaGraphRunner:
             if lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
             # Run and capture
@@ -802,6 +808,8 @@ class PiecewiseCudaGraphRunner:
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                if self.model_runner.is_hybrid_swa:
+                    self.model_runner.token_to_kv_pool.invalidate_loc_cache()
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,

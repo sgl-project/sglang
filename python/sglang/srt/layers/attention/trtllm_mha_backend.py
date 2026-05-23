@@ -578,7 +578,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-
         metadata = TRTLLMMHAMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
