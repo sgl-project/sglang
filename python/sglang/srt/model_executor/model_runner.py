@@ -3169,9 +3169,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        canary_manager = (
-            self.canary_runner if not self.is_draft_worker else None
-        )
+        canary_manager = self.canary_runner if not self.is_draft_worker else None
         canary_sfm = (
             canary_manager.get_single_forward_manager(0)
             if canary_manager is not None

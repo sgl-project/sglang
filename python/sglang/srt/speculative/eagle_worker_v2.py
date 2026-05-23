@@ -358,16 +358,14 @@ class EagleDraftWorker(BaseDraftWorker):
         n_inner = self.speculative_num_steps - 1
         if canary_manager is not None:
             for i in range(n_inner):
-                canary_manager.get_single_forward_manager(
-                    i
-                ).pre_ops_outside_graph(
+                canary_manager.get_single_forward_manager(i).pre_ops_outside_graph(
                     maybe_non_mature_forward_batch=forward_batch
                 )
 
         # Run draft
         if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = (
-                self.cuda_graph_runner.replay(forward_batch)
+            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
+                forward_batch
             )
         else:
             if (

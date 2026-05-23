@@ -47,9 +47,7 @@ class TestManagerPerForward(CanaryManagerTestCase):
             manager = make_manager(device=self.device)
             forward_batch = make_forward_batch(self.device)
             sfm = manager.get_single_forward_manager(0)
-            sfm.pre_ops_outside_graph(
-                maybe_non_mature_forward_batch=forward_batch
-            )
+            sfm.pre_ops_outside_graph(maybe_non_mature_forward_batch=forward_batch)
             with manager.with_single_forward_manager_index(0):
                 sfm.pre_ops_maybe_inside_graph(forward_batch)
                 sfm.post_ops_maybe_inside_graph(forward_batch)
@@ -153,7 +151,9 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
                 write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
                 forward_batch=forward_batch,
                 expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
-                violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+                violation_log=ViolationLog.allocate(
+                    ring_capacity=2, device=self.device
+                ),
                 real_kv_hash_mode=RealKvHashMode.OFF,
                 input_check_mode=False,
             )
@@ -188,7 +188,9 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
                 write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
                 forward_batch=forward_batch,
                 expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
-                violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
+                violation_log=ViolationLog.allocate(
+                    ring_capacity=2, device=self.device
+                ),
                 real_kv_hash_mode=RealKvHashMode.OFF,
                 input_check_mode=False,
             )

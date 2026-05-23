@@ -98,9 +98,7 @@ def run_from_snapshot(
     ):
         return
 
-    slot = pick_out_cache_loc_slot_from_tensor(
-        out_cache_loc=snapshot.out_cache_loc
-    )
+    slot = pick_out_cache_loc_slot_from_tensor(out_cache_loc=snapshot.out_cache_loc)
     if slot is None:
         logger.info(
             "kv_canary perturb real_kv_post_forward: skipped because snapshot.out_cache_loc "

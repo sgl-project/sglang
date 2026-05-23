@@ -397,7 +397,9 @@ class _SnapshotBuffers:
         self.verify_plan_enable.copy_(verify_plan.enable)
         self.kernel_run_counters.copy_(device_state.kernel_run_counters)
         self.slot_run_counters.copy_(device_state.slot_run_counters)
-        self.violation_write_index.copy_(device_state.violation_log.violation_write_index)
+        self.violation_write_index.copy_(
+            device_state.violation_log.violation_write_index
+        )
         if (
             self.swa_verify_total_count is not None
             and swa_divergence_report is not None
@@ -431,9 +433,7 @@ def _allocate_snapshot_buffers(
         kernel_run_counters=torch.zeros(
             num_kernel_tags, dtype=torch.int64, device=device
         ),
-        slot_run_counters=torch.zeros(
-            num_slot_tags, dtype=torch.int64, device=device
-        ),
+        slot_run_counters=torch.zeros(num_slot_tags, dtype=torch.int64, device=device),
         violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
         swa_verify_total_count=(
             None
@@ -449,9 +449,7 @@ def _allocate_snapshot_buffers(
         out_cache_loc=torch.zeros(
             write_entry_capacity, dtype=torch.int64, device=device
         ),
-        positions=torch.zeros(
-            write_entry_capacity, dtype=torch.int64, device=device
-        ),
+        positions=torch.zeros(write_entry_capacity, dtype=torch.int64, device=device),
     )
 
 

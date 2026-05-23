@@ -163,5 +163,3 @@ def _endpoint_belongs_to_group(
 ) -> bool:
     suffix = endpoint.kernel_kind.name.rsplit("_", 1)[1]
     return suffix == group.kind.name
-
-

@@ -94,9 +94,7 @@ class SimplePhaseChecker:
         tensor during init."""
         self.reset_to_idle()
         self._enable_assert_device.fill_(1)
-        _host_debug(
-            f"[SimplePhaseChecker.enable_assert] assert ENABLED"
-        )
+        _host_debug(f"[SimplePhaseChecker.enable_assert] assert ENABLED")
 
     def _resolve_caller_tag(self, caller_name: str) -> int:
         registry = self._caller_tag_registry
