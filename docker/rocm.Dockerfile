@@ -31,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -41,7 +41,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
 # ===============================
 # Base image 950 and args
@@ -51,7 +51,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -61,7 +61,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
+ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
 # ===============================
 # Chosen arch and args
@@ -104,7 +104,7 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v1.1.1"
+ARG MORI_COMMIT="96ffa169710f214e76e07abe5008d686fe54522b"
 
 # AMD AINIC apt repo settings
 ARG AINIC_VERSION=1.117.5-a-38
@@ -199,16 +199,23 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
+
+# cherry pick b639cb6 commit for aiter_mhc_pre fix, may be removed in next aiter upgrade
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=
+# Keep the base image's Torch-compatible Triton by default. Override with
+# AITER_USE_SYSTEM_TRITON=0 when intentionally testing aiter-managed Triton.
+ENV AITER_USE_SYSTEM_TRITON=1
 RUN pip uninstall -y aiter
 RUN git clone ${AITER_REPO} \
  && cd aiter \
  && git checkout ${AITER_COMMIT} \
+ && git cherry-pick --no-commit b639cb63bcac4672dce33a731fad042a65cb3649 \
  && git submodule update --init --recursive \
  && pip install -r requirements.txt
 
 RUN cd aiter \
      && echo "[AITER] GPU_ARCH=${GPU_ARCH}" \
+     && echo "[AITER] AITER_USE_SYSTEM_TRITON=${AITER_USE_SYSTEM_TRITON}" \
      && if [ "$BUILD_AITER_ALL" = "1" ] && [ "$BUILD_LLVM" = "1" ]; then \
           sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ PREBUILD_KERNELS=1 GPU_ARCHS=$GPU_ARCH_LIST python setup.py build_ext --inplace" \
           && sh -c "HIP_CLANG_PATH=/sgl-workspace/llvm-project/build/bin/ GPU_ARCHS=$GPU_ARCH_LIST pip install --config-settings editable_mode=compat -e ."; \

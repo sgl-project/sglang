@@ -19,9 +19,10 @@ logger = logging.getLogger(__name__)
 
 async def list_server_and_tools(server_url: str):
 
-    async with sse_client(url=server_url) as streams, ClientSession(
-        *streams
-    ) as session:
+    async with (
+        sse_client(url=server_url) as streams,
+        ClientSession(*streams) as session,
+    ):
         initialize_response = await session.initialize()
         list_tools_response = await session.list_tools()
         return initialize_response, list_tools_response
@@ -131,9 +132,10 @@ class MCPToolServer(ToolServer):
     async def get_tool_session(self, tool_name: str):
         url = self.urls.get(tool_name)
         if url:
-            async with sse_client(url=url) as streams, ClientSession(
-                *streams
-            ) as session:
+            async with (
+                sse_client(url=url) as streams,
+                ClientSession(*streams) as session,
+            ):
                 await session.initialize()
                 yield session
         else:

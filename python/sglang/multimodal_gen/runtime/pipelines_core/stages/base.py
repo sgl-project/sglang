@@ -17,7 +17,9 @@ from enum import Enum, auto
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -38,6 +40,8 @@ class StageParallelismType(Enum):
     MAIN_RANK_ONLY = auto()
     # this stage requires a cfg-parallel
     CFG_PARALLEL = auto()
+    # executed on main rank only and send result to other ranks
+    MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
 
 
 class StageVerificationError(Exception):
@@ -58,6 +62,8 @@ class PipelineStage(StageDedupMixin, ABC):
     def __init__(self):
         self.server_args = get_global_server_args()
         self._component_residency_manager = None
+        self._registered_stage_name: str | None = None
+        self._profile_stage_name: str | None = None
 
     def log_info(self, msg, *args):
         """Logs an informational message with the stage name as a prefix."""
@@ -113,14 +119,29 @@ class PipelineStage(StageDedupMixin, ABC):
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
+    def set_registered_stage_name(self, stage_name: str) -> None:
+        self._registered_stage_name = stage_name
+
+    def set_profile_stage_name(self, stage_name: str) -> None:
+        self._profile_stage_name = stage_name
+
     def _component_stage_name(self, stage_name: str | None = None) -> str:
-        return stage_name or self.__class__.__name__
+        return (
+            stage_name
+            or getattr(self, "_registered_stage_name", None)
+            or self.__class__.__name__
+        )
 
     def _active_component_stage_name(self) -> str:
-        manager = self._component_residency_manager
-        if manager is not None and manager.state.stage_name is not None:
-            return manager.state.stage_name
-        return self.__class__.__name__
+        manager = getattr(self, "_component_residency_manager", None)
+        manager_state = getattr(manager, "state", None)
+        manager_stage_name = getattr(manager_state, "stage_name", None)
+        if manager_stage_name is not None:
+            return manager_stage_name
+        return self._component_stage_name()
+
+    def _active_profile_stage_name(self) -> str:
+        return getattr(self, "_profile_stage_name", None) or self.__class__.__name__
 
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
@@ -265,7 +286,7 @@ class PipelineStage(StageDedupMixin, ABC):
         Returns:
             The updated batch information after this stage's processing.
         """
-        stage_name = self.__class__.__name__
+        stage_name = self._active_profile_stage_name()
         # Check if verification is enabled (simple approach for prototype)
 
         # Pre-execution input verification
