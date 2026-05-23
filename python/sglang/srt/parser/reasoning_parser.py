@@ -667,13 +667,14 @@ class ReasoningParser:
             kwargs["continue_final_message"] = True
             last_message = request.messages[-1]
             previous_content = last_message.content
-            # Avoid len(None)/`in` TypeError for reasoning-only prefills.
+            # Avoid len(None)/`in` TypeError when the prefill carries
+            # only reasoning_content or tool_calls (content=None).
             if previous_content is None:
                 previous_content = ""
-            # Mirror the DSV4 encoder's wo_eos render (which injects
-            # </think> ahead of visible content) so _in_reasoning starts
-            # past the boundary. wo_eos=False routes to legacy
-            # strip-and-append where no </think> is emitted.
+            # The DSV4 encoder positions </think> ahead of visible content
+            # on the wo_eos path; prepend it to previous_content so
+            # _in_reasoning starts past that boundary. wo_eos=False routes
+            # to legacy strip-and-append where no </think> is emitted.
             if (
                 model_type.lower() == "deepseek-v4"
                 and getattr(last_message, "wo_eos", None) is not False

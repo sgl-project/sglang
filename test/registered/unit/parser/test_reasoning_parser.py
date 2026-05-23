@@ -1428,6 +1428,11 @@ class TestReasoningParserAdvanced(CustomTestCase):
         request = self._make_continue_request(content='{"answer":', wo_eos=False)
         parser = ReasoningParser("deepseek-v4", request=request)
         self.assertEqual(parser.detector.previous_content, '{"answer":')
+        # No </think> in previous_content, so _in_reasoning must reflect
+        # the detector default (False for the DSV4/Qwen3 chain). Locks
+        # against future drift that drops the prepend but flips the
+        # default — both halves matter.
+        self.assertFalse(parser.detector._in_reasoning)
 
     def test_continue_final_message_other_models_keep_previous_content_verbatim(self):
         """Only deepseek-v4 gets the </think> prepend — other parsers unaffected."""
