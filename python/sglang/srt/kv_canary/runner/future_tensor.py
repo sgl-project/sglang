@@ -24,27 +24,20 @@ class FutureTensors:
         if not isinstance(xs_device, dict):
             xs_device = {_DUMMY_DICT_KEY: xs_device}
 
+        device = next(x.device for x in xs_device.values() if isinstance(x, torch.Tensor))
+
         xs_host: _PayloadDict = {}
-        device: Optional[torch.device] = None
         for key, tensor_device in xs_device.items():
             if isinstance(tensor_device, torch.Tensor):
                 xs_host[key] = torch.empty(
                     tensor_device.shape, dtype=tensor_device.dtype, pin_memory=True
                 )
-                if device is None:
-                    device = tensor_device.device
             else:
                 # Non-tensor payload (ints, dicts, etc.) is pass-through so callers
                 # can bundle host metadata (e.g. the step at which the snapshot was
                 # staged) alongside the device tensors and recover that context in
                 # postprocess without reaching back into the producer.
                 xs_host[key] = tensor_device
-
-        if device is None:
-            raise ValueError(
-                "FutureTensors.device_to_host requires at least one torch.Tensor in "
-                "the source dict to anchor the d2h stream sync"
-            )
 
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
