@@ -393,11 +393,25 @@ def _empty_fp8_scale(
         return torch.empty((*dims, sf_mn, sf_k), device="cuda", dtype=sf_dtype)
 
     assert sf_dtype in (torch.int, torch.int32)
-    aligned_mn = ceil_align(sf_mn, 4)
+    from deep_gemm.utils import get_tma_aligned_size
+
+    aligned_mn = get_tma_aligned_size(sf_mn, 4)
     aligned_k = ceil_align(sf_k, 4)
     return torch.empty(
         (*dims, aligned_k // 4, aligned_mn), device="cuda", dtype=torch.int
     ).transpose(-1, -2)[..., :sf_mn, :]
+
+
+def _slice_token_fp8_scale(
+    scale: torch.Tensor,
+    m: int,
+    k: int,
+    operand_recipe: Tuple[int, int],
+    sf_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    if _is_packed_ue8m0_dtype(sf_dtype):
+        return _empty_fp8_scale((m, k), operand_recipe, sf_dtype)
+    return scale[:m]
 
 
 def _empty_token_fp8(
@@ -438,14 +452,20 @@ class _NormalWarmupExecutor(_BaseWarmupExecutor):
         recipe, recipe_a, recipe_b, lhs_recipe, rhs_recipe = _resolve_fp8_recipes(
             recipe, recipe_a, recipe_b, sf_dtype_b
         )
+        self.k = k
+        self.lhs_recipe = lhs_recipe
+        self.sf_dtype_a = sf_dtype_a
         self.recipe_kwargs = _fp8_recipe_kwargs(recipe, recipe_a, recipe_b)
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), lhs_recipe, sf_dtype_a)
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), rhs_recipe, sf_dtype_b)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
+        lhs_s = _slice_token_fp8_scale(
+            self.lhs_s, m, self.k, self.lhs_recipe, self.sf_dtype_a
+        )
         deep_gemm.fp8_gemm_nt(
-            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.lhs_q[:m], lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             **self.recipe_kwargs,
@@ -468,6 +488,9 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         recipe, recipe_a, recipe_b, lhs_recipe, rhs_recipe = _resolve_fp8_recipes(
             recipe, recipe_a, recipe_b, sf_dtype_b
         )
+        self.k = k
+        self.lhs_recipe = lhs_recipe
+        self.sf_dtype_a = sf_dtype_a
         self.recipe_kwargs = _fp8_recipe_kwargs(recipe, recipe_a, recipe_b)
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), lhs_recipe, sf_dtype_a)
         self.rhs_q, self.rhs_s = _empty_block_fp8(
@@ -477,8 +500,11 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
+        lhs_s = _slice_token_fp8_scale(
+            self.lhs_s, m, self.k, self.lhs_recipe, self.sf_dtype_a
+        )
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (self.lhs_q[:m], self.lhs_s[:m]),
+            (self.lhs_q[:m], lhs_s),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
             self.m_indices[:m],

@@ -460,11 +460,13 @@ def create_per_token_group_quant_fp8_output_scale(
     scale_ue8m0: bool,
 ):
     if scale_ue8m0:
+        from deep_gemm.utils import get_tma_aligned_size
+
         assert column_major_scales and scale_tma_aligned
         *x_batch, x_q_mn, x_q_k = x_shape
         assert x_q_k % group_size == 0
         x_s_mn, x_s_k = x_q_mn, x_q_k // group_size
-        aligned_mn = ceil_align(x_s_mn, 4)
+        aligned_mn = get_tma_aligned_size(x_s_mn, 4)
         aligned_k = ceil_align(x_s_k, 4)
         # TODO(FIXME): Fix cuda kernel and recover here to empty.
         return torch.empty(
@@ -585,7 +587,9 @@ def sglang_per_token_group_quant_fp8_ue8m0(
 
     x_s_mn = x_q_mn
     x_s_k = x_q_k // group_size
-    aligned_mn = ceil_align(x_s_mn, 4)
+    from deep_gemm.utils import get_tma_aligned_size
+
+    aligned_mn = get_tma_aligned_size(x_s_mn, 4)
     aligned_k = ceil_align(x_s_k, 4)
     x_s = torch.empty(
         (*x_batch, aligned_k // 4, aligned_mn),
