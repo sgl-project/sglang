@@ -15,6 +15,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -156,6 +157,8 @@ struct PlanEntriesKernel {
       int64_t req_to_token_stride0,
       int64_t bs_padded,
       int32_t swa_window_size) {
+    using namespace host;
+
     const bool has_swa_lut = full_to_swa_index_mapping.has_value();
     const int64_t* lut_ptr =
         has_swa_lut ? static_cast<const int64_t*>(full_to_swa_index_mapping.value().data_ptr()) : nullptr;
