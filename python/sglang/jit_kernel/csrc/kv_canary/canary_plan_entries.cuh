@@ -192,8 +192,7 @@ struct PlanEntriesKernel {
           .with_device<kDLCUDA>(device_)
           .verify(full_to_swa_index_mapping.value());
     }
-    RuntimeCheck(
-        Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
+    RuntimeCheck(Nscratch.unwrap() >= Nbs.unwrap() + 1, "verify_offsets_scratch length must be >= bs_padded + 1");
 
     const int64_t bs_padded = Nbs.unwrap();
     if (bs_padded <= 0) {
