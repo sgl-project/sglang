@@ -179,8 +179,6 @@ unwrap_optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& optiona
 struct PlanEntriesKernel {
   static constexpr int kBlockSize = 128;
   static constexpr int kBlocksPerSm = 8;
-  // Cap the persistent grid so we don't oversubscribe SMs on unusual devices.
-  static constexpr int kMaxBlocks = 4096;
 
   static int get_num_sms(DLDevice device) {
     // Lazy + cached per call site; cudaGetDeviceProperties is fast enough but we still avoid hitting it
@@ -241,13 +239,7 @@ struct PlanEntriesKernel {
 
     const DLDevice device = req_pool_indices.device();
     const int num_sms = get_num_sms(device);
-    int num_blocks = num_sms * kBlocksPerSm;
-    if (num_blocks > kMaxBlocks) {
-      num_blocks = kMaxBlocks;
-    }
-    if (num_blocks <= 0) {
-      num_blocks = 1;
-    }
+    const int num_blocks = num_sms * kBlocksPerSm;
 
     const dim3 grid(num_blocks);
     const dim3 block(kBlockSize);
