@@ -1316,7 +1316,7 @@ class DecodePreallocQueue:
         # Truncate fill_ids to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (fill_ids is 1 ahead).
-        req.fill_ids = (req.origin_input_ids + req.output_ids)[: req.kv_committed_len]
+        req.fill_ids = req.all_ids()[: req.kv_committed_len]
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs

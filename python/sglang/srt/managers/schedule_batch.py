@@ -992,6 +992,11 @@ class Req(ReqDllmMixin):
             return self.output_ids[: self.finished_len]
         return self.output_ids
 
+    def all_ids(self) -> array[int]:
+        ids = array("q", self.origin_input_ids)
+        ids.extend(self.output_ids)
+        return ids
+
     def _cache_commit_len(self) -> int:
         # Report only the prompt prefix so thinking + answer fall into the
         # overallocated range and are reclaimed by release_kv_cache. #22373.
@@ -1050,7 +1055,7 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            self.fill_ids = self.all_ids()
 
         input_len = len(self.fill_ids)
 
@@ -1149,9 +1154,9 @@ class Req(ReqDllmMixin):
             self.surr_offset = max(
                 self.read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
             )
-            self.surr_and_decode_ids = (
-                self.origin_input_ids_unpadded[self.surr_offset :] + output_ids
-            )
+            self.surr_and_decode_ids = self.origin_input_ids_unpadded[
+                self.surr_offset :
+            ] + list(output_ids)
             self.cur_decode_ids_len = len(output_ids)
         else:
             self.surr_and_decode_ids.extend(output_ids[self.cur_decode_ids_len :])
@@ -2204,7 +2209,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+            req.fill_ids = req.all_ids()
             req.set_extend_input_len(1)
 
         input_ids = torch.cat([self.input_ids, running_batch.input_ids])
