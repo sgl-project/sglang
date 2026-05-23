@@ -43,9 +43,7 @@ def _fused_remap_deepep_kernel(
     safe_cols = tl.where(is_routed, cols, tl.zeros_like(cols))
 
     # Load routed IDs and apply interleaved remap: id -> id + id // num_local_routed
-    routed_ids = tl.load(
-        topk_ids_ptr + row * K + safe_cols, mask=is_routed, other=0
-    )
+    routed_ids = tl.load(topk_ids_ptr + row * K + safe_cols, mask=is_routed, other=0)
     remapped_ids = routed_ids + routed_ids // num_local_routed
 
     # Shared expert IDs: ep_rank * num_local_experts + num_local_routed + shared_idx
@@ -90,14 +88,10 @@ def _fused_remap_deepep_npu(
     K_PLUS_N = K + num_fused_shared_experts
 
     routed_scaling_factor = topk_config.routed_scaling_factor
-    shared_weight = (
-        1.0 if not routed_scaling_factor else 1.0 / routed_scaling_factor
-    )
+    shared_weight = 1.0 if not routed_scaling_factor else 1.0 / routed_scaling_factor
 
     out_ids = topk_ids.new_empty((N, K_PLUS_N), dtype=topk_ids.dtype)
-    out_weights = topk_weights.new_empty(
-        (N, K_PLUS_N), dtype=topk_weights.dtype
-    )
+    out_weights = topk_weights.new_empty((N, K_PLUS_N), dtype=topk_weights.dtype)
 
     BLOCK = max(32, K_PLUS_N)
     _fused_remap_deepep_kernel[(N,)](
