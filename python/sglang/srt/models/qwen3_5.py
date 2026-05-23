@@ -572,7 +572,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 alt_stream=alt_stream if not _shared_expert_fusion else None,
                 prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=_shared_expert_fusion and not alt_stream,
+                support_shared_expert_fusion=_shared_expert_fusion,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -784,7 +784,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 alt_stream=alt_stream if not _shared_expert_fusion else None,
                 prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
                 is_nextn=is_nextn,
-                support_shared_expert_fusion=_shared_expert_fusion and not alt_stream,
+                support_shared_expert_fusion=_shared_expert_fusion,
             )
             is_layer_sparse = True
             is_previous_layer_sparse = True
@@ -1670,7 +1670,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
         self.num_fused_shared_experts = 0
-        if _use_aiter and _shared_expert_fusion and not _hip_use_alt_stream:
+        if _use_aiter and _shared_expert_fusion:
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
