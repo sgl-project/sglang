@@ -3169,9 +3169,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        canary_ctx = (
-            c.with_kernels_outside_graph(forward_batch)
-            if (c := self.canary_runner) is not None and not self.is_draft_worker
+        canary_manager = (
+            self.canary_runner if not self.is_draft_worker else None
+        )
+        canary_sfm = (
+            canary_manager.get_single_forward_manager(0)
+            if canary_manager is not None
+            else None
+        )
+        if canary_sfm is not None:
+            canary_sfm.pre_ops_outside_graph(
+                maybe_non_mature_forward_batch=forward_batch
+            )
+        canary_index_ctx = (
+            canary_manager.with_single_forward_manager_index(0)
+            if canary_manager is not None
             else contextlib.nullcontext()
         )
 
@@ -3181,7 +3193,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
-            canary_ctx,
+            canary_index_ctx,
         ):
             output = self._forward_raw(
                 forward_batch,
@@ -3190,15 +3202,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+        if canary_sfm is not None:
+            canary_sfm.post_ops_outside_graph(snapshot=canary_sfm.snapshot)
+            canary_manager.step_shared_facilities()
+        if self.enable_elastic_ep:
+            output = self._maybe_rebalance_after_rank_fault(
+                output,
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
