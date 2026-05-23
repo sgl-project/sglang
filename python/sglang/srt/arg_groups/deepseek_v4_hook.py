@@ -45,6 +45,12 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
             envs.SGLANG_ENABLE_SPEC_V2.set(True)
             logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
 
+    if server_args.moe_runner_backend == "auto" and server_args.quantization == "mxfp4":
+        server_args.moe_runner_backend = "flashinfer_mxfp4"
+        logger.info(
+            f"Use flashinfer_mxfp4 as MoE runner backend for {model_arch} with MXFP4 quantization"
+        )
+
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         server_args.swa_full_tokens_ratio = 0.1
         logger.info(
