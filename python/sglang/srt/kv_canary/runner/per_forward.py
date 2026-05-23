@@ -30,48 +30,42 @@ if TYPE_CHECKING:
 
 
 class _CanaryPerForwardPhase(IntEnum):
-    """Lifecycle phases of one canary outer cuda-graph cycle. Used as ``int`` inputs
-    to a :class:`SimplePhaseChecker` so the checker stays canary-agnostic.
+    """Lifecycle phases of one canary cycle. Used as ``int`` inputs to a
+    :class:`SimplePhaseChecker` so the checker stays canary-agnostic.
 
-    One outer cycle may contain 1 inner forward (target) or N inner forwards
-    (EAGLE draft). Inside the cycle, each inner forward is one head/tail pair.
-    ``launch_tail_kernels`` cycles the phase back to ``AWAITING_HEAD`` so the
-    next inner head can fire; ``post_kernels_outside_cuda_graph`` then returns the phase to
-    ``IDLE`` after the last tail.
+    One cycle is exactly: pre -> head -> tail -> post.
 
     Enforced order::
 
         IDLE
-          -> AWAITING_HEAD     (PerForwardOrchestrator.pre_kernels_outside_cuda_graph)
-          -> AWAITING_TAIL     (PerForwardOrchestrator.launch_head_kernels)
-          -> AWAITING_HEAD     (PerForwardOrchestrator.launch_tail_kernels)
-          -> ... AWAITING_HEAD <-> AWAITING_TAIL repeats N-1 more times ...
-          -> IDLE              (PerForwardOrchestrator.post_kernels_outside_cuda_graph)
+          -> AFTER_PRE     (PerForwardOrchestrator.pre_kernels_outside_cuda_graph)
+          -> AFTER_HEAD    (PerForwardOrchestrator.launch_head_kernels)
+          -> AFTER_TAIL    (PerForwardOrchestrator.launch_tail_kernels)
+          -> IDLE          (PerForwardOrchestrator.post_kernels_outside_cuda_graph)
     """
 
     IDLE = 0
-    AWAITING_HEAD = 1
-    AWAITING_TAIL = 2
+    AFTER_PRE = 1
+    AFTER_HEAD = 2
+    AFTER_TAIL = 3
 
 
 class PerForwardOrchestrator:
-    """Per-forward orchestrator. Split into four phases aligned with the OUTER
-    cuda-graph boundary. "Outer" means the outermost cuda-graph boundary
-    around the run, NOT a literal "per inner ``model.forward``":
+    """One canary cycle = pre -> head -> tail -> post.
 
-    - ``pre_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE the captured
-      region (called once per outer cycle): capacity checks, perturb hooks,
-      fill the static expected_input buffers.
-    - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region,
-      once per inner forward (called by the monkey-patched model.forward
-      before the original forward): per-step PlanInput fill, plan sub-kernels,
-      HEAD endpoint launches.
-    - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region,
-      once per inner forward (called after the original forward): TAIL
-      endpoint launches reusing the plan staged in launch_head_kernels.
-    - ``post_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE the
-      captured region (called once per outer cycle): perturb end-of-forward,
-      enable-warner tick.
+    - ``pre_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE OUTSIDE
+      any cuda-graph capture: capacity checks, perturb hooks, fill the static
+      expected_input buffers.
+    - ``launch_head_kernels(forward_batch)`` runs INSIDE the captured region
+      (called by the monkey-patched model.forward, before the original
+      forward): per-step PlanInput fill, plan sub-kernels, HEAD endpoint
+      launches.
+    - ``launch_tail_kernels(forward_batch)`` runs INSIDE the captured region
+      (called after the original forward): TAIL endpoint launches reusing
+      the plan staged in launch_head_kernels.
+    - ``post_kernels_outside_cuda_graph(forward_batch)`` runs HOST-SIDE
+      OUTSIDE any cuda-graph capture: perturb end-of-forward, enable-warner
+      tick.
     """
 
     def __init__(
@@ -146,7 +140,7 @@ class PerForwardOrchestrator:
 
         self._phase_checker.update(
             expect_phase=_CanaryPerForwardPhase.IDLE,
-            next_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
+            next_phase=_CanaryPerForwardPhase.AFTER_PRE,
             caller_name="PerForwardOrchestrator.pre_kernels_outside_cuda_graph",
         )
 
@@ -186,8 +180,8 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
-            next_phase=_CanaryPerForwardPhase.AWAITING_TAIL,
+            expect_phase=_CanaryPerForwardPhase.AFTER_PRE,
+            next_phase=_CanaryPerForwardPhase.AFTER_HEAD,
             caller_name="PerForwardOrchestrator.launch_head_kernels",
         )
 
@@ -236,11 +230,9 @@ class PerForwardOrchestrator:
         if self._config.mode == "off":
             return
 
-        # Cycle back to AWAITING_HEAD: the next inner head (in EAGLE draft's
-        # N>1 case) can fire from the same start state as the first head.
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AWAITING_TAIL,
-            next_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
+            expect_phase=_CanaryPerForwardPhase.AFTER_HEAD,
+            next_phase=_CanaryPerForwardPhase.AFTER_TAIL,
             caller_name="PerForwardOrchestrator.launch_tail_kernels",
         )
 
@@ -270,7 +262,7 @@ class PerForwardOrchestrator:
             return
 
         self._phase_checker.update(
-            expect_phase=_CanaryPerForwardPhase.AWAITING_HEAD,
+            expect_phase=_CanaryPerForwardPhase.AFTER_TAIL,
             next_phase=_CanaryPerForwardPhase.IDLE,
             caller_name="PerForwardOrchestrator.post_kernels_outside_cuda_graph",
         )
