@@ -355,7 +355,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         canary_manager = self.draft_runner.canary_runner
-        n_inner = max(1, self.speculative_num_steps - 1)
+        n_inner = self.speculative_num_steps - 1
         if canary_manager is not None:
             for i in range(n_inner):
                 canary_manager.get_single_forward_manager(
