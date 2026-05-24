@@ -648,6 +648,38 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.extend(request.input)  # type: ignore
         return messages
 
+    def _build_harmony_system_messages(
+        self, request: "ResponsesRequest"
+    ) -> tuple["OpenAIMessage", "OpenAIMessage"]:
+        """Build the system and developer messages for a Harmony request.
+
+        Extracted to avoid duplicating this logic between the first-turn and
+        continuation branches of _construct_input_messages_with_harmony.
+        """
+        reasoning_effort = request.reasoning.effort if request.reasoning else None
+        tool_types = [tool.type for tool in request.tools]
+        enable_browser = (
+            "web_search_preview" in tool_types and self.tool_server is not None
+        )
+        enable_code_interpreter = (
+            "code_interpreter" in tool_types and self.tool_server is not None
+        )
+        sys_msg = get_system_message(
+            reasoning_effort=reasoning_effort,
+            browser_description=(
+                self.tool_server.get_tool_description("browser")
+                if self.tool_server and enable_browser
+                else None
+            ),
+            python_description=(
+                self.tool_server.get_tool_description("python")
+                if self.tool_server and enable_code_interpreter
+                else None
+            ),
+        )
+        dev_msg = get_developer_message(request.instructions, request.tools)
+        return sys_msg, dev_msg
+
     def _construct_input_messages_with_harmony(
         self,
         request: ResponsesRequest,
@@ -656,58 +688,23 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages: list["OpenAIMessage"] = []
         if prev_response is None:
             # New conversation.
-            reasoning_effort = request.reasoning.effort if request.reasoning else None
-            tool_types = [tool.type for tool in request.tools]
-            enable_browser = (
-                "web_search_preview" in tool_types and self.tool_server is not None
-            )
-            enable_code_interpreter = (
-                "code_interpreter" in tool_types and self.tool_server is not None
-            )
-            sys_msg = get_system_message(
-                reasoning_effort=reasoning_effort,
-                browser_description=(
-                    self.tool_server.get_tool_description("browser")
-                    if self.tool_server and enable_browser
-                    else None
-                ),
-                python_description=(
-                    self.tool_server.get_tool_description("python")
-                    if self.tool_server and enable_code_interpreter
-                    else None
-                ),
-            )
+            sys_msg, dev_msg = self._build_harmony_system_messages(request)
             messages.append(sys_msg)
-            dev_msg = get_developer_message(request.instructions, request.tools)
             messages.append(dev_msg)
         else:
             # Continue the previous conversation.
             # Re-build sys_msg and dev_msg from the current request so that
             # updated instructions, reasoning effort, or tools take effect on
             # this turn (previously they were silently ignored).
-            reasoning_effort = request.reasoning.effort if request.reasoning else None
-            tool_types = [tool.type for tool in request.tools]
-            enable_browser = (
-                "web_search_preview" in tool_types and self.tool_server is not None
-            )
-            enable_code_interpreter = (
-                "code_interpreter" in tool_types and self.tool_server is not None
-            )
-            fresh_sys_msg = get_system_message(
-                reasoning_effort=reasoning_effort,
-                browser_description=(
-                    self.tool_server.get_tool_description("browser")
-                    if self.tool_server and enable_browser
-                    else None
-                ),
-                python_description=(
-                    self.tool_server.get_tool_description("python")
-                    if self.tool_server and enable_code_interpreter
-                    else None
-                ),
-            )
-            fresh_dev_msg = get_developer_message(request.instructions, request.tools)
-            prev_msgs = self.msg_store[prev_response.id]
+            fresh_sys_msg, fresh_dev_msg = self._build_harmony_system_messages(request)
+            if prev_response.id not in self.msg_store:
+                raise ValueError(
+                    f"Conversation history for response ID {prev_response.id} not found. "
+                    "Ensure 'store=True' was used in the previous request."
+                )
+            # Use a shallow copy so we do not destructively mutate the stored
+            # history (important for branching / multi-fork scenarios).
+            prev_msgs = list(self.msg_store[prev_response.id])
             # Replace the stored sys_msg (index 0) and dev_msg (index 1) so
             # the new turn uses the caller's current params.
             if len(prev_msgs) >= 2:
@@ -715,6 +712,9 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prev_msgs[1] = fresh_dev_msg
             elif len(prev_msgs) == 1:
                 prev_msgs[0] = fresh_sys_msg
+                prev_msgs.append(fresh_dev_msg)
+            else:
+                prev_msgs = [fresh_sys_msg, fresh_dev_msg]
             # Remove the previous chain-of-thoughts if there is a new "final"
             # message.
             if (
