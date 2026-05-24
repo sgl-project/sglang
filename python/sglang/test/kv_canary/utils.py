@@ -17,6 +17,10 @@ def build_canary_server_args(
     args = [
         "--kv-canary",
         kv_canary_mode.value,
+        # The SingleForwardManager design hard-asserts piecewise cuda graph
+        # is disabled (see install_canary in api.py). Every canary e2e
+        # fixture must pass this flag or server launch fails.
+        "--disable-piecewise-cuda-graph",
         # The shared _LONG_PROMPT_BODY tokenizes to ~7000 tokens for Qwen3 and
         # similar for gemma-4-E2B; combined with the 2048-token default
         # max_new_tokens the per-request total reaches ~9050, so the context

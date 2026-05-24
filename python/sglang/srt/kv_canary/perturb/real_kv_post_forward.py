@@ -1,4 +1,4 @@
-"""Perturb point (d): flip the first byte of a slot in forward_batch.out_cache_loc
+"""Perturb point (d): flip the first byte of a slot in maybe_inaccurate_forward_batch.out_cache_loc
 AFTER the TAIL kernel has captured its canary hash.
 
 The flip is a PyTorch indexed write on the current CUDA stream; because TAIL is
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
     warmup_gate: WarmupGate,
@@ -41,14 +41,16 @@ def run(
         perturb_name="real_kv_post_forward",
         probability=config.real_kv_post_forward_prob,
         warmup_gate=warmup_gate,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
     ):
         return
 
-    slot = pick_out_cache_loc_slot(forward_batch=forward_batch)
+    slot = pick_out_cache_loc_slot(
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+    )
     if slot is None:
         logger.info(
-            "kv_canary perturb real_kv_post_forward: skipped because forward_batch.out_cache_loc "
+            "kv_canary perturb real_kv_post_forward: skipped because maybe_inaccurate_forward_batch.out_cache_loc "
             "had no valid slot"
         )
         return

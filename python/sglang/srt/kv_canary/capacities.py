@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryLaunchCapacities:
-    """Pre-allocation sizes for the per-forward tensors a CanaryRunner owns. Computed
+    """Pre-allocation sizes for the per-forward tensors a SingleForwardManager owns. Computed
     once at install_canary from ServerArgs + ModelRunner metadata; all fields are upper
     bounds - actual per-step usage may be smaller but never larger.
 

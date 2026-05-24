@@ -137,10 +137,10 @@ class TestPickTargetGroup(CustomTestCase):
 
 
 class TestPerturbManager(CustomTestCase):
-    def test_perturb_manager_end_of_forward_dispatches_real_kv_post_forward(
+    def test_perturb_manager_perturb_post_forward_dispatches_real_kv_post_forward(
         self,
     ) -> None:
-        """Verify end_of_forward() routes only to perturb_real_kv_post_forward."""
+        """Verify perturb_post_forward() routes only to the post_forward dispatch."""
         device = DEFAULT_DEVICE
         manager = PerturbManager(
             config=PerturbConfig(
@@ -153,9 +153,9 @@ class TestPerturbManager(CustomTestCase):
             ),
             req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
-        forward_batch = make_forward_batch(device)
+        forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
 
         with patch.object(
@@ -175,7 +175,7 @@ class TestPerturbManager(CustomTestCase):
             "perturb_real_kv_unused_cache",
             lambda batch: calls.append("real_kv_unused_cache"),
         ):
-            manager.end_of_forward(forward_batch)
+            manager.perturb_post_forward(maybe_inaccurate_forward_batch=forward_batch)
 
         self.assertEqual(calls, ["real_kv_post_forward"])
 
@@ -194,7 +194,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
             target_group_kind=TargetGroupKind.FULL,
             warmup_steps=0,
         )
-        warmup_gate = WarmupGate(config=config, step_counter_getter=lambda: 10)
+        warmup_gate = WarmupGate(config=config, outer_step_counter_getter=lambda: 10)
 
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         forward_batch.out_cache_loc = torch.tensor(
@@ -210,7 +210,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
 
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
             real_kv_post_forward.run(
-                forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
                 config=config,
                 buffer_groups=(group,),
                 warmup_gate=warmup_gate,
@@ -248,7 +248,7 @@ class TestReqToTokenPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         forward_batch = make_forward_batch(device, bs=2, seq_lens_list=(3, 3))
         forward_batch.out_cache_loc = torch.tensor(
@@ -285,7 +285,7 @@ class TestReqToTokenPerturb(CustomTestCase):
         forward_batch.num_token_non_padded_cpu = 1
 
         targets = collect_active_slots(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=forward_batch,
             req_to_token_pool=pool,
         )
 
@@ -319,7 +319,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         forward_batch.out_cache_loc = torch.tensor(
@@ -383,7 +383,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         manager.attach_radix_cache(cast("BasePrefixCache", object()))
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
@@ -398,7 +398,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             "_pick_sweep_slot_for_group",
             return_value=3,
         ):
-            manager.perturb(forward_batch)
+            manager.perturb(maybe_inaccurate_forward_batch=forward_batch)
 
         self.assertTrue(torch.equal(pool.req_to_token, pool_snapshot))
         self.assertTrue(torch.equal(source.tensor, source_snapshot))
@@ -429,7 +429,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
         manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
@@ -504,7 +504,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             ),
             req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
 

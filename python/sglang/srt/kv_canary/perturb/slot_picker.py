@@ -36,17 +36,17 @@ class ReqToTokenEntry:
 
 def collect_active_slots(
     *,
-    forward_batch: "ForwardBatch",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
     req_to_token_pool: "ReqToTokenPool",
     exclude_out_cache_loc: bool = True,
 ) -> list[ReqToTokenEntry]:
     """Collect every (req_pool_idx, position, value) triple for currently-active reqs.
 
-    Excludes slots in ``forward_batch.out_cache_loc`` when ``exclude_out_cache_loc=True``
+    Excludes slots in ``maybe_inaccurate_forward_batch.out_cache_loc`` when ``exclude_out_cache_loc=True``
     so a slot the current forward is about to write isn't picked (write race).
     """
-    req_pool_indices = forward_batch.req_pool_indices
-    seq_lens = forward_batch.seq_lens
+    req_pool_indices = maybe_inaccurate_forward_batch.req_pool_indices
+    seq_lens = maybe_inaccurate_forward_batch.seq_lens
     if req_pool_indices is None or seq_lens is None:
         return []
 
@@ -56,9 +56,9 @@ def collect_active_slots(
 
     excluded: set[int] = set()
     if exclude_out_cache_loc:
-        out_cache_loc = forward_batch.out_cache_loc
+        out_cache_loc = maybe_inaccurate_forward_batch.out_cache_loc
         if out_cache_loc is not None:
-            valid_num_tokens = forward_batch.num_token_non_padded_cpu
+            valid_num_tokens = maybe_inaccurate_forward_batch.num_token_non_padded_cpu
             if valid_num_tokens is None:
                 valid_num_tokens = int(out_cache_loc.shape[0])
             excluded = set(
@@ -95,13 +95,13 @@ def collect_active_slots(
 
 def pick_active_slot(
     *,
-    forward_batch: "ForwardBatch",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
     req_to_token_pool: "ReqToTokenPool",
     exclude_out_cache_loc: bool = True,
 ) -> Optional[ReqToTokenEntry]:
     """Random pick from ``collect_active_slots`` output. Returns None if no candidate."""
     candidates = collect_active_slots(
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         req_to_token_pool=req_to_token_pool,
         exclude_out_cache_loc=exclude_out_cache_loc,
     )
@@ -132,14 +132,16 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
     return valid[pick]
 
 
-def pick_out_cache_loc_slot(*, forward_batch: "ForwardBatch") -> Optional[int]:
-    out_cache_loc = forward_batch.out_cache_loc
+def pick_out_cache_loc_slot(
+    *, maybe_inaccurate_forward_batch: "ForwardBatch"
+) -> Optional[int]:
+    out_cache_loc = maybe_inaccurate_forward_batch.out_cache_loc
     if out_cache_loc is None:
         return None
     total = int(out_cache_loc.shape[0])
     if total <= 0:
         return None
-    valid_num_tokens = forward_batch.num_token_non_padded_cpu
+    valid_num_tokens = maybe_inaccurate_forward_batch.num_token_non_padded_cpu
     if valid_num_tokens is None:
         valid_num_tokens = total
     valid_num_tokens = int(valid_num_tokens)

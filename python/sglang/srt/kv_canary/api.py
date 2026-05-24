@@ -11,7 +11,7 @@ from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patch.utils import wrap_method
-from sglang.srt.kv_canary.runner.canary_runner import CanaryRunner
+from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -28,10 +28,16 @@ def install_canary(
     server_args: "ServerArgs",
     model_runner: "ModelRunner",
     token_oracle_manager: Optional["TokenOracleManager"] = None,
-) -> Optional[CanaryRunner]:
+) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
     if config.mode == "off":
         return None
+
+    assert server_args.disable_piecewise_cuda_graph, (
+        "kv-canary: piecewise cuda graph is not supported by the current "
+        "SingleForwardManager design; pass --disable-piecewise-cuda-graph "
+        "when canary is enabled"
+    )
 
     perturb_config = PerturbConfig.from_env()
     device = torch.device(model_runner.device)
@@ -51,7 +57,8 @@ def install_canary(
         pool_slot_count=model_runner.max_total_num_tokens,
     )
     swa_window_size = model_runner.sliding_window_size or 0
-    runner = CanaryRunner(
+    speculative_num_steps = int(server_args.speculative_num_steps or 1)
+    manager = CanaryManager(
         config=config,
         perturb_config=perturb_config,
         buffer_groups=buffer_groups,
@@ -63,16 +70,18 @@ def install_canary(
         swa_window_size=swa_window_size,
         token_oracle_manager=token_oracle_manager,
         swa_allocator=swa_allocator,
+        speculative_num_steps=speculative_num_steps,
+        is_eagle_draft_decode=model_runner.is_draft_worker,
     )
 
-    _patch_model_forward(model_runner=model_runner, runner=runner)
+    _patch_model_forward(model_runner=model_runner, manager=manager)
 
     # Single-line summary of every knob that controls canary behavior at boot time.
     # Disaggregation mode is included so PD logs are unambiguous about which side this is.
     logger.info(
         "install_canary: disaggregation_mode=%s config=%s perturb_config=%s "
         "launch_capacities=%s n_buffer_groups=%d buffer_group_kinds=%s "
-        "swa_window_size=%d",
+        "swa_window_size=%d speculative_num_steps=%d",
         server_args.disaggregation_mode,
         config,
         perturb_config,
@@ -80,25 +89,29 @@ def install_canary(
         len(buffer_groups),
         [g.kind.name for g in buffer_groups],
         swa_window_size,
+        speculative_num_steps,
     )
-    return runner
+    return manager
 
 
-def get_canary_runner(model_runner: "ModelRunner") -> Optional[CanaryRunner]:
-    """Return the runner attached to this ModelRunner, or None if canary was not installed."""
+def get_canary_manager(model_runner: "ModelRunner") -> Optional[CanaryManager]:
+    """Return the manager attached to this ModelRunner, or None if canary
+    was not installed."""
     return model_runner.canary_runner
 
 
-def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -> None:
+def _patch_model_forward(
+    *, model_runner: "ModelRunner", manager: CanaryManager
+) -> None:
     def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
         forward_batch = _extract_forward_batch(args, kwargs)
         assert (
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
-        runner.launch_head_kernels(forward_batch)
+        canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
         output = original(*args, **kwargs)
-        runner.launch_tail_kernels(forward_batch)
+        manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)

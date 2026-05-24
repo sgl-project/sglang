@@ -834,7 +834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
-        if self.canary_runner is not None:
+        if self.canary_runner is not None and not self.is_draft_worker:
             self.canary_runner.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):
@@ -3169,19 +3169,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        canary_ctx = (
-            c.with_kernels_outside_graph(forward_batch)
-            if (c := self.canary_runner) is not None and not self.is_draft_worker
+        canary_manager = self.canary_runner if not self.is_draft_worker else None
+        canary_outside_ctx = (
+            canary_manager.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
+            if canary_manager is not None
+            else contextlib.nullcontext()
+        )
+        canary_index_ctx = (
+            canary_manager.with_active_single_forward_manager(0)
+            if canary_manager is not None
             else contextlib.nullcontext()
         )
 
         with (
+            canary_outside_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
-            canary_ctx,
+            canary_index_ctx,
         ):
             output = self._forward_raw(
                 forward_batch,
@@ -3190,15 +3200,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            if self.enable_elastic_ep:
-                output = self._maybe_rebalance_after_rank_fault(
-                    output,
-                    forward_batch,
-                    skip_attn_backend_init,
-                    pp_proxy_tensors,
-                    reinit_attn_backend,
-                    split_forward_count,
-                )
+        if self.enable_elastic_ep:
+            output = self._maybe_rebalance_after_rank_fault(
+                output,
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule

@@ -33,14 +33,14 @@ class SweepOrchestrator:
         buffer_groups: tuple[CanaryBufferGroup, ...],
         endpoints: tuple[CanaryEndpoint, ...],
         swa_window_size: int,
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._buffer_groups = buffer_groups
         self._endpoints = endpoints
         self._swa_window_size = swa_window_size
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._radix_cache: Optional["BasePrefixCache"] = None
 
         self._last_sweep_step: int = -1
@@ -56,13 +56,13 @@ class SweepOrchestrator:
     def maybe_run_sweep(self) -> None:
         if self._config.sweep_interval == 0:
             return
-        step_counter = self._step_counter_getter()
+        outer_step_counter = self._outer_step_counter_getter()
         if (
             self._last_sweep_step >= 0
-            and step_counter - self._last_sweep_step < self._config.sweep_interval
+            and outer_step_counter - self._last_sweep_step < self._config.sweep_interval
         ):
             return
-        self._last_sweep_step = step_counter
+        self._last_sweep_step = outer_step_counter
 
         if self._radix_cache is None:
             return
@@ -87,5 +87,5 @@ class SweepOrchestrator:
         logger.info(
             "[canary] sweep succeeded %d times (last_step=%d)",
             self._sweep_passes,
-            step_counter,
+            outer_step_counter,
         )

@@ -17,7 +17,7 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group
-from sglang.test.kv_canary.runner_test_base import CanaryRunnerTestCase, make_runner
+from sglang.test.kv_canary.runner_test_base import CanaryManagerTestCase, make_manager
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
@@ -75,7 +75,7 @@ def _run_compute(
     count = compute_swa_full_idx_divergence(
         swa_allocator=swa_allocator,
         req_to_token_pool=req_to_token_pool,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=forward_batch,
     )
     return int(count.item())
 
@@ -105,8 +105,11 @@ class TestSwaDivergenceReport(CustomTestCase):
                 ),
                 verify_plan=_make_verify_plan(3),
             )
-            stats.step(step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH)
-        # 4th forward lands on step_counter=10 = interval, so compute_on_device
+            stats.step(
+                outer_step_counter=forward_idx + 1,
+                maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH,
+            )
+        # 4th forward lands on outer_step_counter=10 = interval, so compute_on_device
         # snapshots {forward_ct:4, verify_full:40, verify_swa:12} into the dict and
         # the staged future hangs onto it. forward_ct is now 4.
         stats.observe_after_invoke_plan(
@@ -121,14 +124,19 @@ class TestSwaDivergenceReport(CustomTestCase):
             ),
             verify_plan=_make_verify_plan(3),
         )
-        stats.step(step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH)
+        stats.step(
+            outer_step_counter=10, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH
+        )
 
         # 5th step drains the previous stage and emits the log; forward_ct is now 5
         # but the staged dict still carries the snapshot forward_ct=4 from step 4.
         with self.assertLogs(
             swa_div_module.logger.name, level=logging.INFO
         ) as captured:
-            stats.step(step_counter=11, forward_batch=_EMPTY_FORWARD_BATCH)
+            stats.step(
+                outer_step_counter=11,
+                maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH,
+            )
 
         lines = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None
@@ -156,11 +164,17 @@ class TestSwaDivergenceReport(CustomTestCase):
             # Stage the dict at the interval-aligned step (no log emitted yet,
             # DelayedDeviceHostHandler still has nothing to drain), then call
             # step() again at the next counter to drain and emit the log.
-            stats.step(step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH)
+            stats.step(
+                outer_step_counter=stage_step,
+                maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH,
+            )
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(step_counter=drain_step, forward_batch=_EMPTY_FORWARD_BATCH)
+                stats.step(
+                    outer_step_counter=drain_step,
+                    maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH,
+                )
             matching = [
                 line
                 for line in captured.output
@@ -352,11 +366,13 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
 
         # Stage at the interval-aligned step, then drain on the next step so the
         # DelayedDeviceHostHandler has a pending future to postprocess.
-        stats.step(step_counter=10, forward_batch=forward_batch)
+        stats.step(outer_step_counter=10, maybe_inaccurate_forward_batch=forward_batch)
         with self.assertLogs(
             swa_div_module.logger.name, level=logging.INFO
         ) as captured:
-            stats.step(step_counter=11, forward_batch=forward_batch)
+            stats.step(
+                outer_step_counter=11, maybe_inaccurate_forward_batch=forward_batch
+            )
 
         matching = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None
@@ -369,21 +385,21 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
         self.assertEqual(parsed.verify_swa, 3)
 
 
-class TestCanaryRunnerSwaDivergenceWiring(CanaryRunnerTestCase):
+class TestCanaryManagerSwaDivergenceWiring(CanaryManagerTestCase):
     def test_swa_divergence_report_is_none_when_env_disabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
             0
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
-            runner = make_runner(device=self.device)
-        self.assertIsNone(runner._swa_divergence_report)
+            manager = make_manager(device=self.device)
+        self.assertIsNone(manager._swa_divergence_report)
 
     def test_swa_divergence_report_present_when_env_enabled(self) -> None:
         with envs.SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL.override(
             20
         ), envs.SGLANG_KV_CANARY_PERTURB_TARGET_GROUP.override("full"):
-            runner = make_runner(device=self.device)
-        self.assertIsNotNone(runner._swa_divergence_report)
-        self.assertIsInstance(runner._swa_divergence_report, SwaDivergenceReport)
+            manager = make_manager(device=self.device)
+        self.assertIsNotNone(manager._swa_divergence_report)
+        self.assertIsInstance(manager._swa_divergence_report, SwaDivergenceReport)
 
 
 if __name__ == "__main__":
