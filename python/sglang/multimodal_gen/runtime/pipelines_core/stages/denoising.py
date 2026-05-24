@@ -221,12 +221,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not backends:
             return None
         if len(backends) > 1:
+            sparse_backends = {backend for backend in backends if backend.is_sparse}
+            selected_backend = (
+                sorted(sparse_backends, key=lambda backend: backend.name)[0]
+                if sparse_backends
+                else sorted(backends, key=lambda backend: backend.name)[0]
+            )
             logger.warning(
                 "Multiple transformer attention backends detected: %s. "
-                "Using one backend for denoising metadata.",
+                "Using %s for denoising metadata.",
                 sorted(backend.name.lower() for backend in backends),
+                selected_backend.name.lower(),
             )
-        return sorted(backends, key=lambda backend: backend.name)[0]
+            return selected_backend
+        return next(iter(backends))
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -1474,12 +1482,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
+            attention_backend_config = server_args.attention_backend_config or {}
+            vsa_sparsity = attention_backend_config.get(
+                "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+            )
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                VSA_sparsity=vsa_sparsity,
                 device=get_local_torch_device(),
             )
         elif (
