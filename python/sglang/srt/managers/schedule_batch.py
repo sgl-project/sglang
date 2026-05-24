@@ -377,7 +377,7 @@ class MultimodalDataItem:
 
 @dataclasses.dataclass
 class MultimodalProcessorOutput:
-    """Raw output from multimodal processors before scheduler-side preparation.
+    """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
     ``BaseMultimodalProcessor.process_mm_data_async``.  Preprocessed inputs may
@@ -502,8 +502,10 @@ class MultimodalInputs:
     @staticmethod
     def from_processor_output(obj: "MultimodalProcessorOutput"):
         mm_items = obj.mm_items
+
+        # try reconstructing from cuda-ipc
         reconstruct_device = None
-        for mm_item in mm_items:
+        for mm_item in mm_items :
             if mm_item.has_cuda_ipc_proxy():
                 if reconstruct_device is None:
                     reconstruct_device = torch.cuda.current_device()
