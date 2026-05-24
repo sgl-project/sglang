@@ -400,20 +400,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         )
         return mrope_positions.squeeze(1), mrope_position_delta
 
-    # TODO: consider moving it to SGLangBaseProcessor
     @staticmethod
     def _get_processor_output_value(ret, key):
-        """get value with key from returned value of processor"""
         if ret is None:
             return None
-        if hasattr(ret, "get"):
-            value = ret.get(key)
-            if value is not None:
-                return value
-        return getattr(ret, key, None)
+        return ret.get(key) if hasattr(ret, "get") else getattr(ret, key, None)
 
     def _get_precomputed_mrope_from_output(self, ret):
-        """get the precomputed mrope from processor output"""
         mrope_positions = self._get_processor_output_value(ret, "mrope_positions")
         mrope_position_delta = self._get_processor_output_value(
             ret, "mrope_position_delta"
@@ -430,9 +423,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             return None
 
         mrope_position_delta = torch.as_tensor(mrope_position_delta)
-        if mrope_position_delta.ndim == 0:
-            mrope_position_delta = mrope_position_delta.reshape(1, 1)
-        elif mrope_position_delta.ndim == 1:
+        if mrope_position_delta.ndim <= 1:
             mrope_position_delta = mrope_position_delta.reshape(-1, 1)
         return mrope_positions, mrope_position_delta
 
@@ -723,17 +714,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         else:
             padded_input_ids = list(padded_input_ids)
 
-        image_grid_thw = None
-        if hasattr(ret, "image_grid_thw"):
-            image_grid_thw = ret.image_grid_thw
-
+        image_grid_thw = self._get_processor_output_value(ret, "image_grid_thw")
         if image_grid_thw is None and image_data and isinstance(image_data[0], dict):
             image_grid_thw = image_data[0].get("image_grid_thw")
 
-        video_grid_thw = None
-        if hasattr(ret, "video_grid_thw"):
-            video_grid_thw = ret.video_grid_thw
-
+        video_grid_thw = self._get_processor_output_value(ret, "video_grid_thw")
         if video_grid_thw is None and request_obj.video_data:
             first_video = request_obj.video_data[0]
             if isinstance(first_video, dict):
@@ -777,8 +762,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             )
 
         mrope_positions, mrope_position_delta = mrope_result
-        mrope_positions = mrope_positions.squeeze(1)
-
+        if mrope_positions.ndim == 3:
+            mrope_positions = mrope_positions.squeeze(1)
         get_rope_index_time = time.perf_counter()
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
