@@ -59,6 +59,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
 from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
     JoyImageEditPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
+    LongCatImagePipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
@@ -104,6 +107,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
 from sglang.multimodal_gen.configs.sample.joy_image import (
     JoyImageEditSamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_image import (
+    LongCatImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
@@ -998,6 +1004,18 @@ def _register_configs():
         ],
         model_detectors=[
             lambda hf_id: "joyai-image-edit" in hf_id.lower(),
+        ],
+    )
+
+    # LongCat-Image
+    register_configs(
+        sampling_param_cls=LongCatImageSamplingParams,
+        pipeline_config_cls=LongCatImagePipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Image",
+        ],
+        model_detectors=[
+            lambda hf_id: "longcat" in hf_id.lower() and "edit" not in hf_id.lower(),
         ],
     )
 

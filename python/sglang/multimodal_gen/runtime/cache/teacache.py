@@ -124,9 +124,9 @@ class TeaCacheMixin:
         accumulated_rel_l1_distance_negative: L1 distance for negative branch.
     """
 
-    # Models that support CFG cache separation (wan/hunyuan/zimage)
+    # Models that support CFG cache separation (wan/hunyuan/zimage/longcat_image)
     # Models not in this set (flux/qwen) auto-disable TeaCache when CFG is enabled
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage", "longcat_image"}
     config: DiTConfig
 
     def _init_teacache_state(self) -> None:
