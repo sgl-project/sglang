@@ -75,7 +75,7 @@ def selected_tasks(task_names: list[str], suites: list[str]) -> list[EvalTask]:
     return deduped
 
 
-def run_sglang_eval(task: EvalTask, base_url: str, args) -> dict:
+def build_sglang_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
     cmd = [
         "python",
         "-m",
@@ -101,12 +101,10 @@ def run_sglang_eval(task: EvalTask, base_url: str, args) -> dict:
         cmd += ["--min-context-length", str(args.min_context_length)]
     if args.max_context_length and task.name == "longbench_v2":
         cmd += ["--max-context-length", str(args.max_context_length)]
-    return run_command(cmd, args.timeout)
+    return cmd
 
 
-def run_sgl_eval(task: EvalTask, base_url: str, args) -> dict:
-    if shutil.which(args.sgl_eval_bin) is None:
-        raise RuntimeError(f"{args.sgl_eval_bin!r} not found on PATH")
+def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
     cmd = [
         args.sgl_eval_bin,
         "run",
@@ -126,6 +124,23 @@ def run_sgl_eval(task: EvalTask, base_url: str, args) -> dict:
     ]
     if args.num_examples is not None:
         cmd += ["--num-examples", str(args.num_examples)]
+    return cmd
+
+
+def build_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
+    if task.runner == "sglang.test.run_eval":
+        return build_sglang_eval_cmd(task, base_url, args)
+    if task.runner == "sgl-eval":
+        return build_sgl_eval_cmd(task, base_url, args)
+    raise ValueError(f"unknown runner {task.runner}")
+
+
+def run_eval_task(task: EvalTask, base_url: str, args) -> dict:
+    cmd = build_eval_cmd(task, base_url, args)
+    if args.dry_run:
+        return {"cmd": cmd, "returncode": 0, "elapsed_sec": 0, "output": ""}
+    if task.runner == "sgl-eval" and shutil.which(args.sgl_eval_bin) is None:
+        raise RuntimeError(f"{args.sgl_eval_bin!r} not found on PATH")
     return run_command(cmd, args.timeout)
 
 
@@ -182,14 +197,7 @@ def main() -> None:
 
     for label, base_url in args.endpoint:
         for task in tasks:
-            if args.dry_run:
-                result = {"cmd": [], "returncode": 0, "elapsed_sec": 0, "output": ""}
-            elif task.runner == "sglang.test.run_eval":
-                result = run_sglang_eval(task, base_url, args)
-            elif task.runner == "sgl-eval":
-                result = run_sgl_eval(task, base_url, args)
-            else:
-                raise ValueError(f"unknown runner {task.runner}")
+            result = run_eval_task(task, base_url, args)
             results["results"].append(
                 {"endpoint": label, "task": task.name, "runner": task.runner, **result}
             )

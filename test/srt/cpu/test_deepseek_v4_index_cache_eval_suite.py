@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 import pytest
@@ -43,3 +44,48 @@ def test_dsv4_index_cache_eval_suite_rejects_short_context_smokes():
 
     with pytest.raises(ValueError, match="intentionally blocked"):
         eval_suite.selected_tasks(["gsm8k"], [])
+
+
+def test_dsv4_index_cache_eval_suite_builds_longbench_command():
+    args = Namespace(
+        num_threads=64,
+        max_tokens=32768,
+        temperature=1.0,
+        top_p=0.95,
+        num_examples=10,
+        dataset_path="/tmp/longbench",
+        min_context_length=75000,
+        max_context_length=200000,
+    )
+    task = eval_suite.TASKS["longbench_v2"]
+
+    cmd = eval_suite.build_sglang_eval_cmd(task, "http://endpoint", args)
+
+    assert cmd[:3] == ["python", "-m", "sglang.test.run_eval"]
+    assert "--eval-name" in cmd
+    assert "longbench_v2" in cmd
+    assert "--min-context-length" in cmd
+    assert "75000" in cmd
+    assert "--dataset-path" in cmd
+
+
+def test_dsv4_index_cache_eval_suite_dry_run_records_sgl_eval_command(monkeypatch):
+    monkeypatch.setattr(eval_suite.shutil, "which", lambda _: "/usr/bin/sgl-eval")
+    args = Namespace(
+        sgl_eval_bin="sgl-eval",
+        temperature=1.0,
+        top_p=0.95,
+        max_tokens=32768,
+        num_threads=64,
+        out_dir=Path("/tmp/sgl-eval-out"),
+        num_examples=None,
+        dry_run=True,
+        timeout=7200,
+    )
+    task = eval_suite.TASKS["ruler"]
+
+    result = eval_suite.run_eval_task(task, "http://endpoint", args)
+
+    assert result["returncode"] == 0
+    assert result["cmd"][:3] == ["sgl-eval", "run", "ruler"]
+    assert "http://endpoint/v1" in result["cmd"]
