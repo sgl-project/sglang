@@ -40,6 +40,8 @@ class StageParallelismType(Enum):
     MAIN_RANK_ONLY = auto()
     # this stage requires a cfg-parallel
     CFG_PARALLEL = auto()
+    # executed on main rank only and send result to other ranks
+    MAIN_RANK_ONLY_AND_SEND_TO_OTHERS = auto()
 
 
 class StageVerificationError(Exception):
