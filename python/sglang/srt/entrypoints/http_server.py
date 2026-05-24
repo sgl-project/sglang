@@ -37,10 +37,7 @@ from typing import (
     Union,
 )
 
-# Fix a bug of Python threading
-setattr(threading, "_register_atexit", lambda *args, **kwargs: None)
-
-
+import torch
 import numpy as np
 import requests
 import uvicorn
@@ -781,6 +778,23 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
     )
+
+
+@app.api_route("/empty_cache", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def empty_cache():
+    """Empty CUDA cache to free unused GPU memory."""
+    try:
+        torch.cuda.empty_cache()
+        return Response(
+            content="CUDA cache emptied successfully.\n",
+            status_code=200,
+        )
+    except Exception as e:
+        return Response(
+            content=f"Failed to empty cache: {str(e)}\n",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @app.post("/add_external_corpus")
