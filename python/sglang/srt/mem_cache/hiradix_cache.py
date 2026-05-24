@@ -1207,15 +1207,6 @@ class HiRadixCache(RadixCache):
 
         return True
 
-    def terminate_prefetch(self, req_id: str):
-        if req_id not in self.ongoing_prefetch:
-            return
-
-        _, _, _, operation = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            return
-        operation.mark_terminate()
-
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         """
         Pop and return the number of tokens loaded from storage for a request.
