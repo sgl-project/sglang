@@ -299,9 +299,7 @@ class TestComponentResidencyNvtxHooks(unittest.TestCase):
             ("ImageVAEEncodingStage", "vae", None)
         ]
         manager.begin_use(second_use, module=shared)
-        _, second_hooks = manager._nvtx_hooks_by_use_key[
-            ("DecodingStage", "vae", None)
-        ]
+        _, second_hooks = manager._nvtx_hooks_by_use_key[("DecodingStage", "vae", None)]
 
         self.assertFalse(first_hooks._enabled)
         self.assertTrue(second_hooks._enabled)

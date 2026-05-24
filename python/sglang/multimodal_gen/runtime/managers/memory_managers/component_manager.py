@@ -248,9 +248,7 @@ class ComponentResidencyManager:
             return
         self._trace("stage_exit", detail=f"index={stage_index}")
 
-    def before_use(
-        self, use: ComponentUse, module: nn.Module | None = None
-    ) -> None:
+    def before_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """component use-site starts"""
         if not self.enabled:
             return
