@@ -53,7 +53,6 @@ from sglang.srt.kv_canary.single_forward_manager.data import (
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
-from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils.phase_checker import SimplePhaseChecker
 
 if TYPE_CHECKING:
@@ -233,10 +232,7 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        input_check_mode = _should_enable_input_check_for_launch(
-            config=self._config,
-            forward_batch=forward_batch,
-        )
+        input_check_mode = self._should_enable_input_check_for_launch()
         if input_check_mode:
             manager = self._token_oracle_manager
             if manager is None:
@@ -302,10 +298,7 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
-        input_check_mode = _should_enable_input_check_for_launch(
-            config=self._config,
-            forward_batch=forward_batch,
-        )
+        input_check_mode = self._should_enable_input_check_for_launch()
         for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -353,6 +346,13 @@ class SingleForwardManager:
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
         self._enable_warner.tick(snapshot.verify_plan_enable)
+
+    def _should_enable_input_check_for_launch(self) -> bool:
+        if not self._config.input_check_mode:
+            return False
+        if self._is_eagle_draft_decode:
+            return False
+        return True
 
 
 @dataclass(slots=True, kw_only=True)
@@ -422,37 +422,6 @@ def _allocate_snapshot_buffers(
             )
         ),
     )
-
-
-def _should_enable_input_check_for_launch(
-    *, config: CanaryConfig, forward_batch: "ForwardBatch"
-) -> bool:
-    """Return whether the per-forward launches should run the input-check
-    branch on the device.
-
-    Captures one important exception: when running inside a cuda graph
-    capture region AND the forward is an EAGLE_DRAFT decode, the captured
-    graph contains multiple internal draft forwards but the host-filled
-    expected-input buffer is refreshed only once before replay, so the
-    on-device check would compare against stale expected inputs. Skip the
-    check in that path until a per-internal-step expected-input refresh is
-    wired up.
-    """
-    if not config.input_check_mode:
-        return False
-    if not torch.cuda.is_current_stream_capturing():
-        return True
-
-    spec_info = forward_batch.spec_info
-    if (
-        forward_batch.forward_mode is not None
-        and forward_batch.forward_mode.is_decode()
-        and spec_info is not None
-        and spec_info.spec_input_type == SpecInputType.EAGLE_DRAFT
-    ):
-        return False
-
-    return True
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
