@@ -251,8 +251,6 @@ class CanaryManager:
             self._single_forward_managers[idx].pre_ops_outside_graph(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
-        if self.config.mode == "off":
-            return
         self._perturb_manager.perturb(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
         )
@@ -267,8 +265,6 @@ class CanaryManager:
             self._single_forward_managers[idx].post_ops_outside_graph(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
-        if self.config.mode == "off":
-            return
         self._perturb_manager.perturb_post_forward(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
         )
