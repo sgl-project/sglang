@@ -90,6 +90,18 @@ def should_return_index_cache(
     return next_skip_topk is True and hisparse_coordinator is None
 
 
+def index_cache_enabled_for_seq_lens(
+    seq_lens: torch.Tensor,
+    min_seq_len: int,
+    compress_ratio: int = 4,
+) -> bool:
+    if min_seq_len <= 0:
+        return True
+    if seq_lens.numel() == 0:
+        return False
+    return int(seq_lens.max().item()) * compress_ratio >= min_seq_len
+
+
 def get_c4_layer_ids(config) -> list[int]:
     return [
         idx

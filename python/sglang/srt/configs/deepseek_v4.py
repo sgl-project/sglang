@@ -60,6 +60,7 @@ class DeepSeekV4Config(PretrainedConfig):
     index_topk: int = 512
     index_topk_freq: int = 1
     index_topk_pattern: Optional[str] = None
+    index_topk_min_seq_len: int = 0
     initializer_range: float = 0.02
     intermediate_size: int = 2048
     kv_lora_rank: int = 512

@@ -92,10 +92,12 @@ from sglang.srt.models.deepseek_v4_index_cache import (
     DSV4IndexCache,
     assign_index_cache_to_metadata,
     get_index_cache_policy,
+    index_cache_enabled_for_seq_lens,
     make_index_cache_from_metadata,
     should_return_index_cache,
     should_reuse_index_cache,
 )
+from sglang.srt.models.deepseek_v4_index_cache_profile import profile_region
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
 if not _is_hip:
@@ -246,6 +248,7 @@ class MQALayer(nn.Module):
         )
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
+        self.index_topk_min_seq_len = config.index_topk_min_seq_len
         self.skip_topk, self.next_skip_topk = get_index_cache_policy(
             config, layer_id, compress_ratio, is_nextn
         )
@@ -521,15 +524,16 @@ class MQALayer(nn.Module):
         skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
         if self.indexer is not None and not skip_indexer:
             with torch.cuda.stream(stream_indexer):
-                self.indexer(
-                    x=x,
-                    q_lora=q_lora,
-                    forward_batch=forward_batch,
-                    attn_backend=attn_backend,
-                    enable_multi_stream=True,
-                    q_lora_ready=q_lora_ready,
-                    return_raw_indices=self.next_skip_topk is True,
-                )
+                with profile_region("csa_indexer", self.layer_id):
+                    self.indexer(
+                        x=x,
+                        q_lora=q_lora,
+                        forward_batch=forward_batch,
+                        attn_backend=attn_backend,
+                        enable_multi_stream=True,
+                        q_lora_ready=q_lora_ready,
+                        return_raw_indices=self._should_return_topk(attn_backend),
+                    )
         elif skip_indexer:
             self._reuse_topk(prev_topk_indices, attn_backend)
 
@@ -661,13 +665,14 @@ class MQALayer(nn.Module):
 
         skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
         if self.indexer is not None and not skip_indexer:
-            self.indexer(
-                x=x,
-                q_lora=q_lora,
-                forward_batch=forward_batch,
-                attn_backend=attn_backend,
-                return_raw_indices=self.next_skip_topk is True,
-            )
+            with profile_region("csa_indexer", self.layer_id):
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    return_raw_indices=self._should_return_topk(attn_backend),
+                )
         elif skip_indexer:
             self._reuse_topk(prev_topk_indices, attn_backend)
         if self.compressor is not None:
@@ -685,16 +690,33 @@ class MQALayer(nn.Module):
             self.skip_topk,
             prev_topk_indices,
             getattr(attn_backend, "hisparse_coordinator", None),
+        ) and self._index_cache_enabled_for_batch(attn_backend)
+
+    def _should_return_topk(self, attn_backend) -> bool:
+        return should_return_index_cache(
+            self.next_skip_topk, getattr(attn_backend, "hisparse_coordinator", None)
+        ) and self._index_cache_enabled_for_batch(attn_backend)
+
+    def _index_cache_enabled_for_batch(self, attn_backend) -> bool:
+        if self.index_topk_min_seq_len <= 0:
+            return True
+        attn_backend._maybe_upgrade_forward_metadata()
+        seq_lens = attn_backend.forward_metadata.indexer_metadata.c4_seq_lens
+        return index_cache_enabled_for_seq_lens(
+            seq_lens,
+            self.index_topk_min_seq_len,
+            self.compress_ratio,
         )
 
     def _reuse_topk(self, prev_topk_indices: DSV4IndexCache, attn_backend) -> None:
         attn_backend._maybe_upgrade_forward_metadata()
         metadata = attn_backend.forward_metadata
-        raw_indices = assign_index_cache_to_metadata(
-            prev_topk_indices,
-            metadata.core_metadata,
-            metadata.indexer_metadata,
-        )
+        with profile_region("raw_to_page_translation", self.layer_id):
+            raw_indices = assign_index_cache_to_metadata(
+                prev_topk_indices,
+                metadata.core_metadata,
+                metadata.indexer_metadata,
+            )
         if raw_indices is not None:
             if (indexer_capturer := get_global_indexer_capturer()) is not None:
                 token_to_kv_pool = get_token_to_kv_pool()
@@ -704,9 +726,7 @@ class MQALayer(nn.Module):
                 indexer_capturer.capture(compress_layer_id, raw_indices)
 
     def _next_topk_indices(self, attn_backend) -> Optional[DSV4IndexCache]:
-        if not should_return_index_cache(
-            self.next_skip_topk, getattr(attn_backend, "hisparse_coordinator", None)
-        ):
+        if not self._should_return_topk(attn_backend):
             return None
         attn_backend._maybe_upgrade_forward_metadata()
         return make_index_cache_from_metadata(
@@ -1171,12 +1191,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = _a2a_scatter_chunks[r].contiguous()
             input_ids = input_ids.tensor_split(s)[r].contiguous()
             input_ids_global = input_ids_global.tensor_split(s)[r].contiguous()
-        hidden_states = self.mlp(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
+        with profile_region("ffn_moe", self.layer_id):
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),

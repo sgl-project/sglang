@@ -142,6 +142,18 @@ def test_dsv4_index_cache_reuse_guards():
     assert not index_cache.should_return_index_cache(True, object())
 
 
+def test_dsv4_index_cache_min_seq_len_gate_uses_raw_token_length():
+    seq_lens = torch.tensor([10, 25000], dtype=torch.int32)
+
+    assert index_cache.index_cache_enabled_for_seq_lens(seq_lens, 0)
+    assert index_cache.index_cache_enabled_for_seq_lens(seq_lens, 100000)
+    assert not index_cache.index_cache_enabled_for_seq_lens(seq_lens, 100001)
+    assert not index_cache.index_cache_enabled_for_seq_lens(
+        torch.empty(0, dtype=torch.int32),
+        1,
+    )
+
+
 def test_dsv4_index_cache_rebuilds_physical_indices_from_raw_cache():
     source = SimpleNamespace(
         c4_sparse_raw_indices=torch.tensor([[0, 63, 64, 130, -1]], dtype=torch.int32),

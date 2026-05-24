@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models.deepseek_v4_index_cache_profile import profile_region
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
@@ -1052,7 +1053,8 @@ class DeepseekV4HipRadixBackend(
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
             )
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            with profile_region(f"core_attention_c{compress_ratio}", layer_id):
+                o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)
             return o
