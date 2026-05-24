@@ -359,38 +359,32 @@ class EagleDraftWorker(BaseDraftWorker):
 
         canary_manager = self.draft_runner.canary_runner
         n_inner = self.speculative_num_steps - 1
-        if canary_manager is not None:
-            for i in range(n_inner):
-                canary_manager.get_single_forward_manager(i).pre_ops_outside_graph(
-                    maybe_inaccurate_forward_batch=forward_batch
-                )
-
-        # Run draft
-        if can_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
-            )
-        else:
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
-                # Skip attention backend init for 1-step draft,
-                # `draft_forward` only does sample in this case.
-                self.draft_attn_backend.init_forward_metadata(forward_batch)
-            parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
-            )
-
-        if canary_manager is not None:
-            for i in range(n_inner):
-                single_forward_manager = canary_manager.get_single_forward_manager(i)
-                single_forward_manager.post_ops_outside_graph(
-                    maybe_inaccurate_forward_batch=forward_batch,
-                )
-            canary_manager.step_shared_facilities(
+        canary_outside_ctx = (
+            canary_manager.with_ops_outside_graph(
+                single_forward_indices=list(range(n_inner)),
                 maybe_inaccurate_forward_batch=forward_batch,
             )
+            if canary_manager is not None
+            else contextlib.nullcontext()
+        )
+
+        with canary_outside_ctx:
+            # Run draft
+            if can_cuda_graph:
+                parent_list, top_scores_index, draft_tokens = (
+                    self.cuda_graph_runner.replay(forward_batch)
+                )
+            else:
+                if (
+                    not forward_batch.forward_mode.is_idle()
+                    and self.speculative_num_steps > 1
+                ):
+                    # Skip attention backend init for 1-step draft,
+                    # `draft_forward` only does sample in this case.
+                    self.draft_attn_backend.init_forward_metadata(forward_batch)
+                parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                    forward_batch
+                )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
@@ -599,29 +593,21 @@ class EagleDraftWorker(BaseDraftWorker):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
         canary_manager = self.draft_runner.canary_runner
-        canary_sfm = (
-            canary_manager.get_single_forward_manager(0)
-            if canary_manager is not None
-            else None
-        )
-        if canary_sfm is not None:
-            canary_sfm.pre_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch
+        canary_outside_ctx = (
+            canary_manager.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
             )
+            if canary_manager is not None
+            else contextlib.nullcontext()
+        )
         sfm_index_ctx = (
             canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
             else contextlib.nullcontext()
         )
-        with sfm_index_ctx:
+        with canary_outside_ctx, sfm_index_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
-        if canary_sfm is not None:
-            canary_sfm.post_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch,
-            )
-            canary_manager.step_shared_facilities(
-                maybe_inaccurate_forward_batch=forward_batch,
-            )
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         # Update spec_info for the next draft step
@@ -675,21 +661,20 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
         canary_manager = self.draft_runner.canary_runner
-        canary_sfm = (
-            canary_manager.get_single_forward_manager(0)
-            if canary_manager is not None
-            else None
-        )
-        if canary_sfm is not None:
-            canary_sfm.pre_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch
+        canary_outside_ctx = (
+            canary_manager.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
             )
+            if canary_manager is not None
+            else contextlib.nullcontext()
+        )
         sfm_index_ctx = (
             canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
             else contextlib.nullcontext()
         )
-        with sfm_index_ctx:
+        with canary_outside_ctx, sfm_index_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch
@@ -698,13 +683,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 draft_logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
-        if canary_sfm is not None:
-            canary_sfm.post_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch,
-            )
-            canary_manager.step_shared_facilities(
-                maybe_inaccurate_forward_batch=forward_batch,
-            )
 
         maybe_detect_nan(
             draft_logits_output.next_token_logits,

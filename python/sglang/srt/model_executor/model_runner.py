@@ -3170,15 +3170,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         canary_manager = self.canary_runner if not self.is_draft_worker else None
-        canary_sfm = (
-            canary_manager.get_single_forward_manager(0)
-            if canary_manager is not None
-            else None
-        )
-        if canary_sfm is not None:
-            canary_sfm.pre_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch
+        canary_outside_ctx = (
+            canary_manager.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
             )
+            if canary_manager is not None
+            else contextlib.nullcontext()
+        )
         canary_index_ctx = (
             canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
@@ -3186,6 +3185,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         with (
+            canary_outside_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
@@ -3199,13 +3199,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 pp_proxy_tensors,
                 reinit_attn_backend,
                 split_forward_count,
-            )
-        if canary_sfm is not None:
-            canary_sfm.post_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch,
-            )
-            canary_manager.step_shared_facilities(
-                maybe_inaccurate_forward_batch=forward_batch,
             )
         if self.enable_elastic_ep:
             output = self._maybe_rebalance_after_rank_fault(

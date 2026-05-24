@@ -46,20 +46,18 @@ class TestManagerPerForward(CanaryManagerTestCase):
         ):
             manager = make_manager(device=self.device)
             forward_batch = make_forward_batch(self.device)
-            single_forward_manager = manager.get_single_forward_manager(0)
-            single_forward_manager.pre_ops_outside_graph(
-                maybe_inaccurate_forward_batch=forward_batch
-            )
-            with manager.with_active_single_forward_manager(0):
-                pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-                    forward_batch
-                )
-                single_forward_manager.post_ops_maybe_inside_graph(
-                    forward_batch, pre_ops_output
-                )
-            single_forward_manager.post_ops_outside_graph(
+            with manager.with_ops_outside_graph(
+                single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
-            )
+            ):
+                single_forward_manager = manager.get_single_forward_manager(0)
+                with manager.with_active_single_forward_manager(0):
+                    pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
+                        forward_batch
+                    )
+                    single_forward_manager.post_ops_maybe_inside_graph(
+                        forward_batch, pre_ops_output
+                    )
 
         self.assertEqual(calls[0], "plan")
         self.assertTrue(
@@ -232,20 +230,18 @@ class TestManagerBeforeForward(CanaryManagerTestCase):
 
 
 def _drive_one_cycle(manager, forward_batch) -> None:
-    single_forward_manager = manager.get_single_forward_manager(0)
-    single_forward_manager.pre_ops_outside_graph(
-        maybe_inaccurate_forward_batch=forward_batch
-    )
-    with manager.with_active_single_forward_manager(0):
-        pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-            forward_batch
-        )
-        single_forward_manager.post_ops_maybe_inside_graph(
-            forward_batch, pre_ops_output
-        )
-    single_forward_manager.post_ops_outside_graph(
+    with manager.with_ops_outside_graph(
+        single_forward_indices=[0],
         maybe_inaccurate_forward_batch=forward_batch,
-    )
+    ):
+        single_forward_manager = manager.get_single_forward_manager(0)
+        with manager.with_active_single_forward_manager(0):
+            pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
+                forward_batch
+            )
+            single_forward_manager.post_ops_maybe_inside_graph(
+                forward_batch, pre_ops_output
+            )
 
 
 class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
