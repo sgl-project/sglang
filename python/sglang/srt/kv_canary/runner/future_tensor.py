@@ -16,6 +16,13 @@ _DUMMY_DICT_KEY = "__dummy_key__"
 class FutureTensors:
     _data: Optional[_PayloadDict]
     _event: Optional[torch.cuda.Event]
+    # Pinned-source clones must outlive the async d2h copy. PyTorch's CUDA
+    # caching allocator tracks cross-stream usage, but in practice the clones
+    # being freed before the d2h_stream copy completes has been observed to
+    # cause stale-memory reads on the host snapshot (PP test, HEAD_K_FULL
+    # counter snapshot showed 27M while live tensor showed 346). Keep the
+    # clones reachable until wait() drops the references.
+    _retained_device_clones: Optional[dict[str, torch.Tensor]] = None
 
     @classmethod
     def device_to_host(
@@ -66,18 +73,27 @@ class FutureTensors:
             event = torch.cuda.Event()
             event.record()
 
-        return cls(_data=tensors_host | non_tensors_device, _event=event)
+        return cls(
+            _data=tensors_host | non_tensors_device,
+            _event=event,
+            _retained_device_clones=tensors_device_cloned,
+        )
 
     def wait(self) -> _TensorOrDict:
         data = self._data
         event = self._event
         self._data = None
         self._event = None
+        # Releasing clones AFTER event.synchronize() so the d2h copy
+        # finishes reading from them before they become free-able.
+        retained = self._retained_device_clones
+        self._retained_device_clones = None
 
         if data is None or event is None:
             raise RuntimeError("FutureTensors.wait() was called more than once")
 
         event.synchronize()
+        del retained
 
         if _DUMMY_DICT_KEY in data:
             data = data[_DUMMY_DICT_KEY]
