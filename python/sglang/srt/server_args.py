@@ -7064,9 +7064,15 @@ class ServerArgs:
 
         # Check speculative decoding
         if self.speculative_algorithm is not None:
+            mixed_chunk_supported = (
+                self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE")
+                and self.speculative_eagle_topk == 1
+                and not self.disable_overlap_schedule
+                and envs.SGLANG_ENABLE_SPEC_V2.get()
+            )
             assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+                not self.enable_mixed_chunk or mixed_chunk_supported
+            ), "enable_mixed_chunk with speculative decoding requires EAGLE spec v2 topk=1"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

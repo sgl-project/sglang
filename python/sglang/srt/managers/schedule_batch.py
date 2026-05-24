@@ -2190,25 +2190,41 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.fill_ids = req.origin_input_ids + req.output_ids
             req.set_extend_input_len(1)
 
-        input_ids = torch.cat([self.input_ids, running_batch.input_ids])
-        out_cache_loc = torch.cat([self.out_cache_loc, running_batch.out_cache_loc])
+        running_prefix_lens = [
+            len(req.origin_input_ids)
+            + len(req.output_ids)
+            + (0 if self.enable_overlap else -1)
+            for req in running_batch.reqs
+        ]
+        running_input_ids = torch.tensor(
+            [
+                req.output_ids[-1] if len(req.output_ids) else req.origin_input_ids[-1]
+                for req in running_batch.reqs
+            ],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        if running_batch.is_spec_v2:
+            running_prefix_lens_tensor = torch.tensor(
+                running_prefix_lens, dtype=torch.int64, device=self.device
+            )
+            running_out_cache_loc = running_batch.req_to_token_pool.req_to_token[
+                running_batch.req_pool_indices, running_prefix_lens_tensor
+            ]
+        else:
+            running_out_cache_loc = running_batch.out_cache_loc
+        input_ids = torch.cat([self.input_ids, running_input_ids])
+        out_cache_loc = torch.cat([self.out_cache_loc, running_out_cache_loc])
 
         self.merge_batch(running_batch)
         self.input_ids = input_ids
         self.out_cache_loc = out_cache_loc
 
-        # For overlap scheduler, the output_ids has one step delay
-        delta = 0 if self.enable_overlap else -1
-
         # NOTE: prefix_indices is what has been cached, but we don't cache each decode step
-        self.prefix_lens.extend(
-            [
-                len(r.origin_input_ids) + len(r.output_ids) + delta
-                for r in running_batch.reqs
-            ]
-        )
+        self.prefix_lens.extend(running_prefix_lens)
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
+        assert len(self.input_ids) == len(self.out_cache_loc) == self.extend_num_tokens
         # TODO (lianmin): Revisit this. It should be seq_len - 1
         self.extend_logprob_start_lens.extend([0] * running_bs)
         self.is_prefill_only = False

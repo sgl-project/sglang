@@ -291,11 +291,11 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
             "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
         )
 
-    if server_args.enable_mixed_chunk:
+    if server_args.enable_mixed_chunk and server_args.disable_overlap_schedule:
         server_args.enable_mixed_chunk = False
         logger.warning(
             "Mixed chunked prefill is disabled because of using "
-            "eagle speculative decoding."
+            "eagle speculative decoding without spec v2."
         )
 
     model_arch = server_args.get_model_config().hf_config.architectures[0]
