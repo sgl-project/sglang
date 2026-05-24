@@ -129,6 +129,14 @@ def validate_args(args) -> None:
         )
 
 
+def profile_dir_note(profile_dir: Path) -> str:
+    return (
+        f"{profile_dir} must be readable by this driver after /start_profile returns. "
+        "For remote endpoints, run the driver in the same container or mount/copy the "
+        "server profile directory before analysis."
+    )
+
+
 def has_category(categories: dict, required: str) -> bool:
     if required == "core_attention":
         return any(category.startswith("core_attention") for category in categories)
@@ -141,7 +149,8 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
     if not trace_summaries:
         raise RuntimeError(
             "no profile traces found; check --profile-dir, --profile-prefix, "
-            "and server /start_profile support"
+            "server /start_profile support, and that the server-side profile "
+            "directory is visible to this driver"
         )
     observed = {}
     for summary in trace_summaries:
@@ -162,7 +171,16 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--profile-dir", type=Path, default=Path("/tmp"))
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        default=Path("/tmp"),
+        help=(
+            "Directory passed to server /start_profile and then read by this "
+            "driver. For remote endpoints, this path must be shared or copied "
+            "back before analysis."
+        ),
+    )
     parser.add_argument("--profile-prefix", default="dsv4-indexcache")
     parser.add_argument("--profile-stages", nargs="+", default=["prefill", "decode"])
     parser.add_argument("--activities", nargs="+", default=["CPU", "GPU"])
@@ -195,6 +213,7 @@ def main() -> None:
     result = {
         "endpoint": args.endpoint,
         "profile_dir": str(args.profile_dir),
+        "profile_dir_note": profile_dir_note(args.profile_dir),
         "profile_prefix": args.profile_prefix,
         "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
         "request_results": request_results,

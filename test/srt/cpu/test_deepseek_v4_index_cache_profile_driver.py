@@ -98,7 +98,7 @@ def test_dsv4_index_cache_profile_driver_requires_marker_env_for_real_runs():
 def test_dsv4_index_cache_profile_driver_rejects_missing_real_trace_summaries():
     args = Namespace(dry_run=False)
 
-    with pytest.raises(RuntimeError, match="no profile traces"):
+    with pytest.raises(RuntimeError, match="server-side profile directory"):
         profile_driver.validate_trace_summaries(args, [])
 
 
@@ -134,3 +134,10 @@ def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
     ]
 
     profile_driver.validate_trace_summaries(args, summaries)
+
+
+def test_dsv4_index_cache_profile_driver_records_profile_dir_visibility_note():
+    note = profile_driver.profile_dir_note(Path("/tmp/profiles"))
+
+    assert "/tmp/profiles" in note
+    assert "remote endpoints" in note
