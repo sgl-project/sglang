@@ -90,64 +90,15 @@ def get_canary_runner(model_runner: "ModelRunner") -> Optional[CanaryRunner]:
 
 
 def _patch_model_forward(*, model_runner: "ModelRunner", runner: CanaryRunner) -> None:
-    # [PP-DIAG] expose rank info so wrapper prints identify which PP/TP rank is calling
-    try:
-        from sglang.srt.distributed.parallel_state import get_pp_group, get_tp_group
-
-        _pp_rank = get_pp_group().rank_in_group if get_pp_group() is not None else -1
-        _tp_rank = get_tp_group().rank_in_group if get_tp_group() is not None else -1
-    except Exception:
-        _pp_rank = -2
-        _tp_rank = -2
-    logger.warning(
-        "[PP-DIAG] install_canary _patch_model_forward fired: pp_rank=%d tp_rank=%d",
-        _pp_rank,
-        _tp_rank,
-    )
-
-    _call_count = {"n": 0, "head": 0, "tail": 0}
-
     def _with_canary_bracketing(original: Callable, *args: Any, **kwargs: Any) -> Any:
         forward_batch = _extract_forward_batch(args, kwargs)
         assert (
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
-        _call_count["n"] += 1
-        if _call_count["n"] <= 3 or _call_count["n"] % 200 == 0:
-            logger.warning(
-                "[PP-DIAG] wrapper-entry pp=%d tp=%d call#%d before launch_head_kernels",
-                _pp_rank,
-                _tp_rank,
-                _call_count["n"],
-            )
-
         runner.launch_head_kernels(forward_batch)
-        _call_count["head"] += 1
-
-        if _call_count["n"] <= 3 or _call_count["n"] % 200 == 0:
-            logger.warning(
-                "[PP-DIAG] wrapper-mid pp=%d tp=%d call#%d head_done=%d",
-                _pp_rank,
-                _tp_rank,
-                _call_count["n"],
-                _call_count["head"],
-            )
-
         output = original(*args, **kwargs)
         runner.launch_tail_kernels(forward_batch)
-        _call_count["tail"] += 1
-
-        if _call_count["n"] <= 3 or _call_count["n"] % 200 == 0:
-            logger.warning(
-                "[PP-DIAG] wrapper-exit pp=%d tp=%d call#%d head=%d tail=%d",
-                _pp_rank,
-                _tp_rank,
-                _call_count["n"],
-                _call_count["head"],
-                _call_count["tail"],
-            )
-
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
