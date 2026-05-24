@@ -93,7 +93,18 @@ class _EaglePositionsBase(CanaryE2EBase):
 
 
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
-    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
+    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation.
+
+    KNOWN-RED: under token_oracle sampling, the eagle draft's per-step
+    position perturbation does not propagate to a canary-visible signal —
+    sampled tokens come from the oracle regardless of model output, drafts
+    always verify-accept, and the draft slot's stored_position never enters
+    a per-forward verify scope that would compare it to the expected logical
+    position. Fixing needs either a canary signal that runs at write time on
+    the draft path (input_check has warmup compat issues with real models)
+    or a sampling backend that surfaces the perturbed model output. Tracked
+    in note 2026-05-24-eagle-pr-25015-chain-hash-blocker.md.
+    """
 
     __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = True
