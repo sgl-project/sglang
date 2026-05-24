@@ -67,8 +67,8 @@ class PostOpsInsideGraphOutputBuffer:
         self.kernel_run_counters.copy_(kernel_run_counters)
         self.slot_run_counters.copy_(slot_run_counters)
         self.violation_write_index.copy_(violation_write_index)
-        if (
-            self.swa_verify_total_count is not None
-            and swa_verify_total_count is not None
-        ):
+        assert (self.swa_verify_total_count is not None) == (
+            swa_verify_total_count is not None
+        )
+        if self.swa_verify_total_count is not None:
             self.swa_verify_total_count.copy_(swa_verify_total_count)
