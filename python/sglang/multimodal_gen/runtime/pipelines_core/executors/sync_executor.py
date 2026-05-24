@@ -45,12 +45,13 @@ class SyncExecutor(PipelineExecutor):
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             for stage_index, stage in enumerate(stages):
-                # Honor any pipeline-set profile name so multi-pass pipelines
-                # (LTX-2 two-stage etc.) don't collapse repeated stage classes
-                # into a single NVTX range name.
+                # Use the registered (snake_case) stage name so the umbrella
+                # NVTX range matches the per-submodule prefix emitted by
+                # ``ComponentResidencyManager`` (e.g. ``stage_denoising_stage``
+                # + ``denoising_stage.transformer.*``).
                 stage_name = getattr(
                     stage,
-                    "_active_profile_stage_name",
+                    "_active_component_stage_name",
                     lambda: stage.__class__.__name__,
                 )()
                 self.before_stage(stage, stage_index, payload, server_args)

@@ -86,12 +86,13 @@ class ParallelExecutor(PipelineExecutor):
             # TODO: decide when to gather on main when CFG_PARALLEL -> MAIN_RANK_ONLY
             for stage_index, stage in enumerate(stages):
                 paradigm = stage.parallelism_type
-                # Honor any pipeline-set profile name so multi-pass pipelines
-                # (LTX-2 two-stage etc.) don't collapse repeated stage classes
-                # into a single NVTX range name.
+                # Use the registered (snake_case) stage name so the umbrella
+                # NVTX range matches the per-submodule prefix emitted by
+                # ``ComponentResidencyManager`` (e.g. ``stage_denoising_stage``
+                # + ``denoising_stage.transformer.*``).
                 stage_name = getattr(
                     stage,
-                    "_active_profile_stage_name",
+                    "_active_component_stage_name",
                     lambda: stage.__class__.__name__,
                 )()
 
