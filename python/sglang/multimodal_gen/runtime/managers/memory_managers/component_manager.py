@@ -430,7 +430,7 @@ class ComponentResidencyManager:
             total = hooks.register_hooks(module, prefix=prefix)
             if total == 0:
                 return
-            logger.info(
+            logger.debug(
                 "[component_residency] Registered NVTX hooks for %s on %d submodules",
                 prefix,
                 total,

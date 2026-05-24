@@ -1272,10 +1272,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         timesteps_cpu = ctx.timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
-        # Re-apply the gate after the transformer's lazy load / cache-dit /
-        # torch.compile setup, so layer hooks bind to the finalized module
-        # tree (the gate already fired once in __call__ but the lazy-load
-        # path may have registered zero modules then).
+        # Re-resolve the explicit-range gate after the transformer's lazy
+        # load / cache-dit / torch.compile setup, so the per-step
+        # ``denoising_loop`` / ``denoising_step`` / ``predict_noise`` /
+        # ``scheduler_step`` markers below reflect the current request's
+        # is_warmup state. Layerwise module hooks are owned by the
+        # component residency manager and not re-registered here.
         use_nvtx = self._apply_nvtx_gate(ctx.is_warmup)
 
         with torch.autocast(

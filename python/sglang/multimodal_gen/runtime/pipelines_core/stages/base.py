@@ -137,6 +137,17 @@ class PipelineStage(StageDedupMixin, ABC):
         )
 
     def _active_component_stage_name(self) -> str:
+        """Return the stage name the residency manager currently reports.
+
+        Precondition: must be called while the residency manager has
+        already entered this stage (i.e. from inside the forward path,
+        between ``before_stage`` and ``after_stage``). The manager updates
+        ``state.stage_name`` inside ``before_stage``; calling this method
+        from outside that window (e.g. the executor's pre-stage prologue)
+        returns the PREVIOUS stage's name and produces off-by-one labels.
+        Callers that just need this stage's own identity should use
+        :meth:`_component_stage_name` instead.
+        """
         manager = getattr(self, "_component_residency_manager", None)
         manager_state = getattr(manager, "state", None)
         manager_stage_name = getattr(manager_state, "stage_name", None)
