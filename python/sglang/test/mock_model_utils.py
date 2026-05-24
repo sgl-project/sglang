@@ -29,6 +29,10 @@ _MOCK_MODEL_SERVER_ARGS: list[str] = [
     "token_oracle",
     "--kv-canary",
     "raise",
+    # Required by install_canary in the SingleForwardManager design; PP
+    # auto-flips this on but TP / PD / standalone do not. Pass explicitly so
+    # all mock-model canary fixtures (TP, PD, PP) hit the supported path.
+    "--disable-piecewise-cuda-graph",
 ]
 
 
