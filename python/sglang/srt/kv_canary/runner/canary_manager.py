@@ -38,7 +38,10 @@ from sglang.srt.kv_canary.runner.health import (
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.runner.violation_manager import ViolationManager
-from sglang.srt.kv_canary.single_forward_manager.manager import SingleForwardManager
+from sglang.srt.kv_canary.single_forward_manager.manager import (
+    SingleForwardManager,
+    _PreOpsMaybeInsideGraphOutput,
+)
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 
@@ -215,6 +218,28 @@ class CanaryManager:
             yield
         finally:
             self._active_single_forward_manager_index = None
+
+    def pre_ops_maybe_inside_graph(
+        self, forward_batch: "ForwardBatch"
+    ) -> _PreOpsMaybeInsideGraphOutput:
+        assert self._active_single_forward_manager_index is not None, (
+            "kv-canary: pre_ops_maybe_inside_graph called without active SingleForwardManager; "
+            "caller must wrap in CanaryManager.with_active_single_forward_manager(i)"
+        )
+        sfm = self._single_forward_managers[self._active_single_forward_manager_index]
+        return sfm.pre_ops_maybe_inside_graph(forward_batch)
+
+    def post_ops_maybe_inside_graph(
+        self,
+        forward_batch: "ForwardBatch",
+        pre_ops_output: _PreOpsMaybeInsideGraphOutput,
+    ) -> None:
+        assert self._active_single_forward_manager_index is not None, (
+            "kv-canary: post_ops_maybe_inside_graph called without active SingleForwardManager; "
+            "caller must wrap in CanaryManager.with_active_single_forward_manager(i)"
+        )
+        sfm = self._single_forward_managers[self._active_single_forward_manager_index]
+        sfm.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
     def mark_init_finished(self) -> None:
         """Reset every SingleForwardManager's phase tensor and enable its assert. Called

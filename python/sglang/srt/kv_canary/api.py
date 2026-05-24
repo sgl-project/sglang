@@ -109,14 +109,9 @@ def _patch_model_forward(
             forward_batch is not None
         ), "kv-canary: patched model.forward called without a ForwardBatch"
 
-        single_forward_manager = manager.get_current_single_forward_manager()
-        canary_pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-            forward_batch
-        )
+        canary_pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
         output = original(*args, **kwargs)
-        single_forward_manager.post_ops_maybe_inside_graph(
-            forward_batch, canary_pre_ops_output
-        )
+        manager.post_ops_maybe_inside_graph(forward_batch, canary_pre_ops_output)
         return output
 
     wrap_method(model_runner.model, "forward", wrapper=_with_canary_bracketing)
