@@ -479,6 +479,14 @@ class ServerArgs:
     export_metrics_to_file: bool = False
     export_metrics_to_file_dir: Optional[str] = None
 
+    # Class-level DI for the five *MetricsCollector classes. Maps collector role
+    # (one of: "scheduler", "tokenizer", "storage", "radix_cache", "expert_dispatch")
+    # to a subclass of the matching base collector. The five instantiation sites
+    # read from this map and fall back to the base class. Class-object only (no
+    # CLI surface) since this exists for embedded use cases that pass a Python
+    # class directly. Default None preserves existing behavior.
+    stat_loggers: Optional[Dict[str, type]] = None
+
     # API related
     api_key: Optional[str] = None
     admin_api_key: Optional[str] = None
@@ -1825,10 +1833,20 @@ class ServerArgs:
                         assert (
                             self.tp_size <= 8
                         ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                        # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
+                        # DSACPLayerCommunicator does not all-reduce attention-TP
+                        # partial o_proj outputs before replicated dense FFNs.
                         self.attn_cp_size = self.tp_size // self.dp_size
-
+                        self.disable_piecewise_cuda_graph = True
                         logger.warning(
-                            f"Enable Context Parallel opt for deeeseekv3.2-DSA, Setting dp_size == {self.dp_size} and moe_dense_tp_size == {self.moe_dense_tp_size}, ep_size == {self.ep_size}, tp_size == {self.tp_size}, kv_cache_dtype == {self.kv_cache_dtype}, moe_a2a_backend {self.moe_a2a_backend} "
+                            f"Enable DSA Context Parallel opt, "
+                            f"Setting dp_size == {self.dp_size} and "
+                            f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                            f"ep_size == {self.ep_size}, "
+                            f"tp_size == {self.tp_size}, "
+                            f"kv_cache_dtype == {self.kv_cache_dtype}, "
+                            f"moe_a2a_backend {self.moe_a2a_backend}, "
+                            f"disable_piecewise_cuda_graph=True"
                         )
                     else:
                         # Pure TP and partial DP Attention mode is active for DSA, logging a warning
@@ -1870,7 +1888,7 @@ class ServerArgs:
                     ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
 
             else:
-                # DeepSeek V3/R1/V3.1
+                # DeepSeek V3/R1/V3.1 and Kimi K2.5
                 if not self.disable_piecewise_cuda_graph:
                     logger.info("Piecewise CUDA graph is enabled, use MLA for prefill.")
 
@@ -1884,6 +1902,37 @@ class ServerArgs:
                         logger.info(
                             "Use trtllm_mla as attention backend on sm100 for DeepseekV3ForCausalLM"
                         )
+
+                # MLA prefill CP auto-config. Mirrors the NSA CP block above
+                # (minus the in-seq/round-robin mode split, which MLA CP does not support)
+                if self.enable_prefill_context_parallel and self.use_mla_backend():
+                    logger.warning(
+                        "MLA prefill context parallel is still experimental. "
+                        "Verified on Hopper with the fa3 backend."
+                    )
+                    self.enable_dp_attention = True
+                    # TODO(kpham-sgl) Supports moe_dense_tp_size != 1.
+                    self.moe_dense_tp_size = 1
+                    self.moe_a2a_backend = "deepep"
+                    self.ep_size = self.tp_size
+                    logger.warning(
+                        "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
+                    )
+                    # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
+                    # DSACPLayerCommunicator does not all-reduce attention-TP
+                    # partial o_proj outputs before replicated dense FFNs.
+                    self.attn_cp_size = self.tp_size // self.dp_size
+                    self.disable_piecewise_cuda_graph = True
+                    logger.warning(
+                        f"Enable Context Parallel opt for MLA, "
+                        f"Setting dp_size == {self.dp_size} and "
+                        f"attn_cp_size == {self.attn_cp_size}, "
+                        f"moe_dense_tp_size == {self.moe_dense_tp_size}, "
+                        f"ep_size == {self.ep_size}, "
+                        f"tp_size == {self.tp_size}, "
+                        f"moe_a2a_backend {self.moe_a2a_backend}, "
+                        f"disable_piecewise_cuda_graph=True"
+                    )
 
             # Set moe backend for DeepSeek
             if is_sm100_supported():
@@ -2236,11 +2285,13 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
-
-                self.moe_runner_backend = "flashinfer_trtllm"
-                logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
-                )
+                if self.get_model_config().quantization == "modelopt_fp4":
+                    self.quantization = "modelopt_fp4"
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on "
+                        "SM100 for Gemma-4 (modelopt_fp4)"
+                    )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
@@ -3039,6 +3090,19 @@ class ServerArgs:
             )
 
     def _handle_context_parallelism(self):
+        if (
+            self.enable_prefill_context_parallel
+            and self.enable_dsa_prefill_context_parallel
+        ):
+            raise ValueError(
+                "--enable-prefill-context-parallel and "
+                "--enable-nsa-prefill-context-parallel are mutually "
+                "exclusive. Use --enable-nsa-prefill-context-parallel for "
+                "DeepSeek V3.2 (NSA) models and "
+                "--enable-prefill-context-parallel for MLA-based models "
+                "(DeepSeek V3/R1, Kimi K2.5) or MHA/GQA-based models."
+            )
+
         if self.attn_cp_size > 1:
             # The tp_size is the world size, not the real tensor parallel size
             assert (
@@ -6849,7 +6913,12 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        # Some dataclass fields (e.g. stat_loggers) intentionally have no CLI
+        # surface and won't appear on the argparse Namespace. Skip them so the
+        # dataclass default applies.
+        attrs = [
+            attr.name for attr in dataclasses.fields(cls) if hasattr(args, attr.name)
+        ]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self, port: Optional[int] = None):
