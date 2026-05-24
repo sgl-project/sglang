@@ -972,8 +972,7 @@ class MlxModelRunner:
         residual = hidden_states
         normed = layer.input_layernorm(hidden_states)
 
-        cache_type = type(layer_caches[0])
-        batched_cache = cache_type.merge(layer_caches)
+        batched_cache = MlxModelRunner._merge_auxiliary_caches(layer_caches)
         mixed = layer.linear_attn(normed, mask=None, cache=batched_cache)
 
         extract = getattr(batched_cache, "extract", None)
@@ -988,6 +987,49 @@ class MlxModelRunner:
 
         hidden_states = residual + mixed
         return hidden_states + layer.mlp(layer.post_attention_layernorm(hidden_states))
+
+    @staticmethod
+    def _merge_auxiliary_caches(layer_caches: list[Any]) -> Any:
+        if MlxModelRunner._can_fast_merge_arrays_cache(layer_caches):
+            return MlxModelRunner._fast_merge_arrays_cache(layer_caches)
+        return type(layer_caches[0]).merge(layer_caches)
+
+    @staticmethod
+    def _can_fast_merge_arrays_cache(layer_caches: list[Any]) -> bool:
+        cache_type = type(layer_caches[0])
+        if cache_type.__name__ != "ArraysCache":
+            return False
+        return all(
+            type(cache) is cache_type
+            and isinstance(getattr(cache, "cache", None), list)
+            and getattr(cache, "lengths", None) is None
+            and getattr(cache, "left_padding", None) is None
+            for cache in layer_caches
+        )
+
+    @staticmethod
+    def _fast_merge_arrays_cache(layer_caches: list[Any]) -> Any:
+        """Merge mlx-lm ArraysCache with concat instead of zero+slice writes."""
+        cache_type = type(layer_caches[0])
+        merged = cache_type(len(layer_caches[0].cache))
+        slots = []
+        for slot_idx in range(len(layer_caches[0].cache)):
+            values = [cache.cache[slot_idx] for cache in layer_caches]
+            first = next((value for value in values if value is not None), None)
+            if first is None:
+                slots.append(None)
+                continue
+            slots.append(
+                mx.concatenate(
+                    [
+                        value if value is not None else mx.zeros_like(first)
+                        for value in values
+                    ],
+                    axis=0,
+                )
+            )
+        merged.cache = slots
+        return merged
 
     @staticmethod
     def _replace_cache_contents(cache: Any, new_cache: Any) -> None:

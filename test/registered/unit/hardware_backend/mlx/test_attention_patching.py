@@ -386,6 +386,35 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertEqual(cache0[0].tolist(), [[0.0]])
         self.assertEqual(cache1[0].tolist(), [[1.0]])
 
+    def test_arrays_cache_auxiliary_batching_uses_fast_merge(self):
+        runner = object.__new__(MlxModelRunner)
+        layer = FakeBatchableAuxiliaryLayer()
+        cache0 = ArraysCache(size=1)
+        cache1 = ArraysCache(size=1)
+        original_merge = ArraysCache.merge
+
+        def fail_merge(cls, caches):
+            raise AssertionError("ArraysCache fast path should not call merge()")
+
+        ArraysCache.merge = classmethod(fail_merge)
+        try:
+            out = runner._decode_auxiliary_layer(
+                layer,
+                mx.zeros((2, 1, 4), dtype=mx.float32),
+                [cache0, cache1],
+            )
+            mx.eval(out, cache0[0], cache1[0])
+        finally:
+            ArraysCache.merge = original_merge
+
+        self.assertEqual(layer.linear_attn.cache_type, "ArraysCache")
+        self.assertEqual(
+            out.tolist(),
+            [[[2.0, 2.0, 2.0, 2.0]], [[2.0, 2.0, 2.0, 2.0]]],
+        )
+        self.assertEqual(cache0[0].tolist(), [[0.0]])
+        self.assertEqual(cache1[0].tolist(), [[1.0]])
+
     def test_auxiliary_layer_split_back_copies_cache_metadata(self):
         runner = object.__new__(MlxModelRunner)
         layer = FakeBatchableAuxiliaryLayer()
