@@ -474,6 +474,7 @@ class Envs:
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBoolWithAlias(
         False, deprecated_name="SGLANG_NSA_HIP_DISABLE_PRESHUFFLE"
     )
+    SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
 
     # sgl-kernel
@@ -623,6 +624,8 @@ class Envs:
     SGLANG_OPT_USE_AITER_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_QK_NORM_ROPE = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_CLAMP_ACT_MUL = EnvBool(True)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(False)
     # ====================================================================
 
