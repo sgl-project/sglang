@@ -71,6 +71,7 @@ def install_canary(
         token_oracle_manager=token_oracle_manager,
         swa_allocator=swa_allocator,
         speculative_num_steps=speculative_num_steps,
+        is_eagle_draft_decode=model_runner.is_draft_worker,
     )
 
     _patch_model_forward(model_runner=model_runner, manager=manager)

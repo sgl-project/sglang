@@ -73,6 +73,7 @@ class CanaryManager:
         token_oracle_manager: Optional[TokenOracleManager] = None,
         swa_allocator: Optional["SWATokenToKVPoolAllocator"] = None,
         speculative_num_steps: int = 1,
+        is_eagle_draft_decode: bool = False,
     ) -> None:
         self.config = config
         self._req_to_token_pool = req_to_token_pool
@@ -179,6 +180,7 @@ class CanaryManager:
                 d2h_stream=self._d2h_stream,
                 token_oracle_manager=token_oracle_manager,
                 swa_divergence_report=self._swa_divergence_report,
+                is_eagle_draft_decode=is_eagle_draft_decode,
             )
             for i in range(num_sfms)
         )

@@ -112,6 +112,7 @@ class SingleForwardManager:
         d2h_stream: torch.cuda.Stream,
         token_oracle_manager: Optional[TokenOracleManager],
         swa_divergence_report: Optional[SwaDivergenceReport],
+        is_eagle_draft_decode: bool,
     ) -> None:
         self._config = config
         self._device = device
@@ -126,6 +127,7 @@ class SingleForwardManager:
         self._swa_divergence_report: Optional[SwaDivergenceReport] = (
             swa_divergence_report
         )
+        self._is_eagle_draft_decode: bool = is_eagle_draft_decode
 
         self._write_req_capacity = per_forward_write_req_capacity
         self._write_entry_capacity = per_forward_write_entry_capacity
