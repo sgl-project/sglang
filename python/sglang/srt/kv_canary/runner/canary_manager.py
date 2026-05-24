@@ -79,7 +79,7 @@ class CanaryManager:
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
-        self._step_counter: int = 0
+        self._outer_step_counter: int = 0
         self._active_index: Optional[int] = None
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
@@ -124,7 +124,7 @@ class CanaryManager:
             config=config,
             device_state=self._device_state,
             d2h_stream=self._d2h_stream,
-            step_counter_getter=self._get_step_counter,
+            outer_step_counter_getter=self._get_outer_step_counter,
         )
         self._sweep_orchestrator = SweepOrchestrator(
             config=config,
@@ -132,13 +132,13 @@ class CanaryManager:
             buffer_groups=self._buffer_groups,
             endpoints=self._endpoints,
             swa_window_size=self._swa_window_size,
-            step_counter_getter=self._get_step_counter,
+            outer_step_counter_getter=self._get_outer_step_counter,
         )
         self._perturb_manager = PerturbManager(
             config=perturb_config,
             req_to_token_pool=req_to_token_pool,
             buffer_groups=self._buffer_groups,
-            step_counter_getter=self._get_step_counter,
+            step_counter_getter=self._get_outer_step_counter,
             swa_window_size=self._swa_window_size,
             sweep_interval=config.sweep_interval,
         )
@@ -146,14 +146,14 @@ class CanaryManager:
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            step_counter_getter=self._get_step_counter,
+            outer_step_counter_getter=self._get_outer_step_counter,
             d2h_stream=self._d2h_stream,
         )
         self._stats_logger = PeriodicCanaryStatsLogger(
             config=config,
             device_state=self._device_state,
             active_tags=self._active_tags,
-            step_counter_getter=self._get_step_counter,
+            outer_step_counter_getter=self._get_outer_step_counter,
             sweep_orchestrator=self._sweep_orchestrator,
             d2h_stream=self._d2h_stream,
         )
@@ -249,15 +249,15 @@ class CanaryManager:
             return
 
         self._sweep_orchestrator.maybe_run_sweep()
-        self._step_counter += 1
+        self._outer_step_counter += 1
         self._violation_manager.step()
         self._health_checker.step()
         self._stats_logger.step()
         if self._swa_divergence_report is not None:
             self._swa_divergence_report.step(
-                step_counter=self._step_counter,
+                outer_step_counter=self._outer_step_counter,
                 forward_batch=maybe_inaccurate_forward_batch,
             )
 
-    def _get_step_counter(self) -> int:
-        return self._step_counter
+    def _get_outer_step_counter(self) -> int:
+        return self._outer_step_counter

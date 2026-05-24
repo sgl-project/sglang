@@ -34,7 +34,7 @@ class ViolationReporter:
     def is_raised(self) -> bool:
         return self._raised
 
-    def log_or_raise_violation(self, *, step_counter: int) -> None:
+    def log_or_raise_violation(self, *, outer_step_counter: int) -> None:
         violation_log = self._device_state.violation_log
         write_index = int(violation_log.violation_write_index.cpu().item())
         if write_index == 0:
@@ -45,7 +45,7 @@ class ViolationReporter:
             row=ring[0].tolist(),
             total=write_index,
             ring_overflow=ring_overflow,
-            step_when_pumped=step_counter,
+            step_when_pumped=outer_step_counter,
         )
         # log mode: always surface every violation as WARNING. Never rate-limit or demote to
         # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever

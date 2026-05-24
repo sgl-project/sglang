@@ -17,10 +17,10 @@ class ViolationManager:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         d2h_stream: torch.cuda.Stream,
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
     ) -> None:
         self._device_state = device_state
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._violation_reporter = ViolationReporter(
             config=config, device_state=device_state
         )
@@ -36,7 +36,7 @@ class ViolationManager:
         )
         if drain_result["errored"] and not self._violation_reporter.is_raised:
             self._violation_reporter.log_or_raise_violation(
-                step_counter=self._step_counter_getter()
+                outer_step_counter=self._outer_step_counter_getter()
             )
 
     def _compute_on_device(self) -> torch.Tensor:

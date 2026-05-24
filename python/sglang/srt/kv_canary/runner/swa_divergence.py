@@ -64,13 +64,13 @@ class SwaDivergenceReport:
     def step(
         self,
         *,
-        step_counter: int,
+        outer_step_counter: int,
         forward_batch: Optional["ForwardBatch"],
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
             compute_on_device=lambda: self._compute_on_device(
-                step_counter=step_counter, forward_batch=forward_batch
+                outer_step_counter=outer_step_counter, forward_batch=forward_batch
             ),
             postprocess_on_host=self._postprocess_on_host,
         )
@@ -78,10 +78,10 @@ class SwaDivergenceReport:
     def _compute_on_device(
         self,
         *,
-        step_counter: int,
+        outer_step_counter: int,
         forward_batch: Optional["ForwardBatch"],
     ) -> Optional[dict[str, Any]]:
-        if step_counter == 0 or step_counter % self._interval != 0:
+        if outer_step_counter == 0 or outer_step_counter % self._interval != 0:
             return None
 
         # Bundle forward_ct in as an int pass-through so the host log line reports

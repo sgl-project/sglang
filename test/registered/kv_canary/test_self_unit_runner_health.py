@@ -19,10 +19,10 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
     def test_kernel_run_counter_watchdog_raises_on_zero(self) -> None:
         """Verify the kernel watchdog raises when counters stop advancing."""
         manager = make_manager(device=self.device)
-        manager._step_counter = 1000
+        manager._outer_step_counter = 1000
         manager._device_state.kernel_run_counters.zero_()
         manager._health_checker.step()
-        manager._step_counter = 2000
+        manager._outer_step_counter = 2000
         with self.assertRaises(RuntimeError):
             manager._health_checker.step()
 
@@ -41,9 +41,9 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         ):
             manager._device_state.kernel_run_counters[tag.value] = 1
 
-        manager._step_counter = 1000
+        manager._outer_step_counter = 1000
         manager._health_checker.step()
-        manager._step_counter = 2000
+        manager._outer_step_counter = 2000
         manager._health_checker.step()
 
     def test_periodic_stats_log_every_n_step(self) -> None:
@@ -55,7 +55,7 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         with self.assertLogs(manager_module.logger.name, level=logging.INFO) as cm:
             for _ in range(11):
                 manager._stats_logger.step()
-                manager._step_counter += 1
+                manager._outer_step_counter += 1
         log_text = "\n".join(cm.output)
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)

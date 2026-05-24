@@ -33,13 +33,13 @@ class KernelRunCounterHealthChecker:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
     def step(self) -> None:
@@ -49,10 +49,10 @@ class KernelRunCounterHealthChecker:
         )
 
     def _compute_on_device(self) -> Optional[torch.Tensor]:
-        step_counter = self._step_counter_getter()
-        if step_counter < _HEALTH_CHECK_WARMUP_STEPS:
+        outer_step_counter = self._outer_step_counter_getter()
+        if outer_step_counter < _HEALTH_CHECK_WARMUP_STEPS:
             return None
-        if step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
+        if outer_step_counter % _HEALTH_CHECK_EVERY_N_STEPS != 0:
             return None
         if not self._active_tags:
             return None
@@ -66,7 +66,7 @@ class KernelRunCounterHealthChecker:
             names = ", ".join(tag.name for tag in zero_tags)
             raise RuntimeError(
                 f"kv-canary: kernel_run_counter is zero after warmup for tags=[{names}] "
-                f"at step={self._step_counter_getter()}; canary path is not executing"
+                f"at step={self._outer_step_counter_getter()}; canary path is not executing"
             )
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
@@ -82,14 +82,14 @@ class PeriodicCanaryStatsLogger:
         config: CanaryConfig,
         device_state: CanaryDeviceState,
         active_tags: tuple[CanaryLaunchTag, ...],
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
         sweep_orchestrator: SweepOrchestrator,
         d2h_stream: torch.cuda.Stream,
     ) -> None:
         self._config = config
         self._device_state = device_state
         self._active_tags = active_tags
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._sweep_orchestrator = sweep_orchestrator
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
 
@@ -103,8 +103,8 @@ class PeriodicCanaryStatsLogger:
         period = self._config.stats_print_every_n_steps
         if period <= 0:
             return None
-        step_counter = self._step_counter_getter()
-        if step_counter == 0 or step_counter % period != 0:
+        outer_step_counter = self._outer_step_counter_getter()
+        if outer_step_counter == 0 or outer_step_counter % period != 0:
             return None
         device_state = self._device_state
         # Snapshot the step in the staged payload so the host log line reports the
@@ -112,7 +112,7 @@ class PeriodicCanaryStatsLogger:
         # (which is one DelayedDeviceHostHandler tick later). The "step" key is a
         # plain int and rides along via the pass-through path in FutureTensors.
         return {
-            "step": step_counter,
+            "step": outer_step_counter,
             "slot_sum": device_state.slot_run_counters.sum().view(1),
             "write_index": device_state.violation_log.violation_write_index,
         }

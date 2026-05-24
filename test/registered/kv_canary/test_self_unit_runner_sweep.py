@@ -55,7 +55,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
             before = manager._sweep_orchestrator._last_sweep_step
             real_maybe()
             if manager._sweep_orchestrator._last_sweep_step != before:
-                sweep_calls.append(manager._step_counter)
+                sweep_calls.append(manager._outer_step_counter)
 
         with patch.object(manager._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
