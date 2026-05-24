@@ -2,7 +2,7 @@
 Benchmark: Streaming Session Inter-Turn Latency
 
 Tests:
-  1. Stability (bs=8):  streaming only, assert tail_avg / head_avg <= 1.3
+  1. Stability (bs=8):  streaming only, assert tail_avg / head_avg <= 1.15
   2. Correctness (bs=1): regular vs streaming, assert output equal
   3. Random lengths (bs=8): streaming only, random input/output lens, no crash
 """
@@ -345,9 +345,9 @@ class TestSessionLatency(CustomTestCase):
         )
         self.assertLessEqual(
             ratio,
-            1.3,
+            1.15,
             f"streaming latency should stay flat across turns "
-            f"(head={head_avg:.1f}ms, tail={tail_avg:.1f}ms, ratio={ratio:.2f} > 1.3)",
+            f"(head={head_avg:.1f}ms, tail={tail_avg:.1f}ms, ratio={ratio:.2f} > 1.15)",
         )
 
     def test_streaming_session_correctness(self):
