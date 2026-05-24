@@ -102,6 +102,18 @@ def test_dsv4_index_cache_validation_workflow_labels_searched_eval_endpoints(
     ]
 
 
+def test_dsv4_index_cache_validation_workflow_labels_artifacts(tmp_path):
+    args = _args(tmp_path)
+    artifacts = workflow.validation_artifacts(args)
+
+    assert artifacts == {
+        "profile": tmp_path / "out" / "profile.json",
+        "searched_patterns": tmp_path / "out" / "searched_patterns.json",
+        "quality_eval": tmp_path / "out" / "quality_eval.json",
+        "validation_summary": tmp_path / "out" / "validation_summary.json",
+    }
+
+
 def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profile(
     tmp_path,
 ):
@@ -259,6 +271,24 @@ def test_dsv4_index_cache_validation_workflow_dry_run_writes_summary(tmp_path):
         "min_indexcache_prompt_tokens": 75000,
         "profile_prompt_tokens": 128000,
         "eval_min_context_length": 75000,
+    }
+    assert summary["artifacts"] == {
+        "profile": {
+            "path": str(output_dir / "profile.json"),
+            "exists": False,
+        },
+        "searched_patterns": {
+            "path": str(output_dir / "searched_patterns.json"),
+            "exists": False,
+        },
+        "quality_eval": {
+            "path": str(output_dir / "quality_eval.json"),
+            "exists": False,
+        },
+        "validation_summary": {
+            "path": str(output_dir / "validation_summary.json"),
+            "exists": False,
+        },
     }
     assert [phase["phase"] for phase in summary["phases"]] == [
         "profile",

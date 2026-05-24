@@ -131,6 +131,15 @@ def eval_cmd(args) -> list[str]:
     return cmd
 
 
+def validation_artifacts(args) -> dict[str, Path]:
+    return {
+        "profile": args.output_dir / "profile.json",
+        "searched_patterns": args.output_dir / "searched_patterns.json",
+        "quality_eval": args.output_dir / "quality_eval.json",
+        "validation_summary": args.output_dir / "validation_summary.json",
+    }
+
+
 def validate_args(args) -> None:
     if not args.dry_run and not args.eagle_off_confirmed:
         raise SystemExit(
@@ -233,6 +242,7 @@ def main(argv: list[str] | None = None) -> None:
         if result["returncode"] != 0:
             break
 
+    artifacts = validation_artifacts(args)
     summary = {
         "eagle": (
             "confirmed off"
@@ -255,10 +265,12 @@ def main(argv: list[str] | None = None) -> None:
         },
         "quality_eval_repeats": args.eval_repeats,
         "phases": results,
+        "artifacts": {
+            name: {"path": str(path), "exists": path.exists()}
+            for name, path in artifacts.items()
+        },
     }
-    (args.output_dir / "validation_summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n"
-    )
+    artifacts["validation_summary"].write_text(json.dumps(summary, indent=2) + "\n")
 
 
 if __name__ == "__main__":
