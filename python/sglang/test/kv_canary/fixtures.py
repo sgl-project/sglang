@@ -187,7 +187,10 @@ def make_forward_batch(
     if input_ids is None:
         input_ids = torch.zeros(bs, dtype=torch.int32, device=device)
     if positions is None:
-        positions = torch.zeros(bs, dtype=torch.int32, device=device)
+        # Default to decode-canonical: positions = seq_lens - 1 (one-token-per-req decode write
+        # at the post-bump tail). Plan input now derives decode prefix_lens from positions
+        # directly (rather than seq_lens - 1), so the default must keep parity.
+        positions = (seq_lens.to(torch.int64) - 1).clamp(min=0).to(torch.int32)
     if out_cache_loc is None:
         out_cache_loc = torch.zeros(bs, dtype=torch.int32, device=device)
 
