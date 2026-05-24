@@ -44,7 +44,7 @@ def _get_config() -> NextTokenSwapConfig:
     return _config
 
 
-def maybe_swap_next_tokens(
+def maybe_perturb_swap_next_tokens(
     batch_next_token_ids: torch.Tensor,
 ) -> torch.Tensor:
     global _step_counter

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
-from sglang.srt.kv_canary.perturb.next_token_swap import maybe_swap_next_tokens
+from sglang.srt.kv_canary.perturb.next_token_swap import maybe_perturb_swap_next_tokens
 from sglang.srt.kv_canary.token_oracle.oracle import TokenOracle
 from sglang.srt.kv_canary.token_oracle.oracle_manager import (
     TokenOracleManager,
@@ -56,5 +56,5 @@ class _OracleSampler(Sampler):
             logits_positions=positions,
         )
 
-        batch_next_token_ids = maybe_swap_next_tokens(batch_next_token_ids)
+        batch_next_token_ids = maybe_perturb_swap_next_tokens(batch_next_token_ids)
         return batch_next_token_ids
