@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import logging
 import os
 import time
 from typing import ClassVar
@@ -19,8 +18,6 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class MockModelPerturbE2EBase(CapturedServerE2EBase):
     """Base for mock-model self-test perturb e2e tests.
@@ -28,6 +25,10 @@ class MockModelPerturbE2EBase(CapturedServerE2EBase):
     ``setUpClass`` launches the mock-model + canary server with subclass-provided
     extra env / extra server args. Server lifecycle, log capture, and the generic
     violation-log assertions are inherited from ``CapturedServerE2EBase``.
+
+    The canary mode is ``log`` (not ``raise``) so the server stays alive after
+    the first violation — clients get their responses, log keeps accumulating,
+    and the test's log-based assertions run without races.
     """
 
     extra_env: ClassVar[dict[str, str]] = {}
@@ -46,7 +47,9 @@ class MockModelPerturbE2EBase(CapturedServerE2EBase):
             MOCK_MODEL_PATH,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=mock_model_server_args(*cls.extra_server_args),
+            other_args=mock_model_server_args(
+                *cls.extra_server_args, canary_mode="log"
+            ),
             env=server_env,
             return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
         )
@@ -65,28 +68,6 @@ class MockModelPerturbE2EBase(CapturedServerE2EBase):
             max_new_tokens=max_new_tokens,
             timeout=timeout,
         )
-
-    def best_effort_send_parallel_requests(
-        self,
-        n: int = 4,
-        *,
-        max_new_tokens: int = 256,
-        timeout: float = 30.0,
-    ) -> None:
-        """Send parallel requests in scenarios where the server is expected to
-        abort mid-response (e.g. ``--kv-canary raise`` + perturb). Client-side
-        errors are swallowed at DEBUG level — the test's real assertions live
-        in the captured server log, not in the responses."""
-        try:
-            self.send_parallel_requests(
-                n=n, max_new_tokens=max_new_tokens, timeout=timeout
-            )
-        except Exception:
-            logger.debug(
-                "best_effort_send_parallel_requests: client raised; assertions "
-                "depend on captured server log",
-                exc_info=True,
-            )
 
     def assert_any_launch_tag_violation_reported(
         self,

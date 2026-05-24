@@ -22,13 +22,11 @@ from sglang.test.test_utils import (
 
 MOCK_MODEL_PATH = "Qwen/Qwen3-0.6B"
 
-_MOCK_MODEL_SERVER_ARGS: list[str] = [
+_MOCK_MODEL_SERVER_ARGS_NO_CANARY: list[str] = [
     "--load-format",
     "dummy",
     "--sampling-backend",
     "token_oracle",
-    "--kv-canary",
-    "raise",
 ]
 
 
@@ -47,8 +45,15 @@ class MockModelBenchResult:
         return self.log_text[-length:]
 
 
-def mock_model_server_args(*extra_args: str) -> list[str]:
-    return [*_MOCK_MODEL_SERVER_ARGS, *extra_args]
+def mock_model_server_args(
+    *extra_args: str, canary_mode: str = "raise"
+) -> list[str]:
+    return [
+        *_MOCK_MODEL_SERVER_ARGS_NO_CANARY,
+        "--kv-canary",
+        canary_mode,
+        *extra_args,
+    ]
 
 
 def mock_model_server_env(*, input_check_enabled: bool = True) -> dict[str, str]:

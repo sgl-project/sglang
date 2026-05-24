@@ -24,7 +24,7 @@ class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
 
     def test_swap_triggers_input_check_violation_but_kv_paths_silent(self) -> None:
         """Verify next_token swap fires write_token violation while KV reasons stay silent."""
-        self.best_effort_send_parallel_requests(n=4, timeout=30.0)
+        self.send_parallel_requests(n=4, timeout=30.0)
         self.assert_log_contains("mock_perturb next_token_swap: swapped")
         self.assert_any_launch_tag_violation_reported(fail_reason="write_token")
         self.assert_any_launch_tag_violation_absent(fail_reason="real_kv_hash")
