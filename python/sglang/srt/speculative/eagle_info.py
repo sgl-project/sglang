@@ -43,7 +43,9 @@ from sglang.srt.speculative.spec_utils import (
     get_src_tgt_cache_loc,
     get_target_cache_loc,
 )
-from sglang.srt.utils import is_cuda, is_musa, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_musa, next_power_of_2
+
+_is_hip = is_hip()
 
 if is_cuda() or is_musa():
     from sgl_kernel import (
@@ -271,7 +273,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
 
-        predict_shape = list(logits_output.next_token_logits.shape)[:-1]
+        shortcut_ids = logits_output.next_token_ids_shortcut if _is_hip else None
+        if shortcut_ids is not None:
+            target_predict = shortcut_ids.reshape(bs, self.draft_token_num)
+            predict_shape = list(target_predict.shape)
+        else:
+            predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
         accept_index = torch.full(
@@ -287,7 +294,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply the custom logit processors if registered in the sampling info.
-        if sampling_info.has_custom_logit_processor:
+        if shortcut_ids is None and sampling_info.has_custom_logit_processor:
             apply_custom_logit_processor(
                 logits_output.next_token_logits,
                 sampling_info,
@@ -295,7 +302,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply penalty
-        if (
+        if shortcut_ids is None and (
             sampling_info.penalizer_orchestrator.is_required
             or sampling_info.logit_bias is not None
         ):
@@ -311,7 +318,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 )
 
         # Apply grammar mask
-        if vocab_mask is not None:
+        if shortcut_ids is None and vocab_mask is not None:
             assert self.grammar is not None
             self.grammar.apply_vocab_mask(
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
@@ -325,9 +332,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 "Falling back to greedy verification."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
-            target_predict = target_predict.reshape(bs, self.draft_token_num)
+        if shortcut_ids is not None or is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+            if shortcut_ids is None:
+                target_predict = torch.argmax(logits_output.next_token_logits, dim=-1)
+                target_predict = target_predict.reshape(bs, self.draft_token_num)
             predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
                 predicts=predict,  # mutable
                 accept_index=accept_index,  # mutable

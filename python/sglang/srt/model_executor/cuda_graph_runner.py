@@ -1319,6 +1319,11 @@ class CudaGraphRunner:
                     else None
                 ),
                 customized_info=output.customized_info,
+                next_token_ids_shortcut=(
+                    output.next_token_ids_shortcut[: self.raw_num_token]
+                    if output.next_token_ids_shortcut is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)

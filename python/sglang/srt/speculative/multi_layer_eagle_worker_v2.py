@@ -54,7 +54,9 @@ from sglang.srt.speculative.spec_utils import (
     record_stream_for_v2_verify,
     select_top_k_tokens,
 )
-from sglang.srt.utils.common import empty_context, fast_topk
+from sglang.srt.utils.common import empty_context, fast_topk, is_hip
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner, ModelRunnerOutput
@@ -763,7 +765,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         logits_output = forward_batch_output.logits_output
 
         # Sample
-        maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
+        if not _is_hip or logits_output.next_token_logits is not None:
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
+            )
         (
             predict,
             accept_lens,
