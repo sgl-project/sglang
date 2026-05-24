@@ -293,7 +293,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         img_token_id = getattr(self, "IM_TOKEN_ID", None)
         video_token_id = getattr(self, "VIDEO_TOKEN_ID", None)
-        audio_token_id = getattr(self, "audio_token_id", None)
         spatial_merge_size = getattr(self, "spatial_merge_size", 1)
         vision_start_token_id = getattr(self, "vision_start_token_id", None)
         vision_end_token_id = getattr(self, "vision_end_token_id", None)
@@ -312,7 +311,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
         img_idx = 0
         video_idx = 0
-        model_type = getattr(self, "model_type", None)
         for mm_start_idx, modality in vision_start_indices:
             modality_list.append(modality)
             video_tokens = None
