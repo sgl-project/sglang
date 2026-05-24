@@ -100,27 +100,6 @@ class CanaryDeviceState:
         )
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
-        # [PP-DIAG] verify the two counter tensors have non-overlapping memory.
-        # If their data_ptr ranges overlap we have a smoking gun for the PP
-        # 'HEAD_K_FULL counter grows like slot counter' pattern.
-        import logging as _logging
-
-        _log = _logging.getLogger(__name__)
-        _kc_start = kernel_run_counters.data_ptr()
-        _kc_end = _kc_start + num_tags * 8
-        _sc_start = slot_run_counters.data_ptr()
-        _sc_end = _sc_start + num_tags * 8
-        _overlap = (_kc_start < _sc_end) and (_sc_start < _kc_end)
-        _log.warning(
-            "[PP-DIAG] CanaryDeviceState.allocate: kernel_run_counters=[0x%x..0x%x) "
-            "slot_run_counters=[0x%x..0x%x) overlap=%s num_tags=%d",
-            _kc_start,
-            _kc_end,
-            _sc_start,
-            _sc_end,
-            _overlap,
-            num_tags,
-        )
         return cls(
             violation_log=violation_log,
             kernel_run_counters=kernel_run_counters,
