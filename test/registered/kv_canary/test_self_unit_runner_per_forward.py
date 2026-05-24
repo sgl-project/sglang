@@ -50,14 +50,9 @@ class TestManagerPerForward(CanaryManagerTestCase):
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             ):
-                single_forward_manager = manager.get_single_forward_manager(0)
                 with manager.with_active_single_forward_manager(0):
-                    pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-                        forward_batch
-                    )
-                    single_forward_manager.post_ops_maybe_inside_graph(
-                        forward_batch, pre_ops_output
-                    )
+                    pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+                    manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
         self.assertEqual(calls[0], "plan")
         self.assertTrue(
@@ -234,14 +229,9 @@ def _drive_one_cycle(manager, forward_batch) -> None:
         single_forward_indices=[0],
         maybe_inaccurate_forward_batch=forward_batch,
     ):
-        single_forward_manager = manager.get_single_forward_manager(0)
         with manager.with_active_single_forward_manager(0):
-            pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-                forward_batch
-            )
-            single_forward_manager.post_ops_maybe_inside_graph(
-                forward_batch, pre_ops_output
-            )
+            pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
 
 class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
@@ -251,7 +241,7 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
         """Verify the dispatcher routes phase 2 to the bracketed SingleForwardManager."""
         manager = make_manager(device=self.device, speculative_num_steps=3)
         forward_batch = make_forward_batch(self.device)
-        target_sfm = manager.get_single_forward_manager(1)
+        target_sfm = manager._single_forward_managers[1]
         observed: list[object] = []
         original_phase_2 = target_sfm.pre_ops_maybe_inside_graph
 
@@ -260,10 +250,10 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
             return original_phase_2(fb)
 
         target_sfm.pre_ops_maybe_inside_graph = _record
-        manager.get_single_forward_manager(0).pre_ops_outside_graph(
+        manager._single_forward_managers[0].pre_ops_outside_graph(
             maybe_inaccurate_forward_batch=forward_batch
         )
-        manager.get_single_forward_manager(1).pre_ops_outside_graph(
+        manager._single_forward_managers[1].pre_ops_outside_graph(
             maybe_inaccurate_forward_batch=forward_batch
         )
         with manager.with_active_single_forward_manager(1):

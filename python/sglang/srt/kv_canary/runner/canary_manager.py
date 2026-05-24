@@ -187,9 +187,6 @@ class CanaryManager:
     def active_tag_count(self) -> int:
         return len(self._active_tags)
 
-    def get_single_forward_manager(self, index: int) -> SingleForwardManager:
-        return self._single_forward_managers[index]
-
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
         """Mark SingleForwardManager ``index`` as active for the duration of the with-block.

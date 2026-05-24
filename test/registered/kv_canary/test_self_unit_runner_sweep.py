@@ -28,14 +28,9 @@ def _run_one_cycle(manager, forward_batch) -> None:
         single_forward_indices=[0],
         maybe_inaccurate_forward_batch=forward_batch,
     ):
-        single_forward_manager = manager.get_single_forward_manager(0)
         with manager.with_active_single_forward_manager(0):
-            pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
-                forward_batch
-            )
-            single_forward_manager.post_ops_maybe_inside_graph(
-                forward_batch, pre_ops_output
-            )
+            pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
 
 class TestSelfUnitManagerSweep(CanaryManagerTestCase):
@@ -64,12 +59,11 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         config = make_config(sweep_interval=1)
         manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
-        single_forward_manager = manager.get_single_forward_manager(0)
-        single_forward_manager.pre_ops_outside_graph(
+        manager._single_forward_managers[0].pre_ops_outside_graph(
             maybe_inaccurate_forward_batch=forward_batch
         )
         with manager.with_active_single_forward_manager(0):
-            single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
+            manager.pre_ops_maybe_inside_graph(forward_batch)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
