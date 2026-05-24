@@ -34,6 +34,7 @@ struct PlanEntriesParams {
   const int32_t* __restrict__ req_to_token;            // [max_reqs, max_seq_len] int32
   const int64_t* __restrict__ full_to_swa_lut;         // [lut_len] int64, may be nullptr when !HAS_SWA_LUT
   const int64_t* __restrict__ verify_offsets_scratch;  // [bs_padded + 1] int64 (cumulative prefix sum)
+  const int32_t* __restrict__ verify_enable;           // [1] int32 — 0 ⇒ skip scatter entirely
   // Outputs.
   int64_t* __restrict__ out_verify_slot_indices;       // [verify_capacity] int64
   int64_t* __restrict__ out_verify_positions;          // [verify_capacity] int64
@@ -86,12 +87,18 @@ __global__ void plan_entries_persistent_kernel(
     return;
   }
 
-  // Clamp the scatter range to out_verify_*[verify_capacity]. On capacity overflow the offsets kernel
-  // marks the verify plan disabled (out_verify_enable = 0 / out_verify_num_valid = verify_capacity), so
-  // the verify kernel will skip this step entirely — but the scatter into out_verify_* must NOT overflow
-  // the allocated buffer regardless, or it would corrupt adjacent device memory and crash later kernels
-  // with non-canary symptoms (e.g. CUBLAS_STATUS_EXECUTION_FAILED). The clamped tail of work is dropped;
-  // the entries that did make it through are still consistent with what the (clamped) num_valid records.
+  // Honor the offsets kernel's disable signal: when total_verify exceeded verify_capacity on the
+  // previous step (overflow), the offsets kernel clears verify_enable to 0; the verify kernel will
+  // skip this step entirely, so scattering anything is wasted work. Early-exit here makes that
+  // explicit instead of relying on the clamp-and-throw-away pattern.
+  if (*params.verify_enable == 0) {
+    return;
+  }
+
+  // Defensive clamp on the scatter range. If the verify_enable flag did not make it through (e.g.
+  // upstream bug, in-flight reorder), the scatter must still NOT overflow out_verify_*[verify_capacity]
+  // or it corrupts adjacent device memory and crashes later kernels with non-canary symptoms
+  // (e.g. CUBLAS_STATUS_EXECUTION_FAILED). Belt-and-suspenders with the early-exit above.
   const int64_t scatter_total = total_verify < params.verify_capacity ? total_verify : params.verify_capacity;
 
   const int64_t tid_start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -160,6 +167,7 @@ struct PlanEntriesKernel {
       const tvm::ffi::TensorView req_to_token,
       const tvm::ffi::Optional<tvm::ffi::TensorView> full_to_swa_index_mapping,
       const tvm::ffi::TensorView verify_offsets_scratch,
+      const tvm::ffi::TensorView verify_enable,
       const tvm::ffi::TensorView out_verify_slot_indices,
       const tvm::ffi::TensorView out_verify_positions,
       const tvm::ffi::TensorView out_verify_prev_slot_indices,
@@ -184,6 +192,10 @@ struct PlanEntriesKernel {
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device_)
         .verify(verify_offsets_scratch);
+    TensorMatcher({1})  //
+        .with_dtype<int32_t>()
+        .with_device<kDLCUDA>(device_)
+        .verify(verify_enable);
     TensorMatcher({Ncap})  //
         .with_dtype<int64_t>()
         .with_device<kDLCUDA>(device_)
@@ -218,6 +230,7 @@ struct PlanEntriesKernel {
         .req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr()),
         .full_to_swa_lut = lut_ptr,
         .verify_offsets_scratch = static_cast<const int64_t*>(verify_offsets_scratch.data_ptr()),
+        .verify_enable = static_cast<const int32_t*>(verify_enable.data_ptr()),
         .out_verify_slot_indices = static_cast<int64_t*>(out_verify_slot_indices.data_ptr()),
         .out_verify_positions = static_cast<int64_t*>(out_verify_positions.data_ptr()),
         .out_verify_prev_slot_indices = static_cast<int64_t*>(out_verify_prev_slot_indices.data_ptr()),

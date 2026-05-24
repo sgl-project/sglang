@@ -138,6 +138,7 @@ def launch_canary_plan_kernels(
         req_to_token=req_to_token,
         full_to_swa_index_mapping=full_to_swa_index_mapping,
         verify_offsets_scratch=verify_offsets_scratch,
+        verify_enable=verify_plan_out.enable,
         out_verify_slot_indices=verify_plan_out.verify_slot_indices,
         out_verify_positions=verify_plan_out.verify_positions,
         out_verify_prev_slot_indices=verify_plan_out.verify_prev_slot_indices,
