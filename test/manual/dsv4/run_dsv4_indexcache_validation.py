@@ -87,14 +87,20 @@ def search_cmd(args) -> list[str]:
     return cmd
 
 
-def eval_cmd(args) -> list[str]:
+def quality_eval_endpoints(args) -> list[tuple[str, str]]:
+    searched_half_endpoint = args.searched_half_endpoint or args.indexcache_endpoint
+    searched_quarter_endpoint = args.searched_quarter_endpoint or args.indexcache_endpoint
     return [
+        ("baseline", args.baseline_endpoint),
+        ("searched_1_2", searched_half_endpoint),
+        ("searched_1_4", searched_quarter_endpoint),
+    ]
+
+
+def eval_cmd(args) -> list[str]:
+    cmd = [
         sys.executable,
         script_path("eval_dsv4_indexcache_suite.py"),
-        "--endpoint",
-        f"baseline={args.baseline_endpoint}",
-        "--endpoint",
-        f"indexcache={args.indexcache_endpoint}",
         "--suite",
         "long-context",
         "--suite",
@@ -108,6 +114,9 @@ def eval_cmd(args) -> list[str]:
         "--output",
         str(args.output_dir / "quality_eval.json"),
     ]
+    for label, endpoint in quality_eval_endpoints(args):
+        cmd += ["--endpoint", f"{label}={endpoint}"]
+    return cmd
 
 
 def validate_args(args) -> None:
@@ -120,6 +129,16 @@ def validate_args(args) -> None:
         raise SystemExit(
             "--indexcache-profile-env-confirmed is required for real validation runs; "
             "the IndexCache endpoint must set SGLANG_DSV4_INDEXCACHE_PROFILE=true"
+        )
+    if not args.dry_run and not args.searched_half_endpoint:
+        raise SystemExit(
+            "--searched-half-endpoint is required for real validation runs; "
+            "quality eval must target the searched 1/2 pattern explicitly"
+        )
+    if not args.dry_run and not args.searched_quarter_endpoint:
+        raise SystemExit(
+            "--searched-quarter-endpoint is required for real validation runs; "
+            "quality eval must target the searched 1/4 pattern explicitly"
         )
     if args.profile_prompt_tokens < args.min_indexcache_prompt_tokens:
         raise SystemExit(
@@ -137,6 +156,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-endpoint", required=True)
     parser.add_argument("--indexcache-endpoint", required=True)
+    parser.add_argument("--searched-half-endpoint")
+    parser.add_argument("--searched-quarter-endpoint")
     parser.add_argument("--search-endpoint", required=True)
     parser.add_argument("--calibration-jsonl", type=Path, required=True)
     parser.add_argument("--num-c4-layers", type=int, required=True)
@@ -182,6 +203,9 @@ def main() -> None:
             else "dry run; speculative decoding not exercised"
         ),
         "uniform_1_4": "not run; only searched 1/4 is generated",
+        "quality_eval_endpoints": {
+            label: endpoint for label, endpoint in quality_eval_endpoints(args)
+        },
         "indexcache_profile_env": (
             "confirmed SGLANG_DSV4_INDEXCACHE_PROFILE=true"
             if args.indexcache_profile_env_confirmed

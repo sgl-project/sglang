@@ -26,6 +26,8 @@ def _args(tmp_path: Path) -> Namespace:
     return Namespace(
         baseline_endpoint="http://baseline",
         indexcache_endpoint="http://indexcache",
+        searched_half_endpoint="http://searched-half",
+        searched_quarter_endpoint="http://searched-quarter",
         search_endpoint="http://search",
         calibration_jsonl=tmp_path / "calibration.jsonl",
         num_c4_layers=21,
@@ -62,13 +64,26 @@ def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp
     cmd = workflow.eval_cmd(_args(tmp_path))
 
     assert "baseline=http://baseline" in cmd
-    assert "indexcache=http://indexcache" in cmd
+    assert "searched_1_2=http://searched-half" in cmd
+    assert "searched_1_4=http://searched-quarter" in cmd
     assert "long-context" in cmd
     assert "reasoning" in cmd
     assert "--min-context-length" in cmd
     assert "75000" in cmd
     assert "mmlu" not in cmd
     assert "gsm8k" not in cmd
+
+
+def test_dsv4_index_cache_validation_workflow_labels_searched_eval_endpoints(
+    tmp_path,
+):
+    endpoints = workflow.quality_eval_endpoints(_args(tmp_path))
+
+    assert endpoints == [
+        ("baseline", "http://baseline"),
+        ("searched_1_2", "http://searched-half"),
+        ("searched_1_4", "http://searched-quarter"),
+    ]
 
 
 def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profile(
@@ -116,6 +131,26 @@ def test_dsv4_index_cache_validation_workflow_requires_profile_env_for_real_runs
         workflow.validate_args(args)
 
 
+def test_dsv4_index_cache_validation_workflow_requires_searched_half_endpoint(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.searched_half_endpoint = None
+
+    with pytest.raises(SystemExit, match="--searched-half-endpoint"):
+        workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_requires_searched_quarter_endpoint(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.searched_quarter_endpoint = None
+
+    with pytest.raises(SystemExit, match="--searched-quarter-endpoint"):
+        workflow.validate_args(args)
+
+
 def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confirmation(
     tmp_path,
 ):
@@ -123,6 +158,8 @@ def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confi
     args.dry_run = True
     args.eagle_off_confirmed = False
     args.indexcache_profile_env_confirmed = False
+    args.searched_half_endpoint = None
+    args.searched_quarter_endpoint = None
 
     workflow.validate_args(args)
 
