@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     84,
+        "agents":     87,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -198,6 +198,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "logic_bucket":      7836,
             "webhook_hub":       7837,
             "content_engine":    7838,
+            "log_manager":       7839,
+            "security_monitor":  7840,
+            "akash":             7841,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -483,6 +486,9 @@ _INTENTS = {
     "committee_ask":           lambda a, k: {"action": "committee_queued", "question": k.get("question", ""), "strategy": k.get("strategy", "consensus")},
     "webhook_fire":            lambda a, k: {"action": "webhook_queued", "source": k.get("source", ""), "event_type": k.get("event_type", "")},
     "content_generate":        lambda a, k: {"action": "content_queued", "topic": k.get("topic", ""), "content_type": k.get("content_type", "article")},
+    "log_compress":            lambda a, k: {"action": "log_compress_queued", "file": k.get("file", "")},
+    "security_scan":           lambda a, k: {"action": "security_scan_queued"},
+    "akash_deploy":            lambda a, k: {"action": "akash_deploy_queued", "sdl_id": k.get("sdl_id", 0)},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
