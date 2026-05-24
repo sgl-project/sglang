@@ -257,7 +257,8 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    tasks = selected_tasks(args.task, args.suite or ["long-context", "reasoning"])
+    suites = args.suite or (["long-context", "reasoning"] if not args.task else [])
+    tasks = selected_tasks(args.task, suites)
     results = {
         "tasks": [task.name for task in tasks],
         "endpoints": [label for label, _ in args.endpoint],

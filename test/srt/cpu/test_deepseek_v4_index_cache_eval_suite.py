@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -133,3 +134,43 @@ def test_dsv4_index_cache_eval_suite_accepts_base_path_endpoint():
         },
         "baseline",
     )
+
+
+def test_dsv4_index_cache_eval_suite_dry_run_writes_server_checks(tmp_path):
+    output = tmp_path / "eval.json"
+
+    eval_suite.main(
+        [
+            "--endpoint",
+            "baseline=http://baseline",
+            "--endpoint",
+            "searched_1_4=http://searched-quarter",
+            "--task",
+            "ruler",
+            "--repeats",
+            "2",
+            "--output",
+            str(output),
+            "--dry-run",
+        ]
+    )
+
+    result = json.loads(output.read_text())
+
+    assert result["server_checks"] == {
+        "baseline": {
+            "server_info_checked": False,
+            "speculative_decode": "dry run; /server_info not queried",
+        },
+        "searched_1_4": {
+            "server_info_checked": False,
+            "speculative_decode": "dry run; /server_info not queried",
+        },
+    }
+    assert [(row["endpoint"], row["repeat"]) for row in result["results"]] == [
+        ("baseline", 1),
+        ("baseline", 2),
+        ("searched_1_4", 1),
+        ("searched_1_4", 2),
+    ]
+    assert {row["task"] for row in result["results"]} == {"ruler"}
