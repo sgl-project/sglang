@@ -232,7 +232,7 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        input_check_mode = self._should_enable_input_check_for_launch()
+        input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         if input_check_mode:
             manager = self._token_oracle_manager
             if manager is None:
@@ -298,7 +298,7 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = self._expected_inputs.slice(num_tokens)
-        input_check_mode = self._should_enable_input_check_for_launch()
+        input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
@@ -347,10 +347,17 @@ class SingleForwardManager:
             )
         self._enable_warner.tick(snapshot.verify_plan_enable)
 
-    def _should_enable_input_check_for_launch(self) -> bool:
+    def _should_enable_input_check_for_launch(
+        self, forward_batch: "ForwardBatch"
+    ) -> bool:
         if not self._config.input_check_mode:
             return False
-        if self._is_eagle_draft_decode:
+        forward_mode = forward_batch.forward_mode
+        if (
+            self._is_eagle_draft_decode
+            and forward_mode is not None
+            and forward_mode.is_decode()
+        ):
             return False
         return True
 
