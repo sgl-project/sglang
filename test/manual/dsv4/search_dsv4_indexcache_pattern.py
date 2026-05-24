@@ -120,6 +120,12 @@ def greedy_search_pattern(
     pattern = ["F"] * num_c4_layers
     protected = protected_c4_indices(num_c4_layers, pp_block_c4_layers)
     target_f = target_f_layers(num_c4_layers, retention)
+    if len(protected) > target_f:
+        raise ValueError(
+            f"retention {retention} requires {target_f} F layers but "
+            f"{len(protected)} C4 anchors are protected; reduce "
+            "--pp-block-c4-layers or use a higher retention"
+        )
     initial_pattern = pattern_to_str(pattern)
     history = []
 

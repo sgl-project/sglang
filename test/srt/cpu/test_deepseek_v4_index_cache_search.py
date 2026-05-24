@@ -2,6 +2,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_search_module():
     path = (
@@ -55,3 +57,13 @@ def test_dsv4_index_cache_search_can_target_quarter_retention():
     assert result["final_pattern"].count("F") == 2
     assert result["final_pattern"][0] == "F"
     assert result["target_f_layers"] == 2
+
+
+def test_dsv4_index_cache_search_rejects_impossible_protected_retention():
+    with pytest.raises(ValueError, match="C4 anchors are protected"):
+        search_mod.greedy_search_pattern(
+            num_c4_layers=8,
+            retention="1/4",
+            pp_block_c4_layers=2,
+            score_pattern=lambda _: 0.0,
+        )
