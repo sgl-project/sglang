@@ -444,6 +444,13 @@ class LogitsProcessor(nn.Module):
                     + logits_metadata.extend_seq_lens
                     - 1
                 )
+            # Chunked prefill + heavy radix sharing under speculative decoding can
+            # produce ``sum(extend_seq_lens) > hidden_states.shape[0]`` when the
+            # current chunk only covers a prefix of the batched extend window.
+            # Clamp ``last_index`` to keep the gather safe — rows that would have
+            # mapped past the end belong to requests still in flight and will be
+            # re-evaluated in a later chunk's forward.
+            last_index = torch.clamp(last_index, max=hidden_states.shape[0] - 1)
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
