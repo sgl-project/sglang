@@ -105,7 +105,9 @@ class TestSwaDivergenceReport(CustomTestCase):
                 ),
                 verify_plan=_make_verify_plan(3),
             )
-            stats.step(outer_step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH)
+            stats.step(
+                outer_step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH
+            )
         # 4th forward lands on step_counter=10 = interval, so compute_on_device
         # snapshots {forward_ct:4, verify_full:40, verify_swa:12} into the dict and
         # the staged future hangs onto it. forward_ct is now 4.
@@ -156,11 +158,15 @@ class TestSwaDivergenceReport(CustomTestCase):
             # Stage the dict at the interval-aligned step (no log emitted yet,
             # DelayedDeviceHostHandler still has nothing to drain), then call
             # step() again at the next counter to drain and emit the log.
-            stats.step(outer_step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH)
+            stats.step(
+                outer_step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH
+            )
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
-                stats.step(outer_step_counter=drain_step, forward_batch=_EMPTY_FORWARD_BATCH)
+                stats.step(
+                    outer_step_counter=drain_step, forward_batch=_EMPTY_FORWARD_BATCH
+                )
             matching = [
                 line
                 for line in captured.output
