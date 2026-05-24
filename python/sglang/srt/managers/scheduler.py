@@ -3016,9 +3016,6 @@ class Scheduler(
         self.forward_ct += 1
         self.profiler_manager._profile_batch_predicate(batch)
 
-        # Capture prefill start time
-        set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
-
         num_layers = self.model_config.num_hidden_layers
         page_size = self.token_to_kv_pool_allocator.page_size
 
