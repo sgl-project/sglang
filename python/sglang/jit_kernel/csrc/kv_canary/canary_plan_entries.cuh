@@ -21,7 +21,6 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <cassert>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -96,10 +95,20 @@ __global__ void plan_entries_persistent_kernel(
   }
 
   // Contract: offsets kernel sets verify_enable=0 iff total_verify > verify_capacity, so reaching
-  // here means total_verify <= verify_capacity. Assert the invariant — silent OOB scatter into
-  // out_verify_*[verify_capacity] would corrupt adjacent device memory and surface much later as
-  // a non-canary failure (e.g. CUBLAS_STATUS_EXECUTION_FAILED in a downstream kernel).
-  assert(total_verify <= params.verify_capacity);
+  // here means total_verify <= verify_capacity. Trap the invariant in release builds too (jit_kernel
+  // may compile with -DNDEBUG, which neuters cassert) — silent OOB scatter into
+  // out_verify_*[verify_capacity] would corrupt adjacent device memory and surface much later as a
+  // non-canary failure (e.g. CUBLAS_STATUS_EXECUTION_FAILED in a downstream kernel).
+  if (total_verify > params.verify_capacity) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      printf(
+          "kv-canary plan_entries: total_verify=%lld exceeds verify_capacity=%lld with "
+          "verify_enable=1 (offsets/entries contract broken)\n",
+          static_cast<long long>(total_verify),
+          static_cast<long long>(params.verify_capacity));
+    }
+    __trap();
+  }
 
   const int64_t tid_start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
