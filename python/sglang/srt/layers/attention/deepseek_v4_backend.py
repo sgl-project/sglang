@@ -1058,12 +1058,19 @@ class DeepseekV4AttnBackend(
                     is_dsa_prefill_cp_round_robin_split,
                 )
 
-                if is_dsa_prefill_cp_round_robin_split():
-                    cp_positions = core_attn_metadata.positions_casual
-                    if (
-                        forward_batch.batch_size != 1
-                        or cp_positions.shape[0] != q.shape[0]
-                    ):
+                if forward_batch.extend_seq_lens_cpu is None:
+                    use_sparse_prefill = False
+                else:
+                    sparse_num_qo_tokens = sum(forward_batch.extend_seq_lens_cpu)
+                    if is_dsa_prefill_cp_round_robin_split():
+                        cp_positions = core_attn_metadata.positions_casual
+                        sparse_num_qo_tokens = cp_positions.shape[0]
+                        if (
+                            forward_batch.batch_size != 1
+                            or sparse_num_qo_tokens != q.shape[0]
+                        ):
+                            use_sparse_prefill = False
+                    elif sparse_num_qo_tokens != q.shape[0]:
                         use_sparse_prefill = False
 
             if use_sparse_prefill:
