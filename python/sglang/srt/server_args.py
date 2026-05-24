@@ -3669,26 +3669,14 @@ class ServerArgs:
             raise ValueError(f"{arg_name} must be a JSON object")
         return data
 
-    def _normalize_g2plus_endpoint_map(
-        self, value: object, field_name: str
-    ) -> Optional[Union[str, Dict[str, str]]]:
+    def _normalize_g2plus_endpoint(self, value: object, field_name: str) -> Optional[str]:
         if value is None:
             return None
         if isinstance(value, str):
             if not value.strip():
                 raise ValueError(f"{field_name} must be non-empty")
-            return value
-        if not isinstance(value, dict):
-            raise ValueError(f"{field_name} must be a string or JSON object")
-        normalized: Dict[str, str] = {}
-        for key, endpoint in value.items():
-            if not isinstance(endpoint, str) or not endpoint.strip():
-                raise ValueError(
-                    f"{field_name} values must be non-empty strings; "
-                    f"got {endpoint!r} for {key!r}"
-                )
-            normalized[str(key)] = endpoint
-        return normalized
+            return value.strip()
+        raise ValueError(f"{field_name} must be a non-empty string")
 
     def _handle_router_kv_reuse(self):
         """Normalize router-directed HiCache reuse knobs."""
@@ -3708,11 +3696,19 @@ class ServerArgs:
             return
 
         config: Dict[str, Any] = dict(raw_config)
-        if "peer_endpoints" in config:
+        if any(
+            key in config
+            for key in (
+                "endpoint",
+                "peer_endpoints",
+                "static_peer_endpoints",
+                "http_control",
+            )
+        ):
             raise ValueError(
-                "g2plus_config.peer_endpoints is not supported for production "
-                "control-plane discovery; use http_control.static_peer_endpoints "
-                "only for standalone HTTP tests"
+                "g2plus_config static endpoint maps are not supported; put the "
+                "local bind endpoint under control.endpoint and let the router "
+                "provide source_endpoint per plan"
             )
         if "fetch_workers" in config:
             raise ValueError(
@@ -3728,14 +3724,14 @@ class ServerArgs:
         control_config = config.get("control") or {}
         if not isinstance(control_config, dict):
             raise ValueError("g2plus_config.control must be a JSON object")
-        if "workers" in control_config:
+        if any(
+            key in control_config
+            for key in ("workers", "peer_endpoints", "static_peer_endpoints")
+        ):
             raise ValueError(
-                "g2plus_config.control.workers is not supported; use "
-                "SGLANG_G2PLUS_FETCH_WORKERS"
+                "g2plus_config.control static worker maps are not supported; "
+                "use router-provided source_endpoint per plan"
             )
-        http_control = config.get("http_control") or {}
-        if not isinstance(http_control, dict):
-            raise ValueError("g2plus_config.http_control must be a JSON object")
         transfer_config = config.get("transfer") or {}
         if not isinstance(transfer_config, dict):
             raise ValueError("g2plus_config.transfer must be a JSON object")
@@ -3760,14 +3756,11 @@ class ServerArgs:
             raise ValueError("g2plus_config.worker_id must be a non-negative integer")
 
         control_backend = str(
-            config.get(
-                "control_backend",
-                control_config.get("backend", "http" if http_control else "dynamo"),
-            )
+            config.get("control_backend", control_config.get("backend", "dynamo"))
         ).lower()
-        if control_backend not in {"dynamo", "http"}:
+        if control_backend != "dynamo":
             raise ValueError(
-                "g2plus_config.control.backend must be one of ['dynamo', 'http'], "
+                "g2plus_config.control.backend must be 'dynamo', "
                 f"got {control_backend!r}"
             )
 
@@ -3794,18 +3787,10 @@ class ServerArgs:
         self.g2plus_config = {
             "worker_id": worker_id,
             "control_backend": control_backend,
-            "http_control": {
-                "endpoint": self._normalize_g2plus_endpoint_map(
-                    http_control.get("endpoint", config.get("endpoint")),
-                    "g2plus_config.http_control.endpoint",
-                ),
-                "static_peer_endpoints": self._normalize_g2plus_endpoint_map(
-                    http_control.get(
-                        "static_peer_endpoints", config.get("static_peer_endpoints")
-                    ),
-                    "g2plus_config.http_control.static_peer_endpoints",
-                ),
-            },
+            "control_endpoint": self._normalize_g2plus_endpoint(
+                control_config.get("endpoint", config.get("control_endpoint")),
+                "g2plus_config.control.endpoint",
+            ),
             "timeout_secs": timeout_secs,
             "transfer_backend": transfer_backend,
         }
@@ -6658,13 +6643,19 @@ class ServerArgs:
             help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
+            "--enable-router-kv-reuse",
+            action="store_true",
+            default=ServerArgs.enable_router_kv_reuse,
+            help=argparse.SUPPRESS,
+        )
+        parser.add_argument(
             "--g2plus-config",
             type=str,
             default=ServerArgs.g2plus_config,
             help=(
                 "JSON object or JSON file path for G2plus router-directed remote "
                 "G2(host-pinned)->G1(GPU) KV reuse. Keys: worker_id, control, "
-                "http_control, transfer, timeout_secs, transfer_backend. Runtime "
+                "transfer, timeout_secs, transfer_backend. Runtime "
                 "parallelism is controlled by SGLANG_G2PLUS_* env vars."
             ),
         )

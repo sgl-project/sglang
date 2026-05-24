@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import atexit
-import base64
 import json
 import logging
 import socket
@@ -25,7 +24,6 @@ from sglang.srt.mem_cache.g2plus_transfer import (
     g2plus_config,
     g2plus_config_value,
     g2plus_timeout_secs,
-    g2plus_transfer_backend_name,
     make_g2plus_transfer_backend,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
@@ -129,6 +127,7 @@ class RemoteKvReusePlan:
     target_dp_rank: int
     source_worker_id: int
     source_dp_rank: int
+    source_endpoint: Optional[str]
     source_tier: str
     block_hashes: tuple[int, ...]
     planned_prefix_blocks: int
@@ -184,6 +183,17 @@ class RemoteKvReusePlan:
         if start_block_index < 0:
             raise ValueError("start_block_index must be non-negative")
 
+        source_endpoint = _first_present(
+            data,
+            "source_endpoint",
+            "source_control_endpoint",
+            default=None,
+        )
+        if source_endpoint is not None:
+            if not isinstance(source_endpoint, str) or not source_endpoint.strip():
+                raise ValueError("source_endpoint must be a non-empty string")
+            source_endpoint = _normalize_endpoint(source_endpoint)
+
         try:
             return cls(
                 plan_id=str(_first_present(data, "plan_id", default="")),
@@ -202,6 +212,7 @@ class RemoteKvReusePlan:
                     _first_present(data, "source_dp_rank", default=0),
                     "source_dp_rank",
                 ),
+                source_endpoint=source_endpoint,
                 source_tier=str(
                     _first_present(data, "source_tier", default="host_pinned")
                 ),
@@ -285,17 +296,6 @@ class _RemoteG2PendingFetch:
 def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
     tensor = tensor.detach().cpu().contiguous()
     return tensor.view(torch.uint8).numpy().tobytes()
-
-
-def _tensor_from_bytes(
-    raw: bytes, dtype: torch.dtype, expected_numel: int
-) -> torch.Tensor:
-    tensor = torch.frombuffer(bytearray(raw), dtype=dtype)
-    if tensor.numel() != expected_numel:
-        raise ValueError(
-            f"remote host page has {tensor.numel()} elements, expected {expected_numel}"
-        )
-    return tensor
 
 
 def _iter_tree_nodes(root: TreeNode) -> Iterable[TreeNode]:
@@ -573,53 +573,33 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "g2plus_config.endpoint values must be non-empty strings; "
+                "g2plus_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
     if not isinstance(endpoint_spec, str):
-        raise ValueError("g2plus_config.endpoint must be a string or JSON object")
+        raise ValueError(
+            "g2plus_config.control.endpoint must be a string or JSON object"
+        )
     spec = endpoint_spec.strip()
     if not spec:
         return None
     if spec.startswith("{"):
         endpoints = json.loads(spec)
         if not isinstance(endpoints, Mapping):
-            raise ValueError("g2plus_config.endpoint must be a JSON object")
+            raise ValueError("g2plus_config.control.endpoint must be a JSON object")
         endpoint = endpoints.get(str(dp_rank))
         if endpoint is None:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "g2plus_config.endpoint values must be non-empty strings; "
+                "g2plus_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
     if "{dp_rank}" in spec:
         spec = spec.format(dp_rank=dp_rank)
     return _normalize_endpoint(spec)
-
-
-def _parse_peer_endpoints(peer_endpoints: object) -> Dict[str, str]:
-    if not peer_endpoints:
-        return {}
-    if isinstance(peer_endpoints, Mapping):
-        raw = peer_endpoints
-    elif isinstance(peer_endpoints, str):
-        raw = json.loads(peer_endpoints)
-    else:
-        raise ValueError("g2plus_config.peer_endpoints must be a JSON object")
-    if not isinstance(raw, Mapping):
-        raise ValueError("g2plus_config.peer_endpoints must be a JSON object")
-    parsed: Dict[str, str] = {}
-    for key, endpoint in raw.items():
-        if not isinstance(endpoint, str) or not endpoint.strip():
-            raise ValueError(
-                "g2plus_config.peer_endpoints values must be non-empty strings; "
-                f"got {endpoint!r} for {key!r}"
-            )
-        parsed[str(key)] = _normalize_endpoint(endpoint)
-    return parsed
 
 
 class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -677,10 +657,9 @@ class RemoteG2ReuseHandler:
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
         self.control_backend = str(
-            g2plus_config_value(server_args, "control_backend", "http")
+            g2plus_config_value(server_args, "control_backend", "dynamo")
         ).lower()
-        self.allow_http_staging = g2plus_transfer_backend_name(server_args) == "http"
-        if not self._direct_transfer_enabled() and not self.allow_http_staging:
+        if not self._direct_transfer_enabled():
             diagnostic_suffix = ""
             if direct_transfer_diagnostics:
                 diagnostic_suffix = (
@@ -691,30 +670,18 @@ class RemoteG2ReuseHandler:
                 "is available; remote KV reuse plans will be treated as cache misses.%s",
                 diagnostic_suffix,
             )
-        http_control = g2plus_config_value(server_args, "http_control", {}) or {}
-        if not isinstance(http_control, Mapping):
-            http_control = {}
-        endpoint_spec = http_control.get(
-            "endpoint", getattr(server_args, "g2plus_endpoint", None)
-        )
-        static_peer_endpoints = http_control.get(
-            "static_peer_endpoints",
-            getattr(server_args, "g2plus_peer_endpoints", None),
+        endpoint_spec = g2plus_config_value(
+            server_args,
+            "control_endpoint",
+            None,
         )
         self.endpoint = _select_dp_endpoint(endpoint_spec, dp_rank)
-        self.static_peer_endpoints = _parse_peer_endpoints(static_peer_endpoints)
         self._source_server: Optional[ThreadingHTTPServer] = None
         self._source_thread: Optional[threading.Thread] = None
         self._shutdown = False
         worker_limit = max(
             1,
-            int(
-                getattr(
-                    server_args,
-                    "g2plus_fetch_workers",
-                    envs.SGLANG_G2PLUS_FETCH_WORKERS.get(),
-                )
-            ),
+            int(envs.SGLANG_G2PLUS_FETCH_WORKERS.get()),
         )
         self._source_activity_lock = threading.Lock()
         self._active_source_resolver_ops = 0
@@ -890,17 +857,6 @@ class RemoteG2ReuseHandler:
         finally:
             self._release_fetch_worker()
 
-    def _submit_fetch_worker(self, fn, *args, **kwargs) -> Optional[Future]:
-        if not self._try_acquire_fetch_worker():
-            return None
-        try:
-            future = self._fetch_executor.submit(fn, *args, **kwargs)
-        except Exception:
-            self._release_fetch_worker()
-            raise
-        future.add_done_callback(self._on_fetch_worker_done)
-        return future
-
     def _start_source_resolver(self) -> None:
         host, port = _endpoint_to_bind(self.endpoint)
         manager = self
@@ -1049,26 +1005,6 @@ class RemoteG2ReuseHandler:
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _write_binary(
-                self,
-                status_code: int,
-                response: Mapping[str, Any],
-                pages: list[ResolvedHostPage],
-            ):
-                metadata = json.dumps(response).encode("utf-8")
-                metadata_len = len(metadata).to_bytes(8, byteorder="little")
-                data_len = sum(len(page.data) for page in pages)
-                self.send_response(status_code)
-                self.send_header(
-                    "Content-Type", "application/vnd.sglang.remote-g2-pages"
-                )
-                self.send_header("Content-Length", str(8 + len(metadata) + data_len))
-                self.end_headers()
-                self.wfile.write(metadata_len)
-                self.wfile.write(metadata)
-                for page in pages:
-                    self.wfile.write(page.data)
-
         self._source_server = _ReusableThreadingHTTPServer((host, port), Handler)
         self._source_thread = threading.Thread(
             target=self._source_server.serve_forever,
@@ -1171,11 +1107,6 @@ class RemoteG2ReuseHandler:
         self._release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
-    def _endpoint_for_plan(self, plan: RemoteKvReusePlan) -> Optional[str]:
-        for endpoint in self._candidate_endpoints_for_plan(plan):
-            return endpoint
-        return None
-
     def _candidate_endpoints_for_plan(self, plan: RemoteKvReusePlan) -> list[str]:
         endpoints: list[str] = []
 
@@ -1183,124 +1114,8 @@ class RemoteG2ReuseHandler:
             if endpoint and endpoint not in endpoints:
                 endpoints.append(endpoint)
 
-        endpoint = self.static_peer_endpoints.get(
-            f"{plan.source_worker_id}:{plan.source_dp_rank}"
-        )
-        add(endpoint)
-        add(self.static_peer_endpoints.get(str(plan.source_worker_id)))
-        if (
-            self.worker_id == plan.source_worker_id
-            and self.dp_rank == plan.source_dp_rank
-            and self.endpoint is not None
-        ):
-            add(self.endpoint)
-        for endpoint in self.static_peer_endpoints.values():
-            add(endpoint)
+        add(plan.source_endpoint)
         return endpoints
-
-    def _fetch_pages(
-        self, plan: RemoteKvReusePlan, *, start_block: int, max_blocks: int
-    ) -> tuple[list[ResolvedHostPage], str]:
-        endpoints = self._candidate_endpoints_for_plan(plan)
-        if not endpoints:
-            return [], "missing_source_endpoint"
-
-        body = json.dumps(
-            {
-                "plan": plan.to_dict(),
-                "start_block": start_block,
-                "max_blocks": max_blocks,
-            }
-        ).encode("utf-8")
-        last_reason = "missing_source_endpoint"
-        for endpoint in endpoints:
-            try:
-                pages, reason = self._fetch_pages_binary_from_endpoint(endpoint, body)
-                if pages or reason in {"ok", "already_local"}:
-                    return pages, reason
-                last_reason = reason
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as err:
-                last_reason = f"source_request_failed:{err}"
-            except Exception as err:
-                last_reason = f"source_binary_decode_failed:{err}"
-
-            try:
-                pages, reason = self._fetch_pages_json_from_endpoint(endpoint, body)
-            except (urllib.error.URLError, TimeoutError) as err:
-                last_reason = f"source_request_failed:{err}"
-                continue
-
-            last_reason = reason
-            if pages or last_reason in {"ok", "already_local"}:
-                return pages, last_reason
-
-        return [], last_reason
-
-    def _fetch_pages_json_from_endpoint(
-        self, endpoint: str, body: bytes
-    ) -> tuple[list[ResolvedHostPage], str]:
-        request = urllib.request.Request(
-            f"{endpoint}/resolve",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_secs) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-
-        reason = str(payload.get("reason", "ok"))
-        if not payload.get("ok"):
-            return [], reason
-
-        return (
-            [
-                ResolvedHostPage(
-                    block_hash=int(page["block_hash"]),
-                    hash_value=str(page["hash_value"]),
-                    data=base64.b64decode(page["data_b64"]),
-                )
-                for page in payload.get("pages", [])
-            ],
-            reason,
-        )
-
-    def _fetch_pages_binary_from_endpoint(
-        self, endpoint: str, body: bytes
-    ) -> tuple[list[ResolvedHostPage], str]:
-        request = urllib.request.Request(
-            f"{endpoint}/resolve_binary",
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout_secs) as response:
-            metadata_len_raw = response.read(8)
-            if len(metadata_len_raw) != 8:
-                raise ValueError("binary remote G2 response missing metadata header")
-            metadata_len = int.from_bytes(metadata_len_raw, byteorder="little")
-            payload = json.loads(response.read(metadata_len).decode("utf-8"))
-
-            reason = str(payload.get("reason", "ok"))
-            if not payload.get("ok"):
-                return [], reason
-
-            pages: list[ResolvedHostPage] = []
-            for page in payload.get("pages", []):
-                byte_length = int(page["byte_length"])
-                data = response.read(byte_length)
-                if len(data) != byte_length:
-                    raise ValueError(
-                        "binary remote G2 page truncated: "
-                        f"got {len(data)} bytes, expected {byte_length}"
-                    )
-                pages.append(
-                    ResolvedHostPage(
-                        block_hash=int(page["block_hash"]),
-                        hash_value=str(page["hash_value"]),
-                        data=data,
-                    )
-                )
-            return pages, reason
 
     def _pages_from_direct_transfer_payload(
         self,
@@ -2002,11 +1817,6 @@ class RemoteG2ReuseHandler:
             return
         self._free_device_indices(device_indices)
 
-    def _submit_fetch(
-        self, plan: RemoteKvReusePlan, *, start_block: int, max_blocks: int
-    ) -> Optional[Future]:
-        return None
-
     def _submit_direct_transfer(
         self,
         plan: RemoteKvReusePlan,
@@ -2365,17 +2175,24 @@ class RemoteG2ReuseHandler:
 
         insert_start = time.perf_counter()
         try:
-            if pending.device_indices is not None:
-                staged_tokens = self._insert_device_pages(
-                    req,
-                    pages,
-                    device_indices=pending.device_indices,
-                    start_block=pending.target_start_block,
+            if pending.device_indices is None:
+                logger.warning(
+                    "Remote G2 direct transfer completed without target device indices"
                 )
-            else:
-                staged_tokens = self._insert_pages(
-                    req, pages, start_block=pending.target_start_block
+                self._finished_plan_keys.add(self._plan_key(req, plan))
+                self._observe_reuse(
+                    backend=pending.backend,
+                    outcome="error",
+                    reason="missing_target_device_indices",
+                    wait_ms=self._pending_wait_ms(pending),
                 )
+                return RouterKVReuseResult()
+            staged_tokens = self._insert_device_pages(
+                req,
+                pages,
+                device_indices=pending.device_indices,
+                start_block=pending.target_start_block,
+            )
         except Exception:
             insert_ms = (time.perf_counter() - insert_start) * 1000
             logger.exception(
@@ -2426,63 +2243,6 @@ class RemoteG2ReuseHandler:
             transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
         )
         return RouterKVReuseResult(staged_tokens=staged_tokens)
-
-    def _insert_pages(
-        self, req: "Req", pages: list[ResolvedHostPage], *, start_block: int
-    ) -> int:
-        page_size = self.tree_cache.page_size
-        token_count = len(pages) * page_size
-        token_start = start_block * page_size
-        token_end = token_start + token_count
-        if token_end > len(req.fill_ids):
-            token_count = ((len(req.fill_ids) - token_start) // page_size) * page_size
-            pages = pages[: token_count // page_size]
-            token_end = token_start + token_count
-        if token_count <= 0:
-            return 0
-
-        host_pool = self.tree_cache.cache_controller.mem_pool_host
-        host_indices = host_pool.alloc(token_count)
-        if host_indices is None:
-            self.tree_cache.evict_host(token_count)
-            host_indices = host_pool.alloc(token_count)
-        if host_indices is None:
-            logger.warning("Remote G2 failed to allocate %d host tokens", token_count)
-            return 0
-
-        try:
-            expected_numel = host_pool.get_dummy_flat_data_page().numel()
-            for page_idx, page in enumerate(pages):
-                page_tensor = _tensor_from_bytes(
-                    page.data, host_pool.dtype, expected_numel
-                )
-                page_start = int(host_indices[page_idx * page_size].item())
-                host_pool.set_from_flat_data_page(page_start, page_tensor)
-
-            parent = req.last_host_node if req.host_hit_length > 0 else req.last_node
-            if parent is None:
-                parent = self.tree_cache.root_node
-
-            key = RadixKey(
-                req.fill_ids[token_start:token_end],
-                extra_key=req.extra_key,
-                is_bigram=self.tree_cache.is_eagle,
-            )
-            matched_length = self.tree_cache._insert_helper_host(
-                parent,
-                key,
-                host_indices[:token_count],
-                [page.hash_value for page in pages],
-            )
-            if matched_length > 0:
-                host_pool.free(host_indices[:matched_length])
-            staged_tokens = token_count - matched_length
-            if staged_tokens <= 0:
-                return 0
-            return staged_tokens
-        except Exception:
-            host_pool.free(host_indices)
-            raise
 
     def _insert_device_pages(
         self,

@@ -101,11 +101,6 @@ def g2plus_timeout_secs(server_args, default: float = 1.0) -> float:
     return float(g2plus_config_value(server_args, "timeout_secs", default))
 
 
-def g2plus_transfer_parallelism(server_args) -> Optional[int]:
-    legacy_value = getattr(server_args, "g2plus_transfer_parallelism", None)
-    return None if legacy_value is None else int(legacy_value)
-
-
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     host_pool = tree_cache.cache_controller.mem_pool_host
     if getattr(host_pool, "layout", None) != "layer_first":
@@ -386,7 +381,6 @@ class MooncakeG2plusTransferBackend:
                 target_kv_ptrs=target_kv_ptrs,
                 target_kv_item_lens=target_kv_item_lens,
                 target_registered=True,
-                transfer_parallelism=g2plus_transfer_parallelism(server_args),
             )
             transfer._register_source_host_pool()
             if transfer.enabled:
@@ -699,7 +693,6 @@ class NixlG2plusTransferBackend:
                 gpu_id=scheduler.gpu_id,
                 timeout_secs=g2plus_timeout_secs(server_args),
                 backend_name=backend_name,
-                transfer_parallelism=g2plus_transfer_parallelism(server_args),
             )
             transfer._register_target_device_pool()
             transfer._register_source_host_pool()
@@ -991,8 +984,6 @@ def make_g2plus_transfer_backend(
     scheduler, diagnostics: Optional[list[str]] = None
 ) -> Optional[G2plusTransferBackend]:
     backend = g2plus_transfer_backend_name(scheduler.server_args)
-    if backend == "http":
-        return None
     topology_rejection = _direct_topology_rejection(scheduler)
     if topology_rejection is not None:
         if backend in {"mooncake", "nixl"}:
