@@ -43,7 +43,6 @@ def _get_vllm_ops():
     """Lazy-load vllm._custom_ops to avoid crash on incompatible vllm builds."""
     global ops, _vllm_ops_loaded
     if not _vllm_ops_loaded:
-        _vllm_ops_loaded = True
         try:
             from vllm import _custom_ops as _ops
 
@@ -54,6 +53,7 @@ def _get_vllm_ops():
             # RuntimeError: custom ops initialization failed.
             # Catching bare Exception would mask programming errors.
             ops = None
+        _vllm_ops_loaded = True
     return ops
 
 
