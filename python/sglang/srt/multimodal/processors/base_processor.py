@@ -1080,28 +1080,53 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items from processor output. Initially creates one item per modality;
-        these are later split into per-image/video items by get_new_expanded_mm_items.
+        Create mm_items from processor output.
 
-        Note that the data_dict can be passed via offline engine api
+        Initially creates one item per modality; these are later split into per-image/video items by get_new_expanded_mm_items.
+
+        Note that the data_dict can be hf processor output, or passed via offline engine api
+
+        Args:
+            modality: if provided, force the data into a single MultimodalDataItem of that modality
         """
+
+        # universal getter for data_dict
+        get_data_value = (
+            data_dict.get
+            if hasattr(data_dict, "get")
+            else lambda name, default=None: getattr(data_dict, name, default)
+        )
+
+        # decide explicitly-set modality
+        explicit_modality = modality
+        modality_value = get_data_value("modality")
+        if explicit_modality is None and modality_value is not None:
+            explicit_modality = (
+                modality_value
+                if isinstance(modality_value, Modality)
+                else Modality.from_str(str(modality_value))
+            )
 
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
-            if attr_name == "input_ids":
+            if attr_name in (
+                "input_ids",
+                "format",
+                "modality",
+                "hash",
+                "pad_value",
+                "offsets",
+            ):
+                # metadata fields need explicit handling, skip generic item.set
                 continue
 
             # Get modality for this attribute
-            current_modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
+            current_modality = explicit_modality or self.ATTR_NAME_TO_MODALITY.get(
+                attr_name
+            )
 
             if attr_name == "precomputed_embeddings":
-                modality_str = data_dict.get("modality")
-                current_modality = Modality.IMAGE
-                if modality_str:
-                    try:
-                        current_modality = Modality.from_str(modality_str)
-                    except ValueError:
-                        pass
+                current_modality = current_modality or Modality.IMAGE
 
             if current_modality:
                 # Create item if needed
@@ -1114,6 +1139,30 @@ class BaseMultimodalProcessor(ABC):
                     attr_name = "feature"
 
                 items[current_modality].set(attr_name, value)
+
+        # deal with metadata fields when data_dict is preprocessed input: convert from tensor to expected python types
+        # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
+        if len(items) == 1:
+            item = next(iter(items.values()))
+
+            # adjust offset
+            offsets = get_data_value("offsets")
+            if offsets is not None:
+                if isinstance(offsets, torch.Tensor):
+                    offsets = offsets.detach().cpu().tolist()
+                item.offsets = [(int(start), int(end)) for start, end in offsets]
+
+            # adjust hash_value
+            hash_value = get_data_value("hash")
+            if hash_value is not None:
+                if isinstance(hash_value, torch.Tensor):
+                    hash_value = hash_value.item()
+                item.hash = int(hash_value)
+                pad_value = get_data_value("pad_value")
+                if pad_value is not None:
+                    if isinstance(pad_value, torch.Tensor):
+                        pad_value = pad_value.item()
+                    item.pad_value = int(pad_value)
 
         return list(items.values())
 
@@ -1240,6 +1289,8 @@ class BaseMultimodalProcessor(ABC):
 
         # Add offsets to all items
         for mm_item in all_collected_items:
+            if mm_item.offsets is not None:
+                continue
             mm_token_id = mm_tokens.get_token_id_by_modality(mm_item.modality)
             if mm_token_id is None:
                 raise ValueError(f"No token id found for modality: {mm_item.modality}")
