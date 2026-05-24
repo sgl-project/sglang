@@ -118,6 +118,17 @@ def test_dsv4_index_cache_rejects_short_layer_indexed_pattern():
         get_index_cache_policy(config, 4, 4)
 
 
+def test_dsv4_index_cache_rejects_layer_indexed_pattern_shorter_than_first_c4():
+    config = SimpleNamespace(
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
+        index_topk_freq=1,
+        index_topk_pattern="F",
+    )
+
+    with pytest.raises(ValueError, match="does not cover first C4 layer"):
+        get_index_cache_policy(config, 2, 4)
+
+
 def test_dsv4_index_cache_rejects_invalid_pattern_entries():
     config = SimpleNamespace(
         compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],

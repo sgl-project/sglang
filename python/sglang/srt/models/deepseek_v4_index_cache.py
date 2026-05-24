@@ -157,8 +157,8 @@ def get_index_cache_policy(
 
     if index_topk_pattern is not None:
         _validate_index_topk_pattern(index_topk_pattern)
-        _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
         if len(index_topk_pattern) == len(c4_layer_ids):
+            _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
             skip_topk = index_topk_pattern[c4_index] == "S"
             next_skip_topk = (
                 c4_index < len(index_topk_pattern) - 1
@@ -166,6 +166,11 @@ def get_index_cache_policy(
             )
             return skip_topk, next_skip_topk
 
+        if c4_layer_ids[0] >= len(index_topk_pattern):
+            raise ValueError(
+                f"index_topk_pattern length {len(index_topk_pattern)} "
+                f"does not cover first C4 layer {c4_layer_ids[0]}"
+            )
         if layer_id >= len(index_topk_pattern):
             raise ValueError(
                 f"index_topk_pattern length {len(index_topk_pattern)} "
@@ -176,6 +181,7 @@ def get_index_cache_policy(
                 f"index_topk_pattern length {len(index_topk_pattern)} "
                 f"does not cover next C4 layer {next_c4_layer_id}"
             )
+        _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
         skip_topk = index_topk_pattern[layer_id] == "S"
         next_skip_topk = (
             next_c4_layer_id is not None and index_topk_pattern[next_c4_layer_id] == "S"
