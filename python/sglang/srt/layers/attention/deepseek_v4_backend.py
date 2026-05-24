@@ -1058,11 +1058,13 @@ class DeepseekV4AttnBackend(
                     is_dsa_prefill_cp_round_robin_split,
                 )
 
-                if (
-                    is_dsa_prefill_cp_round_robin_split()
-                    and forward_batch.batch_size != 1
-                ):
-                    use_sparse_prefill = False
+                if is_dsa_prefill_cp_round_robin_split():
+                    cp_positions = core_attn_metadata.positions_casual
+                    if (
+                        forward_batch.batch_size != 1
+                        or cp_positions.shape[0] != q.shape[0]
+                    ):
+                        use_sparse_prefill = False
 
             if use_sparse_prefill:
                 return self._forward_prefill_sparse(
@@ -1130,14 +1132,15 @@ class DeepseekV4AttnBackend(
             local_extend_seq_lens = None
             positions = None
             from sglang.srt.layers.attention.dsa.utils import (
-                dsa_use_prefill_cp,
                 is_dsa_prefill_cp_round_robin_split,
             )
 
-            if dsa_use_prefill_cp(
-                forward_batch
-            ) and is_dsa_prefill_cp_round_robin_split():
+            if (
+                forward_batch.attn_cp_metadata is not None
+                and is_dsa_prefill_cp_round_robin_split()
+            ):
                 assert seq_lens.numel() == 1
+                assert core_attn_metadata.positions_casual.shape[0] == q_flat.shape[0]
                 local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
                 positions = core_attn_metadata.positions_casual.to(torch.int32)
 
