@@ -3,6 +3,8 @@ import sys
 from argparse import Namespace
 from pathlib import Path
 
+import pytest
+
 
 def _load_workflow_module():
     path = (
@@ -38,6 +40,8 @@ def _args(tmp_path: Path) -> Namespace:
         eval_num_threads=64,
         eval_max_tokens=32768,
         output_dir=tmp_path / "out",
+        dry_run=False,
+        eagle_off_confirmed=True,
     )
 
 
@@ -60,3 +64,31 @@ def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp
     assert "reasoning" in cmd
     assert "mmlu" not in cmd
     assert "gsm8k" not in cmd
+
+
+def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profile(
+    tmp_path,
+):
+    cmd = workflow.profile_cmd(_args(tmp_path))
+
+    assert "--eagle-off-confirmed" in cmd
+
+
+def test_dsv4_index_cache_validation_workflow_requires_eagle_off_for_real_runs(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.eagle_off_confirmed = False
+
+    with pytest.raises(SystemExit, match="--eagle-off-confirmed"):
+        workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confirmation(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.dry_run = True
+    args.eagle_off_confirmed = False
+
+    workflow.validate_args(args)

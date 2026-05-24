@@ -1,7 +1,10 @@
 import importlib.util
 import json
 import sys
+from argparse import Namespace
 from pathlib import Path
+
+import pytest
 
 
 def _load_profile_driver_module():
@@ -39,3 +42,16 @@ def test_dsv4_index_cache_profile_driver_finds_and_summarizes_traces(tmp_path):
     summary = profile_driver.summarize_trace(traces[0])
     assert summary["categories"]["csa_indexer"]["total_ms"] == 1.0
     assert summary["cuda_graph_paths"] == {"decode.replay": 1}
+
+
+def test_dsv4_index_cache_profile_driver_requires_eagle_off_for_real_runs():
+    args = Namespace(dry_run=False, eagle_off_confirmed=False)
+
+    with pytest.raises(SystemExit, match="--eagle-off-confirmed"):
+        profile_driver.validate_args(args)
+
+
+def test_dsv4_index_cache_profile_driver_allows_dry_run_without_eagle_confirmation():
+    args = Namespace(dry_run=True, eagle_off_confirmed=False)
+
+    profile_driver.validate_args(args)

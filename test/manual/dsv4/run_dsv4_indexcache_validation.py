@@ -34,7 +34,7 @@ def run_command(cmd: list[str], timeout: int, dry_run: bool) -> dict:
 
 
 def profile_cmd(args) -> list[str]:
-    return [
+    cmd = [
         sys.executable,
         script_path("profile_dsv4_indexcache_endpoint.py"),
         "--endpoint",
@@ -52,6 +52,9 @@ def profile_cmd(args) -> list[str]:
         "--output",
         str(args.output_dir / "profile.json"),
     ]
+    if args.eagle_off_confirmed:
+        cmd.append("--eagle-off-confirmed")
+    return cmd
 
 
 def search_cmd(args) -> list[str]:
@@ -101,6 +104,14 @@ def eval_cmd(args) -> list[str]:
     ]
 
 
+def validate_args(args) -> None:
+    if not args.dry_run and not args.eagle_off_confirmed:
+        raise SystemExit(
+            "--eagle-off-confirmed is required for real validation runs; "
+            "speculative decoding must be disabled until base path validation passes"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-endpoint", required=True)
@@ -121,7 +132,9 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=86400)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--eagle-off-confirmed", action="store_true")
     args = parser.parse_args()
+    validate_args(args)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     commands = [
@@ -139,7 +152,11 @@ def main() -> None:
             break
 
     summary = {
-        "eagle": "off only; do not use this workflow with speculative decoding enabled",
+        "eagle": (
+            "confirmed off"
+            if args.eagle_off_confirmed
+            else "dry run; speculative decoding not exercised"
+        ),
         "uniform_1_4": "not run; only searched 1/4 is generated",
         "phases": results,
     }

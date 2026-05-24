@@ -103,6 +103,14 @@ def find_trace_files(profile_dir: Path, profile_prefix: str) -> list[Path]:
     return sorted(set(traces))
 
 
+def validate_args(args) -> None:
+    if not args.dry_run and not args.eagle_off_confirmed:
+        raise SystemExit(
+            "--eagle-off-confirmed is required for real profile runs; "
+            "speculative decoding must be disabled for base-path validation"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
@@ -120,7 +128,9 @@ def main() -> None:
     parser.add_argument("--seed", default="dsv4-indexcache-profile")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--eagle-off-confirmed", action="store_true")
     args = parser.parse_args()
+    validate_args(args)
 
     args.profile_dir.mkdir(parents=True, exist_ok=True)
     if args.dry_run:
@@ -136,7 +146,11 @@ def main() -> None:
         "request_results": request_results,
         "trace_files": [str(path) for path in trace_files],
         "trace_summaries": [summarize_trace(path) for path in trace_files],
-        "eagle": "not tested by this driver; keep speculative decoding disabled",
+        "eagle": (
+            "confirmed off"
+            if args.eagle_off_confirmed
+            else "dry run; speculative decoding not exercised"
+        ),
     }
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
