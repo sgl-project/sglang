@@ -42,7 +42,7 @@ from sglang.srt.utils import is_cuda
 _is_cuda = is_cuda()
 
 if _is_cuda:
-    from sgl_kernel import concat_mla_absorb_q
+    from sglang.jit_kernel.concat_mla import concat_mla_absorb_q
 
 
 # When num_kv_heads=1, we have tensors with degenerate strides,
