@@ -10,7 +10,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import requests
 
@@ -111,15 +111,21 @@ def run_candidate(
             proc.wait(timeout=60)
 
 
-def search(args) -> list[dict]:
-    texts = load_calibration_texts(args.calibration_jsonl, args.limit)
-    pattern = ["F"] * args.num_c4_layers
-    protected = protected_c4_indices(args.num_c4_layers, args.pp_block_c4_layers)
-    target_f = target_f_layers(args.num_c4_layers, args.retention)
+def greedy_search_pattern(
+    num_c4_layers: int,
+    retention: str,
+    pp_block_c4_layers: int,
+    score_pattern: Callable[[str], float],
+) -> list[dict]:
+    pattern = ["F"] * num_c4_layers
+    protected = protected_c4_indices(num_c4_layers, pp_block_c4_layers)
+    target_f = target_f_layers(num_c4_layers, retention)
     history = []
 
     while pattern.count("F") > target_f:
-        candidates = [i for i, v in enumerate(pattern) if v == "F" and i not in protected]
+        candidates = [
+            i for i, v in enumerate(pattern) if v == "F" and i not in protected
+        ]
         if not candidates:
             raise RuntimeError("no candidate F layers left to flip")
 
@@ -128,14 +134,7 @@ def search(args) -> list[dict]:
             candidate = pattern.copy()
             candidate[idx] = "S"
             candidate_str = pattern_to_str(candidate)
-            loss = run_candidate(
-                args.command_template,
-                args.endpoint,
-                candidate_str,
-                args.startup_timeout,
-                texts,
-                args.request_timeout,
-            )
+            loss = score_pattern(candidate_str)
             scored.append((loss, idx, candidate_str))
             print(json.dumps({"candidate": candidate_str, "flip": idx, "loss": loss}))
 
@@ -148,13 +147,40 @@ def search(args) -> list[dict]:
     return history
 
 
+def search(args, retention: str) -> list[dict]:
+    texts = load_calibration_texts(args.calibration_jsonl, args.limit)
+
+    def score_pattern(pattern: str) -> float:
+        return run_candidate(
+            args.command_template,
+            args.endpoint,
+            pattern,
+            args.startup_timeout,
+            texts,
+            args.request_timeout,
+        )
+
+    return greedy_search_pattern(
+        args.num_c4_layers,
+        retention,
+        args.pp_block_c4_layers,
+        score_pattern,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--calibration-jsonl", type=Path, required=True)
     parser.add_argument("--endpoint", required=True)
     parser.add_argument("--command-template")
     parser.add_argument("--num-c4-layers", type=int, required=True)
-    parser.add_argument("--retention", choices=["1/2", "1/4"], required=True)
+    parser.add_argument(
+        "--retention",
+        action="append",
+        choices=["1/2", "1/4"],
+        required=True,
+        help="Target retention. Repeat to search both 1/2 and 1/4.",
+    )
     parser.add_argument("--pp-block-c4-layers", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--startup-timeout", type=int, default=900)
@@ -162,8 +188,12 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
-    history = search(args)
-    result = {"retention": args.retention, "history": history}
+    result = {
+        "retentions": {
+            retention: {"history": search(args, retention)}
+            for retention in args.retention
+        }
+    }
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result))
