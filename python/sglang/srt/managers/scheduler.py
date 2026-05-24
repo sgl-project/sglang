@@ -1744,6 +1744,8 @@ class Scheduler(
 
     @staticmethod
     def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
+        """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
+        if absent, call pad_input_ids_func"""
         padded_input_ids = image_inputs.padded_input_ids
         if padded_input_ids is None or recv_req.input_ids is None:
             return False
