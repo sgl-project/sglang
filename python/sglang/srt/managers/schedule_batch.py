@@ -511,13 +511,13 @@ class MultimodalInputs:
                     reconstruct_device = torch.cuda.current_device()
                 mm_item.reconstruct(reconstruct_device)
 
-        ret = MultimodalInputs(
+        mm_inputs = MultimodalInputs(
             mm_items=mm_items,
             padded_input_ids=obj.padded_input_ids,
         )
 
-        assert isinstance(ret.mm_items, list)
-        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+        assert isinstance(mm_inputs.mm_items, list)
+        mm_inputs.mm_items = [item for item in mm_inputs.mm_items if item.is_valid()]
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -534,16 +534,16 @@ class MultimodalInputs:
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
+            for item in mm_inputs.mm_items:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
-        for item in ret.mm_items:
+        for item in mm_inputs.mm_items:
             item.set_pad_value()
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
+            for item in mm_inputs.mm_items:
                 if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
 
@@ -566,9 +566,9 @@ class MultimodalInputs:
         for arg in optional_args:
             val = getattr(obj, arg, None)
             if val is not None:
-                setattr(ret, arg, val)
+                setattr(mm_inputs, arg, val)
 
-        return ret
+        return mm_inputs
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
