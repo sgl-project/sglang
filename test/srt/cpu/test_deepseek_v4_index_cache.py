@@ -67,18 +67,6 @@ def test_dsv4_index_cache_accepts_c4_indexed_pattern():
     assert get_index_cache_policy(config, 6, 4) == (False, False)
 
 
-def test_dsv4_index_cache_accepts_layer_indexed_pattern():
-    config = SimpleNamespace(
-        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
-        index_topk_freq=1,
-        index_topk_pattern="FFFFSFFF",
-    )
-
-    assert get_index_cache_policy(config, 2, 4) == (False, True)
-    assert get_index_cache_policy(config, 4, 4) == (True, False)
-    assert get_index_cache_policy(config, 6, 4) == (False, False)
-
-
 def test_dsv4_index_cache_ignores_nextn_and_non_c4_layers():
     config = SimpleNamespace(
         compress_ratios=[0, 0, 4, 128, 4],
@@ -104,28 +92,14 @@ def test_dsv4_index_cache_policy_allows_hisa():
     assert get_index_cache_policy(config, 4, 4) == (True, False)
 
 
-def test_dsv4_index_cache_rejects_short_layer_indexed_pattern():
+def test_dsv4_index_cache_rejects_wrong_length_pattern():
     config = SimpleNamespace(
         compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
         index_topk_freq=1,
         index_topk_pattern="FFFF",
     )
 
-    with pytest.raises(ValueError, match="does not cover next C4 layer"):
-        get_index_cache_policy(config, 2, 4)
-
-    with pytest.raises(ValueError, match="does not cover C4 layer"):
-        get_index_cache_policy(config, 4, 4)
-
-
-def test_dsv4_index_cache_rejects_layer_indexed_pattern_shorter_than_first_c4():
-    config = SimpleNamespace(
-        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
-        index_topk_freq=1,
-        index_topk_pattern="F",
-    )
-
-    with pytest.raises(ValueError, match="does not cover first C4 layer"):
+    with pytest.raises(ValueError, match="must match the number of C4 layers"):
         get_index_cache_policy(config, 2, 4)
 
 
@@ -145,17 +119,6 @@ def test_dsv4_index_cache_rejects_c4_indexed_pattern_that_skips_first_c4():
         compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
         index_topk_freq=1,
         index_topk_pattern="SFF",
-    )
-
-    with pytest.raises(ValueError, match="first C4 layer as F"):
-        get_index_cache_policy(config, 2, 4)
-
-
-def test_dsv4_index_cache_rejects_layer_indexed_pattern_that_skips_first_c4():
-    config = SimpleNamespace(
-        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
-        index_topk_freq=1,
-        index_topk_pattern="FFSFFFFF",
     )
 
     with pytest.raises(ValueError, match="first C4 layer as F"):

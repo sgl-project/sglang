@@ -176,14 +176,16 @@ def _validate_index_topk_pattern(index_topk_pattern: str) -> None:
         )
 
 
-def _validate_first_c4_layer_is_full(
+def _validate_c4_indexed_pattern(
     index_topk_pattern: str, c4_layer_ids: list[int]
 ) -> None:
-    if len(index_topk_pattern) == len(c4_layer_ids):
-        first_c4_entry = index_topk_pattern[0]
-    else:
-        first_c4_entry = index_topk_pattern[c4_layer_ids[0]]
-    if first_c4_entry != "F":
+    _validate_index_topk_pattern(index_topk_pattern)
+    if len(index_topk_pattern) != len(c4_layer_ids):
+        raise ValueError(
+            f"index_topk_pattern length {len(index_topk_pattern)} must match "
+            f"the number of C4 layers {len(c4_layer_ids)}"
+        )
+    if index_topk_pattern[0] != "F":
         raise ValueError("index_topk_pattern must keep the first C4 layer as F")
 
 
@@ -201,9 +203,6 @@ def get_index_cache_policy(
         c4_index = c4_layer_ids.index(layer_id)
     except ValueError:
         return None, None
-    next_c4_layer_id = (
-        c4_layer_ids[c4_index + 1] if c4_index < len(c4_layer_ids) - 1 else None
-    )
 
     index_topk_pattern = getattr(config, "index_topk_pattern", None)
     index_topk_freq = getattr(config, "index_topk_freq", 1)
@@ -211,35 +210,11 @@ def get_index_cache_policy(
         return None, None
 
     if index_topk_pattern is not None:
-        _validate_index_topk_pattern(index_topk_pattern)
-        if len(index_topk_pattern) == len(c4_layer_ids):
-            _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
-            skip_topk = index_topk_pattern[c4_index] == "S"
-            next_skip_topk = (
-                c4_index < len(index_topk_pattern) - 1
-                and index_topk_pattern[c4_index + 1] == "S"
-            )
-            return skip_topk, next_skip_topk
-
-        if c4_layer_ids[0] >= len(index_topk_pattern):
-            raise ValueError(
-                f"index_topk_pattern length {len(index_topk_pattern)} "
-                f"does not cover first C4 layer {c4_layer_ids[0]}"
-            )
-        if layer_id >= len(index_topk_pattern):
-            raise ValueError(
-                f"index_topk_pattern length {len(index_topk_pattern)} "
-                f"does not cover C4 layer {layer_id}"
-            )
-        if next_c4_layer_id is not None and next_c4_layer_id >= len(index_topk_pattern):
-            raise ValueError(
-                f"index_topk_pattern length {len(index_topk_pattern)} "
-                f"does not cover next C4 layer {next_c4_layer_id}"
-            )
-        _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
-        skip_topk = index_topk_pattern[layer_id] == "S"
+        _validate_c4_indexed_pattern(index_topk_pattern, c4_layer_ids)
+        skip_topk = index_topk_pattern[c4_index] == "S"
         next_skip_topk = (
-            next_c4_layer_id is not None and index_topk_pattern[next_c4_layer_id] == "S"
+            c4_index < len(index_topk_pattern) - 1
+            and index_topk_pattern[c4_index + 1] == "S"
         )
         return skip_topk, next_skip_topk
 
