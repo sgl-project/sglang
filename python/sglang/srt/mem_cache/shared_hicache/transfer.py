@@ -9,12 +9,12 @@ from typing import Any, Mapping, Optional, Protocol
 import numpy as np
 
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.environ import default_remote_g2_transfer_parallelism
+from sglang.srt.environ import default_shared_hicache_transfer_parallelism
 
 logger = logging.getLogger(__name__)
 
 
-class RemoteG2TransferBackend(Protocol):
+class SharedHiCacheTransferBackend(Protocol):
     name: str
     target_session_id: str
     target_kv_ptrs: list[int]
@@ -43,7 +43,7 @@ def _target_kv_infos_from_scheduler(scheduler):
     target_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     if hasattr(target_pool, "full_kv_pool") and hasattr(target_pool, "full_layer_nums"):
         raise RuntimeError(
-            "RemoteG2 direct transfer does not support hybrid linear-attention KV pools"
+            "SharedHiCache direct transfer does not support hybrid linear-attention KV pools"
         )
     return target_pool.get_contiguous_buf_infos()
 
@@ -63,34 +63,51 @@ def _direct_topology_rejection(scheduler) -> Optional[str]:
     if not unsupported:
         return None
     return (
-        "RemoteG2 direct transfer V0 supports only tp_size=1, pp_size=1, "
+        "SharedHiCache direct transfer V0 supports only tp_size=1, pp_size=1, "
         f"and attn_cp_size=1; got {', '.join(unsupported)}"
     )
 
 
-def remote_g2_config(server_args) -> Mapping[str, Any]:
-    config = getattr(server_args, "remote_g2_config", None)
+def shared_hicache_config(server_args) -> Mapping[str, Any]:
+    config = getattr(server_args, "shared_hicache_config", None)
     return config if isinstance(config, Mapping) else {}
 
 
-def remote_g2_config_value(server_args, key: str, default=None):
-    config = remote_g2_config(server_args)
+def shared_hicache_config_value(server_args, key: str, default=None):
+    config = shared_hicache_config(server_args)
     return config.get(key, default)
 
 
-def remote_g2_transfer_backend_name(server_args, default: str = "auto") -> str:
-    return str(remote_g2_config_value(server_args, "transfer_backend", default)).lower()
+def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> str:
+    return str(shared_hicache_config_value(server_args, "transfer_backend", default)).lower()
 
 
-def remote_g2_timeout_secs(server_args, default: float = 1.0) -> float:
-    return float(remote_g2_config_value(server_args, "timeout_secs", default))
+def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
+    return float(shared_hicache_config_value(server_args, "timeout_secs", default))
+
+
+def _get_or_init_mooncake_transfer_engine(scheduler):
+    from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+        get_mooncake_transfer_engine,
+        init_mooncake_transfer_engine,
+    )
+    from sglang.srt.utils.network import get_local_ip_auto
+
+    engine = get_mooncake_transfer_engine()
+    if engine is not None:
+        return engine
+    return init_mooncake_transfer_engine(
+        get_local_ip_auto(),
+        gpu_id=scheduler.gpu_id,
+        ib_device=scheduler.server_args.mooncake_ib_device,
+    )
 
 
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     host_pool = tree_cache.cache_controller.mem_pool_host
     if getattr(host_pool, "layout", None) != "layer_first":
         raise RuntimeError(
-            "RemoteG2 direct transfer requires layer_first host layout, "
+            "SharedHiCache direct transfer requires layer_first host layout, "
             f"got {getattr(host_pool, 'layout', None)!r}"
         )
 
@@ -99,7 +116,7 @@ def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     elif hasattr(host_pool, "data_refs"):
         refs = host_pool.data_refs
     else:
-        raise RuntimeError("Unsupported HiCache host pool for RemoteG2 direct transfer")
+        raise RuntimeError("Unsupported HiCache host pool for SharedHiCache direct transfer")
 
     page_size = tree_cache.page_size
     ptrs = [int(ref.data_ptr()) for ref in refs]
@@ -125,73 +142,6 @@ def _validate_kv_item_lens_match(
             "KV item length mismatch: "
             f"source={int(src_item_lens[idx])} target={int(dst_item_lens[idx])}"
         )
-
-
-def _mooncake_ib_device(engine) -> Optional[str]:
-    get_ib_device = getattr(engine, "get_ib_device", None)
-    if callable(get_ib_device):
-        ib_device = get_ib_device()
-    else:
-        ib_device = getattr(engine, "ib_device", None)
-    if ib_device is None:
-        return None
-    ib_device = str(ib_device).strip()
-    return ib_device or None
-
-
-def _mooncake_protocol(engine) -> str:
-    get_protocol = getattr(engine, "get_protocol", None)
-    if callable(get_protocol):
-        protocol = get_protocol()
-    else:
-        protocol = getattr(engine, "protocol", None)
-    if protocol is None:
-        return "rdma"
-    protocol = str(protocol).strip().lower()
-    return protocol or "rdma"
-
-
-def _mooncake_path_hint(protocol: str, ib_device: Optional[str]) -> str:
-    if protocol == "rdma":
-        return (
-            "explicit_ib_device"
-            if ib_device is not None
-            else "no_explicit_ib_device"
-        )
-    return protocol
-
-
-def _mooncake_register_regions(
-    engine, ptrs: list[int], lengths: list[int]
-) -> tuple[bool, str]:
-    ptrs = [int(ptr) for ptr in ptrs]
-    lengths = [int(length) for length in lengths]
-    if len(ptrs) != len(lengths):
-        return (
-            False,
-            f"registration_length_mismatch:ptrs={len(ptrs)}:lengths={len(lengths)}",
-        )
-
-    # Mooncake 0.3.10 can return success from batch_register_memory even when
-    # individual CUDA registrations fail. Prefer the scalar API when available
-    # so RemoteG2 does not advertise a target whose GPU KV addresses are absent
-    # from Mooncake's segment descriptor.
-    underlying_engine = getattr(engine, "engine", None)
-    register_memory = getattr(underlying_engine, "register_memory", None)
-    if callable(register_memory):
-        for index, (ptr, length) in enumerate(zip(ptrs, lengths)):
-            try:
-                ret = int(register_memory(ptr, length))
-            except Exception as err:
-                return False, f"register_memory_exception:index={index}:error={err}"
-            if ret != 0:
-                return False, f"register_memory_failed:index={index}:ret={ret}"
-        return True, "ok"
-
-    ret = int(engine.batch_register(ptrs, lengths))
-    if ret != 0:
-        return False, f"batch_register_failed:ret={ret}"
-    return True, "ok"
 
 
 def _build_grouped_transfer_arrays(
@@ -238,8 +188,8 @@ def _build_grouped_transfer_arrays(
     return src_addrs, dst_addrs, lengths, len(src_blocks)
 
 
-class MooncakeRemoteG2TransferBackend:
-    """Mooncake-backed source-G2-host to target-G1-device transfer helper."""
+class MooncakeSharedHiCacheTransferBackend:
+    """Mooncake-backed source-HiCache-host to target-GPU-device transfer helper."""
 
     name = "mooncake"
 
@@ -261,61 +211,51 @@ class MooncakeRemoteG2TransferBackend:
         self._target_registered = bool(target_registered)
         self._source_registered = False
         self._source_registered_ptrs: list[int] = []
-        self.ib_device = _mooncake_ib_device(engine)
-        self.protocol = _mooncake_protocol(engine)
+        transport_info = engine.get_transport_info()
+        self.ib_device = transport_info.get("ib_device")
+        self.protocol = str(transport_info.get("protocol") or "rdma").lower()
+        self.path_hint = str(
+            transport_info.get("path_hint") or self.protocol
+        ).lower()
         if transfer_parallelism is None:
-            transfer_parallelism = default_remote_g2_transfer_parallelism()
+            transfer_parallelism = default_shared_hicache_transfer_parallelism()
         self._transfer_parallelism = max(1, int(transfer_parallelism))
         self._transfer_executor: Optional[ThreadPoolExecutor] = None
         self._transfer_executor_lock = threading.Lock()
         self._shutdown = False
 
     @classmethod
-    def from_scheduler(cls, scheduler) -> Optional["MooncakeRemoteG2TransferBackend"]:
+    def from_scheduler(cls, scheduler) -> Optional["MooncakeSharedHiCacheTransferBackend"]:
         server_args = scheduler.server_args
-        backend = remote_g2_transfer_backend_name(server_args)
+        backend = shared_hicache_transfer_backend_name(server_args)
         if backend not in {"auto", "mooncake"}:
             return None
         topology_rejection = _direct_topology_rejection(scheduler)
         if topology_rejection is not None:
             if backend == "mooncake":
                 logger.warning(
-                    "RemoteG2 Mooncake direct transfer disabled: %s",
+                    "SharedHiCache Mooncake direct transfer disabled: %s",
                     topology_rejection,
                 )
             else:
                 logger.debug(
-                    "RemoteG2 Mooncake direct transfer disabled: %s",
+                    "SharedHiCache Mooncake direct transfer disabled: %s",
                     topology_rejection,
                 )
             return None
 
         try:
-            from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-                init_mooncake_transfer_engine,
-            )
-            from sglang.srt.distributed.parallel_state import (
-                get_mooncake_transfer_engine,
-            )
-            from sglang.srt.utils.network import get_local_ip_auto
-
-            engine = get_mooncake_transfer_engine()
-            if engine is None:
-                engine = init_mooncake_transfer_engine(
-                    get_local_ip_auto(),
-                    gpu_id=scheduler.gpu_id,
-                    ib_device=server_args.mooncake_ib_device,
-                )
+            engine = _get_or_init_mooncake_transfer_engine(scheduler)
 
             target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
                 _target_kv_infos_from_scheduler(scheduler)
             )
-            registered, register_reason = _mooncake_register_regions(
-                engine, target_kv_ptrs, target_kv_lens
+            registered, register_reason = engine.register_regions_checked(
+                target_kv_ptrs, target_kv_lens
             )
             if not registered:
                 logger.warning(
-                    "RemoteG2 Mooncake disabled: target KV registration failed (%s)",
+                    "SharedHiCache Mooncake disabled: target KV registration failed (%s)",
                     register_reason,
                 )
                 return None
@@ -335,11 +275,11 @@ class MooncakeRemoteG2TransferBackend:
         except Exception:
             if backend == "mooncake":
                 logger.exception(
-                    "RemoteG2 Mooncake direct transfer initialization failed"
+                    "SharedHiCache Mooncake direct transfer initialization failed"
                 )
             else:
                 logger.debug(
-                    "RemoteG2 Mooncake direct transfer unavailable; using fallback",
+                    "SharedHiCache Mooncake direct transfer unavailable; using fallback",
                     exc_info=True,
                 )
             return None
@@ -355,16 +295,15 @@ class MooncakeRemoteG2TransferBackend:
             "transport": {
                 "protocol": self.protocol,
                 "ib_device": self.ib_device,
-                "path_hint": _mooncake_path_hint(self.protocol, self.ib_device),
+                "path_hint": self.path_hint,
                 "transfer_parallelism": self._transfer_parallelism,
             },
         }
 
     def _log_ready(self) -> None:
-        path_hint = _mooncake_path_hint(self.protocol, self.ib_device)
         if self.protocol == "rdma" and self.ib_device is None:
             logger.warning(
-                "RemoteG2 Mooncake direct transfer enabled session=%s "
+                "SharedHiCache Mooncake direct transfer enabled session=%s "
                 "protocol=rdma ib_device=<none> path_hint=no_explicit_ib_device "
                 "parallelism=%d; benchmark labels should not treat this as a "
                 "configured RDMA/GDR path",
@@ -373,12 +312,12 @@ class MooncakeRemoteG2TransferBackend:
             )
             return
         logger.info(
-            "RemoteG2 Mooncake direct transfer enabled session=%s protocol=%s "
+            "SharedHiCache Mooncake direct transfer enabled session=%s protocol=%s "
             "ib_device=%s path_hint=%s parallelism=%d",
             self.target_session_id,
             self.protocol,
             self.ib_device if self.ib_device is not None else "<none>",
-            path_hint,
+            self.path_hint,
             self._transfer_parallelism,
         )
 
@@ -386,13 +325,13 @@ class MooncakeRemoteG2TransferBackend:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
         if getattr(host_pool, "layout", None) != "layer_first":
             logger.info(
-                "RemoteG2 Mooncake direct transfer disabled for HiCache layout=%s; "
+                "SharedHiCache Mooncake direct transfer disabled for HiCache layout=%s; "
                 "source host pool must be layer_first",
                 getattr(host_pool, "layout", None),
             )
             return
         if not hasattr(host_pool, "kv_buffer"):
-            logger.info("RemoteG2 Mooncake direct transfer disabled: no host kv_buffer")
+            logger.info("SharedHiCache Mooncake direct transfer disabled: no host kv_buffer")
             return
         try:
             _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
@@ -400,14 +339,14 @@ class MooncakeRemoteG2TransferBackend:
                 source_kv_item_lens, self.target_kv_item_lens
             )
         except RuntimeError as err:
-            logger.info("RemoteG2 Mooncake direct transfer disabled: %s", err)
+            logger.info("SharedHiCache Mooncake direct transfer disabled: %s", err)
             return
-        registered, register_reason = _mooncake_register_regions(
-            self.engine, [host_pool.kv_buffer.data_ptr()], [host_pool.kv_buffer.nbytes]
+        registered, register_reason = self.engine.register_regions_checked(
+            [host_pool.kv_buffer.data_ptr()], [host_pool.kv_buffer.nbytes]
         )
         if not registered:
             logger.warning(
-                "RemoteG2 Mooncake direct transfer disabled: host registration failed (%s)",
+                "SharedHiCache Mooncake direct transfer disabled: host registration failed (%s)",
                 register_reason,
             )
             return
@@ -421,7 +360,7 @@ class MooncakeRemoteG2TransferBackend:
 
         # Keep Mooncake memory registrations process-lifetime, matching existing
         # Mooncake disagg/staging users of the shared transfer engine. The same
-        # pointer can be registered by multiple in-process features, and RemoteG2
+        # pointer can be registered by multiple in-process features, and SharedHiCache
         # cannot safely infer global ownership at scheduler shutdown.
         self._source_registered_ptrs = []
         self._source_registered = False
@@ -437,7 +376,7 @@ class MooncakeRemoteG2TransferBackend:
             if self._transfer_executor is None:
                 self._transfer_executor = ThreadPoolExecutor(
                     max_workers=self._transfer_parallelism,
-                    thread_name_prefix="remote_g2-mooncake-transfer",
+                    thread_name_prefix="shared_hicache-mooncake-transfer",
                 )
             return self._transfer_executor
 
@@ -516,7 +455,7 @@ class MooncakeRemoteG2TransferBackend:
             )
             transfer_ms = (time.perf_counter() - start) * 1000
             logger.debug(
-                "RemoteG2 Mooncake transferred blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
+                "SharedHiCache Mooncake transferred blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
                 num_blocks,
                 len(src_addrs),
                 int(lengths.sum()),
@@ -527,30 +466,30 @@ class MooncakeRemoteG2TransferBackend:
                 raise RuntimeError(f"Mooncake direct KV transfer failed with ret={ret}")
 
 
-def make_remote_g2_transfer_backend(scheduler) -> Optional[RemoteG2TransferBackend]:
-    backend = remote_g2_transfer_backend_name(scheduler.server_args)
+def make_shared_hicache_transfer_backend(scheduler) -> Optional[SharedHiCacheTransferBackend]:
+    backend = shared_hicache_transfer_backend_name(scheduler.server_args)
     topology_rejection = _direct_topology_rejection(scheduler)
     if topology_rejection is not None:
         if backend == "mooncake":
             raise RuntimeError(topology_rejection)
-        logger.warning("RemoteG2 direct transfer unavailable: %s", topology_rejection)
+        logger.warning("SharedHiCache direct transfer unavailable: %s", topology_rejection)
         return None
 
     if backend == "mooncake":
-        transfer = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
+        transfer = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
         if transfer is None:
             raise RuntimeError(
-                "RemoteG2 Mooncake transfer backend was requested but unavailable"
+                "SharedHiCache Mooncake transfer backend was requested but unavailable"
             )
         return transfer
 
     if backend != "auto":
         raise RuntimeError(
-            f"RemoteG2 transfer backend {backend!r} is not supported; "
+            f"SharedHiCache transfer backend {backend!r} is not supported; "
             "this path supports only 'mooncake'"
         )
 
-    transfer = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
+    transfer = MooncakeSharedHiCacheTransferBackend.from_scheduler(scheduler)
     if transfer is not None:
         return transfer
     return None

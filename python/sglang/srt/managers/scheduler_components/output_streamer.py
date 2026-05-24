@@ -62,23 +62,23 @@ class SchedulerOutputStreamer:
 
         Returns:
             - None if no cached tokens at all
-            - {"device": X, "host": Y} without storage or remote-G2 breakdown
-            - {"device": X, "host": Y, "remote_g2": R} with router remote-G2 reuse
+            - {"device": X, "host": Y} without storage or shared-hicache breakdown
+            - {"device": X, "host": Y, "shared_hicache": R} with Shared HiCache reuse
             - {"device": X, "host": Y, "storage": Z} with storage breakdown
         """
         if (
             req.cached_tokens_device > 0
             or req.cached_tokens_host > 0
             or req.cached_tokens_storage > 0
-            or getattr(req, "cached_tokens_remote_g2", 0) > 0
+            or getattr(req, "cached_tokens_shared_hicache", 0) > 0
         ):
             details = {
                 "device": req.cached_tokens_device,
                 "host": req.cached_tokens_host,
             }
-            remote_g2_tokens = getattr(req, "cached_tokens_remote_g2", 0)
-            if remote_g2_tokens > 0:
-                details["remote_g2"] = remote_g2_tokens
+            shared_hicache_tokens = getattr(req, "cached_tokens_shared_hicache", 0)
+            if shared_hicache_tokens > 0:
+                details["shared_hicache"] = shared_hicache_tokens
             # Only include storage fields if L3 storage is enabled
             if self.enable_hicache_storage():
                 details["storage"] = req.cached_tokens_storage

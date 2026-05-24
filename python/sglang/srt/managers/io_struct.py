@@ -215,8 +215,8 @@ class GenerateReqInput(BaseReq):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
-    # External RemoteG2 host-cache reuse metadata.
-    remote_g2_plan: Optional[Any] = None
+    # External SharedHiCache host-cache reuse metadata.
+    shared_hicache_plan: Optional[Any] = None
 
     # For background responses (OpenAI responses API)
     background: bool = False
@@ -408,7 +408,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
-        self._normalize_remote_g2_plan(self.batch_size)
+        self._normalize_shared_hicache_plan(self.batch_size)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -611,16 +611,16 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
-    def _normalize_remote_g2_plan(self, batch_size):
-        if self.remote_g2_plan is None:
-            self.remote_g2_plan = [None] * batch_size
-        elif isinstance(self.remote_g2_plan, list):
-            if len(self.remote_g2_plan) != batch_size:
+    def _normalize_shared_hicache_plan(self, batch_size):
+        if self.shared_hicache_plan is None:
+            self.shared_hicache_plan = [None] * batch_size
+        elif isinstance(self.shared_hicache_plan, list):
+            if len(self.shared_hicache_plan) != batch_size:
                 raise ValueError(
-                    "The length of remote_g2_plan should be equal to the batch size."
+                    "The length of shared_hicache_plan should be equal to the batch size."
                 )
         else:
-            self.remote_g2_plan = [self.remote_g2_plan] * batch_size
+            self.shared_hicache_plan = [self.shared_hicache_plan] * batch_size
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
@@ -702,10 +702,10 @@ class GenerateReqInput(BaseReq):
             ),
             routed_dp_rank=self.routed_dp_rank,
             disagg_prefill_dp_rank=self.disagg_prefill_dp_rank,
-            remote_g2_plan=(
-                self.remote_g2_plan[i]
-                if isinstance(self.remote_g2_plan, list)
-                else self.remote_g2_plan
+            shared_hicache_plan=(
+                self.shared_hicache_plan[i]
+                if isinstance(self.shared_hicache_plan, list)
+                else self.shared_hicache_plan
             ),
             conversation_id=self.conversation_id,
             priority=self.priority,
@@ -789,7 +789,7 @@ class TokenizedGenerateReqInput(BaseReq):
     routed_dp_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    remote_g2_plan: Optional[Any] = None
+    shared_hicache_plan: Optional[Any] = None
 
     # Priority for the request
     priority: Optional[int] = None

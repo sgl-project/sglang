@@ -108,11 +108,11 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
-        self.enable_remote_g2 = bool(
-            getattr(server_args, "enable_remote_g2", False)
+        self.enable_shared_hicache = bool(
+            getattr(server_args, "enable_shared_hicache", False)
         )
-        self.remote_g2_host_index_lock = threading.RLock()
-        self.remote_g2_host_block_index = {} if self.enable_remote_g2 else None
+        self.hicache_host_index_lock = threading.RLock()
+        self.hicache_host_block_index = {} if self.enable_shared_hicache else None
 
         (
             extra_config,
@@ -636,69 +636,71 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
-        if getattr(self, "remote_g2_host_block_index", None) is not None:
-            with self.remote_g2_host_index_lock:
-                self.remote_g2_host_block_index.clear()
+        if getattr(self, "hicache_host_block_index", None) is not None:
+            with self.hicache_host_index_lock:
+                self.hicache_host_block_index.clear()
         super().reset()
 
-    def _index_remote_g2_host_node(self, node: TreeNode) -> None:
-        if getattr(self, "remote_g2_host_block_index", None) is None:
+    def _index_hicache_host_node(self, node: TreeNode) -> None:
+        if getattr(self, "hicache_host_block_index", None) is None:
             return
         if node.host_value is None:
-            self._drop_remote_g2_host_node(node)
+            self._drop_hicache_host_node(node)
             return
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
 
         num_pages = min(len(node.hash_value), len(node.host_value) // self.page_size)
-        with self._remote_g2_index_lock():
-            self._drop_remote_g2_host_node(node, locked=True)
+        with self._hicache_host_index_lock():
+            self._drop_hicache_host_node(node, locked=True)
             for page_idx in range(num_pages):
                 hash_value = node.hash_value[page_idx]
                 block_hash = hash_str_to_int64(hash_value)
                 for alias in block_hash_aliases(block_hash):
-                    self.remote_g2_host_block_index[alias] = (
+                    self.hicache_host_block_index[alias] = (
                         node,
                         page_idx,
                         hash_value,
                     )
 
-    def _drop_remote_g2_host_node(
+    def _drop_hicache_host_node(
         self, node: TreeNode, *, locked: bool = False
     ) -> None:
-        if getattr(self, "remote_g2_host_block_index", None) is None:
+        if getattr(self, "hicache_host_block_index", None) is None:
             return
 
         def drop() -> None:
             stale = [
                 block_hash
-                for block_hash, entry in self.remote_g2_host_block_index.items()
+                for block_hash, entry in self.hicache_host_block_index.items()
                 if entry[0] is node
             ]
             for block_hash in stale:
-                self.remote_g2_host_block_index.pop(block_hash, None)
+                self.hicache_host_block_index.pop(block_hash, None)
 
         if locked:
             drop()
         else:
-            with self._remote_g2_index_lock():
+            with self._hicache_host_index_lock():
                 drop()
 
-    def lookup_remote_g2_host_blocks(
-        self, wanted_hashes: set[int]
-    ) -> dict[int, tuple[TreeNode, int, str]]:
-        if getattr(self, "remote_g2_host_block_index", None) is None:
-            return {}
+    def lookup_hicache_host_blocks(
+        self, wanted_hashes: set[int], *, protect: bool = False
+    ):
+        if getattr(self, "hicache_host_block_index", None) is None:
+            return ({}, []) if protect else {}
 
         matches: dict[int, tuple[TreeNode, int, str]] = {}
+        protected_nodes: list[TreeNode] = []
+        protected_ids: set[int] = set()
         wanted_aliases: set[int] = set()
         for block_hash in wanted_hashes:
             wanted_aliases.update(block_hash_aliases(block_hash))
 
         stale_aliases = []
-        with self._remote_g2_index_lock():
+        with self._hicache_host_index_lock():
             for alias in wanted_aliases:
-                entry = self.remote_g2_host_block_index.get(alias)
+                entry = self.hicache_host_block_index.get(alias)
                 if entry is None:
                     continue
                 node, page_idx, hash_value = entry
@@ -711,19 +713,30 @@ class HiRadixCache(RadixCache):
                 )
                 if valid:
                     matches[alias] = entry
+                    if protect and node.id not in protected_ids:
+                        node.protect_host()
+                        protected_nodes.append(node)
+                        protected_ids.add(node.id)
                 else:
                     stale_aliases.append(alias)
 
             for alias in stale_aliases:
-                self.remote_g2_host_block_index.pop(alias, None)
+                self.hicache_host_block_index.pop(alias, None)
+        if protect:
+            return matches, protected_nodes
         return matches
 
-    def _remote_g2_index_lock(self):
-        lock = getattr(self, "remote_g2_host_index_lock", None)
+    def _hicache_host_index_lock(self):
+        lock = getattr(self, "hicache_host_index_lock", None)
         if lock is None:
             lock = threading.RLock()
-            self.remote_g2_host_index_lock = lock
+            self.hicache_host_index_lock = lock
         return lock
+
+    def insert_shared_hicache_device_blocks(
+        self, *, key: RadixKey, value: torch.Tensor
+    ) -> InsertResult:
+        return self.insert(InsertParams(key=key, value=value))
 
     def get_height(self, node: TreeNode):
         height = 0
@@ -848,7 +861,7 @@ class HiRadixCache(RadixCache):
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
                         )
-                        self._index_remote_g2_host_node(backuped_node)
+                        self._index_hicache_host_node(backuped_node)
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -876,7 +889,7 @@ class HiRadixCache(RadixCache):
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self._index_remote_g2_host_node(backuped_node)
+                self._index_hicache_host_node(backuped_node)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -1047,6 +1060,7 @@ class HiRadixCache(RadixCache):
 
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
+            self._drop_hicache_host_node(x)
             self._record_remove_event(x, medium=StorageMedium.CPU)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
@@ -1443,6 +1457,7 @@ class HiRadixCache(RadixCache):
             # Publish the newly materialized host suffix immediately so downstream
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
+            self._index_hicache_host_node(new_node)
 
         return matched_length
 
@@ -1498,8 +1513,8 @@ class HiRadixCache(RadixCache):
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        self._index_remote_g2_host_node(new_node)
-        self._index_remote_g2_host_node(child)
+        self._index_hicache_host_node(new_node)
+        self._index_hicache_host_node(child)
 
         return new_node
 

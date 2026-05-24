@@ -551,52 +551,51 @@ class SchedulerMetricsCollector:
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
-            remote_g2_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
-            self.remote_g2_events_total = Counter(
-                name="sglang:remote_g2_events_total",
-                documentation="RemoteG2 KV reuse events by backend, outcome, and reason.",
-                labelnames=remote_g2_labels,
+            shared_hicache_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
+            self.shared_hicache_requests_total = Counter(
+                name="sglang:shared_hicache_requests_total",
+                documentation="Shared HiCache KV reuse requests by backend, outcome, and reason.",
+                labelnames=shared_hicache_labels,
             )
-            self.remote_g2_tokens_total = Counter(
-                name="sglang:remote_g2_tokens_total",
-                documentation="Tokens staged by RemoteG2 KV reuse by backend, outcome, and reason.",
-                labelnames=remote_g2_labels,
+            self.shared_hicache_tokens_total = Counter(
+                name="sglang:shared_hicache_tokens_total",
+                documentation="Tokens staged by Shared HiCache KV reuse by backend, outcome, and reason.",
+                labelnames=shared_hicache_labels,
             )
-            self.remote_g2_wait_ms = Histogram(
-                name="sglang:remote_g2_wait_ms",
-                documentation="Scheduler wait time for RemoteG2 KV reuse in ms.",
-                labelnames=remote_g2_labels,
-                buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+            self.shared_hicache_wait_seconds = Histogram(
+                name="sglang:shared_hicache_wait_seconds",
+                documentation="Scheduler wait time for Shared HiCache KV reuse in seconds.",
+                labelnames=shared_hicache_labels,
+                buckets=(0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5),
             )
-            self.remote_g2_insert_ms = Histogram(
-                name="sglang:remote_g2_insert_ms",
-                documentation="Scheduler cache insertion time for RemoteG2 KV reuse in ms.",
-                labelnames=remote_g2_labels,
-                buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100),
+            self.shared_hicache_insert_seconds = Histogram(
+                name="sglang:shared_hicache_insert_seconds",
+                documentation="Scheduler cache insertion time for Shared HiCache KV reuse in seconds.",
+                labelnames=shared_hicache_labels,
+                buckets=(0.00001, 0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.025, 0.05, 0.1),
             )
-            self.remote_g2_transfer_mb = Histogram(
-                name="sglang:remote_g2_transfer_mb",
-                documentation="RemoteG2 KV reuse transfer size in MB.",
-                labelnames=remote_g2_labels,
-                buckets=(0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000),
+            self.shared_hicache_transfer_bytes_total = Counter(
+                name="sglang:shared_hicache_transfer_bytes_total",
+                documentation="Shared HiCache KV reuse transfer bytes.",
+                labelnames=shared_hicache_labels,
             )
-            remote_g2_quarantine_labels = list(labels.keys()) + [
+            shared_hicache_quarantine_labels = list(labels.keys()) + [
                 "backend",
                 "reason",
             ]
-            self.remote_g2_quarantine_events_total = Counter(
-                name="sglang:remote_g2_quarantine_events_total",
-                documentation="RemoteG2 KV reuse target-page quarantine events.",
-                labelnames=remote_g2_quarantine_labels,
+            self.shared_hicache_quarantine_events_total = Counter(
+                name="sglang:shared_hicache_quarantine_events_total",
+                documentation="Shared HiCache KV reuse target-page quarantine events.",
+                labelnames=shared_hicache_quarantine_labels,
             )
-            self.remote_g2_quarantined_tokens_total = Counter(
-                name="sglang:remote_g2_quarantined_tokens_total",
-                documentation="Total target KV tokens quarantined by RemoteG2 KV reuse.",
-                labelnames=remote_g2_quarantine_labels,
+            self.shared_hicache_quarantined_tokens_total = Counter(
+                name="sglang:shared_hicache_quarantined_tokens_total",
+                documentation="Total target KV tokens quarantined by Shared HiCache KV reuse.",
+                labelnames=shared_hicache_quarantine_labels,
             )
-            self.remote_g2_quarantined_tokens = Gauge(
-                name="sglang:remote_g2_quarantined_tokens",
-                documentation="Current target KV tokens held out of the allocator after indeterminate RemoteG2 KV reuse transfers.",
+            self.shared_hicache_quarantined_tokens = Gauge(
+                name="sglang:shared_hicache_quarantined_tokens",
+                documentation="Current target KV tokens held out of the allocator after indeterminate Shared HiCache KV reuse transfers.",
                 labelnames=list(labels.keys()) + ["backend"],
                 multiprocess_mode="mostrecent",
             )
@@ -1102,7 +1101,7 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
-    def observe_remote_g2(
+    def observe_shared_hicache(
         self,
         *,
         backend: str,
@@ -1113,8 +1112,8 @@ class SchedulerMetricsCollector:
         insert_ms: Optional[float] = None,
         transfer_bytes: Optional[int] = None,
     ) -> None:
-        events_total = getattr(self, "remote_g2_events_total", None)
-        if events_total is None:
+        requests_total = getattr(self, "shared_hicache_requests_total", None)
+        if requests_total is None:
             return
 
         labels = {
@@ -1123,19 +1122,24 @@ class SchedulerMetricsCollector:
             "outcome": outcome,
             "reason": reason,
         }
-        events_total.labels(**labels).inc(1)
+        requests_total.labels(**labels).inc(1)
 
         if tokens > 0:
-            self.remote_g2_tokens_total.labels(**labels).inc(tokens)
+            self.shared_hicache_tokens_total.labels(**labels).inc(tokens)
         if wait_ms is not None:
-            self.remote_g2_wait_ms.labels(**labels).observe(float(wait_ms))
+            self.shared_hicache_wait_seconds.labels(**labels).observe(
+                float(wait_ms) / 1000
+            )
         if insert_ms is not None:
-            self.remote_g2_insert_ms.labels(**labels).observe(float(insert_ms))
+            self.shared_hicache_insert_seconds.labels(**labels).observe(
+                float(insert_ms) / 1000
+            )
         if transfer_bytes is not None:
-            transfer_mb = max(0.0, float(transfer_bytes) / (1024 * 1024))
-            self.remote_g2_transfer_mb.labels(**labels).observe(transfer_mb)
+            self.shared_hicache_transfer_bytes_total.labels(**labels).inc(
+                max(0, int(transfer_bytes))
+            )
 
-    def observe_remote_g2_quarantine(
+    def observe_shared_hicache_quarantine(
         self,
         *,
         backend: str,
@@ -1144,9 +1148,9 @@ class SchedulerMetricsCollector:
         current_tokens: int,
     ) -> None:
         events_total = getattr(
-            self, "remote_g2_quarantine_events_total", None
+            self, "shared_hicache_quarantine_events_total", None
         )
-        current_gauge = getattr(self, "remote_g2_quarantined_tokens", None)
+        current_gauge = getattr(self, "shared_hicache_quarantined_tokens", None)
         if events_total is None or current_gauge is None:
             return
 
@@ -1161,7 +1165,7 @@ class SchedulerMetricsCollector:
         }
         if tokens > 0:
             events_total.labels(**event_labels).inc(1)
-            self.remote_g2_quarantined_tokens_total.labels(
+            self.shared_hicache_quarantined_tokens_total.labels(
                 **event_labels
             ).inc(tokens)
         current_gauge.labels(**gauge_labels).set(max(0, int(current_tokens)))
@@ -1526,7 +1530,7 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens by source (device/host/remote_g2/storage).",
+            documentation="Number of cached prompt tokens by source (device/host/shared_hicache/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
@@ -1679,7 +1683,7 @@ class TokenizerMetricsCollector:
                 report_cache_source("device", cached_tokens_details.get("device", 0))
                 report_cache_source("host", cached_tokens_details.get("host", 0))
                 report_cache_source(
-                    "remote_g2", cached_tokens_details.get("remote_g2", 0)
+                    "shared_hicache", cached_tokens_details.get("shared_hicache", 0)
                 )
 
                 # Storage fields are only present when L3 storage backend is enabled

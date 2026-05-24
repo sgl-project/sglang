@@ -6,7 +6,7 @@ from enum import IntEnum
 from typing import Any, Optional
 
 
-REMOTE_G2_DEFAULT_TRANSFER_PARALLELISM = 4
+SHARED_HICACHE_DEFAULT_TRANSFER_PARALLELISM = 4
 
 
 @contextmanager
@@ -341,8 +341,8 @@ class Envs:
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
-    SGLANG_REMOTE_G2_FETCH_WORKERS = EnvInt(4)
-    SGLANG_REMOTE_G2_TRANSFER_PARALLELISM = EnvInt(None)
+    SGLANG_SHARED_HICACHE_FETCH_WORKERS = EnvInt(4)
+    SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM = EnvInt(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -726,10 +726,10 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def default_remote_g2_transfer_parallelism() -> int:
-    value = envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.get()
+def default_shared_hicache_transfer_parallelism() -> int:
+    value = envs.SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM.get()
     if value is None:
-        value = REMOTE_G2_DEFAULT_TRANSFER_PARALLELISM
+        value = SHARED_HICACHE_DEFAULT_TRANSFER_PARALLELISM
     return max(1, int(value))
 
 

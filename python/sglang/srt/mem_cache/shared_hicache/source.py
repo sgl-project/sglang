@@ -2,25 +2,19 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.remote_g2.transfer import RemoteG2TransferBackend
+from sglang.srt.mem_cache.shared_hicache.transfer import SharedHiCacheTransferBackend
 from sglang.srt.mem_cache.radix_cache import TreeNode
-from sglang.srt.mem_cache.remote_g2.plan import (
-    REMOTE_G2_DIRECT_TIMEOUT_REASON,
-    RemoteG2Plan,
-    expand_block_hash_aliases,
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SharedHiCachePlan,
 )
-from sglang.srt.mem_cache.utils import (
-    block_hash_aliases,
-    compute_node_hash_values,
-    hash_str_to_int64,
-)
+from sglang.srt.mem_cache.utils import block_hash_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -44,56 +38,29 @@ def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
     return tensor.view(torch.uint8).numpy().tobytes()
 
 
-def _iter_tree_nodes(root: TreeNode) -> Iterable[TreeNode]:
-    stack = list(root.children.values())
-    while stack:
-        node = stack.pop()
-        yield node
-        stack.extend(node.children.values())
-
-
-def _build_host_block_index(
+def _lookup_hicache_host_blocks(
     tree_cache, wanted_hashes: set[int]
-) -> Dict[int, tuple[TreeNode, int, str]]:
-    lookup_index = getattr(tree_cache, "lookup_remote_g2_host_blocks", None)
-    if lookup_index is not None:
-        index = lookup_index(wanted_hashes)
-        if len(index) >= len(wanted_hashes):
-            return index
-        if getattr(tree_cache, "remote_g2_host_block_index", None) is not None:
-            return index
-        wanted_hashes = wanted_hashes - set(index.keys())
-    else:
-        index: Dict[int, tuple[TreeNode, int, str]] = {}
-
-    wanted_hashes = expand_block_hash_aliases(wanted_hashes)
-    page_size = tree_cache.page_size
-    for node in _iter_tree_nodes(tree_cache.root_node):
-        if node.host_value is None:
-            continue
-        if node.hash_value is None:
-            node.hash_value = compute_node_hash_values(node, page_size)
-
-        num_pages = min(len(node.hash_value), len(node.host_value) // page_size)
-        for page_idx in range(num_pages):
-            hash_value = node.hash_value[page_idx]
-            block_hash = hash_str_to_int64(hash_value)
-            for alias in block_hash_aliases(block_hash):
-                if alias in wanted_hashes and alias not in index:
-                    index[alias] = (node, page_idx, hash_value)
-        if len(index) >= len(wanted_hashes):
-            break
-    return index
+) -> tuple[dict[int, tuple[TreeNode, int, str]], list[TreeNode], Optional[str]]:
+    lookup_index = getattr(tree_cache, "lookup_hicache_host_blocks", None)
+    if not callable(lookup_index):
+        return {}, [], "hicache_host_lookup_unavailable"
+    lookup_result = lookup_index(wanted_hashes, protect=True)
+    if not isinstance(lookup_result, tuple) or len(lookup_result) != 2:
+        return {}, [], "malformed_hicache_host_lookup"
+    index, protected_nodes = lookup_result
+    if not isinstance(index, dict):
+        return {}, list(protected_nodes or []), "malformed_hicache_host_lookup"
+    return index, list(protected_nodes or []), None
 
 
-def _host_lookup_guard(tree_cache):
-    return getattr(tree_cache, "remote_g2_host_index_lock", nullcontext())
-
-
-def _flush_hicache_write_through_acks(tree_cache) -> None:
-    flush = getattr(tree_cache, "flush_write_through_acks", None)
-    if callable(flush):
-        flush()
+def _host_block_entry(
+    block_index: Mapping[int, tuple[TreeNode, int, str]], block_hash: int
+) -> Optional[tuple[TreeNode, int, str]]:
+    for alias in block_hash_aliases(block_hash):
+        entry = block_index.get(alias)
+        if entry is not None:
+            return entry
+    return None
 
 
 def _host_page_start_indices(
@@ -119,7 +86,7 @@ def _host_page_start_indices(
 
 def resolve_host_pages(
     tree_cache,
-    plan: RemoteG2Plan,
+    plan: SharedHiCachePlan,
     *,
     start_block: int,
     max_blocks: int,
@@ -154,7 +121,7 @@ def resolve_host_pages(
 
 def resolve_host_page_locations(
     tree_cache,
-    plan: RemoteG2Plan,
+    plan: SharedHiCachePlan,
     *,
     start_block: int,
     max_blocks: int,
@@ -169,8 +136,8 @@ def resolve_host_page_locations(
         return [], "wrong_source_dp_rank", []
     if plan.is_expired():
         return [], "plan_expired", []
-    if not plan.is_remote_g2():
-        return [], "unsupported_source_tier", []
+    if not plan.is_shared_hicache():
+        return [], "unsupported_source_medium", []
     if plan.block_size_tokens != tree_cache.page_size:
         return [], "incompatible_block_size", []
 
@@ -185,41 +152,39 @@ def resolve_host_page_locations(
     requested_identity_hashes = identity_hashes[start_block : start_block + max_blocks]
     requested_kv_hashes = kv_hashes[start_block : start_block + max_blocks]
     entries: list[tuple[int, str, TreeNode, int]] = []
-    protected_nodes: list[TreeNode] = []
-    protected_ids: set[int] = set()
-    _flush_hicache_write_through_acks(tree_cache)
-    with _host_lookup_guard(tree_cache):
-        block_index = _build_host_block_index(
-            tree_cache, set(requested_kv_hashes)
-        )
-        reason = "ok"
-        for identity_hash, kv_hash in zip(
-            requested_identity_hashes, requested_kv_hashes
-        ):
-            entry = block_index.get(kv_hash)
-            if entry is None:
-                reason = "partial" if entries else "missing_first_block"
-                break
-            node, page_idx, hash_value = entry
-            if node.id not in protected_ids:
-                node.protect_host()
-                protected_nodes.append(node)
-                protected_ids.add(node.id)
-            entries.append((identity_hash, hash_value, node, page_idx))
+    block_index, protected_nodes, lookup_error = _lookup_hicache_host_blocks(
+        tree_cache, set(requested_kv_hashes)
+    )
+    if lookup_error is not None:
+        return [], lookup_error, protected_nodes
 
-        pages = [
-            ResolvedHostPageLocation(
-                block_hash=identity_hash,
-                hash_value=hash_value,
-                host_index=host_index,
-            )
-            for (identity_hash, hash_value, _, _), host_index in zip(
-                entries,
-                _host_page_start_indices(entries, tree_cache.page_size),
-            )
-        ]
-        if reason != "ok":
-            return pages, reason, protected_nodes
+    protected_ids = {node.id for node in protected_nodes}
+    reason = "ok"
+    for identity_hash, kv_hash in zip(requested_identity_hashes, requested_kv_hashes):
+        entry = _host_block_entry(block_index, kv_hash)
+        if entry is None:
+            reason = "partial" if entries else "missing_first_block"
+            break
+        node, page_idx, hash_value = entry
+        if node.id not in protected_ids:
+            node.protect_host()
+            protected_nodes.append(node)
+            protected_ids.add(node.id)
+        entries.append((identity_hash, hash_value, node, page_idx))
+
+    pages = [
+        ResolvedHostPageLocation(
+            block_hash=identity_hash,
+            hash_value=hash_value,
+            host_index=host_index,
+        )
+        for (identity_hash, hash_value, _, _), host_index in zip(
+            entries,
+            _host_page_start_indices(entries, tree_cache.page_size),
+        )
+    ]
+    if reason != "ok":
+        return pages, reason, protected_nodes
 
     return pages, "ok", protected_nodes
 
@@ -229,7 +194,7 @@ def release_protected_host_nodes(nodes: Iterable[TreeNode]) -> None:
         try:
             node.release_host()
         except RuntimeError:
-            logger.exception("Failed to release remote G2 source host page protection")
+            logger.exception("Failed to release shared HiCache source host page protection")
 
 
 def _coerce_int(value: Any, field_name: str) -> int:
@@ -268,7 +233,7 @@ def _is_timeout_error(err: BaseException) -> bool:
 
 
 def _parse_target_kv_metadata(
-    payload: Mapping[str, Any], transfer_backend: RemoteG2TransferBackend
+    payload: Mapping[str, Any], transfer_backend: SharedHiCacheTransferBackend
 ) -> tuple[Optional[str], Optional[list[int]], Optional[list[int]], Optional[str]]:
     try:
         target_session_id_raw = payload["target_session_id"]
@@ -345,7 +310,7 @@ def _parse_target_kv_metadata(
 def handle_source_transfer(
     *,
     payload: Mapping[str, Any],
-    transfer_backend: Optional[RemoteG2TransferBackend],
+    transfer_backend: Optional[SharedHiCacheTransferBackend],
     tree_cache,
     worker_id: Optional[int],
     dp_rank: int,
@@ -363,7 +328,7 @@ def handle_source_transfer(
         }
 
     try:
-        plan = RemoteG2Plan.from_dict(payload["plan"])
+        plan = SharedHiCachePlan.from_dict(payload["plan"])
         start_block = _coerce_int(payload.get("start_block", 0), "start_block")
         max_blocks = _coerce_int(
             payload.get("max_blocks", len(plan.block_hashes)), "max_blocks"
@@ -477,12 +442,12 @@ def handle_source_transfer(
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000
                 if _is_timeout_error(err):
                     failure_reason = (
-                        f"{REMOTE_G2_DIRECT_TIMEOUT_REASON}:source:{err}"
+                        f"{SHARED_HICACHE_DIRECT_TIMEOUT_REASON}:source:{err}"
                     )
                 else:
                     failure_reason = f"direct_transfer_failed:{err}"
                 logger.warning(
-                    "RemoteG2 source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
+                    "SharedHiCache source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
                     len(pages),
                     resolve_ms,
                     transfer_ms,
@@ -501,7 +466,7 @@ def handle_source_transfer(
             transfer_ms = (time.perf_counter() - transfer_start) * 1000
         total_ms = (time.perf_counter() - total_start) * 1000
         logger.debug(
-            "RemoteG2 source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
+            "SharedHiCache source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
             len(pages),
             reason,
             resolve_ms,

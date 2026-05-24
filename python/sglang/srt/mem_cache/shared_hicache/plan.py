@@ -7,11 +7,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.utils import block_hash_aliases
 
-REMOTE_G2_PLAN_EXTRA_ARGS_KEY = "remote_g2_plan"
-REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_g2_no_plan_reason"
-REMOTE_G2_PLAN_VERSION = 1
-REMOTE_G2_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
-REMOTE_G2_SOURCE_TIER = StorageMedium.CPU.value
+SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY = "shared_hicache_plan"
+SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY = "shared_hicache_no_plan_reason"
+SHARED_HICACHE_PLAN_VERSION = 1
+SHARED_HICACHE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
+SHARED_HICACHE_SOURCE_MEDIUM = StorageMedium.CPU.value
 
 
 def _now_ms() -> int:
@@ -27,12 +27,12 @@ def normalize_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
 
 
-def _canonical_source_tier(tier: Any) -> str:
-    if tier != REMOTE_G2_SOURCE_TIER:
+def _canonical_source_medium(medium: Any) -> str:
+    if medium != SHARED_HICACHE_SOURCE_MEDIUM:
         raise ValueError(
-            f"source_tier must be {REMOTE_G2_SOURCE_TIER!r}, got {tier!r}"
+            f"source_medium must be {SHARED_HICACHE_SOURCE_MEDIUM!r}, got {medium!r}"
         )
-    return REMOTE_G2_SOURCE_TIER
+    return SHARED_HICACHE_SOURCE_MEDIUM
 
 
 def _coerce_int(value: Any, field_name: str) -> int:
@@ -77,7 +77,7 @@ def _first_present(data: Mapping[str, Any], *names: str, default: Any = None) ->
 
 
 @dataclass(frozen=True)
-class RemoteG2Plan:
+class SharedHiCachePlan:
     plan_id: str
     request_id: str
     target_worker_id: int
@@ -85,24 +85,24 @@ class RemoteG2Plan:
     source_worker_id: int
     source_dp_rank: int
     source_endpoint: Optional[str]
-    source_tier: str
+    source_medium: str
     block_hashes: tuple[int, ...]
     planned_prefix_blocks: int
     block_size_tokens: int
     created_at_ms: int
     expires_at_ms: int
     start_block_index: int = 0
-    plan_version: int = REMOTE_G2_PLAN_VERSION
+    plan_version: int = SHARED_HICACHE_PLAN_VERSION
     kv_block_hashes: tuple[int, ...] = ()
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RemoteG2Plan":
+    def from_dict(cls, data: Mapping[str, Any]) -> "SharedHiCachePlan":
         if not isinstance(data, Mapping):
-            raise ValueError("RemoteG2 plan must be a mapping")
+            raise ValueError("SharedHiCache plan must be a mapping")
 
         block_hashes_raw = _first_present(data, "block_hashes", "hashes")
         if block_hashes_raw is None:
-            raise ValueError("RemoteG2 plan missing block_hashes")
+            raise ValueError("SharedHiCache plan missing block_hashes")
         block_hashes = tuple(
             _coerce_block_hash(item)
             for item in _coerce_array(block_hashes_raw, "block_hashes")
@@ -170,10 +170,8 @@ class RemoteG2Plan:
                     "source_dp_rank",
                 ),
                 source_endpoint=source_endpoint,
-                source_tier=_canonical_source_tier(
-                    _first_present(
-                        data, "source_tier", default=REMOTE_G2_SOURCE_TIER
-                    )
+                source_medium=_canonical_source_medium(
+                    data["source_medium"]
                 ),
                 block_hashes=block_hashes,
                 planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
@@ -188,14 +186,14 @@ class RemoteG2Plan:
                 start_block_index=start_block_index,
                 plan_version=_coerce_int(
                     _first_present(
-                        data, "plan_version", default=REMOTE_G2_PLAN_VERSION
+                        data, "plan_version", default=SHARED_HICACHE_PLAN_VERSION
                     ),
                     "plan_version",
                 ),
                 kv_block_hashes=kv_block_hashes,
             )
         except KeyError as err:
-            raise ValueError(f"RemoteG2 plan missing {err.args[0]}") from err
+            raise ValueError(f"SharedHiCache plan missing {err.args[0]}") from err
 
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)
@@ -211,8 +209,8 @@ class RemoteG2Plan:
     def planned_kv_block_hashes(self) -> tuple[int, ...]:
         return self.kv_block_hashes[: self.planned_prefix_blocks]
 
-    def is_remote_g2(self) -> bool:
-        return self.source_tier == REMOTE_G2_SOURCE_TIER
+    def is_shared_hicache(self) -> bool:
+        return self.source_medium == SHARED_HICACHE_SOURCE_MEDIUM
 
     def is_expired(self, now_ms: Optional[int] = None) -> bool:
         return self.expires_at_ms <= (now_ms if now_ms is not None else _now_ms())

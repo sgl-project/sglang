@@ -13,28 +13,28 @@ from urllib.parse import urlparse
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.remote_g2.transfer import (
-    RemoteG2TransferBackend,
-    remote_g2_config,
-    remote_g2_config_value,
-    remote_g2_timeout_secs,
-    make_remote_g2_transfer_backend,
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.shared_hicache.transfer import (
+    SharedHiCacheTransferBackend,
+    shared_hicache_config,
+    shared_hicache_config_value,
+    shared_hicache_timeout_secs,
+    make_shared_hicache_transfer_backend,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
-from sglang.srt.mem_cache.remote_g2.control import (
+from sglang.srt.mem_cache.shared_hicache.control import (
     is_indeterminate_direct_transfer_reason,
     request_source_transfer,
     start_source_transfer_server,
 )
-from sglang.srt.mem_cache.remote_g2.plan import (
-    REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
-    REMOTE_G2_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
-    REMOTE_G2_PLAN_VERSION as _PLAN_VERSION,
-    RemoteG2Plan,
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
+    SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
+    SHARED_HICACHE_PLAN_VERSION as _PLAN_VERSION,
+    SharedHiCachePlan,
     normalize_endpoint,
 )
-from sglang.srt.mem_cache.remote_g2.source import (
+from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
     handle_source_transfer,
     resolve_host_pages as _resolve_host_pages,
@@ -47,10 +47,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-REMOTE_G2_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
-REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
-REMOTE_G2_PLAN_VERSION = _PLAN_VERSION
-REMOTE_G2_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
+SHARED_HICACHE_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
+SHARED_HICACHE_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
+SHARED_HICACHE_PLAN_VERSION = _PLAN_VERSION
+SHARED_HICACHE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
 resolve_host_pages = _resolve_host_pages
 
 
@@ -66,14 +66,14 @@ def _normalize_endpoint(endpoint: str) -> str:
 
 
 @dataclass(frozen=True)
-class RemoteG2Result:
+class SharedHiCacheResult:
     staged_tokens: int = 0
     pending: bool = False
 
 
 @dataclass
-class _RemoteG2PendingFetch:
-    plan: RemoteG2Plan
+class _SharedHiCachePendingFetch:
+    plan: SharedHiCachePlan
     plan_offset: int
     target_start_block: int
     expected_hashes: tuple[int, ...]
@@ -96,9 +96,9 @@ def _is_indeterminate_direct_transfer_reason(reason: str) -> bool:
 def _endpoint_to_bind(endpoint: str) -> tuple[str, int]:
     parsed = urlparse(_normalize_endpoint(endpoint))
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"unsupported remote G2 endpoint scheme: {parsed.scheme}")
+        raise ValueError(f"unsupported shared HiCache endpoint scheme: {parsed.scheme}")
     if parsed.hostname is None or parsed.port is None:
-        raise ValueError(f"remote G2 endpoint must include host and port: {endpoint}")
+        raise ValueError(f"shared HiCache endpoint must include host and port: {endpoint}")
     return parsed.hostname, parsed.port
 
 
@@ -111,13 +111,13 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "remote_g2_config.control.endpoint values must be non-empty strings; "
+                "shared_hicache_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
     if not isinstance(endpoint_spec, str):
         raise ValueError(
-            "remote_g2_config.control.endpoint must be a string or JSON object"
+            "shared_hicache_config.control.endpoint must be a string or JSON object"
         )
     spec = endpoint_spec.strip()
     if not spec:
@@ -125,13 +125,13 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     if spec.startswith("{"):
         endpoints = json.loads(spec)
         if not isinstance(endpoints, Mapping):
-            raise ValueError("remote_g2_config.control.endpoint must be a JSON object")
+            raise ValueError("shared_hicache_config.control.endpoint must be a JSON object")
         endpoint = endpoints.get(str(dp_rank))
         if endpoint is None:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "remote_g2_config.control.endpoint values must be non-empty strings; "
+                "shared_hicache_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
@@ -140,12 +140,12 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     return _normalize_endpoint(spec)
 
 
-def _remote_g2_enabled(server_args: "ServerArgs") -> bool:
-    config = remote_g2_config(server_args)
-    return bool(getattr(server_args, "enable_remote_g2", False) or config)
+def _shared_hicache_enabled(server_args: "ServerArgs") -> bool:
+    config = shared_hicache_config(server_args)
+    return bool(getattr(server_args, "enable_shared_hicache", False) or config)
 
 
-class RemoteG2Manager:
+class SharedHiCacheManager:
     def __init__(
         self,
         *,
@@ -153,13 +153,13 @@ class RemoteG2Manager:
         tree_cache,
         worker_id: Optional[int],
         dp_rank: int,
-        direct_transfer: Optional[RemoteG2TransferBackend] = None,
+        direct_transfer: Optional[SharedHiCacheTransferBackend] = None,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
         self.dp_rank = dp_rank
-        self.timeout_secs = remote_g2_timeout_secs(server_args)
+        self.timeout_secs = shared_hicache_timeout_secs(server_args)
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
@@ -170,10 +170,10 @@ class RemoteG2Manager:
         self.metrics_collector = metrics_collector
         if not self._direct_transfer_enabled():
             logger.warning(
-                "RemoteG2 is enabled but no direct transfer backend is available; "
-                "RemoteG2 plans will be treated as cache misses."
+                "SharedHiCache is enabled but no direct transfer backend is available; "
+                "SharedHiCache plans will be treated as cache misses."
             )
-        endpoint_spec = remote_g2_config_value(
+        endpoint_spec = shared_hicache_config_value(
             server_args,
             "control_endpoint",
             None,
@@ -184,7 +184,7 @@ class RemoteG2Manager:
         self._shutdown = False
         worker_limit = max(
             1,
-            int(envs.SGLANG_REMOTE_G2_FETCH_WORKERS.get()),
+            int(envs.SGLANG_SHARED_HICACHE_FETCH_WORKERS.get()),
         )
         self._source_activity_lock = threading.Lock()
         self._active_source_resolver_ops = 0
@@ -192,14 +192,14 @@ class RemoteG2Manager:
         self._fetch_semaphore = threading.BoundedSemaphore(worker_limit)
         self._fetch_executor = ThreadPoolExecutor(
             max_workers=worker_limit,
-            thread_name_prefix=f"remote_g2-fetch-dp{dp_rank}",
+            thread_name_prefix=f"shared_hicache-fetch-dp{dp_rank}",
         )
-        self._pending_fetches: dict[str, _RemoteG2PendingFetch] = {}
+        self._pending_fetches: dict[str, _SharedHiCachePendingFetch] = {}
         self._detached_fetches: set[Future] = set()
         self._quarantined_device_indices: list[torch.Tensor] = []
         self._quarantined_tokens_by_backend: dict[str, int] = {}
         self._finished_plan_keys: set[tuple[str, str]] = set()
-        self.max_control_body_bytes = REMOTE_G2_MAX_CONTROL_BODY_BYTES
+        self.max_control_body_bytes = SHARED_HICACHE_MAX_CONTROL_BODY_BYTES
         self._direct_transfer_shutdown_done = False
         self._direct_transfer_shutdown_deferred = False
         self._direct_transfer_shutdown_lock = threading.Lock()
@@ -209,28 +209,39 @@ class RemoteG2Manager:
         atexit.register(self.shutdown)
 
     @classmethod
-    def from_scheduler(cls, scheduler) -> Optional["RemoteG2Manager"]:
+    def from_scheduler(cls, scheduler) -> Optional["SharedHiCacheManager"]:
         server_args = scheduler.server_args
-        if not _remote_g2_enabled(server_args):
+        if not _shared_hicache_enabled(server_args):
             return None
         if not scheduler.enable_hierarchical_cache:
             logger.warning(
-                "RemoteG2 disabled because hierarchical cache is not enabled"
+                "SharedHiCache disabled because hierarchical cache is not enabled"
             )
             return None
-        if not hasattr(scheduler.tree_cache, "_insert_helper_host"):
+        required_tree_methods = (
+            "lookup_hicache_host_blocks",
+            "insert_shared_hicache_device_blocks",
+        )
+        missing_tree_methods = [
+            name
+            for name in required_tree_methods
+            if not callable(getattr(scheduler.tree_cache, name, None))
+        ]
+        if missing_tree_methods:
             logger.warning(
-                "RemoteG2 disabled because the active tree cache does not support host inserts"
+                "SharedHiCache disabled because the active tree cache lacks HiCache "
+                "shared-cache primitives: %s",
+                ", ".join(missing_tree_methods),
             )
             return None
-        worker_id = remote_g2_config_value(server_args, "worker_id", None)
+        worker_id = shared_hicache_config_value(server_args, "worker_id", None)
         if worker_id is None:
             logger.warning(
-                "RemoteG2 disabled because worker_id is not set; "
-                "set worker_id in --remote-g2-config"
+                "SharedHiCache disabled because worker_id is not set; "
+                "set --shared-hicache-worker-id"
             )
             return None
-        direct_transfer = make_remote_g2_transfer_backend(scheduler)
+        direct_transfer = make_shared_hicache_transfer_backend(scheduler)
         return cls(
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
@@ -268,7 +279,7 @@ class RemoteG2Manager:
         transfer_bytes: Optional[int] = None,
     ) -> None:
         metrics_collector = getattr(self, "metrics_collector", None)
-        observe = getattr(metrics_collector, "observe_remote_g2", None)
+        observe = getattr(metrics_collector, "observe_shared_hicache", None)
         if observe is None:
             return
         try:
@@ -282,15 +293,15 @@ class RemoteG2Manager:
                 transfer_bytes=transfer_bytes,
             )
         except Exception:
-            logger.debug("Failed to record RemoteG2 metrics", exc_info=True)
+            logger.debug("Failed to record SharedHiCache metrics", exc_info=True)
 
-    def _pending_wait_ms(self, pending: _RemoteG2PendingFetch) -> Optional[float]:
+    def _pending_wait_ms(self, pending: _SharedHiCachePendingFetch) -> Optional[float]:
         submitted_at = getattr(pending, "submitted_at", 0.0)
         if submitted_at <= 0:
             return None
         return (time.perf_counter() - submitted_at) * 1000
 
-    def _pending_timeout_secs(self, pending: _RemoteG2PendingFetch) -> float:
+    def _pending_timeout_secs(self, pending: _SharedHiCachePendingFetch) -> float:
         cfg = getattr(self, "prefetch_timeout_config", None)
         if cfg is None:
             return float(getattr(self, "timeout_secs", 0.0))
@@ -298,7 +309,7 @@ class RemoteG2Manager:
         return float(min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024))
 
     def _pending_should_stop_waiting(
-        self, pending: _RemoteG2PendingFetch
+        self, pending: _SharedHiCachePendingFetch
     ) -> tuple[bool, str]:
         policy = str(getattr(self, "prefetch_stop_policy", "timeout"))
         if policy == "best_effort":
@@ -314,15 +325,15 @@ class RemoteG2Manager:
         return True, "unknown_prefetch_policy"
 
     def _pending_ready_wait_ms(
-        self, pending: _RemoteG2PendingFetch
+        self, pending: _SharedHiCachePendingFetch
     ) -> Optional[float]:
-        done_at = getattr(pending.future, "_remote_g2_done_at", 0.0)
+        done_at = getattr(pending.future, "_shared_hicache_done_at", 0.0)
         if done_at <= 0:
             return None
         return max(0.0, (time.perf_counter() - done_at) * 1000)
 
     def _transfer_bytes_for_pages(
-        self, pending: _RemoteG2PendingFetch, pages: list[ResolvedHostPage]
+        self, pending: _SharedHiCachePendingFetch, pages: list[ResolvedHostPage]
     ) -> int:
         bytes_per_page = int(getattr(pending, "bytes_per_page", 0) or 0)
         if bytes_per_page > 0:
@@ -334,7 +345,7 @@ class RemoteG2Manager:
             getattr(
                 self,
                 "max_control_body_bytes",
-                REMOTE_G2_MAX_CONTROL_BODY_BYTES,
+                SHARED_HICACHE_MAX_CONTROL_BODY_BYTES,
             )
         )
 
@@ -369,11 +380,11 @@ class RemoteG2Manager:
         try:
             semaphore.release()
         except ValueError:
-            logger.debug("RemoteG2 fetch worker semaphore release ignored", exc_info=True)
+            logger.debug("SharedHiCache fetch worker semaphore release ignored", exc_info=True)
 
     def _on_fetch_worker_done(self, future: Future) -> None:
         try:
-            setattr(future, "_remote_g2_done_at", time.perf_counter())
+            setattr(future, "_shared_hicache_done_at", time.perf_counter())
         finally:
             self._release_fetch_worker()
 
@@ -423,13 +434,13 @@ class RemoteG2Manager:
                 self._shutdown_direct_transfer_backend()
             except Exception:
                 logger.warning(
-                    "RemoteG2 deferred direct transfer backend shutdown failed",
+                    "SharedHiCache deferred direct transfer backend shutdown failed",
                     exc_info=True,
                 )
 
         thread = threading.Thread(
             target=_wait_for_pending_and_shutdown,
-            name="remote_g2-direct-transfer-shutdown",
+            name="shared_hicache-direct-transfer-shutdown",
             daemon=True,
         )
         self._direct_transfer_shutdown_thread = thread
@@ -447,7 +458,7 @@ class RemoteG2Manager:
                 server.shutdown()
                 server.server_close()
             except Exception:
-                logger.debug("Remote G2 source resolver shutdown failed", exc_info=True)
+                logger.debug("Shared HiCache source resolver shutdown failed", exc_info=True)
 
         source_thread = self._source_thread
         self._source_thread = None
@@ -458,7 +469,7 @@ class RemoteG2Manager:
             try:
                 source_thread.join(timeout=1)
             except Exception:
-                logger.debug("Remote G2 source resolver join failed", exc_info=True)
+                logger.debug("Shared HiCache source resolver join failed", exc_info=True)
 
         for pending in self._pending_fetches.values():
             self._release_pending_fetch(pending)
@@ -472,7 +483,7 @@ class RemoteG2Manager:
 
         if self.has_pending():
             logger.warning(
-                "Deferring direct transfer backend shutdown while RemoteG2 work is still pending"
+                "Deferring direct transfer backend shutdown while SharedHiCache work is still pending"
             )
             self._defer_direct_transfer_shutdown()
             return
@@ -480,7 +491,7 @@ class RemoteG2Manager:
         self._release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
-    def _candidate_endpoints_for_plan(self, plan: RemoteG2Plan) -> list[str]:
+    def _candidate_endpoints_for_plan(self, plan: SharedHiCachePlan) -> list[str]:
         endpoints: list[str] = []
 
         def add(endpoint: Optional[str]) -> None:
@@ -493,9 +504,9 @@ class RemoteG2Manager:
     def _request_source_transfer(
         self,
         *,
-        transfer_backend: RemoteG2TransferBackend,
+        transfer_backend: SharedHiCacheTransferBackend,
         endpoints: list[str],
-        plan: RemoteG2Plan,
+        plan: SharedHiCachePlan,
         start_block: int,
         max_blocks: int,
         target_page_indices: list[int],
@@ -527,7 +538,7 @@ class RemoteG2Manager:
             max_prefix_len = 0
         return max_prefix_len // self.tree_cache.page_size
 
-    def _validate_plan(self, plan: RemoteG2Plan) -> Optional[str]:
+    def _validate_plan(self, plan: SharedHiCachePlan) -> Optional[str]:
         if self.worker_id is None:
             return "missing_worker_id"
         if plan.target_worker_id != self.worker_id:
@@ -539,17 +550,17 @@ class RemoteG2Manager:
             and plan.source_dp_rank == plan.target_dp_rank
         ):
             return "source_is_target"
-        if plan.plan_version != REMOTE_G2_PLAN_VERSION:
+        if plan.plan_version != SHARED_HICACHE_PLAN_VERSION:
             return "unsupported_plan_version"
         if plan.is_expired():
             return "plan_expired"
-        if not plan.is_remote_g2():
-            return "unsupported_source_tier"
+        if not plan.is_shared_hicache():
+            return "unsupported_source_medium"
         if plan.block_size_tokens != self.tree_cache.page_size:
             return "incompatible_block_size"
         return None
 
-    def _plan_key(self, req: "Req", plan: RemoteG2Plan) -> tuple[str, str]:
+    def _plan_key(self, req: "Req", plan: SharedHiCachePlan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
     def _alloc_device_indices(self, token_count: int) -> Optional[torch.Tensor]:
@@ -559,7 +570,7 @@ class RemoteG2Manager:
             self.tree_cache.evict(EvictParams(num_tokens=token_count))
             device_indices = allocator.alloc(token_count)
         if device_indices is None:
-            logger.warning("Remote G2 failed to allocate %d device tokens", token_count)
+            logger.warning("Shared HiCache failed to allocate %d device tokens", token_count)
         return device_indices
 
     def _free_device_indices(self, device_indices: Optional[torch.Tensor]) -> None:
@@ -572,7 +583,7 @@ class RemoteG2Manager:
     ) -> None:
         metrics_collector = getattr(self, "metrics_collector", None)
         observe = getattr(
-            metrics_collector, "observe_remote_g2_quarantine", None
+            metrics_collector, "observe_shared_hicache_quarantine", None
         )
         if observe is None:
             return
@@ -585,7 +596,7 @@ class RemoteG2Manager:
             )
         except Exception:
             logger.debug(
-                "Failed to record RemoteG2 quarantine metrics", exc_info=True
+                "Failed to record SharedHiCache quarantine metrics", exc_info=True
             )
 
     def _quarantine_device_indices(
@@ -609,7 +620,7 @@ class RemoteG2Manager:
             current_tokens=current_tokens,
         )
         logger.error(
-            "Quarantining %d RemoteG2 target KV indices after indeterminate direct transfer: %s",
+            "Quarantining %d SharedHiCache target KV indices after indeterminate direct transfer: %s",
             token_count,
             reason,
         )
@@ -677,14 +688,14 @@ class RemoteG2Manager:
         self.tree_cache.inc_lock_ref(last_node)
         return last_node
 
-    def _unlock_pending_prefix(self, pending: _RemoteG2PendingFetch) -> None:
+    def _unlock_pending_prefix(self, pending: _SharedHiCachePendingFetch) -> None:
         locked_node = getattr(pending, "locked_node", None)
         if locked_node is None:
             return
         pending.locked_node = None
         self.tree_cache.dec_lock_ref(locked_node)
 
-    def _release_pending_fetch(self, pending: _RemoteG2PendingFetch) -> None:
+    def _release_pending_fetch(self, pending: _SharedHiCachePendingFetch) -> None:
         cancelled = pending.future.cancel()
         self._unlock_pending_prefix(pending)
         if pending.device_indices is None:
@@ -727,7 +738,7 @@ class RemoteG2Manager:
 
     def _submit_direct_transfer(
         self,
-        plan: RemoteG2Plan,
+        plan: SharedHiCachePlan,
         *,
         start_block: int,
         max_blocks: int,
@@ -750,7 +761,7 @@ class RemoteG2Manager:
         target_page_indices = self._device_indices_to_page_indices(device_indices)
         if target_page_indices is None:
             logger.warning(
-                "Remote G2 direct transfer got non page-aligned target device allocation"
+                "Shared HiCache direct transfer got non page-aligned target device allocation"
             )
             self._free_device_indices(device_indices)
             self._release_fetch_worker()
@@ -772,32 +783,32 @@ class RemoteG2Manager:
         future.add_done_callback(self._on_fetch_worker_done)
         return future, device_indices
 
-    def maybe_stage_remote_prefix(self, req: "Req") -> int:
-        return self.check_remote_prefix(req).staged_tokens
+    def maybe_stage_shared_prefix(self, req: "Req") -> int:
+        return self.check_shared_prefix(req).staged_tokens
 
     def maybe_stage_reuse_plan(self, req: "Req") -> int:
-        return self.maybe_stage_remote_prefix(req)
+        return self.maybe_stage_shared_prefix(req)
 
     def has_reuse_plan(self, req: "Req") -> bool:
-        plan_data = getattr(req, "remote_g2_plan", None)
+        plan_data = getattr(req, "shared_hicache_plan", None)
         if plan_data is None:
             return False
         try:
-            plan = RemoteG2Plan.from_dict(plan_data)
+            plan = SharedHiCachePlan.from_dict(plan_data)
         except ValueError:
             return False
         if self._validate_plan(plan) is not None:
             return False
         return self._direct_transfer_enabled()
 
-    def prefetch_remote_prefix(self, req: "Req") -> RemoteG2Result:
-        return RemoteG2Result()
+    def prefetch_shared_prefix(self, req: "Req") -> SharedHiCacheResult:
+        return SharedHiCacheResult()
 
-    def prefetch_reuse_plan(self, req: "Req") -> RemoteG2Result:
-        return self.prefetch_remote_prefix(req)
+    def prefetch_reuse_plan(self, req: "Req") -> SharedHiCacheResult:
+        return self.prefetch_shared_prefix(req)
 
-    def check_reuse_plan_progress(self, req: "Req") -> RemoteG2Result:
-        return self.check_remote_prefix(req)
+    def check_reuse_plan_progress(self, req: "Req") -> SharedHiCacheResult:
+        return self.check_shared_prefix(req)
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
@@ -810,26 +821,26 @@ class RemoteG2Manager:
             key for key in self._finished_plan_keys if key[0] != rid
         }
 
-    def check_remote_prefix(self, req: "Req") -> RemoteG2Result:
-        plan_data = getattr(req, "remote_g2_plan", None)
+    def check_shared_prefix(self, req: "Req") -> SharedHiCacheResult:
+        plan_data = getattr(req, "shared_hicache_plan", None)
         if plan_data is None:
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         try:
-            plan = RemoteG2Plan.from_dict(plan_data)
+            plan = SharedHiCachePlan.from_dict(plan_data)
         except ValueError as err:
-            logger.debug("Ignoring invalid remote G2 plan for rid=%s: %s", req.rid, err)
+            logger.debug("Ignoring invalid shared HiCache plan for rid=%s: %s", req.rid, err)
             self._observe_reuse(
                 backend=self._current_backend_label(),
                 outcome="skip",
                 reason="invalid_plan",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         rejection = self._validate_plan(plan)
         if rejection is not None:
             logger.debug(
-                "Ignoring remote G2 plan rid=%s plan_id=%s reason=%s",
+                "Ignoring shared HiCache plan rid=%s plan_id=%s reason=%s",
                 req.rid,
                 plan.plan_id,
                 rejection,
@@ -839,17 +850,17 @@ class RemoteG2Manager:
                 outcome="skip",
                 reason=rejection,
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         plan_key = self._plan_key(req, plan)
         if plan_key in self._finished_plan_keys:
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         page_size = self.tree_cache.page_size
         matched_tokens = len(req.prefix_indices) + req.host_hit_length
         if matched_tokens % page_size != 0:
             logger.debug(
-                "Skipping remote G2 plan rid=%s plan_id=%s reason=unaligned_matched_tokens matched_tokens=%d page_size=%d",
+                "Skipping shared HiCache plan rid=%s plan_id=%s reason=unaligned_matched_tokens matched_tokens=%d page_size=%d",
                 req.rid,
                 plan.plan_id,
                 matched_tokens,
@@ -860,11 +871,11 @@ class RemoteG2Manager:
                 outcome="skip",
                 reason="unaligned_matched_tokens",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
         computed_blocks = matched_tokens // page_size
         if computed_blocks < plan.start_block_index:
             logger.debug(
-                "Skipping remote G2 plan rid=%s plan_id=%s reason=before_plan_start computed_blocks=%d start_block_index=%d",
+                "Skipping shared HiCache plan rid=%s plan_id=%s reason=before_plan_start computed_blocks=%d start_block_index=%d",
                 req.rid,
                 plan.plan_id,
                 computed_blocks,
@@ -875,7 +886,7 @@ class RemoteG2Manager:
                 outcome="skip",
                 reason="before_plan_start",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         max_plan_blocks = max(
             self._max_cacheable_blocks(req) - plan.start_block_index, 0
@@ -884,7 +895,7 @@ class RemoteG2Manager:
         plan_offset = computed_blocks - plan.start_block_index
         if planned_blocks <= plan_offset:
             logger.debug(
-                "Skipping remote G2 plan rid=%s plan_id=%s reason=no_remaining_planned_blocks planned_blocks=%d plan_offset=%d max_plan_blocks=%d",
+                "Skipping shared HiCache plan rid=%s plan_id=%s reason=no_remaining_planned_blocks planned_blocks=%d plan_offset=%d max_plan_blocks=%d",
                 req.rid,
                 plan.plan_id,
                 planned_blocks,
@@ -896,7 +907,7 @@ class RemoteG2Manager:
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         pending = self._pending_fetches.get(str(req.rid))
         if pending is not None:
@@ -915,13 +926,13 @@ class RemoteG2Manager:
                         reason=reason,
                         wait_ms=self._pending_wait_ms(pending),
                     )
-                    return RemoteG2Result()
-                return RemoteG2Result(pending=True)
+                    return SharedHiCacheResult()
+                return SharedHiCacheResult(pending=True)
             else:
                 return self._finish_pending_fetch(req, pending)
 
         logger.debug(
-            "Submitting remote G2 fetch rid=%s plan_id=%s source=%s:%s start_block=%d max_blocks=%d matched_tokens=%d",
+            "Submitting shared HiCache fetch rid=%s plan_id=%s source=%s:%s start_block=%d max_blocks=%d matched_tokens=%d",
             req.rid,
             plan.plan_id,
             plan.source_worker_id,
@@ -938,7 +949,7 @@ class RemoteG2Manager:
         direct_transfer_enabled = self._direct_transfer_enabled()
         if not direct_transfer_enabled:
             logger.debug(
-                "Skipping remote G2 plan rid=%s plan_id=%s reason=direct_transfer_unavailable",
+                "Skipping shared HiCache plan rid=%s plan_id=%s reason=direct_transfer_unavailable",
                 req.rid,
                 plan.plan_id,
             )
@@ -948,7 +959,7 @@ class RemoteG2Manager:
                 outcome="miss",
                 reason="direct_transfer_unavailable",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
         if direct_transfer_enabled and req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(
@@ -956,7 +967,7 @@ class RemoteG2Manager:
                 outcome="skip",
                 reason="local_host_hit",
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
         locked_node = None
         if req.host_hit_length == 0:
             if direct_transfer_enabled:
@@ -981,7 +992,7 @@ class RemoteG2Manager:
                     outcome="miss",
                     reason="direct_submit_unavailable",
                 )
-                return RemoteG2Result()
+                return SharedHiCacheResult()
         backend = "none"
         bytes_per_page = 0
         if device_indices is not None and direct_transfer_enabled:
@@ -994,7 +1005,7 @@ class RemoteG2Manager:
                 )
             except Exception:
                 bytes_per_page = 0
-        self._pending_fetches[str(req.rid)] = _RemoteG2PendingFetch(
+        self._pending_fetches[str(req.rid)] = _SharedHiCachePendingFetch(
             plan=plan,
             plan_offset=plan_offset,
             target_start_block=plan.start_block_index + plan_offset,
@@ -1006,11 +1017,11 @@ class RemoteG2Manager:
             bytes_per_page=bytes_per_page,
             submitted_at=time.perf_counter(),
         )
-        return RemoteG2Result(pending=True)
+        return SharedHiCacheResult(pending=True)
 
     def _finish_pending_fetch(
-        self, req: "Req", pending: _RemoteG2PendingFetch
-    ) -> RemoteG2Result:
+        self, req: "Req", pending: _SharedHiCachePendingFetch
+    ) -> SharedHiCacheResult:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
 
@@ -1018,7 +1029,7 @@ class RemoteG2Manager:
             pages, reason = pending.future.result()
         except Exception:
             logger.exception(
-                "Remote G2 fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
+                "Shared HiCache fetch failed rid=%s plan_id=%s", req.rid, plan.plan_id
             )
             self._unlock_pending_prefix(pending)
             if pending.device_indices is not None:
@@ -1030,11 +1041,11 @@ class RemoteG2Manager:
                 reason="fetch_exception",
                 wait_ms=self._pending_wait_ms(pending),
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         if not pages:
             logger.debug(
-                "Remote G2 source returned no pages rid=%s plan_id=%s reason=%s",
+                "Shared HiCache source returned no pages rid=%s plan_id=%s reason=%s",
                 req.rid,
                 plan.plan_id,
                 reason,
@@ -1059,11 +1070,11 @@ class RemoteG2Manager:
                 reason=reason,
                 wait_ms=self._pending_wait_ms(pending),
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         if len(pages) > len(pending.expected_hashes):
             logger.warning(
-                "Remote G2 source returned too many pages rid=%s plan_id=%s pages=%d expected=%d",
+                "Shared HiCache source returned too many pages rid=%s plan_id=%s pages=%d expected=%d",
                 req.rid,
                 plan.plan_id,
                 len(pages),
@@ -1080,12 +1091,12 @@ class RemoteG2Manager:
                 wait_ms=self._pending_wait_ms(pending),
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         expected_hashes = pending.expected_hashes[: len(pages)]
         if tuple(page.block_hash for page in pages) != expected_hashes:
             logger.warning(
-                "Remote G2 source returned non-contiguous pages rid=%s plan_id=%s",
+                "Shared HiCache source returned non-contiguous pages rid=%s plan_id=%s",
                 req.rid,
                 plan.plan_id,
             )
@@ -1100,13 +1111,13 @@ class RemoteG2Manager:
                 wait_ms=self._pending_wait_ms(pending),
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
 
         insert_start = time.perf_counter()
         try:
             if pending.device_indices is None:
                 logger.warning(
-                    "Remote G2 direct transfer completed without target device indices"
+                    "Shared HiCache direct transfer completed without target device indices"
                 )
                 self._finished_plan_keys.add(self._plan_key(req, plan))
                 self._observe_reuse(
@@ -1115,7 +1126,7 @@ class RemoteG2Manager:
                     reason="missing_target_device_indices",
                     wait_ms=self._pending_wait_ms(pending),
                 )
-                return RemoteG2Result()
+                return SharedHiCacheResult()
             staged_tokens = self._insert_device_pages(
                 req,
                 pages,
@@ -1125,7 +1136,7 @@ class RemoteG2Manager:
         except Exception:
             insert_ms = (time.perf_counter() - insert_start) * 1000
             logger.exception(
-                "Remote G2 insert failed rid=%s plan_id=%s",
+                "Shared HiCache insert failed rid=%s plan_id=%s",
                 req.rid,
                 plan.plan_id,
             )
@@ -1138,18 +1149,18 @@ class RemoteG2Manager:
                 insert_ms=insert_ms,
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RemoteG2Result()
+            return SharedHiCacheResult()
         finally:
             self._unlock_pending_prefix(pending)
         insert_ms = (time.perf_counter() - insert_start) * 1000
         if staged_tokens > 0:
-            req.remote_g2_hit_length = (
-                getattr(req, "remote_g2_hit_length", 0) + staged_tokens
+            req.shared_hicache_hit_length = (
+                getattr(req, "shared_hicache_hit_length", 0) + staged_tokens
             )
             wait_ms = self._pending_wait_ms(pending)
             ready_wait_ms = self._pending_ready_wait_ms(pending)
             logger.debug(
-                "Remote G2 staged %d tokens rid=%s plan_id=%s source=%s:%s wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
+                "Shared HiCache staged %d tokens rid=%s plan_id=%s source=%s:%s wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
@@ -1171,7 +1182,7 @@ class RemoteG2Manager:
             insert_ms=insert_ms,
             transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
         )
-        return RemoteG2Result(staged_tokens=staged_tokens)
+        return SharedHiCacheResult(staged_tokens=staged_tokens)
 
     def _insert_device_pages(
         self,
@@ -1206,7 +1217,7 @@ class RemoteG2Manager:
             )
             if token_start != len(prefix_indices):
                 logger.debug(
-                    "Remote G2 direct insert cannot attach suffix rid=%s token_start=%d prefix_indices=%d",
+                    "Shared HiCache direct insert cannot attach suffix rid=%s token_start=%d prefix_indices=%d",
                     getattr(req, "rid", None),
                     token_start,
                     len(prefix_indices),
@@ -1227,7 +1238,14 @@ class RemoteG2Manager:
             else:
                 insert_value = device_indices
 
-            result = self.tree_cache.insert(InsertParams(key=key, value=insert_value))
+            insert_shared_blocks = getattr(
+                self.tree_cache, "insert_shared_hicache_device_blocks", None
+            )
+            if not callable(insert_shared_blocks):
+                raise RuntimeError(
+                    "tree cache does not support insert_shared_hicache_device_blocks"
+                )
+            result = insert_shared_blocks(key=key, value=insert_value)
             matched_length = result.prefix_len
             matched_new_tokens = min(max(0, matched_length - token_start), token_count)
             if matched_new_tokens > 0:

@@ -10,12 +10,12 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
 
-from sglang.srt.mem_cache.remote_g2.transfer import RemoteG2TransferBackend
-from sglang.srt.mem_cache.remote_g2.plan import (
-    REMOTE_G2_DIRECT_TIMEOUT_REASON,
-    RemoteG2Plan,
+from sglang.srt.mem_cache.shared_hicache.transfer import SharedHiCacheTransferBackend
+from sglang.srt.mem_cache.shared_hicache.plan import (
+    SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
+    SharedHiCachePlan,
 )
-from sglang.srt.mem_cache.remote_g2.source import ResolvedHostPage
+from sglang.srt.mem_cache.shared_hicache.source import ResolvedHostPage
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
         try:
             request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
-            logger.debug("Failed to set TCP_NODELAY on RemoteG2 control socket")
+            logger.debug("Failed to set TCP_NODELAY on SharedHiCache control socket")
         return request, client_address
 
 
@@ -44,7 +44,7 @@ def is_timeout_error(err: BaseException) -> bool:
 
 
 def is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    return str(reason).startswith(REMOTE_G2_DIRECT_TIMEOUT_REASON)
+    return str(reason).startswith(SHARED_HICACHE_DIRECT_TIMEOUT_REASON)
 
 
 def start_source_transfer_server(
@@ -163,7 +163,7 @@ def start_source_transfer_server(
                 self._write_json(200, response)
                 write_ms = (time.perf_counter() - write_start) * 1000
                 logger.debug(
-                    "RemoteG2 source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
+                    "SharedHiCache source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
                     self.path,
                     pre_handler_ms,
                     body_read_ms,
@@ -172,13 +172,13 @@ def start_source_transfer_server(
                     (time.perf_counter() - request_start) * 1000,
                 )
             except Exception as err:
-                logger.exception("Remote G2 source transfer failed")
+                logger.exception("Shared HiCache source transfer failed")
                 self._write_json(500, {"ok": False, "reason": str(err)})
             finally:
                 exit_resolver()
 
         def log_message(self, fmt, *args):
-            logger.debug("Remote G2 source resolver: " + fmt, *args)
+            logger.debug("Shared HiCache source resolver: " + fmt, *args)
 
         def _write_json(self, status_code: int, response: Mapping[str, Any]):
             data = json.dumps(response).encode("utf-8")
@@ -191,12 +191,12 @@ def start_source_transfer_server(
     server = _ReusableThreadingHTTPServer((host, port), Handler)
     thread = threading.Thread(
         target=server.serve_forever,
-        name=f"remote_g2-source-{host}:{port}",
+        name=f"shared_hicache-source-{host}:{port}",
         daemon=True,
     )
     thread.start()
     logger.info(
-        "Remote G2 source resolver listening on %s for worker_id=%s dp_rank=%s",
+        "Shared HiCache source resolver listening on %s for worker_id=%s dp_rank=%s",
         endpoint,
         worker_id,
         dp_rank,
@@ -214,7 +214,7 @@ def _coerce_int(value: Any, field_name: str) -> int:
 
 def pages_from_transfer_result(
     payload: Mapping[str, Any],
-    plan: RemoteG2Plan,
+    plan: SharedHiCachePlan,
     *,
     start_block: int,
     max_blocks: int,
@@ -234,9 +234,9 @@ def pages_from_transfer_result(
 
 def request_source_transfer(
     *,
-    transfer_backend: RemoteG2TransferBackend,
+    transfer_backend: SharedHiCacheTransferBackend,
     endpoints: list[str],
-    plan: RemoteG2Plan,
+    plan: SharedHiCachePlan,
     start_block: int,
     max_blocks: int,
     target_page_indices: list[int],
@@ -285,9 +285,9 @@ def request_source_transfer(
             UnicodeDecodeError,
         ) as err:
             if is_timeout_error(err):
-                last_reason = f"{REMOTE_G2_DIRECT_TIMEOUT_REASON}:{err}"
+                last_reason = f"{SHARED_HICACHE_DIRECT_TIMEOUT_REASON}:{err}"
                 logger.warning(
-                    "Remote G2 direct transfer timed out endpoint=%s ms=%.3f; target pages will be quarantined reason=%s",
+                    "Shared HiCache direct transfer timed out endpoint=%s ms=%.3f; target pages will be quarantined reason=%s",
                     endpoint,
                     (time.perf_counter() - request_start) * 1000,
                     last_reason,
@@ -295,7 +295,7 @@ def request_source_transfer(
                 return [], last_reason
             last_reason = f"source_transfer_failed:{err}"
             logger.debug(
-                "Remote G2 direct transfer request failed endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
+                "Shared HiCache direct transfer request failed endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
                 endpoint,
                 (time.perf_counter() - request_start) * 1000,
                 encode_ms,
@@ -310,7 +310,7 @@ def request_source_transfer(
         if not isinstance(payload, Mapping):
             last_reason = "malformed_source_transfer_response:not_object"
             logger.debug(
-                "Remote G2 direct transfer returned malformed response endpoint=%s ms=%.3f reason=%s",
+                "Shared HiCache direct transfer returned malformed response endpoint=%s ms=%.3f reason=%s",
                 endpoint,
                 (time.perf_counter() - request_start) * 1000,
                 last_reason,
@@ -321,14 +321,14 @@ def request_source_transfer(
         if not payload.get("ok"):
             if is_indeterminate_direct_transfer_reason(last_reason):
                 logger.warning(
-                    "Remote G2 direct transfer rejected with indeterminate target-page state endpoint=%s ms=%.3f reason=%s",
+                    "Shared HiCache direct transfer rejected with indeterminate target-page state endpoint=%s ms=%.3f reason=%s",
                     endpoint,
                     (time.perf_counter() - request_start) * 1000,
                     last_reason,
                 )
                 return [], last_reason
             logger.debug(
-                "Remote G2 direct transfer rejected endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s reason=%s",
+                "Shared HiCache direct transfer rejected endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s reason=%s",
                 endpoint,
                 (time.perf_counter() - request_start) * 1000,
                 encode_ms,
@@ -354,7 +354,7 @@ def request_source_transfer(
         except (TypeError, KeyError, ValueError) as err:
             last_reason = f"malformed_source_transfer_response:{err}"
             logger.debug(
-                "Remote G2 direct transfer returned malformed pages endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
+                "Shared HiCache direct transfer returned malformed pages endpoint=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
                 endpoint,
                 (time.perf_counter() - request_start) * 1000,
                 encode_ms,
@@ -366,7 +366,7 @@ def request_source_transfer(
             )
             continue
         logger.debug(
-            "Remote G2 direct transfer response endpoint=%s pages=%d ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f response_parse_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s source_bytes=%s reason=%s",
+            "Shared HiCache direct transfer response endpoint=%s pages=%d ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f response_parse_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s source_bytes=%s reason=%s",
             endpoint,
             len(pages),
             (time.perf_counter() - request_start) * 1000,

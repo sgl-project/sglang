@@ -184,7 +184,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-REMOTE_G2_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
+SHARED_HICACHE_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -648,8 +648,9 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
-    enable_remote_g2: bool = False
-    remote_g2_config: Optional[Union[str, Dict[str, Any]]] = None
+    enable_shared_hicache: bool = False
+    shared_hicache_worker_id: Optional[int] = None
+    shared_hicache_config: Optional[Union[str, Dict[str, Any]]] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -852,7 +853,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
-        self._handle_remote_g2()
+        self._handle_shared_hicache()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3669,7 +3670,7 @@ class ServerArgs:
             raise ValueError(f"{arg_name} must be a JSON object")
         return data
 
-    def _normalize_remote_g2_endpoint(
+    def _normalize_shared_hicache_endpoint(
         self, value: object, field_name: str
     ) -> Optional[str]:
         if value is None:
@@ -3680,23 +3681,24 @@ class ServerArgs:
             return value.strip()
         raise ValueError(f"{field_name} must be a non-empty string")
 
-    def _handle_remote_g2(self):
-        """Normalize RemoteG2 HiCache reuse knobs."""
+    def _handle_shared_hicache(self):
+        """Normalize Shared HiCache reuse knobs."""
         raw_config = self._load_json_object_config(
-            self.remote_g2_config, "--remote-g2-config"
+            self.shared_hicache_config, "--shared-hicache-config"
         )
         if raw_config is not None:
-            self.enable_remote_g2 = True
+            self.enable_shared_hicache = True
 
-        if not self.enable_remote_g2:
-            self.remote_g2_config = None
+        if not self.enable_shared_hicache:
+            self.shared_hicache_config = None
             return
 
-        self.enable_hierarchical_cache = True
-        if raw_config is None:
-            raise ValueError("--remote-g2-config requires worker_id")
+        if not self.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-shared-hicache requires --enable-hierarchical-cache"
+            )
 
-        config: Dict[str, Any] = dict(raw_config)
+        config: Dict[str, Any] = dict(raw_config or {})
         if any(
             key in config
             for key in (
@@ -3707,53 +3709,59 @@ class ServerArgs:
             )
         ):
             raise ValueError(
-                "remote_g2_config static endpoint maps are not supported; put the "
-                "local bind endpoint under control.endpoint and let each RemoteG2 "
+                "shared_hicache_config static endpoint maps are not supported; put the "
+                "local bind endpoint under control.endpoint and let each SharedHiCache "
                 "plan provide source_endpoint"
             )
         if "fetch_workers" in config:
             raise ValueError(
-                "remote_g2_config.fetch_workers is not supported; use "
-                "SGLANG_REMOTE_G2_FETCH_WORKERS"
+                "shared_hicache_config.fetch_workers is not supported; use "
+                "SGLANG_SHARED_HICACHE_FETCH_WORKERS"
             )
         if "transfer_parallelism" in config:
             raise ValueError(
-                "remote_g2_config.transfer_parallelism is not supported; use "
-                "SGLANG_REMOTE_G2_TRANSFER_PARALLELISM"
+                "shared_hicache_config.transfer_parallelism is not supported; use "
+                "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
             )
 
         control_config = config.get("control") or {}
         if not isinstance(control_config, dict):
-            raise ValueError("remote_g2_config.control must be a JSON object")
+            raise ValueError("shared_hicache_config.control must be a JSON object")
         if any(
             key in control_config
             for key in ("workers", "peer_endpoints", "static_peer_endpoints")
         ):
             raise ValueError(
-                "remote_g2_config.control static worker maps are not supported; "
-                "use source_endpoint from each RemoteG2 plan"
+                "shared_hicache_config.control static worker maps are not supported; "
+                "use source_endpoint from each SharedHiCache plan"
             )
         transfer_config = config.get("transfer") or {}
         if not isinstance(transfer_config, dict):
-            raise ValueError("remote_g2_config.transfer must be a JSON object")
+            raise ValueError("shared_hicache_config.transfer must be a JSON object")
         if "parallelism" in transfer_config:
             raise ValueError(
-                "remote_g2_config.transfer.parallelism is not supported; use "
-                "SGLANG_REMOTE_G2_TRANSFER_PARALLELISM"
+                "shared_hicache_config.transfer.parallelism is not supported; use "
+                "SGLANG_SHARED_HICACHE_TRANSFER_PARALLELISM"
             )
 
-        worker_id = config.get("worker_id")
+        worker_id = self.shared_hicache_worker_id
+        if "worker_id" in config:
+            worker_id = config["worker_id"]
         if worker_id is None:
-            raise ValueError("--remote-g2-config requires worker_id")
+            raise ValueError("--enable-shared-hicache requires --shared-hicache-worker-id")
         if not isinstance(worker_id, int) or isinstance(worker_id, bool):
-            raise ValueError("remote_g2_config.worker_id must be a non-negative integer")
+            raise ValueError(
+                "shared_hicache_worker_id must be a non-negative integer"
+            )
         if worker_id < 0:
-            raise ValueError("remote_g2_config.worker_id must be a non-negative integer")
+            raise ValueError(
+                "shared_hicache_worker_id must be a non-negative integer"
+            )
 
         if "control_backend" in config or "backend" in control_config:
             raise ValueError(
-                "remote_g2_config.control.backend is not supported; "
-                "RemoteG2 plans carry the source endpoint directly"
+                "shared_hicache_config.control.backend is not supported; "
+                "SharedHiCache plans carry the source endpoint directly"
             )
 
         transfer_backend = str(
@@ -3761,10 +3769,10 @@ class ServerArgs:
                 "transfer_backend", transfer_config.get("backend", "auto")
             )
         ).lower()
-        if transfer_backend not in REMOTE_G2_TRANSFER_BACKEND_CHOICES:
+        if transfer_backend not in SHARED_HICACHE_TRANSFER_BACKEND_CHOICES:
             raise ValueError(
-                "remote_g2_config.transfer_backend must be one of "
-                f"{REMOTE_G2_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
+                "shared_hicache_config.transfer_backend must be one of "
+                f"{SHARED_HICACHE_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
             )
 
         timeout_secs = config.get(
@@ -3772,20 +3780,21 @@ class ServerArgs:
             transfer_config.get("timeout_secs", control_config.get("timeout_secs", 1.0)),
         )
         if not isinstance(timeout_secs, (int, float)) or isinstance(timeout_secs, bool):
-            raise ValueError("remote_g2_config.timeout_secs must be a positive number")
+            raise ValueError("shared_hicache_config.timeout_secs must be a positive number")
         timeout_secs = float(timeout_secs)
         if timeout_secs <= 0:
-            raise ValueError("remote_g2_config.timeout_secs must be > 0")
+            raise ValueError("shared_hicache_config.timeout_secs must be > 0")
 
-        self.remote_g2_config = {
+        self.shared_hicache_config = {
             "worker_id": worker_id,
-            "control_endpoint": self._normalize_remote_g2_endpoint(
+            "control_endpoint": self._normalize_shared_hicache_endpoint(
                 control_config.get("endpoint", config.get("control_endpoint")),
-                "remote_g2_config.control.endpoint",
+                "shared_hicache_config.control.endpoint",
             ),
             "timeout_secs": timeout_secs,
             "transfer_backend": transfer_backend,
         }
+        self.shared_hicache_worker_id = worker_id
 
     def _handle_load_format(self):
         if (
@@ -6635,20 +6644,26 @@ class ServerArgs:
             help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
-            "--enable-remote-g2",
+            "--enable-shared-hicache",
             action="store_true",
-            default=ServerArgs.enable_remote_g2,
-            help="Enable RemoteG2 host-pinned KV cache sharing between workers.",
+            default=ServerArgs.enable_shared_hicache,
+            help="Enable Shared HiCache CPU-pinned KV cache sharing between workers.",
         )
         parser.add_argument(
-            "--remote-g2-config",
+            "--shared-hicache-worker-id",
+            type=int,
+            default=ServerArgs.shared_hicache_worker_id,
+            help="Explicit Shared HiCache worker id for prefix-warmup plans.",
+        )
+        parser.add_argument(
+            "--shared-hicache-config",
             type=str,
-            default=ServerArgs.remote_g2_config,
+            default=ServerArgs.shared_hicache_config,
             help=(
-                "JSON object or JSON file path for RemoteG2 remote "
-                "G2(host-pinned)->G1(GPU) KV reuse. Keys: worker_id, control, "
-                "transfer, timeout_secs, transfer_backend. Runtime "
-                "parallelism is controlled by SGLANG_REMOTE_G2_* env vars."
+                "JSON object or JSON file path for Shared HiCache peer-worker "
+                "CPU_PINNED->GPU KV reuse. Keys: control, transfer, "
+                "timeout_secs, transfer_backend. Runtime "
+                "parallelism is controlled by SGLANG_SHARED_HICACHE_* env vars."
             ),
         )
         parser.add_argument(

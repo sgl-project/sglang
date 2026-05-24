@@ -110,12 +110,12 @@ def cached_tokens_details_from_dict(
     details: Dict[str, Any],
 ) -> CachedTokensDetails:
     """Convert a raw cached_tokens_details dict to a CachedTokensDetails object."""
-    remote_g2 = details.get("remote_g2")
+    shared_hicache = details.get("shared_hicache")
     if "storage" in details:
         return CachedTokensDetails(
             device=details.get("device", 0),
             host=details.get("host", 0),
-            remote_g2=remote_g2,
+            shared_hicache=shared_hicache,
             storage=details.get("storage", 0),
             storage_backend=details.get("storage_backend"),
         )
@@ -123,7 +123,7 @@ def cached_tokens_details_from_dict(
         return CachedTokensDetails(
             device=details.get("device", 0),
             host=details.get("host", 0),
-            remote_g2=remote_g2,
+            shared_hicache=shared_hicache,
         )
 
 
