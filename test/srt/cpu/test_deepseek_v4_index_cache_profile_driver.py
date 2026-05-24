@@ -158,6 +158,45 @@ def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
     profile_driver.validate_trace_summaries(args, summaries)
 
 
+def test_dsv4_index_cache_profile_driver_accepts_server_info_without_spec_decode():
+    server_info = {
+        "speculative_algorithm": None,
+        "speculative_num_steps": 0,
+        "speculative_eagle_topk": None,
+        "speculative_num_draft_tokens": 0,
+    }
+
+    assert profile_driver.validate_server_info_for_base_path(server_info) == []
+
+
+def test_dsv4_index_cache_profile_driver_rejects_eagle_server_info():
+    server_info = {
+        "speculative_algorithm": "EAGLE",
+        "speculative_num_steps": 1,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 3,
+    }
+
+    with pytest.raises(RuntimeError, match="speculative_algorithm=EAGLE"):
+        profile_driver.validate_server_info_for_base_path(server_info)
+
+
+def test_dsv4_index_cache_profile_driver_rejects_nested_spec_server_info():
+    server_info = {
+        "decode": [
+            {
+                "speculative_algorithm": None,
+                "speculative_num_draft_tokens": "4",
+            }
+        ]
+    }
+
+    with pytest.raises(
+        RuntimeError, match=r"decode\[0\].speculative_num_draft_tokens=4"
+    ):
+        profile_driver.validate_server_info_for_base_path(server_info)
+
+
 def test_dsv4_index_cache_profile_driver_records_profile_dir_visibility_note():
     note = profile_driver.profile_dir_note(Path("/tmp/profiles"))
 
