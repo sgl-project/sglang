@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Iterator, Optional
+from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import torch
 
@@ -240,6 +240,59 @@ class CanaryManager:
         )
         sfm = self._single_forward_managers[self._active_single_forward_manager_index]
         sfm.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
+
+    @contextlib.contextmanager
+    def with_ops_outside_graph(
+        self,
+        *,
+        single_forward_indices: Sequence[int],
+        maybe_inaccurate_forward_batch: "ForwardBatch",
+    ) -> Iterator[None]:
+        self._pre_ops_outside_graph(
+            single_forward_indices=single_forward_indices,
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
+        )
+        try:
+            yield
+        finally:
+            self._post_ops_outside_graph(
+                single_forward_indices=single_forward_indices,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
+            )
+
+    def _pre_ops_outside_graph(
+        self,
+        *,
+        single_forward_indices: Sequence[int],
+        maybe_inaccurate_forward_batch: "ForwardBatch",
+    ) -> None:
+        for idx in single_forward_indices:
+            self._single_forward_managers[idx].pre_ops_outside_graph(
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+            )
+
+    def _post_ops_outside_graph(
+        self,
+        *,
+        single_forward_indices: Sequence[int],
+        maybe_inaccurate_forward_batch: "ForwardBatch",
+    ) -> None:
+        for idx in single_forward_indices:
+            self._single_forward_managers[idx].post_ops_outside_graph(
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+            )
+        if self.config.mode == "off":
+            return
+        self._sweep_orchestrator.maybe_run_sweep()
+        self._outer_step_counter += 1
+        self._violation_manager.step()
+        self._health_checker.step()
+        self._stats_logger.step()
+        if self._swa_divergence_report is not None:
+            self._swa_divergence_report.step(
+                outer_step_counter=self._outer_step_counter,
+                forward_batch=maybe_inaccurate_forward_batch,
+            )
 
     def mark_init_finished(self) -> None:
         """Reset every SingleForwardManager's phase tensor and enable its assert. Called
