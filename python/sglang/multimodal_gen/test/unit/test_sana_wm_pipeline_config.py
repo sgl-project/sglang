@@ -77,6 +77,20 @@ class TestSanaWMSamplingParams(unittest.TestCase):
         self.assertEqual(params.num_inference_steps, 20)
         self.assertEqual(params.guidance_scale, 4.5)
 
+    def test_build_request_extra_omits_camera_by_default(self) -> None:
+        params = SanaWMSamplingParams()
+        extra = params.build_request_extra()
+        self.assertNotIn("camera_to_world", extra)
+        self.assertNotIn("intrinsics", extra)
+
+    def test_build_request_extra_includes_camera_when_set(self) -> None:
+        cam = torch.eye(4).unsqueeze(0).expand(49, 4, 4)
+        intr = torch.eye(3).unsqueeze(0).expand(49, 3, 3)
+        params = SanaWMSamplingParams(camera_to_world=cam, intrinsics=intr)
+        extra = params.build_request_extra()
+        self.assertIs(extra["camera_to_world"], cam)
+        self.assertIs(extra["intrinsics"], intr)
+
 
 class TestSanaWMRegistry(unittest.TestCase):
     def setUp(self) -> None:

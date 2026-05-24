@@ -978,7 +978,13 @@ def _register_configs():
             "Efficient-Large-Model/Sana_1600M_512px_diffusers",
             "Efficient-Large-Model/Sana_600M_512px_diffusers",
         ],
-        model_detectors=[lambda hf_id: "sana" in hf_id.lower()],
+        model_detectors=[
+            lambda hf_id: (
+                "sana" in hf_id.lower()
+                and "sana-wm" not in hf_id.lower()
+                and "sana_wm" not in hf_id.lower()
+            )
+        ],
     )
 
     # FireRed-Image-Edit

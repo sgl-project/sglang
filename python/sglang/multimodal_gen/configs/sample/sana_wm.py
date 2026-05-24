@@ -1,12 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sampling parameters for SANA-WM TI2V world model generation."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Optional, Sequence, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+
+
+# Type alias for the camera tensor inputs. Accept torch.Tensor, numpy arrays,
+# or nested Python lists — coerced to torch.Tensor downstream in the stage.
+CameraTensorLike = Union[Any, Sequence[Sequence[Sequence[float]]]]
 
 
 @dataclass
@@ -17,6 +23,12 @@ class SanaWMSamplingParams(SamplingParams):
     SANA-WM generates 720p video (704×1280) at 16fps.
     Supported frame counts: must satisfy (num_frames - 1) % 8 == 0.
     Common choices: 49 (~3s), 81 (~5s), 121 (~7.5s), 321 (~20s), 961 (~60s).
+
+    Camera conditioning (optional):
+        camera_to_world: (T, 4, 4) extrinsic matrices, one per output frame.
+        intrinsics:      (T, 3, 3) pinhole intrinsics, one per output frame.
+        If either is None, the camera branch is bypassed and SANA-WM runs in
+        plain TI2V mode (text + first-frame image only).
     """
 
     data_type: DataType = DataType.VIDEO
@@ -40,3 +52,15 @@ class SanaWMSamplingParams(SamplingParams):
         "watermark, text, signature, ugly, noisy, artifacts, camera shake, "
         "jitter, lens flare"
     )
+
+    # --- Camera trajectory (6-DoF) — optional ---
+    camera_to_world: Optional[CameraTensorLike] = None
+    intrinsics: Optional[CameraTensorLike] = None
+
+    def build_request_extra(self) -> dict[str, Any]:
+        extra = super().build_request_extra()
+        if self.camera_to_world is not None:
+            extra["camera_to_world"] = self.camera_to_world
+        if self.intrinsics is not None:
+            extra["intrinsics"] = self.intrinsics
+        return extra

@@ -69,7 +69,11 @@ class SanaWMArchConfig(DiTArchConfig):
     gdn_bidirectional: bool = True
 
     # --- Camera conditioning ---
-    # Plücker raymap channels: VAE temporal stride=8 orig frames × 6 Plücker dims = 48
+    # VAE temporal compression factor (LTX-2 VAE is 8x temporal). Drives both
+    # the Plücker frame-packing channel count and any in-DiT fallback raymap
+    # computation. Must match `pipeline_config.vae_stride[0]`.
+    vae_temporal_stride: int = 8
+    # Plücker raymap channels: vae_temporal_stride orig frames × 6 Plücker dims
     chunk_plucker_channels: int = 48    # 8 original frames × 6D Plücker = 48 channels
     chunk_plucker_post_attn_blocks: int = 20   # all blocks receive Plücker mixing
 

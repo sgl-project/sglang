@@ -190,32 +190,13 @@ class SanaWMPipelineConfig(PipelineConfig):
         return latents
 
     def shard_latents_for_sp(self, batch, latents):
-        """SP sharding along temporal dim for multi-GPU inference."""
-        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-            get_sp_parallel_rank,
-            get_sp_world_size,
-        )
-        sp_world_size = get_sp_world_size()
-        if sp_world_size <= 1 or latents.dim() != 5:
-            return latents, False
-
-        T = latents.shape[2]
-        if T % sp_world_size != 0:
-            # Pad to divisible by SP degree
-            import torch as _torch
-            pad_len = sp_world_size - (T % sp_world_size)
-            pad = _torch.zeros((*latents.shape[:2], pad_len, *latents.shape[3:]),
-                               dtype=latents.dtype, device=latents.device)
-            latents = _torch.cat([latents, pad], dim=2)
-
-        rank = get_sp_parallel_rank()
-        T_total = latents.shape[2]
-        local_T = T_total // sp_world_size
-        latents = latents[:, :, rank * local_T:(rank + 1) * local_T]
-        return latents, True
+        # SANA-WM uses frame-wise GDN recurrent scan and a temporal depth-wise
+        # conv (GLUMBConvTemp, t_kernel=3) that both span across frames. Splitting
+        # the latent along T would truncate the GDN hidden state and drop the
+        # GLUMBConvTemp halo at rank boundaries, producing silent wrong outputs.
+        # Camera/Plücker tensors are also indexed in lockstep with T and would
+        # need matching shards. Disable SP until a halo-exchange-aware impl lands.
+        return latents, False
 
     def gather_latents_for_sp(self, latents):
-        from sglang.multimodal_gen.runtime.distributed.communication_op import (
-            sequence_model_parallel_all_gather,
-        )
-        return sequence_model_parallel_all_gather(latents.contiguous(), dim=2)
+        return latents

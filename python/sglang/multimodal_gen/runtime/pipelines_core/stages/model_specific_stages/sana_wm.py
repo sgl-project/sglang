@@ -243,7 +243,7 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
         if not hasattr(batch, "extra") or batch.extra is None:
             batch.extra = {}
 
-        # Extract camera tensors from the request (may have been set by server input parsing)
+        # Extract camera tensors from the request (set via SamplingParams or by server input parsing)
         camera_to_world = batch.extra.get("camera_to_world", None)
         intrinsics = batch.extra.get("intrinsics", None)
 
@@ -261,6 +261,17 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
                 sp_h = latent_shape[3]
                 sp_w = latent_shape[4]
                 vae_temporal_stride = self.pipeline_config.vae_stride[0]
+
+                # Coerce to torch.Tensor so list/numpy inputs from API users work.
+                if not isinstance(camera_to_world, torch.Tensor):
+                    camera_to_world = torch.as_tensor(camera_to_world)
+                if not isinstance(intrinsics, torch.Tensor):
+                    intrinsics = torch.as_tensor(intrinsics)
+                # Add batch dim if missing: (T, 4, 4) -> (1, T, 4, 4)
+                if camera_to_world.dim() == 3:
+                    camera_to_world = camera_to_world.unsqueeze(0)
+                if intrinsics.dim() == 3:
+                    intrinsics = intrinsics.unsqueeze(0)
 
                 camera_to_world = camera_to_world.to(device=device, dtype=dtype)
                 intrinsics = intrinsics.to(device=device, dtype=dtype)

@@ -933,6 +933,7 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self.out_channels = arch.out_channels
         self.attention_head_dim = arch.attention_head_dim
         self.softmax_block_indices = set(arch.softmax_block_indices)
+        self.vae_temporal_stride = arch.vae_temporal_stride
 
         # Video patch embedding: project (B, C, T, H, W) spatial tokens
         # patch_size=1 means each latent voxel is one token
@@ -1143,14 +1144,13 @@ class SanaWMTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         # --- 6. Compute Plücker raymaps (fine camera) if not pre-computed ---
         if plucker is None and camera_to_world is not None and intrinsics is not None:
             try:
-                vae_temporal_stride = 8  # LTX-2 VAE temporal compression
                 plucker = self.compute_plucker(
                     camera_to_world=camera_to_world,
                     intrinsics=intrinsics,
                     sp_h=sp_h,
                     sp_w=sp_w,
                     latent_scale=p * 32,
-                    vae_temporal_stride=vae_temporal_stride,
+                    vae_temporal_stride=self.vae_temporal_stride,
                 )
             except Exception as e:
                 logger.warning(f"Plücker computation failed: {e}. Disabling Plücker mixing.")

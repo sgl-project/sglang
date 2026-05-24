@@ -222,17 +222,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "Representative LTX-2 VAE accuracy is already covered by ltx_2_two_stage_t2v for the same source component and topology"
         ),
     },
-    "sana_wm_ti2v_2gpu": {
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "SANA-WM custom DiT (GDN/UCPE/Plücker) has no faithful standalone Diffusers component contract for harness comparison"
-        ),
-        ComponentType.VAE: ComponentSkip(
-            "Representative LTX-2 VAE accuracy is already covered by ltx_2_two_stage_t2v for the same source component and topology"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Representative text encoder accuracy is already covered by sana_wm_ti2v for the same source component and topology"
-        ),
-    },
     "turbo_wan2_1_t2v_1.3b": {
         ComponentType.TRANSFORMER: ComponentSkip(
             "Weight transfer match ratio too low for reliable comparison"
