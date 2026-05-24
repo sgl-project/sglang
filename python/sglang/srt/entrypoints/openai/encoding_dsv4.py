@@ -136,12 +136,12 @@ def tool_calls_to_openai_format(tool_calls):
     ]
 
 
-def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
+def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
     """
     Encode tool call arguments into DSML parameter format.
 
     Args:
-        tool_call: Dict with "name" and "arguments" (JSON string) keys.
+        tool_call: Dict with "name" and "arguments" keys.
 
     Returns:
         DSML-formatted parameter string.
@@ -149,10 +149,26 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = '<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>'
     P_dsml_strs = []
 
-    try:
-        arguments = json.loads(tool_call["arguments"])
-    except Exception as err:
-        arguments = {"arguments": tool_call["arguments"]}
+    raw_arguments = tool_call["arguments"]
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    elif isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError as err:
+            raise ValueError(
+                "tool_calls[].function.arguments must be a JSON object string."
+            ) from err
+    else:
+        raise ValueError(
+            "tool_calls[].function.arguments must be a JSON object string."
+        )
+
+    if not isinstance(arguments, dict):
+        raise ValueError(
+            "tool_calls[].function.arguments must decode to a JSON object, "
+            f"but got {type(arguments).__name__}."
+        )
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

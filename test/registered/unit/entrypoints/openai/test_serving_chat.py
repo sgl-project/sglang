@@ -59,6 +59,7 @@ class _MockTokenizerManager:
         self.tokenizer.decode.return_value = "Test response"
         self.tokenizer.chat_template = None
         self.tokenizer.bos_token_id = 1
+        self.request_logger = Mock(log_requests=False, log_requests_level=0)
 
         # async generator stub for generate_request
         async def _mock_generate():
@@ -886,6 +887,47 @@ class ServingChatTestCase(unittest.TestCase):
             out.index("<｜User｜>"),
         )
         self.assertIn("<｜Assistant｜>", out)
+
+    def test_dsv4_tool_call_arguments_string_literal_returns_bad_request(self):
+        """Malformed assistant tool-call arguments should surface as a 400."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "string"
+        self.chat.chat_encoding_spec = "dsv4"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "user", "content": "Call the tool."},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": '"not an object"',
+                            },
+                        }
+                    ],
+                },
+            ],
+        )
+
+        loop = get_or_create_event_loop()
+        with patch.object(
+            encoding_dsv4, "encode_messages", wraps=encoding_dsv4.encode_messages
+        ) as encode_messages_mock:
+            response = loop.run_until_complete(
+                self.chat.handle_request(req, self.fastapi_request)
+            )
+
+        encode_messages_mock.assert_called_once()
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        body = json.loads(response.body)
+        self.assertEqual(body["type"], "BadRequest")
+        self.assertIn("tool_calls[].function.arguments", body["message"])
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""
