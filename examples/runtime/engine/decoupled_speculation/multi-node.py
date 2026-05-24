@@ -691,7 +691,7 @@ def print_decoupled_spec_layout(
         f"target_gpus_per_node={target_gpus_per_node}"
     )
     print(f"ndrafter={args.num_draft_replicas}, tp_size={args.draft_tp_size}")
-    for node_index, host in enumerate(sorted(node_layout), start=1):
+    for node_index, host in enumerate(sorted(node_layout)):
         items = ", ".join(node_layout[host]) if node_layout[host] else "idle"
         print(f"node{node_index} ({host}): {items}")
 
