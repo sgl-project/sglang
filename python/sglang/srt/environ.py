@@ -199,6 +199,18 @@ class Envs:
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Gemma multimodal models shift positions by +1 before feeding them into
+    # RoPE (the pretrained checkpoint was trained against 1-indexed positions).
+    # Historically this was done in-place (``positions += 1``), which mutates
+    # ``forward_batch.positions`` for the rest of the request. kv_canary's
+    # WRITE kernels read ``forward_batch.positions`` directly while VERIFY
+    # derives expected positions from 0-indexed prefix arithmetic, so the
+    # in-place shift produces systematic position-mismatch violations on every
+    # Gemma multimodal forward. Setting this flag flips the shift to
+    # out-of-place so ``forward_batch.positions`` stays canonical 0-indexed.
+    # Default is False to preserve historical behavior; test harnesses that
+    # enable kv_canary on Gemma multimodal models must turn it on.
+    SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
