@@ -97,6 +97,7 @@ FLASHINFER_MAX_SEQLEN_BUCKETS = [
 HOPPER_TMA_ALIGN_BYTE = 16
 FA3_ENABLE_FP8_SHAPE = 2400
 
+
 @dataclasses.dataclass
 class SingletonCache:
     data: Any = None
@@ -383,6 +384,7 @@ class VisionTritonAttention(nn.Module):
 
         return output
 
+
 def pad_last_dim_to_multiple_zero(x: torch.Tensor, multiple: int):
     orig_d = x.shape[-1]
     padded_d = ((orig_d + multiple - 1) // multiple) * multiple
@@ -397,6 +399,7 @@ def pad_last_dim_to_multiple_zero(x: torch.Tensor, multiple: int):
     )
     out[..., :orig_d] = x
     return out, orig_d
+
 
 class VisionFlash3Attention(nn.Module):
     def __init__(
@@ -439,7 +442,7 @@ class VisionFlash3Attention(nn.Module):
         """
         window_size = kwargs.get("window_size", (-1, -1))
         s_aux = kwargs.get("s_aux", None)
-        
+
         if envs.SGLANG_VISION_ATTN_FP8.get():
             if isinstance(cu_seqlens, list):
                 cu_seqlens_tensor = cu_seqlens[0]
@@ -528,10 +531,10 @@ class VisionFlash3Attention(nn.Module):
                 max_seqlen_k=max_seqlen,
                 window_size=window_size,
             )
-            
+
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
-            
+
             max_seqlen = cu_seqlens[1]
             if use_fp8:
                 fa_kwargs["q_descale"] = scale_q
@@ -539,27 +542,19 @@ class VisionFlash3Attention(nn.Module):
                 fa_kwargs["v_descale"] = scale_v
                 fa_kwargs["softmax_scale"] = attn_softmax_scale
                 output = flash_attn_varlen_func(
-                    q_quant_pad,
-                    k_quant_pad,
-                    v_quant_pad,
-                    **fa_kwargs
+                    q_quant_pad, k_quant_pad, v_quant_pad, **fa_kwargs
                 )
-                
+
                 ret = output[:, :, :ori_headsize]
             else:
                 fa_kwargs["softmax_scale"] = softmax_scale
-                ret = flash_attn_varlen_func(
-                    q,
-                    k,
-                    v,
-                    **fa_kwargs
-                )
+                ret = flash_attn_varlen_func(q, k, v, **fa_kwargs)
         else:
             cu_seqlens = resolve_seqlens(cu_seqlens, bsz, seq_len, device=q.device)
             cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
-            
+
             fa_kwargs = dict(
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_k=cu_seqlens,
@@ -567,7 +562,7 @@ class VisionFlash3Attention(nn.Module):
                 max_seqlen_k=max_seqlen,
                 window_size=window_size,
             )
-            
+
             if s_aux is not None:
                 fa_kwargs["sinks"] = s_aux
 
@@ -592,7 +587,6 @@ class VisionFlash3Attention(nn.Module):
                     **fa_kwargs,
                 )
         return ret
-
 
 
 class VisionFlash4Attention(nn.Module):
