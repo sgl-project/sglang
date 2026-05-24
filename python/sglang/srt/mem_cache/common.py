@@ -532,7 +532,8 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     batch.maybe_evict_swa()
 
-    bs = batch.seq_lens.shape[0]
+    seq_lens_gpu = batch.seq_lens
+    bs = seq_lens_gpu.shape[0]
 
     allocator = batch.tree_cache.token_to_kv_pool_allocator
     if allocator.page_size == 1:
@@ -541,9 +542,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         # Paged allocation
         last_loc = batch.req_to_token_pool.req_to_token[
-            batch.req_pool_indices, batch.seq_lens - 1
+            batch.req_pool_indices, seq_lens_gpu - 1
         ]
-        seq_lens_next = batch.seq_lens + token_per_req
+        seq_lens_next = seq_lens_gpu + token_per_req
         out_cache_loc = alloc_paged_token_slots_decode(
             tree_cache=batch.tree_cache,
             seq_lens=seq_lens_next,
@@ -554,9 +555,9 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     # Write to req_to_token_pool
     if batch.model_config.is_encoder_decoder:
-        locs = batch.encoder_lens + batch.seq_lens
+        locs = batch.encoder_lens + seq_lens_gpu
     else:
-        locs = batch.seq_lens.clone()
+        locs = seq_lens_gpu.clone()
 
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
