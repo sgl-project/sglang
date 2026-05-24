@@ -1314,8 +1314,12 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         )
         try:
             torch._dynamo.mark_dynamic(dummy, 0)
-        except Exception:
+        except Exception as e:
             # Best-effort; different torch versions may expose this differently.
+            logger.warning(
+                "Failed to mark tensor as dynamic for PCG: %s. This may cause performance degradation.",
+                e,
+            )
             pass
         kwargs["input_deepstack_embeds"] = dummy
         return kwargs
