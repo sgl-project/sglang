@@ -243,6 +243,11 @@ def main(argv: list[str] | None = None) -> None:
             break
 
     artifacts = validation_artifacts(args)
+    artifact_status = {
+        name: {"path": str(path), "exists": path.exists()}
+        for name, path in artifacts.items()
+    }
+    artifact_status["validation_summary"]["exists"] = True
     summary = {
         "eagle": (
             "confirmed off"
@@ -265,10 +270,7 @@ def main(argv: list[str] | None = None) -> None:
         },
         "quality_eval_repeats": args.eval_repeats,
         "phases": results,
-        "artifacts": {
-            name: {"path": str(path), "exists": path.exists()}
-            for name, path in artifacts.items()
-        },
+        "artifacts": artifact_status,
     }
     artifacts["validation_summary"].write_text(json.dumps(summary, indent=2) + "\n")
 

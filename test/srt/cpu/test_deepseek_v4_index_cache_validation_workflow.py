@@ -287,7 +287,7 @@ def test_dsv4_index_cache_validation_workflow_dry_run_writes_summary(tmp_path):
         },
         "validation_summary": {
             "path": str(output_dir / "validation_summary.json"),
-            "exists": False,
+            "exists": True,
         },
     }
     assert [phase["phase"] for phase in summary["phases"]] == [
