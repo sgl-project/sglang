@@ -16,11 +16,11 @@ patches:
     edits:
       - match: |
           forward_batch.out_cache_loc = out_cache_loc[i]
-          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+          spec_info.hidden_states = hidden_states
         replacement: |
           forward_batch.out_cache_loc = out_cache_loc[i]
           forward_batch.positions.add_(1)
-          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+          spec_info.hidden_states = hidden_states
       - match: |
           hidden_states = logits_output.hidden_states
           forward_batch.positions.add_(1)
@@ -31,11 +31,11 @@ patches:
     edits:
       - match: |
           forward_batch.out_cache_loc = out_cache_loc[i]
-          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+          spec_info.hidden_states = hidden_states
         replacement: |
           forward_batch.out_cache_loc = out_cache_loc[i]
           forward_batch.positions.add_(1)
-          forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+          spec_info.hidden_states = hidden_states
       - match: |
           hidden_states = logits_output.hidden_states
           forward_batch.positions.add_(1)
