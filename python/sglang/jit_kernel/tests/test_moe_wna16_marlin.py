@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
     prepare_moe_nvfp4_layer_for_marlin,
 )
+from sglang.srt.utils.common import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
     awq_marlin_quantize,
@@ -30,13 +31,6 @@ def _has_aot_moe_wna16_marlin_gemm() -> bool:
 
 
 AOT_AVAILABLE = _has_aot_moe_wna16_marlin_gemm()
-
-
-def _is_sm80_sm90_cuda() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    major, minor = torch.cuda.get_device_capability()
-    return 80 <= major * 10 + minor < 100
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):
@@ -356,7 +350,7 @@ def test_moe_wna16_marlin_gemm(
 
 
 @pytest.mark.skipif(
-    not _is_sm80_sm90_cuda(),
+    not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
 )
 def test_fused_marlin_moe_non_gated_relu2():
@@ -419,7 +413,7 @@ def test_fused_marlin_moe_non_gated_relu2():
 
 
 @pytest.mark.skipif(
-    not _is_sm80_sm90_cuda(),
+    not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
@@ -515,7 +509,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
 
 
 @pytest.mark.skipif(
-    not _is_sm80_sm90_cuda(),
+    not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
 )
 def test_fused_marlin_moe_nvfp4_non_gated_matches_dequant_reference():
