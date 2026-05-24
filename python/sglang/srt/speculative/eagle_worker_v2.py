@@ -591,6 +591,7 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
+
         canary_outside_ctx = (
             c.with_ops_outside_graph(
                 single_forward_indices=[0],
@@ -658,6 +659,7 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
+
         canary_outside_ctx = (
             c.with_ops_outside_graph(
                 single_forward_indices=[0],
