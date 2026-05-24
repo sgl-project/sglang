@@ -197,7 +197,6 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         skip_prefill: bool = False,
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
-        skip_init_workspace_buffer: bool = False,
     ):
         super().__init__()
 
@@ -205,7 +204,10 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
         self.skip_prefill = skip_prefill
-        self.skip_init_workspace_buffer = skip_init_workspace_buffer
+        # Pool refs — captured at construction so they survive deletion of the
+        # corresponding ForwardBatch fields.
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_chunk_kv = (
             not skip_prefill
             and get_global_server_args().disaggregation_mode != "decode"
@@ -215,18 +217,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
 
         # Allocate buffers
-        if skip_init_workspace_buffer:
-            self.workspace_buffer = None
-        else:
-            global global_workspace_buffer
-            if global_workspace_buffer is None:
-                # different from flashinfer zero_init_global_workspace_buffer
-                global_workspace_buffer = torch.empty(
-                    envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
-                    dtype=torch.uint8,
-                    device=model_runner.device,
-                )
-            self.workspace_buffer = global_workspace_buffer
+        global global_workspace_buffer
+        if global_workspace_buffer is None:
+            # different from flashinfer zero_init_global_workspace_buffer
+            global_workspace_buffer = torch.empty(
+                envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.get(),
+                dtype=torch.uint8,
+                device=model_runner.device,
+            )
+        self.workspace_buffer = global_workspace_buffer
 
         max_bs = model_runner.req_to_token_pool.size
         if kv_indptr_buf is None:
@@ -248,53 +247,42 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         else:
             self.q_indptr_decode = q_indptr_decode_buf
 
-        if skip_init_workspace_buffer:
-            self.fmha_backend = None
-            self.prefill_wrapper_ragged = None
-            self.prefill_wrapper_paged = None
-            self.prefill_wrapper_verify = None
-            self.decode_wrapper = None
-            self.indices_updater_prefill = None
-            self.indices_updater_decode = None
+        if is_sm100_supported():
+            self.fmha_backend = "cutlass"
         else:
-            if is_sm100_supported():
-                self.fmha_backend = "cutlass"
-            else:
-                self.fmha_backend = "auto"
+            self.fmha_backend = "auto"
 
-            self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
-                self.workspace_buffer, "NHD", backend=self.fmha_backend
+        self.prefill_wrapper_ragged = BatchPrefillWithRaggedKVCacheWrapper(
+            self.workspace_buffer, "NHD", backend=self.fmha_backend
+        )
+
+        if not self.skip_prefill:
+            self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                backend="auto",
             )
 
-            if not self.skip_prefill:
-                self.prefill_wrapper_paged = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    backend="auto",
-                )
-
-                # FlashinferMLA backend uses mla wrapper for target verify
-                self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
-                    self.workspace_buffer,
-                    backend="auto",
-                )
-
-            self.decode_wrapper = BatchMLAPagedAttentionWrapper(
-                self.workspace_buffer, backend="auto"
+            # FlashinferMLA backend uses mla wrapper for target verify
+            self.prefill_wrapper_verify = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer,
+                backend="auto",
             )
 
-            # Create indices updater
-            if not skip_prefill:
-                self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
-                    model_runner, self
-                )
-                if self.enable_chunk_kv:
-                    self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(
-                        model_runner, self
-                    )
+        self.decode_wrapper = BatchMLAPagedAttentionWrapper(
+            self.workspace_buffer, backend="auto"
+        )
 
-            self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
+        # Create indices updater
+        if not skip_prefill:
+            self.indices_updater_prefill = FlashInferMLAIndicesUpdaterPrefill(
                 model_runner, self
             )
+            if self.enable_chunk_kv:
+                self.mha_chunk_kv_cache = FlashInferMhaChunkKVRunner(model_runner, self)
+
+        self.indices_updater_decode = FlashInferMLAIndicesUpdaterDecode(
+            model_runner, self
+        )
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
@@ -560,11 +548,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                        layer, cache_loc, k, k_rope
-                    )
+                    self.token_to_kv_pool.set_mla_kv_buffer(layer, cache_loc, k, k_rope)
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
         if q_rope is not None:
             q = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -588,9 +574,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             # mla paged prefill
-            k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-                q.dtype
-            )
+            k_buf = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
             if q_rope is None:
                 qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
                 q, q_rope = (
@@ -627,14 +611,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             assert v is not None
             if save_kv_cache:
                 if k_rope is not None:
-                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    self.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
                 else:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer,
                         cache_loc,
                         k,
@@ -652,9 +636,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             q_nope = reshaped_q[:, :, : layer.v_head_dim]
             q_rope = reshaped_q[:, :, layer.v_head_dim :]
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
-            q.dtype
-        )
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id).to(q.dtype)
 
         o = q_nope.new_empty(q_nope.shape)
         # Direct call to run without the wrapper
@@ -960,6 +942,7 @@ class FlashInferMLAMultiStepDraftBackend:
         self.max_context_len = self.attn_backends[0].max_context_len
 
         # Cached variables for generate_draft_decode_kv_indices
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
         self.page_size = model_runner.server_args.page_size
 
@@ -977,7 +960,7 @@ class FlashInferMLAMultiStepDraftBackend:
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,

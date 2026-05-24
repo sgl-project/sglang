@@ -25,7 +25,10 @@ from sglang.srt.disaggregation.base.conn import (
     KVPoll,
     KVTransferMetric,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
@@ -235,19 +238,11 @@ class CommonKVManager(BaseKVManager):
 
         # Sanity checks
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
-            if self.server_args.enable_hisparse:
-                # HiSparse: decode host pool page_size=1, prefill device pool page_size >= 1.
-                # Transfer will use send_kvcache_hisparse with per-token item_lens.
-                logger.info(
-                    f"HiSparse PD transfer mode: prefill page_size={info.page_size}, "
-                    f"decode host page_size={self.kv_args.page_size}"
-                )
-            else:
-                raise RuntimeError(
-                    f"Page size mismatch: prefill server has page_size={info.page_size}, "
-                    f"but decode server has page_size={self.kv_args.page_size}. "
-                    f"Both servers must use the same --page-size value."
-                )
+            raise RuntimeError(
+                f"Page size mismatch: prefill server has page_size={info.page_size}, "
+                f"but decode server has page_size={self.kv_args.page_size}. "
+                f"Both servers must use the same --page-size value."
+            )
 
         if (
             info.kv_cache_dtype is not None
@@ -602,6 +597,92 @@ class CommonKVManager(BaseKVManager):
 
         return src_kv_ptrs, sliced_dst
 
+    def _start_heartbeat_checker_thread(self):
+        """Start the heartbeat checker thread for Decode worker."""
+
+        def heartbeat_checker():
+            while True:
+                time.sleep(self.heartbeat_interval)
+                with self.connection_lock:
+                    addresses = list(self.prefill_info_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+                            self._on_heartbeat_success(bootstrap_addr)
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
+
+        threading.Thread(target=heartbeat_checker, daemon=True).start()
+
+    def _on_heartbeat_success(self, bootstrap_addr: str):
+        """Hook called on successful heartbeat. Override for backend-specific cleanup."""
+        pass
+
+    def _handle_node_failure(self, failed_bootstrap_addr: str):
+        """Handle failure of a prefill node."""
+        with self.connection_lock:
+            keys_to_remove = [
+                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+            ]
+            for k in keys_to_remove:
+                del self.connection_pool[k]
+            self.prefill_info_table.pop(failed_bootstrap_addr, None)
+
+            possible_affected_rooms = self.addr_to_rooms_tracker.get(
+                failed_bootstrap_addr, []
+            )
+            self.addr_to_rooms_tracker.pop(failed_bootstrap_addr, None)
+
+        affected_rooms = []
+        for room in possible_affected_rooms:
+            if (
+                room in self.request_status
+                and self.check_status(room) != KVPoll.Success
+            ):
+                self.record_failure(
+                    room,
+                    f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr})",
+                )
+                self.update_status(room, KVPoll.Failed)
+                affected_rooms.append(room)
+
+        logger.error(
+            f"Lost connection with prefill instance (bootstrap_addr: {failed_bootstrap_addr}), "
+            f"{len(affected_rooms)} requests affected"
+        )
+
 
 class CommonKVSender(BaseKVSender):
     def __init__(
@@ -622,6 +703,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_num_state_indices = 0
         # inner state
         self.curr_idx = 0
+        self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
@@ -675,10 +757,10 @@ class CommonKVSender(BaseKVSender):
         )
 
     def pop_decode_prefix_len(self) -> int:
-        return 0
+        return self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, 0)
 
     def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
-        return num_pages > 0
+        return num_pages > 0 or last_chunk
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
@@ -699,12 +781,61 @@ class CommonKVSender(BaseKVSender):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
 
+    def _prepare_send_indices(
+        self,
+        kv_indices: npt.NDArray[np.int32],
+        state_indices: Optional[List] = None,
+    ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
+        """Common pre-processing for send(): index tracking and CP-rank handling.
+
+        Returns:
+            (kv_indices, index_slice, is_last_chunk, should_skip)
+            If should_skip is True, the caller should return immediately.
+        """
+        index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
+        self.curr_idx += len(kv_indices)
+        is_last_chunk = self.curr_idx == self.num_kv_indices
+
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last_chunk:
+                return kv_indices, index_slice, is_last_chunk, True
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return kv_indices, index_slice, is_last_chunk, True
+
+        return kv_indices, index_slice, is_last_chunk, False
+
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
         pass
+
+    def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
+        if self.init_time is None:
+            return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.bootstrap_timeout:
+            return None
+        logger.warning_once(
+            "Some requests timed out when bootstrapping, "
+            "which means prefill instances fail to receive the KV indices from the decode instance of this request. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.Bootstrapping",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return KVPoll.Failed
 
     def poll(self) -> KVPoll:
         pass
@@ -745,6 +876,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr = mgr
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        self.init_time: Optional[float] = None
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
@@ -913,6 +1045,24 @@ class CommonKVReceiver(BaseKVReceiver):
         state_indices: Optional[List[int]] = None,
     ):
         raise NotImplementedError
+
+    def _check_waiting_timeout(self) -> Optional[KVPoll]:
+        if self.init_time is None:
+            return None
+        elapsed = time.time() - self.init_time
+        if elapsed < self.kv_mgr.waiting_timeout:
+            return None
+        logger.warning_once(
+            "Some requests fail to receive KV Cache transfer done signal after bootstrapping. "
+            "If a greater mean TTFT is acceptable, you can 'export SGLANG_DISAGGREGATION_WAITING_TIMEOUT=600' (10 minutes) to relax the timeout condition. "
+        )
+        self.kv_mgr.record_failure(
+            self.bootstrap_room,
+            f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s "
+            f"in KVPoll.WaitingForInput",
+        )
+        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        return KVPoll.Failed
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")

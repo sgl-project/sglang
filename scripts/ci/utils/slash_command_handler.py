@@ -282,23 +282,46 @@ def has_sgl_kernel_changes(pr):
         return False
 
 
-def handle_tag_run_ci(gh_repo, pr, comment, user_perms, react_on_success=True):
+def handle_tag_run_ci(
+    gh_repo, pr, comment, user_perms, react_on_success=True, tag_extra=False
+):
     """
     Handles the /tag-run-ci-label command.
+
+    When tag_extra is True (triggered by the `extra` argument), also adds the
+    `run-ci-extra` label. pr-test-extra.yml gates on BOTH `run-ci` and
+    `run-ci-extra`, so both must be present for the extra workflow to run —
+    we always add `run-ci` alongside `run-ci-extra`. Reuses the same
+    `can_tag_run_ci_label` permission.
+
+    How fresh runs get dispatched: pr-test.yml and pr-test-extra.yml both
+    include `labeled` in `on.pull_request.types`, so adding a label fires a
+    new `pull_request.labeled` event with the up-to-date label set in its
+    payload, which spawns a fresh workflow run that satisfies the
+    `check-changes.if` gate. Note that this is the ONLY way to "un-skip" a
+    label-gated run — `run.rerun()` on a previously-skipped pull_request run
+    reuses the original event payload (frozen labels), so it would skip
+    again. handle_rerun_failed_ci can't recover label-skipped runs; the
+    labeled event is the recovery mechanism.
+
     Returns True if action was taken, False otherwise.
     """
     if not user_perms.get("can_tag_run_ci_label", False):
         print("Permission denied: can_tag_run_ci_label is false.")
         return False
 
-    print("Permission granted. Adding 'run-ci' label.")
-    pr.add_to_labels("run-ci")
+    labels = ["run-ci"]
+    if tag_extra:
+        labels.append("run-ci-extra")
+    print(f"Permission granted. Adding labels: {labels}.")
+    for label in labels:
+        pr.add_to_labels(label)
 
     if react_on_success:
         comment.create_reaction("+1")
-        print("Label added and comment reacted.")
+        print("Labels added and comment reacted.")
     else:
-        print("Label added (reaction suppressed).")
+        print("Labels added (reaction suppressed).")
 
     return True
 
@@ -366,6 +389,14 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     #   core.setFailed(...) so their conclusion is "failure" and are covered.
     # - skipped: the entire run was skipped (no jobs ran), so there are no
     #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    #
+    #   Caveat: GitHub's `run.rerun()` reuses the original event payload, so
+    #   reruns of `pull_request`-event runs that were skipped because their
+    #   `if` evaluated to false (e.g. missing label) will skip again — the
+    #   label set in the frozen payload doesn't update. To un-skip a
+    #   label-gated workflow, add the missing label (the `labeled` event
+    #   dispatches a fresh run with the current label set); this function
+    #   cannot recover those by rerun alone.
     # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
     #   builds are success yet, full-rerun failure runs too — Build Wheel
     #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
@@ -1071,19 +1102,24 @@ def main():
 
     # 4. Parse Command and Execute
     first_line = comment_body.split("\n")[0].strip()
+    # `extra` argument opts in to also tagging `run-ci-extra`. Both
+    # `/tag-run-ci-label extra` and `/tag-and-rerun-ci extra` share this
+    # parser so the surface is symmetric.
+    tokens = first_line.split()
+    tag_extra = len(tokens) > 1 and "extra" in tokens[1:]
 
     if first_line.startswith("/tag-run-ci-label"):
-        handle_tag_run_ci(repo, pr, comment, user_perms)
+        handle_tag_run_ci(repo, pr, comment, user_perms, tag_extra=tag_extra)
 
     elif first_line.startswith("/rerun-failed-ci"):
         handle_rerun_failed_ci(repo, pr, comment, user_perms)
 
     elif first_line.startswith("/tag-and-rerun-ci"):
         # Perform both actions, but suppress individual reactions
-        print("Processing combined command: /tag-and-rerun-ci")
+        print(f"Processing combined command: /tag-and-rerun-ci (tag_extra={tag_extra})")
 
         tagged = handle_tag_run_ci(
-            repo, pr, comment, user_perms, react_on_success=False
+            repo, pr, comment, user_perms, react_on_success=False, tag_extra=tag_extra
         )
 
         # Wait for the label to propagate before triggering rerun
