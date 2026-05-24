@@ -106,6 +106,14 @@ def launch_canary_write_kernel_torch_reference(
         seed_slot = int(seed_slot_indices_host[r].item())
         running_prev_hash = compute_slot_hash(buf_i64, seed_slot)
 
+        # Geometric expected_position base — see canary_write.cuh for the rationale.
+        if seed_slot < 0:
+            expected_position_base = 0
+        else:
+            expected_position_base = 1 + int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
+            )
+
         for entry_offset in range(entry_count):
             entry_idx = entry_start + entry_offset
             slot = int(out_cache_loc_host[entry_idx].item())
@@ -113,6 +121,7 @@ def launch_canary_write_kernel_torch_reference(
                 continue
             token = int(input_ids_host[entry_idx].item())
             position = int(positions_host[entry_idx].item())
+            expected_position_geometric = expected_position_base + entry_offset
 
             real_kv_hash_u64 = _compute_real_kv_hash_scalar(
                 slot_idx=slot,
@@ -120,6 +129,22 @@ def launch_canary_write_kernel_torch_reference(
                 real_kv_hash_mode=real_kv_hash_mode,
                 work_device=work_device,
             )
+
+            if position != expected_position_geometric:
+                row = [0] * consts.VIOLATION_FIELDS
+                row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
+                row[consts.VIOLATION_FIELD_SLOT_IDX] = slot
+                row[consts.VIOLATION_FIELD_POSITION] = position
+                row[consts.VIOLATION_FIELD_STORED_TOKEN] = token
+                row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = 0
+                row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                    running_prev_hash
+                )
+                row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position_geometric
+                row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(
+                    consts.FailReason.WRITE_POSITION_MISMATCH
+                )
+                violation_rows.append(row)
 
             if enable_assert_inputs:
                 assert expected_input_tokens_host is not None

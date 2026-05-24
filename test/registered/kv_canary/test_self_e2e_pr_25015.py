@@ -74,7 +74,7 @@ class _EaglePositionsBase(CanaryE2EBase):
             # violation kills the scheduler before the draft slot itself
             # appears in a later prefix). Either signal proves canary caught
             # the regression; accept whichever fires first.
-            for reason in ("position", "chain_hash"):
+            for reason in ("write_position", "position", "chain_hash"):
                 try:
                     self.assert_violation_logged_any(
                         launch_tag_patterns=("*",),
@@ -85,8 +85,9 @@ class _EaglePositionsBase(CanaryE2EBase):
                 except AssertionError:
                     continue
             raise AssertionError(
-                "Expected canary to fire one of fail_reason ∈ {position, chain_hash} "
-                "after reverting PR #25015, but neither was logged."
+                "Expected canary to fire one of fail_reason ∈ "
+                "{write_position, position, chain_hash} after reverting PR #25015, "
+                "but none was logged."
             )
         else:
             self.assert_no_violation(wait_seconds=2.0)

@@ -82,6 +82,19 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
+  // Geometric expected_position: derived from the seed slot's recorded position (= prefix_len - 1) plus
+  // the intra-req entry offset. Any divergence between this and ``positions[entry_idx]`` means the
+  // caller fed positions inconsistent with req_to_token / seq_lens geometry (e.g. an eagle draft
+  // step that mutates ``forward_batch.positions`` out of phase with what canary's plan assumes —
+  // the regression PR #25015 was supposed to fix). seed_slot_idx < 0 anchors at logical position 0.
+  int64_t expected_position_base;
+  if (seed_slot_idx < 0) {
+    expected_position_base = 0;
+  } else {
+    expected_position_base = 1 + canary_load_field(
+        p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+  }
+
   int64_t entries_written = 0;
   for (int64_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
     const int64_t entry_idx = entry_start + entry_offset;
@@ -92,9 +105,28 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
     ++entries_written;
     const int64_t token = p.input_ids[entry_idx];
     const int64_t position = p.positions[entry_idx];
+    const int64_t expected_position_geometric = expected_position_base + entry_offset;
 
     const uint64_t real_kv_hash_u64 = real_kv_fold_sources(p.sources, p.num_sources, slot, p.real_kv_hash_mode);
     const int64_t real_kv_hash = static_cast<int64_t>(real_kv_hash_u64);
+
+    // Geometric write_position check (always on; independent of enable_assert_inputs which compares
+    // against a caller-supplied oracle). Records one violation per offending slot with
+    // fail_reason=kWritePositionMismatch and chain still advances on the actual position below so
+    // downstream verify won't cascade.
+    if (position != expected_position_geometric) {
+      record_violation(
+          p.violation_sink,
+          ViolationRow{
+              /* slot_idx = */ slot,
+              /* position = */ position,
+              /* stored_token = */ token,
+              /* expected_token = */ 0,
+              /* stored_chain_hash = */ static_cast<int64_t>(running_prev_hash),
+              /* expected_aux = expected_position */ expected_position_geometric,
+              /* fail_reason_bits = */ static_cast<int64_t>(FailReason::kWritePositionMismatch),
+          });
+    }
 
     // Write-time input verification: compare actual (token, position) against caller-supplied expected
     // values; mismatch records a single violation row carrying both bits OR'd together. Chain still
