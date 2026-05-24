@@ -53,6 +53,38 @@ class CanaryViolationAssertMixin:
             flush_wait_seconds=flush_wait_seconds,
         )
 
+    def assert_any_launch_tag_violation_reported(
+        self,
+        *,
+        fail_reason: str,
+        side: _Side = None,
+        flush_wait_seconds: float = 3.0,
+        max_retries: int = 10,
+    ) -> None:
+        """Wildcard-launch_tag wrapper: assert that *some* violation line with
+        the given fail_reason landed, regardless of which HEAD/TAIL/SWEEP/FULL/
+        SWA kernel produced it. Used by self-test perturb suites (mock-model)
+        that don't constrain the kernel scope. Defaults are biased towards
+        log mode, where the captured stdout buffer may not have flushed at
+        the first poll."""
+        self.assert_violation_logged_any(
+            launch_tag_patterns=("*",),
+            fail_reason=fail_reason,
+            side=side,
+            flush_wait_seconds=flush_wait_seconds,
+            max_retries=max_retries,
+        )
+
+    def assert_any_launch_tag_violation_absent(
+        self, *, fail_reason: str, side: _Side = None
+    ) -> None:
+        """Symmetric negative of ``assert_any_launch_tag_violation_reported``:
+        no violation line with the given fail_reason may appear, regardless of
+        launch_tag."""
+        self.assert_no_violation_matching(
+            launch_tag_patterns=("*",), fail_reason=fail_reason, side=side
+        )
+
     def assert_violation_logged_any(
         self,
         *,
@@ -60,15 +92,23 @@ class CanaryViolationAssertMixin:
         fail_reason: str,
         side: _Side = None,
         flush_wait_seconds: float = 2.0,
+        max_retries: int = 1,
     ) -> None:
-        time.sleep(flush_wait_seconds)
-        log_text = self._captured_log_text(side)
-        if find_violation_in_log(
-            log_text,
-            launch_tag_patterns=launch_tag_patterns,
-            fail_reason=fail_reason,
-        ):
-            return
+        """Sleep ``flush_wait_seconds`` and check for a matching violation. With
+        ``max_retries > 1`` the sleep+check is repeated up to ``max_retries``
+        times, useful when the server is still running (log mode) and the
+        captured stdout/stderr buffer may not have flushed the violation line
+        yet at the first poll."""
+        log_text = ""
+        for _ in range(max_retries):
+            time.sleep(flush_wait_seconds)
+            log_text = self._captured_log_text(side)
+            if find_violation_in_log(
+                log_text,
+                launch_tag_patterns=launch_tag_patterns,
+                fail_reason=fail_reason,
+            ):
+                return
         side_label = "" if side is None else f" on side={side}"
         other_side_diag = ""
         if side in ("prefill", "decode"):
@@ -88,10 +128,35 @@ class CanaryViolationAssertMixin:
                 pass
         raise AssertionError(
             f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r}{side_label}. "
+            f"fail_reason={fail_reason!r}{side_label} after max_retries={max_retries} "
+            f"(wait={flush_wait_seconds}s each). "
             f"log_text len={len(log_text)}.{other_side_diag} Log tail:\n"
             f"{log_text[-2000:]}"
         )
+
+    def assert_no_violation_matching(
+        self,
+        *,
+        launch_tag_patterns: tuple[str, ...],
+        fail_reason: str,
+        side: _Side = None,
+    ) -> None:
+        """Raise if any violation line in the captured log matches both
+        ``launch_tag_patterns`` and ``fail_reason``. Companion to
+        ``assert_violation_logged_any``: where that one says "must appear",
+        this one says "must not appear". Differs from ``assert_no_violation``
+        which rejects *any* violation regardless of launch_tag / fail_reason."""
+        log_text = self._captured_log_text(side)
+        if find_violation_in_log(
+            log_text,
+            launch_tag_patterns=launch_tag_patterns,
+            fail_reason=fail_reason,
+        ):
+            raise AssertionError(
+                f"Unexpected canary violation matching "
+                f"launch_tag_patterns={launch_tag_patterns!r} "
+                f"fail_reason={fail_reason!r}. Log tail:\n{log_text[-2000:]}"
+            )
 
     def assert_no_violation(
         self,
