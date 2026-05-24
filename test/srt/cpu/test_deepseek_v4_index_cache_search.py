@@ -40,12 +40,14 @@ def test_dsv4_index_cache_search_keeps_pp_block_anchors_full():
         "pattern": "FFFFFSFF",
         "flip": 5,
         "loss": 0,
+        "loss_delta": 0,
     }
     assert history[0]["candidates"] == sorted(
         history[0]["candidates"],
-        key=lambda item: (item["loss"], item["flip"]),
+        key=lambda item: (item["loss_delta"], item["flip"]),
     )
     assert result["initial_pattern"] == "FFFFFFFF"
+    assert result["baseline_loss"] == 0
     assert result["final_pattern"] == "FSSSFSFF"
     assert result["target_f_layers"] == 4
     assert result["protected_c4_indices"] == [0, 4]
@@ -78,6 +80,34 @@ def test_dsv4_index_cache_search_ties_break_by_layer_index():
     )
 
     assert [step["flip"] for step in result["history"]] == [1, 2]
+
+
+def test_dsv4_index_cache_search_records_loss_delta_from_all_full_baseline():
+    losses = {
+        "FFFF": 10.0,
+        "FSFF": 11.0,
+        "FFSF": 10.5,
+        "FFFS": 11.5,
+        "FSSF": 12.0,
+        "FFSS": 10.8,
+    }
+
+    result = search_mod.greedy_search_pattern(
+        num_c4_layers=4,
+        retention="1/2",
+        pp_block_c4_layers=0,
+        score_pattern=losses.__getitem__,
+    )
+
+    assert result["baseline_loss"] == 10.0
+    assert [step["flip"] for step in result["history"]] == [2, 3]
+    assert result["history"][0]["loss_delta"] == 0.5
+    assert result["history"][0]["candidates"][0] == {
+        "pattern": "FFSF",
+        "flip": 2,
+        "loss": 10.5,
+        "loss_delta": 0.5,
+    }
 
 
 def test_dsv4_index_cache_search_rejects_impossible_protected_retention():

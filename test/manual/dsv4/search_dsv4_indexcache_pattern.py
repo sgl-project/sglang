@@ -148,6 +148,12 @@ def greedy_search_pattern(
             "--pp-block-c4-layers or use a higher retention"
         )
     initial_pattern = pattern_to_str(pattern)
+    baseline_loss = score_pattern(initial_pattern)
+    print(
+        json.dumps(
+            {"baseline": {"pattern": initial_pattern, "loss": baseline_loss}}
+        )
+    )
     history = []
 
     while pattern.count("F") > target_f:
@@ -163,11 +169,17 @@ def greedy_search_pattern(
             candidate[idx] = "S"
             candidate_str = pattern_to_str(candidate)
             loss = score_pattern(candidate_str)
-            item = {"pattern": candidate_str, "flip": idx, "loss": loss}
+            loss_delta = loss - baseline_loss
+            item = {
+                "pattern": candidate_str,
+                "flip": idx,
+                "loss": loss,
+                "loss_delta": loss_delta,
+            }
             scored.append(item)
             print(json.dumps({"candidate": item}))
 
-        selected = min(scored, key=lambda item: (item["loss"], item["flip"]))
+        selected = min(scored, key=lambda item: (item["loss_delta"], item["flip"]))
         idx = selected["flip"]
         candidate_str = selected["pattern"]
         pattern[idx] = "S"
@@ -175,7 +187,10 @@ def greedy_search_pattern(
             "pattern": candidate_str,
             "flip": idx,
             "loss": selected["loss"],
-            "candidates": sorted(scored, key=lambda item: (item["loss"], item["flip"])),
+            "loss_delta": selected["loss_delta"],
+            "candidates": sorted(
+                scored, key=lambda item: (item["loss_delta"], item["flip"])
+            ),
         }
         history.append(step)
         print(json.dumps({"selected": step}))
@@ -183,6 +198,7 @@ def greedy_search_pattern(
     return {
         "retention": retention,
         "initial_pattern": initial_pattern,
+        "baseline_loss": baseline_loss,
         "final_pattern": pattern_to_str(pattern),
         "target_f_layers": target_f,
         "protected_c4_indices": sorted(protected),
