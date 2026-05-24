@@ -77,6 +77,8 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+_SPARSE_PREFILL_ENABLED_LOGGED_RATIOS: set[int] = set()
+_SPARSE_PREFILL_SKIPPED_LOGGED = False
 
 
 T = TypeVar("T", bound=Optional[torch.Tensor])
@@ -1052,13 +1054,14 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            use_sparse_prefill = (
+            sparse_prefill_requested = (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
                 )
             )
+            use_sparse_prefill = sparse_prefill_requested
             if use_sparse_prefill:
                 from sglang.srt.layers.attention.dsa.utils import (
                     is_dsa_prefill_cp_round_robin_split,
@@ -1076,6 +1079,29 @@ class DeepseekV4AttnBackend(
                         else None
                     ),
                 )
+                global _SPARSE_PREFILL_SKIPPED_LOGGED
+                max_extend_seq_len = max(forward_batch.extend_seq_lens_cpu or [0])
+                should_log_sparse_skip = max_extend_seq_len > SWA_WINDOW
+                if (
+                    not use_sparse_prefill
+                    and should_log_sparse_skip
+                    and not _SPARSE_PREFILL_SKIPPED_LOGGED
+                ):
+                    logger.warning(
+                        "DSV4 sparse prefill requested but skipped: "
+                        "q_rows=%s batch_size=%s extend_seq_lens_cpu=%s "
+                        "is_cp_round_robin=%s cp_num_rows=%s",
+                        q.shape[0],
+                        forward_batch.batch_size,
+                        forward_batch.extend_seq_lens_cpu,
+                        is_cp_round_robin,
+                        (
+                            core_attn_metadata.positions_casual.shape[0]
+                            if is_cp_round_robin
+                            else None
+                        ),
+                    )
+                    _SPARSE_PREFILL_SKIPPED_LOGGED = True
 
             if use_sparse_prefill:
                 return self._forward_prefill_sparse(
@@ -1134,6 +1160,18 @@ class DeepseekV4AttnBackend(
 
         # q is (b, 1, h_q, d_qk); flash_mla_sparse_fwd takes (s_q, h_q, d_qk).
         q_flat = q.squeeze(1)
+        global _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS
+        if compress_ratio not in _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS:
+            logger.warning(
+                "DSV4 sparse prefill enabled: q_rows=%s compress_ratio=%s "
+                "cp_rank=%s cp_size=%s positions=%s",
+                q_flat.shape[0],
+                compress_ratio,
+                get_attention_cp_rank(),
+                get_attention_cp_size(),
+                core_attn_metadata.positions_casual.shape[0],
+            )
+            _SPARSE_PREFILL_ENABLED_LOGGED_RATIOS.add(compress_ratio)
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
