@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     39,
+        "agents":     54,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -153,6 +153,21 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "openrouter":        7791,
             "devto_hub":         7792,
             "supabase":          7793,
+            "github_ops":        7794,
+            "firebase":          7795,
+            "coolify":           7796,
+            "paypal":            7797,
+            "circle":            7798,
+            "lighthouse":        7799,
+            "opensea":           7800,
+            "langchain":         7801,
+            "notion":            7802,
+            "langsmith":         7803,
+            "admin_api":         7804,
+            "rss_hub":           7805,
+            "rag_pipeline":      7806,
+            "scraper_v2":        7807,
+            "minimax":           7808,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -199,6 +214,64 @@ def _handle_generate_content(args, kwargs) -> dict:
     tier   = kwargs.get("tier", "balanced")
     return {"action": "content_gen_queued", "topic": topic, "series": series, "tier": tier}
 
+def _handle_github_op(args, kwargs) -> dict:
+    op   = kwargs.get("op", args[0] if args else "list_repos")
+    repo = kwargs.get("repo", "")
+    return {"action": "github_op_queued", "op": op, "repo": repo}
+
+def _handle_notion_sync(args, kwargs) -> dict:
+    target = kwargs.get("target", args[0] if args else "all")
+    return {"action": "notion_sync_queued", "target": target}
+
+def _handle_rag_query(args, kwargs) -> dict:
+    query = kwargs.get("query", args[0] if args else "")
+    top_k = kwargs.get("top_k", 5)
+    return {"action": "rag_query_queued", "query": query[:200], "top_k": top_k}
+
+def _handle_scrape(args, kwargs) -> dict:
+    url  = kwargs.get("url", args[0] if args else "")
+    mode = kwargs.get("mode", "single")
+    return {"action": "scrape_queued", "url": url, "mode": mode}
+
+def _handle_dork(args, kwargs) -> dict:
+    category = kwargs.get("category", args[0] if args else "linkedin_leads")
+    return {"action": "dork_queued", "category": category}
+
+def _handle_mm_generate(args, kwargs) -> dict:
+    prompt = kwargs.get("prompt", args[0] if args else "")
+    model  = kwargs.get("model", "MiniMax-M2.7")
+    return {"action": "minimax_generate_queued", "model": model, "prompt_len": len(prompt)}
+
+def _handle_mm_tts(args, kwargs) -> dict:
+    text  = kwargs.get("text", args[0] if args else "")
+    voice = kwargs.get("voice", "English_expressive_narrator")
+    return {"action": "minimax_tts_queued", "voice": voice, "text_len": len(text)}
+
+def _handle_rss_fetch(args, kwargs) -> dict:
+    category = kwargs.get("category", "")
+    return {"action": "rss_fetch_queued", "category": category}
+
+def _handle_lighthouse_audit(args, kwargs) -> dict:
+    url      = kwargs.get("url", args[0] if args else "")
+    strategy = kwargs.get("strategy", "mobile")
+    return {"action": "lighthouse_audit_queued", "url": url, "strategy": strategy}
+
+def _handle_langchain_run(args, kwargs) -> dict:
+    pipeline = kwargs.get("pipeline", args[0] if args else "summarize")
+    return {"action": "langchain_run_queued", "pipeline": pipeline}
+
+def _handle_coolify_deploy(args, kwargs) -> dict:
+    app_uuid = kwargs.get("app_uuid", args[0] if args else "")
+    return {"action": "coolify_deploy_queued", "app_uuid": app_uuid}
+
+def _handle_firebase_sync(args, kwargs) -> dict:
+    collection = kwargs.get("collection", "fm_mesh_state")
+    return {"action": "firebase_sync_queued", "collection": collection}
+
+def _handle_admin_broadcast(args, kwargs) -> dict:
+    intent = kwargs.get("intent", ""); sub_kwargs = kwargs.get("kwargs", {})
+    return {"action": "admin_broadcast_queued", "intent": intent, "kwargs": sub_kwargs}
+
 _INTENTS = {
     # ── core ──────────────────────────────────────────────────────────────────
     "sync_samsung_calendar":   _handle_sync_calendar,
@@ -217,6 +290,20 @@ _INTENTS = {
     "devto_publish":           _handle_devto_publish,
     "zapier_fire":             _handle_zapier_fire,
     "supabase_sync":           _handle_supabase_sync,
+    # ── extended platform suite ───────────────────────────────────────────────
+    "github_op":               _handle_github_op,
+    "notion_sync":             _handle_notion_sync,
+    "rag_query":               _handle_rag_query,
+    "scrape":                  _handle_scrape,
+    "dork":                    _handle_dork,
+    "minimax_generate":        _handle_mm_generate,
+    "minimax_tts":             _handle_mm_tts,
+    "rss_fetch":               _handle_rss_fetch,
+    "lighthouse_audit":        _handle_lighthouse_audit,
+    "langchain_run":           _handle_langchain_run,
+    "coolify_deploy":          _handle_coolify_deploy,
+    "firebase_sync":           _handle_firebase_sync,
+    "admin_broadcast":         _handle_admin_broadcast,
     "generate_content":        _handle_generate_content,
 }
 

@@ -955,6 +955,54 @@ module.exports = {
             time:       true,
         },
 
+        // ── GITHUB / FIREBASE / COOLIFY / LIGHTHOUSE (ports 7794-7799) ─
+
+        ...[
+            ['fm-github-ops',   'fm_github_ops',  '7794', 'GITHUB_OPS_PORT',  '40M'],
+            ['fm-firebase',     'fm_firebase',    '7795', 'FIREBASE_PORT',     '40M'],
+            ['fm-coolify',      'fm_coolify',     '7796', 'COOLIFY_PORT',      '30M'],
+            ['fm-paypal',       'fm_paypal',      '7797', 'PAYPAL_PORT',       '30M'],
+            ['fm-circle',       'fm_circle',      '7798', 'CIRCLE_PORT',       '30M'],
+            ['fm-lighthouse',   'fm_lighthouse',  '7799', 'LIGHTHOUSE_PORT',   '40M'],
+        ].map(([name, script, port, portEnv, mem]) => ({
+            name, script: `agents/${script}.py`, interpreter: '/usr/bin/python3',
+            cwd: ROOT, autorestart: true, watch: false, max_memory_restart: mem,
+            env_production: { FRACTALMESH_HOME: ROOT, [portEnv]: port, NODE_ENV: 'production', PYTHONUNBUFFERED: '1' },
+            error_file: `${ROOT}/logs/${name}-error.log`,
+            out_file:   `${ROOT}/logs/${name}-out.log`, time: true,
+        })),
+
+        // ── OPENSEA / LANGCHAIN / NOTION / LANGSMITH (ports 7800-7803) ─
+
+        ...[
+            ['fm-opensea',      'fm_opensea',     '7800', 'OPENSEA_PORT',      '40M'],
+            ['fm-langchain',    'fm_langchain',   '7801', 'LANGCHAIN_PORT',    '60M'],
+            ['fm-notion',       'fm_notion',      '7802', 'NOTION_PORT',       '30M'],
+            ['fm-langsmith',    'fm_langsmith',   '7803', 'LANGSMITH_PORT',    '40M'],
+        ].map(([name, script, port, portEnv, mem]) => ({
+            name, script: `agents/${script}.py`, interpreter: '/usr/bin/python3',
+            cwd: ROOT, autorestart: true, watch: false, max_memory_restart: mem,
+            env_production: { FRACTALMESH_HOME: ROOT, [portEnv]: port, NODE_ENV: 'production', PYTHONUNBUFFERED: '1' },
+            error_file: `${ROOT}/logs/${name}-error.log`,
+            out_file:   `${ROOT}/logs/${name}-out.log`, time: true,
+        })),
+
+        // ── ADMIN / RSS / RAG / SCRAPER / MINIMAX (ports 7804-7808) ───
+
+        ...[
+            ['fm-admin-api',    'fm_admin_api',   '7804', 'ADMIN_PORT',        '40M'],
+            ['fm-rss-hub',      'fm_rss_hub',     '7805', 'RSS_PORT',          '50M'],
+            ['fm-rag-pipeline', 'fm_rag_pipeline','7806', 'RAG_PORT',          '80M'],
+            ['fm-scraper-v2',   'fm_scraper_v2',  '7807', 'SCRAPER_PORT',      '50M'],
+            ['fm-minimax',      'fm_minimax',     '7808', 'MINIMAX_PORT',      '60M'],
+        ].map(([name, script, port, portEnv, mem]) => ({
+            name, script: `agents/${script}.py`, interpreter: '/usr/bin/python3',
+            cwd: ROOT, autorestart: true, watch: false, max_memory_restart: mem,
+            env_production: { FRACTALMESH_HOME: ROOT, [portEnv]: port, NODE_ENV: 'production', PYTHONUNBUFFERED: '1' },
+            error_file: `${ROOT}/logs/${name}-error.log`,
+            out_file:   `${ROOT}/logs/${name}-out.log`, time: true,
+        })),
+
         // ── PLATFORM INTEGRATION SUITE (ports 7788-7793) ─────────────
 
         {
