@@ -1,4 +1,5 @@
 import importlib.util
+import ast
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -152,6 +153,22 @@ def test_dsv4_index_cache_min_seq_len_gate_uses_raw_token_length():
         torch.empty(0, dtype=torch.int32),
         1,
     )
+
+
+def test_dsv4_index_cache_config_defaults_to_long_context_gate():
+    path = Path(__file__).parents[3] / "python/sglang/srt/configs/deepseek_v4.py"
+    module = ast.parse(path.read_text())
+    default_value = None
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "index_topk_min_seq_len"
+        ):
+            default_value = ast.literal_eval(node.value)
+            break
+
+    assert default_value == 75000
 
 
 def test_dsv4_index_cache_rebuilds_physical_indices_from_raw_cache():
