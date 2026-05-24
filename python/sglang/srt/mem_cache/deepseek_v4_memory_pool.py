@@ -578,6 +578,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 enable_memory_saver=enable_memory_saver,
                 ratio=ratio,
                 online=(ratio == 128 and ONLINE_C128),
+                swa_page_size=self.swa_page_size,
             )
 
             if ratio == 4:
