@@ -834,7 +834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
-        if self.canary_runner is not None:
+        if self.canary_runner is not None and not self.is_draft_worker:
             self.canary_runner.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):

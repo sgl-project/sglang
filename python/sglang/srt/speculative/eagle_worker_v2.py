@@ -196,6 +196,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             self.init_cuda_graphs()
 
+        if self.draft_runner.canary_runner is not None:
+            self.draft_runner.canary_runner.mark_init_finished()
+
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
