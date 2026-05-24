@@ -677,10 +677,9 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # In multi-step EAGLE draft, the per-step backend metadata bakes
-            # in this step's KV write target (c4/c128 out_loc). The shared
-            # out_cache_loc buffer must be sliced via the EAGLE per-step
-            # convention -- see per_step_draft_out_cache_loc.
+            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
+            # so slice the shared multi-step out_cache_loc now rather than at
+            # forward time.
             out_cache_loc = forward_batch.out_cache_loc
             if self.topk > 0 and self.speculative_num_steps > 1:
                 out_cache_loc = per_step_draft_out_cache_loc(

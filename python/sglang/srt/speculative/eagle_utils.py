@@ -29,15 +29,11 @@ def per_step_draft_out_cache_loc(
     topk: int,
     num_steps: int,
 ) -> torch.Tensor:
-    """Return per-step view of the multi-step EAGLE draft out_cache_loc buffer.
+    """Per-step slice of the multi-step EAGLE draft out_cache_loc buffer.
 
-    Single source of truth for the layout convention shared between:
-      - EagleWorkerV2.draft_forward (per-step write target)
-      - DeepseekV4AttnBackend.init_forward_metadata (per-step compression
-        write target baked into metadata)
-
-    Layout: out_cache_loc is flat with elements ordered `[bs, topk, num_steps]`.
-    Returns a [num_steps, bs * topk] view where row i is step i's slice.
+    Single source of truth for the layout shared by EagleWorkerV2.draft_forward
+    (per-step write target) and DeepseekV4AttnBackend (per-step compression
+    write target baked into metadata).
     """
     expected = batch_size * topk * num_steps
     assert out_cache_loc.shape[0] == expected, (
