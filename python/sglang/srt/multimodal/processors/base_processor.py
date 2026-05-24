@@ -1095,6 +1095,15 @@ class BaseMultimodalProcessor(ABC):
             if hasattr(data_dict, "get")
             else lambda name, default=None: getattr(data_dict, name, default)
         )
+        explicit_modality = modality
+        modality_value = get_data_value("modality")
+        if explicit_modality is None and modality_value is not None:
+            explicit_modality = (
+                modality_value
+                if isinstance(modality_value, Modality)
+                else Modality.from_str(str(modality_value))
+            )
+
         items: dict[Modality, MultimodalDataItem] = {}
         for attr_name, value in data_dict.items():
             if attr_name in (
@@ -1105,20 +1114,16 @@ class BaseMultimodalProcessor(ABC):
                 "pad_value",
                 "offsets",
             ):
-                # metadata fields are explicitly set later, filter them here to avoid side-effects
+                # metadata fields need explicit handling, skip generic item.set
                 continue
 
             # Get modality for this attribute
-            current_modality = modality or self.ATTR_NAME_TO_MODALITY.get(attr_name)
+            current_modality = explicit_modality or self.ATTR_NAME_TO_MODALITY.get(
+                attr_name
+            )
 
             if attr_name == "precomputed_embeddings":
-                modality_str = get_data_value("modality")
-                current_modality = Modality.IMAGE
-                if modality_str:
-                    try:
-                        current_modality = Modality.from_str(modality_str)
-                    except ValueError:
-                        pass
+                current_modality = current_modality or Modality.IMAGE
 
             if current_modality:
                 # Create item if needed
@@ -1132,7 +1137,7 @@ class BaseMultimodalProcessor(ABC):
 
                 items[current_modality].set(attr_name, value)
 
-        # deal with metadata fileds: convert from tensor to expected python types
+        # deal with metadata fields from preprocessed input
         # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
         if len(items) == 1:
             item = next(iter(items.values()))
