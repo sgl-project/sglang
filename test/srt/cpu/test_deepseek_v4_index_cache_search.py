@@ -88,3 +88,17 @@ def test_dsv4_index_cache_search_rejects_impossible_protected_retention():
             pp_block_c4_layers=2,
             score_pattern=lambda _: 0.0,
         )
+
+
+def test_dsv4_index_cache_search_requires_pattern_deployment_template():
+    args = type("Args", (), {"command_template": None})()
+
+    with pytest.raises(SystemExit, match="--command-template is required"):
+        search_mod.validate_args(args)
+
+
+def test_dsv4_index_cache_search_requires_pattern_placeholder():
+    args = type("Args", (), {"command_template": "modal deploy endpoint.py"})()
+
+    with pytest.raises(SystemExit, match=r"\{pattern\}"):
+        search_mod.validate_args(args)

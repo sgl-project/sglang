@@ -33,7 +33,7 @@ def _args(tmp_path: Path) -> Namespace:
         calibration_jsonl=tmp_path / "calibration.jsonl",
         num_c4_layers=21,
         pp_block_c4_layers=7,
-        pattern_command_template=None,
+        pattern_command_template="modal deploy endpoint.py --pattern {pattern}",
         calibration_limit=8,
         profile_dir=tmp_path / "profiles",
         profile_prefix="dsv4-indexcache",
@@ -59,6 +59,8 @@ def test_dsv4_index_cache_validation_workflow_uses_searched_half_and_quarter(tmp
     assert "1/2" in cmd
     assert "1/4" in cmd
     assert "--pp-block-c4-layers" in cmd
+    assert "--command-template" in cmd
+    assert "modal deploy endpoint.py --pattern {pattern}" in cmd
 
 
 def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp_path):

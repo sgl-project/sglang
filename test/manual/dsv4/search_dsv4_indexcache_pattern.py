@@ -190,6 +190,16 @@ def search(args, retention: str) -> dict:
     )
 
 
+def validate_args(args) -> None:
+    if not args.command_template:
+        raise SystemExit(
+            "--command-template is required so each candidate pattern is actually "
+            "deployed/scored; otherwise every candidate would hit the same endpoint"
+        )
+    if "{pattern}" not in args.command_template:
+        raise SystemExit("--command-template must contain {pattern}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--calibration-jsonl", type=Path, required=True)
@@ -209,6 +219,7 @@ def main() -> None:
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    validate_args(args)
 
     result = {
         "retentions": {

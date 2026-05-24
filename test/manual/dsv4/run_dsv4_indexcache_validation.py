@@ -164,7 +164,7 @@ def main() -> None:
     parser.add_argument("--calibration-jsonl", type=Path, required=True)
     parser.add_argument("--num-c4-layers", type=int, required=True)
     parser.add_argument("--pp-block-c4-layers", type=int, default=0)
-    parser.add_argument("--pattern-command-template")
+    parser.add_argument("--pattern-command-template", required=True)
     parser.add_argument("--calibration-limit", type=int, default=0)
     parser.add_argument("--profile-dir", type=Path, default=Path("/tmp"))
     parser.add_argument("--profile-prefix", default="dsv4-indexcache")
