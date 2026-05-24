@@ -112,13 +112,17 @@ def launch_canary_write_kernel_torch_reference(
         seed_slot = int(seed_slot_indices_host[r].item())
         running_prev_hash = compute_slot_hash(buf_i64, seed_slot)
 
-        do_geometric_assert = (entry_count == 1) and (runtime_assert_enable_value != 0)
-        if do_geometric_assert and seed_slot >= 0:
-            expected_position_base = int(
+        do_chain_position_assert = (
+            (entry_count == 1)
+            and (seed_slot >= 0)
+            and (runtime_assert_enable_value != 0)
+        )
+        if do_chain_position_assert:
+            running_prev_position = int(
                 buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
             )
         else:
-            expected_position_base = 0
+            running_prev_position = 0
 
         for entry_offset in range(entry_count):
             entry_idx = entry_start + entry_offset
@@ -159,9 +163,9 @@ def launch_canary_write_kernel_torch_reference(
                     row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(mismatch_bits)
                     violation_rows.append(row)
 
-            if do_geometric_assert:
-                expected_position_geometric = expected_position_base + 1 + entry_offset
-                if position != expected_position_geometric:
+            if do_chain_position_assert:
+                expected_position_chain = running_prev_position + 1
+                if position != expected_position_chain:
                     row = [0] * consts.VIOLATION_FIELDS
                     row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
                     row[consts.VIOLATION_FIELD_SLOT_IDX] = slot
@@ -171,13 +175,12 @@ def launch_canary_write_kernel_torch_reference(
                     row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
                         running_prev_hash
                     )
-                    row[consts.VIOLATION_FIELD_EXPECTED_AUX] = (
-                        expected_position_geometric
-                    )
+                    row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position_chain
                     row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(
                         consts.FailReason.WRITE_POSITION_MISMATCH
                     )
                     violation_rows.append(row)
+                running_prev_position = position
 
             buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token
             buf_i64[slot, consts.CANARY_FIELD_POSITION] = position

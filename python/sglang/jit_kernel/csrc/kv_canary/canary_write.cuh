@@ -87,16 +87,21 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
-  // Geometric write_position assert is enabled only:
-  //   1. after CanaryManager.mark_init_finished() (warmup / cuda-graph capture may write synthetic
-  //      positions whose seed slot has unrelated stored_position, which is not a real bug),
-  //   2. when entry_count == 1 (single-token decode shape — eagle DRAFT, regular DECODE). Multi-token
-  //      writes (extend prefill, target_verify with a token tree) carry positions that aren't a simple
-  //      seed.position + 1 + offset arithmetic progression, so geometric checking would misfire.
-  const bool do_geometric_assert = (entry_count == 1) && (*p.runtime_assert_enable != 0);
-  int64_t expected_position_base = 0;
-  if (do_geometric_assert && seed_slot_idx >= 0) {
-    expected_position_base = canary_load_field(p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+  // Chain-step position assert (only enabled when:
+  //   1. after CanaryManager.mark_init_finished() — warmup / cuda-graph capture may write synthetic
+  //      positions whose seed has unrelated stored_position, which is not a real bug;
+  //   2. entry_count == 1 — single-token decode shape (eagle DRAFT, regular DECODE). Multi-token
+  //      writes (extend prefill, target_verify with a token tree) carry positions that aren't a
+  //      simple prev + 1 arithmetic progression;
+  //   3. seed_slot_idx >= 0 — chain heads have no predecessor stored_position to compare against.
+  // Asserts ``position == running_prev_position + 1`` per chain step; running_prev_position starts at
+  // the seed's stored position and advances to ``position`` after each entry.
+  const bool do_chain_position_assert =
+      (entry_count == 1) && (seed_slot_idx >= 0) && (*p.runtime_assert_enable != 0);
+  int64_t running_prev_position = 0;
+  if (do_chain_position_assert) {
+    running_prev_position =
+        canary_load_field(p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
   }
 
   int64_t entries_written = 0;
@@ -142,13 +147,14 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
       }
     }
 
-    // Geometric write_position check (single-entry decode shape, post-init): the only legitimate
-    // sequence is position == seed.position + 1 + entry_offset. Eagle-DRAFT under reverted PR #25015
-    // perturbs position by +1, which lands here and surfaces the bug. Independent of input_check, so
-    // tests that don't wire an oracle still get coverage.
-    if (do_geometric_assert) {
-      const int64_t expected_position_geometric = expected_position_base + 1 + entry_offset;
-      if (position != expected_position_geometric) {
+    // Chain-step write_position check (single-entry decode shape, post-init, seed present): the only
+    // legitimate transition along the chain is position == running_prev_position + 1. Eagle-DRAFT
+    // under reverted PR #25015 perturbs position by +1, which lands here on the first draft step
+    // (seed = last verified target slot, perturbation breaks the +1 invariant) and surfaces the bug.
+    // Independent of input_check, so tests that don't wire an oracle still get coverage.
+    if (do_chain_position_assert) {
+      const int64_t expected_position_chain = running_prev_position + 1;
+      if (position != expected_position_chain) {
         record_violation(
             p.violation_sink,
             ViolationRow{
@@ -158,10 +164,11 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
                 /* expected_token = */ token,
                 /* stored_chain_hash (running running_prev_hash about to be written) = */
                 static_cast<int64_t>(running_prev_hash),
-                /* expected_aux = expected_position */ expected_position_geometric,
+                /* expected_aux = expected_position */ expected_position_chain,
                 /* fail_reason_bits = */ static_cast<int64_t>(FailReason::kWritePositionMismatch),
             });
       }
+      running_prev_position = position;
     }
 
     canary_store_field(p.canary_buf, slot, p.slot_stride_bytes, kCanaryFieldToken, token);
