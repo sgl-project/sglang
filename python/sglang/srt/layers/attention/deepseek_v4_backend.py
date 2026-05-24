@@ -1049,10 +1049,22 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            if forward_batch.forward_mode.is_extend_without_speculative() and (
+            use_sparse_prefill = forward_batch.forward_mode.is_extend_without_speculative() and (
                 q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-            ):
+            )
+            if use_sparse_prefill and forward_batch.attn_cp_metadata is not None:
+                from sglang.srt.layers.attention.dsa.utils import (
+                    is_dsa_prefill_cp_round_robin_split,
+                )
+
+                if (
+                    is_dsa_prefill_cp_round_robin_split()
+                    and forward_batch.batch_size != 1
+                ):
+                    use_sparse_prefill = False
+
+            if use_sparse_prefill:
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1118,7 +1130,6 @@ class DeepseekV4AttnBackend(
             local_extend_seq_lens = None
             positions = None
             from sglang.srt.layers.attention.dsa.utils import (
-                dsa_cp_round_robin_split_q_seqs,
                 dsa_use_prefill_cp,
                 is_dsa_prefill_cp_round_robin_split,
             )
@@ -1126,18 +1137,8 @@ class DeepseekV4AttnBackend(
             if dsa_use_prefill_cp(
                 forward_batch
             ) and is_dsa_prefill_cp_round_robin_split():
-                if seq_lens.numel() == 1:
-                    local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
-                else:
-                    _, local_extend_seq_lens, _, bs_idx = (
-                        dsa_cp_round_robin_split_q_seqs(
-                            forward_batch.extend_seq_lens_cpu,
-                            extend_seq_lens,
-                        )
-                    )
-                    seq_lens = seq_lens[bs_idx]
-                    extend_seq_lens = extend_seq_lens[bs_idx]
-                    req_pool_indices = req_pool_indices[bs_idx]
+                assert seq_lens.numel() == 1
+                local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
                 positions = core_attn_metadata.positions_casual.to(torch.int32)
 
             cache = SparsePrefillChunkCache.build(
