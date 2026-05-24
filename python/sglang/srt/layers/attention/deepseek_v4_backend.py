@@ -54,6 +54,9 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
 )
+from sglang.srt.layers.attention.dsv4.sparse_prefill_gate import (
+    can_use_sparse_prefill,
+)
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
     get_attention_cp_size,
@@ -1058,20 +1061,18 @@ class DeepseekV4AttnBackend(
                     is_dsa_prefill_cp_round_robin_split,
                 )
 
-                if forward_batch.extend_seq_lens_cpu is None:
-                    use_sparse_prefill = False
-                else:
-                    sparse_num_qo_tokens = sum(forward_batch.extend_seq_lens_cpu)
-                    if is_dsa_prefill_cp_round_robin_split():
-                        cp_positions = core_attn_metadata.positions_casual
-                        sparse_num_qo_tokens = cp_positions.shape[0]
-                        if (
-                            forward_batch.batch_size != 1
-                            or sparse_num_qo_tokens != q.shape[0]
-                        ):
-                            use_sparse_prefill = False
-                    elif sparse_num_qo_tokens != q.shape[0]:
-                        use_sparse_prefill = False
+                is_cp_round_robin = is_dsa_prefill_cp_round_robin_split()
+                use_sparse_prefill = can_use_sparse_prefill(
+                    q_num_rows=q.shape[0],
+                    batch_size=forward_batch.batch_size,
+                    extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    is_cp_round_robin=is_cp_round_robin,
+                    cp_num_rows=(
+                        core_attn_metadata.positions_casual.shape[0]
+                        if is_cp_round_robin
+                        else None
+                    ),
+                )
 
             if use_sparse_prefill:
                 return self._forward_prefill_sparse(
