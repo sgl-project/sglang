@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     55,
+        "agents":     71,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -169,6 +169,22 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "scraper_v2":        7807,
             "minimax":           7808,
             "base44":            7809,
+            "gumroad":           7810,
+            "printful":          7811,
+            "coinbase":          7812,
+            "pionex":            7813,
+            "kucoin":            7814,
+            "elevenlabs":        7815,
+            "twitter":           7816,
+            "sendgrid":          7817,
+            "alchemy":           7818,
+            "moralis":           7819,
+            "coingecko":         7820,
+            "xyo":               7821,
+            "producthunt":       7822,
+            "docker":            7823,
+            "crawlbase":         7824,
+            "bugcrowd":          7825,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -279,6 +295,80 @@ def _handle_base44_op(args, kwargs) -> dict:
     payload = kwargs.get("payload", {})
     return {"action": "base44_op_queued", "op": op, "app_id": app_id, "payload_keys": list(payload.keys())}
 
+def _handle_gumroad(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "products")
+    return {"action": "gumroad_queued", "op": op}
+
+def _handle_printful(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "products")
+    return {"action": "printful_queued", "op": op}
+
+def _handle_coinbase(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "portfolio")
+    return {"action": "coinbase_queued", "op": op}
+
+def _handle_pionex(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "account")
+    symbol  = kwargs.get("symbol", "")
+    return {"action": "pionex_queued", "op": op, "symbol": symbol}
+
+def _handle_kucoin(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "accounts")
+    symbol  = kwargs.get("symbol", "")
+    return {"action": "kucoin_queued", "op": op, "symbol": symbol}
+
+def _handle_elevenlabs(args, kwargs) -> dict:
+    text    = kwargs.get("text", args[0] if args else "")
+    voice   = kwargs.get("voice_id", "")
+    return {"action": "elevenlabs_tts_queued", "text_len": len(text), "voice_id": voice}
+
+def _handle_twitter(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "tweet")
+    text    = kwargs.get("text", "")
+    return {"action": "twitter_queued", "op": op, "text_len": len(text)}
+
+def _handle_sendgrid(args, kwargs) -> dict:
+    to      = kwargs.get("to", args[0] if args else "")
+    subject = kwargs.get("subject", "")
+    return {"action": "sendgrid_queued", "to": to, "subject": subject}
+
+def _handle_alchemy(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "balance")
+    address = kwargs.get("address", "")
+    return {"action": "alchemy_queued", "op": op, "address": address[:10] + "..." if address else ""}
+
+def _handle_moralis(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "nfts")
+    chain   = kwargs.get("chain", "eth")
+    return {"action": "moralis_queued", "op": op, "chain": chain}
+
+def _handle_coingecko(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "market")
+    coin_id = kwargs.get("id", "")
+    return {"action": "coingecko_queued", "op": op, "coin_id": coin_id}
+
+def _handle_xyo(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "balance")
+    return {"action": "xyo_queued", "op": op}
+
+def _handle_producthunt(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "trending")
+    return {"action": "producthunt_queued", "op": op}
+
+def _handle_docker(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "containers")
+    image   = kwargs.get("image", "")
+    return {"action": "docker_queued", "op": op, "image": image}
+
+def _handle_crawlbase(args, kwargs) -> dict:
+    url     = kwargs.get("url", args[0] if args else "")
+    js      = kwargs.get("js", False)
+    return {"action": "crawlbase_queued", "url": url, "js_render": js}
+
+def _handle_bugcrowd(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "programs")
+    return {"action": "bugcrowd_queued", "op": op}
+
 _INTENTS = {
     # ── core ──────────────────────────────────────────────────────────────────
     "sync_samsung_calendar":   _handle_sync_calendar,
@@ -314,6 +404,27 @@ _INTENTS = {
     "generate_content":        _handle_generate_content,
     # ── base44 no-code app builder ────────────────────────────────────────────
     "base44_op":               _handle_base44_op,
+    # ── revenue / commerce ────────────────────────────────────────────────────
+    "gumroad":                 _handle_gumroad,
+    "printful":                _handle_printful,
+    "coinbase":                _handle_coinbase,
+    # ── trading ───────────────────────────────────────────────────────────────
+    "pionex":                  _handle_pionex,
+    "kucoin":                  _handle_kucoin,
+    # ── content / outreach ────────────────────────────────────────────────────
+    "elevenlabs_tts":          _handle_elevenlabs,
+    "twitter_post":            _handle_twitter,
+    "sendgrid_send":           _handle_sendgrid,
+    # ── web3 / data ───────────────────────────────────────────────────────────
+    "alchemy_query":           _handle_alchemy,
+    "moralis_query":           _handle_moralis,
+    "coingecko_price":         _handle_coingecko,
+    "xyo_op":                  _handle_xyo,
+    # ── platform ──────────────────────────────────────────────────────────────
+    "producthunt_op":          _handle_producthunt,
+    "docker_op":               _handle_docker,
+    "crawlbase_scrape":        _handle_crawlbase,
+    "bugcrowd_op":             _handle_bugcrowd,
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
