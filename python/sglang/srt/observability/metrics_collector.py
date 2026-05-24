@@ -594,7 +594,7 @@ class SchedulerMetricsCollector:
                 labelnames=shared_hicache_quarantine_labels,
             )
             self.shared_hicache_quarantined_tokens = Gauge(
-                name="sglang:shared_hicache_quarantined_tokens",
+                name="sglang:shared_hicache_quarantined_tokens_current",
                 documentation="Current target KV tokens held out of the allocator after indeterminate Shared HiCache KV reuse transfers.",
                 labelnames=list(labels.keys()) + ["backend"],
                 multiprocess_mode="mostrecent",
