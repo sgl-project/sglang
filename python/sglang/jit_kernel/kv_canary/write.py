@@ -208,6 +208,11 @@ def launch_canary_write_kernel(
     _assert_contiguous(context.slot_run_counter, "slot_run_counter")
     _assert_contiguous(context.kernel_run_counter, "kernel_run_counter")
 
+    runtime_assert_enable = _resolve_runtime_assert_enable(
+        context.runtime_assert_enable, device=canary_buf.device
+    )
+    _assert_contiguous(runtime_assert_enable, "runtime_assert_enable")
+
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device
     )
@@ -229,6 +234,7 @@ def launch_canary_write_kernel(
         context.violation_write_index,
         context.slot_run_counter,
         context.kernel_run_counter,
+        runtime_assert_enable,
         padded_bufs[0],
         padded_bufs[1],
         padded_bufs[2],
@@ -237,6 +243,30 @@ def launch_canary_write_kernel(
         len(real_kv_sources),
         int(context.real_kv_hash_mode),
     )
+
+
+_RUNTIME_ASSERT_ENABLE_FALLBACK_CACHE: dict[torch.device, torch.Tensor] = {}
+
+
+def _resolve_runtime_assert_enable(
+    runtime_assert_enable: torch.Tensor | None,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a usable [1] int32 device flag.
+
+    Test/bench call sites that build VerifyOrWriteContext without a CanaryDeviceState pass None;
+    callers without an init-gate concept want the assert always-on, so we materialize a cached
+    always-1 fallback tensor per device. Production (CanaryManager-owned) callers pass a real
+    flag that starts at 0 and flips to 1 in mark_init_finished().
+    """
+    if runtime_assert_enable is not None:
+        return runtime_assert_enable
+    cached = _RUNTIME_ASSERT_ENABLE_FALLBACK_CACHE.get(device)
+    if cached is None:
+        cached = torch.ones(1, dtype=torch.int32, device=device)
+        _RUNTIME_ASSERT_ENABLE_FALLBACK_CACHE[device] = cached
+    return cached
 
 
 @cache_once

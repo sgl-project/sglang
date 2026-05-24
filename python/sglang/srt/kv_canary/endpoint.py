@@ -60,6 +60,7 @@ class CanaryEndpoint:
     real_kv_sources: tuple[RealKvSource, ...]
     slot_run_counter_view: torch.Tensor
     kernel_run_counter_view: torch.Tensor
+    runtime_assert_enable: torch.Tensor
 
     def launch_per_forward(
         self,
@@ -146,6 +147,7 @@ class CanaryEndpoint:
             kernel_run_counter=self.kernel_run_counter_view,
             real_kv_sources=self.real_kv_sources,
             real_kv_hash_mode=real_kv_hash_mode,
+            runtime_assert_enable=self.runtime_assert_enable,
         )
 
 
@@ -246,6 +248,7 @@ def build_endpoints_from_group(
                 real_kv_sources=real_kv_sources,
                 slot_run_counter_view=slot_view,
                 kernel_run_counter_view=kernel_view,
+                runtime_assert_enable=device_state.runtime_assert_enable,
             )
         )
 

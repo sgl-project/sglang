@@ -48,6 +48,11 @@ struct WriteKernelParams {
   int64_t* slot_run_counter;
   int64_t* kernel_run_counter;
 
+  // Runtime-only assert gate. Read by the kernel as a single int32 cell on every launch. Starts at 0
+  // during warmup / cuda-graph capture (writes use synthetic positions that may not be geometric); host
+  // flips to 1 in CanaryManager.mark_init_finished() to enable the geometric write_position check.
+  const int32_t* runtime_assert_enable;
+
   // Real-KV sources.
   RealKvSourceHandle sources[kMaxRealKvSources];
   int32_t num_sources;
@@ -81,6 +86,19 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   // seed_slot_idx < 0 anchors on splitmix64(kCanaryChainAnchor).
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
+
+  // Geometric write_position assert is enabled only:
+  //   1. after CanaryManager.mark_init_finished() (warmup / cuda-graph capture may write synthetic
+  //      positions whose seed slot has unrelated stored_position, which is not a real bug),
+  //   2. when entry_count == 1 (single-token decode shape — eagle DRAFT, regular DECODE). Multi-token
+  //      writes (extend prefill, target_verify with a token tree) carry positions that aren't a simple
+  //      seed.position + 1 + offset arithmetic progression, so geometric checking would misfire.
+  const bool do_geometric_assert = (entry_count == 1) && (*p.runtime_assert_enable != 0);
+  int64_t expected_position_base = 0;
+  if (do_geometric_assert && seed_slot_idx >= 0) {
+    expected_position_base = canary_load_field(
+        p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+  }
 
   int64_t entries_written = 0;
   for (int64_t entry_offset = 0; entry_offset < entry_count; ++entry_offset) {
@@ -121,6 +139,28 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
                 static_cast<int64_t>(running_prev_hash),
                 /* expected_aux = expected_position */ expected_position,
                 /* fail_reason_bits = */ static_cast<int64_t>(mismatch_bits),
+            });
+      }
+    }
+
+    // Geometric write_position check (single-entry decode shape, post-init): the only legitimate
+    // sequence is position == seed.position + 1 + entry_offset. Eagle-DRAFT under reverted PR #25015
+    // perturbs position by +1, which lands here and surfaces the bug. Independent of input_check, so
+    // tests that don't wire an oracle still get coverage.
+    if (do_geometric_assert) {
+      const int64_t expected_position_geometric = expected_position_base + 1 + entry_offset;
+      if (position != expected_position_geometric) {
+        record_violation(
+            p.violation_sink,
+            ViolationRow{
+                /* slot_idx = */ slot,
+                /* position = */ position,
+                /* stored_token = */ token,
+                /* expected_token = */ token,
+                /* stored_chain_hash (running running_prev_hash about to be written) = */
+                static_cast<int64_t>(running_prev_hash),
+                /* expected_aux = expected_position */ expected_position_geometric,
+                /* fail_reason_bits = */ static_cast<int64_t>(FailReason::kWritePositionMismatch),
             });
       }
     }
@@ -168,6 +208,7 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
     tvm::ffi::TensorView kernel_run_counter,
+    tvm::ffi::TensorView runtime_assert_enable,
     tvm::ffi::TensorView real_kv_buf_0,
     tvm::ffi::TensorView real_kv_buf_1,
     tvm::ffi::TensorView real_kv_buf_2,
@@ -225,6 +266,7 @@ inline void canary_write_step_cuda(
       .with_device<kDLCUDA>(device_)
       .verify(slot_run_counter)
       .verify(kernel_run_counter);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(runtime_assert_enable);
 
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
@@ -300,6 +342,7 @@ inline void canary_write_step_cuda(
   p.violation_sink.kernel_kind = static_cast<int32_t>(kernel_kind);
   p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
+  p.runtime_assert_enable = static_cast<const int32_t*>(runtime_assert_enable.data_ptr());
 
   const int32_t* params = static_cast<const int32_t*>(real_kv_source_params.data_ptr());
   tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};

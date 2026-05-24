@@ -34,6 +34,12 @@ def launch_canary_write_kernel_torch_reference(
     kernel_run_counter = context.kernel_run_counter
     real_kv_sources = context.real_kv_sources
     real_kv_hash_mode = context.real_kv_hash_mode
+    if context.runtime_assert_enable is None:
+        runtime_assert_enable_value = 1
+    else:
+        runtime_assert_enable_value = int(
+            context.runtime_assert_enable.detach().to("cpu").item()
+        )
 
     work_device = torch.device("cpu")
 
@@ -106,6 +112,14 @@ def launch_canary_write_kernel_torch_reference(
         seed_slot = int(seed_slot_indices_host[r].item())
         running_prev_hash = compute_slot_hash(buf_i64, seed_slot)
 
+        do_geometric_assert = (entry_count == 1) and (runtime_assert_enable_value != 0)
+        if do_geometric_assert and seed_slot >= 0:
+            expected_position_base = int(
+                buf_i64[seed_slot, consts.CANARY_FIELD_POSITION].item()
+            )
+        else:
+            expected_position_base = 0
+
         for entry_offset in range(entry_count):
             entry_idx = entry_start + entry_offset
             slot = int(out_cache_loc_host[entry_idx].item())
@@ -143,6 +157,28 @@ def launch_canary_write_kernel_torch_reference(
                     )
                     row[consts.VIOLATION_FIELD_EXPECTED_AUX] = expected_position
                     row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(mismatch_bits)
+                    violation_rows.append(row)
+
+            if do_geometric_assert:
+                expected_position_geometric = (
+                    expected_position_base + 1 + entry_offset
+                )
+                if position != expected_position_geometric:
+                    row = [0] * consts.VIOLATION_FIELDS
+                    row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
+                    row[consts.VIOLATION_FIELD_SLOT_IDX] = slot
+                    row[consts.VIOLATION_FIELD_POSITION] = position
+                    row[consts.VIOLATION_FIELD_STORED_TOKEN] = token
+                    row[consts.VIOLATION_FIELD_EXPECTED_TOKEN] = token
+                    row[consts.VIOLATION_FIELD_STORED_CHAIN_HASH] = _to_signed_int64(
+                        running_prev_hash
+                    )
+                    row[consts.VIOLATION_FIELD_EXPECTED_AUX] = (
+                        expected_position_geometric
+                    )
+                    row[consts.VIOLATION_FIELD_FAIL_REASON_BITS] = int(
+                        consts.FailReason.WRITE_POSITION_MISMATCH
+                    )
                     violation_rows.append(row)
 
             buf_i64[slot, consts.CANARY_FIELD_TOKEN] = token
