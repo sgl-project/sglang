@@ -391,9 +391,12 @@ export const config = {
       // Verified best for B200 Pro balanced: keeps the flashinfer-mxfp4 runner
       // but routes A2A through MegaMoE. Throughput bench is still being
       // re-validated, so the benchmark card surfaces latency-only.
+      // MegaMoE + balanced MTP (1/1/2) needs a smaller per-rank dispatch cap
+      // than max-throughput's 8320 — the MTP draft pass eats extra GMEM budget,
+      // so cap at 4096 to keep MoE memory in budget.
       match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -537,9 +540,11 @@ export const config = {
       // Verified best for B300 Pro balanced: mirrors B200 Pro balanced — keep
       // flashinfer-mxfp4 runner, route A2A through MegaMoE. Throughput is
       // still pending re-verification.
+      // MegaMoE + balanced MTP needs the same 4096 per-rank dispatch cap as
+      // B200 Pro balanced (see that cell's comment).
       match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
