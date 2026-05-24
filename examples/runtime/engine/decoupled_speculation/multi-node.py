@@ -4,9 +4,10 @@ Run decoupled speculative decoding for either an input prompt or a prompt datase
 
 By default, this compares decoupled speculative decoding against normal decode.
 Use `--baseline none` to run decoupled speculation only, `--baseline mtp` to
-compare against SGLang's builtin colocated MTP baseline, and `--show-responses`
-to print full response text. When `--output-dir` is set, JSON output records
-full prompt and response text.
+compare against SGLang's builtin colocated MTP baseline, or `--baseline all` to
+run decode and MTP baselines in sequence. Use `--show-responses` to print full
+response text. When `--output-dir` is set, JSON output records full prompt and
+response text.
 """
 
 from __future__ import annotations
@@ -258,9 +259,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Base port for this run. With V verifier replicas, spec dist-init "
-            "uses base..base+V-1, baseline uses base+V..base+2V-1, verifier "
-            "result endpoints use base+2V..base+3V-1, and drafter control "
-            "endpoints start at base+3V."
+            "uses the first V ports; baseline dist-init ports follow; verifier "
+            "result and drafter control endpoints are placed after the "
+            "baseline slots."
         ),
     )
     parser.add_argument(
@@ -292,11 +293,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--baseline",
-        choices=["decode", "mtp", "none"],
+        choices=common.BASELINE_CHOICES,
         default="decode",
         help=(
-            "Baseline to run after decoupled speculation. 'mtp' uses SGLang's "
-            "builtin colocated, serial draft-verify MTP/EAGLE path."
+            "Baseline to run after decoupled speculation. Use 'all' to run "
+            "decode and MTP. 'mtp' uses SGLang's builtin colocated, serial "
+            "draft-verify MTP/EAGLE path."
         ),
     )
     parser.add_argument(
@@ -374,10 +376,16 @@ def _parse_reserved_ports(raw_ports: str | None) -> list[int]:
 
 def _split_reserved_ports(
     args: argparse.Namespace,
-) -> tuple[list[int], list[int] | None, list[int], list[int], list[int] | None]:
+) -> tuple[
+    list[int],
+    dict[str, list[int]],
+    list[int],
+    list[int],
+    list[int] | None,
+]:
     reserved_ports = _parse_reserved_ports(args.reserved_ports)
     if not reserved_ports:
-        return [], None, [], [], None
+        return [], {}, [], [], None
 
     if args.dist_init_addr is not None or args.dist_init_port is not None:
         raise ValueError(
@@ -387,9 +395,10 @@ def _split_reserved_ports(
 
     num_verifiers = args.num_verifier_replicas
     num_drafters = args.num_draft_replicas
+    baseline_modes = common.resolve_baseline_modes(args.baseline)
     required_ports = (
         num_verifiers
-        + (num_verifiers if args.baseline != "none" else 0)
+        + len(baseline_modes) * num_verifiers
         + num_verifiers
         + num_drafters
     )
@@ -397,7 +406,7 @@ def _split_reserved_ports(
         raise ValueError(
             f"--reserved-ports provides {len(reserved_ports)} ports, but this "
             f"run needs {required_ports}: {num_verifiers} spec dist-init, "
-            f"{num_verifiers if args.baseline != 'none' else 0} baseline "
+            f"{len(baseline_modes) * num_verifiers} baseline "
             f"dist-init, {num_verifiers} result endpoint, and {num_drafters} "
             "drafter control ports"
         )
@@ -405,14 +414,16 @@ def _split_reserved_ports(
     cursor = 0
     spec_ports = reserved_ports[cursor : cursor + num_verifiers]
     cursor += num_verifiers
-    baseline_ports = None
-    if args.baseline != "none":
-        baseline_ports = reserved_ports[cursor : cursor + num_verifiers]
+    baseline_ports_by_mode = {}
+    for baseline_mode in baseline_modes:
+        baseline_ports_by_mode[baseline_mode] = reserved_ports[
+            cursor : cursor + num_verifiers
+        ]
         cursor += num_verifiers
     result_ports = reserved_ports[cursor : cursor + num_verifiers]
     cursor += num_verifiers
     control_ports = reserved_ports[cursor : cursor + num_drafters]
-    return spec_ports, baseline_ports, result_ports, control_ports, reserved_ports
+    return spec_ports, baseline_ports_by_mode, result_ports, control_ports, reserved_ports
 
 
 def derive_dist_init_addr(
@@ -913,6 +924,7 @@ def main() -> None:
     try:
         init_ray(args.ray_address, args.ray_namespace, args.nnodes)
         target_nnodes, target_gpus_per_node = validate_resources(args)
+        baseline_modes = common.resolve_baseline_modes(args.baseline)
 
         spec_pgs = create_target_placement_groups(
             args.num_verifier_replicas,
@@ -950,19 +962,24 @@ def main() -> None:
         }
         num_verifiers = args.num_verifier_replicas
         reserved_dist_init_ports = set(spec_dist_init_ports)
-        if args.baseline != "none":
-            if baseline_reserved_ports is not None:
-                reserved_dist_init_ports.update(baseline_reserved_ports)
-            elif args.dist_init_port is not None:
+        baseline_slot_count = max(1, len(baseline_modes))
+        for baseline_index, baseline_mode in enumerate(baseline_modes):
+            if baseline_mode in baseline_reserved_ports:
                 reserved_dist_init_ports.update(
-                    args.dist_init_port + num_verifiers + replica_index
+                    baseline_reserved_ports[baseline_mode]
+                )
+            elif args.dist_init_port is not None:
+                baseline_offset = num_verifiers * (1 + baseline_index)
+                reserved_dist_init_ports.update(
+                    args.dist_init_port + baseline_offset + replica_index
                     for replica_index in range(num_verifiers)
                 )
             elif args.dist_init_addr is not None:
                 _, base_port = _parse_host_port(args.dist_init_addr)
                 if base_port is not None:
+                    baseline_offset = num_verifiers * (1 + baseline_index)
                     reserved_dist_init_ports.update(
-                        base_port + num_verifiers + replica_index
+                        base_port + baseline_offset + replica_index
                         for replica_index in range(num_verifiers)
                     )
         preferred_result_ports = (
@@ -970,7 +987,9 @@ def main() -> None:
             if result_reserved_ports
             else (
                 [
-                    args.dist_init_port + 2 * num_verifiers + i
+                    args.dist_init_port
+                    + num_verifiers * (1 + baseline_slot_count)
+                    + i
                     for i in range(num_verifiers)
                 ]
                 if args.dist_init_port is not None
@@ -982,7 +1001,9 @@ def main() -> None:
             if control_reserved_ports
             else (
                 [
-                    args.dist_init_port + 3 * num_verifiers + i
+                    args.dist_init_port
+                    + num_verifiers * (2 + baseline_slot_count)
+                    + i
                     for i in range(args.num_draft_replicas)
                 ]
                 if args.dist_init_port is not None
@@ -1020,32 +1041,37 @@ def main() -> None:
         shutdown_actors(draft_actors)
         draft_actors = []
 
-        baseline_metrics = None
-        if args.baseline != "none":
+        baseline_metrics = []
+        baseline_dist_init_addrs_by_mode = {}
+        for baseline_index, baseline_mode in enumerate(baseline_modes):
+            baseline_offset = args.num_verifier_replicas * (1 + baseline_index)
             baseline_dist_init_addrs = [
                 derive_dist_init_addr_from_pg(
                     args,
                     pg,
-                    port_offset=args.num_verifier_replicas + replica_index,
+                    port_offset=baseline_offset + replica_index,
                     preferred_port=(
-                        baseline_reserved_ports[replica_index]
-                        if baseline_reserved_ports is not None
+                        baseline_reserved_ports[baseline_mode][replica_index]
+                        if baseline_mode in baseline_reserved_ports
                         else None
                     ),
                 )
                 for replica_index, pg in enumerate(spec_pgs)
             ]
-            baseline_metrics = run_mode(
-                args=args,
-                mode=args.baseline,
-                prompt_input_ids=prompt_input_ids,
-                sampling_params=sampling_params,
-                prompt_samples=prompt_samples,
-                dist_init_addrs=baseline_dist_init_addrs,
-                target_nnodes=target_nnodes,
-                target_gpus_per_node=target_gpus_per_node,
-                pgs=spec_pgs,
-                include_output_text=True,
+            baseline_dist_init_addrs_by_mode[baseline_mode] = baseline_dist_init_addrs
+            baseline_metrics.append(
+                run_mode(
+                    args=args,
+                    mode=baseline_mode,
+                    prompt_input_ids=prompt_input_ids,
+                    sampling_params=sampling_params,
+                    prompt_samples=prompt_samples,
+                    dist_init_addrs=baseline_dist_init_addrs,
+                    target_nnodes=target_nnodes,
+                    target_gpus_per_node=target_gpus_per_node,
+                    pgs=spec_pgs,
+                    include_output_text=True,
+                )
             )
 
         result = build_result(
@@ -1061,10 +1087,14 @@ def main() -> None:
         if reserved_ports is not None:
             result["config"]["reserved_ports"] = reserved_ports
             result["config"]["spec_dist_init_addrs"] = spec_dist_init_addrs
-            if args.baseline != "none":
-                result["config"]["baseline_dist_init_addrs"] = (
-                    baseline_dist_init_addrs
-                )
+        if len(baseline_dist_init_addrs_by_mode) == 1:
+            result["config"]["baseline_dist_init_addrs"] = next(
+                iter(baseline_dist_init_addrs_by_mode.values())
+            )
+        elif baseline_dist_init_addrs_by_mode:
+            result["config"]["baseline_dist_init_addrs_by_mode"] = (
+                baseline_dist_init_addrs_by_mode
+            )
         print_summary(result)
         if args.output_dir:
             print("output_files:")

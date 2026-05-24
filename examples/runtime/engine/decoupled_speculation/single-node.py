@@ -5,7 +5,8 @@ Run decoupled speculative decoding on a single node without Ray.
 This keeps the same user-facing workload arguments as
 multi-node.py, but removes Ray/multi-node launch. The drafter
 engines run in local child processes and the verifier engine runs in this
-process, which makes it convenient to launch under nsys.
+process, which makes it convenient to launch under nsys. Use --baseline all to
+run decode and MTP baselines in sequence.
 """
 
 from __future__ import annotations
@@ -209,9 +210,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Base port for this run. Spec dist-init uses base, baseline uses "
-            "base+1, verifier result endpoint uses base+2, and drafter control "
-            "endpoints start at base+3."
+            "Base port for this run. Spec dist-init uses base; baseline "
+            "dist-init ports follow; verifier result and drafter control "
+            "endpoints are placed after the baseline slots."
         ),
     )
     parser.add_argument(
@@ -243,11 +244,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--baseline",
-        choices=["decode", "mtp", "none"],
+        choices=common.BASELINE_CHOICES,
         default="decode",
         help=(
-            "Baseline to run after decoupled speculation. 'mtp' uses SGLang's "
-            "builtin colocated, serial draft-verify MTP/EAGLE path."
+            "Baseline to run after decoupled speculation. Use 'all' to run "
+            "decode and MTP. 'mtp' uses SGLang's builtin colocated, serial "
+            "draft-verify MTP/EAGLE path."
         ),
     )
     parser.add_argument(
@@ -366,7 +368,8 @@ def _allocate_local_ports(
     *,
     num_verifiers: int,
     num_drafters: int,
-) -> tuple[str, str | None, str, list[str], list[int] | None]:
+) -> tuple[str, dict[str, str], str, list[str], list[int] | None]:
+    baseline_modes = common.resolve_baseline_modes(args.baseline)
     reserved_ports = _parse_reserved_ports(args.reserved_ports)
     if reserved_ports:
         if args.dist_init_addr is not None or args.dist_init_port is not None:
@@ -374,12 +377,12 @@ def _allocate_local_ports(
                 "--reserved-ports cannot be combined with --dist-init-addr or "
                 "--dist-init-port"
             )
-        required_ports = 1 + (1 if args.baseline != "none" else 0) + 1 + num_drafters
+        required_ports = 1 + len(baseline_modes) + 1 + num_drafters
         if len(reserved_ports) < required_ports:
             raise ValueError(
                 f"--reserved-ports provides {len(reserved_ports)} ports, but this "
                 f"run needs {required_ports}: spec dist-init, "
-                f"{'baseline dist-init, ' if args.baseline != 'none' else ''}"
+                f"{'baseline dist-init, ' if baseline_modes else ''}"
                 "verifier result, and drafter control endpoints"
             )
         usable_ports = [port for port in reserved_ports if _port_available(port)]
@@ -397,38 +400,46 @@ def _allocate_local_ports(
             )
         port_iter = iter(usable_ports)
         spec_dist_init_addr = f"{LOCAL_HOST}:{next(port_iter)}"
-        baseline_dist_init_addr = (
-            f"{LOCAL_HOST}:{next(port_iter)}" if args.baseline != "none" else None
-        )
+        baseline_dist_init_addrs = {
+            mode: f"{LOCAL_HOST}:{next(port_iter)}" for mode in baseline_modes
+        }
         result_endpoint = _format_tcp_endpoint(next(port_iter))
         control_endpoints = [
             _format_tcp_endpoint(next(port_iter)) for _ in range(num_drafters)
         ]
         return (
             spec_dist_init_addr,
-            baseline_dist_init_addr,
+            baseline_dist_init_addrs,
             result_endpoint,
             control_endpoints,
             reserved_ports,
         )
 
     explicit_dist_init_port = _port_from_dist_init_addr(args.dist_init_addr)
+    baseline_slot_count = max(1, len(baseline_modes))
     base_port = args.dist_init_port or _pick_free_port_block(
-        3 + num_drafters,
+        2 + baseline_slot_count + num_drafters,
         avoid_ports=(
             {explicit_dist_init_port} if explicit_dist_init_port is not None else None
         ),
     )
     spec_dist_init_addr = args.dist_init_addr or f"{LOCAL_HOST}:{base_port}"
-    baseline_dist_init_addr = f"{LOCAL_HOST}:{base_port + num_verifiers}"
-    result_endpoint = _format_tcp_endpoint(base_port + 2 * num_verifiers)
+    baseline_dist_init_addrs = {
+        mode: f"{LOCAL_HOST}:{base_port + num_verifiers * (1 + mode_index)}"
+        for mode_index, mode in enumerate(baseline_modes)
+    }
+    result_endpoint = _format_tcp_endpoint(
+        base_port + num_verifiers * (1 + baseline_slot_count)
+    )
     control_endpoints = [
-        _format_tcp_endpoint(base_port + 3 * num_verifiers + index)
+        _format_tcp_endpoint(
+            base_port + num_verifiers * (2 + baseline_slot_count) + index
+        )
         for index in range(num_drafters)
     ]
     return (
         spec_dist_init_addr,
-        baseline_dist_init_addr,
+        baseline_dist_init_addrs,
         result_endpoint,
         control_endpoints,
         None,
@@ -862,7 +873,7 @@ def main() -> None:
     num_drafters = args.num_draft_replicas
     (
         spec_dist_init_addr,
-        baseline_dist_init_addr,
+        baseline_dist_init_addrs,
         result_endpoint,
         control_endpoints,
         reserved_ports,
@@ -880,6 +891,8 @@ def main() -> None:
     print(f"  verifier_result_endpoint: {result_endpoint}", flush=True)
     print(f"  draft_control_endpoints: {control_endpoints}", flush=True)
     print(f"  verifier_dist_init_addr: {spec_dist_init_addr}", flush=True)
+    if baseline_dist_init_addrs:
+        print(f"  baseline_dist_init_addrs: {baseline_dist_init_addrs}", flush=True)
 
     draft_processes: list[mp.Process] = []
     draft_stop_senders = None
@@ -917,34 +930,38 @@ def main() -> None:
         draft_processes = []
         draft_stop_senders = None
 
-        baseline_metrics = None
-        if args.baseline != "none":
-            print(f"creating_{args.baseline}_engine...", flush=True)
-            assert baseline_dist_init_addr is not None
-            if args.baseline == "decode":
+        baseline_metrics = []
+        for baseline_mode in common.resolve_baseline_modes(args.baseline):
+            print(f"creating_{baseline_mode}_engine...", flush=True)
+            baseline_dist_init_addr = baseline_dist_init_addrs[baseline_mode]
+            if baseline_mode == "decode":
                 baseline_engine = create_decode_engine(
                     args,
                     dist_init_addr=baseline_dist_init_addr,
                 )
-            elif args.baseline == "mtp":
+            elif baseline_mode == "mtp":
                 baseline_engine = create_mtp_engine(
                     args,
                     dist_init_addr=baseline_dist_init_addr,
                 )
             else:
-                raise ValueError(f"Unsupported baseline: {args.baseline}")
-            print(f"running_{args.baseline}_generate...", flush=True)
+                raise ValueError(f"Unsupported baseline: {baseline_mode}")
+            print(f"running_{baseline_mode}_generate...", flush=True)
             baseline_outputs = run_engine_generate(
                 baseline_engine,
                 input_ids=prompt_input_ids,
                 sampling_params=sampling_params,
             )
-            print(f"{args.baseline}_generate_done", flush=True)
-            baseline_metrics = _collect_mode_metrics(
-                mode=args.baseline,
-                outputs=baseline_outputs,
-                prompt_samples=prompt_samples,
+            print(f"{baseline_mode}_generate_done", flush=True)
+            baseline_metrics.append(
+                _collect_mode_metrics(
+                    mode=baseline_mode,
+                    outputs=baseline_outputs,
+                    prompt_samples=prompt_samples,
+                )
             )
+            baseline_engine.shutdown()
+            baseline_engine = None
 
         result = common.build_result(
             args=args,
@@ -962,8 +979,8 @@ def main() -> None:
         result["config"]["verifier_result_endpoint"] = result_endpoint
         result["config"]["draft_control_endpoints"] = control_endpoints
         result["config"]["verifier_dist_init_addr"] = spec_dist_init_addr
-        if baseline_dist_init_addr is not None:
-            result["config"]["baseline_dist_init_addr"] = baseline_dist_init_addr
+        if baseline_dist_init_addrs:
+            result["config"]["baseline_dist_init_addrs"] = baseline_dist_init_addrs
         if reserved_ports is not None:
             result["config"]["reserved_ports"] = reserved_ports
 

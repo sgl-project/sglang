@@ -14,6 +14,7 @@ DEFAULT_PROMPT_COLUMN_CANDIDATES = [
     "input",
     "query",
 ]
+BASELINE_CHOICES = ["decode", "mtp", "none", "all"]
 DAPO_MATH_17K_DEFAULT_PROMPT_COLUMN = "prompt"
 CODEFORCES_REQUIRED_COLUMNS = [
     "description",
@@ -35,6 +36,16 @@ CODEFORCES_LANGUAGE_ALIASES = {
     "cpp": "C++17",
     "c++": "C++17",
 }
+
+
+def resolve_baseline_modes(baseline: str) -> list[str]:
+    if baseline == "none":
+        return []
+    if baseline == "all":
+        return ["decode", "mtp"]
+    if baseline in ("decode", "mtp"):
+        return [baseline]
+    raise ValueError(f"Unsupported baseline: {baseline}")
 
 
 @dataclass
@@ -78,4 +89,3 @@ class ModeMetrics:
     total_spec_valid_accept_token_num: int = 0
     total_spec_valid_draft_token_num_by_position: list[int] | None = None
     total_spec_valid_accept_token_num_by_position: list[int] | None = None
-

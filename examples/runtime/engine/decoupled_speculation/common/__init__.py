@@ -31,6 +31,7 @@ from .runtime import (
     reserve_tcp_port,
 )
 from .types import (
+    BASELINE_CHOICES,
     CODEFORCES_LANGUAGE_ALIASES,
     CODEFORCES_OPTIONAL_COLUMNS,
     CODEFORCES_REQUIRED_COLUMNS,
@@ -40,9 +41,11 @@ from .types import (
     DecoupledSpecTopology,
     ModeMetrics,
     PromptSample,
+    resolve_baseline_modes,
 )
 
 __all__ = [
+    "BASELINE_CHOICES",
     "CODEFORCES_LANGUAGE_ALIASES",
     "CODEFORCES_OPTIONAL_COLUMNS",
     "CODEFORCES_REQUIRED_COLUMNS",
@@ -75,5 +78,6 @@ __all__ = [
     "print_summary",
     "reserve_tcp_port",
     "resolve_dapo_math_17k_prompt_column",
+    "resolve_baseline_modes",
     "write_output_files",
 ]

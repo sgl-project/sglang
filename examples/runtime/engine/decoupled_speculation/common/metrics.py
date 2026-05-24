@@ -375,14 +375,44 @@ def build_result(
     total_rows: int,
     prompt_samples: list[PromptSample],
     spec_metrics: ModeMetrics,
-    baseline_metrics: ModeMetrics | None = None,
+    baseline_metrics: ModeMetrics | list[ModeMetrics] | None = None,
 ) -> dict[str, Any]:
-    speedup = (
-        baseline_metrics.generation_time_s / spec_metrics.generation_time_s
-        if baseline_metrics is not None and spec_metrics.generation_time_s > 0
-        else None
+    if baseline_metrics is None:
+        baseline_metrics_list: list[ModeMetrics] = []
+    elif isinstance(baseline_metrics, ModeMetrics):
+        baseline_metrics_list = [baseline_metrics]
+    else:
+        baseline_metrics_list = list(baseline_metrics)
+
+    baseline_names = [metrics.mode for metrics in baseline_metrics_list]
+    e2e_speedups: dict[str, float | None] = {}
+    for metrics in baseline_metrics_list:
+        e2e_speedups[f"decoupled_spec_vs_{metrics.mode}"] = (
+            metrics.generation_time_s / spec_metrics.generation_time_s
+            if spec_metrics.generation_time_s > 0
+            else None
+        )
+
+    decode_metrics = next(
+        (metrics for metrics in baseline_metrics_list if metrics.mode == "decode"),
+        None,
     )
-    baseline = baseline_metrics.mode if baseline_metrics is not None else "none"
+    if decode_metrics is not None:
+        comparable_metrics = [spec_metrics] + [
+            metrics for metrics in baseline_metrics_list if metrics.mode != "decode"
+        ]
+        for metrics in comparable_metrics:
+            e2e_speedups[f"{metrics.mode}_vs_decode"] = (
+                decode_metrics.generation_time_s / metrics.generation_time_s
+                if metrics.generation_time_s > 0
+                else None
+            )
+
+    baseline = (
+        baseline_names[0]
+        if len(baseline_names) == 1
+        else ("all" if baseline_names else "none")
+    )
     actor_env_vars = get_decoupled_spec_actor_env_vars()
     result = {
         "config": {
@@ -441,10 +471,16 @@ def build_result(
         },
         "decoupled_spec": _mode_metrics_result_dict(spec_metrics),
     }
-    if baseline_metrics is not None:
-        result[baseline] = _mode_metrics_result_dict(baseline_metrics)
+    if baseline_metrics_list:
+        for metrics in baseline_metrics_list:
+            result[metrics.mode] = _mode_metrics_result_dict(metrics)
         result["baseline"] = baseline
-        result["e2e_speedup"] = speedup
+        result["baselines"] = baseline_names
+        result["e2e_speedups"] = e2e_speedups
+        if len(baseline_metrics_list) == 1:
+            result["e2e_speedup"] = e2e_speedups.get(
+                f"decoupled_spec_vs_{baseline_names[0]}"
+            )
     return result
 
 
@@ -639,14 +675,29 @@ def _print_response_block(label: str, text: str, *, indent: str = "    ") -> Non
         print(f"{indent}  {line}")
 
 
+def _format_speedup(value: float | None) -> str:
+    return f"{value:.4f}" if value is not None else "None"
+
+
 def print_summary(result: dict[str, Any]) -> None:
     spec = result["decoupled_spec"]
-    baseline_name = result.get("baseline")
-    baseline = result.get(baseline_name) if baseline_name else None
-    speedup = result.get("e2e_speedup")
+    baseline_names = result.get("baselines")
+    if baseline_names is None:
+        baseline_name = result.get("baseline")
+        baseline_names = (
+            [baseline_name]
+            if baseline_name in ("decode", "mtp") and baseline_name in result
+            else []
+        )
+    baselines = {
+        baseline_name: result[baseline_name]
+        for baseline_name in baseline_names
+        if baseline_name in result
+    }
+    e2e_speedups = result.get("e2e_speedups", {})
     title = (
-        f"decoupled_spec_vs_{baseline_name}_batch"
-        if baseline is not None
+        f"decoupled_spec_vs_{'_'.join(baselines)}_batch"
+        if baselines
         else "decoupled_spec_batch"
     )
     print(f"=== {title} ===")
@@ -677,7 +728,7 @@ def print_summary(result: dict[str, Any]) -> None:
         f"valid_draft_tokens_by_position="
         f"{spec['total_spec_valid_draft_token_num_by_position']}"
     )
-    if baseline is not None:
+    for baseline_name, baseline in baselines.items():
         baseline_line = (
             f"{baseline_name}: "
             f"generation_time_s={baseline['generation_time_s']:.3f}, "
@@ -690,10 +741,21 @@ def print_summary(result: dict[str, Any]) -> None:
                 f"avg_spec_accept_rate={baseline['avg_spec_accept_rate']}"
             )
         print(baseline_line)
+    if "decode" in baselines:
         print(
-            f"e2e_speedup_vs_{baseline_name}: {speedup:.4f}"
-            if speedup is not None
-            else f"e2e_speedup_vs_{baseline_name}: None"
+            "e2e_speedup_decoupled_spec_vs_decode: "
+            f"{_format_speedup(e2e_speedups.get('decoupled_spec_vs_decode'))}"
+        )
+        if "mtp" in baselines:
+            print(
+                "e2e_speedup_mtp_vs_decode: "
+                f"{_format_speedup(e2e_speedups.get('mtp_vs_decode'))}"
+            )
+    elif len(baselines) == 1:
+        baseline_name = next(iter(baselines))
+        print(
+            f"e2e_speedup_vs_{baseline_name}: "
+            f"{_format_speedup(result.get('e2e_speedup'))}"
         )
     print("per_request:")
     for item in spec["per_request"]:
@@ -718,9 +780,9 @@ def print_summary(result: dict[str, Any]) -> None:
             f"{item['spec_valid_draft_token_num_by_position']}, "
             f"spec_verify_ct={item['spec_verify_ct']}"
         )
-    if baseline_name == "mtp" and baseline is not None:
+    if "mtp" in baselines:
         print("mtp_per_request:")
-        for item in baseline["per_request"]:
+        for item in baselines["mtp"]["per_request"]:
             print(
                 "  "
                 f"batch_index={item['batch_index']}, "
@@ -737,14 +799,7 @@ def print_summary(result: dict[str, Any]) -> None:
             )
     if result["config"].get("show_responses"):
         print("responses:")
-        baseline_items = (
-            baseline["per_request"]
-            if baseline is not None
-            else [None] * len(spec["per_request"])
-        )
-        for spec_item, baseline_item in zip(
-            spec["per_request"], baseline_items, strict=True
-        ):
+        for spec_index, spec_item in enumerate(spec["per_request"]):
             print(
                 "  "
                 f"batch_index={spec_item['batch_index']}, "
@@ -755,7 +810,8 @@ def print_summary(result: dict[str, Any]) -> None:
                 "decoupled_spec_response",
                 spec_item.get("output_text", ""),
             )
-            if baseline_item is not None:
+            for baseline_name, baseline in baselines.items():
+                baseline_item = baseline["per_request"][spec_index]
                 if (
                     spec_item["batch_index"] != baseline_item["batch_index"]
                     or spec_item["row_index"] != baseline_item["row_index"]
