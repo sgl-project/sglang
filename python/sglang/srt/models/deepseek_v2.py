@@ -680,6 +680,9 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "gptq",
+                "gptq_marlin",
+                "auto-round",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
