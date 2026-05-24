@@ -12,14 +12,7 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
-    # Enable write-time oracle input checks so the canary write kernel can
-    # directly catch a perturbed-position eagle draft write as
-    # ``fail_reason=write_position`` on the affected slot. Without this,
-    # detection has to wait for a later per-forward verify cycle to include
-    # the perturbed slot in its prefix scope — which never happens when the
-    # PR-revert garbled outputs make the eagle requests time out before
-    # producing enough decode tokens.
-    "SGLANG_KV_CANARY_INPUT_CHECK": "1",
+    "SGLANG_KV_CANARY_INPUT_CHECK": "0",
     "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
 }
 _SPEC_EAGLE_REVERT_PR_ENV = {
@@ -66,14 +59,17 @@ class _EaglePositionsBase(CanaryE2EBase):
         )
 
         if self.revert_pr:
-            # Reverting PR #25015 shifts every eagle draft position by +1. With
-            # SGLANG_KV_CANARY_INPUT_CHECK=1 the canary write kernel directly
-            # compares each write's actual position against the oracle's
-            # expected position and fires ``write_position`` immediately on the
-            # first perturbed draft write. Fall back to ``position`` /
-            # ``chain_hash`` (the per-forward-verify signals) if a different
-            # cycle catches it first.
-            for reason in ("write_position", "position", "chain_hash"):
+            # Reverting PR #25015 shifts every eagle draft position by +1. The
+            # mismatch manifests as either a direct ``position`` bit (if the
+            # write-side stored_position differs from verify-side
+            # expected_position on a slot that gets per-forward-verified) or a
+            # propagated ``chain_hash`` bit (if the affected slot is reached
+            # transitively through the per-forward chain on a sibling slot
+            # — happens when canary mode is RAISE so the first detected
+            # violation kills the scheduler before the draft slot itself
+            # appears in a later prefix). Either signal proves canary caught
+            # the regression; accept whichever fires first.
+            for reason in ("position", "chain_hash"):
                 try:
                     self.assert_violation_logged_any(
                         launch_tag_patterns=("*",),
@@ -84,9 +80,8 @@ class _EaglePositionsBase(CanaryE2EBase):
                 except AssertionError:
                     continue
             raise AssertionError(
-                "Expected canary to fire one of fail_reason ∈ "
-                "{write_position, position, chain_hash} after reverting PR #25015, "
-                "but none was logged."
+                "Expected canary to fire one of fail_reason ∈ {position, chain_hash} "
+                "after reverting PR #25015, but neither was logged."
             )
         else:
             self.assert_no_violation(wait_seconds=2.0)
