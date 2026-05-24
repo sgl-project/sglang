@@ -223,17 +223,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             ),
         ]
 
-    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
-        # Prefixes are chosen to match ``component_uses`` and avoid
-        # collisions with TextEncodingStage / EncodingStage / DenoisingStage
-        # when the same trace mixes layered Qwen-Image with siblings.
-        mods: list[tuple[torch.nn.Module, str]] = []
-        if self.text_encoder is not None:
-            mods.append((self.text_encoder, "qwen_layered_text_encoder"))
-        if self.vae is not None:
-            mods.append((self.vae, "qwen_layered_vae"))
-        return mods
-
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
         bool_mask = mask.bool()

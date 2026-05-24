@@ -7,10 +7,15 @@ require CUDA and are exercised end-to-end by Nsight-Systems profiling runs.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentResidencyManager,
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.utils import nvtx_pytorch_hooks
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import (
     DiffusionNvtxHooks,
@@ -147,8 +152,7 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
 
     def test_default_enabled_is_false(self) -> None:
         """Default off so an unguarded forward (e.g. early warmup) cannot
-        emit ranges; the caller must explicitly enable via set_enabled
-        (typically through ``PipelineStage._apply_nvtx_gate``)."""
+        emit ranges; the caller must explicitly enable via set_enabled."""
         self.assertFalse(DiffusionNvtxHooks()._enabled)
 
     def test_post_hook_fires_on_forward_exception(self) -> None:
@@ -176,129 +180,142 @@ class TestDiffusionNvtxHooks(unittest.TestCase):
         self.assertEqual(push.call_count, 1)
 
 
-class _StubStage:
-    """Pipeline-stage stand-in that exercises the shared NVTX helpers.
+class _NoOpResidencyStrategy:
+    name = "noop"
 
-    Importing the real ``PipelineStage`` would drag in unrelated runtime
-    dependencies (server_args, residency manager); the copies below are
-    logic-equivalent to the methods in ``stages/base.py`` — logging is
-    swapped for an in-test counter so spam-tests can assert call counts.
-    Drift between this stub and the real base is caught by
-    ``test_call_invokes_gate_before_forward`` below, which subclasses
-    the real ``PipelineStage`` directly.
-    """
+    def prepare_for_use(self, module, use, state) -> None:
+        pass
 
-    def __init__(self, modules, enable_flag: bool) -> None:
-        self._nvtx_hooks = None
-        self._nvtx_registered_ids: frozenset[int] = frozenset()
-        self._nvtx_zero_warned = False
-        self._current_use_nvtx = False
-        self._modules = modules
-        self.server_args = type(
-            "Args", (), {"enable_layerwise_nvtx_marker": enable_flag}
-        )()
-        self.zero_warn_count = 0  # tracked by the stub for spam-test
+    def wait_for_use(self, module, use, state) -> None:
+        pass
 
-    def nvtx_hookable_modules(self):
-        return self._modules
+    def finish_use(self, module, use, state) -> None:
+        pass
 
-    def _maybe_register_nvtx_hooks(self):
-        if not self.server_args.enable_layerwise_nvtx_marker:
-            return
-        current = self.nvtx_hookable_modules()
-        current_ids = frozenset(id(m) for m, _ in current if m is not None)
-        if self._nvtx_hooks is not None:
-            if current_ids == self._nvtx_registered_ids:
-                return
-            self._nvtx_hooks.remove_hooks()
-            self._nvtx_hooks = None
-            self._nvtx_registered_ids = frozenset()
-            self._nvtx_zero_warned = False
-        hooks = DiffusionNvtxHooks()
-        total = 0
-        for module, prefix in current:
-            if module is None:
-                continue
-            total += hooks.register_hooks(module, prefix=prefix)
-        if total == 0:
-            if not self._nvtx_zero_warned:
-                self.zero_warn_count += 1
-                self._nvtx_zero_warned = True
-            return
-        self._nvtx_hooks = hooks
-        self._nvtx_registered_ids = current_ids
+    def finish_request(self, module, use, state, *, preferred: bool) -> None:
+        pass
 
-    def _apply_nvtx_gate(self, is_warmup: bool) -> bool:
-        self._maybe_register_nvtx_hooks()
-        use_nvtx = self.server_args.enable_layerwise_nvtx_marker and not is_warmup
-        if self._nvtx_hooks is not None:
-            self._nvtx_hooks.set_enabled(use_nvtx)
-        self._current_use_nvtx = use_nvtx
-        return use_nvtx
+    def prefetch_for_use(self, module, use, state) -> bool:
+        return False
 
-    @property
-    def current_use_nvtx(self) -> bool:
-        return self._current_use_nvtx
-
-    def _detach_nvtx_hooks(self):
-        if self._nvtx_hooks is not None:
-            self._nvtx_hooks.remove_hooks()
-            self._nvtx_hooks = None
-        self._nvtx_registered_ids = frozenset()
-        self._nvtx_zero_warned = False
+    def prepare_after_request(self, module, use, state) -> None:
+        pass
 
 
-class TestStageMixin(unittest.TestCase):
+def _test_manager(
+    modules: dict[str, torch.nn.Module],
+    *,
+    enable_flag: bool = True,
+    is_warmup: bool = False,
+) -> ComponentResidencyManager:
+    pipeline = SimpleNamespace(
+        modules=modules,
+        _stage_name_mapping={},
+        component_residency_strategies={},
+    )
+    server_args = SimpleNamespace(enable_layerwise_nvtx_marker=enable_flag)
+    manager = ComponentResidencyManager(pipeline, server_args)
+    manager.state.batch_is_warmup = is_warmup
+    manager.strategy_for = lambda _component_name, _module: _NoOpResidencyStrategy()
+    return manager
+
+
+class TestComponentResidencyNvtxHooks(unittest.TestCase):
     def test_disabled_flag_is_noop(self) -> None:
-        stage = _StubStage([(torch.nn.Linear(2, 2), "m")], enable_flag=False)
-        stage._maybe_register_nvtx_hooks()
-        self.assertIsNone(stage._nvtx_hooks)
+        module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": module}, enable_flag=False)
+        manager.begin_use(ComponentUse("Stage", "linear"), module=module)
+        self.assertEqual(manager._nvtx_hooks_by_use_key, {})
 
-    def test_apply_nvtx_gate_registers_and_toggles(self) -> None:
-        stage = _StubStage([(torch.nn.Linear(2, 2), "linear")], enable_flag=True)
-        self.assertTrue(stage._apply_nvtx_gate(is_warmup=False))
-        self.assertTrue(stage._nvtx_hooks._enabled)
-        # Warmup flips the toggle but keeps hooks registered.
-        self.assertFalse(stage._apply_nvtx_gate(is_warmup=True))
-        self.assertFalse(stage._nvtx_hooks._enabled)
+    def test_warmup_is_noop(self) -> None:
+        module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": module}, is_warmup=True)
+        manager.begin_use(ComponentUse("Stage", "linear"), module=module)
+        self.assertEqual(manager._nvtx_hooks_by_use_key, {})
 
-    def test_detach_clears_state_and_allows_reregister(self) -> None:
-        stage = _StubStage([(torch.nn.Linear(2, 2), "linear")], enable_flag=True)
-        stage._maybe_register_nvtx_hooks()
-        stage._detach_nvtx_hooks()
-        self.assertIsNone(stage._nvtx_hooks)
-        # Idempotent + re-registration still works.
-        stage._detach_nvtx_hooks()
-        stage._maybe_register_nvtx_hooks()
-        self.assertIsNotNone(stage._nvtx_hooks)
+    def test_begin_use_registers_and_enables_component_hooks(self) -> None:
+        module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": module})
+        use = ComponentUse("Stage", "linear")
 
-    def test_zero_modules_warning_fires_once(self) -> None:
-        # A lazy-loaded stage may have zero modules for several requests;
-        # the warning must not spam every call.
-        stage = _StubStage(modules=[], enable_flag=True)
-        for _ in range(5):
-            stage._maybe_register_nvtx_hooks()
-        self.assertEqual(stage.zero_warn_count, 1)
+        manager.begin_use(use, module=module)
 
-    def test_current_use_nvtx_reflects_last_gate(self) -> None:
-        stage = _StubStage([(torch.nn.Linear(2, 2), "m")], enable_flag=True)
-        self.assertFalse(stage.current_use_nvtx)  # before any gate
-        stage._apply_nvtx_gate(is_warmup=False)
-        self.assertTrue(stage.current_use_nvtx)
-        stage._apply_nvtx_gate(is_warmup=True)
-        self.assertFalse(stage.current_use_nvtx)
+        _, hooks = manager._nvtx_hooks_by_use_key[("Stage", "linear", None)]
+        self.assertTrue(hooks._enabled)
+        self.assertIn(module, hooks._module_to_name_map)
+        self.assertTrue(hooks._module_to_name_map[module].startswith("Stage.linear"))
 
-    def test_call_invokes_gate_before_forward(self) -> None:
-        """Integration: ``PipelineStage.__call__`` must run
-        ``_apply_nvtx_gate`` before ``forward``. Catches drift between
-        the stub above and the real base class (which may grow new
-        responsibilities the stub doesn't mirror)."""
+    def test_end_use_disables_component_hooks(self) -> None:
+        module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": module})
+        use = ComponentUse("Stage", "linear")
+
+        manager.begin_use(use, module=module)
+        _, hooks = manager._nvtx_hooks_by_use_key[("Stage", "linear", None)]
+        manager.end_use(use, module=module)
+
+        self.assertFalse(hooks._enabled)
+        self.assertIsNone(manager._active_nvtx_key)
+
+    def test_remove_nvtx_hooks_for_module_drops_stale_reference(self) -> None:
+        module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": module})
+        use = ComponentUse("Stage", "linear")
+
+        manager.begin_use(use, module=module)
+        _, hooks = manager._nvtx_hooks_by_use_key[("Stage", "linear", None)]
+        manager.remove_nvtx_hooks_for_module(module)
+
+        self.assertEqual(manager._nvtx_hooks_by_use_key, {})
+        self.assertEqual(hooks._module_to_name_map, {})
+        self.assertIsNone(manager._active_nvtx_key)
+
+    def test_re_registers_when_module_identity_changes(self) -> None:
+        use = ComponentUse("Stage", "linear")
+        first_module = torch.nn.Linear(2, 2)
+        manager = _test_manager({"linear": first_module})
+
+        manager.begin_use(use, module=first_module)
+        _, first_hooks = manager._nvtx_hooks_by_use_key[("Stage", "linear", None)]
+        manager.end_use(use, module=first_module)
+
+        second_module = torch.nn.Linear(2, 2)
+        manager.pipeline.modules["linear"] = second_module
+        manager.begin_use(use, module=second_module)
+
+        _, second_hooks = manager._nvtx_hooks_by_use_key[("Stage", "linear", None)]
+        self.assertIsNot(second_hooks, first_hooks)
+        self.assertEqual(first_hooks._module_to_name_map, {})
+        self.assertIn(second_module, second_hooks._module_to_name_map)
+
+    def test_same_component_in_different_stages_switches_active_prefix(self) -> None:
+        shared = torch.nn.Linear(2, 2)
+        manager = _test_manager({"vae": shared})
+        first_use = ComponentUse("ImageVAEEncodingStage", "vae")
+        second_use = ComponentUse("DecodingStage", "vae")
+
+        manager.begin_use(first_use, module=shared)
+        _, first_hooks = manager._nvtx_hooks_by_use_key[
+            ("ImageVAEEncodingStage", "vae", None)
+        ]
+        manager.begin_use(second_use, module=shared)
+        _, second_hooks = manager._nvtx_hooks_by_use_key[
+            ("DecodingStage", "vae", None)
+        ]
+
+        self.assertFalse(first_hooks._enabled)
+        self.assertTrue(second_hooks._enabled)
+        self.assertTrue(
+            second_hooks._module_to_name_map[shared].startswith("DecodingStage.vae")
+        )
+
+    def test_pipeline_stage_call_sets_explicit_range_gate_before_forward(self) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
             PipelineStage,
         )
 
         class _Spy(PipelineStage):
-            def __init__(self, mod) -> None:
+            def __init__(self) -> None:
                 self.server_args = type(
                     "Args",
                     (),
@@ -310,15 +327,8 @@ class TestStageMixin(unittest.TestCase):
                 self._component_residency_manager = None
                 self._registered_stage_name = None
                 self._profile_stage_name = None
-                self._nvtx_hooks = None
-                self._nvtx_registered_ids = frozenset()
-                self._nvtx_zero_warned = False
                 self._current_use_nvtx = False
-                self._mod = mod
                 self.use_nvtx_during_forward: bool | None = None
-
-            def nvtx_hookable_modules(self):
-                return [(self._mod, "spy")]
 
             def forward(self, batch, server_args):
                 self.use_nvtx_during_forward = self.current_use_nvtx
@@ -329,83 +339,10 @@ class TestStageMixin(unittest.TestCase):
             metrics = None
             perf_dump_path = None
 
-        spy = _Spy(torch.nn.Linear(2, 2))
+        spy = _Spy()
         spy(_Batch(), spy.server_args)
-        # __call__ must have set current_use_nvtx before forward executed.
         self.assertTrue(spy.use_nvtx_during_forward)
-        self.assertIsNotNone(spy._nvtx_hooks)
-
-    def test_re_registers_when_module_identity_changes(self) -> None:
-        """Regression: when the underlying module reference is replaced
-        between calls (lazy load, cache-dit wrap, hot swap), hooks must
-        rebind to the new instance. The previous design's idempotency
-        guard would have silently kept hooks on the orphan module."""
-        a = torch.nn.Linear(2, 2)
-        stage = _StubStage([(a, "t")], enable_flag=True)
-        stage._maybe_register_nvtx_hooks()
-        first_hooks = stage._nvtx_hooks
-        self.assertIsNotNone(first_hooks)
-        self.assertIn(a, first_hooks._module_to_name_map)
-
-        # Replace the declared module with a different instance — same
-        # role / same prefix, different identity (mimics cache-dit wrap).
-        b = torch.nn.Linear(2, 2)
-        stage._modules = [(b, "t")]
-        stage._maybe_register_nvtx_hooks()
-
-        # A fresh DiffusionNvtxHooks instance must have replaced the old
-        # one and registered hooks on B; A must no longer be tracked.
-        self.assertIsNot(stage._nvtx_hooks, first_hooks)
-        self.assertIn(b, stage._nvtx_hooks._module_to_name_map)
-        self.assertNotIn(a, stage._nvtx_hooks._module_to_name_map)
-
-    def test_gate_survives_deleted_module_attr(self) -> None:
-        """Regression: overrides that read ``self.<attr>`` via ``getattr``
-        with a ``None`` default must not raise after a stage deallocates
-        its component (e.g. MPS dealloc deletes ``self.transformer``)."""
-
-        class _DeletableStage(_StubStage):
-            def __init__(self) -> None:
-                super().__init__([], enable_flag=True)
-                self.module = torch.nn.Linear(2, 2)
-
-            def nvtx_hookable_modules(self):
-                return [(getattr(self, "module", None), "m")]
-
-        stage = _DeletableStage()
-        stage._apply_nvtx_gate(is_warmup=False)
-        self.assertIsNotNone(stage._nvtx_hooks)
-        # Mimic MPS dealloc: detach + del the attr, then the next request's
-        # gate must not raise even though the override reads the attribute.
-        stage._detach_nvtx_hooks()
-        del stage.module
-        stage._apply_nvtx_gate(is_warmup=False)
-        self.assertIsNone(stage._nvtx_hooks)  # zero-modules retry path
-
-    def test_finally_disables_hooks_for_cross_stage_isolation(self) -> None:
-        """Regression: when two stages share a module (e.g. VAE shared
-        between ImageVAEEncodingStage and DecodingStage), each stage's
-        own hooks must only fire during its own forward. The base
-        ``__call__`` disables this stage's hooks in a ``finally`` block.
-
-        This stub-level test asserts the contract by simulating the
-        sequence: stage A enables → A's forward → A disables → stage B
-        enables → B's forward sees A.enabled = False."""
-        shared = torch.nn.Linear(2, 2)
-        stage_a = _StubStage([(shared, "a_prefix")], enable_flag=True)
-        stage_b = _StubStage([(shared, "b_prefix")], enable_flag=True)
-
-        # Stage A's call cycle
-        stage_a._apply_nvtx_gate(is_warmup=False)
-        self.assertTrue(stage_a._nvtx_hooks._enabled)
-        # Simulate the base __call__'s finally clause.
-        stage_a._nvtx_hooks.set_enabled(False)
-
-        # Stage B's call cycle
-        stage_b._apply_nvtx_gate(is_warmup=False)
-        self.assertTrue(stage_b._nvtx_hooks._enabled)
-        # While B is enabled, A is still disabled (the finally above ran).
-        self.assertFalse(stage_a._nvtx_hooks._enabled)
+        self.assertFalse(spy.current_use_nvtx)
 
 
 class TestCollectInputShapes(unittest.TestCase):

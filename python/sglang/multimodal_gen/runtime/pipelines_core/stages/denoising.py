@@ -345,17 +345,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 return True
         return False
 
-    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
-        # Registered from ``_prepare_denoising_loop`` after cache-dit and
-        # torch.compile finalize the transformer tree.
-        # ``getattr`` because the MPS deallocation path ``del`` s the
-        # transformer attributes between requests; the next request
-        # then re-loads and re-registers via the zero-modules retry.
-        return [
-            (getattr(self, "transformer", None), "transformer"),
-            (getattr(self, "transformer_2", None), "transformer_2"),
-        ]
-
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
     ) -> None:
@@ -1089,9 +1078,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Memory before deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
-            # Detach NVTX hooks so the next lazy-load re-registers them
-            # against the freshly loaded transformer.
-            self._detach_nvtx_hooks()
+            if self._component_residency_manager is not None:
+                self._component_residency_manager.remove_nvtx_hooks_for_module(
+                    self.transformer
+                )
             del self.transformer
             if pipeline is not None and "transformer" in pipeline.modules:
                 del pipeline.modules["transformer"]
@@ -1197,7 +1187,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             preferred_ready_after_request=component_name == "transformer",
             memory_intensive=True,
         )
-        manager.begin_use(use)
+        manager.begin_use(use, module=current_model)
 
     def _select_and_manage_model(
         self,

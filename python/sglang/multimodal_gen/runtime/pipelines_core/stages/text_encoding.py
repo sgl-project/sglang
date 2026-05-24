@@ -114,13 +114,6 @@ class TextEncodingStage(PipelineStage):
             for i in range(len(self.text_encoders))
         ]
 
-    def nvtx_hookable_modules(self) -> list[tuple[torch.nn.Module, str]]:
-        # Mirror ``component_uses`` naming so trace labels stay consistent.
-        return [
-            (enc, "text_encoder" if i == 0 else f"text_encoder_{i + 1}")
-            for i, enc in enumerate(self.text_encoders or [])
-        ]
-
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
@@ -436,7 +429,7 @@ class TextEncodingStage(PipelineStage):
         # TODO: Keep this begin-only interval until manager supports explicit
         # declared-use interval grouping. Wrapping each encoder call separately
         # can offload between positive and negative prompt encoding.
-        manager.before_use(use)
+        manager.begin_use(use, module=self.text_encoders[encoder_index])
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):
