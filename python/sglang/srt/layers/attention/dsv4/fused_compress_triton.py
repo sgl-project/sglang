@@ -592,7 +592,8 @@ def _c128_prefill_compress_kernel(
         local_max = tl.max(s, axis=0)
         new_max = tl.maximum(running_max, local_max)
         exp_s = tl.exp(s - new_max[None, :])
-        valid = is_state & state_valid
+        # Keep input-path entries valid; only state-path entries need src_pos guard.
+        valid = state_valid | (~is_state)
         exp_s = tl.where(valid[:, None], exp_s, 0.0)
         factor = tl.exp(running_max - new_max)
         running_sum = running_sum * factor + tl.sum(exp_s, axis=0)
