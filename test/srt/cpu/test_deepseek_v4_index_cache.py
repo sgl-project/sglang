@@ -191,6 +191,31 @@ def test_dsv4_index_cache_graph_gate_returns_capture_variant():
     )
 
 
+def test_dsv4_index_cache_cuda_graph_profile_mode_includes_gate_variant():
+    config = SimpleNamespace(
+        index_topk_freq=2,
+        index_topk_pattern=None,
+        index_topk_min_seq_len=75000,
+    )
+
+    assert (
+        index_cache.index_cache_cuda_graph_profile_mode(
+            "decode",
+            config,
+            torch.tensor([12000], dtype=torch.int32),
+        )
+        == "decode.indexcache_off"
+    )
+    assert (
+        index_cache.index_cache_cuda_graph_profile_mode(
+            "decode",
+            config,
+            torch.tensor([20000], dtype=torch.int32),
+        )
+        == "decode.indexcache_on"
+    )
+
+
 def test_dsv4_index_cache_graph_gate_is_inactive_without_context_gate():
     config = SimpleNamespace(
         index_topk_freq=1,
@@ -202,6 +227,14 @@ def test_dsv4_index_cache_graph_gate_is_inactive_without_context_gate():
         config,
         torch.tensor([12000], dtype=torch.int32),
     ) is None
+    assert (
+        index_cache.index_cache_cuda_graph_profile_mode(
+            "decode",
+            config,
+            torch.tensor([12000], dtype=torch.int32),
+        )
+        == "decode"
+    )
 
 
 def test_dsv4_index_cache_capture_gate_restores_previous_value():

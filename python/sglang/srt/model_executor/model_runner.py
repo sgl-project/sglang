@@ -169,6 +169,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v4_index_cache import (
+    index_cache_cuda_graph_profile_mode,
     should_disable_cuda_graph_for_index_cache_gate,
 )
 from sglang.srt.models.deepseek_v4_index_cache_profile import record_cuda_graph_path
@@ -3072,7 +3073,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.seq_lens_cpu,
         ):
             can_run_graph = False
-        record_cuda_graph_path("extend_piecewise", can_run_graph)
+        record_cuda_graph_path(
+            index_cache_cuda_graph_profile_mode(
+                "extend_piecewise",
+                self.model_config.hf_config,
+                forward_batch.seq_lens_cpu,
+            ),
+            can_run_graph,
+        )
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
             # replay_prepare time. Move timing into the piecewise cuda graph
@@ -3281,7 +3289,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 )
             )
-            record_cuda_graph_path(graph_mode, can_run_graph)
+            record_cuda_graph_path(
+                index_cache_cuda_graph_profile_mode(
+                    graph_mode,
+                    self.model_config.hf_config,
+                    forward_batch.seq_lens_cpu,
+                ),
+                can_run_graph,
+            )
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if (

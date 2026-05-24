@@ -144,6 +144,18 @@ def should_disable_cuda_graph_for_index_cache_gate(
     return not gate_value
 
 
+def index_cache_cuda_graph_profile_mode(
+    mode: str,
+    config,
+    seq_lens_cpu: Optional[torch.Tensor],
+) -> str:
+    gate_value = index_cache_graph_gate_value(config, seq_lens_cpu)
+    if gate_value is None:
+        return mode
+    suffix = "indexcache_on" if gate_value else "indexcache_off"
+    return f"{mode}.{suffix}"
+
+
 def get_index_cache_capture_gate() -> Optional[bool]:
     return _index_cache_capture_gate
 
