@@ -60,7 +60,7 @@ def fp8_paged_mqa_logits_torch(
     assert weight.shape == (batch_size, num_heads)
     assert seq_lens.shape == (batch_size,)
     assert page_table.shape[0] == batch_size
-    assert clean_logits == False
+    assert not clean_logits
 
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
     for i in range(batch_size):
@@ -99,7 +99,6 @@ def topk_transform_512_pytorch_vectorized(
     page_size: int,
     out_raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
-
     TOPK = out_page_indices.shape[1]
     batch_size = scores.shape[0]
     max_seq_len = scores.shape[1]
@@ -316,6 +315,7 @@ class C4IndexerBackendMixin:
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        return_raw_indices: bool = False,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -405,8 +405,9 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
-            raw_indices = torch.empty_like(core_metadata.c4_sparse_page_indices)
+        if capture_enabled or return_raw_indices:
+            assert core_metadata.c4_sparse_raw_indices is not None
+            raw_indices = core_metadata.c4_sparse_raw_indices
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : core_metadata.c4_sparse_page_indices.size(0)
@@ -545,6 +546,7 @@ class C4Indexer(nn.Module):
         attn_backend: AttentionBackend,
         enable_multi_stream: bool = False,
         q_lora_ready: Optional[torch.cuda.Event] = None,
+        return_raw_indices: bool = False,
     ) -> None:
         return attn_backend.forward_c4_indexer(
             x=x,
@@ -554,4 +556,5 @@ class C4Indexer(nn.Module):
             alt_streams=self.alt_streams,
             enable_multi_stream=enable_multi_stream,
             q_lora_ready=q_lora_ready,
+            return_raw_indices=return_raw_indices,
         )

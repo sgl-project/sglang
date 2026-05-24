@@ -88,6 +88,15 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_v4_index_cache import (
+    DSV4IndexCache,
+    assign_index_cache_to_metadata,
+    get_index_cache_policy,
+    make_index_cache_from_metadata,
+    should_return_index_cache,
+    should_reuse_index_cache,
+)
+from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -205,6 +214,7 @@ class MQALayer(nn.Module):
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
         compress_ratio_override: Optional[int] = None,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.tp_rank = attn_tp_rank = get_attention_tp_rank()
@@ -236,6 +246,9 @@ class MQALayer(nn.Module):
         )
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
+        self.skip_topk, self.next_skip_topk = get_index_cache_policy(
+            config, layer_id, compress_ratio, is_nextn
+        )
 
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
@@ -365,9 +378,9 @@ class MQALayer(nn.Module):
             **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+            assert hasattr(self.wo_a, "weight_scale_inv"), (
+                "FP8 quant_config must create weight_scale_inv"
+            )
             self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -481,6 +494,7 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        prev_topk_indices: Optional[DSV4IndexCache] = None,
     ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
@@ -504,7 +518,8 @@ class MQALayer(nn.Module):
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        if self.indexer is not None:
+        skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
+        if self.indexer is not None and not skip_indexer:
             with torch.cuda.stream(stream_indexer):
                 self.indexer(
                     x=x,
@@ -513,7 +528,10 @@ class MQALayer(nn.Module):
                     attn_backend=attn_backend,
                     enable_multi_stream=True,
                     q_lora_ready=q_lora_ready,
+                    return_raw_indices=self.next_skip_topk is True,
                 )
+        elif skip_indexer:
+            self._reuse_topk(prev_topk_indices, attn_backend)
 
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
@@ -544,6 +562,7 @@ class MQALayer(nn.Module):
         attn_backend,
         q_out: Optional[torch.Tensor] = None,
         x_quant=None,
+        prev_topk_indices: Optional[DSV4IndexCache] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
         if self.fuse_wqa_wkv:
@@ -640,13 +659,17 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        if self.indexer is not None:
+        skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
+        if self.indexer is not None and not skip_indexer:
             self.indexer(
                 x=x,
                 q_lora=q_lora,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
+                return_raw_indices=self.next_skip_topk is True,
             )
+        elif skip_indexer:
+            self._reuse_topk(prev_topk_indices, attn_backend)
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
                 x,
@@ -657,17 +680,51 @@ class MQALayer(nn.Module):
 
         return q, kv
 
+    def _should_reuse_topk(self, prev_topk_indices, attn_backend) -> bool:
+        return should_reuse_index_cache(
+            self.skip_topk,
+            prev_topk_indices,
+            getattr(attn_backend, "hisparse_coordinator", None),
+        )
+
+    def _reuse_topk(self, prev_topk_indices: DSV4IndexCache, attn_backend) -> None:
+        attn_backend._maybe_upgrade_forward_metadata()
+        metadata = attn_backend.forward_metadata
+        raw_indices = assign_index_cache_to_metadata(
+            prev_topk_indices,
+            metadata.core_metadata,
+            metadata.indexer_metadata,
+        )
+        if raw_indices is not None:
+            if (indexer_capturer := get_global_indexer_capturer()) is not None:
+                token_to_kv_pool = get_token_to_kv_pool()
+                compress_layer_id = token_to_kv_pool.layer_mapping[
+                    self.layer_id
+                ].compress_layer_id
+                indexer_capturer.capture(compress_layer_id, raw_indices)
+
+    def _next_topk_indices(self, attn_backend) -> Optional[DSV4IndexCache]:
+        if not should_return_index_cache(
+            self.next_skip_topk, getattr(attn_backend, "hisparse_coordinator", None)
+        ):
+            return None
+        attn_backend._maybe_upgrade_forward_metadata()
+        return make_index_cache_from_metadata(
+            attn_backend.forward_metadata.core_metadata,
+        )
+
     def forward(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         x_quant=None,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[DSV4IndexCache] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[DSV4IndexCache]]]:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.wo_b.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return x
 
         attn_backend = get_attn_backend()
@@ -702,6 +759,7 @@ class MQALayer(nn.Module):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                prev_topk_indices=prev_topk_indices,
             )
             kv = None
         else:
@@ -712,6 +770,7 @@ class MQALayer(nn.Module):
                 attn_backend,
                 q_out,
                 x_quant=x_quant,
+                prev_topk_indices=prev_topk_indices,
             )
 
         # The cache write is always fused / already done by _forward_prepare* --
@@ -765,6 +824,9 @@ class MQALayer(nn.Module):
 
         o, _ = self.wo_b(o.flatten(1))
 
+        if self.next_skip_topk is not None:
+            return o, self._next_topk_indices(attn_backend)
+
         return o
 
 
@@ -791,6 +853,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
+            is_nextn=is_nextn,
         )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
@@ -990,7 +1053,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
@@ -1028,7 +1090,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[DSV4IndexCache] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[DSV4IndexCache]]]:
         residual = hidden_states
         hidden_states, post, comb, norm_fused = self.hc_pre(
             hidden_states,
@@ -1055,7 +1118,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             positions=positions,
             forward_batch=forward_batch,
             x_quant=x_quant,
+            prev_topk_indices=prev_topk_indices,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = prev_topk_indices
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
         residual = hidden_states
@@ -1123,7 +1191,9 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        return hidden_states
+        if self.self_attn.next_skip_topk is None:
+            return hidden_states
+        return hidden_states, topk_indices
 
 
 class DeepseekV4Model(nn.Module):
@@ -1269,6 +1339,7 @@ class DeepseekV4Model(nn.Module):
         # forks alt-streams; later per-layer calls become no-ops.
         get_attn_backend()._maybe_upgrade_forward_metadata()
 
+        topk_indices = None
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             ctx = (
@@ -1277,13 +1348,18 @@ class DeepseekV4Model(nn.Module):
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
-                hidden_states = layer(
+                layer_output = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     forward_batch=forward_batch,
                     input_ids=input_ids,
                     input_ids_global=input_ids_global,
+                    prev_topk_indices=topk_indices,
                 )
+            if isinstance(layer_output, tuple):
+                hidden_states, topk_indices = layer_output
+            else:
+                hidden_states = layer_output
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
@@ -1807,9 +1883,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = loaded_weight
                                 if len(bucket) == 2:
                                     fused_weight = torch.cat(
@@ -1913,9 +1989,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert (
-        weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8_e4m3fn, got {weight.dtype}"
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn, got {weight.dtype}"
+    )
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,
