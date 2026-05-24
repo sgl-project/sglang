@@ -29,10 +29,10 @@ class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
         except Exception:
             pass
         self.assert_log_contains("mock_perturb next_token_swap: swapped")
-        self.assert_violation_reported(fail_reason="write_token")
-        self.assert_violation_absent(fail_reason="real_kv_hash")
-        self.assert_violation_absent(fail_reason="position")
-        self.assert_violation_absent(fail_reason="chain_hash")
+        self.assert_any_launch_tag_violation_reported(fail_reason="write_token")
+        self.assert_any_launch_tag_violation_absent(fail_reason="real_kv_hash")
+        self.assert_any_launch_tag_violation_absent(fail_reason="position")
+        self.assert_any_launch_tag_violation_absent(fail_reason="chain_hash")
 
 
 if __name__ == "__main__":

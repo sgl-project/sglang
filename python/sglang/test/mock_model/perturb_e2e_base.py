@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import io
 import os
-import re
 import time
-from typing import ClassVar, Optional
+from typing import ClassVar, Literal, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kv_canary.utils import post_parallel_generate
+from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
+from sglang.test.kv_canary.violation_log_utils import find_violation_in_log
 from sglang.test.mock_model_utils import (
     MOCK_MODEL_PATH,
     mock_model_server_args,
@@ -20,12 +21,8 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-_VIOLATION_LINE_RE = re.compile(
-    r"kv_canary violation: launch_tag=(\S+) fail_reason=(\S+)"
-)
 
-
-class MockModelPerturbE2EBase(CustomTestCase):
+class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     """Base for mock-model self-test perturb e2e tests.
 
     Launches the mock-model + canary server with subclass-provided extra env
@@ -69,7 +66,9 @@ class MockModelPerturbE2EBase(CustomTestCase):
         cls._stdout_buf = None
         cls._stderr_buf = None
 
-    def _captured_log_text(self) -> str:
+    def _captured_log_text(
+        self, side: Optional[Literal["prefill", "decode"]] = None
+    ) -> str:
         stdout_text = (
             self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
         )
@@ -93,17 +92,21 @@ class MockModelPerturbE2EBase(CustomTestCase):
             timeout=timeout,
         )
 
-    def assert_violation_reported(
+    def assert_any_launch_tag_violation_reported(
         self,
         *,
         fail_reason: str,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
+        """Like assert_violation_logged_any but with retries: mock-model log may
+        still be draining when the first poll happens."""
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
-            if _log_contains_violation(
-                log_text=self._captured_log_text(), fail_reason=fail_reason
+            if find_violation_in_log(
+                self._captured_log_text(),
+                launch_tag_patterns=("*",),
+                fail_reason=fail_reason,
             ):
                 return
         raise AssertionError(
@@ -112,9 +115,11 @@ class MockModelPerturbE2EBase(CustomTestCase):
             f"Log tail:\n{self._captured_log_text()[-2000:]}"
         )
 
-    def assert_violation_absent(self, *, fail_reason: str) -> None:
+    def assert_any_launch_tag_violation_absent(self, *, fail_reason: str) -> None:
         log_text = self._captured_log_text()
-        if _log_contains_violation(log_text=log_text, fail_reason=fail_reason):
+        if find_violation_in_log(
+            log_text, launch_tag_patterns=("*",), fail_reason=fail_reason
+        ):
             raise AssertionError(
                 f"Unexpected kv_canary violation line with fail_reason={fail_reason!r}. "
                 f"Log tail:\n{log_text[-2000:]}"
@@ -127,11 +132,3 @@ class MockModelPerturbE2EBase(CustomTestCase):
                 f"Expected substring {substring!r} not found in captured log. "
                 f"Log tail:\n{log_text[-2000:]}"
             )
-
-
-def _log_contains_violation(*, log_text: str, fail_reason: str) -> bool:
-    for match in _VIOLATION_LINE_RE.finditer(log_text):
-        reason_field = match.group(2)
-        if fail_reason in reason_field.split("+"):
-            return True
-    return False
