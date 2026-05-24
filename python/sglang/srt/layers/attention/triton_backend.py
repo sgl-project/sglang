@@ -1046,9 +1046,9 @@ class TritonAttnBackend(AttentionBackend):
             else:
                 kwargs["dcp_kv_mask"] = forward_batch.dcp_kv_mask
         if k_scale is None and v_scale is None:
-            forward_batch.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, **kwargs)
         else:
-            forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.token_to_kv_pool.set_kv_buffer(
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
@@ -1091,18 +1091,12 @@ class TritonAttnBackend(AttentionBackend):
                             v,
                         )
                     else:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                        self.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc,
                             k,
                             v,
                         )
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        forward_batch.out_cache_loc,
-                        k,
-                        v,
-                    )
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
                     # doesn't accept scale parameters. Clone to protect k from mutation
@@ -1126,7 +1120,7 @@ class TritonAttnBackend(AttentionBackend):
                             layer.v_scale,
                         )
                     else:
-                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                        self.token_to_kv_pool.set_kv_buffer(
                             layer,
                             forward_batch.out_cache_loc,
                             k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
@@ -1134,14 +1128,6 @@ class TritonAttnBackend(AttentionBackend):
                             layer.k_scale,
                             layer.v_scale,
                         )
-                    self.token_to_kv_pool.set_kv_buffer(
-                        layer,
-                        forward_batch.out_cache_loc,
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
-                        layer.k_scale,
-                        layer.v_scale,
-                    )
 
         logits_soft_cap = logit_capping_mod(layer.logit_capping_method, layer.logit_cap)
 
@@ -1248,8 +1234,8 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        v_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        k_buffer = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_buffer = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
         current_out = torch.zeros(
             (total_tokens, local_heads, layer.v_head_dim),
@@ -1574,8 +1560,8 @@ class TritonAttnBackend(AttentionBackend):
             self.forward_metadata.attn_lse.fill_(-float("inf"))
             self.decode_attention_fwd(
                 q_for_decode,
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o_for_decode,
                 kv_indptr,
                 kv_indices,
