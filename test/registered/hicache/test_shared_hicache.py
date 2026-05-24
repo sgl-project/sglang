@@ -1,4 +1,6 @@
 import argparse
+import asyncio
+import inspect
 import json
 import threading
 import time
@@ -11,6 +13,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.kv_events import StorageMedium
+from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.entrypoints.openai.utils import cached_tokens_details_from_dict
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.scheduler_components.output_streamer import (
@@ -194,6 +197,19 @@ class FakePrometheusMetric:
 
     def set(self, value):
         self.calls.append(("set", self._labels, value))
+
+
+class FakeTokenizerManager:
+    def __init__(self):
+        self.requests = []
+
+    def generate_request(self, obj, _):
+        self.requests.append(obj)
+
+        async def _gen():
+            yield {"ok": True}
+
+        return _gen()
 
 
 def _make_manager(tree=None):
@@ -667,6 +683,27 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertEqual(req[0].shared_hicache_plan, plan_0)
         self.assertEqual(req[1].shared_hicache_plan, plan_1)
+
+    def test_engine_async_generate_forwards_shared_hicache_plan(self):
+        plan = _make_plan([11])
+        engine = object.__new__(Engine)
+        engine.server_args = SimpleNamespace(dp_size=1)
+        engine.tokenizer_manager = FakeTokenizerManager()
+
+        self.assertIn(
+            "shared_hicache_plan",
+            inspect.signature(Engine.async_generate).parameters,
+        )
+        result = asyncio.run(
+            engine.async_generate(
+                input_ids=[1, 2],
+                sampling_params={"max_new_tokens": 1},
+                shared_hicache_plan=plan,
+            )
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(engine.tokenizer_manager.requests[0].shared_hicache_plan, plan)
 
 
 if __name__ == "__main__":
