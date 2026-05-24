@@ -1126,13 +1126,18 @@ class DeepseekV4AttnBackend(
             if dsa_use_prefill_cp(
                 forward_batch
             ) and is_dsa_prefill_cp_round_robin_split():
-                _, local_extend_seq_lens, _, bs_idx = dsa_cp_round_robin_split_q_seqs(
-                    forward_batch.extend_seq_lens_cpu,
-                    extend_seq_lens,
-                )
-                seq_lens = seq_lens[bs_idx]
-                extend_seq_lens = extend_seq_lens[bs_idx]
-                req_pool_indices = req_pool_indices[bs_idx]
+                if seq_lens.numel() == 1:
+                    local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
+                else:
+                    _, local_extend_seq_lens, _, bs_idx = (
+                        dsa_cp_round_robin_split_q_seqs(
+                            forward_batch.extend_seq_lens_cpu,
+                            extend_seq_lens,
+                        )
+                    )
+                    seq_lens = seq_lens[bs_idx]
+                    extend_seq_lens = extend_seq_lens[bs_idx]
+                    req_pool_indices = req_pool_indices[bs_idx]
                 positions = core_attn_metadata.positions_casual.to(torch.int32)
 
             cache = SparsePrefillChunkCache.build(
