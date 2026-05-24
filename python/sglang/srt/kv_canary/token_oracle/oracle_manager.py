@@ -21,11 +21,12 @@ class TokenOracleManager:
         forward_batch: "ForwardBatch",
         expected_inputs_out: ExpectedInputs,
     ) -> None:
-        """Called by CanaryRunner BEFORE its per-forward write launch when
-        CanaryConfig.input_check_mode is ON. Layout of the output tensors mirrors
-        forward_batch.input_ids / forward_batch.positions — flat, indexed by the same
-        write_offsets canary uses. Capacity of the placeholders is sized at CanaryRunner install
-        time to max per-forward write capacity (cuda-graph safe).
+        """Called by SingleForwardManager (phase 2) BEFORE its per-forward write
+        launch when CanaryConfig.input_check_mode is ON. Layout of the output
+        tensors mirrors forward_batch.input_ids / forward_batch.positions —
+        flat, indexed by the same write_offsets canary uses. Capacity of the
+        placeholders is sized at install time to max per-forward write
+        capacity (cuda-graph safe).
 
         For positions outside [0, current_seq_len) the value is undefined — caller is expected to
         keep mock-model running such that every (generalized_req_id, position) hit by the canary
@@ -71,19 +72,21 @@ def _build_generalized_req_id_per_token(
     num_tokens: int,
     generalized_req_ids_per_row: torch.Tensor,
 ) -> torch.Tensor:
+    # target_verify / draft_extend run a constant number of tokens per req
+    # (Python int from spec_info). Capture-safe expansion: broadcast +
+    # reshape; the output shape is a capture-time constant since both
+    # ``bs`` and ``per_req`` are Python ints.
     forward_mode = forward_batch.forward_mode
     if forward_mode.is_target_verify():
-        lens = torch.full_like(
-            generalized_req_ids_per_row, int(forward_batch.spec_info.draft_token_num)
-        )
-        result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
+        per_req = int(forward_batch.spec_info.draft_token_num)
+        result = _expand_uniform(generalized_req_ids_per_row, per_req)
     elif forward_mode.is_draft_extend(include_v2=True):
-        lens = torch.full_like(
-            generalized_req_ids_per_row,
-            int(forward_batch.spec_info.num_tokens_per_req),
-        )
-        result = torch.repeat_interleave(generalized_req_ids_per_row, lens)
+        per_req = int(forward_batch.spec_info.num_tokens_per_req)
+        result = _expand_uniform(generalized_req_ids_per_row, per_req)
     elif forward_mode.is_extend():
+        # Extend (prefill) runs eager / never enters cuda-graph capture, so
+        # ``torch.repeat_interleave`` with a runtime-valued repeats tensor is
+        # acceptable here.
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
             raise RuntimeError(
@@ -99,6 +102,21 @@ def _build_generalized_req_id_per_token(
             f"fill_expected_inputs: sum(lens)={int(result.shape[0])} != num_tokens={num_tokens}"
         )
     return result
+
+
+def _expand_uniform(values: torch.Tensor, per_row: int) -> torch.Tensor:
+    """Capture-safe equivalent of ``torch.repeat_interleave(values, per_row)``
+    when ``per_row`` is a Python int (uniform per row). Returns a contiguous
+    flat tensor of shape ``[values.shape[0] * per_row]``.
+
+    Replaces the dynamic-output-shape ``torch.repeat_interleave(values,
+    repeats_tensor)`` form which cuda graph cannot capture. The reshape on
+    a stride-0 broadcast view does allocate a contiguous copy, but that
+    allocation goes through the cuda-graph memory pool — allocation
+    inside capture is fine (see qwen3.py forward for the same pattern).
+    """
+    bs = int(values.shape[0])
+    return values.unsqueeze(1).expand(bs, per_row).reshape(bs * per_row)
 
 
 def select_generalized_req_ids(

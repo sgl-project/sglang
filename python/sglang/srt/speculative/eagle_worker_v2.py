@@ -196,6 +196,9 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             self.init_cuda_graphs()
 
+        if self.draft_runner.canary_runner is not None:
+            self.draft_runner.canary_runner.mark_init_finished()
+
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
@@ -354,12 +357,17 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        canary_ctx = (
-            c.with_kernels_outside_graph(forward_batch)
+        n_inner = self.speculative_num_steps - 1
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=list(range(n_inner)),
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+
+        with canary_outside_ctx:
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens = (
@@ -455,6 +463,8 @@ class EagleDraftWorker(BaseDraftWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
+        canary_manager = self.draft_runner.canary_runner
+
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
@@ -475,10 +485,17 @@ class EagleDraftWorker(BaseDraftWorker):
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            # Run forward. SingleForwardManager index ``i`` tells the monkey-patched
+            # model.forward wrap which SingleForwardManager owns this step.
+            sfm_index_ctx = (
+                canary_manager.with_active_single_forward_manager(i)
+                if canary_manager is not None
+                else contextlib.nullcontext()
+            )
+            with sfm_index_ctx:
+                logits_output = self.draft_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
             probs = torch.softmax(logits_output.next_token_logits, dim=-1)
             topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
@@ -574,12 +591,21 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        canary_ctx = (
-            c.with_kernels_outside_graph(forward_batch)
+
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        sfm_index_ctx = (
+            c.with_active_single_forward_manager(0)
+            if c is not None
+            else contextlib.nullcontext()
+        )
+        with canary_outside_ctx, sfm_index_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -633,12 +659,21 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
-        canary_ctx = (
-            c.with_kernels_outside_graph(forward_batch)
+
+        canary_outside_ctx = (
+            c.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
+            )
             if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        sfm_index_ctx = (
+            c.with_active_single_forward_manager(0)
+            if c is not None
+            else contextlib.nullcontext()
+        )
+        with canary_outside_ctx, sfm_index_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch

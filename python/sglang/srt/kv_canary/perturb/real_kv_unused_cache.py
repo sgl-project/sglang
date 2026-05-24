@@ -35,23 +35,23 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
     radix_cache: Optional["BasePrefixCache"],
     swa_window_size: int,
     sweep_interval: int,
-    step_counter: int,
+    outer_step_counter: int,
     warmup_gate: WarmupGate,
 ) -> None:
-    if sweep_interval <= 0 or step_counter % sweep_interval != 0:
+    if sweep_interval <= 0 or outer_step_counter % sweep_interval != 0:
         return
 
     if not should_run_perturbation(
         perturb_name="real_kv_unused_cache",
         probability=config.real_kv_unused_cache_prob,
         warmup_gate=warmup_gate,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         require_forward_batch=False,
     ):
         return

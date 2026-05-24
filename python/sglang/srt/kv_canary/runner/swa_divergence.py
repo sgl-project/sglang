@@ -39,7 +39,10 @@ class SwaDivergenceReport:
         self._swa_allocator = swa_allocator
         self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
-        self._verify_total_count_device: torch.Tensor = torch.zeros(
+        # Per-group running total of verify entries (shape ``[2]``, int32).
+        # Read by :class:`SingleForwardManager` to snapshot into its per-step
+        # buffer at phase 3, so the name is public.
+        self.verify_total_count_device: torch.Tensor = torch.zeros(
             2, dtype=torch.int32, device=device
         )
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
@@ -50,20 +53,21 @@ class SwaDivergenceReport:
         idx = _FULL_IDX if group.kind is PoolKind.FULL else _SWA_IDX
         # verify_num_valid is shape [1]; slice to a length-1 view so the in-place add
         # has matching ranks (else torch refuses the broadcast into shape []).
-        self._verify_total_count_device[idx : idx + 1].add_(
+        self.verify_total_count_device[idx : idx + 1].add_(
             verify_plan.verify_num_valid
         )
 
     def step(
         self,
         *,
-        step_counter: int,
-        forward_batch: "ForwardBatch",
+        outer_step_counter: int,
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
             compute_on_device=lambda: self._compute_on_device(
-                step_counter=step_counter, forward_batch=forward_batch
+                outer_step_counter=outer_step_counter,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             ),
             postprocess_on_host=self._postprocess_on_host,
         )
@@ -71,10 +75,10 @@ class SwaDivergenceReport:
     def _compute_on_device(
         self,
         *,
-        step_counter: int,
-        forward_batch: "ForwardBatch",
+        outer_step_counter: int,
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> Optional[dict[str, Any]]:
-        if step_counter == 0 or step_counter % self._interval != 0:
+        if outer_step_counter == 0 or outer_step_counter % self._interval != 0:
             return None
 
         # Bundle forward_ct in as an int pass-through so the host log line reports
@@ -82,13 +86,18 @@ class SwaDivergenceReport:
         # drain happens (DelayedDeviceHostHandler runs postprocess one tick later).
         result: dict[str, Any] = {
             "forward_ct": self._forward_ct,
-            "verify_total_count": self._verify_total_count_device,
+            "verify_total_count": self.verify_total_count_device,
         }
-        if self._swa_allocator is not None:
+        # ``maybe_inaccurate_forward_batch`` is the same (possibly already-advanced) instance
+        # passed to phase 4 — accurate enough for the coarse trend metric.
+        if (
+            self._swa_allocator is not None
+            and maybe_inaccurate_forward_batch is not None
+        ):
             result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
                 swa_allocator=self._swa_allocator,
                 req_to_token_pool=self._req_to_token_pool,
-                forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             )
         return result
 
@@ -142,13 +151,13 @@ def compute_swa_full_idx_divergence(
     *,
     swa_allocator: "SWATokenToKVPoolAllocator",
     req_to_token_pool: "ReqToTokenPool",
-    forward_batch: "ForwardBatch",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
     """Count non-identity (full, swa) index pairs in the live req_to_token range."""
     full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
     device = full_to_swa_index_mapping.device
-    req_pool_indices = forward_batch.req_pool_indices
-    seq_lens = forward_batch.seq_lens
+    req_pool_indices = maybe_inaccurate_forward_batch.req_pool_indices
+    seq_lens = maybe_inaccurate_forward_batch.seq_lens
 
     if req_pool_indices.numel() == 0:
         return torch.zeros(1, dtype=torch.int32, device=device)

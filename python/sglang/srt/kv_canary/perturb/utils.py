@@ -28,15 +28,15 @@ class WarmupGate:
         self,
         *,
         config: PerturbConfig,
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
     ) -> None:
         self._config = config
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._warmup_disable_logged: bool = False
         self._warmup_enable_logged: bool = False
 
     def is_in_warmup(self) -> bool:
-        step = self._step_counter_getter()
+        step = self._outer_step_counter_getter()
         warmup_steps = self._config.warmup_steps
 
         if step < warmup_steps:
@@ -70,16 +70,16 @@ def should_run_perturbation(
     perturb_name: str,
     probability: float,
     warmup_gate: WarmupGate,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     require_forward_batch: bool = True,
 ) -> bool:
     if probability <= 0.0:
         return False
     if warmup_gate.is_in_warmup():
         return False
-    if require_forward_batch and forward_batch is None:
+    if require_forward_batch and maybe_inaccurate_forward_batch is None:
         logger.info(
-            "kv_canary perturb %s: skipped because forward_batch is unavailable",
+            "kv_canary perturb %s: skipped because maybe_inaccurate_forward_batch is unavailable",
             perturb_name,
         )
         return False

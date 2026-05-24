@@ -424,11 +424,18 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
 
-        self._capture_init(run_once)
-
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
+        canary_manager = self.model_runner.canary_runner
+        canary_ctx = (
+            canary_manager.with_active_single_forward_manager(0)
+            if canary_manager is not None
+            else contextlib.nullcontext()
         )
+        with canary_ctx:
+            self._capture_init(run_once)
+
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
 
         set_global_graph_memory_pool(graph.pool())
         return graph, out

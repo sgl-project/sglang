@@ -11,47 +11,63 @@ from sglang.test.kv_canary.fixtures import (
     make_req_to_token_pool,
 )
 from sglang.test.kv_canary.runner_test_base import (
-    CanaryRunnerTestCase,
+    CanaryManagerTestCase,
     make_config,
-    make_runner,
+    make_manager,
 )
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
+def _run_one_cycle(manager, forward_batch) -> None:
+    """Drive one full outer canary cycle on the manager: phase 1 ->
+    phase 2 (via the SingleForwardManager's pre_ops_maybe_inside_graph) -> phase 3 ->
+    phase 4 -> shared facilities. Mirrors the production caller
+    sequence for SingleForwardManager(0) (target / single-step case)."""
+    with manager.with_ops_outside_graph(
+        single_forward_indices=[0],
+        maybe_inaccurate_forward_batch=forward_batch,
+    ):
+        with manager.with_active_single_forward_manager(0):
+            pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
+
+
+class TestSelfUnitManagerSweep(CanaryManagerTestCase):
     def test_sweep_every_n_cadence(self) -> None:
         """Verify sweep execution follows the configured step cadence."""
         config = make_config(sweep_interval=4)
-        runner = make_runner(device=self.device, config=config)
+        manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
 
         sweep_calls: list[int] = []
-        real_maybe = runner._sweep_orchestrator.maybe_run_sweep
+        real_maybe = manager._sweep_orchestrator.maybe_run_sweep
 
         def _spy() -> None:
-            before = runner._sweep_orchestrator._last_sweep_step
+            before = manager._sweep_orchestrator._last_sweep_step
             real_maybe()
-            if runner._sweep_orchestrator._last_sweep_step != before:
-                sweep_calls.append(runner._step_counter)
+            if manager._sweep_orchestrator._last_sweep_step != before:
+                sweep_calls.append(manager._outer_step_counter)
 
-        with patch.object(runner._sweep_orchestrator, "maybe_run_sweep", _spy):
+        with patch.object(manager._sweep_orchestrator, "maybe_run_sweep", _spy):
             for _ in range(12):
-                with runner.with_kernels_outside_graph(forward_batch):
-                    pass
+                _run_one_cycle(manager, forward_batch)
         self.assertEqual(sweep_calls, [0, 4, 8])
 
     def test_sweep_path_launches_sweep_kernels(self) -> None:
         """Verify sweep paths launch sweep verify kernels."""
         config = make_config(sweep_interval=1)
-        runner = make_runner(device=self.device, config=config)
+        manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
-        with runner.with_kernels_outside_graph(forward_batch):
-            runner.launch_head_kernels(forward_batch)
+        manager._single_forward_managers[0].pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        with manager.with_active_single_forward_manager(0):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        runner.attach_radix_cache(cache)
+        manager.attach_radix_cache(cache)
 
         sweep_kernel_kinds: list[str] = []
         with patch.object(
@@ -61,15 +77,15 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
                 kwargs["context"].kernel_kind.name
             ),
         ):
-            runner._sweep_orchestrator.maybe_run_sweep()
+            manager._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(any("SWEEP" in kind for kind in sweep_kernel_kinds))
 
     def test_sweep_allocates_verify_plan_from_walker_output(self) -> None:
         """Verify sweep planning sizes the verify plan from walker output."""
-        runner = make_runner(device=self.device)
+        manager = make_manager(device=self.device)
         cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)
-        runner.attach_radix_cache(cache)
+        manager.attach_radix_cache(cache)
 
         valid_counts: list[int] = []
         with patch.object(
@@ -79,7 +95,7 @@ class TestSelfUnitRunnerSweep(CanaryRunnerTestCase):
                 int(kwargs["plan"].verify_num_valid.item())
             ),
         ):
-            runner._sweep_orchestrator.maybe_run_sweep()
+            manager._sweep_orchestrator.maybe_run_sweep()
         self.assertTrue(all(count == 5 for count in valid_counts))
 
 

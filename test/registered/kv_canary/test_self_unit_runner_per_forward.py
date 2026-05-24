@@ -15,15 +15,15 @@ from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
 from sglang.test.kv_canary.runner_test_base import (
-    CanaryRunnerTestCase,
+    CanaryManagerTestCase,
     RecordingEndpoint,
-    make_runner,
+    make_manager,
 )
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 
-class TestRunnerPerForward(CanaryRunnerTestCase):
+class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
         """Verify per-forward execution launches plan, head, and tail kernels."""
         calls: list[object] = []
@@ -44,11 +44,15 @@ class TestRunnerPerForward(CanaryRunnerTestCase):
                 ("write", kwargs["context"].kernel_kind.name)
             ),
         ):
-            runner = make_runner(device=self.device)
+            manager = make_manager(device=self.device)
             forward_batch = make_forward_batch(self.device)
-            with runner.with_kernels_outside_graph(forward_batch):
-                runner.launch_head_kernels(forward_batch)
-                runner.launch_tail_kernels(forward_batch)
+            with manager.with_ops_outside_graph(
+                single_forward_indices=[0],
+                maybe_inaccurate_forward_batch=forward_batch,
+            ):
+                with manager.with_active_single_forward_manager(0):
+                    pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+                    manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
 
         self.assertEqual(calls[0], "plan")
         self.assertTrue(
@@ -67,7 +71,7 @@ class TestRunnerPerForward(CanaryRunnerTestCase):
         )
 
 
-class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
+class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self) -> None:
         """Verify endpoint launch preserves CUDA graph-stable tensor shapes."""
         group = make_buffer_group(device=self.device)
@@ -118,8 +122,16 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
             )
         )
 
-    def test_launch_endpoints_per_forward_accepts_int32_boundary_tensors(self) -> None:
-        """Verify int32 ForwardBatch tensors are promoted at the canary boundary."""
+    def test_launch_endpoints_per_forward_promotes_int32_boundary_tensors_to_int64(
+        self,
+    ) -> None:
+        """Verify int32 boundary tensors are promoted to int64 at the launch boundary.
+
+        The canonicalize helper runs ``.to(torch.int64).contiguous()`` on
+        each boundary tensor. Allocation inside cuda graph capture is
+        legal (the graph memory pool absorbs it — see qwen3.py forward
+        for the same pattern with ``.to(dtype)`` conversions).
+        """
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -132,6 +144,7 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [7], dtype=torch.int32, device=self.device
         )
+        forward_batch.num_token_non_padded_cpu = 1
 
         kernel_launch_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -146,15 +159,20 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
             input_check_mode=False,
         )
 
+        self.assertEqual(len(endpoint.calls), 1)
         call = endpoint.calls[0]
         self.assertEqual(call["input_ids"].dtype, torch.int64)
         self.assertEqual(call["positions"].dtype, torch.int64)
         self.assertEqual(call["out_cache_loc"].dtype, torch.int64)
 
-    def test_launch_endpoints_per_forward_accepts_strided_boundary_tensors(
+    def test_launch_endpoints_per_forward_materializes_strided_boundary_tensors(
         self,
     ) -> None:
-        """Verify strided ForwardBatch views are copied at the canary boundary."""
+        """Verify non-contiguous boundary views are materialized contiguous at launch.
+
+        ``.contiguous()`` allocates a fresh copy; that allocation is fine
+        inside cuda graph capture (graph memory pool absorbs it).
+        """
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -167,6 +185,7 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
         forward_batch.out_cache_loc = torch.tensor(
             [[7, 8]], dtype=torch.int64, device=self.device
         )[:, 0]
+        forward_batch.num_token_non_padded_cpu = 1
 
         kernel_launch_module.launch_endpoints_per_forward(
             endpoints=(endpoint,),
@@ -181,29 +200,77 @@ class TestLaunchEndpointsPerForward(CanaryRunnerTestCase):
             input_check_mode=False,
         )
 
+        self.assertEqual(len(endpoint.calls), 1)
         call = endpoint.calls[0]
         self.assertTrue(call["input_ids"].is_contiguous())
         self.assertTrue(call["positions"].is_contiguous())
         self.assertTrue(call["out_cache_loc"].is_contiguous())
 
 
-class TestRunnerBeforeForward(CanaryRunnerTestCase):
+class TestManagerBeforeForward(CanaryManagerTestCase):
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:
         """Verify oversized prefix sums are handled without host-side errors."""
         # Overflow no longer raises host-side: the plan kernel sets VerifyPlan.enable=0 and the
         # verify kernel skips the step on-device; host logs a throttled warning instead.
-        runner = make_runner(device=self.device, per_forward_verify_capacity=4)
+        manager = make_manager(device=self.device, per_forward_verify_capacity=4)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with runner.with_kernels_outside_graph(forward_batch):
-            pass
+        _drive_one_cycle(manager, forward_batch)
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self) -> None:
         """Verify prefix sums within capacity pass before-forward handling."""
         # Same multi-req shape that breaks the old sizing now fits the new capacity formula.
-        runner = make_runner(device=self.device, per_forward_verify_capacity=16)
+        manager = make_manager(device=self.device, per_forward_verify_capacity=16)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
-        with runner.with_kernels_outside_graph(forward_batch):
-            pass
+        _drive_one_cycle(manager, forward_batch)
+
+
+def _drive_one_cycle(manager, forward_batch) -> None:
+    with manager.with_ops_outside_graph(
+        single_forward_indices=[0],
+        maybe_inaccurate_forward_batch=forward_batch,
+    ):
+        with manager.with_active_single_forward_manager(0):
+            pre_ops_output = manager.pre_ops_maybe_inside_graph(forward_batch)
+            manager.post_ops_maybe_inside_graph(forward_batch, pre_ops_output)
+
+
+class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
+    def test_pre_ops_maybe_inside_graph_dispatches_to_bracketed_sfm(
+        self,
+    ) -> None:
+        """Verify the dispatcher routes phase 2 to the bracketed SingleForwardManager."""
+        manager = make_manager(device=self.device, speculative_num_steps=3)
+        forward_batch = make_forward_batch(self.device)
+        target_sfm = manager._single_forward_managers[1]
+        observed: list[object] = []
+        original_phase_2 = target_sfm.pre_ops_maybe_inside_graph
+
+        def _record(fb):
+            observed.append(fb)
+            return original_phase_2(fb)
+
+        target_sfm.pre_ops_maybe_inside_graph = _record
+        manager._single_forward_managers[0].pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        manager._single_forward_managers[1].pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        with manager.with_active_single_forward_manager(1):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
+        self.assertEqual(observed, [forward_batch])
+
+    def test_pre_ops_maybe_inside_graph_asserts_outside_bracket(
+        self,
+    ) -> None:
+        """Every call to the patched model.forward must be inside a
+        with_active_single_forward_manager(i) bracket — including cuda
+        graph capture/warmup. The dispatcher protects against silent
+        contract violations."""
+        manager = make_manager(device=self.device)
+        forward_batch = make_forward_batch(self.device)
+        with self.assertRaises(AssertionError):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
 
 
 if __name__ == "__main__":
