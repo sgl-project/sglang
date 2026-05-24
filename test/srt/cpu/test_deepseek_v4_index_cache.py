@@ -363,6 +363,79 @@ def test_dsv4_index_cache_clamps_invalid_raw_indices_before_gather():
     assert target.c4_sparse_page_indices.tolist() == [[640, -1, -1]]
 
 
+def test_dsv4_index_cache_rebuilds_physical_indices_per_request_row():
+    source = SimpleNamespace(
+        c4_sparse_raw_indices=torch.tensor(
+            [
+                [0, 63, 64, 127],
+                [0, 4, 5, 64],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    target = SimpleNamespace(
+        c4_sparse_page_indices=torch.full((2, 4), -1, dtype=torch.int32),
+        c4_sparse_raw_indices=torch.full((2, 4), -1, dtype=torch.int32),
+        page_table=torch.tensor(
+            [
+                [10, 11],
+                [20, 21],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    indexer_metadata = SimpleNamespace(
+        c4_seq_lens=torch.tensor([128, 5], dtype=torch.int32),
+        c4_page_size=64,
+    )
+
+    cached = index_cache.make_index_cache_from_metadata(source)
+    index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)
+
+    assert target.c4_sparse_page_indices.tolist() == [
+        [640, 703, 704, 767],
+        [1280, 1284, -1, -1],
+    ]
+
+
+def test_dsv4_index_cache_rejects_non_power_of_two_page_size():
+    source = SimpleNamespace(
+        c4_sparse_raw_indices=torch.tensor([[0, 1]], dtype=torch.int32),
+    )
+    target = SimpleNamespace(
+        c4_sparse_page_indices=torch.full((1, 2), -1, dtype=torch.int32),
+        c4_sparse_raw_indices=torch.full((1, 2), -1, dtype=torch.int32),
+        page_table=torch.tensor([[0]], dtype=torch.int32),
+    )
+    indexer_metadata = SimpleNamespace(
+        c4_seq_lens=torch.tensor([2], dtype=torch.int32),
+        c4_page_size=48,
+    )
+
+    cached = index_cache.make_index_cache_from_metadata(source)
+    with pytest.raises(AssertionError, match="power of two"):
+        index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)
+
+
+def test_dsv4_index_cache_rejects_seq_lens_row_mismatch():
+    source = SimpleNamespace(
+        c4_sparse_raw_indices=torch.tensor([[0, 1], [0, 1]], dtype=torch.int32),
+    )
+    target = SimpleNamespace(
+        c4_sparse_page_indices=torch.full((2, 2), -1, dtype=torch.int32),
+        c4_sparse_raw_indices=torch.full((2, 2), -1, dtype=torch.int32),
+        page_table=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    indexer_metadata = SimpleNamespace(
+        c4_seq_lens=torch.tensor([2], dtype=torch.int32),
+        c4_page_size=64,
+    )
+
+    cached = index_cache.make_index_cache_from_metadata(source)
+    with pytest.raises(AssertionError, match="one entry per raw index row"):
+        index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)
+
+
 def test_dsv4_index_cache_rejects_missing_raw_indices():
     source = SimpleNamespace(
         c4_sparse_page_indices=torch.tensor([[3, 4, -1]], dtype=torch.int32),

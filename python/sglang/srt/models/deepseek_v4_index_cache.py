@@ -62,11 +62,18 @@ def _translate_raw_indices_to_page_indices(
     out_page_indices: torch.Tensor,
     page_size: int,
 ) -> None:
+    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
+        f"c4_page_size must be a positive power of two, got {page_size}"
+    )
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
     valid = raw_indices >= 0
     if seq_lens.dim() > 1:
         seq_lens = seq_lens.squeeze(-1)
+    assert seq_lens.dim() == 1 and seq_lens.shape[0] == raw_indices.shape[0], (
+        f"c4_seq_lens must have one entry per raw index row, got "
+        f"{seq_lens.shape=} and {raw_indices.shape=}"
+    )
     valid = valid & (raw_indices < seq_lens.unsqueeze(1))
     page_idx = torch.clamp(raw_indices >> page_bits, min=0, max=page_table.shape[1] - 1)
     offset_in_page = raw_indices & page_mask
