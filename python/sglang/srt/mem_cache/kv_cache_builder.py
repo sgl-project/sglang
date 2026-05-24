@@ -181,15 +181,6 @@ def build_kv_cache(
             "Transformers backend to avoid multimodal prefix-cache mismatches."
         )
 
-    # Decode radix cache support by hybrid model family:
-    #   - Plain SWA (gpt-oss): supported. Full-attention layers reuse the radix
-    #     prefix; the sliding-window state is transferred fresh per turn.
-    #   - DeepSeek-V4 (DSA) / SWA-compress (Gemma4, MiMo-V2): blocked. They also
-    #     report is_hybrid_swa, but their compressed KV (c4/c128/indexer) is
-    #     reused over the full logical span, not a sliding window, so the
-    #     window-cap prefix-reuse path does not apply.
-    #   - Mamba/SSM: blocked. State is O(1) per request, so there is no
-    #     O(prefix_len) transfer to save.
     if (
         server_args.disaggregation_decode_enable_radix_cache
         and server_args.disaggregation_mode == "decode"
