@@ -71,10 +71,10 @@ def test_dsv4_index_cache_accepts_layer_indexed_pattern():
     config = SimpleNamespace(
         compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
         index_topk_freq=1,
-        index_topk_pattern="FFSFSFFF",
+        index_topk_pattern="FFFFSFFF",
     )
 
-    assert get_index_cache_policy(config, 2, 4) == (True, True)
+    assert get_index_cache_policy(config, 2, 4) == (False, True)
     assert get_index_cache_policy(config, 4, 4) == (True, False)
     assert get_index_cache_policy(config, 6, 4) == (False, False)
 
@@ -108,7 +108,7 @@ def test_dsv4_index_cache_rejects_short_layer_indexed_pattern():
     config = SimpleNamespace(
         compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
         index_topk_freq=1,
-        index_topk_pattern="FFSF",
+        index_topk_pattern="FFFF",
     )
 
     with pytest.raises(ValueError, match="does not cover next C4 layer"):
@@ -126,6 +126,28 @@ def test_dsv4_index_cache_rejects_invalid_pattern_entries():
     )
 
     with pytest.raises(ValueError, match="unsupported entries"):
+        get_index_cache_policy(config, 2, 4)
+
+
+def test_dsv4_index_cache_rejects_c4_indexed_pattern_that_skips_first_c4():
+    config = SimpleNamespace(
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
+        index_topk_freq=1,
+        index_topk_pattern="SFF",
+    )
+
+    with pytest.raises(ValueError, match="first C4 layer as F"):
+        get_index_cache_policy(config, 2, 4)
+
+
+def test_dsv4_index_cache_rejects_layer_indexed_pattern_that_skips_first_c4():
+    config = SimpleNamespace(
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 0],
+        index_topk_freq=1,
+        index_topk_pattern="FFSFFFFF",
+    )
+
+    with pytest.raises(ValueError, match="first C4 layer as F"):
         get_index_cache_policy(config, 2, 4)
 
 

@@ -121,6 +121,17 @@ def _validate_index_topk_pattern(index_topk_pattern: str) -> None:
         )
 
 
+def _validate_first_c4_layer_is_full(
+    index_topk_pattern: str, c4_layer_ids: list[int]
+) -> None:
+    if len(index_topk_pattern) == len(c4_layer_ids):
+        first_c4_entry = index_topk_pattern[0]
+    else:
+        first_c4_entry = index_topk_pattern[c4_layer_ids[0]]
+    if first_c4_entry != "F":
+        raise ValueError("index_topk_pattern must keep the first C4 layer as F")
+
+
 def get_index_cache_policy(
     config,
     layer_id: int,
@@ -146,6 +157,7 @@ def get_index_cache_policy(
 
     if index_topk_pattern is not None:
         _validate_index_topk_pattern(index_topk_pattern)
+        _validate_first_c4_layer_is_full(index_topk_pattern, c4_layer_ids)
         if len(index_topk_pattern) == len(c4_layer_ids):
             skip_topk = index_topk_pattern[c4_index] == "S"
             next_skip_topk = (
