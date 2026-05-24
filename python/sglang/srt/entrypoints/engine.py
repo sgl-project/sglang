@@ -49,6 +49,9 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    apply_mooncake_nvlink_env_defaults,
+)
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -1214,6 +1217,7 @@ class Engine(EngineScoreMixin, EngineBase):
 
 def _set_envs_and_config(server_args: ServerArgs):
     # Set global environments
+    apply_mooncake_nvlink_env_defaults()
     if "NCCL_CUMEM_ENABLE" not in os.environ or server_args.enable_symm_mem:
         os.environ["NCCL_CUMEM_ENABLE"] = str(int(server_args.enable_symm_mem))
     if (

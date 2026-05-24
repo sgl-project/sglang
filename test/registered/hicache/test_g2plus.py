@@ -1,6 +1,7 @@
 import argparse
 import base64
 import json
+import os
 import threading
 import time
 import unittest
@@ -15,8 +16,9 @@ import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     _get_mooncake_transfer_protocol,
+    apply_mooncake_nvlink_env_defaults,
 )
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, temp_set_env
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -372,10 +374,60 @@ class TestMooncakeTransferProtocol(unittest.TestCase):
             with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
                 self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
 
+    def test_true_pool_selects_nvlink_protocol(self):
+        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
+            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("true"):
+                self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
+
     def test_protocol_override_wins(self):
         with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override("RDMA"):
             with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
                 self.assertEqual(_get_mooncake_transfer_protocol(), "rdma")
+
+    def test_nvlink_pool_applies_external_env_defaults(self):
+        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
+            with temp_set_env(
+                MC_FORCE_MNNVL=None,
+                NCCL_MNNVL_ENABLE=None,
+                NCCL_CUMEM_ENABLE=None,
+            ):
+                applied = apply_mooncake_nvlink_env_defaults()
+                self.assertEqual(
+                    applied,
+                    {
+                        "MC_FORCE_MNNVL": "True",
+                        "NCCL_MNNVL_ENABLE": "1",
+                        "NCCL_CUMEM_ENABLE": "1",
+                    },
+                )
+                self.assertEqual(os.environ["MC_FORCE_MNNVL"], "True")
+                self.assertEqual(os.environ["NCCL_MNNVL_ENABLE"], "1")
+                self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "1")
+
+    def test_nvlink_pool_respects_external_env_overrides(self):
+        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
+            with temp_set_env(
+                MC_FORCE_MNNVL="False",
+                NCCL_MNNVL_ENABLE="0",
+                NCCL_CUMEM_ENABLE="0",
+            ):
+                applied = apply_mooncake_nvlink_env_defaults()
+                self.assertEqual(applied, {})
+                self.assertEqual(os.environ["MC_FORCE_MNNVL"], "False")
+                self.assertEqual(os.environ["NCCL_MNNVL_ENABLE"], "0")
+                self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "0")
+
+    def test_non_nvlink_pool_does_not_apply_external_env_defaults(self):
+        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override(None):
+            with temp_set_env(
+                MC_FORCE_MNNVL=None,
+                NCCL_MNNVL_ENABLE=None,
+                NCCL_CUMEM_ENABLE=None,
+            ):
+                self.assertEqual(apply_mooncake_nvlink_env_defaults(), {})
+                self.assertNotIn("MC_FORCE_MNNVL", os.environ)
+                self.assertNotIn("NCCL_MNNVL_ENABLE", os.environ)
+                self.assertNotIn("NCCL_CUMEM_ENABLE", os.environ)
 
 
 class TestRouterKVReuse(unittest.TestCase):

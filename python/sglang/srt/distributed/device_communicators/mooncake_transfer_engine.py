@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port
@@ -11,17 +11,55 @@ logger = logging.getLogger(__name__)
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
+_MOONCAKE_NVLINK_ENV_DEFAULTS = {
+    "MC_FORCE_MNNVL": "True",
+    "NCCL_MNNVL_ENABLE": "1",
+    "NCCL_CUMEM_ENABLE": "1",
+}
+
+
+def _normalize_mooncake_custom_mem_pool(custom_pool: Optional[str]) -> Optional[str]:
+    if custom_pool is None:
+        return None
+    custom_pool = custom_pool.strip().upper()
+    if custom_pool == "TRUE":
+        return "NVLINK"
+    return custom_pool or None
+
 
 def _get_mooncake_transfer_protocol() -> str:
     protocol = envs.SGLANG_MOONCAKE_TE_PROTOCOL.get()
     if protocol:
         return protocol.strip().lower()
 
-    custom_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
-    if custom_pool and custom_pool.strip().upper() == "NVLINK":
+    custom_pool = _normalize_mooncake_custom_mem_pool(
+        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+    )
+    if custom_pool == "NVLINK":
         return "nvlink"
 
     return "rdma"
+
+
+def apply_mooncake_nvlink_env_defaults() -> Dict[str, str]:
+    custom_pool = _normalize_mooncake_custom_mem_pool(
+        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+    )
+    if custom_pool != "NVLINK":
+        return {}
+
+    applied = {}
+    for name, value in _MOONCAKE_NVLINK_ENV_DEFAULTS.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            applied[name] = value
+
+    if applied:
+        logger.info(
+            "Applied Mooncake NVLink environment defaults: %s",
+            ", ".join(f"{name}={value}" for name, value in applied.items()),
+        )
+    return applied
 
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:

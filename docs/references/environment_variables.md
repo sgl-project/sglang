@@ -110,6 +110,9 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK` | Enable checks for memory imbalance across Tensor Parallel ranks | `true` |
 | `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. | `None` |
 | `SGLANG_MOONCAKE_TE_PROTOCOL` | Override the Mooncake transfer engine protocol. If unset, SGLang uses `nvlink` when `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`; otherwise it uses `rdma`. | `None` |
+| `MC_FORCE_MNNVL` | Mooncake NVLink/MNNVL transport hint. When `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`, SGLang sets this to `True` if the variable is not already set. | Not set |
+| `NCCL_MNNVL_ENABLE` | Enable NCCL MNNVL support for Mooncake NVLink paths. When `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`, SGLang sets this to `1` if the variable is not already set. | Not set |
+| `NCCL_CUMEM_ENABLE` | Enable CUDA memory allocations required by Mooncake NVLink/MNNVL. When `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`, SGLang sets this to `1` if the variable is not already set. | `0` unless symmetric memory or Mooncake NVLink is enabled |
 
 ## Model-Specific Options
 
