@@ -28,15 +28,15 @@ class WarmupGate:
         self,
         *,
         config: PerturbConfig,
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
     ) -> None:
         self._config = config
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._warmup_disable_logged: bool = False
         self._warmup_enable_logged: bool = False
 
     def is_in_warmup(self) -> bool:
-        step = self._step_counter_getter()
+        step = self._outer_step_counter_getter()
         warmup_steps = self._config.warmup_steps
 
         if step < warmup_steps:

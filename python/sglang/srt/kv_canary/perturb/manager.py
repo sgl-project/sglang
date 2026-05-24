@@ -35,19 +35,19 @@ class PerturbManager:
         config: PerturbConfig,
         req_to_token_pool: "ReqToTokenPool",
         buffer_groups: tuple[CanaryBufferGroup, ...],
-        step_counter_getter: Callable[[], int],
+        outer_step_counter_getter: Callable[[], int],
         swa_window_size: int = 0,
         sweep_interval: int = 0,
     ) -> None:
         self._config = config
         self._req_to_token_pool = req_to_token_pool
         self._buffer_groups = buffer_groups
-        self._step_counter_getter = step_counter_getter
+        self._outer_step_counter_getter = outer_step_counter_getter
         self._swa_window_size = swa_window_size
         self._sweep_interval = sweep_interval
         self._radix_cache: Optional["BasePrefixCache"] = None
         self._warmup_gate = WarmupGate(
-            config=config, step_counter_getter=step_counter_getter
+            config=config, outer_step_counter_getter=outer_step_counter_getter
         )
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
@@ -105,7 +105,7 @@ class PerturbManager:
             radix_cache=self._radix_cache,
             swa_window_size=self._swa_window_size,
             sweep_interval=self._sweep_interval,
-            step_counter=self._step_counter_getter(),
+            outer_step_counter=self._outer_step_counter_getter(),
             warmup_gate=self._warmup_gate,
         )
 

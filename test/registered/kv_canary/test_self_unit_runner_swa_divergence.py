@@ -108,7 +108,7 @@ class TestSwaDivergenceReport(CustomTestCase):
             stats.step(
                 outer_step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH
             )
-        # 4th forward lands on step_counter=10 = interval, so compute_on_device
+        # 4th forward lands on outer_step_counter=10 = interval, so compute_on_device
         # snapshots {forward_ct:4, verify_full:40, verify_swa:12} into the dict and
         # the staged future hangs onto it. forward_ct is now 4.
         stats.observe_after_invoke_plan(

@@ -153,7 +153,7 @@ class TestPerturbManager(CustomTestCase):
             ),
             req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         calls: list[str] = []
@@ -194,7 +194,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
             target_group_kind=TargetGroupKind.FULL,
             warmup_steps=0,
         )
-        warmup_gate = WarmupGate(config=config, step_counter_getter=lambda: 10)
+        warmup_gate = WarmupGate(config=config, outer_step_counter_getter=lambda: 10)
 
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         forward_batch.out_cache_loc = torch.tensor(
@@ -248,7 +248,7 @@ class TestReqToTokenPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         forward_batch = make_forward_batch(device, bs=2, seq_lens_list=(3, 3))
         forward_batch.out_cache_loc = torch.tensor(
@@ -319,7 +319,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
         forward_batch.out_cache_loc = torch.tensor(
@@ -383,7 +383,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
         )
         manager.attach_radix_cache(cast("BasePrefixCache", object()))
         forward_batch = make_forward_batch(device, bs=1, seq_lens_list=(1,))
@@ -429,7 +429,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             ),
             req_to_token_pool=pool,
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
         manager.attach_radix_cache(make_radix_cache([[], [3]], device=device))
@@ -504,7 +504,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
             ),
             req_to_token_pool=make_req_to_token_pool(device, max_reqs=4, max_seq_len=8),
             buffer_groups=(group,),
-            step_counter_getter=lambda: 10,
+            outer_step_counter_getter=lambda: 10,
             sweep_interval=1,
         )
 

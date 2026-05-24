@@ -41,10 +41,10 @@ def run(
     radix_cache: Optional["BasePrefixCache"],
     swa_window_size: int,
     sweep_interval: int,
-    step_counter: int,
+    outer_step_counter: int,
     warmup_gate: WarmupGate,
 ) -> None:
-    if sweep_interval <= 0 or step_counter % sweep_interval != 0:
+    if sweep_interval <= 0 or outer_step_counter % sweep_interval != 0:
         return
 
     if not should_run_perturbation(
