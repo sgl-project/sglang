@@ -67,24 +67,3 @@ class MockModelPerturbE2EBase(CapturedServerE2EBase):
             timeout=timeout,
         )
 
-    def assert_any_launch_tag_violation_reported(
-        self,
-        *,
-        fail_reason: str,
-        flush_wait_seconds: float = 3.0,
-        max_retries: int = 10,
-    ) -> None:
-        """Wildcard-launch_tag wrapper around ``assert_violation_logged_any``:
-        mock-model self-test doesn't care which HEAD/TAIL/FULL/SWA produced the
-        violation, only that some line with the given fail_reason landed."""
-        self.assert_violation_logged_any(
-            launch_tag_patterns=("*",),
-            fail_reason=fail_reason,
-            flush_wait_seconds=flush_wait_seconds,
-            max_retries=max_retries,
-        )
-
-    def assert_any_launch_tag_violation_absent(self, *, fail_reason: str) -> None:
-        self.assert_no_violation_matching(
-            launch_tag_patterns=("*",), fail_reason=fail_reason
-        )

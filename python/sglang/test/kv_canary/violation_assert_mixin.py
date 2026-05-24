@@ -53,6 +53,38 @@ class CanaryViolationAssertMixin:
             flush_wait_seconds=flush_wait_seconds,
         )
 
+    def assert_any_launch_tag_violation_reported(
+        self,
+        *,
+        fail_reason: str,
+        side: _Side = None,
+        flush_wait_seconds: float = 3.0,
+        max_retries: int = 10,
+    ) -> None:
+        """Wildcard-launch_tag wrapper: assert that *some* violation line with
+        the given fail_reason landed, regardless of which HEAD/TAIL/SWEEP/FULL/
+        SWA kernel produced it. Used by self-test perturb suites (mock-model)
+        that don't constrain the kernel scope. Defaults are biased towards
+        log mode, where the captured stdout buffer may not have flushed at
+        the first poll."""
+        self.assert_violation_logged_any(
+            launch_tag_patterns=("*",),
+            fail_reason=fail_reason,
+            side=side,
+            flush_wait_seconds=flush_wait_seconds,
+            max_retries=max_retries,
+        )
+
+    def assert_any_launch_tag_violation_absent(
+        self, *, fail_reason: str, side: _Side = None
+    ) -> None:
+        """Symmetric negative of ``assert_any_launch_tag_violation_reported``:
+        no violation line with the given fail_reason may appear, regardless of
+        launch_tag."""
+        self.assert_no_violation_matching(
+            launch_tag_patterns=("*",), fail_reason=fail_reason, side=side
+        )
+
     def assert_violation_logged_any(
         self,
         *,
