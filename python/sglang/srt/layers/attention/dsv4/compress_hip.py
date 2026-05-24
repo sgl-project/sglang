@@ -21,6 +21,11 @@ from sglang.srt.layers.deepseek_v4_rope import (
     fused_norm_rope_inplace_triton,
     fused_softmax_pool_triton,
 )
+
+try:
+    from sglang.srt.layers.deepseek_v4_rope import fused_softmax_pool_triton
+except ImportError:
+    fused_softmax_pool_triton = None
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
     KVAndScore,

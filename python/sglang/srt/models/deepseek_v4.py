@@ -713,6 +713,7 @@ class MQALayer(nn.Module):
                 q_out=q_out,
                 dtype=x.dtype,
             )
+
             if use_cp:
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
@@ -1552,6 +1553,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                     self.cp_rank,
                     self.cp_size,
                     forward_batch.seq_lens_cpu.tolist(),
+                    extend_lens=forward_batch.extend_seq_lens_cpu,
                 )
                 if is_dsa_prefill_cp_round_robin_split():
                     attn_backend = get_attn_backend()

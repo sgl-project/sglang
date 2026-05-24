@@ -101,13 +101,10 @@ def deepseek_v4_topk_transform_512(
             contiguous on dim 1.
         page_indices: int32 ``[B, topk]``, output buffer, contiguous. Filled
             with paged physical slots; -1 for padding entries.
-        page_size: power-of-two page size (e.g. 256 for V4 decode).
-        raw_indices: optional int32 ``[B, topk]``, output buffer, contiguous.
-            If provided, filled with raw absolute token positions (or -1 for
-            padding entries).
+        page_size: power-of-2 page size.
+        raw_indices: optional int32 ``[B, topk]``, contiguous. If provided,
+            filled with raw token positions within each row.
     """
-    assert scores.dim() == 2
-    assert page_indices.dim() == 2
     if raw_indices is not None:
         assert raw_indices.dim() == 2
     torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
