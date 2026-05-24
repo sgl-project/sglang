@@ -53,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
@@ -676,22 +677,18 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            # Multi-step EAGLE draft (topk > 0, num_steps > 1) shares one
-            # out_cache_loc buffer across all draft steps; layout matches
-            # EagleWorkerV2.draft_forward: [bs, topk, num_steps] flattened.
-            # Pick this step's slice so the per-step backend sees a buffer
-            # whose length matches its own seq_lens.
+            # In multi-step EAGLE draft, the per-step backend metadata bakes
+            # in this step's KV write target (c4/c128 out_loc). The shared
+            # out_cache_loc buffer must be sliced via the EAGLE per-step
+            # convention -- see per_step_draft_out_cache_loc.
             out_cache_loc = forward_batch.out_cache_loc
             if self.topk > 0 and self.speculative_num_steps > 1:
-                out_cache_loc = (
-                    out_cache_loc.view(
-                        forward_batch.batch_size,
-                        self.topk,
-                        self.speculative_num_steps,
-                    )
-                    .permute(2, 0, 1)[self.speculative_step_id]
-                    .reshape(-1)
-                )
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
