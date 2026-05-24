@@ -347,28 +347,23 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
-    def reconstruct(self):
-        """materialize cuda ipc proxy tensors in-place on target_device"""
-        has_ipc_proxy = isinstance(
-            self.feature, CudaIpcTensorTransportProxy
-        ) or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
-        if not has_ipc_proxy:
-            has_ipc_proxy = any(
+    def has_cuda_ipc_proxy(self):
+        return (
+            isinstance(self.feature, CudaIpcTensorTransportProxy)
+            or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            or any(
                 isinstance(value, CudaIpcTensorTransportProxy)
                 for value in self.model_specific_data.values()
             )
-        if not has_ipc_proxy:
-            # if no cuda-ipc tensor is involved
-            return
+        )
 
-        reconstruct_device = torch.cuda.current_device()
+    def reconstruct(self, target_device: int):
+        """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+            self.feature = self.feature.reconstruct_on_target_device(target_device)
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
-                self.precomputed_embeddings.reconstruct_on_target_device(
-                    reconstruct_device
-                )
+                self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
             if isinstance(
@@ -376,7 +371,7 @@ class MultimodalDataItem:
             ):
                 extra_data = self.model_specific_data[
                     extra_key
-                ].reconstruct_on_target_device(reconstruct_device)
+                ].reconstruct_on_target_device(target_device)
                 self.model_specific_data[extra_key] = extra_data
 
 
@@ -507,8 +502,12 @@ class MultimodalInputs:
     @staticmethod
     def from_processor_output(obj: "MultimodalProcessorOutput"):
         mm_items = obj.mm_items
+        reconstruct_device = None
         for mm_item in mm_items:
-            mm_item.reconstruct()
+            if mm_item.has_cuda_ipc_proxy():
+                if reconstruct_device is None:
+                    reconstruct_device = torch.cuda.current_device()
+                mm_item.reconstruct(reconstruct_device)
 
         ret = MultimodalInputs(
             mm_items=mm_items,
