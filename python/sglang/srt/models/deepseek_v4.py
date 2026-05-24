@@ -720,7 +720,6 @@ class MQALayer(nn.Module):
         return index_cache_enabled_for_seq_lens(
             seq_lens,
             self.index_topk_min_seq_len,
-            self.compress_ratio,
         )
 
     def _reuse_topk(self, prev_topk_indices: DSV4IndexCache, attn_backend) -> None:

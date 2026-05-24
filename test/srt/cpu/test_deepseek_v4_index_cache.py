@@ -140,11 +140,22 @@ def test_dsv4_index_cache_reuse_guards():
 
 
 def test_dsv4_index_cache_min_seq_len_gate_uses_raw_token_length():
-    seq_lens = torch.tensor([10, 25000], dtype=torch.int32)
-
-    assert index_cache.index_cache_enabled_for_seq_lens(seq_lens, 0)
-    assert index_cache.index_cache_enabled_for_seq_lens(seq_lens, 100000)
-    assert not index_cache.index_cache_enabled_for_seq_lens(seq_lens, 100001)
+    assert index_cache.index_cache_enabled_for_seq_lens(
+        torch.tensor([80000, 75000], dtype=torch.int32),
+        75000,
+    )
+    assert not index_cache.index_cache_enabled_for_seq_lens(
+        torch.tensor([80000, 74999], dtype=torch.int32),
+        75000,
+    )
+    assert not index_cache.index_cache_enabled_for_seq_lens(
+        torch.tensor([18750], dtype=torch.int32),
+        75000,
+    )
+    assert index_cache.index_cache_enabled_for_seq_lens(
+        torch.tensor([10, 25000], dtype=torch.int32),
+        0,
+    )
     assert not index_cache.index_cache_enabled_for_seq_lens(
         torch.empty(0, dtype=torch.int32),
         1,
@@ -160,11 +171,11 @@ def test_dsv4_index_cache_graph_gate_disables_short_context_graphs():
 
     assert index_cache.should_disable_cuda_graph_for_index_cache_gate(
         config,
-        torch.tensor([1000, 12000], dtype=torch.int32),
+        torch.tensor([1000, 80000], dtype=torch.int32),
     )
     assert not index_cache.should_disable_cuda_graph_for_index_cache_gate(
         config,
-        torch.tensor([20000], dtype=torch.int32),
+        torch.tensor([75000], dtype=torch.int32),
     )
 
 
@@ -178,16 +189,23 @@ def test_dsv4_index_cache_graph_gate_returns_capture_variant():
     assert (
         index_cache.index_cache_graph_gate_value(
             config,
-            torch.tensor([12000], dtype=torch.int32),
+            torch.tensor([74999], dtype=torch.int32),
         )
         is False
     )
     assert (
         index_cache.index_cache_graph_gate_value(
             config,
-            torch.tensor([20000], dtype=torch.int32),
+            torch.tensor([75000, 80000], dtype=torch.int32),
         )
         is True
+    )
+    assert (
+        index_cache.index_cache_graph_gate_value(
+            config,
+            torch.tensor([75000, 12000], dtype=torch.int32),
+        )
+        is False
     )
 
 
@@ -202,7 +220,7 @@ def test_dsv4_index_cache_cuda_graph_profile_mode_includes_gate_variant():
         index_cache.index_cache_cuda_graph_profile_mode(
             "decode",
             config,
-            torch.tensor([12000], dtype=torch.int32),
+            torch.tensor([74999], dtype=torch.int32),
         )
         == "decode.indexcache_off"
     )
@@ -210,7 +228,7 @@ def test_dsv4_index_cache_cuda_graph_profile_mode_includes_gate_variant():
         index_cache.index_cache_cuda_graph_profile_mode(
             "decode",
             config,
-            torch.tensor([20000], dtype=torch.int32),
+            torch.tensor([75000], dtype=torch.int32),
         )
         == "decode.indexcache_on"
     )

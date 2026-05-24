@@ -99,13 +99,12 @@ def should_return_index_cache(
 def index_cache_enabled_for_seq_lens(
     seq_lens: torch.Tensor,
     min_seq_len: int,
-    compress_ratio: int = 4,
 ) -> bool:
     if min_seq_len <= 0:
         return True
     if seq_lens.numel() == 0:
         return False
-    return int(seq_lens.max().item()) * compress_ratio >= min_seq_len
+    return int(seq_lens.min().item()) >= min_seq_len
 
 
 def index_cache_config_has_context_gate(config) -> bool:
@@ -125,7 +124,6 @@ def index_cache_config_enabled(config) -> bool:
 def index_cache_graph_gate_value(
     config,
     seq_lens_cpu: Optional[torch.Tensor],
-    compress_ratio: int = 4,
 ) -> Optional[bool]:
     if not index_cache_config_has_context_gate(config):
         return None
@@ -134,7 +132,6 @@ def index_cache_graph_gate_value(
     return index_cache_enabled_for_seq_lens(
         seq_lens_cpu,
         getattr(config, "index_topk_min_seq_len", 0),
-        compress_ratio,
     )
 
 
