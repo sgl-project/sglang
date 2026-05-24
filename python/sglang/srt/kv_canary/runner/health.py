@@ -61,20 +61,14 @@ class KernelRunCounterHealthChecker:
     def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
         counters = host_tensor.tolist()
         expected_tags = self._expected_active_tags_for_health_check()
-        # [PP-DIAG] dump all counters + active tags + sibling slot counters.
-        # If kernel[T] == slot[T] for all T, the kernel pointers are swapped at the C++ ABI.
-        # If only HEAD_K_FULL is huge, something else is at play.
-        slot_counters_now = self._device_state.slot_run_counters.cpu().tolist()
-        kernel_counters_now = self._device_state.kernel_run_counters.cpu().tolist()
+        # [PP-DIAG] dump all counters + active tags so we see WHICH tags are zero
+        # AND what the non-zero counter values are. Cheap (one log line every 100 steps).
         logger.warning(
-            "[PP-DIAG] health step=%d active_tags=%s expected_tags=%s "
-            "counters_from_handler=%s kernel_now=%s slot_now=%s",
+            "[PP-DIAG] health step=%d active_tags=%s expected_tags=%s counters=%s",
             self._step_counter_getter(),
             [t.name for t in self._active_tags],
             [t.name for t in expected_tags],
             {t.name: int(counters[t.value]) for t in expected_tags},
-            {t.name: int(kernel_counters_now[t.value]) for t in expected_tags},
-            {t.name: int(slot_counters_now[t.value]) for t in expected_tags},
         )
         zero_tags = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
         if zero_tags:
