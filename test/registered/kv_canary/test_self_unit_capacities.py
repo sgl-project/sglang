@@ -48,7 +48,7 @@ class TestComputeLaunchCapacities(CustomTestCase):
         )
         self.assertEqual(
             capacities.per_forward_verify_capacity,
-            int(max_total_num_tokens * 1.2),
+            int(max_total_num_tokens * 3),
         )
 
     def test_from_args_treats_missing_speculative_draft_tokens_as_zero(self) -> None:
