@@ -253,9 +253,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # Disable CUTLASS backend when piecewise cuda graph is enabled
             # due to TMA descriptor initialization issues on B200
             if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
-                logger.warning(
+                logger.info(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
-                    "due to TMA descriptor initialization issues on B200. "
+                    "due to TMA descriptor initialization issues on SM100 GPUs. "
                     "Using auto backend instead for stability."
                 )
             else:
