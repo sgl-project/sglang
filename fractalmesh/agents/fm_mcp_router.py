@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     87,
+        "agents":     90,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -201,6 +201,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "log_manager":       7839,
             "security_monitor":  7840,
             "akash":             7841,
+            "affiliate_engine":  7842,
+            "tunnel_manager":    7843,
+            "geosignal":         7844,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -489,6 +492,9 @@ _INTENTS = {
     "log_compress":            lambda a, k: {"action": "log_compress_queued", "file": k.get("file", "")},
     "security_scan":           lambda a, k: {"action": "security_scan_queued"},
     "akash_deploy":            lambda a, k: {"action": "akash_deploy_queued", "sdl_id": k.get("sdl_id", 0)},
+    "affiliate_click":         lambda a, k: {"action": "affiliate_click_queued", "program_id": k.get("program_id", 0)},
+    "tunnel_start":            lambda a, k: {"action": "tunnel_start_queued", "port": k.get("port", 7777), "provider": k.get("provider", "cloudflare")},
+    "geo_scan":                lambda a, k: {"action": "geo_scan_queued", "target": k.get("target", "Albury CBD")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
