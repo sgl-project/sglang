@@ -13,6 +13,9 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    _get_mooncake_transfer_protocol,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
@@ -348,6 +351,23 @@ class FakePrometheusMetric:
                 metric.calls.append(("set", labels, value))
 
         return LabeledMetric()
+
+
+class TestMooncakeTransferProtocol(unittest.TestCase):
+    def test_defaults_to_rdma(self):
+        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
+            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override(None):
+                self.assertEqual(_get_mooncake_transfer_protocol(), "rdma")
+
+    def test_nvlink_pool_selects_nvlink_protocol(self):
+        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
+            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
+                self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
+
+    def test_protocol_override_wins(self):
+        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override("RDMA"):
+            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
+                self.assertEqual(_get_mooncake_transfer_protocol(), "rdma")
 
 
 class TestRouterKVReuse(unittest.TestCase):

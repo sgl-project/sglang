@@ -12,6 +12,18 @@ logger = logging.getLogger(__name__)
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
 
 
+def _get_mooncake_transfer_protocol() -> str:
+    protocol = envs.SGLANG_MOONCAKE_TE_PROTOCOL.get()
+    if protocol:
+        return protocol.strip().lower()
+
+    custom_pool = envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
+    if custom_pool and custom_pool.strip().upper() == "NVLINK":
+        return "nvlink"
+
+    return "rdma"
+
+
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
     """
     Parse IB device string and get IB devices for a specific GPU ID.
@@ -189,10 +201,11 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
+            protocol = _get_mooncake_transfer_protocol()
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                "rdma",
+                protocol,
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
