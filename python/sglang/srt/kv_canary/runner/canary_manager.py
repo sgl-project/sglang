@@ -198,6 +198,11 @@ class CanaryManager:
         try:
             yield
         finally:
+            assert self._active_single_forward_manager_index == index, (
+                f"kv-canary: with_active_single_forward_manager({index}) exited with "
+                f"_active_single_forward_manager_index="
+                f"{self._active_single_forward_manager_index}; nested or mismatched bracket"
+            )
             self._active_single_forward_manager_index = None
 
     def pre_ops_maybe_inside_graph(
