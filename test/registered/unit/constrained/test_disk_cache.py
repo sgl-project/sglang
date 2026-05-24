@@ -15,6 +15,10 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(60, "base-a-test-cpu")
+
 
 class TestDiskCacheDecorator(unittest.TestCase):
     """Tests for the disk_cache decorator."""
@@ -22,6 +26,7 @@ class TestDiskCacheDecorator(unittest.TestCase):
     def _get_fresh_decorator(self):
         """Re-import the decorator to avoid module-level cache pollution."""
         import importlib
+
         import sglang.srt.constrained.outlines_jump_forward as mod
 
         importlib.reload(mod)
@@ -104,11 +109,13 @@ class TestDiskCacheDecorator(unittest.TestCase):
 
         @disk_cache()
         def compute(n):
-            return n ** 2
+            return n**2
 
         def worker(n):
             try:
-                with patch.dict(os.environ, {"SGLANG_DISABLE_OUTLINES_DISK_CACHE": "1"}):
+                with patch.dict(
+                    os.environ, {"SGLANG_DISABLE_OUTLINES_DISK_CACHE": "1"}
+                ):
                     results.append(compute(n))
             except Exception as e:
                 errors.append(e)
