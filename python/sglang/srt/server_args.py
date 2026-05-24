@@ -2410,6 +2410,19 @@ class ServerArgs:
                     support_mamba_cache_extra_buffer=True,
                     sm100_default_attention_backend=sm100_default_attn_backend,
                 )
+                if (
+                    is_sm90_supported()
+                    and self.speculative_algorithm is None
+                    and self.mamba_ssm_dtype in (None, "float32")
+                    and self.linear_attn_backend == "triton"
+                    and self.linear_attn_decode_backend is None
+                    and self.linear_attn_prefill_backend is None
+                ):
+                    # sm90 FlashInfer GDN supports extend and decode with fp32 state
+                    self.linear_attn_backend = "flashinfer"
+                    logger.info(
+                        f"Use flashinfer as linear attention backend on sm90 for {model_arch}"
+                    )
 
         elif model_arch == "MiniCPMV4_6ForConditionalGeneration":
             # 4.6 wraps a Qwen3.5 hybrid GDN backbone, so it needs the same
