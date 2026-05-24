@@ -142,12 +142,20 @@ def greedy_search_pattern(
             candidate[idx] = "S"
             candidate_str = pattern_to_str(candidate)
             loss = score_pattern(candidate_str)
-            scored.append((loss, idx, candidate_str))
-            print(json.dumps({"candidate": candidate_str, "flip": idx, "loss": loss}))
+            item = {"pattern": candidate_str, "flip": idx, "loss": loss}
+            scored.append(item)
+            print(json.dumps({"candidate": item}))
 
-        loss, idx, candidate_str = min(scored)
+        selected = min(scored, key=lambda item: (item["loss"], item["flip"]))
+        idx = selected["flip"]
+        candidate_str = selected["pattern"]
         pattern[idx] = "S"
-        step = {"pattern": candidate_str, "flip": idx, "loss": loss}
+        step = {
+            "pattern": candidate_str,
+            "flip": idx,
+            "loss": selected["loss"],
+            "candidates": sorted(scored, key=lambda item: (item["loss"], item["flip"])),
+        }
         history.append(step)
         print(json.dumps({"selected": step}))
 

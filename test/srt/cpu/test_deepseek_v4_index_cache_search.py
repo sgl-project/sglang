@@ -35,6 +35,15 @@ def test_dsv4_index_cache_search_keeps_pp_block_anchors_full():
     history = result["history"]
 
     assert [step["flip"] for step in history] == [5, 3, 1, 2]
+    assert history[0]["candidates"][0] == {
+        "pattern": "FFFFFSFF",
+        "flip": 5,
+        "loss": 0,
+    }
+    assert history[0]["candidates"] == sorted(
+        history[0]["candidates"],
+        key=lambda item: (item["loss"], item["flip"]),
+    )
     assert result["initial_pattern"] == "FFFFFFFF"
     assert result["final_pattern"] == "FSSSFSFF"
     assert result["target_f_layers"] == 4
@@ -57,6 +66,17 @@ def test_dsv4_index_cache_search_can_target_quarter_retention():
     assert result["final_pattern"].count("F") == 2
     assert result["final_pattern"][0] == "F"
     assert result["target_f_layers"] == 2
+
+
+def test_dsv4_index_cache_search_ties_break_by_layer_index():
+    result = search_mod.greedy_search_pattern(
+        num_c4_layers=4,
+        retention="1/2",
+        pp_block_c4_layers=0,
+        score_pattern=lambda _: 1.0,
+    )
+
+    assert [step["flip"] for step in result["history"]] == [1, 2]
 
 
 def test_dsv4_index_cache_search_rejects_impossible_protected_retention():
