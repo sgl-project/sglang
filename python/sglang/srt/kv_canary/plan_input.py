@@ -102,10 +102,14 @@ def _extract_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
-        # Evidence: ForwardBatch.init_new leaves extend_* fields unset for decode/idle, while
-        # attention backends treat decode as one query token whose cache length is seq_lens.
-        # Therefore the covered span is prefix seq_lens - 1 plus one extend token.
-        out_prefix_lens.copy_((forward_batch.seq_lens[:bs] - 1).to(torch.int64))
+        # Use ``forward_batch.positions`` directly (one entry per req for decode-shape) instead of
+        # deriving the prefix from ``seq_lens - 1``. Reason: ``seq_lens`` convention is path-dependent
+        # — regular decode bumps it pre-forward (so seq_lens - 1 = write_position), but the eagle
+        # draft path leaves seq_lens pre-bump (so seq_lens - 1 = write_position - 1, one slot behind
+        # the actual chain predecessor). ``positions[entry]`` is always the canonical write position
+        # regardless of mode, so anchoring prefix_lens on it makes the canary's seed selection
+        # convention-agnostic.
+        out_prefix_lens.copy_(forward_batch.positions[:bs].to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
         # Evidence: EagleVerifyInputV2Mixin.prepare_for_v2_verify assigns out_cache_loc in
