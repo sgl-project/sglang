@@ -210,7 +210,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
 
         with patch.object(torch, "rand", return_value=torch.tensor(0.0)):
             real_kv_post_forward.run(
-                forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=forward_batch,
                 config=config,
                 buffer_groups=(group,),
                 warmup_gate=warmup_gate,
@@ -285,7 +285,7 @@ class TestReqToTokenPerturb(CustomTestCase):
         forward_batch.num_token_non_padded_cpu = 1
 
         targets = collect_active_slots(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=forward_batch,
             req_to_token_pool=pool,
         )
 

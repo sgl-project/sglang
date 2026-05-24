@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     req_to_token_pool: "ReqToTokenPool",
     buffer_groups: tuple[CanaryBufferGroup, ...],
@@ -49,7 +49,7 @@ def run(
         perturb_name="real_kv_used",
         probability=config.real_kv_used_prob,
         warmup_gate=warmup_gate,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
     ):
         return
 
@@ -69,7 +69,7 @@ def run(
         return
 
     target = _pick_active_slot_for_group(
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         req_to_token_pool=req_to_token_pool,
         group=group,
         swa_window_size=swa_window_size,
@@ -112,13 +112,13 @@ def run(
 
 def _pick_active_slot_for_group(
     *,
-    forward_batch: "ForwardBatch",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
     req_to_token_pool: "ReqToTokenPool",
     group: CanaryBufferGroup,
     swa_window_size: int,
 ) -> Optional[ReqToTokenEntry]:
     candidates = collect_active_slots(
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         req_to_token_pool=req_to_token_pool,
         exclude_out_cache_loc=True,
     )

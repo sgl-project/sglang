@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     req_to_token_pool: "ReqToTokenPool",
     warmup_gate: WarmupGate,
@@ -39,12 +39,12 @@ def run(
         perturb_name="req_to_token",
         probability=config.req_to_token_prob,
         warmup_gate=warmup_gate,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
     ):
         return
 
     entries = collect_active_slots(
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         req_to_token_pool=req_to_token_pool,
         exclude_out_cache_loc=True,
     )

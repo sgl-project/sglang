@@ -75,7 +75,7 @@ def _run_compute(
     count = compute_swa_full_idx_divergence(
         swa_allocator=swa_allocator,
         req_to_token_pool=req_to_token_pool,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=forward_batch,
     )
     return int(count.item())
 
@@ -106,7 +106,7 @@ class TestSwaDivergenceReport(CustomTestCase):
                 verify_plan=_make_verify_plan(3),
             )
             stats.step(
-                outer_step_counter=forward_idx + 1, forward_batch=_EMPTY_FORWARD_BATCH
+                outer_step_counter=forward_idx + 1, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH
             )
         # 4th forward lands on outer_step_counter=10 = interval, so compute_on_device
         # snapshots {forward_ct:4, verify_full:40, verify_swa:12} into the dict and
@@ -123,14 +123,14 @@ class TestSwaDivergenceReport(CustomTestCase):
             ),
             verify_plan=_make_verify_plan(3),
         )
-        stats.step(outer_step_counter=10, forward_batch=_EMPTY_FORWARD_BATCH)
+        stats.step(outer_step_counter=10, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH)
 
         # 5th step drains the previous stage and emits the log; forward_ct is now 5
         # but the staged dict still carries the snapshot forward_ct=4 from step 4.
         with self.assertLogs(
             swa_div_module.logger.name, level=logging.INFO
         ) as captured:
-            stats.step(outer_step_counter=11, forward_batch=_EMPTY_FORWARD_BATCH)
+            stats.step(outer_step_counter=11, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH)
 
         lines = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None
@@ -159,13 +159,13 @@ class TestSwaDivergenceReport(CustomTestCase):
             # DelayedDeviceHostHandler still has nothing to drain), then call
             # step() again at the next counter to drain and emit the log.
             stats.step(
-                outer_step_counter=stage_step, forward_batch=_EMPTY_FORWARD_BATCH
+                outer_step_counter=stage_step, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH
             )
             with self.assertLogs(
                 swa_div_module.logger.name, level=logging.INFO
             ) as captured:
                 stats.step(
-                    outer_step_counter=drain_step, forward_batch=_EMPTY_FORWARD_BATCH
+                    outer_step_counter=drain_step, maybe_inaccurate_forward_batch=_EMPTY_FORWARD_BATCH
                 )
             matching = [
                 line
@@ -358,11 +358,11 @@ class TestSwaDivergenceReportWithCompute(CustomTestCase):
 
         # Stage at the interval-aligned step, then drain on the next step so the
         # DelayedDeviceHostHandler has a pending future to postprocess.
-        stats.step(outer_step_counter=10, forward_batch=forward_batch)
+        stats.step(outer_step_counter=10, maybe_inaccurate_forward_batch=forward_batch)
         with self.assertLogs(
             swa_div_module.logger.name, level=logging.INFO
         ) as captured:
-            stats.step(outer_step_counter=11, forward_batch=forward_batch)
+            stats.step(outer_step_counter=11, maybe_inaccurate_forward_batch=forward_batch)
 
         matching = [
             line for line in captured.output if SwaDivergenceLog.parse(line) is not None

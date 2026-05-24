@@ -65,12 +65,12 @@ class SwaDivergenceReport:
         self,
         *,
         outer_step_counter: int,
-        forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
         self._forward_ct += 1
         self._handler.step(
             compute_on_device=lambda: self._compute_on_device(
-                outer_step_counter=outer_step_counter, forward_batch=forward_batch
+                outer_step_counter=outer_step_counter, maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             ),
             postprocess_on_host=self._postprocess_on_host,
         )
@@ -79,7 +79,7 @@ class SwaDivergenceReport:
         self,
         *,
         outer_step_counter: int,
-        forward_batch: Optional["ForwardBatch"],
+        maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> Optional[dict[str, Any]]:
         if outer_step_counter == 0 or outer_step_counter % self._interval != 0:
             return None
@@ -91,13 +91,13 @@ class SwaDivergenceReport:
             "forward_ct": self._forward_ct,
             "verify_total_count": self._verify_total_count_device,
         }
-        # ``forward_batch`` is the same (possibly already-advanced) instance
+        # ``maybe_inaccurate_forward_batch`` is the same (possibly already-advanced) instance
         # passed to phase 4 — accurate enough for the coarse trend metric.
-        if self._swa_allocator is not None and forward_batch is not None:
+        if self._swa_allocator is not None and maybe_inaccurate_forward_batch is not None:
             result["swa_full_idx_divergence"] = compute_swa_full_idx_divergence(
                 swa_allocator=self._swa_allocator,
                 req_to_token_pool=self._req_to_token_pool,
-                forward_batch=forward_batch,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             )
         return result
 
@@ -151,13 +151,13 @@ def compute_swa_full_idx_divergence(
     *,
     swa_allocator: "SWATokenToKVPoolAllocator",
     req_to_token_pool: "ReqToTokenPool",
-    forward_batch: "ForwardBatch",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
     """Count non-identity (full, swa) index pairs in the live req_to_token range."""
     full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
     device = full_to_swa_index_mapping.device
-    req_pool_indices = forward_batch.req_pool_indices
-    seq_lens = forward_batch.seq_lens
+    req_pool_indices = maybe_inaccurate_forward_batch.req_pool_indices
+    seq_lens = maybe_inaccurate_forward_batch.seq_lens
 
     if req_pool_indices.numel() == 0:
         return torch.zeros(1, dtype=torch.int32, device=device)

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 def run(
     *,
-    forward_batch: Optional["ForwardBatch"],
+    maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     config: PerturbConfig,
     buffer_groups: tuple[CanaryBufferGroup, ...],
     radix_cache: Optional["BasePrefixCache"],
@@ -51,7 +51,7 @@ def run(
         perturb_name="real_kv_unused_cache",
         probability=config.real_kv_unused_cache_prob,
         warmup_gate=warmup_gate,
-        forward_batch=forward_batch,
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
         require_forward_batch=False,
     ):
         return

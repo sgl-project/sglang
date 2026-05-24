@@ -276,7 +276,7 @@ class CanaryManager:
         if self._swa_divergence_report is not None:
             self._swa_divergence_report.step(
                 outer_step_counter=self._outer_step_counter,
-                forward_batch=maybe_inaccurate_forward_batch,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             )
 
     def mark_init_finished(self) -> None:

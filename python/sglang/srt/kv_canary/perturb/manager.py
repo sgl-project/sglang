@@ -77,17 +77,17 @@ class PerturbManager:
         this MUST fire after the captured forward writes have completed."""
         self.perturb_real_kv_post_forward(maybe_inaccurate_forward_batch)
 
-    def perturb_req_to_token(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_req_to_token(self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]) -> None:
         req_to_token.run(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,
             req_to_token_pool=self._req_to_token_pool,
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_used(self, forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_real_kv_used(self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]) -> None:
         real_kv_used.run(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,
             req_to_token_pool=self._req_to_token_pool,
             buffer_groups=self._buffer_groups,
@@ -96,10 +96,10 @@ class PerturbManager:
         )
 
     def perturb_real_kv_unused_cache(
-        self, forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
     ) -> None:
         real_kv_unused_cache.run(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,
             buffer_groups=self._buffer_groups,
             radix_cache=self._radix_cache,
@@ -110,10 +110,10 @@ class PerturbManager:
         )
 
     def perturb_real_kv_post_forward(
-        self, forward_batch: Optional["ForwardBatch"]
+        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
     ) -> None:
         real_kv_post_forward.run(
-            forward_batch=forward_batch,
+            maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,
             buffer_groups=self._buffer_groups,
             warmup_gate=self._warmup_gate,
