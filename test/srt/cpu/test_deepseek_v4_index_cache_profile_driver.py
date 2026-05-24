@@ -248,6 +248,10 @@ def test_dsv4_index_cache_profile_driver_dry_run_writes_manifest(tmp_path):
     assert result["min_indexcache_prompt_tokens"] == 75000
     assert result["request_results"] == []
     assert result["trace_files"] == []
+    assert result["profile_validation"] == {
+        "passed": True,
+        "failures": [],
+    }
     assert result["server_checks"] == {
         "server_info_checked": False,
         "speculative_decode": "dry run; /server_info not queried",
@@ -256,3 +260,64 @@ def test_dsv4_index_cache_profile_driver_dry_run_writes_manifest(tmp_path):
         "dry run; profiler marker env not exercised"
     )
     assert result["eagle"] == "dry run; speculative decoding not exercised"
+
+
+def test_dsv4_index_cache_profile_driver_writes_manifest_before_validation_failure(
+    tmp_path, monkeypatch
+):
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir()
+    trace_path = profile_dir / "dsv4-indexcache-rank0.trace.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {"name": "dsv4_indexcache.csa_indexer.layer_2", "dur": 1000},
+                    {
+                        "name": "dsv4_indexcache.cuda_graph.decode.indexcache_on.replay",
+                        "dur": 0,
+                    },
+                ]
+            }
+        )
+    )
+    output = tmp_path / "profile.json"
+
+    monkeypatch.setattr(
+        profile_driver,
+        "fetch_server_info",
+        lambda *_: {
+            "speculative_algorithm": None,
+            "speculative_num_steps": 0,
+            "speculative_eagle_topk": None,
+            "speculative_num_draft_tokens": 0,
+        },
+    )
+    monkeypatch.setattr(profile_driver, "collect_profile", lambda _: [])
+
+    with pytest.raises(RuntimeError, match="raw_to_page_translation"):
+        profile_driver.main(
+            [
+                "--endpoint",
+                "http://indexcache",
+                "--profile-dir",
+                str(profile_dir),
+                "--prompt-tokens",
+                "128000",
+                "--min-indexcache-prompt-tokens",
+                "75000",
+                "--output",
+                str(output),
+                "--eagle-off-confirmed",
+                "--indexcache-profile-env-confirmed",
+            ]
+        )
+
+    result = json.loads(output.read_text())
+
+    assert result["profile_validation"]["passed"] is False
+    assert any(
+        "raw_to_page_translation" in failure
+        for failure in result["profile_validation"]["failures"]
+    )
+    assert result["trace_files"] == [str(trace_path)]

@@ -155,14 +155,20 @@ def has_category(categories: dict, required: str) -> bool:
 
 
 def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
+    failures = profile_validation_failures(args, trace_summaries)
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def profile_validation_failures(args, trace_summaries: list[dict]) -> list[str]:
     if args.dry_run:
-        return
+        return []
     if not trace_summaries:
-        raise RuntimeError(
+        return [
             "no profile traces found; check --profile-dir, --profile-prefix, "
             "server /start_profile support, and that the server-side profile "
             "directory is visible to this driver"
-        )
+        ]
     observed = {}
     cuda_graph_paths = {}
     for summary in trace_summaries:
@@ -173,22 +179,24 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
         for category in REQUIRED_PROFILE_CATEGORIES
         if not has_category(observed, category)
     ]
+    failures = []
     if missing:
-        raise RuntimeError(
+        failures.append(
             "profile traces are missing required DSV4 IndexCache regions "
             f"{missing}; check SGLANG_DSV4_INDEXCACHE_PROFILE=true and that "
             "IndexCache reuse was exercised"
         )
     if not cuda_graph_paths:
-        raise RuntimeError(
+        failures.append(
             "profile traces are missing CUDA graph replay/fallback path stats; "
             "check that DSV4 IndexCache profiling reached ModelRunner.forward"
         )
     if not any(".indexcache_on." in path for path in cuda_graph_paths):
-        raise RuntimeError(
+        failures.append(
             "profile traces did not record an indexcache_on CUDA graph path; "
             "check that the profiled prompt exceeded the IndexCache context gate"
         )
+    return failures
 
 
 def parse_args(argv: list[str] | None = None):
@@ -247,7 +255,7 @@ def main(argv: list[str] | None = None) -> None:
 
     trace_files = find_trace_files(args.profile_dir, args.profile_prefix)
     trace_summaries = [summarize_trace(path) for path in trace_files]
-    validate_trace_summaries(args, trace_summaries)
+    validation_failures = profile_validation_failures(args, trace_summaries)
 
     result = {
         "endpoint": args.endpoint,
@@ -258,6 +266,10 @@ def main(argv: list[str] | None = None) -> None:
         "request_results": request_results,
         "trace_files": [str(path) for path in trace_files],
         "trace_summaries": trace_summaries,
+        "profile_validation": {
+            "passed": not validation_failures,
+            "failures": validation_failures,
+        },
         "server_checks": server_checks,
         "server_info": server_info,
         "indexcache_profile_env": (
@@ -273,6 +285,8 @@ def main(argv: list[str] | None = None) -> None:
     }
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
+    if validation_failures:
+        raise RuntimeError("; ".join(validation_failures))
 
 
 if __name__ == "__main__":
