@@ -363,8 +363,6 @@ class SingleForwardManager:
         return True
 
 
-
-
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
     return tag in (
         CanaryLaunchTag.HEAD_K_FULL,
