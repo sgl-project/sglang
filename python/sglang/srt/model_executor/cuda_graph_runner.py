@@ -68,6 +68,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
+from sglang.srt.models.deepseek_v4_index_cache import (
+    index_cache_config_has_context_gate,
+    index_cache_graph_gate_value,
+    set_index_cache_capture_gate,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -542,6 +547,8 @@ class CudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        self.index_cache_capture_enabled = None
+        self.index_cache_replay_enabled = None
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -728,6 +735,10 @@ class CudaGraphRunner:
         graph_key = cuda_graph_bs
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
+        graph_key = self._index_cache_graph_key(
+            graph_key,
+            self._index_cache_graph_gate_value(forward_batch),
+        )
 
         is_bs_supported = (
             graph_key in self.graphs
@@ -790,7 +801,7 @@ class CudaGraphRunner:
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -806,10 +817,6 @@ class CudaGraphRunner:
         logger.info(log_message)
 
     def capture(self) -> None:
-        profile_context = empty_context()
-        if self.enable_profile_cuda_graph:
-            profile_context = self._init_profile_context_and_memory_record()
-
         def _capture_one_stream(stream_idx: Optional[int] = None):
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
@@ -845,29 +852,59 @@ class CudaGraphRunner:
                     ) = self.capture_one_batch_size(bs, forward, stream_idx)
                     # For pd_multiplexing, we need to save the graph and output buffers
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                    key = self._index_cache_graph_key(
+                        key,
+                        self.index_cache_capture_enabled,
+                    )
                     self.graphs[key] = graph
                     self.output_buffers[key] = output_buffers
 
-        # Trigger CUDA graph capture for specific shapes.
-        # Capture the large shapes first so that the smaller shapes
-        # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    _capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with (
-                        graph_capture(stream=sg[1]) as graph_capture_context,
-                        profile_context as prof,
-                    ):
-                        self.stream = graph_capture_context.stream
-                        _capture_one_stream(i)
+        try:
+            for index_cache_enabled in self._index_cache_capture_variants():
+                profile_context = empty_context()
+                if self.enable_profile_cuda_graph:
+                    profile_context = self._init_profile_context_and_memory_record()
+                self.index_cache_capture_enabled = index_cache_enabled
+                with (
+                    freeze_gc(self.model_runner.server_args.enable_cudagraph_gc),
+                    set_index_cache_capture_gate(index_cache_enabled),
+                ):
+                    if not self.enable_pdmux:
+                        with (
+                            graph_capture() as graph_capture_context,
+                            profile_context as prof,
+                        ):
+                            self.stream = graph_capture_context.stream
+                            _capture_one_stream()
+                    else:
+                        set_pdmux_status(False)
+                        for i, sg in enumerate(self.stream_groups):
+                            with (
+                                graph_capture(stream=sg[1]) as graph_capture_context,
+                                profile_context as prof,
+                            ):
+                                self.stream = graph_capture_context.stream
+                                _capture_one_stream(i)
+                if self.enable_profile_cuda_graph:
+                    self._post_process_after_profile(prof)
+        finally:
+            self.index_cache_capture_enabled = None
 
-        if self.enable_profile_cuda_graph:
-            self._post_process_after_profile(prof)
+    def _index_cache_capture_variants(self):
+        if index_cache_config_has_context_gate(self.model_runner.model_config.hf_config):
+            return (False, True)
+        return (None,)
+
+    def _index_cache_graph_gate_value(self, forward_batch: ForwardBatch):
+        return index_cache_graph_gate_value(
+            self.model_runner.model_config.hf_config,
+            forward_batch.seq_lens_cpu,
+        )
+
+    def _index_cache_graph_key(self, graph_key, index_cache_enabled):
+        if index_cache_enabled is None:
+            return graph_key
+        return f"{graph_key}_indexcache_{int(index_cache_enabled)}"
 
     def _capture_graph(self, graph, pool, stream, run_once_fn):
         if self.model_runner.server_args.debug_cuda_graph:
@@ -1248,6 +1285,9 @@ class CudaGraphRunner:
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.index_cache_replay_enabled = self._index_cache_graph_gate_value(
+            forward_batch
+        )
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1263,6 +1303,9 @@ class CudaGraphRunner:
         if not skip_attn_backend_init:
             self.replay_prepare(forward_batch, pp_proxy_tensors)
         else:
+            self.index_cache_replay_enabled = self._index_cache_graph_gate_value(
+                forward_batch
+            )
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
@@ -1280,6 +1323,10 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
+        graph_key = self._index_cache_graph_key(
+            graph_key,
+            self.index_cache_replay_enabled,
+        )
         ctx = (
             self.model_runner.device_timer.wrap(
                 metadata={

@@ -91,6 +91,7 @@ from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is
 from sglang.srt.models.deepseek_v4_index_cache import (
     DSV4IndexCache,
     assign_index_cache_to_metadata,
+    get_index_cache_capture_gate,
     get_index_cache_policy,
     index_cache_enabled_for_seq_lens,
     make_index_cache_from_metadata,
@@ -711,7 +712,8 @@ class MQALayer(nn.Module):
         if self.index_topk_min_seq_len <= 0:
             return True
         if get_is_capture_mode():
-            return True
+            capture_gate = get_index_cache_capture_gate()
+            return True if capture_gate is None else capture_gate
         seq_lens = forward_batch.seq_lens_cpu
         if seq_lens is None:
             seq_lens = forward_batch.seq_lens

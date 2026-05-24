@@ -1,7 +1,11 @@
+import contextlib
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
+
+
+_index_cache_capture_gate: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -104,21 +108,55 @@ def index_cache_enabled_for_seq_lens(
     return int(seq_lens.max().item()) * compress_ratio >= min_seq_len
 
 
+def index_cache_config_has_context_gate(config) -> bool:
+    min_seq_len = getattr(config, "index_topk_min_seq_len", 0)
+    if min_seq_len <= 0:
+        return False
+    return (
+        getattr(config, "index_topk_pattern", None) is not None
+        or getattr(config, "index_topk_freq", 1) > 1
+    )
+
+
+def index_cache_graph_gate_value(
+    config,
+    seq_lens_cpu: Optional[torch.Tensor],
+    compress_ratio: int = 4,
+) -> Optional[bool]:
+    if not index_cache_config_has_context_gate(config):
+        return None
+    if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        return False
+    return index_cache_enabled_for_seq_lens(
+        seq_lens_cpu,
+        getattr(config, "index_topk_min_seq_len", 0),
+        compress_ratio,
+    )
+
+
 def should_disable_cuda_graph_for_index_cache_gate(
     config,
     seq_lens_cpu: Optional[torch.Tensor],
 ) -> bool:
-    min_seq_len = getattr(config, "index_topk_min_seq_len", 0)
-    if min_seq_len <= 0:
+    gate_value = index_cache_graph_gate_value(config, seq_lens_cpu)
+    if gate_value is None:
         return False
-    if (
-        getattr(config, "index_topk_pattern", None) is None
-        and getattr(config, "index_topk_freq", 1) <= 1
-    ):
-        return False
-    if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
-        return True
-    return int(seq_lens_cpu.max().item()) * 4 < min_seq_len
+    return not gate_value
+
+
+def get_index_cache_capture_gate() -> Optional[bool]:
+    return _index_cache_capture_gate
+
+
+@contextlib.contextmanager
+def set_index_cache_capture_gate(enabled: Optional[bool]):
+    global _index_cache_capture_gate
+    prev = _index_cache_capture_gate
+    _index_cache_capture_gate = enabled
+    try:
+        yield
+    finally:
+        _index_cache_capture_gate = prev
 
 
 def get_c4_layer_ids(config) -> list[int]:

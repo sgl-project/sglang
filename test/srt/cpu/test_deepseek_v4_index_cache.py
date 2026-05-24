@@ -205,6 +205,52 @@ def test_dsv4_index_cache_graph_gate_disables_short_context_graphs():
     )
 
 
+def test_dsv4_index_cache_graph_gate_returns_capture_variant():
+    config = SimpleNamespace(
+        index_topk_freq=2,
+        index_topk_pattern=None,
+        index_topk_min_seq_len=75000,
+    )
+
+    assert (
+        index_cache.index_cache_graph_gate_value(
+            config,
+            torch.tensor([12000], dtype=torch.int32),
+        )
+        is False
+    )
+    assert (
+        index_cache.index_cache_graph_gate_value(
+            config,
+            torch.tensor([20000], dtype=torch.int32),
+        )
+        is True
+    )
+
+
+def test_dsv4_index_cache_graph_gate_is_inactive_without_context_gate():
+    config = SimpleNamespace(
+        index_topk_freq=1,
+        index_topk_pattern=None,
+        index_topk_min_seq_len=75000,
+    )
+
+    assert index_cache.index_cache_graph_gate_value(
+        config,
+        torch.tensor([12000], dtype=torch.int32),
+    ) is None
+
+
+def test_dsv4_index_cache_capture_gate_restores_previous_value():
+    assert index_cache.get_index_cache_capture_gate() is None
+    with index_cache.set_index_cache_capture_gate(False):
+        assert index_cache.get_index_cache_capture_gate() is False
+        with index_cache.set_index_cache_capture_gate(True):
+            assert index_cache.get_index_cache_capture_gate() is True
+        assert index_cache.get_index_cache_capture_gate() is False
+    assert index_cache.get_index_cache_capture_gate() is None
+
+
 def test_dsv4_index_cache_graph_gate_ignores_disabled_indexcache():
     config = SimpleNamespace(
         index_topk_freq=1,

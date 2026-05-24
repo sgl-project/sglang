@@ -3266,11 +3266,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.graph_runner
                 and self.graph_runner.can_run(forward_batch)
             )
-            if can_run_graph and should_disable_cuda_graph_for_index_cache_gate(
-                self.model_config.hf_config,
-                forward_batch.seq_lens_cpu,
-            ):
-                can_run_graph = False
             graph_mode = (
                 "decode"
                 if forward_batch.forward_mode.is_decode()
