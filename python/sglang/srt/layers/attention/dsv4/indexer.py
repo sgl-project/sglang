@@ -423,7 +423,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
             topk_transform_512_v2(
                 logits,
                 indexer_metadata.c4_seq_lens,
@@ -431,6 +431,7 @@ class C4IndexerBackendMixin:
                 core_metadata.c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 indexer_metadata.topk_metadata,
+                raw_indices,
             )
         else:
             topk_transform_512(
