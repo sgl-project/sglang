@@ -5,10 +5,6 @@ Tests:
   1. Stability (bs=8):  streaming only, assert tail_avg / head_avg <= 1.3
   2. Correctness (bs=1): regular vs streaming, assert output equal
   3. Random lengths (bs=8): streaming only, random input/output lens, no crash
-
-Usage:
-    python -m pytest test_session_latency.py -s
-    python -m unittest test_session_latency.BenchSessionLatency
 """
 
 import random
@@ -66,8 +62,6 @@ class TurnResult:
     turn: int
     context_len: int
     cached_tokens: int
-    prompt_tokens: int
-    completion_tokens: int
     client_latency_ms: float
     e2e_latency_ms: float
 
@@ -77,11 +71,6 @@ class ModeResult:
     mode: str
     turns: List[TurnResult] = field(default_factory=list)
     outputs: List[str] = field(default_factory=list)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 
 def _generate_input_chunks(
@@ -150,16 +139,9 @@ def _record_turn(
         turn=turn_idx + 1,
         context_len=context_len,
         cached_tokens=meta["cached_tokens"],
-        prompt_tokens=meta["prompt_tokens"],
-        completion_tokens=meta["completion_tokens"],
         client_latency_ms=client_latency_ms,
         e2e_latency_ms=meta.get("e2e_latency", 0) * 1000,
     )
-
-
-# ---------------------------------------------------------------------------
-# Single-session runner (called by worker threads)
-# ---------------------------------------------------------------------------
 
 
 def _run_one_session(
@@ -216,11 +198,6 @@ def _run_one_session(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Stats & reporting
-# ---------------------------------------------------------------------------
-
-
 def _collect_latencies(
     results: List[ModeResult],
     last_n: Optional[int] = None,
@@ -275,11 +252,6 @@ def _print_mode_table(result: ModeResult, label: str = ""):
             colalign=("right",) * 5,
         )
     )
-
-
-# ---------------------------------------------------------------------------
-# Test class
-# ---------------------------------------------------------------------------
 
 
 class TestSessionLatency(CustomTestCase):
@@ -356,18 +328,9 @@ class TestSessionLatency(CustomTestCase):
         with ThreadPoolExecutor(max_workers=num_concurrent) as pool:
             return list(pool.map(run_one, range(num_concurrent)))
 
-    # ------------------------------------------------------------------
-    # Test methods
-    # ------------------------------------------------------------------
-
     def test_streaming_session(self):
-        """Latency stability: bs=8, assert streaming tail_avg / head_avg <= 1.3.
-
-        Streaming session reuses the prior KV state across turns, so per-turn
-        latency should stay roughly flat as context grows. We assert the tail
-        average (last TAIL_TURNS) is within 1.3x of the head average (first
-        HEAD_TURNS after skipping turn 1's prefill).
-        """
+        """Stability: streaming reuses KV across turns, so tail/head latency
+        should stay flat. Skip turn 1 (prefill) when computing head."""
         results = self._run_concurrent_session(streaming=True)
         _print_mode_table(results[0], label="session 0")
 
