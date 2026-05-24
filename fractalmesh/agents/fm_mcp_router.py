@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     71,
+        "agents":     76,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -185,6 +185,11 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "docker":            7823,
             "crawlbase":         7824,
             "bugcrowd":          7825,
+            "osintaas":          7826,
+            "leadgen":           7827,
+            "nft_engine":        7828,
+            "data_api":          7829,
+            "aiaas":             7830,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -369,6 +374,36 @@ def _handle_bugcrowd(args, kwargs) -> dict:
     op      = kwargs.get("op", args[0] if args else "programs")
     return {"action": "bugcrowd_queued", "op": op}
 
+def _handle_osintaas(args, kwargs) -> dict:
+    scan_type = kwargs.get("scan_type", args[0] if args else "person")
+    target    = kwargs.get("target", kwargs.get("domain", kwargs.get("username", "")))
+    depth     = kwargs.get("depth", "standard")
+    return {"action": "osint_scan_queued", "scan_type": scan_type, "target": target, "depth": depth}
+
+def _handle_leadgen(args, kwargs) -> dict:
+    op       = kwargs.get("op", args[0] if args else "campaign_run")
+    industry = kwargs.get("industry", "")
+    location = kwargs.get("location", "")
+    return {"action": "leadgen_queued", "op": op, "industry": industry, "location": location}
+
+def _handle_nft_engine(args, kwargs) -> dict:
+    op         = kwargs.get("op", args[0] if args else "generate_image")
+    prompt     = kwargs.get("prompt", "fractal mesh")
+    collection = kwargs.get("collection_id", 0)
+    return {"action": "nft_engine_queued", "op": op, "prompt": prompt, "collection_id": collection}
+
+def _handle_data_api(args, kwargs) -> dict:
+    dataset = kwargs.get("dataset", args[0] if args else "leads")
+    filters = kwargs.get("filters", {})
+    fmt     = kwargs.get("format", "json")
+    return {"action": "data_api_queued", "dataset": dataset, "filters": filters, "format": fmt}
+
+def _handle_aiaas(args, kwargs) -> dict:
+    endpoint = kwargs.get("endpoint", args[0] if args else "chat")
+    model    = kwargs.get("model", "claude-3-5-haiku")
+    prompt   = kwargs.get("prompt", kwargs.get("content", ""))
+    return {"action": "aiaas_queued", "endpoint": endpoint, "model": model, "prompt": prompt}
+
 _INTENTS = {
     # ── core ──────────────────────────────────────────────────────────────────
     "sync_samsung_calendar":   _handle_sync_calendar,
@@ -425,6 +460,12 @@ _INTENTS = {
     "docker_op":               _handle_docker,
     "crawlbase_scrape":        _handle_crawlbase,
     "bugcrowd_op":             _handle_bugcrowd,
+    # ── monetisation pipeline ─────────────────────────────────────────────────
+    "osint_scan":              _handle_osintaas,
+    "leadgen":                 _handle_leadgen,
+    "nft_mint":                _handle_nft_engine,
+    "data_query":              _handle_data_api,
+    "ai_infer":                _handle_aiaas,
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
