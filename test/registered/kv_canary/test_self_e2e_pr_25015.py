@@ -95,15 +95,14 @@ class _EaglePositionsBase(CanaryE2EBase):
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
     """Revert PR #25015 fix and expect canary to fire a position-mismatch violation.
 
-    KNOWN-RED: under token_oracle sampling, the eagle draft's per-step
-    position perturbation does not propagate to a canary-visible signal —
-    sampled tokens come from the oracle regardless of model output, drafts
-    always verify-accept, and the draft slot's stored_position never enters
-    a per-forward verify scope that would compare it to the expected logical
-    position. Fixing needs either a canary signal that runs at write time on
-    the draft path (input_check has warmup compat issues with real models)
-    or a sampling backend that surfaces the perturbed model output. Tracked
-    in note 2026-05-24-eagle-pr-25015-chain-hash-blocker.md.
+    Caught at write-time by the kernel's init-gated geometric write_position
+    assert (canary_write.cuh): single-entry decode writes must satisfy
+    ``position == seed.position + 1 + entry_offset``. Eagle DRAFT under the
+    reverted PR perturbs position by +1, breaking that arithmetic and firing
+    ``fail_reason = position``. The assert is gated on
+    ``CanaryDeviceState.runtime_assert_enable`` (flipped from 0 to 1 in
+    ``CanaryManager.mark_init_finished()``) so warmup / cuda-graph capture
+    paths — whose seed slots may hold synthetic positions — don't misfire.
     """
 
     __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
