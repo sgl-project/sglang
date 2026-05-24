@@ -111,6 +111,8 @@ def eval_cmd(args) -> list[str]:
         "reasoning",
         "--num-threads",
         str(args.eval_num_threads),
+        "--repeats",
+        str(args.eval_repeats),
         "--max-tokens",
         str(args.eval_max_tokens),
         "--min-context-length",
@@ -188,6 +190,7 @@ def main() -> None:
     parser.add_argument("--profile-max-tokens", type=int, default=256)
     parser.add_argument("--min-indexcache-prompt-tokens", type=int, default=75000)
     parser.add_argument("--eval-num-threads", type=int, default=64)
+    parser.add_argument("--eval-repeats", type=int, default=3)
     parser.add_argument("--eval-max-tokens", type=int, default=32768)
     parser.add_argument("--eval-min-context-length", type=int, default=75000)
     parser.add_argument("--timeout", type=int, default=86400)
@@ -233,6 +236,7 @@ def main() -> None:
             "profile_prompt_tokens": args.profile_prompt_tokens,
             "eval_min_context_length": args.eval_min_context_length,
         },
+        "quality_eval_repeats": args.eval_repeats,
         "phases": results,
     }
     (args.output_dir / "validation_summary.json").write_text(

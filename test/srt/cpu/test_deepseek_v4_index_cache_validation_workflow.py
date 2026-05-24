@@ -42,6 +42,7 @@ def _args(tmp_path: Path) -> Namespace:
         profile_max_tokens=256,
         min_indexcache_prompt_tokens=75000,
         eval_num_threads=64,
+        eval_repeats=3,
         eval_max_tokens=32768,
         eval_min_context_length=75000,
         output_dir=tmp_path / "out",
@@ -73,6 +74,8 @@ def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp
     assert "searched_1_4=http://searched-quarter" in cmd
     assert "long-context" in cmd
     assert "reasoning" in cmd
+    assert "--repeats" in cmd
+    assert "3" in cmd
     assert "--min-context-length" in cmd
     assert "75000" in cmd
     assert "mmlu" not in cmd

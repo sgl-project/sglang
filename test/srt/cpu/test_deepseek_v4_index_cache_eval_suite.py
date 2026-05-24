@@ -53,6 +53,8 @@ def test_dsv4_index_cache_eval_suite_builds_longbench_command():
         dataset_path="/tmp/longbench",
         min_context_length=75000,
         max_context_length=200000,
+        endpoint_label="baseline",
+        repeat_index=1,
     )
     task = eval_suite.TASKS["longbench_v2"]
 
@@ -76,6 +78,8 @@ def test_dsv4_index_cache_eval_suite_dry_run_records_sgl_eval_command(monkeypatc
         num_threads=64,
         out_dir=Path("/tmp/sgl-eval-out"),
         num_examples=None,
+        endpoint_label="searched_1_2",
+        repeat_index=2,
         dry_run=True,
         timeout=7200,
     )
@@ -86,3 +90,21 @@ def test_dsv4_index_cache_eval_suite_dry_run_records_sgl_eval_command(monkeypatc
     assert result["returncode"] == 0
     assert result["cmd"][:3] == ["sgl-eval", "run", "ruler"]
     assert "http://endpoint/v1" in result["cmd"]
+    assert "/tmp/sgl-eval-out/searched_1_2/ruler/repeat_2" in result["cmd"]
+
+
+def test_dsv4_index_cache_eval_suite_rejects_zero_repeats(tmp_path):
+    output = tmp_path / "eval.json"
+
+    with pytest.raises(SystemExit, match="--repeats"):
+        eval_suite.parse_args(
+            [
+                "--endpoint",
+                "baseline=http://endpoint",
+                "--repeats",
+                "0",
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )

@@ -104,6 +104,9 @@ def build_sglang_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
 
 
 def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
+    out_dir = args.out_dir
+    if getattr(args, "endpoint_label", None) and getattr(args, "repeat_index", None):
+        out_dir = out_dir / args.endpoint_label / task.name / f"repeat_{args.repeat_index}"
     cmd = [
         args.sgl_eval_bin,
         "run",
@@ -119,7 +122,7 @@ def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
         "--num-threads",
         str(args.num_threads),
         "--out-dir",
-        str(args.out_dir),
+        str(out_dir),
     ]
     if args.num_examples is not None:
         cmd += ["--num-examples", str(args.num_examples)]
@@ -161,7 +164,7 @@ def run_command(cmd: list[str], timeout: int) -> dict:
     }
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--endpoint",
@@ -173,6 +176,7 @@ def main() -> None:
     parser.add_argument("--suite", action="append", default=[])
     parser.add_argument("--task", action="append", default=[])
     parser.add_argument("--num-examples", type=int)
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--num-threads", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.95)
@@ -185,7 +189,14 @@ def main() -> None:
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be at least 1")
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     tasks = selected_tasks(args.task, args.suite or ["long-context", "reasoning"])
     results = {
@@ -195,12 +206,21 @@ def main() -> None:
     }
 
     for label, base_url in args.endpoint:
-        for task in tasks:
-            result = run_eval_task(task, base_url, args)
-            results["results"].append(
-                {"endpoint": label, "task": task.name, "runner": task.runner, **result}
-            )
-            print(json.dumps(results["results"][-1], default=str), flush=True)
+        for repeat_index in range(args.repeats):
+            args.endpoint_label = label
+            args.repeat_index = repeat_index + 1
+            for task in tasks:
+                result = run_eval_task(task, base_url, args)
+                results["results"].append(
+                    {
+                        "endpoint": label,
+                        "repeat": repeat_index + 1,
+                        "task": task.name,
+                        "runner": task.runner,
+                        **result,
+                    }
+                )
+                print(json.dumps(results["results"][-1], default=str), flush=True)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2, default=str) + "\n")
