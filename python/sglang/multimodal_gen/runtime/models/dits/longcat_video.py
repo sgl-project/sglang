@@ -475,9 +475,7 @@ class MultiHeadCrossAttention(nn.Module):
                 q=q[0],
                 k=k[0],
                 v=v[0],
-                cu_seqlens_q=torch.tensor([0] + [n_tokens] * bsz, device=q.device)
-                .cumsum(0)
-                .to(torch.int32),
+                cu_seqlens_q=torch.arange(0, (bsz + 1) * n_tokens, n_tokens, device=q.device, dtype=torch.int32),
                 cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
                 .cumsum(0)
                 .to(torch.int32),
@@ -492,9 +490,7 @@ class MultiHeadCrossAttention(nn.Module):
                     q=q[0],
                     k=k[0],
                     v=v[0],
-                    cu_seqlens_q=torch.tensor([0] + [n_tokens] * bsz, device=q.device)
-                    .cumsum(0)
-                    .to(torch.int32),
+                    cu_seqlens_q=torch.arange(0, (bsz + 1) * n_tokens, n_tokens, device=q.device, dtype=torch.int32),
                     cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
                     .cumsum(0)
                     .to(torch.int32),
@@ -870,10 +866,8 @@ class LongCatVideoTransformer3DModel(CachableDiT):
             )
 
         if encoder_attention_mask is not None:
-            # encoder_attention_mask is [batch, seq] from longcat_text_postprocess;
-            # the squeeze calls are no-ops on a 2D tensor but retained for shape-safety
-            # in case the mask arrives with extra singleton dims from other code paths.
-            encoder_attention_mask = encoder_attention_mask.squeeze(1).squeeze(1)
+            if encoder_attention_mask.ndim > 2:
+                encoder_attention_mask = encoder_attention_mask.view(encoder_attention_mask.shape[0], -1)
             encoder_hidden_states = (
                 encoder_hidden_states.squeeze(1)
                 .masked_select(encoder_attention_mask.unsqueeze(-1) != 0)
