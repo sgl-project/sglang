@@ -43,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models.deepseek_v4_index_cache import index_cache_config_enabled
 from sglang.srt.models.deepseek_v4_index_cache_profile import profile_region
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
@@ -99,6 +100,7 @@ class DSV4AttnMetadata:
     swa_topk_lengths: torch.Tensor
 
     c4_sparse_topk: int
+    need_c4_sparse_raw_indices: bool = False
     c4_out_loc: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
@@ -134,6 +136,7 @@ class DSV4AttnMetadata:
             dst=self,
             check_eq_fields=[
                 "c4_sparse_topk",
+                "need_c4_sparse_raw_indices",
                 "page_size",
                 "cuda_int32_kwargs",
             ],
@@ -255,7 +258,11 @@ class DSV4AttnMetadata:
             device=self.c4_topk_lengths_clamp1.device,
         )
         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
-        self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
+        self.c4_sparse_raw_indices = (
+            torch.empty_like(self.c4_sparse_page_indices)
+            if self.need_c4_sparse_raw_indices
+            else None
+        )
         self.c1_flashmla_metadata = _create_flashmla_metadata()
         self.c4_flashmla_metadata = _create_flashmla_metadata()
         self.c128_flashmla_metadata = _create_flashmla_metadata()
@@ -361,6 +368,10 @@ class DeepseekV4HipRadixBackend(
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+        )
+        self.need_c4_sparse_raw_indices = (
+            index_cache_config_enabled(model_runner.model_config.hf_config)
+            or model_runner.server_args.enable_return_indexer_topk
         )
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
@@ -1152,6 +1163,7 @@ class DeepseekV4HipRadixBackend(
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
             c4_sparse_topk=self.c4_topk,
+            need_c4_sparse_raw_indices=self.need_c4_sparse_raw_indices,
         )
 
         if need_compress:

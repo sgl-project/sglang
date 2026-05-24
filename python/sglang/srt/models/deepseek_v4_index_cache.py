@@ -112,6 +112,10 @@ def index_cache_config_has_context_gate(config) -> bool:
     min_seq_len = getattr(config, "index_topk_min_seq_len", 0)
     if min_seq_len <= 0:
         return False
+    return index_cache_config_enabled(config)
+
+
+def index_cache_config_enabled(config) -> bool:
     return (
         getattr(config, "index_topk_pattern", None) is not None
         or getattr(config, "index_topk_freq", 1) > 1

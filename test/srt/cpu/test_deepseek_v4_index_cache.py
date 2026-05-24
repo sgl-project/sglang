@@ -237,6 +237,18 @@ def test_dsv4_index_cache_graph_gate_is_inactive_without_context_gate():
     )
 
 
+def test_dsv4_index_cache_config_enabled_ignores_context_floor():
+    assert index_cache.index_cache_config_enabled(
+        SimpleNamespace(index_topk_freq=2, index_topk_pattern=None)
+    )
+    assert index_cache.index_cache_config_enabled(
+        SimpleNamespace(index_topk_freq=1, index_topk_pattern="FSF")
+    )
+    assert not index_cache.index_cache_config_enabled(
+        SimpleNamespace(index_topk_freq=1, index_topk_pattern=None)
+    )
+
+
 def test_dsv4_index_cache_capture_gate_restores_previous_value():
     assert index_cache.get_index_cache_capture_gate() is None
     with index_cache.set_index_cache_capture_gate(False):
