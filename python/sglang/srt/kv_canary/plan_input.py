@@ -102,14 +102,20 @@ def _extract_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
-        # Use ``forward_batch.positions`` directly (one entry per req for decode-shape) instead of
-        # deriving the prefix from ``seq_lens - 1``. Reason: ``seq_lens`` convention is path-dependent
-        # — regular decode bumps it pre-forward (so seq_lens - 1 = write_position), but the eagle
-        # draft path leaves seq_lens pre-bump (so seq_lens - 1 = write_position - 1, one slot behind
-        # the actual chain predecessor). ``positions[entry]`` is always the canonical write position
-        # regardless of mode, so anchoring prefix_lens on it makes the canary's seed selection
-        # convention-agnostic.
-        out_prefix_lens.copy_(forward_batch.positions[:bs].to(torch.int64))
+        # Anchor prefix_lens on ``forward_batch.positions`` (one entry per active decode token)
+        # instead of ``seq_lens - 1``. Reason: ``seq_lens`` convention is path-dependent — regular
+        # decode bumps it pre-forward (so seq_lens - 1 = write_position), but the eagle draft path
+        # leaves seq_lens pre-bump (so seq_lens - 1 = write_position - 1, one slot behind the actual
+        # chain predecessor). ``positions[entry]`` is always the canonical write position regardless
+        # of mode. Positions can be shorter than ``bs`` when the batch is padded (cuda-graph capture
+        # with idle slots): seed the tail with the ``seq_lens - 1`` fallback so plan-kernel padding
+        # filters apply, then overlay the active prefix with positions.
+        seq_lens_i64 = forward_batch.seq_lens[:bs].to(torch.int64)
+        out_prefix_lens.copy_((seq_lens_i64 - 1).clamp(min=0))
+        positions = forward_batch.positions
+        if positions.shape[0] > 0:
+            num_real = min(positions.shape[0], bs)
+            out_prefix_lens[:num_real].copy_(positions[:num_real].to(torch.int64))
         out_extend_seq_lens.fill_(1)
     elif forward_mode.is_target_verify():
         # Evidence: EagleVerifyInputV2Mixin.prepare_for_v2_verify assigns out_cache_loc in
