@@ -592,4 +592,7 @@ if __name__ == "__main__":
         env = MUSAEnv()
     elif is_mps():
         env = MPSEnv()
+    else:
+        print("No supported device platform detected (CUDA, ROCm, NPU, MUSA, MPS).")
+        sys.exit(1)
     env.check_env()
