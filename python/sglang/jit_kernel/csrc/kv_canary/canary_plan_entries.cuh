@@ -21,6 +21,7 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
+#include <cassert>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -89,17 +90,16 @@ __global__ void plan_entries_persistent_kernel(
 
   // Honor the offsets kernel's disable signal: when total_verify exceeded verify_capacity on the
   // previous step (overflow), the offsets kernel clears verify_enable to 0; the verify kernel will
-  // skip this step entirely, so scattering anything is wasted work. Early-exit here makes that
-  // explicit instead of relying on the clamp-and-throw-away pattern.
+  // skip this step entirely, so scattering anything is wasted work.
   if (*params.verify_enable == 0) {
     return;
   }
 
-  // Defensive clamp on the scatter range. If the verify_enable flag did not make it through (e.g.
-  // upstream bug, in-flight reorder), the scatter must still NOT overflow out_verify_*[verify_capacity]
-  // or it corrupts adjacent device memory and crashes later kernels with non-canary symptoms
-  // (e.g. CUBLAS_STATUS_EXECUTION_FAILED). Belt-and-suspenders with the early-exit above.
-  const int64_t scatter_total = total_verify < params.verify_capacity ? total_verify : params.verify_capacity;
+  // Contract: offsets kernel sets verify_enable=0 iff total_verify > verify_capacity, so reaching
+  // here means total_verify <= verify_capacity. Assert the invariant — silent OOB scatter into
+  // out_verify_*[verify_capacity] would corrupt adjacent device memory and surface much later as
+  // a non-canary failure (e.g. CUBLAS_STATUS_EXECUTION_FAILED in a downstream kernel).
+  assert(total_verify <= params.verify_capacity);
 
   const int64_t tid_start = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
@@ -107,7 +107,7 @@ __global__ void plan_entries_persistent_kernel(
   const int32_t swa_window = params.swa_window_size;
   const int64_t req_to_token_stride0 = params.req_to_token_stride0;
 
-  for (int64_t tid = tid_start; tid < scatter_total; tid += stride) {
+  for (int64_t tid = tid_start; tid < total_verify; tid += stride) {
     // 1) Find the owning req via binary search over verify_offsets.
     const int32_t req_id = find_req_id(params.verify_offsets_scratch, params.bs_padded, tid);
     const int64_t req_start = params.verify_offsets_scratch[req_id];
