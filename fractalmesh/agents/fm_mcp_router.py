@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     54,
+        "agents":     55,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -168,6 +168,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "rag_pipeline":      7806,
             "scraper_v2":        7807,
             "minimax":           7808,
+            "base44":            7809,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -272,6 +273,12 @@ def _handle_admin_broadcast(args, kwargs) -> dict:
     intent = kwargs.get("intent", ""); sub_kwargs = kwargs.get("kwargs", {})
     return {"action": "admin_broadcast_queued", "intent": intent, "kwargs": sub_kwargs}
 
+def _handle_base44_op(args, kwargs) -> dict:
+    op      = kwargs.get("op", args[0] if args else "list_apps")
+    app_id  = kwargs.get("app_id", "")
+    payload = kwargs.get("payload", {})
+    return {"action": "base44_op_queued", "op": op, "app_id": app_id, "payload_keys": list(payload.keys())}
+
 _INTENTS = {
     # ── core ──────────────────────────────────────────────────────────────────
     "sync_samsung_calendar":   _handle_sync_calendar,
@@ -305,6 +312,8 @@ _INTENTS = {
     "firebase_sync":           _handle_firebase_sync,
     "admin_broadcast":         _handle_admin_broadcast,
     "generate_content":        _handle_generate_content,
+    # ── base44 no-code app builder ────────────────────────────────────────────
+    "base44_op":               _handle_base44_op,
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

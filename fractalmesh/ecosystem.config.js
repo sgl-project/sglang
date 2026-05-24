@@ -1117,6 +1117,7 @@ module.exports = {
         // ── APEX OMNI-MATRIX EXTENDED SWARM ──────────────────────────
 
         ...[
+            ['fm-base44',         'fm_base44',         '30M'],
             ['fm-dork-engine',    'fm_dork_engine',    '80M'],
             ['fm-contract-forge', 'fm_contract_forge', '80M'],
             ['fm-wigle-oracle',   'fm_wigle_oracle',   '80M'],
