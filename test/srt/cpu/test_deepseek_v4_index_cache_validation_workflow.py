@@ -46,6 +46,7 @@ def _args(tmp_path: Path) -> Namespace:
         eval_repeats=3,
         eval_max_tokens=32768,
         eval_min_context_length=75000,
+        require_eval_metrics=True,
         output_dir=tmp_path / "out",
         dry_run=False,
         eagle_off_confirmed=True,
@@ -79,6 +80,7 @@ def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp
     assert "3" in cmd
     assert "--min-context-length" in cmd
     assert "75000" in cmd
+    assert "--require-metrics" in cmd
     assert "mmlu" not in cmd
     assert "gsm8k" not in cmd
 

@@ -120,6 +120,8 @@ def eval_cmd(args) -> list[str]:
         "--output",
         str(args.output_dir / "quality_eval.json"),
     ]
+    if args.require_eval_metrics:
+        cmd.append("--require-metrics")
     for label, endpoint in quality_eval_endpoints(args):
         cmd += ["--endpoint", f"{label}={endpoint}"]
     return cmd
@@ -193,6 +195,11 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--eval-repeats", type=int, default=3)
     parser.add_argument("--eval-max-tokens", type=int, default=32768)
     parser.add_argument("--eval-min-context-length", type=int, default=75000)
+    parser.add_argument(
+        "--require-eval-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--timeout", type=int, default=86400)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")

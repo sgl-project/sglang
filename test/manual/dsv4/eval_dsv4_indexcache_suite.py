@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +22,15 @@ from indexcache_base_path import (
 )
 
 FORBIDDEN_TASKS = {"mmlu", "gsm8k"}
+PRIMARY_METRIC_KEYS = (
+    "score",
+    "accuracy",
+    "overall",
+    "average",
+    "pass_at_1",
+    "exact_match",
+    "f1",
+)
 
 
 @dataclass(frozen=True)
@@ -113,11 +124,7 @@ def build_sglang_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
 
 
 def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
-    out_dir = args.out_dir
-    if getattr(args, "endpoint_label", None) and getattr(args, "repeat_index", None):
-        out_dir = (
-            out_dir / args.endpoint_label / task.name / f"repeat_{args.repeat_index}"
-        )
+    out_dir = sgl_eval_out_dir(task, args)
     cmd = [
         args.sgl_eval_bin,
         "run",
@@ -138,6 +145,15 @@ def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
     if args.num_examples is not None:
         cmd += ["--num-examples", str(args.num_examples)]
     return cmd
+
+
+def sgl_eval_out_dir(task: EvalTask, args) -> Path:
+    out_dir = args.out_dir
+    if getattr(args, "endpoint_label", None) and getattr(args, "repeat_index", None):
+        out_dir = (
+            out_dir / args.endpoint_label / task.name / f"repeat_{args.repeat_index}"
+        )
+    return out_dir
 
 
 def build_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
@@ -161,10 +177,27 @@ def validate_endpoint_for_base_path(label: str, base_url: str, timeout: int) -> 
 def run_eval_task(task: EvalTask, base_url: str, args) -> dict:
     cmd = build_eval_cmd(task, base_url, args)
     if args.dry_run:
-        return {"cmd": cmd, "returncode": 0, "elapsed_sec": 0, "output": ""}
+        return {
+            "cmd": cmd,
+            "returncode": 0,
+            "elapsed_sec": 0,
+            "output": "",
+            "metrics": {},
+            "primary_metric": None,
+        }
     if task.runner == "sgl-eval" and shutil.which(args.sgl_eval_bin) is None:
         raise RuntimeError(f"{args.sgl_eval_bin!r} not found on PATH")
-    return run_command(cmd, args.timeout)
+    result = run_command(cmd, args.timeout)
+    out_dir = sgl_eval_out_dir(task, args) if task.runner == "sgl-eval" else None
+    metrics = extract_metrics(result["output"], out_dir)
+    result["metrics"] = metrics
+    result["primary_metric"] = choose_primary_metric(metrics)
+    if args.require_metrics and result["returncode"] == 0 and not result["metrics"]:
+        raise RuntimeError(
+            f"{task.name} completed but no parseable metrics were found in stdout"
+            + (f" or {out_dir}" if out_dir else "")
+        )
+    return result
 
 
 def run_command(cmd: list[str], timeout: int) -> dict:
@@ -183,6 +216,119 @@ def run_command(cmd: list[str], timeout: int) -> dict:
         "elapsed_sec": elapsed,
         "output": proc.stdout,
     }
+
+
+def metric_candidates_from_text(output: str) -> list[dict]:
+    candidates = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        candidates.extend(metric_candidates_from_object(parse_object(stripped)))
+        match = re.search(r"metrics=(\{.*\})(?:\s+score=|\s*$)", stripped)
+        if match:
+            candidates.extend(
+                metric_candidates_from_object(parse_object(match.group(1), python=True))
+            )
+    return candidates
+
+
+def metric_candidates_from_files(out_dir: Path | None) -> list[dict]:
+    if out_dir is None or not out_dir.exists():
+        return []
+    candidates = []
+    for path in sorted(out_dir.rglob("*.json")):
+        try:
+            candidates.extend(metric_candidates_from_object(json.loads(path.read_text())))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return candidates
+
+
+def parse_object(value: str, python: bool = False):
+    try:
+        return ast.literal_eval(value) if python else json.loads(value)
+    except (SyntaxError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def metric_candidates_from_object(value) -> list[dict]:
+    if isinstance(value, dict):
+        candidates = []
+        metrics = value.get("metrics")
+        if isinstance(metrics, dict):
+            candidates.append(flatten_numeric_metrics(metrics))
+        own_metrics = flatten_numeric_metrics(value)
+        if own_metrics:
+            candidates.append(own_metrics)
+        for item in value.values():
+            candidates.extend(metric_candidates_from_object(item))
+        return candidates
+    if isinstance(value, list):
+        candidates = []
+        for item in value:
+            candidates.extend(metric_candidates_from_object(item))
+        return candidates
+    return []
+
+
+def flatten_numeric_metrics(value: dict, prefix: str = "") -> dict:
+    metrics = {}
+    for key, item in value.items():
+        if isinstance(item, bool):
+            continue
+        name = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(item, (int, float)):
+            metrics[name] = float(item)
+        elif isinstance(item, dict):
+            metrics.update(flatten_numeric_metrics(item, name))
+    return metrics
+
+
+def extract_metrics(output: str, out_dir: Path | None = None) -> dict:
+    candidates = metric_candidates_from_text(output)
+    candidates.extend(metric_candidates_from_files(out_dir))
+    merged = {}
+    for candidate in candidates:
+        merged.update(candidate)
+    return merged
+
+
+def choose_primary_metric(metrics: dict) -> dict | None:
+    for key in PRIMARY_METRIC_KEYS:
+        if key in metrics:
+            return {"name": key, "value": metrics[key]}
+    for key in sorted(metrics):
+        suffix = key.rsplit(".", maxsplit=1)[-1]
+        if suffix in PRIMARY_METRIC_KEYS:
+            return {"name": key, "value": metrics[key]}
+    if metrics:
+        key = sorted(metrics)[0]
+        return {"name": key, "value": metrics[key]}
+    return None
+
+
+def summarize_primary_metrics(rows: list[dict]) -> dict:
+    grouped: dict[str, dict[str, list[float]]] = {}
+    for row in rows:
+        primary_metric = row.get("primary_metric")
+        if not primary_metric:
+            continue
+        key = f"{row['endpoint']}::{row['task']}::{primary_metric['name']}"
+        grouped.setdefault(key, {"values": []})["values"].append(primary_metric["value"])
+
+    summary = {}
+    for key, data in grouped.items():
+        endpoint, task, metric = key.split("::", maxsplit=2)
+        values = data["values"]
+        summary.setdefault(endpoint, {})[task] = {
+            "metric": metric,
+            "mean": sum(values) / len(values),
+            "min": min(values),
+            "max": max(values),
+            "n": len(values),
+        }
+    return summary
 
 
 def parse_args(argv: list[str] | None = None):
@@ -209,6 +355,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--out-dir", type=Path, default=Path("/tmp/sgl-eval-out"))
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-metrics", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.repeats < 1:
@@ -226,6 +373,7 @@ def main(argv: list[str] | None = None) -> None:
         "endpoints": [label for label, _ in args.endpoint],
         "server_checks": {},
         "results": [],
+        "primary_metric_summary": {},
     }
 
     for label, base_url in args.endpoint:
@@ -258,6 +406,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
                 print(json.dumps(results["results"][-1], default=str), flush=True)
 
+    results["primary_metric_summary"] = summarize_primary_metrics(results["results"])
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2, default=str) + "\n")
 

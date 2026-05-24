@@ -83,12 +83,15 @@ def test_dsv4_index_cache_eval_suite_dry_run_records_sgl_eval_command(monkeypatc
         repeat_index=2,
         dry_run=True,
         timeout=7200,
+        require_metrics=False,
     )
     task = eval_suite.TASKS["ruler"]
 
     result = eval_suite.run_eval_task(task, "http://endpoint", args)
 
     assert result["returncode"] == 0
+    assert result["metrics"] == {}
+    assert result["primary_metric"] is None
     assert result["cmd"][:3] == ["sgl-eval", "run", "ruler"]
     assert "http://endpoint/v1" in result["cmd"]
     assert "/tmp/sgl-eval-out/searched_1_2/ruler/repeat_2" in result["cmd"]
@@ -174,3 +177,61 @@ def test_dsv4_index_cache_eval_suite_dry_run_writes_server_checks(tmp_path):
         ("searched_1_4", 2),
     ]
     assert {row["task"] for row in result["results"]} == {"ruler"}
+    assert result["primary_metric_summary"] == {}
+
+
+def test_dsv4_index_cache_eval_suite_extracts_stdout_metrics():
+    metrics = eval_suite.extract_metrics(
+        "{'event': 'ignored'}\n"
+        "==========================================\n"
+        "model - metrics={'score': 0.82, 'latency': 12.5} score=0.82\n"
+    )
+
+    assert metrics["score"] == 0.82
+    assert metrics["latency"] == 12.5
+    assert eval_suite.choose_primary_metric(metrics) == {
+        "name": "score",
+        "value": 0.82,
+    }
+
+
+def test_dsv4_index_cache_eval_suite_extracts_json_file_metrics(tmp_path):
+    out_dir = tmp_path / "eval-out"
+    out_dir.mkdir()
+    (out_dir / "results.json").write_text(
+        json.dumps({"metrics": {"accuracy": 0.71, "details": {"f1": 0.66}}})
+    )
+
+    metrics = eval_suite.extract_metrics("", out_dir)
+
+    assert metrics["accuracy"] == 0.71
+    assert metrics["details.f1"] == 0.66
+
+
+def test_dsv4_index_cache_eval_suite_summarizes_primary_metrics():
+    summary = eval_suite.summarize_primary_metrics(
+        [
+            {
+                "endpoint": "baseline",
+                "task": "ruler",
+                "primary_metric": {"name": "score", "value": 0.8},
+            },
+            {
+                "endpoint": "baseline",
+                "task": "ruler",
+                "primary_metric": {"name": "score", "value": 0.9},
+            },
+            {
+                "endpoint": "searched_1_2",
+                "task": "ruler",
+                "primary_metric": {"name": "score", "value": 0.85},
+            },
+        ]
+    )
+
+    assert summary["baseline"]["ruler"]["metric"] == "score"
+    assert summary["baseline"]["ruler"]["mean"] == pytest.approx(0.85)
+    assert summary["baseline"]["ruler"]["min"] == 0.8
+    assert summary["baseline"]["ruler"]["max"] == 0.9
+    assert summary["baseline"]["ruler"]["n"] == 2
+    assert summary["searched_1_2"]["ruler"]["mean"] == pytest.approx(0.85)
