@@ -154,6 +154,26 @@ def test_dsv4_index_cache_validation_workflow_requires_searched_quarter_endpoint
         workflow.validate_args(args)
 
 
+def test_dsv4_index_cache_validation_workflow_rejects_duplicate_searched_endpoints(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.searched_quarter_endpoint = args.searched_half_endpoint + "/"
+
+    with pytest.raises(SystemExit, match="must be distinct"):
+        workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_requires_pattern_placeholder(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.pattern_command_template = "modal deploy endpoint.py"
+
+    with pytest.raises(SystemExit, match=r"\{pattern\}"):
+        workflow.validate_args(args)
+
+
 def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confirmation(
     tmp_path,
 ):

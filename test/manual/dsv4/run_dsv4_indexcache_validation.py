@@ -79,9 +79,9 @@ def search_cmd(args) -> list[str]:
         "1/4",
         "--output",
         str(args.output_dir / "searched_patterns.json"),
+        "--command-template",
+        args.pattern_command_template,
     ]
-    if args.pattern_command_template:
-        cmd += ["--command-template", args.pattern_command_template]
     if args.calibration_limit > 0:
         cmd += ["--limit", str(args.calibration_limit)]
     return cmd
@@ -141,6 +141,19 @@ def validate_args(args) -> None:
         raise SystemExit(
             "--searched-quarter-endpoint is required for real validation runs; "
             "quality eval must target the searched 1/4 pattern explicitly"
+        )
+    if "{pattern}" not in args.pattern_command_template:
+        raise SystemExit("--pattern-command-template must contain {pattern}")
+    if (
+        not args.dry_run
+        and args.searched_half_endpoint
+        and args.searched_quarter_endpoint
+        and args.searched_half_endpoint.rstrip("/")
+        == args.searched_quarter_endpoint.rstrip("/")
+    ):
+        raise SystemExit(
+            "--searched-half-endpoint and --searched-quarter-endpoint must be "
+            "distinct real endpoints"
         )
     if args.profile_prompt_tokens < args.min_indexcache_prompt_tokens:
         raise SystemExit(
