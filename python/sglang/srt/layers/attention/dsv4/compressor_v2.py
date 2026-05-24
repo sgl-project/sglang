@@ -103,7 +103,7 @@ if _is_hip:
 
             m_new = tl.maximum(m_prev, score_k)
             exp_old = tl.where(m_prev == float("-inf"), 0.0, tl.exp(m_prev - m_new))
-            exp_cur = tl.exp(score_k - m_new)
+            exp_cur = tl.where(score_k == float("-inf"), 0.0, tl.exp(score_k - m_new))
             kv_acc = kv_acc * exp_old + exp_cur * kv_val
             w_acc = w_acc * exp_old + exp_cur
             m_prev = m_new
@@ -195,7 +195,7 @@ if _is_hip:
 
             m_new = tl.maximum(m_prev, score_k)
             exp_old = tl.where(m_prev == float("-inf"), 0.0, tl.exp(m_prev - m_new))
-            exp_cur = tl.exp(score_k - m_new)
+            exp_cur = tl.where(score_k == float("-inf"), 0.0, tl.exp(score_k - m_new))
             kv_acc = kv_acc * exp_old + exp_cur * kv_val
             w_acc = w_acc * exp_old + exp_cur
             m_prev = m_new
@@ -351,10 +351,8 @@ def _compress_forward_c128_fallback(
             write_locs = plan_raw[:, 1].long()
             # Only write valid locations (>= 0 and < buffer size)
             valid_write = (write_locs >= 0) & (write_locs < num_total_slots)
-            write_locs_safe = torch.where(
-                valid_write, write_locs, torch.zeros_like(write_locs)
-            )
-            buf_flat[write_locs_safe] = kv_score_input
+            if valid_write.any():
+                buf_flat[write_locs[valid_write]] = kv_score_input[valid_write]
         else:
             # Prefill: plan_w has {ragged_id, write_loc} per write entry
             plan_w = plan[2]  # [num_w, 8] uint8 = WritePlan
@@ -363,13 +361,13 @@ def _compress_forward_c128_fallback(
                 ragged_ids = plan_w_raw[:, 0].long() & 0xFFFF
                 write_locs = plan_w_raw[:, 1].long()
                 valid_write = (write_locs >= 0) & (write_locs < num_total_slots)
-                write_locs_safe = torch.where(
-                    valid_write, write_locs, torch.zeros_like(write_locs)
-                )
                 ragged_ids_safe = ragged_ids.clamp(
                     min=0, max=kv_score_input.shape[0] - 1
                 )
-                buf_flat[write_locs_safe] = kv_score_input[ragged_ids_safe]
+                if valid_write.any():
+                    buf_flat[write_locs[valid_write]] = kv_score_input[
+                        ragged_ids_safe[valid_write]
+                    ]
 
     # Step 2: COMPRESS (read from buffer page and do softmax-pool)
     plan_c = plan[1]  # plan_d for decode, plan_c for prefill
