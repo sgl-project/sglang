@@ -132,7 +132,9 @@ def pick_orphan_slot(*, radix_cache: Optional["BasePrefixCache"]) -> Optional[in
     return valid[pick]
 
 
-def pick_out_cache_loc_slot(*, maybe_inaccurate_forward_batch: "ForwardBatch") -> Optional[int]:
+def pick_out_cache_loc_slot(
+    *, maybe_inaccurate_forward_batch: "ForwardBatch"
+) -> Optional[int]:
     out_cache_loc = maybe_inaccurate_forward_batch.out_cache_loc
     if out_cache_loc is None:
         return None

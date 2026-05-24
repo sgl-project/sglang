@@ -77,7 +77,9 @@ class PerturbManager:
         this MUST fire after the captured forward writes have completed."""
         self.perturb_real_kv_post_forward(maybe_inaccurate_forward_batch)
 
-    def perturb_req_to_token(self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_req_to_token(
+        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+    ) -> None:
         req_to_token.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,
@@ -85,7 +87,9 @@ class PerturbManager:
             warmup_gate=self._warmup_gate,
         )
 
-    def perturb_real_kv_used(self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]) -> None:
+    def perturb_real_kv_used(
+        self, maybe_inaccurate_forward_batch: Optional["ForwardBatch"]
+    ) -> None:
         real_kv_used.run(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             config=self._config,

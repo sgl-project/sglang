@@ -41,7 +41,16 @@ def make_config(
     )
 
 
-def _make_disabled_perturb_config() -> PerturbConfig:
+class RecordingEndpoint:
+    def __init__(self, *, kernel_kind: CanaryLaunchTag) -> None:
+        self.kernel_kind = kernel_kind
+        self.calls: list[dict[str, object]] = []
+
+    def launch_per_forward(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+
+
+def make_perturb_config() -> PerturbConfig:
     """Build a PerturbConfig with every probability pinned to 0 so the
     perturb hooks do nothing during unit tests."""
     return PerturbConfig(
@@ -54,19 +63,11 @@ def _make_disabled_perturb_config() -> PerturbConfig:
     )
 
 
-class RecordingEndpoint:
-    def __init__(self, *, kernel_kind: CanaryLaunchTag) -> None:
-        self.kernel_kind = kernel_kind
-        self.calls: list[dict[str, object]] = []
-
-    def launch_per_forward(self, **kwargs: object) -> None:
-        self.calls.append(kwargs)
-
-
 def make_manager(
     *,
     device: torch.device,
     config: CanaryConfig | None = None,
+    perturb_config: PerturbConfig | None = None,
     group: CanaryBufferGroup | None = None,
     req_pool: SimpleNamespace | None = None,
     per_forward_verify_capacity: int = 16,
@@ -74,13 +75,15 @@ def make_manager(
 ) -> CanaryManager:
     if config is None:
         config = make_config()
+    if perturb_config is None:
+        perturb_config = make_perturb_config()
     if group is None:
         group = make_buffer_group(device=device)
     if req_pool is None:
         req_pool = make_req_to_token_pool(device=device, max_reqs=4, max_seq_len=8)
     return CanaryManager(
         config=config,
-        perturb_config=_make_disabled_perturb_config(),
+        perturb_config=perturb_config,
         buffer_groups=(group,),
         device=device,
         req_to_token_pool=req_pool,

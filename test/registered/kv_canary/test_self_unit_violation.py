@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from typing import Literal
+from unittest.mock import patch
+
+import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary.consts import FailReason
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
-from sglang.srt.kv_canary.runner.violation_reporter import _format_violation
+from sglang.srt.kv_canary.runner import violation_reporter as violation_reporter_module
+from sglang.srt.kv_canary.runner.violation_reporter import (
+    ViolationReporter,
+    _format_violation,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -155,6 +164,184 @@ class TestViolationReporter(CustomTestCase):
             "  stored:   token_id=111   position=42 prev_hash=0x0000000000000000\n"
             "  expected: prev_hash=0x0000000000000000\n"
             "  total_violations=1 ring_overflow=False step_when_pumped=0",
+        )
+
+
+def _make_reporter(
+    *,
+    rows: list[list[int]],
+    write_index: int,
+    ring_capacity: int,
+    mode: Literal["log", "raise"] = "log",
+) -> ViolationReporter:
+    ring = torch.zeros(ring_capacity, consts.VIOLATION_FIELDS, dtype=torch.int64)
+    for i, row in enumerate(rows):
+        ring[i] = torch.tensor(row, dtype=torch.int64)
+    violation_log = SimpleNamespace(
+        violation_ring=ring,
+        violation_write_index=torch.tensor([write_index], dtype=torch.int32),
+    )
+    device_state = SimpleNamespace(violation_log=violation_log)
+    config = SimpleNamespace(mode=mode)
+    return ViolationReporter(config=config, device_state=device_state)
+
+
+class TestLogOrRaiseViolation(CustomTestCase):
+    def test_log_or_raise_violation_empty_ring_is_noop(self) -> None:
+        """Empty ring (write_index=0) emits no warning and leaves reporter non-raised."""
+        reporter = _make_reporter(rows=[], write_index=0, ring_capacity=4, mode="log")
+        with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
+            reporter.log_or_raise_violation(step_counter=0)
+        mock_warning.assert_not_called()
+        self.assertFalse(reporter.is_raised)
+
+    def test_log_mode_emits_one_warning_per_violation(self) -> None:
+        """Log mode with 3 valid rows emits 3 warnings, each a full _format_violation snapshot for that row."""
+        rows = [
+            _make_row(
+                slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
+            ),
+            _make_row(
+                slot_idx=22, position=202, fail_reason_bits=int(FailReason.POSITION)
+            ),
+            _make_row(
+                slot_idx=33, position=303, fail_reason_bits=int(FailReason.REAL_KV_HASH)
+            ),
+        ]
+        reporter = _make_reporter(
+            rows=rows, write_index=3, ring_capacity=4, mode="log"
+        )
+        with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
+            reporter.log_or_raise_violation(step_counter=7)
+
+        self.assertEqual(mock_warning.call_count, 3)
+        messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
+        self.assertEqual(
+            messages[0],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash slot_idx=11 position=101 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=11, position=101)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: chain_hash\n"
+            "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
+        )
+        self.assertEqual(
+            messages[1],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=position slot_idx=22 position=202 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=22, position=202)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: position\n"
+            "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
+        )
+        self.assertEqual(
+            messages[2],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=real_kv_hash slot_idx=33 position=303 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: real_kv_hash\n"
+            "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=7",
+        )
+        self.assertFalse(reporter.is_raised)
+
+    def test_raise_mode_raises_one_error_containing_all_violations(self) -> None:
+        """Raise mode raises a single RuntimeError whose text is the 3 formatted rows joined with single newlines."""
+        rows = [
+            _make_row(
+                slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
+            ),
+            _make_row(
+                slot_idx=22, position=202, fail_reason_bits=int(FailReason.POSITION)
+            ),
+            _make_row(
+                slot_idx=33, position=303, fail_reason_bits=int(FailReason.REAL_KV_HASH)
+            ),
+        ]
+        reporter = _make_reporter(
+            rows=rows, write_index=3, ring_capacity=4, mode="raise"
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            reporter.log_or_raise_violation(step_counter=5)
+
+        self.assertEqual(
+            str(ctx.exception),
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=chain_hash slot_idx=11 position=101 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=11, position=101)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: chain_hash\n"
+            "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=position slot_idx=22 position=202 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=22, position=202)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: position\n"
+            "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=5\n"
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=real_kv_hash slot_idx=33 position=303 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=33, position=303)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: real_kv_hash\n"
+            "  stored:   token_id=111   position=303 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=3 ring_overflow=False step_when_pumped=5",
+        )
+        self.assertTrue(reporter.is_raised)
+
+    def test_log_mode_ring_overflow_marks_overflow_in_each_row(self) -> None:
+        """Log mode with write_index=5 but ring_capacity=2 emits 2 warnings, each a full snapshot with overflow footer."""
+        rows = [
+            _make_row(slot_idx=11, position=101),
+            _make_row(slot_idx=22, position=202),
+        ]
+        reporter = _make_reporter(
+            rows=rows, write_index=5, ring_capacity=2, mode="log"
+        )
+        with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
+            reporter.log_or_raise_violation(step_counter=0)
+
+        self.assertEqual(mock_warning.call_count, 2)
+        messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
+        self.assertEqual(
+            messages[0],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=none slot_idx=11 position=101 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=11, position=101)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: none\n"
+            "  stored:   token_id=111   position=101 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=5 ring_overflow=True step_when_pumped=0",
+        )
+        self.assertEqual(
+            messages[1],
+            "kv_canary violation: launch_tag=HEAD_K_FULL fail_reason=none slot_idx=22 position=202 "
+            "stored_token=111 expected_token=0 stored_chain_hash=0x0000000000000000 "
+            "expected_aux=0x0000000000000000\n"
+            "KV cache canary violation detected (kernel_kind=HEAD_K_FULL, slot_idx=22, position=202)\n"
+            "canary_kind:       per_forward_head_k_full\n"
+            "  fail_reasons: none\n"
+            "  stored:   token_id=111   position=202 prev_hash=0x0000000000000000\n"
+            "  expected: prev_hash=0x0000000000000000\n"
+            "  total_violations=5 ring_overflow=True step_when_pumped=0",
         )
 
 

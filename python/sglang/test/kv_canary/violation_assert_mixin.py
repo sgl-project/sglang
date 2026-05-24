@@ -70,9 +70,26 @@ class CanaryViolationAssertMixin:
         ):
             return
         side_label = "" if side is None else f" on side={side}"
+        other_side_diag = ""
+        if side in ("prefill", "decode"):
+            other = "decode" if side == "prefill" else "prefill"
+            try:
+                other_text = self._captured_log_text(other)
+                other_match = find_violation_in_log(
+                    other_text,
+                    launch_tag_patterns=launch_tag_patterns,
+                    fail_reason=fail_reason,
+                )
+                other_side_diag = (
+                    f"\n[diag] other side ({other}) buf len={len(other_text)} "
+                    f"contains_match={other_match}"
+                )
+            except (NotImplementedError, ValueError):
+                pass
         raise AssertionError(
             f"No canary violation matching launch_tag_patterns={launch_tag_patterns!r} "
-            f"fail_reason={fail_reason!r}{side_label}. Log tail:\n"
+            f"fail_reason={fail_reason!r}{side_label}. "
+            f"log_text len={len(log_text)}.{other_side_diag} Log tail:\n"
             f"{log_text[-2000:]}"
         )
 

@@ -45,7 +45,9 @@ def run(
     ):
         return
 
-    slot = pick_out_cache_loc_slot(maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch)
+    slot = pick_out_cache_loc_slot(
+        maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
+    )
     if slot is None:
         logger.info(
             "kv_canary perturb real_kv_post_forward: skipped because maybe_inaccurate_forward_batch.out_cache_loc "
