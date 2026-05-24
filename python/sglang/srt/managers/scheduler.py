@@ -451,19 +451,6 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
-        if self.ps.tp_rank == 0:
-            avail_mem = get_available_gpu_memory(
-                self.device, self.ps.gpu_id, empty_cache=False
-            )
-            logger.info(
-                f"max_total_num_tokens={self.max_total_num_tokens}, "
-                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
-                f"max_prefill_tokens={self.max_prefill_tokens}, "
-                f"max_running_requests={self.max_running_requests}, "
-                f"context_len={self.model_config.context_len}, "
-                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
-            )
-
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -712,7 +699,23 @@ class Scheduler(
             abort_request=self.abort_request,
         )
 
+        self.log_init_summary()
+
         self.is_initializing = False
+
+    def log_init_summary(self):
+        if self.ps.tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.ps.gpu_id, empty_cache=False
+            )
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}, "
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+            )
 
     def init_zbal_on_npu(self):
         if _is_npu:
