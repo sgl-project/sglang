@@ -1775,14 +1775,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True
 
-    def terminate_prefetch(self, req_id: str) -> None:
-        if req_id not in self.ongoing_prefetch:
-            return
-        _, _, _, operation, _, _ = self.ongoing_prefetch[req_id]
-        if operation.host_indices is None:
-            return
-        operation.mark_terminate()
-
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
