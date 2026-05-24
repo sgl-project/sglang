@@ -117,25 +117,27 @@ class SchedulerBatchResultProcessor:
         if capturer is None:
             return
         start_len = req.routed_experts_start_len
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.routed_experts = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
+            seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
 
-        expected_rows = max(0, req.seqlen - 1 - start_len)
+        expected_rows = max(0, seqlen - 1 - start_len)
         if (
             req.routed_experts is not None
             and req.routed_experts.shape[0] != expected_rows
         ):
             logger.warning(
-                "routed_experts row-count mismatch for req %s: got %d, "
-                "expected %d (seqlen=%d, cached_tokens=%d, start_len=%s). "
+                "routed_experts row-count mismatch for req %s: got %d, expected %d "
+                "(seqlen=%d, raw_seqlen=%d, cached_tokens=%d, start_len=%s). "
                 "This indicates a silent bug.",
                 req.rid,
                 req.routed_experts.shape[0],
                 expected_rows,
+                seqlen,
                 req.seqlen,
                 req.cached_tokens,
                 req.routed_experts_start_len,
@@ -145,9 +147,10 @@ class SchedulerBatchResultProcessor:
         capturer = get_global_indexer_capturer()
         if capturer is None:
             return
+        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
         req.indexer_topk = capturer.get_topk(
             req_pool_idx=req.req_pool_idx,
-            seqlen=req.seqlen,
+            seqlen=seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
 
