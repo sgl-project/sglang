@@ -56,6 +56,10 @@ def pattern_to_str(pattern: list[str]) -> str:
     return "".join(pattern)
 
 
+def pattern_counts(pattern: str) -> dict[str, int]:
+    return {"F": pattern.count("F"), "S": pattern.count("S")}
+
+
 def finite_logprobs(meta_info: dict) -> Iterable[float]:
     for item in meta_info.get("input_token_logprobs", []):
         if item is None:
@@ -195,11 +199,15 @@ def greedy_search_pattern(
         history.append(step)
         print(json.dumps({"selected": step}))
 
+    final_pattern = pattern_to_str(pattern)
     return {
         "retention": retention,
+        "search_method": "greedy_training_free",
+        "uniform_candidate": False,
         "initial_pattern": initial_pattern,
         "baseline_loss": baseline_loss,
-        "final_pattern": pattern_to_str(pattern),
+        "final_pattern": final_pattern,
+        "final_pattern_counts": pattern_counts(final_pattern),
         "target_f_layers": target_f,
         "protected_c4_indices": sorted(protected),
         "history": history,
@@ -261,6 +269,9 @@ def main() -> None:
     validate_args(args)
 
     result = {
+        "search_method": "greedy_training_free",
+        "uniform_1_4_candidate": "not generated; only searched 1/4 is produced",
+        "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
         "retentions": {
             retention: search(args, retention) for retention in args.retention
         }

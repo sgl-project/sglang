@@ -48,7 +48,10 @@ def test_dsv4_index_cache_search_keeps_pp_block_anchors_full():
     )
     assert result["initial_pattern"] == "FFFFFFFF"
     assert result["baseline_loss"] == 0
+    assert result["search_method"] == "greedy_training_free"
+    assert result["uniform_candidate"] is False
     assert result["final_pattern"] == "FSSSFSFF"
+    assert result["final_pattern_counts"] == {"F": 4, "S": 4}
     assert result["target_f_layers"] == 4
     assert result["protected_c4_indices"] == [0, 4]
     assert result["final_pattern"][0] == "F"
@@ -68,6 +71,7 @@ def test_dsv4_index_cache_search_can_target_quarter_retention():
 
     assert result["final_pattern"].count("F") == 2
     assert result["final_pattern"][0] == "F"
+    assert result["uniform_candidate"] is False
     assert result["target_f_layers"] == 2
 
 
