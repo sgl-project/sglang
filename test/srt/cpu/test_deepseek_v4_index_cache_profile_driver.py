@@ -93,3 +93,44 @@ def test_dsv4_index_cache_profile_driver_requires_marker_env_for_real_runs():
 
     with pytest.raises(SystemExit, match="--indexcache-profile-env-confirmed"):
         profile_driver.validate_args(args)
+
+
+def test_dsv4_index_cache_profile_driver_rejects_missing_real_trace_summaries():
+    args = Namespace(dry_run=False)
+
+    with pytest.raises(RuntimeError, match="no profile traces"):
+        profile_driver.validate_trace_summaries(args, [])
+
+
+def test_dsv4_index_cache_profile_driver_rejects_missing_required_regions():
+    args = Namespace(dry_run=False)
+    summaries = [
+        {
+            "categories": {
+                "csa_indexer": {},
+                "core_attention_c4": {},
+                "ffn_moe": {},
+                "cuda_graph": {},
+            }
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="raw_to_page_translation"):
+        profile_driver.validate_trace_summaries(args, summaries)
+
+
+def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
+    args = Namespace(dry_run=False)
+    summaries = [
+        {
+            "categories": {
+                "csa_indexer": {},
+                "raw_to_page_translation": {},
+                "core_attention_c4": {},
+                "ffn_moe": {},
+                "cuda_graph": {},
+            }
+        }
+    ]
+
+    profile_driver.validate_trace_summaries(args, summaries)

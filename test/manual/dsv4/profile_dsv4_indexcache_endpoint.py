@@ -23,6 +23,14 @@ def _load_profile_analyzer():
 
 summarize_trace = _load_profile_analyzer().summarize_trace
 
+REQUIRED_PROFILE_CATEGORIES = (
+    "csa_indexer",
+    "raw_to_page_translation",
+    "core_attention",
+    "ffn_moe",
+    "cuda_graph",
+)
+
 
 def make_prompt(token_target: int, seed: str) -> str:
     rng = random.Random(seed)
@@ -121,6 +129,36 @@ def validate_args(args) -> None:
         )
 
 
+def has_category(categories: dict, required: str) -> bool:
+    if required == "core_attention":
+        return any(category.startswith("core_attention") for category in categories)
+    return required in categories
+
+
+def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
+    if args.dry_run:
+        return
+    if not trace_summaries:
+        raise RuntimeError(
+            "no profile traces found; check --profile-dir, --profile-prefix, "
+            "and server /start_profile support"
+        )
+    observed = {}
+    for summary in trace_summaries:
+        observed.update(summary.get("categories", {}))
+    missing = [
+        category
+        for category in REQUIRED_PROFILE_CATEGORIES
+        if not has_category(observed, category)
+    ]
+    if missing:
+        raise RuntimeError(
+            "profile traces are missing required DSV4 IndexCache regions "
+            f"{missing}; check SGLANG_DSV4_INDEXCACHE_PROFILE=true and that "
+            "IndexCache reuse was exercised"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
@@ -151,6 +189,9 @@ def main() -> None:
         request_results = collect_profile(args)
 
     trace_files = find_trace_files(args.profile_dir, args.profile_prefix)
+    trace_summaries = [summarize_trace(path) for path in trace_files]
+    validate_trace_summaries(args, trace_summaries)
+
     result = {
         "endpoint": args.endpoint,
         "profile_dir": str(args.profile_dir),
@@ -158,7 +199,7 @@ def main() -> None:
         "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
         "request_results": request_results,
         "trace_files": [str(path) for path in trace_files],
-        "trace_summaries": [summarize_trace(path) for path in trace_files],
+        "trace_summaries": trace_summaries,
         "indexcache_profile_env": (
             "confirmed SGLANG_DSV4_INDEXCACHE_PROFILE=true"
             if args.indexcache_profile_env_confirmed
