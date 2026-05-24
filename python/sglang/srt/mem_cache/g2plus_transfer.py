@@ -159,6 +159,39 @@ def _mooncake_ib_device(engine) -> Optional[str]:
     return ib_device or None
 
 
+def _mooncake_register_regions(
+    engine, ptrs: list[int], lengths: list[int]
+) -> tuple[bool, str]:
+    ptrs = [int(ptr) for ptr in ptrs]
+    lengths = [int(length) for length in lengths]
+    if len(ptrs) != len(lengths):
+        return (
+            False,
+            f"registration_length_mismatch:ptrs={len(ptrs)}:lengths={len(lengths)}",
+        )
+
+    # Mooncake 0.3.10 can return success from batch_register_memory even when
+    # individual CUDA registrations fail. Prefer the scalar API when available
+    # so G2plus does not advertise a target whose GPU KV addresses are absent
+    # from Mooncake's segment descriptor.
+    underlying_engine = getattr(engine, "engine", None)
+    register_memory = getattr(underlying_engine, "register_memory", None)
+    if callable(register_memory):
+        for index, (ptr, length) in enumerate(zip(ptrs, lengths)):
+            try:
+                ret = int(register_memory(ptr, length))
+            except Exception as err:
+                return False, f"register_memory_exception:index={index}:error={err}"
+            if ret != 0:
+                return False, f"register_memory_failed:index={index}:ret={ret}"
+        return True, "ok"
+
+    ret = int(engine.batch_register(ptrs, lengths))
+    if ret != 0:
+        return False, f"batch_register_failed:ret={ret}"
+    return True, "ok"
+
+
 def _default_nixl_num_threads() -> int:
     value = envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.get()
     if value is None:
@@ -311,9 +344,13 @@ class MooncakeG2plusTransferBackend:
             target_kv_ptrs, target_kv_lens, target_kv_item_lens = (
                 _target_kv_infos_from_scheduler(scheduler)
             )
-            if engine.batch_register(target_kv_ptrs, target_kv_lens) != 0:
+            registered, register_reason = _mooncake_register_regions(
+                engine, target_kv_ptrs, target_kv_lens
+            )
+            if not registered:
                 logger.warning(
-                    "G2plus Mooncake disabled: target KV registration failed"
+                    "G2plus Mooncake disabled: target KV registration failed (%s)",
+                    register_reason,
                 )
                 _record_diagnostic(
                     diagnostics,
@@ -413,12 +450,13 @@ class MooncakeG2plusTransferBackend:
         except RuntimeError as err:
             logger.info("G2plus Mooncake direct transfer disabled: %s", err)
             return
-        ret = self.engine.batch_register(
-            [host_pool.kv_buffer.data_ptr()], [host_pool.kv_buffer.nbytes]
+        registered, register_reason = _mooncake_register_regions(
+            self.engine, [host_pool.kv_buffer.data_ptr()], [host_pool.kv_buffer.nbytes]
         )
-        if ret != 0:
+        if not registered:
             logger.warning(
-                "G2plus Mooncake direct transfer disabled: host registration failed"
+                "G2plus Mooncake direct transfer disabled: host registration failed (%s)",
+                register_reason,
             )
             return
         self._source_registered = True

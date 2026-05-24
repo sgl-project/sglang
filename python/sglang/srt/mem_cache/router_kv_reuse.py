@@ -1347,8 +1347,6 @@ class RemoteG2ReuseHandler:
         last_reason = "missing_source_endpoint"
         for endpoint in endpoints:
             paths = ["/transfer_direct"]
-            if transfer_backend.name == "mooncake":
-                paths.append("/transfer_mooncake")
             for path in paths:
                 request = urllib.request.Request(
                     f"{endpoint}{path}",

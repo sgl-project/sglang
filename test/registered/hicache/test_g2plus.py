@@ -215,6 +215,20 @@ class FakeMooncakeEngine:
         return 0
 
 
+class FakeCheckedMooncakeEngine(FakeMooncakeEngine):
+    def __init__(self, ib_device=None, register_returns=None):
+        super().__init__(ib_device=ib_device)
+        self.checked_registered = []
+        self._register_returns = list(register_returns or [])
+        self.engine = SimpleNamespace(register_memory=self._register_memory)
+
+    def _register_memory(self, ptr, length):
+        self.checked_registered.append((int(ptr), int(length)))
+        if self._register_returns:
+            return self._register_returns.pop(0)
+        return 0
+
+
 class FakeNixlAgent:
     name = "source-agent"
 
@@ -2543,6 +2557,46 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(payload["target_metadata"]["agent_name"], "target-agent")
         self.assertEqual(payload["target_page_indices"], [3, 4])
 
+    def test_mooncake_direct_transfer_does_not_retry_legacy_alias(self):
+        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler.timeout_secs = 1
+        requests = []
+        transfer_backend = SimpleNamespace(
+            name="mooncake",
+            target_session_id="target-session",
+            target_kv_ptrs=[1000],
+            target_kv_item_lens=[64],
+            target_descriptor=lambda: {
+                "backend": "mooncake",
+                "session_id": "target-session",
+            },
+        )
+        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+
+        def fake_urlopen(request, timeout):
+            requests.append(request.full_url)
+            return FakeUrlopenResponse(
+                {
+                    "ok": False,
+                    "reason": "direct_transfer_failed:ret=-1",
+                    "pages": [],
+                }
+            )
+
+        with patch("urllib.request.urlopen", fake_urlopen):
+            pages, reason = handler._request_source_transfer(
+                transfer_backend=transfer_backend,
+                endpoints=["http://127.0.0.1:39000"],
+                plan=plan,
+                start_block=0,
+                max_blocks=1,
+                target_page_indices=[3],
+            )
+
+        self.assertEqual(pages, [])
+        self.assertEqual(reason, "direct_transfer_failed:ret=-1")
+        self.assertEqual(requests, ["http://127.0.0.1:39000/transfer_direct"])
+
     def test_direct_transfer_control_plane_timeout_is_indeterminate(self):
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
         handler.timeout_secs = 1
@@ -3594,6 +3648,33 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertTrue(backend.enabled)
         self.assertEqual(engine.registered, [([host_buffer.data_ptr()], [32])])
 
+    def test_mooncake_transfer_backend_prefers_checked_source_registration(self):
+        host_buffer = torch.zeros((32,), dtype=torch.uint8)
+        engine = FakeCheckedMooncakeEngine()
+        tree = SimpleNamespace(
+            page_size=2,
+            cache_controller=SimpleNamespace(
+                mem_pool_host=SimpleNamespace(
+                    layout="layer_first",
+                    kv_buffer=host_buffer,
+                    k_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
+                    v_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
+                )
+            ),
+        )
+        backend = MooncakeG2plusTransferBackend(
+            engine=engine,
+            tree_cache=tree,
+            target_kv_ptrs=[1, 2],
+            target_kv_item_lens=[8, 8],
+        )
+
+        backend._register_source_host_pool()
+
+        self.assertTrue(backend.enabled)
+        self.assertEqual(engine.checked_registered, [(host_buffer.data_ptr(), 32)])
+        self.assertEqual(engine.registered, [])
+
     def test_mooncake_transfer_backend_rejects_host_pool_without_refs(self):
         host_buffer = torch.zeros((32,), dtype=torch.uint8)
         engine = FakeMooncakeEngine()
@@ -4496,6 +4577,56 @@ class TestRouterKVReuse(unittest.TestCase):
             backend.target_descriptor()["transport"]["transfer_parallelism"], 4
         )
         backend.shutdown()
+
+    def test_mooncake_from_scheduler_rejects_failed_checked_target_registration(self):
+        engine = FakeCheckedMooncakeEngine(register_returns=[0, -202])
+        source_item_len = 8
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                g2plus_transfer_backend="mooncake",
+                mooncake_ib_device=None,
+                g2plus_transfer_parallelism=4,
+                tp_size=1,
+                pp_size=1,
+                attn_cp_size=1,
+            ),
+            gpu_id=0,
+            tp_rank=0,
+            tree_cache=SimpleNamespace(
+                page_size=2,
+                cache_controller=SimpleNamespace(
+                    mem_pool_host=SimpleNamespace(
+                        layout="layer_first",
+                        kv_buffer=torch.zeros((32,), dtype=torch.uint8),
+                        k_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
+                        v_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
+                    )
+                ),
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: SimpleNamespace(
+                    get_contiguous_buf_infos=lambda: (
+                        [1, 2],
+                        [128, 128],
+                        [source_item_len, source_item_len],
+                    )
+                )
+            ),
+        )
+        diagnostics = []
+
+        with patch(
+            "sglang.srt.distributed.parallel_state.get_mooncake_transfer_engine",
+            return_value=engine,
+        ):
+            backend = MooncakeG2plusTransferBackend.from_scheduler(
+                scheduler, diagnostics=diagnostics
+            )
+
+        self.assertIsNone(backend)
+        self.assertEqual(engine.checked_registered, [(1, 128), (2, 128)])
+        self.assertEqual(engine.registered, [])
+        self.assertEqual(diagnostics, ["mooncake target KV registration failed"])
 
     def test_scheduler_initializes_router_reuse_manager(self):
         manager = object()
