@@ -771,6 +771,16 @@ class Envs:
     # targets: "full" / "swa" exact-match the PoolKind name. Used by per-group
     # e2e tests to drive detection deterministically.
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
+    # Mock-model self-test next_token_swap perturb. When >0, the sampler exit
+    # swaps two requests' sampled next tokens with this per-step probability.
+    # KV path is untouched, so KV-side fail_reasons stay silent; the
+    # token-oracle input check downstream MUST report write_token violation.
+    # 0 = disabled.
+    SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
+    # Number of initial forward steps during which the next_token_swap perturb
+    # is gated off. Separate from SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS because
+    # the mock-model self-test path runs without sglang's warmup forward.
+    SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_WARMUP_STEPS = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     # ===================================================================
