@@ -451,6 +451,19 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
+        if self.ps.tp_rank == 0:
+            avail_mem = get_available_gpu_memory(
+                self.device, self.ps.gpu_id, empty_cache=False
+            )
+            logger.info(
+                f"max_total_num_tokens={self.max_total_num_tokens}, "
+                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
+                f"max_prefill_tokens={self.max_prefill_tokens}, "
+                f"max_running_requests={self.max_running_requests}, "
+                f"context_len={self.model_config.context_len}, "
+                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
+            )
+
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
@@ -964,20 +977,6 @@ class Scheduler(
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
-        # Print debug info
-        avail_mem = get_available_gpu_memory(
-            self.device, self.ps.gpu_id, empty_cache=False
-        )
-        if self.ps.tp_rank == 0:
-            logger.info(
-                f"max_total_num_tokens={self.max_total_num_tokens}, "
-                f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
-                f"max_prefill_tokens={self.max_prefill_tokens}, "
-                f"max_running_requests={self.max_running_requests}, "
-                f"context_len={self.model_config.context_len}, "
-                f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
-            )
-
         if self.server_args.enable_metrics:
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
@@ -990,7 +989,9 @@ class Scheduler(
                 page_size=self.page_size,
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
-                startup_available_gpu_memory_gb=avail_mem,
+                startup_available_gpu_memory_gb=get_available_gpu_memory(
+                    self.device, self.ps.gpu_id, empty_cache=False
+                ),
             )
 
     def init_running_status(self):
