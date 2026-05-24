@@ -33,6 +33,9 @@ def test_dsv4_index_cache_profile_analysis_groups_trace_regions(tmp_path):
                     },
                     {"name": "dsv4_indexcache.core_attention_c4.layer_4", "dur": 2000},
                     {"name": "dsv4_indexcache.ffn_moe.layer_4", "dur": 4000},
+                    {"name": "dsv4_indexcache.cuda_graph.decode.replay", "dur": 0},
+                    {"name": "dsv4_indexcache.cuda_graph.decode.fallback", "dur": 0},
+                    {"name": "dsv4_indexcache.cuda_graph.decode.fallback", "dur": 0},
                     {"name": "unrelated", "dur": 999999},
                 ]
             }
@@ -46,4 +49,9 @@ def test_dsv4_index_cache_profile_analysis_groups_trace_regions(tmp_path):
     assert summary["categories"]["raw_to_page_translation"]["total_ms"] == 0.5
     assert summary["categories"]["core_attention_c4"]["total_ms"] == 2.0
     assert summary["categories"]["ffn_moe"]["total_ms"] == 4.0
+    assert summary["categories"]["cuda_graph"]["count"] == 3
+    assert summary["cuda_graph_paths"] == {
+        "decode.fallback": 2,
+        "decode.replay": 1,
+    }
     assert summary["layers"]["4"]["raw_to_page_translation"] == 0.5

@@ -31,8 +31,13 @@ def record_cuda_graph_path(mode: str, can_run_graph: bool) -> None:
     if not is_dsv4_index_cache_profile_enabled():
         return
     path = "replay" if can_run_graph else "fallback"
+    with torch.profiler.record_function(f"dsv4_indexcache.cuda_graph.{mode}.{path}"):
+        pass
     _graph_counts[f"{mode}.{path}"] += 1
     total = sum(_graph_counts.values())
     interval = envs.SGLANG_DSV4_INDEXCACHE_PROFILE_LOG_INTERVAL.get()
     if interval > 0 and total % interval == 0:
-        logger.info("[DSV4 IndexCache profile] CUDA graph path counts: %s", dict(_graph_counts))
+        logger.info(
+            "[DSV4 IndexCache profile] CUDA graph path counts: %s",
+            dict(_graph_counts),
+        )

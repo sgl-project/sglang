@@ -30,6 +30,8 @@ def event_duration_us(event: dict) -> float:
 
 def event_category(name: str) -> str:
     suffix = name.removeprefix(PREFIX)
+    if suffix.startswith("cuda_graph."):
+        return "cuda_graph"
     if suffix.startswith("csa_indexer"):
         return "csa_indexer"
     if suffix.startswith("raw_to_page_translation"):
@@ -45,6 +47,7 @@ def summarize_trace(path: Path) -> dict:
     trace = open_trace(path)
     totals = defaultdict(float)
     counts = defaultdict(int)
+    graph_paths = defaultdict(int)
     by_layer = defaultdict(lambda: defaultdict(float))
 
     for event in trace.get("traceEvents", []):
@@ -55,6 +58,9 @@ def summarize_trace(path: Path) -> dict:
         category = event_category(name)
         totals[category] += dur
         counts[category] += 1
+        suffix = name.removeprefix(PREFIX)
+        if suffix.startswith("cuda_graph."):
+            graph_paths[suffix.removeprefix("cuda_graph.")] += 1
         if ".layer_" in name:
             layer_id = name.rsplit(".layer_", maxsplit=1)[1]
             by_layer[layer_id][category] += dur
@@ -71,6 +77,7 @@ def summarize_trace(path: Path) -> dict:
             }
             for category, total in sorted(totals.items())
         },
+        "cuda_graph_paths": dict(sorted(graph_paths.items())),
         "layers": {
             layer: {
                 category: total / 1000.0
