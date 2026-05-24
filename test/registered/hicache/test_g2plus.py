@@ -193,8 +193,9 @@ def _wait_until_no_pending(handler, timeout_secs=1.0):
 
 
 class FakeMooncakeEngine:
-    def __init__(self, ib_device=None):
+    def __init__(self, ib_device=None, protocol=None):
         self.ib_device = ib_device
+        self.protocol = protocol
         self.transfers = []
         self.registered = []
         self.deregistered = []
@@ -204,6 +205,9 @@ class FakeMooncakeEngine:
 
     def get_ib_device(self):
         return self.ib_device
+
+    def get_protocol(self):
+        return self.protocol
 
     def batch_register(self, ptrs, lens):
         self.registered.append((ptrs, lens))
@@ -3641,6 +3645,18 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(
             descriptor["transport"]["path_hint"], "no_explicit_ib_device"
         )
+
+        backend = MooncakeG2plusTransferBackend(
+            engine=FakeMooncakeEngine(protocol="nvlink"),
+            tree_cache=tree,
+            target_kv_ptrs=[1, 2],
+            target_kv_item_lens=[source_item_len, source_item_len],
+        )
+
+        descriptor = backend.target_descriptor()
+        self.assertEqual(descriptor["transport"]["protocol"], "nvlink")
+        self.assertIsNone(descriptor["transport"]["ib_device"])
+        self.assertEqual(descriptor["transport"]["path_hint"], "nvlink")
 
     def test_mooncake_transfer_backend_registers_source_host_pool(self):
         host_buffer = torch.zeros((32,), dtype=torch.uint8)

@@ -159,6 +159,28 @@ def _mooncake_ib_device(engine) -> Optional[str]:
     return ib_device or None
 
 
+def _mooncake_protocol(engine) -> str:
+    get_protocol = getattr(engine, "get_protocol", None)
+    if callable(get_protocol):
+        protocol = get_protocol()
+    else:
+        protocol = getattr(engine, "protocol", None)
+    if protocol is None:
+        return "rdma"
+    protocol = str(protocol).strip().lower()
+    return protocol or "rdma"
+
+
+def _mooncake_path_hint(protocol: str, ib_device: Optional[str]) -> str:
+    if protocol == "rdma":
+        return (
+            "explicit_ib_device"
+            if ib_device is not None
+            else "no_explicit_ib_device"
+        )
+    return protocol
+
+
 def _mooncake_register_regions(
     engine, ptrs: list[int], lengths: list[int]
 ) -> tuple[bool, str]:
@@ -294,6 +316,7 @@ class MooncakeG2plusTransferBackend:
         self._source_registered = False
         self._source_registered_ptrs: list[int] = []
         self.ib_device = _mooncake_ib_device(engine)
+        self.protocol = _mooncake_protocol(engine)
         if transfer_parallelism is None:
             transfer_parallelism = default_g2plus_transfer_parallelism()
         self._transfer_parallelism = max(1, int(transfer_parallelism))
@@ -400,22 +423,19 @@ class MooncakeG2plusTransferBackend:
             "backend": self.name,
             "session_id": self.target_session_id,
             "transport": {
-                "protocol": "rdma",
+                "protocol": self.protocol,
                 "ib_device": self.ib_device,
-                "path_hint": (
-                    "explicit_ib_device"
-                    if self.ib_device is not None
-                    else "no_explicit_ib_device"
-                ),
+                "path_hint": _mooncake_path_hint(self.protocol, self.ib_device),
                 "transfer_parallelism": self._transfer_parallelism,
             },
         }
 
     def _log_ready(self) -> None:
-        if self.ib_device is None:
+        path_hint = _mooncake_path_hint(self.protocol, self.ib_device)
+        if self.protocol == "rdma" and self.ib_device is None:
             logger.warning(
                 "G2plus Mooncake direct transfer enabled session=%s "
-                "ib_device=<none> path_hint=no_explicit_ib_device "
+                "protocol=rdma ib_device=<none> path_hint=no_explicit_ib_device "
                 "parallelism=%d; benchmark labels should not treat this as a "
                 "configured RDMA/GDR path",
                 self.target_session_id,
@@ -423,10 +443,12 @@ class MooncakeG2plusTransferBackend:
             )
             return
         logger.info(
-            "G2plus Mooncake direct transfer enabled session=%s ib_device=%s "
-            "path_hint=explicit_ib_device parallelism=%d",
+            "G2plus Mooncake direct transfer enabled session=%s protocol=%s "
+            "ib_device=%s path_hint=%s parallelism=%d",
             self.target_session_id,
-            self.ib_device,
+            self.protocol,
+            self.ib_device if self.ib_device is not None else "<none>",
+            path_hint,
             self._transfer_parallelism,
         )
 

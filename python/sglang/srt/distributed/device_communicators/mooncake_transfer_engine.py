@@ -124,6 +124,7 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
+        self.protocol: Optional[str] = None
 
         self.initialize(
             hostname=self.hostname,
@@ -189,6 +190,7 @@ class MooncakeTransferEngine:
     ) -> None:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+            self.protocol = "ascend"
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
@@ -202,6 +204,7 @@ class MooncakeTransferEngine:
             )
         else:
             protocol = _get_mooncake_transfer_protocol()
+            self.protocol = protocol
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
@@ -275,6 +278,9 @@ class MooncakeTransferEngine:
 
     def get_ib_device(self):
         return self.ib_device
+
+    def get_protocol(self):
+        return self.protocol
 
 
 def init_mooncake_transfer_engine(
