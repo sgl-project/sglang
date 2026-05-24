@@ -357,14 +357,13 @@ class EagleDraftWorker(BaseDraftWorker):
             self.speculative_num_steps,
         )
 
-        canary_manager = self.draft_runner.canary_runner
         n_inner = self.speculative_num_steps - 1
         canary_outside_ctx = (
-            canary_manager.with_ops_outside_graph(
+            c.with_ops_outside_graph(
                 single_forward_indices=list(range(n_inner)),
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if canary_manager is not None
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
 
@@ -592,18 +591,17 @@ class EagleDraftWorker(BaseDraftWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        canary_manager = self.draft_runner.canary_runner
         canary_outside_ctx = (
-            canary_manager.with_ops_outside_graph(
+            c.with_ops_outside_graph(
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if canary_manager is not None
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
         sfm_index_ctx = (
-            canary_manager.with_active_single_forward_manager(0)
-            if canary_manager is not None
+            c.with_active_single_forward_manager(0)
+            if c is not None
             else contextlib.nullcontext()
         )
         with canary_outside_ctx, sfm_index_ctx:
@@ -660,18 +658,17 @@ class EagleDraftWorker(BaseDraftWorker):
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
-        canary_manager = self.draft_runner.canary_runner
         canary_outside_ctx = (
-            canary_manager.with_ops_outside_graph(
+            c.with_ops_outside_graph(
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if canary_manager is not None
+            if (c := self.draft_runner.canary_runner) is not None
             else contextlib.nullcontext()
         )
         sfm_index_ctx = (
-            canary_manager.with_active_single_forward_manager(0)
-            if canary_manager is not None
+            c.with_active_single_forward_manager(0)
+            if c is not None
             else contextlib.nullcontext()
         )
         with canary_outside_ctx, sfm_index_ctx:
