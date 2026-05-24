@@ -693,7 +693,9 @@ class MQALayer(nn.Module):
 
         return q, kv
 
-    def _should_reuse_topk(self, prev_topk_indices, attn_backend, forward_batch) -> bool:
+    def _should_reuse_topk(
+        self, prev_topk_indices, attn_backend, forward_batch
+    ) -> bool:
         return should_reuse_index_cache(
             self.skip_topk,
             prev_topk_indices,
