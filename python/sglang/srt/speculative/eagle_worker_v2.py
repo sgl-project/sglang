@@ -386,7 +386,7 @@ class EagleDraftWorker(BaseDraftWorker):
             for i in range(n_inner):
                 single_forward_manager = canary_manager.get_single_forward_manager(i)
                 single_forward_manager.post_ops_outside_graph(
-                    snapshot=single_forward_manager.snapshot,
+                    output_buffer=single_forward_manager.output_buffer,
                     maybe_inaccurate_forward_batch=forward_batch,
                 )
             canary_manager.step_shared_facilities(
@@ -618,7 +618,7 @@ class EagleDraftWorker(BaseDraftWorker):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
-                snapshot=canary_sfm.snapshot,
+                output_buffer=canary_sfm.output_buffer,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities(
@@ -702,7 +702,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 ).logits_output
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
-                snapshot=canary_sfm.snapshot,
+                output_buffer=canary_sfm.output_buffer,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities(

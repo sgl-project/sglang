@@ -6,7 +6,7 @@ import torch
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class PostOpsInsideGraphOutputSnapshot:
+class PostOpsInsideGraphOutputBuffer:
     """Per-SingleForwardManager buffer holding the in-graph signals produced by phases 2-3.
 
     Allocated once via :meth:`allocate`; written in-place by phase 3 via
@@ -35,7 +35,7 @@ class PostOpsInsideGraphOutputSnapshot:
         num_slot_tags: int,
         swa_verify_total_count_shape: tuple[int, ...] | None,
         device: torch.device,
-    ) -> "PostOpsInsideGraphOutputSnapshot":
+    ) -> "PostOpsInsideGraphOutputBuffer":
         return cls(
             verify_plan_enable=torch.zeros(1, dtype=torch.int32, device=device),
             kernel_run_counters=torch.zeros(

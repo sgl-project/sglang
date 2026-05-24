@@ -48,7 +48,7 @@ from sglang.srt.kv_canary.runner.kernel_launch import (
 )
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceReport
 from sglang.srt.kv_canary.single_forward_manager.data import (
-    PostOpsInsideGraphOutputSnapshot,
+    PostOpsInsideGraphOutputBuffer,
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
@@ -153,7 +153,7 @@ class SingleForwardManager:
             initial_phase=_SingleForwardPhase.IDLE, device=device
         )
 
-        self._snapshot = PostOpsInsideGraphOutputSnapshot.allocate(
+        self._output_buffer = PostOpsInsideGraphOutputBuffer.allocate(
             num_kernel_tags=int(device_state.kernel_run_counters.shape[0]),
             num_slot_tags=int(device_state.slot_run_counters.shape[0]),
             swa_verify_total_count_shape=(
@@ -165,8 +165,8 @@ class SingleForwardManager:
         )
 
     @property
-    def snapshot(self) -> PostOpsInsideGraphOutputSnapshot:
-        return self._snapshot
+    def output_buffer(self) -> PostOpsInsideGraphOutputBuffer:
+        return self._output_buffer
 
     @property
     def phase_checker(self) -> SimplePhaseChecker:
@@ -308,7 +308,7 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
-        self._snapshot.copy_from(
+        self._output_buffer.copy_from(
             verify_plan_enable=self._verify_plan.enable,
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
@@ -323,11 +323,11 @@ class SingleForwardManager:
     def post_ops_outside_graph(
         self,
         *,
-        snapshot: PostOpsInsideGraphOutputSnapshot,
+        output_buffer: PostOpsInsideGraphOutputBuffer,
         maybe_inaccurate_forward_batch: "ForwardBatch",
     ) -> None:
         """Phase 4. Host-side outside cuda graph. Reads in-graph signals
-        from ``snapshot`` (immune to later-step mutation) plus the live
+        from ``output_buffer`` (immune to later-step mutation) plus the live
         (possibly already-advanced) ``ForwardBatch`` for the tail-after
         perturb that needs to flip a byte in the slot the forward just
         wrote to. The forward_batch arg is named ``maybe_inaccurate_``
@@ -346,7 +346,7 @@ class SingleForwardManager:
             self._perturb_manager.perturb_post_forward(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
-        self._enable_warner.tick(snapshot.verify_plan_enable)
+        self._enable_warner.tick(output_buffer.verify_plan_enable)
 
     def _should_enable_input_check_for_launch(
         self, forward_batch: "ForwardBatch"
