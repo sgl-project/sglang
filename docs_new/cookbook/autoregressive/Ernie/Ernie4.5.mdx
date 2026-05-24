@@ -1,0 +1,696 @@
+---
+title: Ernie4.5
+metatags:
+    description: "Deploy Ernie4.5 with SGLang - community contribution guide for Baidu's Ernie 4.5 model deployment."
+---
+
+import { Ernie45Deployment } from '/src/snippets/autoregressive/ernie-45-deployment.jsx';
+
+## 1. Model Introduction
+
+The **ERNIE-4.5** series is a family of large language models developed by Baidu. ERNIE (Enhanced Representation through Knowledge Integration) 4.5 represents an advanced version of the ERNIE series, optimized for general-purpose tasks and conversational scenarios.
+
+ERNIE-4.5 delivers advanced features as below:
+- **Heterogeneous Modality Structure**: MoE architecture that supports parameter sharing across modalities while allowing dedicated parameters for each individual modality, enhancing multimodal understanding without compromising, and even improving, performance on text-related tasks.
+- **Vision Encoder**: Dedicated adaptive-resolution ViT with 2D RoPE and image packing; for video, adaptive frame sampling and timestamp rendering, supporting both shared and modality-specific visual processing.
+- **Adapter**: Shared modality-bridging module with spatial and temporal compression to align vision to text embedding space, enabling cross-modal understanding without compromising text representations.
+- **Multimodal Position Embedding**: Unified 3D RoPE (temporal, height, width) for vision and 1D RoPE for text in a single embedding space, supporting parameter sharing while encoding modality-specific positions.
+- **Hardware Optimization**: Specifically tuned for AMD MI300X, MI325X, and MI355X GPUs.
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance optimization, suitable for users at different levels.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
+
+<Ernie45Deployment />
+
+## 4. API Usage
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+The following example demonstrates deployment using ERNIE-4.5-21B-A3B-PT.
+
+```shell Command
+python -m sglang.launch_server \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --tp 1
+```
+
+**Basic Python Client Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="baidu/ERNIE-4.5-21B-A3B-PT",
+    messages=[
+        {"role": "user", "content": "What is artificial intelligence?"}
+    ],
+    temperature=1.0,
+    top_p=0.95,
+    max_tokens=1024
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+```text Output
+**Artificial Intelligence (AI)** is the simulation of human intelligence processes by machines, particularly computer systems. These processes include **learning** (acquiring information and rules for using the information), **reasoning** (using rules to reach approximate or definite conclusions), and **self-correction**. AI encompasses a wide range of techniques, algorithms, and methodologies designed to enable machines to perform tasks that typically require human intelligence.
+
+### Key Characteristics of AI:
+...
+
+### In Summary:
+AI represents a transformative force with the potential to revolutionize industries and enhance human capabilities. However, its development requires careful consideration of ethical, legal, and social implications to ensure that it benefits society as a whole. As AI continues to evolve, ongoing dialogue among stakeholders will be crucial to balancing innovation with responsibility.
+```
+
+**Streaming Example:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="baidu/ERNIE-4.5-21B-A3B-PT",
+    messages=[
+        {"role": "user", "content": "Explain quantum computing in simple terms."}
+    ],
+    temperature=1.0,
+    top_p=0.95,
+    max_tokens=2048,
+    stream=True
+)
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+Sure! Here’s a simple explanation of quantum computing:
+
+### **Quantum Computing: Making Computers Super Fast (But Weird) Using Quantum Rules**
+
+1. **Classic vs. Quantum Computers**
+   - **Normal computers** use **bits** (0s and 1s) to store and process information.
+   - **Quantum computers** use **qubits** (short for quantum bits). Unlike bits, qubits can be **0, 1, or both at the same time** (this is called **superposition**).
+
+2. **Superposition: The Magic Behind Speed**
+   - A single qubit can represent **0 and 1 simultaneously**, like a coin spinning in the air.
+   - Many qubits working together (in something called **quantum parallelism**) can **check multiple possibilities at once**, making quantum computers much faster for certain problems.
+
+3. **Entanglement: Making Qubits Link**
+   - When qubits are **entangled**, their states are linked—changing one instantly affects the other, no matter how far apart they are (this is called **spooky action at a distance** by Einstein).
+   - Entanglement allows quantum computers to process information in **very efficient ways**.
+
+4. **What Quantum Computers Are Good At**
+   - **Cracking encryption** (like RSA).
+   - **Factoring large numbers** (used in encryption and cryptography).
+   - **Searching unsorted databases** (way faster than classical computers).
+   - **Simulating quantum systems** (like molecules for drug discovery).
+   - **Optimizing problems** (like logistics or finance).
+
+5. **Challenges & Current State**
+   - Qubits are **fragile** and easily disturbed (called **decoherence**).
+   - Engineers are working to keep qubits stable long enough to do useful calculations.
+   - Today’s quantum computers are **small and experimental**, but the goal is to build powerful ones that outperform classical supercomputers.
+
+### **Final Thought**
+Quantum computing isn’t just a faster calculator—it’s a **new way of thinking about problems** using the weird laws of physics. While still new, it has the potential to revolutionize fields like medicine, AI, and cybersecurity.
+
+Would you like an example of how a quantum computer might solve a problem? 😊
+```
+
+## 5. Benchmark
+
+This section uses **industry-standard configurations** for comparable benchmark results.
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: AMD MI300X GPU (1x)
+- Model: ERNIE-4.5-21B-A3B-PT
+- Tensor Parallelism: 1
+- SGLang Version: 0.5.7
+
+**Benchmark Methodology:**
+
+We use industry-standard benchmark configurations to ensure results are comparable across frameworks and hardware platforms.
+
+#### 5.1.1 Standard Scenario Benchmark
+
+- Model Deployment Command:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path baidu/ERNIE-4.5-21B-A3B-PT \
+  --tp 1
+```
+
+##### 5.1.1.1 Low Concurrency (Latency-Optimized)
+- Benchmark Command:
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  58.72
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4219
+Request throughput (req/s):              0.17
+Input token throughput (tok/s):          103.90
+Output token throughput (tok/s):         71.87
+Peak output token throughput (tok/s):    245.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          175.77
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   5869.86
+Median E2E Latency (ms):                 1870.80
+---------------Time to First Token----------------
+Mean TTFT (ms):                          4152.58
+Median TTFT (ms):                        36.81
+P99 TTFT (ms):                           37498.23
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          4.07
+Median TPOT (ms):                        4.09
+P99 TPOT (ms):                           4.09
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           4.08
+Median ITL (ms):                         4.08
+P95 ITL (ms):                            4.14
+P99 ITL (ms):                            4.20
+Max ITL (ms):                            4.67
+==================================================
+```
+
+##### 5.1.1.2 Medium Concurrency (Balanced)
+- Benchmark Command:
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  34.30
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  40805
+Total generated tokens (retokenized):    40773
+Request throughput (req/s):              2.33
+Input token throughput (tok/s):          1156.62
+Output token throughput (tok/s):         1189.77
+Peak output token throughput (tok/s):    1392.00
+Peak concurrent requests:                21
+Total token throughput (tok/s):          2346.39
+Concurrency:                             14.14
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   6060.62
+Median E2E Latency (ms):                 6496.70
+---------------Time to First Token----------------
+Mean TTFT (ms):                          78.90
+Median TTFT (ms):                        45.90
+P99 TTFT (ms):                           234.33
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          11.99
+Median TPOT (ms):                        12.16
+P99 TPOT (ms):                           14.81
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           11.75
+Median ITL (ms):                         11.48
+P95 ITL (ms):                            12.24
+P99 ITL (ms):                            34.85
+Max ITL (ms):                            105.01
+==================================================
+```
+
+##### 5.1.1.3 High Concurrency (Throughput-Optimized)
+- Benchmark Command:
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 1000 \
+  --num-prompts 500 \
+  --max-concurrency 100 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     500
+Benchmark duration (s):                  66.63
+Total input tokens:                      249831
+Total input text tokens:                 249831
+Total input vision tokens:               0
+Total generated tokens:                  252662
+Total generated tokens (retokenized):    252449
+Request throughput (req/s):              7.50
+Input token throughput (tok/s):          3749.79
+Output token throughput (tok/s):         3792.28
+Peak output token throughput (tok/s):    4902.00
+Peak concurrent requests:                113
+Total token throughput (tok/s):          7542.06
+Concurrency:                             90.33
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   12036.90
+Median E2E Latency (ms):                 11782.16
+---------------Time to First Token----------------
+Mean TTFT (ms):                          104.86
+Median TTFT (ms):                        84.62
+P99 TTFT (ms):                           297.85
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          23.89
+Median TPOT (ms):                        24.62
+P99 TPOT (ms):                           26.91
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           23.66
+Median ITL (ms):                         20.48
+P95 ITL (ms):                            45.57
+P99 ITL (ms):                            54.31
+Max ITL (ms):                            185.12
+==================================================
+```
+
+#### 5.1.2 Reasoning Scenario Benchmark
+
+##### 5.1.2.1 Low Concurrency
+- Benchmark Command:
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  185.11
+Total input tokens:                      6101
+Total input text tokens:                 6101
+Total input vision tokens:               0
+Total generated tokens:                  44462
+Total generated tokens (retokenized):    44423
+Request throughput (req/s):              0.05
+Input token throughput (tok/s):          32.96
+Output token throughput (tok/s):         240.19
+Peak output token throughput (tok/s):    245.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          273.15
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   18508.84
+Median E2E Latency (ms):                 19866.81
+---------------Time to First Token----------------
+Mean TTFT (ms):                          32.59
+Median TTFT (ms):                        32.14
+P99 TTFT (ms):                           38.58
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          4.13
+Median TPOT (ms):                        4.13
+P99 TPOT (ms):                           4.20
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           4.16
+Median ITL (ms):                         4.12
+P95 ITL (ms):                            4.31
+P99 ITL (ms):                            4.36
+Max ITL (ms):                            7.28
+==================================================
+```
+
+##### 5.1.2.2 Medium Concurrency
+
+- Benchmark Command:
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  263.48
+Total input tokens:                      39668
+Total input text tokens:                 39668
+Total input vision tokens:               0
+Total generated tokens:                  318306
+Total generated tokens (retokenized):    317984
+Request throughput (req/s):              0.30
+Input token throughput (tok/s):          150.55
+Output token throughput (tok/s):         1208.09
+Peak output token throughput (tok/s):    1408.00
+Peak concurrent requests:                19
+Total token throughput (tok/s):          1358.64
+Concurrency:                             14.35
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   47249.55
+Median E2E Latency (ms):                 47828.67
+---------------Time to First Token----------------
+Mean TTFT (ms):                          62.77
+Median TTFT (ms):                        57.10
+P99 TTFT (ms):                           93.70
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          11.92
+Median TPOT (ms):                        12.09
+P99 TPOT (ms):                           12.50
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           11.86
+Median ITL (ms):                         12.04
+P95 ITL (ms):                            12.68
+P99 ITL (ms):                            13.61
+Max ITL (ms):                            39.94
+==================================================
+```
+
+##### 5.1.2.3 High Concurrency
+- Benchmark Command:
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 1000 \
+  --random-output-len 8000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  428.30
+Total input tokens:                      158939
+Total input text tokens:                 158939
+Total input vision tokens:               0
+Total generated tokens:                  1301025
+Total generated tokens (retokenized):    1299877
+Request throughput (req/s):              0.75
+Input token throughput (tok/s):          371.09
+Output token throughput (tok/s):         3037.63
+Peak output token throughput (tok/s):    3880.00
+Peak concurrent requests:                69
+Total token throughput (tok/s):          3408.73
+Concurrency:                             57.08
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   76392.58
+Median E2E Latency (ms):                 79698.73
+---------------Time to First Token----------------
+Mean TTFT (ms):                          92.79
+Median TTFT (ms):                        78.71
+P99 TTFT (ms):                           168.89
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          18.81
+Median TPOT (ms):                        19.15
+P99 TPOT (ms):                           19.81
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           18.77
+Median ITL (ms):                         18.77
+P95 ITL (ms):                            19.86
+P99 ITL (ms):                            42.08
+Max ITL (ms):                            74.36
+==================================================
+```
+
+#### 5.1.3 Summarization Scenario Benchmark
+
+##### 5.1.3.1 Low Concurrency
+- Benchmark Command:
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  18.59
+Total input tokens:                      41941
+Total input text tokens:                 41941
+Total input vision tokens:               0
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    4216
+Request throughput (req/s):              0.54
+Input token throughput (tok/s):          2256.43
+Output token throughput (tok/s):         227.04
+Peak output token throughput (tok/s):    245.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          2483.46
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1856.72
+Median E2E Latency (ms):                 1513.87
+---------------Time to First Token----------------
+Mean TTFT (ms):                          86.66
+Median TTFT (ms):                        72.30
+P99 TTFT (ms):                           167.13
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          4.19
+Median TPOT (ms):                        4.22
+P99 TPOT (ms):                           4.30
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           4.20
+Median ITL (ms):                         4.23
+P95 ITL (ms):                            4.34
+P99 ITL (ms):                            4.42
+Max ITL (ms):                            5.68
+==================================================
+```
+
+##### 5.1.3.2 Medium Concurrency
+- Benchmark Command:
+
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 80 \
+  --max-concurrency 16 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 16
+Successful requests:                     80
+Benchmark duration (s):                  40.25
+Total input tokens:                      300020
+Total input text tokens:                 300020
+Total input vision tokens:               0
+Total generated tokens:                  41669
+Total generated tokens (retokenized):    41646
+Request throughput (req/s):              1.99
+Input token throughput (tok/s):          7454.72
+Output token throughput (tok/s):         1035.37
+Peak output token throughput (tok/s):    1310.00
+Peak concurrent requests:                20
+Total token throughput (tok/s):          8490.09
+Concurrency:                             14.37
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   7229.56
+Median E2E Latency (ms):                 7578.95
+---------------Time to First Token----------------
+Mean TTFT (ms):                          137.38
+Median TTFT (ms):                        122.59
+P99 TTFT (ms):                           485.34
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          14.04
+Median TPOT (ms):                        14.24
+P99 TPOT (ms):                           20.77
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           13.64
+Median ITL (ms):                         12.36
+P95 ITL (ms):                            14.72
+P99 ITL (ms):                            57.39
+Max ITL (ms):                            411.31
+==================================================
+```
+
+##### 5.1.3.3 High Concurrency
+
+- Benchmark Command:
+```bash Command
+python -m sglang.bench_serving \
+  --backend sglang \
+  --model baidu/ERNIE-4.5-21B-A3B-PT \
+  --dataset-name random \
+  --random-input-len 8000 \
+  --random-output-len 1000 \
+  --num-prompts 320 \
+  --max-concurrency 64 \
+  --request-rate inf
+```
+
+- Test Results:
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 64
+Successful requests:                     320
+Benchmark duration (s):                  78.33
+Total input tokens:                      1273893
+Total input text tokens:                 1273893
+Total input vision tokens:               0
+Total generated tokens:                  170000
+Total generated tokens (retokenized):    169888
+Request throughput (req/s):              4.09
+Input token throughput (tok/s):          16262.33
+Output token throughput (tok/s):         2170.20
+Peak output token throughput (tok/s):    3005.00
+Peak concurrent requests:                73
+Total token throughput (tok/s):          18432.53
+Concurrency:                             58.79
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   14392.52
+Median E2E Latency (ms):                 14460.70
+---------------Time to First Token----------------
+Mean TTFT (ms):                          184.82
+Median TTFT (ms):                        155.24
+P99 TTFT (ms):                           379.82
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          26.97
+Median TPOT (ms):                        28.31
+P99 TPOT (ms):                           33.61
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           26.79
+Median ITL (ms):                         20.55
+P95 ITL (ms):                            47.55
+P99 ITL (ms):                            145.64
+Max ITL (ms):                            287.62
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+Document model accuracy on standard benchmarks:
+
+#### 5.2.1 GSM8K Benchmark
+
+- Benchmark Command:
+
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py \
+  --num-shots 8 \
+  --num-questions 1316 \
+  --parallel 1316
+```
+
+- Test Results:
+  - ERNIE-4.5-21B-A3B-PT
+  ```
+  Accuracy: 0.865
+  Invalid: 0.000
+  Latency: 21.669 s
+  Output throughput: 10359.790 token/s
+  ```

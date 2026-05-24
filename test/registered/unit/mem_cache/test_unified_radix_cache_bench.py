@@ -12,6 +12,7 @@ import random
 import statistics
 import time
 import unittest
+from array import array
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
@@ -38,7 +39,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-small")
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -335,7 +336,8 @@ def _insert_seq(env, seq):
     if env.has_mamba:
         req = env.make_req()
         mamba_val = req.mamba_pool_idx.unsqueeze(0)
-    env.tree.insert(InsertParams(key=RadixKey(seq), value=v, mamba_value=mamba_val))
+    key = RadixKey(array("q", seq))
+    env.tree.insert(InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val))
     return True
 
 
@@ -356,7 +358,10 @@ def _fill_no_evict(env):
         if env.has_mamba:
             req = env.make_req()
             mamba_val = req.mamba_pool_idx.unsqueeze(0)
-        env.tree.insert(InsertParams(key=RadixKey(seq), value=v, mamba_value=mamba_val))
+        key = RadixKey(array("q", seq))
+        env.tree.insert(
+            InsertParams(key=key, value=v[: len(key)], mamba_value=mamba_val)
+        )
         inserted += 1
     return inserted
 
@@ -501,15 +506,16 @@ def bench_match_prefix(
             queries.append([rng.randint(1, 32000)] * rng.randint(50, 300))
 
     def verify_fn(q):
-        r1 = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q)))
-        r2 = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q)))
+        k = RadixKey(array("q", q))
+        r1 = env.tree.match_prefix(MatchPrefixParams(key=k))
+        r2 = env.tree.match_prefix(MatchPrefixParams(key=k))
         assert len(r1.device_indices) == len(r2.device_indices), "match not idempotent"
 
     warmup = min(20, len(queries) // 10)
     return bench_api(
         "match_prefix",
         lambda: queries,
-        lambda q: env.tree.match_prefix(MatchPrefixParams(key=RadixKey(q))),
+        lambda q: env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", q)))),
         min(len(queries) - warmup, num_seqs),
         env.avg_tokens,
         warmup,
@@ -561,7 +567,7 @@ def bench_lock_unlock(
 
     nodes = []
     for seq in env.seqs[: num_seqs // 2]:
-        r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(seq)))
+        r = env.tree.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
         if r.last_device_node != env.tree.root_node:
             nodes.append(r.last_device_node)
     if not nodes:
@@ -608,7 +614,7 @@ def bench_cache_finished(
     # Pre-build Req objects with token IDs filled into req_to_token
     req_items: list = []
     for seq in env.seqs:
-        key = RadixKey(seq)
+        key = RadixKey(array("q", seq))
         mr = env.tree.match_prefix(MatchPrefixParams(key=key))
         matched_len = len(mr.device_indices)
         node = mr.last_device_node
@@ -630,9 +636,9 @@ def bench_cache_finished(
             kv_indices = mr.device_indices
 
         req = env.make_req()
-        req.origin_input_ids = list(seq)
-        req.output_ids = []
-        req.fill_ids = list(seq)
+        req.origin_input_ids = array("q", seq)
+        req.output_ids = array("q")
+        req.fill_ids = array("q", seq)
         req.last_node = node
         req.cache_protected_len = matched_len
         req.kv_committed_len = len(seq)

@@ -87,16 +87,16 @@ class AscendLoRABackend(BaseLoRABackend):
         output_offset_cpu: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        num_slices = 3
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = qkv_lora_a.shape
         _, weight_out_dim, _ = qkv_lora_b.shape
-        max_rank = weight_intermediate_dim // num_slices
+        max_rank = weight_intermediate_dim // n_slices
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -124,7 +124,7 @@ class AscendLoRABackend(BaseLoRABackend):
         )
         lora_a_output *= scaling
 
-        for slice_id in range(num_slices):
+        for slice_id in range(n_slices):
             slice_offset = output_offset_cpu[slice_id]
             slice_offset_next = output_offset_cpu[slice_id + 1]
             slice_size = slice_offset_next - slice_offset
