@@ -157,6 +157,25 @@ class SingleForwardManager:
             device=device,
         )
 
+        # Per-SFM persistent buffers. Allocating these fresh inside
+        # ``pre_ops_maybe_inside_graph`` (which runs inside cuda-graph capture
+        # for DECODE / EAGLE-draft) puts them in the cuda-graph memory pool;
+        # two SFMs in the same captured region (eagle multi-step) can then
+        # land at overlapping addresses and corrupt each other's writes.
+        # Owning them per-SFM at init keeps each SFM's slots distinct.
+        self._verify_plan = VerifyPlan.allocate(
+            verify_capacity=per_forward_verify_capacity, device=device
+        )
+        self._write_plan = WritePlan.allocate(
+            write_req_capacity=per_forward_write_req_capacity, device=device
+        )
+        self._plan_input = PlanInput.allocate(
+            bs_capacity=per_forward_write_req_capacity, device=device
+        )
+        self._expected_inputs = ExpectedInputs.allocate(
+            capacity=per_forward_write_entry_capacity, device=device
+        )
+
     @property
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
@@ -210,18 +229,13 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        verify_plan = VerifyPlan.allocate(
-            verify_capacity=self._verify_capacity, device=self._device
-        )
-        write_plan = WritePlan.allocate(
-            write_req_capacity=self._write_req_capacity, device=self._device
-        )
-        expected_inputs = ExpectedInputs.allocate(
-            capacity=self._write_entry_capacity, device=self._device
-        )
-        plan_input = PlanInput.allocate(
-            bs_capacity=self._write_req_capacity, device=self._device
-        )
+        # Reuse the per-SFM persistent buffers allocated at construction
+        # rather than fresh-allocating inside the captured region (see
+        # __init__ comment about cuda-graph-pool overlap on eagle multi-step).
+        verify_plan = self._verify_plan
+        write_plan = self._write_plan
+        expected_inputs = self._expected_inputs
+        plan_input = self._plan_input
 
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         if input_check_mode:
