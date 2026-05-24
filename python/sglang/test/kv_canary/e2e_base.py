@@ -60,6 +60,13 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
             server_env.setdefault(
                 "SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL", "20"
             )
+            # SWA mode uses google/gemma-4-E2B-it, whose forward does a
+            # ``positions += 1`` in-place. canary's WRITE/VERIFY require
+            # forward_batch.positions to stay 0-indexed, so flip the gemma
+            # path to out-of-place shift for these tests.
+            server_env.setdefault(
+                "SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION", "1"
+            )
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()

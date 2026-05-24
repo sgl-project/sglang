@@ -29,6 +29,13 @@ class ViolationReporter:
         self._config = config
         self._device_state = device_state
         self._raised: bool = False
+        # In log mode, the kernel keeps appending to violation_ring across pumps
+        # (we never reset violation_write_index). Track how many ring entries we
+        # have already surfaced so each pump only logs the *new* ones; otherwise
+        # every pump after the first violation re-dumps the full ring (up to
+        # ring_capacity) and the host-side stderr flood blocks the main thread,
+        # causing HTTP timeouts on the test client.
+        self._last_logged_write_index: int = 0
 
     @property
     def is_raised(self) -> bool:
@@ -44,6 +51,13 @@ class ViolationReporter:
         valid_count = min(write_index, ring_capacity)
         ring_overflow = write_index > ring_capacity
 
+        # Only surface entries we have not surfaced before. Clamp the lower
+        # bound to valid_count so that if the kernel has overflowed and is now
+        # rolling over the ring, we don't accidentally re-emit the entire ring.
+        start = min(self._last_logged_write_index, valid_count)
+        if start >= valid_count:
+            return
+
         messages: list[str] = [
             _format_violation(
                 row=ring[i].tolist(),
@@ -51,8 +65,9 @@ class ViolationReporter:
                 ring_overflow=ring_overflow,
                 step_when_pumped=outer_step_counter,
             )
-            for i in range(valid_count)
+            for i in range(start, valid_count)
         ]
+        self._last_logged_write_index = valid_count
 
         # log mode: always surface every violation as WARNING. Never rate-limit or demote to
         # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever

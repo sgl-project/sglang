@@ -45,6 +45,19 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
         )
         cls.extra_prefill_args = list(canary_args)
         cls.extra_decode_args = list(canary_args)
+        if cls.model_mode == "swa":
+            # SWA mode uses google/gemma-4-E2B-it, whose forward does a
+            # ``positions += 1`` in-place. canary's WRITE/VERIFY require
+            # forward_batch.positions to stay 0-indexed, so flip the gemma
+            # path to out-of-place shift for these tests.
+            cls.extra_prefill_env = {
+                **cls.extra_prefill_env,
+                "SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION": "1",
+            }
+            cls.extra_decode_env = {
+                **cls.extra_decode_env,
+                "SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION": "1",
+            }
         cls.launch_all()
 
     def send_parallel_short_requests(
