@@ -239,7 +239,9 @@ def metric_candidates_from_files(out_dir: Path | None) -> list[dict]:
     candidates = []
     for path in sorted(out_dir.rglob("*.json")):
         try:
-            candidates.extend(metric_candidates_from_object(json.loads(path.read_text())))
+            candidates.extend(
+                metric_candidates_from_object(json.loads(path.read_text()))
+            )
         except (OSError, json.JSONDecodeError):
             continue
     return candidates
@@ -315,7 +317,9 @@ def summarize_primary_metrics(rows: list[dict]) -> dict:
         if not primary_metric:
             continue
         key = f"{row['endpoint']}::{row['task']}::{primary_metric['name']}"
-        grouped.setdefault(key, {"values": []})["values"].append(primary_metric["value"])
+        grouped.setdefault(key, {"values": []})["values"].append(
+            primary_metric["value"]
+        )
 
     summary = {}
     for key, data in grouped.items():

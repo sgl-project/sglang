@@ -4,7 +4,6 @@ from typing import Optional
 
 import torch
 
-
 _index_cache_capture_gate: Optional[bool] = None
 
 
@@ -62,9 +61,9 @@ def _translate_raw_indices_to_page_indices(
     out_page_indices: torch.Tensor,
     page_size: int,
 ) -> None:
-    assert page_size > 0 and (page_size & (page_size - 1)) == 0, (
-        f"c4_page_size must be a positive power of two, got {page_size}"
-    )
+    assert (
+        page_size > 0 and (page_size & (page_size - 1)) == 0
+    ), f"c4_page_size must be a positive power of two, got {page_size}"
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
     valid = raw_indices >= 0

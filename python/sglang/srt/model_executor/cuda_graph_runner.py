@@ -891,7 +891,9 @@ class CudaGraphRunner:
             self.index_cache_capture_enabled = None
 
     def _index_cache_capture_variants(self):
-        if index_cache_config_has_context_gate(self.model_runner.model_config.hf_config):
+        if index_cache_config_has_context_gate(
+            self.model_runner.model_config.hf_config
+        ):
             return (False, True)
         return (None,)
 

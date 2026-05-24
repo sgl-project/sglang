@@ -153,11 +153,7 @@ def greedy_search_pattern(
         )
     initial_pattern = pattern_to_str(pattern)
     baseline_loss = score_pattern(initial_pattern)
-    print(
-        json.dumps(
-            {"baseline": {"pattern": initial_pattern, "loss": baseline_loss}}
-        )
-    )
+    print(json.dumps({"baseline": {"pattern": initial_pattern, "loss": baseline_loss}}))
     history = []
 
     while pattern.count("F") > target_f:
@@ -274,7 +270,7 @@ def main() -> None:
         "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
         "retentions": {
             retention: search(args, retention) for retention in args.retention
-        }
+        },
     }
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n")

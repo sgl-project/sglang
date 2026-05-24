@@ -241,10 +241,13 @@ def test_dsv4_index_cache_graph_gate_is_inactive_without_context_gate():
         index_topk_min_seq_len=75000,
     )
 
-    assert index_cache.index_cache_graph_gate_value(
-        config,
-        torch.tensor([12000], dtype=torch.int32),
-    ) is None
+    assert (
+        index_cache.index_cache_graph_gate_value(
+            config,
+            torch.tensor([12000], dtype=torch.int32),
+        )
+        is None
+    )
     assert (
         index_cache.index_cache_cuda_graph_profile_mode(
             "decode",
