@@ -184,6 +184,11 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
             "profile traces are missing CUDA graph replay/fallback path stats; "
             "check that DSV4 IndexCache profiling reached ModelRunner.forward"
         )
+    if not any(".indexcache_on." in path for path in cuda_graph_paths):
+        raise RuntimeError(
+            "profile traces did not record an indexcache_on CUDA graph path; "
+            "check that the profiled prompt exceeded the IndexCache context gate"
+        )
 
 
 def parse_args(argv: list[str] | None = None):
