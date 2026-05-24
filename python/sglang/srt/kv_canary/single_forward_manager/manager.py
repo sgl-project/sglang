@@ -181,9 +181,6 @@ class SingleForwardManager:
         Callers in this phase should treat the batch as a coarse cycle-
         level view.
         """
-        if self._config.mode == "off":
-            return
-
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.IDLE,
             next_phase=_SingleForwardPhase.AFTER_PRE_OUT,
@@ -213,17 +210,13 @@ class SingleForwardManager:
 
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
-    ) -> Optional["_PreOpsMaybeInsideGraphOutput"]:
+    ) -> "_PreOpsMaybeInsideGraphOutput":
         """Phase 2. Capture-safe ops only (DECODE path is inside cuda graph;
         EXTEND / eager fallback is outside). Fired by monkey-patched
         ``model.forward`` wrap BEFORE the original forward.
 
-        Returns the staged plan + expected_inputs threaded to phase 3, or
-        ``None`` when canary is mode=off.
+        Returns the staged plan + expected_inputs threaded to phase 3.
         """
-        if self._config.mode == "off":
-            return None
-
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_OUT,
             next_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
@@ -298,7 +291,7 @@ class SingleForwardManager:
     def post_ops_maybe_inside_graph(
         self,
         forward_batch: "ForwardBatch",
-        pre_ops_output: Optional["_PreOpsMaybeInsideGraphOutput"],
+        pre_ops_output: "_PreOpsMaybeInsideGraphOutput",
     ) -> None:
         """Phase 3. Same capture regime as phase 2. Fired by monkey-patched
         ``model.forward`` wrap AFTER the original forward.
@@ -308,9 +301,6 @@ class SingleForwardManager:
         observable into the per-SingleForwardManager output buffer so
         phase 4 sees a dead view immune to later step mutation.
         """
-        if pre_ops_output is None:
-            return
-
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
             next_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
@@ -360,9 +350,6 @@ class SingleForwardManager:
         wrote to. The forward_batch arg is named ``maybe_inaccurate_``
         because by phase 4 the outer cycle may already have mutated its
         step-specific fields."""
-        if self._config.mode == "off":
-            return
-
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
             next_phase=_SingleForwardPhase.IDLE,
