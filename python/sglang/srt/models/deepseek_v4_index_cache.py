@@ -121,6 +121,14 @@ def index_cache_config_enabled(config) -> bool:
     )
 
 
+def validate_index_cache_hisparse_compatibility(config, enable_hisparse: bool) -> None:
+    if enable_hisparse and index_cache_config_enabled(config):
+        raise ValueError(
+            "DeepSeek V4 IndexCache is incompatible with --enable-hisparse; "
+            "disable HiSparse or remove index_topk_pattern/index_topk_freq reuse"
+        )
+
+
 def index_cache_graph_gate_value(
     config,
     seq_lens_cpu: Optional[torch.Tensor],

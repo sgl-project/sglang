@@ -267,6 +267,19 @@ def test_dsv4_index_cache_config_enabled_ignores_context_floor():
     )
 
 
+def test_dsv4_index_cache_rejects_hisparse_combination():
+    config = SimpleNamespace(index_topk_freq=2, index_topk_pattern=None)
+
+    with pytest.raises(ValueError, match="--enable-hisparse"):
+        index_cache.validate_index_cache_hisparse_compatibility(config, True)
+
+    index_cache.validate_index_cache_hisparse_compatibility(config, False)
+    index_cache.validate_index_cache_hisparse_compatibility(
+        SimpleNamespace(index_topk_freq=1, index_topk_pattern=None),
+        True,
+    )
+
+
 def test_dsv4_index_cache_capture_gate_restores_previous_value():
     assert index_cache.get_index_cache_capture_gate() is None
     with index_cache.set_index_cache_capture_gate(False):

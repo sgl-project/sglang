@@ -171,8 +171,12 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v4_index_cache import (
     index_cache_cuda_graph_profile_mode,
     should_disable_cuda_graph_for_index_cache_gate,
+    validate_index_cache_hisparse_compatibility,
 )
-from sglang.srt.models.deepseek_v4_index_cache_profile import record_cuda_graph_path
+from sglang.srt.models.deepseek_v4_index_cache_profile import (
+    is_dsv4_index_cache_profile_enabled,
+    record_cuda_graph_path,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
@@ -653,6 +657,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        validate_index_cache_hisparse_compatibility(
+            self.model_config.hf_config,
+            self.enable_hisparse,
+        )
         self._prepare_moe_topk()
 
         # Load the expert backup client
@@ -3073,14 +3081,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.seq_lens_cpu,
         ):
             can_run_graph = False
-        record_cuda_graph_path(
-            index_cache_cuda_graph_profile_mode(
-                "extend_piecewise",
-                self.model_config.hf_config,
-                forward_batch.seq_lens_cpu,
-            ),
-            can_run_graph,
-        )
+        if is_dsv4_index_cache_profile_enabled():
+            record_cuda_graph_path(
+                index_cache_cuda_graph_profile_mode(
+                    "extend_piecewise",
+                    self.model_config.hf_config,
+                    forward_batch.seq_lens_cpu,
+                ),
+                can_run_graph,
+            )
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
             # replay_prepare time. Move timing into the piecewise cuda graph
@@ -3289,14 +3298,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 )
             )
-            record_cuda_graph_path(
-                index_cache_cuda_graph_profile_mode(
-                    graph_mode,
-                    self.model_config.hf_config,
-                    forward_batch.seq_lens_cpu,
-                ),
-                can_run_graph,
-            )
+            if is_dsv4_index_cache_profile_enabled():
+                record_cuda_graph_path(
+                    index_cache_cuda_graph_profile_mode(
+                        graph_mode,
+                        self.model_config.hf_config,
+                        forward_batch.seq_lens_cpu,
+                    ),
+                    can_run_graph,
+                )
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if (
