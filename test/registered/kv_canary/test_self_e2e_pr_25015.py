@@ -41,6 +41,11 @@ class _EaglePositionsBase(CanaryE2EBase):
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
     extra_server_args = _SPEC_EAGLE_SERVER_ARGS
+    # Use unique-prefix prompts so each request keeps its own KV-cache slots
+    # without radix folding. This isolates the eagle position-mismatch
+    # detection path from the prefix-share verify path, which has subtle
+    # chain-hash recomputation timing that's outside the scope of this test.
+    use_unique_prompts: ClassVar[bool] = True
     revert_pr: ClassVar[bool]
 
     @classmethod
