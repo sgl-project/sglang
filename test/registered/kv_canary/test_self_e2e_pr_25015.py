@@ -32,8 +32,6 @@ _SPEC_EAGLE_SERVER_ARGS = (
     str(_CUDA_GRAPH_MAX_BS),
     "--max-running-requests",
     "32",
-    "--piecewise-cuda-graph-max-tokens",
-    "2048",
     "--max-total-tokens",
     "16384",
 )
