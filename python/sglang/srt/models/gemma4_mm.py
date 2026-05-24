@@ -29,6 +29,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -596,10 +597,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        # Out-of-place shift: Gemma RoPE expects 1-indexed positions, but
-        # ``forward_batch.positions`` must stay canonical 0-indexed for downstream
-        # consumers (e.g. kv_canary write/verify).
-        positions = positions + 1
+        # Gemma RoPE expects 1-indexed positions. Default behavior shifts
+        # in-place to match the historical reference; flip
+        # SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION to leave
+        # ``forward_batch.positions`` canonical (required by kv_canary).
+        if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
+            positions = positions + 1
+        else:
+            positions += 1
         per_layer_inputs = None
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
