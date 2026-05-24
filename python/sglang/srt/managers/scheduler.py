@@ -3014,7 +3014,7 @@ class Scheduler(
         group_size is computed adaptively by _get_pipeline_group_size().
         """
         self.forward_ct += 1
-        self._profile_batch_predicate(batch)
+        self.profiler_manager._profile_batch_predicate(batch)
 
         # Capture prefill start time
         set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
