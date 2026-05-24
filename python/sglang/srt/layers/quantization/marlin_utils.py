@@ -34,10 +34,27 @@ if TYPE_CHECKING:
 
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
 
-try:
-    from vllm import _custom_ops as ops
-except ImportError:
-    ops = None
+ops = None  # vllm._custom_ops loaded lazily on first use
+
+_vllm_ops_loaded = False
+
+
+def _get_vllm_ops():
+    """Lazy-load vllm._custom_ops to avoid crash on incompatible vllm builds."""
+    global ops, _vllm_ops_loaded
+    if not _vllm_ops_loaded:
+        _vllm_ops_loaded = True
+        try:
+            from vllm import _custom_ops as _ops
+
+            ops = _ops
+        except (ImportError, OSError, RuntimeError):
+            # ImportError: vllm not installed.
+            # OSError: shared library (.so) failed to load (e.g., CUDA version mismatch).
+            # RuntimeError: custom ops initialization failed.
+            # Catching bare Exception would mask programming errors.
+            ops = None
+    return ops
 
 
 _is_cuda = is_cuda()
@@ -848,7 +865,13 @@ class MarlinLinearMethod(LinearMethodBase):
         size_k = x_2d.shape[1]
         size_n = scales.shape[1]
 
-        output_2d = ops.marlin_gemm(
+        _ops = _get_vllm_ops()
+        if _ops is None:
+            raise RuntimeError(
+                "marlin_gemm requires vllm._custom_ops, but vllm is not installed "
+                "or its custom ops could not be loaded."
+            )
+        output_2d = _ops.marlin_gemm(
             x_2d, qweight, scales, workspace, size_m, size_n, size_k
         )
 

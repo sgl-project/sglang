@@ -90,8 +90,11 @@ if _is_hip:
             import vllm._C  # noqa: F401
 
             _has_vllm = True
-        except ImportError:
-            # Fallback: vllm not available, will use native PyTorch implementation
+        except (ImportError, OSError, RuntimeError):
+            # ImportError: vllm._C not installed.
+            # OSError: shared library (.so) failed to load (e.g., CUDA version mismatch).
+            # RuntimeError: custom ops initialization failed.
+            # Catching bare Exception would mask programming errors.
             _has_vllm = False
 
 logger = logging.getLogger(__name__)
