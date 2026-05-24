@@ -51,11 +51,11 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
-    SparsePrefillChunkCache,
-)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_gate import (
     can_use_sparse_prefill,
+)
+from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+    SparsePrefillChunkCache,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_cp_rank,
@@ -1052,9 +1052,12 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            use_sparse_prefill = forward_batch.forward_mode.is_extend_without_speculative() and (
-                q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+            use_sparse_prefill = (
+                forward_batch.forward_mode.is_extend_without_speculative()
+                and (
+                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+                )
             )
             if use_sparse_prefill:
                 from sglang.srt.layers.attention.dsa.utils import (

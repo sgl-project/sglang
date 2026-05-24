@@ -55,9 +55,7 @@ def test_combine_topk_swa_indices_uses_sparse_prefill_positions():
     )
     expected[0, :6] = torch.tensor([100, 101, 201, 202, 203, 204], device=device)
     expected[1, :6] = torch.tensor([110, 111, 203, 204, 205, 206], device=device)
-    expected[2, :7] = torch.tensor(
-        [120, 121, 122, 205, 206, 207, 208], device=device
-    )
+    expected[2, :7] = torch.tensor([120, 121, 122, 205, 206, 207, 208], device=device)
     expected_lens = torch.tensor([6, 6, 7], dtype=torch.int32, device=device)
 
     assert torch.equal(combined_lens, expected_lens)

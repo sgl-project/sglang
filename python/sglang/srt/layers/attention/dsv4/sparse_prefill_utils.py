@@ -416,12 +416,10 @@ class SparsePrefillChunkCache:
             local_extend_seq_lens = extend_seq_lens
 
         query_start_loc = torch.zeros(num_reqs + 1, dtype=torch.int32, device=device)
-        query_start_loc[1:] = torch.cumsum(local_extend_seq_lens, dim=0).to(
-            torch.int32
-        )
-        assert int(query_start_loc[-1].item()) == num_qo_tokens, (
-            f"local query rows {int(query_start_loc[-1].item())} != {num_qo_tokens}"
-        )
+        query_start_loc[1:] = torch.cumsum(local_extend_seq_lens, dim=0).to(torch.int32)
+        assert (
+            int(query_start_loc[-1].item()) == num_qo_tokens
+        ), f"local query rows {int(query_start_loc[-1].item())} != {num_qo_tokens}"
 
         swa_token_ids, swa_first_pos, swa_gather_lens, swa_offsets = (
             build_swa_token_ids(
