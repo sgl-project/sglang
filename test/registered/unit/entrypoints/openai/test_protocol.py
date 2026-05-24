@@ -32,7 +32,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 class TestModelCard(unittest.TestCase):
@@ -191,7 +191,10 @@ class TestChatCompletionRequest(unittest.TestCase):
             },
         )
         self.assertEqual(request.reasoning_effort, "high")
-        self.assertEqual(request.chat_template_kwargs, {"thinking": True})
+        self.assertEqual(
+            request.chat_template_kwargs,
+            {"thinking": True, "enable_thinking": True},
+        )
 
     def test_chat_completion_reasoning_effort_none(self):
         """Test reasoning_effort='none' disables thinking"""
@@ -216,6 +219,37 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "none")
         self.assertFalse(request.chat_template_kwargs.get("thinking"))
         self.assertFalse(request.chat_template_kwargs.get("enable_thinking"))
+
+    def test_chat_completion_reasoning_effort_max(self):
+        """`max` is an sglang extension on chat completion's top-level
+        `reasoning_effort` only; the Responses-API-style nested
+        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="max",
+        )
+        self.assertEqual(request.reasoning_effort, "max")
+
+        # Unknown values still rejected.
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                reasoning_effort="ultra",
+            )
+
+        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
+        # the Responses API path keeps the OpenAI low/medium/high contract.
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"effort": "max"},
+        )
+        self.assertNotEqual(request.reasoning_effort, "max")
 
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
@@ -439,6 +473,21 @@ class TestValidationEdgeCases(unittest.TestCase):
         self.assertEqual(restored_request.temperature, original_request.temperature)
         self.assertEqual(restored_request.max_tokens, original_request.max_tokens)
         self.assertEqual(len(restored_request.messages), len(original_request.messages))
+
+
+class TestParsedResponseFieldsProtocol(unittest.TestCase):
+    """Test ParsedResponseFields protocol."""
+
+    def test_parsed_response_fields_protocol(self):
+        """ParsedResponseFields protocol works with isinstance."""
+        from sglang.srt.entrypoints.openai.protocol import ParsedResponseFields
+
+        class MockFields:
+            content = "hello"
+            tool_calls = None
+            reasoning_content = None
+
+        self.assertIsInstance(MockFields(), ParsedResponseFields)
 
 
 if __name__ == "__main__":
