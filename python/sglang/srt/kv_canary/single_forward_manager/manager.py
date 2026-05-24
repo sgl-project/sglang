@@ -28,6 +28,7 @@ must be capture-safe.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional
 
@@ -75,6 +76,15 @@ class _SingleForwardPhase(IntEnum):
     AFTER_PRE_OUT = 1
     AFTER_PRE_MAYBE_IN = 2
     AFTER_POST_MAYBE_IN = 3
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _PreOpsMaybeInsideGraphOutput:
+    """Phase-2 staged buffers threaded to phase 3."""
+
+    verify_plan: VerifyPlan
+    write_plan: WritePlan
+    expected_inputs: ExpectedInputs
 
 
 class SingleForwardManager:
@@ -130,19 +140,6 @@ class SingleForwardManager:
         self._write_req_capacity = per_forward_write_req_capacity
         self._write_entry_capacity = per_forward_write_entry_capacity
         self._verify_capacity = per_forward_verify_capacity
-
-        self._verify_plan = VerifyPlan.allocate(
-            verify_capacity=per_forward_verify_capacity, device=device
-        )
-        self._write_plan = WritePlan.allocate(
-            write_req_capacity=per_forward_write_req_capacity, device=device
-        )
-        self._expected_inputs = ExpectedInputs.allocate(
-            capacity=per_forward_write_entry_capacity, device=device
-        )
-        self._plan_input = PlanInput.allocate(
-            bs_capacity=per_forward_write_req_capacity, device=device
-        )
 
         self._enable_warner = _CanaryEnableWarner(
             verify_capacity=self._verify_capacity,
@@ -214,17 +211,36 @@ class SingleForwardManager:
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
 
-    def pre_ops_maybe_inside_graph(self, forward_batch: "ForwardBatch") -> None:
+    def pre_ops_maybe_inside_graph(
+        self, forward_batch: "ForwardBatch"
+    ) -> Optional["_PreOpsMaybeInsideGraphOutput"]:
         """Phase 2. Capture-safe ops only (DECODE path is inside cuda graph;
         EXTEND / eager fallback is outside). Fired by monkey-patched
-        ``model.forward`` wrap BEFORE the original forward."""
+        ``model.forward`` wrap BEFORE the original forward.
+
+        Returns the staged plan + expected_inputs threaded to phase 3, or
+        ``None`` when canary is mode=off.
+        """
         if self._config.mode == "off":
-            return
+            return None
 
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_OUT,
             next_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
+        )
+
+        verify_plan = VerifyPlan.allocate(
+            verify_capacity=self._verify_capacity, device=self._device
+        )
+        write_plan = WritePlan.allocate(
+            write_req_capacity=self._write_req_capacity, device=self._device
+        )
+        expected_inputs = ExpectedInputs.allocate(
+            capacity=self._write_entry_capacity, device=self._device
+        )
+        plan_input = PlanInput.allocate(
+            bs_capacity=self._write_req_capacity, device=self._device
         )
 
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
@@ -238,19 +254,19 @@ class SingleForwardManager:
                 )
             manager.fill_expected_inputs(
                 forward_batch=forward_batch,
-                expected_inputs_out=self._expected_inputs,
+                expected_inputs_out=expected_inputs,
             )
 
-        self._plan_input.fill_from_forward_batch(forward_batch=forward_batch)
+        plan_input.fill_from_forward_batch(forward_batch=forward_batch)
 
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
-        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
+        expected_inputs_slice = expected_inputs.slice(num_tokens)
         for group in self._buffer_groups:
             invoke_plan(
-                plan_input=self._plan_input,
-                verify_plan=self._verify_plan,
-                write_plan=self._write_plan,
+                plan_input=plan_input,
+                verify_plan=verify_plan,
+                write_plan=write_plan,
                 group=group,
                 req_to_token=self._req_to_token_pool.req_to_token,
                 swa_window_size=self._swa_window_size,
@@ -258,14 +274,14 @@ class SingleForwardManager:
             if self._swa_divergence_report is not None:
                 self._swa_divergence_report.observe_after_invoke_plan(
                     group=group,
-                    verify_plan=self._verify_plan,
+                    verify_plan=verify_plan,
                 )
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_head_tag,
-                verify_plan=self._verify_plan,
-                write_plan=self._write_plan,
+                verify_plan=verify_plan,
+                write_plan=write_plan,
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
@@ -273,15 +289,26 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
-    def post_ops_maybe_inside_graph(self, forward_batch: "ForwardBatch") -> None:
+        return _PreOpsMaybeInsideGraphOutput(
+            verify_plan=verify_plan,
+            write_plan=write_plan,
+            expected_inputs=expected_inputs,
+        )
+
+    def post_ops_maybe_inside_graph(
+        self,
+        forward_batch: "ForwardBatch",
+        pre_ops_output: Optional["_PreOpsMaybeInsideGraphOutput"],
+    ) -> None:
         """Phase 3. Same capture regime as phase 2. Fired by monkey-patched
         ``model.forward`` wrap AFTER the original forward.
 
-        Launches TAIL kernels reusing the plan staged in phase 2, then copies
-        every observable into the per-SingleForwardManager snapshot so phase 4 sees a dead
-        view immune to later step mutation.
+        Launches TAIL kernels reusing the plan + expected_inputs staged in
+        phase 2 (threaded via ``pre_ops_output``), then copies every
+        observable into the per-SingleForwardManager output buffer so
+        phase 4 sees a dead view immune to later step mutation.
         """
-        if self._config.mode == "off":
+        if pre_ops_output is None:
             return
 
         self._phase_checker.update(
@@ -292,15 +319,15 @@ class SingleForwardManager:
 
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
-        expected_inputs_slice = self._expected_inputs.slice(num_tokens)
+        expected_inputs_slice = pre_ops_output.expected_inputs.slice(num_tokens)
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
         for group in self._buffer_groups:
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_tail_tag,
-                verify_plan=self._verify_plan,
-                write_plan=self._write_plan,
+                verify_plan=pre_ops_output.verify_plan,
+                write_plan=pre_ops_output.write_plan,
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
@@ -309,7 +336,7 @@ class SingleForwardManager:
             )
 
         self._output_buffer.copy_from(
-            verify_plan_enable=self._verify_plan.enable,
+            verify_plan_enable=pre_ops_output.verify_plan.enable,
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
             violation_write_index=self._device_state.violation_log.violation_write_index,
