@@ -123,3 +123,26 @@ def test_dsv4_index_cache_search_rejects_short_tokenized_calibration(
             timeout=1,
             min_prompt_tokens=3,
         )
+
+
+def test_dsv4_index_cache_search_rejects_speculative_candidate_server():
+    with pytest.raises(RuntimeError, match="speculative_algorithm=EAGLE"):
+        search_mod.validate_server_info_for_base_path(
+            {
+                "speculative_algorithm": "EAGLE",
+                "speculative_num_steps": 1,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 3,
+            }
+        )
+
+
+def test_dsv4_index_cache_search_accepts_base_path_candidate_server():
+    search_mod.validate_server_info_for_base_path(
+        {
+            "speculative_algorithm": None,
+            "speculative_num_steps": 0,
+            "speculative_eagle_topk": None,
+            "speculative_num_draft_tokens": 0,
+        }
+    )

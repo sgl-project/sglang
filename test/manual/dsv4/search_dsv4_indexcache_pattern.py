@@ -86,11 +86,63 @@ def score_endpoint(
     return sum(losses) / len(losses)
 
 
+def _as_int(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def speculative_config_paths(value, path: str = "") -> list[str]:
+    if isinstance(value, dict):
+        paths = []
+        for key, item in value.items():
+            child_path = f"{path}.{key}" if path else str(key)
+            if key == "speculative_algorithm" and item:
+                paths.append(f"{child_path}={item}")
+            elif key in {
+                "speculative_num_steps",
+                "speculative_eagle_topk",
+                "speculative_num_draft_tokens",
+            }:
+                int_value = _as_int(item)
+                if int_value is not None and int_value > 0:
+                    paths.append(f"{child_path}={item}")
+            elif key == "enable_multi_layer_eagle" and item:
+                paths.append(f"{child_path}={item}")
+            paths.extend(speculative_config_paths(item, child_path))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for i, item in enumerate(value):
+            child_path = f"{path}[{i}]" if path else f"[{i}]"
+            paths.extend(speculative_config_paths(item, child_path))
+        return paths
+    return []
+
+
+def validate_server_info_for_base_path(server_info: dict) -> None:
+    speculative_paths = speculative_config_paths(server_info)
+    if speculative_paths:
+        raise RuntimeError(
+            "candidate endpoint reports speculative decoding enabled; "
+            "disable EAGLE/spec decode before IndexCache pattern search: "
+            + ", ".join(speculative_paths)
+        )
+
+
 def wait_for_endpoint(endpoint: str, timeout: int) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             requests.get(endpoint.rstrip("/") + "/health", timeout=5).raise_for_status()
+            server_info = requests.get(
+                endpoint.rstrip("/") + "/server_info", timeout=5
+            )
+            server_info.raise_for_status()
+            validate_server_info_for_base_path(server_info.json())
             return
         except requests.RequestException:
             time.sleep(2)
