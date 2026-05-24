@@ -184,9 +184,7 @@ SGL_DEVICE uint64_t compute_slot_hash(const uint8_t* canary_buf, int64_t slot_st
   const int64_t position = canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldPosition);
   const int64_t prev_hash = canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldPrevHash);
   return splitmix64_mix3(
-      static_cast<uint64_t>(prev_hash),
-      static_cast<uint64_t>(token),
-      static_cast<uint64_t>(position));
+      static_cast<uint64_t>(prev_hash), static_cast<uint64_t>(token), static_cast<uint64_t>(position));
 }
 
 }  // namespace canary

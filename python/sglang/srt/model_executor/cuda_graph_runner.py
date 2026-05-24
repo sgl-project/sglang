@@ -244,9 +244,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
 
             if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
                 rids_int = torch.zeros((max_bs,), dtype=torch.int64)
-                bootstrap_room_ids_int = torch.full(
-                    (max_bs,), -1, dtype=torch.int64
-                )
+                bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
             else:
                 rids_int = None
                 bootstrap_room_ids_int = None

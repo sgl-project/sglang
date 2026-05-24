@@ -70,7 +70,10 @@ def maybe_perturb_swap_next_tokens(
         j = random.randrange(batch_size)
 
     swapped = batch_next_token_ids.clone()
-    swapped[i], swapped[j] = batch_next_token_ids[j].clone(), batch_next_token_ids[i].clone()
+    swapped[i], swapped[j] = (
+        batch_next_token_ids[j].clone(),
+        batch_next_token_ids[i].clone(),
+    )
 
     logger.info(
         "kv_canary mock_perturb next_token_swap: swapped i=%d j=%d step=%d",

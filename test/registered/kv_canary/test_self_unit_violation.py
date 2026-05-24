@@ -208,9 +208,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
                 slot_idx=33, position=303, fail_reason_bits=int(FailReason.REAL_KV_HASH)
             ),
         ]
-        reporter = _make_reporter(
-            rows=rows, write_index=3, ring_capacity=4, mode="log"
-        )
+        reporter = _make_reporter(rows=rows, write_index=3, ring_capacity=4, mode="log")
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=7)
 
@@ -311,9 +309,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             _make_row(slot_idx=11, position=101),
             _make_row(slot_idx=22, position=202),
         ]
-        reporter = _make_reporter(
-            rows=rows, write_index=5, ring_capacity=2, mode="log"
-        )
+        reporter = _make_reporter(rows=rows, write_index=5, ring_capacity=2, mode="log")
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=0)
 

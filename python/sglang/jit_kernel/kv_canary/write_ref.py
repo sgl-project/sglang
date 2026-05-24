@@ -160,9 +160,7 @@ def launch_canary_write_kernel_torch_reference(
                     violation_rows.append(row)
 
             if do_geometric_assert:
-                expected_position_geometric = (
-                    expected_position_base + 1 + entry_offset
-                )
+                expected_position_geometric = expected_position_base + 1 + entry_offset
                 if position != expected_position_geometric:
                     row = [0] * consts.VIOLATION_FIELDS
                     row[consts.VIOLATION_FIELD_KERNEL_KIND] = int(kernel_kind)
@@ -190,9 +188,7 @@ def launch_canary_write_kernel_torch_reference(
                 real_kv_hash_u64
             )
 
-            running_prev_hash = splitmix64_mix3(
-                running_prev_hash, token, position
-            )
+            running_prev_hash = splitmix64_mix3(running_prev_hash, token, position)
 
             total_slots_written += 1
 

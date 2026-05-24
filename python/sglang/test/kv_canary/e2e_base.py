@@ -109,9 +109,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
             # ``positions += 1`` in-place. canary's WRITE/VERIFY require
             # forward_batch.positions to stay 0-indexed, so flip the gemma
             # path to out-of-place shift for these tests.
-            server_env.setdefault(
-                "SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION", "1"
-            )
+            server_env.setdefault("SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION", "1")
 
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
@@ -213,6 +211,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
                 f"not strictly less than verify_full={last_parsed.verify_full}. "
                 f"Line: {last_line}"
             )
+
 
 def _make_unique_prompts(n: int) -> list[str]:
     """Each prompt has a unique high-entropy prefix so no two share a radix prefix path.

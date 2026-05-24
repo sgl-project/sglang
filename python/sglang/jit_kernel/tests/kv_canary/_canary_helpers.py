@@ -295,9 +295,7 @@ def stamp_clean_chain(
                 real_kv_hash=to_signed_int64(real_kv_hash),
             )
         stored_prev_hashes.append(signed_prev)
-        running_prev_hash = splitmix64_mix3(
-            running_prev_hash, token, position
-        )
+        running_prev_hash = splitmix64_mix3(running_prev_hash, token, position)
     return stored_prev_hashes
 
 

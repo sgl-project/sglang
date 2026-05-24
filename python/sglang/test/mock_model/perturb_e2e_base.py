@@ -66,4 +66,3 @@ class MockModelPerturbE2EBase(CapturedServerE2EBase):
             max_new_tokens=max_new_tokens,
             timeout=timeout,
         )
-

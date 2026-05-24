@@ -267,7 +267,8 @@ class TestChain:
 
             actual = (
                 splitmix64_mix3(
-                    prev_hash & u64_mask, token & u64_mask, position & u64_mask)
+                    prev_hash & u64_mask, token & u64_mask, position & u64_mask
+                )
                 & u64_mask
             )
             assert actual == expected, (

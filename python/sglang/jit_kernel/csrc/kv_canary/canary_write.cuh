@@ -96,8 +96,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   const bool do_geometric_assert = (entry_count == 1) && (*p.runtime_assert_enable != 0);
   int64_t expected_position_base = 0;
   if (do_geometric_assert && seed_slot_idx >= 0) {
-    expected_position_base = canary_load_field(
-        p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    expected_position_base = canary_load_field(p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
   }
 
   int64_t entries_written = 0;
@@ -171,10 +170,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
         p.canary_buf, slot, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(running_prev_hash));
     canary_store_field(p.canary_buf, slot, p.slot_stride_bytes, kCanaryFieldRealKvHash, real_kv_hash);
 
-    running_prev_hash = splitmix64_mix3(
-        running_prev_hash,
-        static_cast<uint64_t>(token),
-        static_cast<uint64_t>(position));
+    running_prev_hash =
+        splitmix64_mix3(running_prev_hash, static_cast<uint64_t>(token), static_cast<uint64_t>(position));
   }
 
   // Each block contributes its non-skipped entry count to slot_run_counter once at exit.

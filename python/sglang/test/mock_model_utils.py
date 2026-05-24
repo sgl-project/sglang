@@ -46,9 +46,7 @@ class MockModelBenchResult:
         return self.log_text[-length:]
 
 
-def mock_model_server_args(
-    *extra_args: str, canary_mode: str = "raise"
-) -> list[str]:
+def mock_model_server_args(*extra_args: str, canary_mode: str = "raise") -> list[str]:
     return [
         *_MOCK_MODEL_SERVER_ARGS_NO_CANARY,
         "--kv-canary",
