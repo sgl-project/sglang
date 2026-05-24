@@ -14,10 +14,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    set_mamba_track_indices_from_reqs,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import get_alloc_len_per_decode
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -90,6 +87,11 @@ def assign_draft_cache_locs_page_size_1(
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
+        if get_global_server_args().enable_mamba_extra_buffer():
+            batch.mamba_track_indices = None
+            batch.mamba_track_mask = None
+            batch.mamba_track_seqlens = None
+
         batch.maybe_evict_swa()
 
         from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -274,25 +276,14 @@ class EagleVerifyInputV2Mixin:
             )
 
             # Set mamba_track_indices for mamba prefix-cache state tracking.
-            # Reuse existing pending_radix_mamba_slot — the verify kernel will
-            # overwrite it, so no free+alloc needed on this hot path.
             if get_global_server_args().enable_mamba_extra_buffer():
                 mamba_track_interval = get_global_server_args().mamba_track_interval
                 may_cross_boundary = (
-                    (
-                        batch.seq_lens_cpu // mamba_track_interval
-                        != (batch.seq_lens_cpu + self.draft_token_num)
-                        // mamba_track_interval
-                    ).tolist()
-                    if not get_global_server_args().disable_overlap_schedule
-                    else [False] * bs
-                )
-                track_mask_cpu = [
-                    (not may_cross) or batch._maybe_backup_pending_radix_mamba_slot(req)
-                    for req, may_cross in zip(batch.reqs, may_cross_boundary)
-                ]
-                set_mamba_track_indices_from_reqs(batch, track_mask_cpu)
-                batch.mamba_track_seqlens = None
+                    batch.seq_lens_cpu // mamba_track_interval
+                    != (batch.seq_lens_cpu + self.draft_token_num)
+                    // mamba_track_interval
+                ).tolist()
+                batch._set_radix_mamba_spec_track_indices(may_cross_boundary)
 
             # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
             # TBO's split_spec_info can slice the custom_mask correctly.

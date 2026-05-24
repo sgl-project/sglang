@@ -571,6 +571,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
                         )
                     )
                     mamba_exist = result.mamba_exist
+                    if mamba_exist:
+                        self.req_to_token_pool.mamba_pool.free(mamba_value)
                 else:
                     # No pending slot: decode phase never triggered tracking
                     # (output shorter than mamba_track_interval). The mamba
@@ -730,8 +732,8 @@ class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
             if pending is None:
                 self.evict(EvictParams(num_tokens=0, mamba_num=1))
                 pending = self.req_to_token_pool.mamba_pool.alloc(1)
-            if pending is not None:
-                req.pending_radix_mamba_slot = pending
+            assert pending is not None, "Can not alloc pending mamba cache"
+            req.pending_radix_mamba_slot = pending
 
     def pretty_print(self) -> None:
         self._print_helper(self.root_node, 0)

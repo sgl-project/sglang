@@ -17,10 +17,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.overlap_utils import FutureIndices
-from sglang.srt.managers.schedule_batch import (
-    ScheduleBatch,
-    set_mamba_track_indices_from_reqs,
-)
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -171,19 +168,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         if get_global_server_args().enable_mamba_extra_buffer():
             mamba_track_interval = get_global_server_args().mamba_track_interval
             may_cross_boundary = (
-                (
-                    prefix_lens_cpu // mamba_track_interval
-                    != end_offset_cpu // mamba_track_interval
-                ).tolist()
-                if batch.enable_overlap
-                else [False] * bs
-            )
-            track_mask_cpu = [
-                (not may_cross) or batch._maybe_backup_pending_radix_mamba_slot(req)
-                for req, may_cross in zip(batch.reqs, may_cross_boundary)
-            ]
-            set_mamba_track_indices_from_reqs(batch, track_mask_cpu)
-            batch.mamba_track_seqlens = None
+                prefix_lens_cpu // mamba_track_interval
+                != end_offset_cpu // mamba_track_interval
+            ).tolist()
+            batch._set_radix_mamba_spec_track_indices(may_cross_boundary)
 
     def generate_attn_arg_prefill(
         self,

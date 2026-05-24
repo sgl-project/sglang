@@ -836,6 +836,39 @@ class TestMamba(unittest.TestCase):
 
         tree.sanity_check()
 
+    def test_extra_buffer_cache_finished_duplicate_mamba_frees_pending(self):
+        """A duplicate finished insert must free the donated pending slot."""
+        tree, allocator, req_to_token_pool, make_dummy_req = (
+            self._setup_tree_and_allocator_extra_buffer()
+        )
+        mamba_pool = req_to_token_pool.mamba_pool
+
+        def cache_finished_with_tokens(token_ids):
+            req = make_dummy_req()
+            req.origin_input_ids = token_ids
+            req.output_ids = []
+            req.mamba_last_track_seqlen = len(token_ids)
+            req.kv_committed_len = len(token_ids)
+            req.kv_allocated_len = len(token_ids)
+            kv = allocator.alloc(len(token_ids))
+            self.assertIsNotNone(kv)
+            req_to_token_pool.write((req.req_pool_idx, slice(0, len(token_ids))), kv)
+            avail_before = mamba_pool.available_size()
+            tree.cache_finished_req(req)
+            req_to_token_pool.free(req)
+            return avail_before
+
+        cache_finished_with_tokens([1, 2, 3, 4])
+        tree.sanity_check()
+        _, mamba_total_after_first = tree.total_size()
+        self.assertEqual(mamba_total_after_first, 1)
+
+        avail_before_duplicate = cache_finished_with_tokens([1, 2, 3, 4])
+        self.assertEqual(mamba_pool.available_size(), avail_before_duplicate + 2)
+        _, mamba_total_after_duplicate = tree.total_size()
+        self.assertEqual(mamba_total_after_duplicate, 1)
+        tree.sanity_check()
+
     def test_extra_buffer_multiple_cache_unfinished(self):
         """Test multiple cache_unfinished_req calls (simulating chunked prefill
         with multiple chunks), each with a fresh pending_radix_mamba_slot."""

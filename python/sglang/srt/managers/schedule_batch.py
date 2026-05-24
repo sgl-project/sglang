@@ -721,8 +721,6 @@ class Req(ReqDllmMixin):
         self.pending_radix_mamba_slot: Optional[torch.Tensor] = (
             None  # shape (1), pre-allocated radix target slot
         )
-        self.radix_mamba_backup_slot: Optional[torch.Tensor] = None  # shape (1)
-        self.radix_mamba_backup_seqlen: Optional[int] = None
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1286,7 +1284,6 @@ class Req(ReqDllmMixin):
         self.inflight_middle_chunks = 0
         self.mamba_pool_idx = None
         self.pending_radix_mamba_slot = None
-        self.radix_mamba_backup_slot = self.radix_mamba_backup_seqlen = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
@@ -1407,22 +1404,26 @@ class _MambaRadixCacheV2TrackEntry(NamedTuple):
     track_seqlen: int
 
 
-def set_mamba_track_indices_from_reqs(
-    batch, track_mask_cpu: Optional[List[bool]] = None
+def set_mamba_track_indices_from_slots(
+    batch, track_slots: List[Optional[torch.Tensor]]
 ):
-    """Build mamba track indices from req-owned pending radix slots."""
+    """Build mamba track indices from explicit per-request radix slots."""
+    if len(track_slots) == 0:
+        batch.mamba_track_indices = torch.empty(
+            (0,), dtype=torch.int64, device=batch.device
+        )
+        batch.mamba_track_mask = torch.empty(
+            (0,), dtype=torch.bool, device=batch.device
+        )
+        return
+
     _zero = torch.zeros(1, dtype=torch.int64, device=batch.device)
-    has_slot = [req.pending_radix_mamba_slot is not None for req in batch.reqs]
-    if track_mask_cpu is not None:
-        has_slot = [
-            has_pending and can_track
-            for has_pending, can_track in zip(has_slot, track_mask_cpu)
-        ]
+    has_slot = [slot is not None for slot in track_slots]
     batch.mamba_track_indices = (
         torch.stack(
             [
-                req.pending_radix_mamba_slot if has_pending else _zero
-                for req, has_pending in zip(batch.reqs, has_slot)
+                slot.to(device=batch.device) if slot is not None else _zero
+                for slot in track_slots
             ]
         )
         .squeeze(1)
@@ -2462,66 +2463,59 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     (0,), dtype=torch.bool, device=self.device
                 )
             else:
-                interval_mask_cpu = self.seq_lens_cpu % mamba_track_interval == 0
-                can_track_cpu = [
-                    (
-                        (not in_interval)
-                        or self._maybe_backup_pending_radix_mamba_slot(req)
-                    )
-                    for req, in_interval in zip(self.reqs, interval_mask_cpu.tolist())
-                ]
-                interval_mask = interval_mask_cpu.pin_memory().to(
-                    device=self.device, non_blocking=True
-                )
-                _zero = torch.zeros(1, dtype=torch.int64, device=self.device)
-                slot_indices = (
-                    torch.stack(
-                        [
-                            (
-                                req.pending_radix_mamba_slot
-                                if req.pending_radix_mamba_slot is not None
-                                else _zero
-                            )
-                            for req in self.reqs
-                        ]
-                    )
-                    .squeeze(1)
-                    .to(torch.int64)
-                )
-                has_slot = torch.tensor(
-                    [req.pending_radix_mamba_slot is not None for req in self.reqs],
-                    dtype=torch.bool,
-                    pin_memory=True,
-                ).to(device=self.device, non_blocking=True)
-                can_track = torch.tensor(
-                    can_track_cpu,
-                    dtype=torch.bool,
-                    pin_memory=True,
-                ).to(device=self.device, non_blocking=True)
-                self.mamba_track_mask = interval_mask & has_slot & can_track
-                self.mamba_track_indices = torch.where(
-                    self.mamba_track_mask, slot_indices, torch.zeros_like(slot_indices)
-                )
+                interval_mask_cpu = (
+                    self.seq_lens_cpu % mamba_track_interval == 0
+                ).tolist()
+                if self.enable_overlap:
+                    track_slots = [
+                        (
+                            self._prepare_overlap_radix_mamba_track_slot(req)
+                            if in_interval
+                            else None
+                        )
+                        for req, in_interval in zip(self.reqs, interval_mask_cpu)
+                    ]
+                else:
+                    track_slots = [
+                        req.pending_radix_mamba_slot if in_interval else None
+                        for req, in_interval in zip(self.reqs, interval_mask_cpu)
+                    ]
+                set_mamba_track_indices_from_slots(self, track_slots)
 
-    def _maybe_backup_pending_radix_mamba_slot(self, req: Req) -> bool:
-        if (
-            not self.enable_overlap
-            or req.pending_radix_mamba_slot is None
-            or req.mamba_last_track_seqlen is None
-            or req.radix_mamba_backup_slot is not None
-        ):
-            return True
+    def _prepare_overlap_radix_mamba_track_slot(
+        self, req: Req
+    ) -> Optional[torch.Tensor]:
+        track_slot = req.pending_radix_mamba_slot
+        if track_slot is None:
+            return None
 
-        backup = self.req_to_token_pool.mamba_pool.alloc(1)
-        if backup is None:
-            return False
-        self.req_to_token_pool.mamba_pool.copy_from(
-            req.pending_radix_mamba_slot, backup
-        )
+        if req.mamba_last_track_seqlen is None:
+            req.pending_radix_mamba_slot = None
+            return track_slot
 
-        req.radix_mamba_backup_slot = backup
-        req.radix_mamba_backup_seqlen = req.mamba_last_track_seqlen
-        return True
+        spare_slot = self.req_to_token_pool.mamba_pool.alloc(1)
+        if spare_slot is not None:
+            return spare_slot
+
+        req.pending_radix_mamba_slot = None
+        return track_slot
+
+    def _set_radix_mamba_spec_track_indices(
+        self, may_cross_boundary: List[bool]
+    ) -> None:
+        if self.enable_overlap:
+            track_slots = [
+                (
+                    self._prepare_overlap_radix_mamba_track_slot(req)
+                    if may_cross
+                    else None
+                )
+                for req, may_cross in zip(self.reqs, may_cross_boundary)
+            ]
+        else:
+            track_slots = [req.pending_radix_mamba_slot for req in self.reqs]
+        set_mamba_track_indices_from_slots(self, track_slots)
+        self.mamba_track_seqlens = None
 
     def filter_batch(
         self,

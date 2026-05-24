@@ -2815,8 +2815,17 @@ class Scheduler(
             yield
         finally:
             if snapshot_v2_full:
+                mamba_track_indices = batch.mamba_track_indices
+                mamba_track_mask = batch.mamba_track_mask
+                mamba_track_seqlens = batch.mamba_track_seqlens
                 for name, value in sched_snapshot.items():
                     setattr(batch, name, value)
+                # Spec V2 prepares the target-verify mamba track plan inside
+                # the worker path. Keep that plan for result processing; the
+                # next decode prepare will rebuild it.
+                batch.mamba_track_indices = mamba_track_indices
+                batch.mamba_track_mask = mamba_track_mask
+                batch.mamba_track_seqlens = mamba_track_seqlens
             else:
                 batch.sampling_info = sched_sampling_info
 

@@ -584,9 +584,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         if req.pending_radix_mamba_slot is not None:
             tree_cache.req_to_token_pool.mamba_pool.free(req.pending_radix_mamba_slot)
             req.pending_radix_mamba_slot = None
-        if req.radix_mamba_backup_slot is not None:
-            tree_cache.req_to_token_pool.mamba_pool.free(req.radix_mamba_backup_slot)
-            req.radix_mamba_backup_slot = req.radix_mamba_backup_seqlen = None
         return
 
     tree_cache.cache_finished_req(

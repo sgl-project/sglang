@@ -337,6 +337,11 @@ class MambaComponent(TreeComponent):
                 # Tree already holds mamba state for this prefix (or the
                 # insert was a no-op); the pre-allocated pending slot is
                 # no longer needed.
+                if insert_params and insert_params.mamba_value is not None:
+                    self.cache.req_to_token_pool.mamba_pool.free(
+                        insert_params.mamba_value
+                    )
+                    insert_params.mamba_value = None
                 if req.pending_radix_mamba_slot is not None:
                     self.cache.req_to_token_pool.mamba_pool.free(
                         req.pending_radix_mamba_slot
@@ -361,8 +366,8 @@ class MambaComponent(TreeComponent):
                 if pending is None:
                     self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
                     pending = self.cache.req_to_token_pool.mamba_pool.alloc(1)
-                if pending is not None:
-                    req.pending_radix_mamba_slot = pending
+                assert pending is not None, "Can not alloc pending mamba cache"
+                req.pending_radix_mamba_slot = pending
 
     # ---- HiCache Hooks ----
 

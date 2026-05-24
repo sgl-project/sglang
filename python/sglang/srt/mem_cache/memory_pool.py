@@ -618,10 +618,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.mamba_pool.free(req.pending_radix_mamba_slot)
             req.pending_radix_mamba_slot = None
 
-        if req.radix_mamba_backup_slot is not None:
-            self.mamba_pool.free(req.radix_mamba_backup_slot)
-            req.radix_mamba_backup_slot = req.radix_mamba_backup_seqlen = None
-
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
