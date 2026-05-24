@@ -171,7 +171,7 @@ def validate_args(args) -> None:
         )
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline-endpoint", required=True)
     parser.add_argument("--indexcache-endpoint", required=True)
@@ -198,8 +198,13 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--eagle-off-confirmed", action="store_true")
     parser.add_argument("--indexcache-profile-env-confirmed", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_args(args)
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     commands = [

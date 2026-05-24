@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -210,3 +211,50 @@ def test_dsv4_index_cache_validation_workflow_rejects_short_eval_context(
 
     with pytest.raises(SystemExit, match="--eval-min-context-length"):
         workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_dry_run_writes_summary(tmp_path):
+    calibration = tmp_path / "calibration.jsonl"
+    calibration.write_text('{"text": "calibration"}\n')
+    output_dir = tmp_path / "out"
+
+    workflow.main(
+        [
+            "--baseline-endpoint",
+            "http://baseline",
+            "--indexcache-endpoint",
+            "http://indexcache",
+            "--search-endpoint",
+            "http://search",
+            "--calibration-jsonl",
+            str(calibration),
+            "--num-c4-layers",
+            "21",
+            "--pp-block-c4-layers",
+            "7",
+            "--pattern-command-template",
+            "deploy --pattern {pattern}",
+            "--output-dir",
+            str(output_dir),
+            "--dry-run",
+        ]
+    )
+
+    summary = json.loads((output_dir / "validation_summary.json").read_text())
+
+    assert summary["uniform_1_4"] == "not run; only searched 1/4 is generated"
+    assert summary["quality_eval_endpoints"] == {
+        "baseline": "http://baseline",
+        "searched_1_2": "http://indexcache",
+        "searched_1_4": "http://indexcache",
+    }
+    assert summary["context_gate"] == {
+        "min_indexcache_prompt_tokens": 75000,
+        "profile_prompt_tokens": 128000,
+        "eval_min_context_length": 75000,
+    }
+    assert [phase["phase"] for phase in summary["phases"]] == [
+        "profile",
+        "search",
+        "eval",
+    ]
