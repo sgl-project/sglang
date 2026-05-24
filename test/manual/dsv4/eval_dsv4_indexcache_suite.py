@@ -106,7 +106,9 @@ def build_sglang_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
 def build_sgl_eval_cmd(task: EvalTask, base_url: str, args) -> list[str]:
     out_dir = args.out_dir
     if getattr(args, "endpoint_label", None) and getattr(args, "repeat_index", None):
-        out_dir = out_dir / args.endpoint_label / task.name / f"repeat_{args.repeat_index}"
+        out_dir = (
+            out_dir / args.endpoint_label / task.name / f"repeat_{args.repeat_index}"
+        )
     cmd = [
         args.sgl_eval_bin,
         "run",

@@ -138,9 +138,7 @@ def wait_for_endpoint(endpoint: str, timeout: int) -> None:
     while time.time() < deadline:
         try:
             requests.get(endpoint.rstrip("/") + "/health", timeout=5).raise_for_status()
-            server_info = requests.get(
-                endpoint.rstrip("/") + "/server_info", timeout=5
-            )
+            server_info = requests.get(endpoint.rstrip("/") + "/server_info", timeout=5)
             server_info.raise_for_status()
             validate_server_info_for_base_path(server_info.json())
             return
