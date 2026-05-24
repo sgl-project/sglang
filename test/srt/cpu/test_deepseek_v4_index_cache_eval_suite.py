@@ -108,3 +108,28 @@ def test_dsv4_index_cache_eval_suite_rejects_zero_repeats(tmp_path):
                 "--dry-run",
             ]
         )
+
+
+def test_dsv4_index_cache_eval_suite_rejects_speculative_endpoint():
+    with pytest.raises(RuntimeError, match="quality eval endpoint 'searched_1_2'"):
+        eval_suite.validate_server_info_for_base_path(
+            {
+                "speculative_algorithm": "EAGLE",
+                "speculative_num_steps": 1,
+                "speculative_eagle_topk": 1,
+                "speculative_num_draft_tokens": 3,
+            },
+            "searched_1_2",
+        )
+
+
+def test_dsv4_index_cache_eval_suite_accepts_base_path_endpoint():
+    eval_suite.validate_server_info_for_base_path(
+        {
+            "speculative_algorithm": None,
+            "speculative_num_steps": 0,
+            "speculative_eagle_topk": None,
+            "speculative_num_draft_tokens": 0,
+        },
+        "baseline",
+    )
