@@ -59,11 +59,11 @@ def _logical_shr(x: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def _uint64_mod(x: torch.Tensor, mod: int) -> torch.Tensor:
+    # ``torch.tensor(scalar, device=cuda)`` allocates on CPU and copies to
+    # device, which is forbidden during cuda-graph capture (unless the CPU
+    # source is pinned). Fold the correction in via tensor arithmetic so the
+    # whole expression stays on-device and capture-safe.
     offset = (1 << 64) % mod
     base = x % mod
-    correction = torch.where(
-        x < 0,
-        torch.tensor(offset, dtype=torch.int64, device=x.device),
-        torch.tensor(0, dtype=torch.int64, device=x.device),
-    )
+    correction = (x < 0).to(x.dtype) * offset
     return (base + correction) % mod
