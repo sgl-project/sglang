@@ -240,16 +240,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
-            # Static buffers for ``ForwardBatch.rids_int`` and
-            # ``ForwardBatch.bootstrap_room_ids_int`` — needed so callers
-            # that read them inside cuda-graph capture (notably kv_canary
-            # token-oracle input-check) see real tensors instead of None.
-            # Refreshed from the real ForwardBatch in populate_from_forward_batch
-            # before each replay. Gated on the same env var that populates
-            # them upstream in prepare_forward_batch. The bootstrap-room
-            # buffer is seeded with -1 so the synthetic capture batch makes
-            # select_generalized_req_ids fall back to rids_int (matches the
-            # non-PD path); per-replay overwrite drives the actual content.
             if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
                 rids_int = torch.zeros((max_bs,), dtype=torch.int64)
                 bootstrap_room_ids_int = torch.full(
@@ -358,13 +348,6 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
 
-        # ``rids_int`` / ``bootstrap_room_ids_int`` are captured as static
-        # buffers so kv_canary's token-oracle input-check (which reads them
-        # inside the graph) sees real tensors instead of None on PP/TP/PD
-        # ranks where they would otherwise be absent at capture time. PD
-        # specifically needs ``bootstrap_room_ids_int`` so D-side oracle ids
-        # match P-side ones; capturing the rids_int-only path would freeze
-        # the wrong branch of ``select_generalized_req_ids``.
         if self.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(self.rids_int[:raw_bs])
             srcs.append(forward_batch.rids_int)
