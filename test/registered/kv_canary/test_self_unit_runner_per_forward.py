@@ -58,7 +58,6 @@ class TestManagerPerForward(CanaryManagerTestCase):
                     forward_batch, pre_ops_output
                 )
             single_forward_manager.post_ops_outside_graph(
-                output_buffer=single_forward_manager.output_buffer,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
 
@@ -245,7 +244,6 @@ def _drive_one_cycle(manager, forward_batch) -> None:
             forward_batch, pre_ops_output
         )
     single_forward_manager.post_ops_outside_graph(
-        output_buffer=single_forward_manager.output_buffer,
         maybe_inaccurate_forward_batch=forward_batch,
     )
 

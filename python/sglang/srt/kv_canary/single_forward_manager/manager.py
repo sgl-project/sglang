@@ -162,10 +162,6 @@ class SingleForwardManager:
         )
 
     @property
-    def output_buffer(self) -> PostOpsInsideGraphOutputBuffer:
-        return self._output_buffer
-
-    @property
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
 
@@ -340,16 +336,15 @@ class SingleForwardManager:
     def post_ops_outside_graph(
         self,
         *,
-        output_buffer: PostOpsInsideGraphOutputBuffer,
         maybe_inaccurate_forward_batch: "ForwardBatch",
     ) -> None:
         """Phase 4. Host-side outside cuda graph. Reads in-graph signals
-        from ``output_buffer`` (immune to later-step mutation) plus the live
-        (possibly already-advanced) ``ForwardBatch`` for the tail-after
-        perturb that needs to flip a byte in the slot the forward just
-        wrote to. The forward_batch arg is named ``maybe_inaccurate_``
-        because by phase 4 the outer cycle may already have mutated its
-        step-specific fields."""
+        from ``self._output_buffer`` (immune to later-step mutation) plus
+        the live (possibly already-advanced) ``ForwardBatch`` for the
+        tail-after perturb that needs to flip a byte in the slot the
+        forward just wrote to. The forward_batch arg is named
+        ``maybe_inaccurate_`` because by phase 4 the outer cycle may
+        already have mutated its step-specific fields."""
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
             next_phase=_SingleForwardPhase.IDLE,
@@ -360,7 +355,7 @@ class SingleForwardManager:
             self._perturb_manager.perturb_post_forward(
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
-        self._enable_warner.tick(output_buffer.verify_plan_enable)
+        self._enable_warner.tick(self._output_buffer.verify_plan_enable)
 
     def _should_enable_input_check_for_launch(
         self, forward_batch: "ForwardBatch"

@@ -3202,7 +3202,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         if canary_sfm is not None:
             canary_sfm.post_ops_outside_graph(
-                output_buffer=canary_sfm.output_buffer,
                 maybe_inaccurate_forward_batch=forward_batch,
             )
             canary_manager.step_shared_facilities(
