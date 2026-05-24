@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     93,
+        "agents":     96,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -207,6 +207,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "email_listener":    7845,
             "licensing":         7846,
             "gitops":            7847,
+            "rate_limiter":      7848,
+            "ab_testing":        7849,
+            "revenue_forecast":  7850,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -501,6 +504,9 @@ _INTENTS = {
     "email_process":           lambda a, k: {"action": "email_process_queued", "email_id": k.get("email_id", 0)},
     "license_verify":          lambda a, k: {"action": "license_verify_queued", "license_key": k.get("license_key", ""), "machine_id": k.get("machine_id", "")},
     "gitops_deploy":           lambda a, k: {"action": "gitops_deploy_queued", "branch": k.get("branch", "main")},
+    "rate_check":              lambda a, k: {"action": "rate_check_queued", "rule": k.get("rule", "api_global"), "identifier": k.get("identifier", "")},
+    "ab_assign":               lambda a, k: {"action": "ab_assign_queued", "experiment_id": k.get("experiment_id", 0), "user_id": k.get("user_id", "")},
+    "revenue_sync":            lambda a, k: {"action": "revenue_sync_queued"},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────

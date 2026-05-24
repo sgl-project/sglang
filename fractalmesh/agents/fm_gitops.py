@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import threading
+import logging
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -27,7 +28,7 @@ if _vault.exists():
 
 # ── config ────────────────────────────────────────────────────────────────────
 PORT         = int(os.getenv("GITOPS_PORT", "7847"))
-ROOT         = Path(os.getenv("FRACTALMESH_HOME", os.path.expanduser("~/fmsaas")))
+ROOT         = Path(os.path.expanduser(os.getenv("FRACTALMESH_HOME", "~/fmsaas")))
 DB_PATH      = ROOT / "database" / "sovereign.db"
 LOG_PATH     = ROOT / "logs" / "fm_gitops.log"
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
@@ -44,11 +45,10 @@ DEFAULT_PIPELINE_STEPS = [
     {"name": "pm2_reload",   "cmd": "pm2 reload {agent_name}"},
     {"name": "syntax_check", "cmd": "python3 -m py_compile {file}"},
 ]
-DEFAULT_PIPELINE_NAME   = "fractalmesh-auto-deploy"
-DEFAULT_TRIGGER_BRANCH  = "claude/deploy-fractalmesh-live-rkyHT"
+DEFAULT_PIPELINE_NAME  = "fractalmesh-auto-deploy"
+DEFAULT_TRIGGER_BRANCH = "claude/deploy-fractalmesh-live-rkyHT"
 
 # ── logging ───────────────────────────────────────────────────────────────────
-import logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [FM-GITOPS] %(message)s",
@@ -192,6 +192,19 @@ def _parse_path(path: str):
         return p.rstrip("/"), params
     return path.rstrip("/"), {}
 
+
+def _split_pipeline_path(path: str):
+    """
+    Parse /pipelines/{id} and /pipelines/{id}/runs or /pipelines/{id}/run.
+    Returns (pipeline_id_str, suffix) where suffix is '' | 'runs' | 'run'.
+    """
+    # strip leading /pipelines/
+    rest = path[len("/pipelines/"):]
+    parts = rest.split("/", 1)
+    pid = parts[0]
+    suffix = parts[1] if len(parts) > 1 else ""
+    return pid, suffix
+
 # ── deploy logic ──────────────────────────────────────────────────────────────
 def _exec_deploy(deployment_id: int, branch: str) -> None:
     """Run default deploy pipeline in a background thread."""
@@ -201,7 +214,7 @@ def _exec_deploy(deployment_id: int, branch: str) -> None:
         "pm2 reload all",
     ]
     combined_out = []
-    error_msg = ""
+    error_msg    = ""
     final_status = "success"
 
     for step_cmd in steps:
@@ -211,7 +224,7 @@ def _exec_deploy(deployment_id: int, branch: str) -> None:
         if stderr:
             combined_out.append(f"[stderr] {stderr}")
         if rc != 0:
-            error_msg = f"Step failed (rc={rc}): {step_cmd}\n{stderr}"
+            error_msg    = f"Step failed (rc={rc}): {step_cmd}\n{stderr}"
             final_status = "failed"
             break
 
@@ -227,25 +240,28 @@ def _exec_deploy(deployment_id: int, branch: str) -> None:
 
 
 def _exec_pipeline(pipeline_id: int, branch: str, commit_sha: str) -> int:
-    """Execute all pipeline steps sequentially. Returns pipeline_run id."""
+    """
+    Execute all pipeline steps sequentially in a background thread.
+    Creates one deployment record and one pipeline_run record.
+    Returns the pipeline_run id (or -1 on error).
+    """
     conn = _db()
-    row = conn.execute(
-        "SELECT * FROM pipelines WHERE id=?", (pipeline_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM pipelines WHERE id=?", (pipeline_id,)).fetchone()
     if not row:
         conn.close()
         return -1
 
     steps = json.loads(row["steps"])
-    repo = str(REPO_PATH)
+    repo  = str(REPO_PATH)
 
-    # create a linked deployment record
+    # deployment record
     dep_id = conn.execute(
         "INSERT INTO deployments (name, branch, commit_sha, status, trigger, started_at) "
         "VALUES (?, ?, ?, 'running', 'pipeline', ?)",
         (row["name"], branch, commit_sha, time.time()),
     ).lastrowid
 
+    # pipeline_run record
     run_id = conn.execute(
         "INSERT INTO pipeline_runs (pipeline_id, deployment_id, status, started_at) "
         "VALUES (?, ?, 'running', ?)",
@@ -260,11 +276,11 @@ def _exec_pipeline(pipeline_id: int, branch: str, commit_sha: str) -> int:
     conn.close()
 
     combined_out = []
-    error_msg = ""
+    error_msg    = ""
     final_status = "success"
 
     for step in steps:
-        name = step.get("name", "step")
+        name    = step.get("name", "step")
         raw_cmd = step.get("cmd", "")
         cmd = raw_cmd.format(
             repo=repo,
@@ -278,7 +294,7 @@ def _exec_pipeline(pipeline_id: int, branch: str, commit_sha: str) -> int:
         if stderr:
             combined_out.append(f"[{name}][stderr] {stderr}")
         if rc != 0:
-            error_msg = f"Step '{name}' failed (rc={rc}): {stderr}"
+            error_msg    = f"Step '{name}' failed (rc={rc}): {stderr}"
             final_status = "failed"
             break
 
@@ -327,26 +343,31 @@ class GitOpsHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             return self._health()
+
         if path == "/deployments":
             return self._list_deployments()
+
         if path.startswith("/deployments/"):
             dep_id = path[len("/deployments/"):]
             return self._get_deployment(dep_id)
+
         if path == "/pipelines":
             return self._list_pipelines()
-        if path.startswith("/pipelines/") and path.endswith("/runs"):
-            pid = path[len("/pipelines/"):].rstrip("/runs").rstrip("/")
-            # handle /pipelines/{id}/runs
-            parts = path.split("/")
-            if len(parts) == 4 and parts[3] == "runs":
-                return self._pipeline_runs(parts[2])
+
         if path.startswith("/pipelines/"):
-            pid = path[len("/pipelines/"):]
-            return self._get_pipeline(pid)
+            pid, suffix = _split_pipeline_path(path)
+            if suffix == "runs":
+                return self._pipeline_runs(pid)
+            if suffix == "":
+                return self._get_pipeline(pid)
+            return _send_json(self, {"error": "not found"}, 404)
+
         if path == "/git/status":
             return self._git_status()
+
         if path == "/git/diff":
             return self._git_diff(params)
+
         if path == "/analytics":
             return self._analytics()
 
@@ -357,16 +378,22 @@ class GitOpsHandler(BaseHTTPRequestHandler):
 
         if path == "/deploy":
             return self._deploy()
+
         if path == "/pipelines/create":
             return self._create_pipeline()
-        if path.startswith("/pipelines/") and path.endswith("/run"):
-            parts = path.split("/")
-            if len(parts) == 4 and parts[3] == "run":
-                return self._run_pipeline(parts[2])
+
+        if path.startswith("/pipelines/"):
+            pid, suffix = _split_pipeline_path(path)
+            if suffix == "run":
+                return self._run_pipeline(pid)
+            return _send_json(self, {"error": "not found"}, 404)
+
         if path == "/webhooks/github":
             return self._github_webhook()
+
         if path == "/git/commit":
             return self._git_commit()
+
         if path == "/git/push":
             return self._git_push()
 
@@ -375,8 +402,9 @@ class GitOpsHandler(BaseHTTPRequestHandler):
     def do_PUT(self):
         path, _ = _parse_path(self.path)
         if path.startswith("/pipelines/"):
-            pid = path[len("/pipelines/"):]
-            return self._update_pipeline(pid)
+            pid, suffix = _split_pipeline_path(path)
+            if suffix == "":
+                return self._update_pipeline(pid)
         _send_json(self, {"error": "not found"}, 404)
 
     # ── GET handlers ──────────────────────────────────────────────────────────
@@ -453,18 +481,18 @@ class GitOpsHandler(BaseHTTPRequestHandler):
         log_out, _, _    = _run_cmd(f"git -C {repo} log --oneline -10")
         branch_out, _, _ = _run_cmd(f"git -C {repo} branch -a")
         _send_json(self, {
-            "status_lines":    [l for l in status_out.splitlines() if l],
-            "recent_commits":  [l for l in log_out.splitlines() if l],
-            "branches":        [l.strip() for l in branch_out.splitlines() if l],
+            "status_lines":   [line for line in status_out.splitlines() if line],
+            "recent_commits": [line for line in log_out.splitlines() if line],
+            "branches":       [line.strip() for line in branch_out.splitlines() if line],
         })
 
     def _git_diff(self, params: dict):
         branch = params.get("branch", "main")
-        repo = str(REPO_PATH)
+        repo   = str(REPO_PATH)
         diff_out, _, _ = _run_cmd(
             f"git -C {repo} diff origin/{branch}...HEAD --stat"
         )
-        lines = [l for l in diff_out.splitlines() if l]
+        lines = [line for line in diff_out.splitlines() if line]
         files_changed = 0
         for line in lines:
             if "changed" in line:
@@ -504,9 +532,9 @@ class GitOpsHandler(BaseHTTPRequestHandler):
 
     # ── POST handlers ─────────────────────────────────────────────────────────
     def _deploy(self):
-        body   = _read_body(self)
-        name   = body.get("name", "fractalmesh-update")
-        branch = body.get("branch", "main")
+        body    = _read_body(self)
+        name    = body.get("name", "fractalmesh-update")
+        branch  = body.get("branch", "main")
         trigger = body.get("trigger", "manual")
 
         conn = _db()
@@ -526,7 +554,7 @@ class GitOpsHandler(BaseHTTPRequestHandler):
     def _create_pipeline(self):
         if not _check_auth(self):
             return _send_json(self, {"error": "unauthorized"}, 401)
-        body = _read_body(self)
+        body           = _read_body(self)
         name           = body.get("name")
         steps          = body.get("steps", [])
         trigger_branch = body.get("trigger_branch", "main")
@@ -550,6 +578,7 @@ class GitOpsHandler(BaseHTTPRequestHandler):
             pid_int = int(pid)
         except ValueError:
             return _send_json(self, {"error": "invalid id"}, 400)
+
         body       = _read_body(self)
         branch     = body.get("branch", "main")
         commit_sha = body.get("commit_sha", "")
@@ -560,29 +589,29 @@ class GitOpsHandler(BaseHTTPRequestHandler):
         if not row:
             return _send_json(self, {"error": "pipeline not found"}, 404)
 
-        # create a placeholder run record so we can return run_id immediately
+        # Insert a placeholder run record so we can return run_id immediately.
+        # _exec_pipeline will insert its own authoritative record; the placeholder
+        # is marked 'queued' and updated to 'dispatched' once the thread starts.
         conn = _db()
-        run_id = conn.execute(
+        placeholder_id = conn.execute(
             "INSERT INTO pipeline_runs (pipeline_id, status, started_at) VALUES (?, 'queued', ?)",
             (pid_int, time.time()),
         ).lastrowid
         conn.commit()
         conn.close()
 
-        def _run_and_update():
+        def _run_thread():
             actual_run_id = _exec_pipeline(pid_int, branch, commit_sha)
-            # _exec_pipeline creates its own run; the placeholder stays as historical artifact
-            # update placeholder to point to the real execution
-            if actual_run_id > 0:
-                conn2 = _db()
-                conn2.execute(
-                    "UPDATE pipeline_runs SET status='completed' WHERE id=?", (run_id,)
-                )
-                conn2.commit()
-                conn2.close()
+            conn2 = _db()
+            conn2.execute(
+                "UPDATE pipeline_runs SET status='dispatched', deployment_id=? WHERE id=?",
+                (actual_run_id, placeholder_id),
+            )
+            conn2.commit()
+            conn2.close()
 
-        threading.Thread(target=_run_and_update, daemon=True).start()
-        _send_json(self, {"run_id": run_id, "status": "running"})
+        threading.Thread(target=_run_thread, daemon=True).start()
+        _send_json(self, {"run_id": placeholder_id, "status": "running"})
 
     def _github_webhook(self):
         event_type = self.headers.get("X-GitHub-Event", "unknown")
@@ -600,15 +629,15 @@ class GitOpsHandler(BaseHTTPRequestHandler):
             commits    = body.get("commits", [])
             commit_sha = body.get("after", "")
             if commits:
-                head = commits[-1]
+                head    = commits[-1]
                 author  = head.get("author", {}).get("name", "")
                 message = head.get("message", "")
         elif event_type == "pull_request":
-            pr      = body.get("pull_request", {})
-            branch  = pr.get("head", {}).get("ref", "")
+            pr         = body.get("pull_request", {})
+            branch     = pr.get("head", {}).get("ref", "")
             commit_sha = pr.get("head", {}).get("sha", "")
-            author  = pr.get("user", {}).get("login", "")
-            message = pr.get("title", "")
+            author     = pr.get("user", {}).get("login", "")
+            message    = pr.get("title", "")
 
         conn = _db()
         conn.execute(
@@ -640,9 +669,9 @@ class GitOpsHandler(BaseHTTPRequestHandler):
 
         if files:
             files_arg = " ".join(f'"{f}"' for f in files)
-            add_out, add_err, add_rc = _run_cmd(f"git -C {repo} add {files_arg}")
+            _, add_err, add_rc = _run_cmd(f"git -C {repo} add {files_arg}")
         else:
-            add_out, add_err, add_rc = _run_cmd(f"git -C {repo} add -A")
+            _, add_err, add_rc = _run_cmd(f"git -C {repo} add -A")
 
         if add_rc != 0:
             return _send_json(self, {"committed": False, "reason": add_err}, 500)
@@ -656,7 +685,6 @@ class GitOpsHandler(BaseHTTPRequestHandler):
                 return _send_json(self, {"committed": False, "reason": "nothing to commit"})
             return _send_json(self, {"committed": False, "reason": reason}, 500)
 
-        # extract commit SHA
         sha_out, _, _ = _run_cmd(f"git -C {repo} rev-parse HEAD")
         _send_json(self, {"committed": True, "sha": sha_out})
 
@@ -666,7 +694,7 @@ class GitOpsHandler(BaseHTTPRequestHandler):
         body   = _read_body(self)
         branch = body.get("branch", "main")
         repo   = str(REPO_PATH)
-        push_out, push_err, push_rc = _run_cmd(
+        _, push_err, push_rc = _run_cmd(
             f"git -C {repo} push origin {branch}", timeout=120
         )
         if push_rc != 0:
