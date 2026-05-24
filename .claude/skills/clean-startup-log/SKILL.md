@@ -93,12 +93,12 @@ Any `logger.info()` or `logger.warning()` in `ModelConfig.__init__()` or `get_to
       _torchao_logger.setLevel(_prev_level)
   ```
 
-### 2. "`torch_dtype` is deprecated! Use `dtype` instead!" (FIXED)
+### 2. "`torch_dtype` is deprecated! Use `dtype` instead!" (PARTIALLY FIXED)
 
 - **Source:** `transformers/configuration_utils.py` — the `torch_dtype` property warns via `logger.warning_once()`
 - **Trigger:** Model files accessing `config.torch_dtype` instead of `config.dtype`
-- **Fix applied:** Replaced `config.torch_dtype` with `config.dtype` in all model files:
-  - `models/gpt_oss.py` (lines 222, 471)
+- **Fix applied so far:** Only `models/gpt_oss.py` (lines 222, 471) — tested with `openai/gpt-oss-20b`.
+- **Remaining files that still use `config.torch_dtype`** (fix each only after testing with the corresponding model):
   - `models/bailing_moe.py` (line 302)
   - `models/llada2.py` (line 313)
   - `models/qwen3_next.py` (lines 192, 209)
@@ -107,6 +107,7 @@ Any `logger.info()` or `logger.warning()` in `ModelConfig.__init__()` or `get_to
   - `models/llava.py` (lines 732, 734-737)
   - `model_loader/loader.py` (line 649)
 - **Note:** `common.py` was already fixed in a prior session. If new model files are added with `config.torch_dtype`, the warning will reappear — grep for `\.torch_dtype` to find them.
+- **Important:** Only change `config.torch_dtype` → `config.dtype` for models you have actually tested. The `dtype` property should return the same value, but verify per-model to avoid regressions.
 
 ### 3. "`BaseImageProcessorFast` is deprecated"
 
