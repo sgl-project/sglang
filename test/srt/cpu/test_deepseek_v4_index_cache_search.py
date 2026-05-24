@@ -22,7 +22,7 @@ search_mod = _load_search_module()
 def test_dsv4_index_cache_search_keeps_pp_block_anchors_full():
     priority = {5: 0, 3: 1, 1: 2, 2: 3, 6: 4, 7: 5}
 
-    history = search_mod.greedy_search_pattern(
+    result = search_mod.greedy_search_pattern(
         num_c4_layers=8,
         retention="1/2",
         pp_block_c4_layers=4,
@@ -30,23 +30,28 @@ def test_dsv4_index_cache_search_keeps_pp_block_anchors_full():
             priority.get(i, 10) for i, value in enumerate(pattern) if value == "S"
         ),
     )
+    history = result["history"]
 
     assert [step["flip"] for step in history] == [5, 3, 1, 2]
-    assert history[-1]["pattern"] == "FSSSFSFF"
-    assert history[-1]["pattern"][0] == "F"
-    assert history[-1]["pattern"][4] == "F"
+    assert result["initial_pattern"] == "FFFFFFFF"
+    assert result["final_pattern"] == "FSSSFSFF"
+    assert result["target_f_layers"] == 4
+    assert result["protected_c4_indices"] == [0, 4]
+    assert result["final_pattern"][0] == "F"
+    assert result["final_pattern"][4] == "F"
 
 
 def test_dsv4_index_cache_search_can_target_quarter_retention():
     def score(pattern: str) -> float:
         return pattern.rfind("S")
 
-    history = search_mod.greedy_search_pattern(
+    result = search_mod.greedy_search_pattern(
         num_c4_layers=8,
         retention="1/4",
         pp_block_c4_layers=0,
         score_pattern=score,
     )
 
-    assert history[-1]["pattern"].count("F") == 2
-    assert history[-1]["pattern"][0] == "F"
+    assert result["final_pattern"].count("F") == 2
+    assert result["final_pattern"][0] == "F"
+    assert result["target_f_layers"] == 2

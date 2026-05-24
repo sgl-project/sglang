@@ -116,10 +116,11 @@ def greedy_search_pattern(
     retention: str,
     pp_block_c4_layers: int,
     score_pattern: Callable[[str], float],
-) -> list[dict]:
+) -> dict:
     pattern = ["F"] * num_c4_layers
     protected = protected_c4_indices(num_c4_layers, pp_block_c4_layers)
     target_f = target_f_layers(num_c4_layers, retention)
+    initial_pattern = pattern_to_str(pattern)
     history = []
 
     while pattern.count("F") > target_f:
@@ -144,10 +145,17 @@ def greedy_search_pattern(
         history.append(step)
         print(json.dumps({"selected": step}))
 
-    return history
+    return {
+        "retention": retention,
+        "initial_pattern": initial_pattern,
+        "final_pattern": pattern_to_str(pattern),
+        "target_f_layers": target_f,
+        "protected_c4_indices": sorted(protected),
+        "history": history,
+    }
 
 
-def search(args, retention: str) -> list[dict]:
+def search(args, retention: str) -> dict:
     texts = load_calibration_texts(args.calibration_jsonl, args.limit)
 
     def score_pattern(pattern: str) -> float:
@@ -190,7 +198,7 @@ def main() -> None:
 
     result = {
         "retentions": {
-            retention: {"history": search(args, retention)}
+            retention: search(args, retention)
             for retention in args.retention
         }
     }
