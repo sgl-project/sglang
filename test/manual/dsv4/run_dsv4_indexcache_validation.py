@@ -47,6 +47,8 @@ def profile_cmd(args) -> list[str]:
         str(args.profile_steps),
         "--prompt-tokens",
         str(args.profile_prompt_tokens),
+        "--min-indexcache-prompt-tokens",
+        str(args.min_indexcache_prompt_tokens),
         "--max-tokens",
         str(args.profile_max_tokens),
         "--output",
@@ -99,6 +101,8 @@ def eval_cmd(args) -> list[str]:
         str(args.eval_num_threads),
         "--max-tokens",
         str(args.eval_max_tokens),
+        "--min-context-length",
+        str(args.eval_min_context_length),
         "--output",
         str(args.output_dir / "quality_eval.json"),
     ]
@@ -109,6 +113,16 @@ def validate_args(args) -> None:
         raise SystemExit(
             "--eagle-off-confirmed is required for real validation runs; "
             "speculative decoding must be disabled until base path validation passes"
+        )
+    if args.profile_prompt_tokens < args.min_indexcache_prompt_tokens:
+        raise SystemExit(
+            "--profile-prompt-tokens must be at least "
+            "--min-indexcache-prompt-tokens for DSV4 IndexCache validation"
+        )
+    if args.eval_min_context_length < args.min_indexcache_prompt_tokens:
+        raise SystemExit(
+            "--eval-min-context-length must be at least "
+            "--min-indexcache-prompt-tokens for DSV4 IndexCache validation"
         )
 
 
@@ -127,8 +141,10 @@ def main() -> None:
     parser.add_argument("--profile-steps", type=int, default=4)
     parser.add_argument("--profile-prompt-tokens", type=int, default=128000)
     parser.add_argument("--profile-max-tokens", type=int, default=256)
+    parser.add_argument("--min-indexcache-prompt-tokens", type=int, default=75000)
     parser.add_argument("--eval-num-threads", type=int, default=64)
     parser.add_argument("--eval-max-tokens", type=int, default=32768)
+    parser.add_argument("--eval-min-context-length", type=int, default=75000)
     parser.add_argument("--timeout", type=int, default=86400)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
@@ -158,6 +174,11 @@ def main() -> None:
             else "dry run; speculative decoding not exercised"
         ),
         "uniform_1_4": "not run; only searched 1/4 is generated",
+        "context_gate": {
+            "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
+            "profile_prompt_tokens": args.profile_prompt_tokens,
+            "eval_min_context_length": args.eval_min_context_length,
+        },
         "phases": results,
     }
     (args.output_dir / "validation_summary.json").write_text(

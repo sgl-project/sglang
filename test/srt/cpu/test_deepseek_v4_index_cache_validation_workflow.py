@@ -37,8 +37,10 @@ def _args(tmp_path: Path) -> Namespace:
         profile_steps=4,
         profile_prompt_tokens=128000,
         profile_max_tokens=256,
+        min_indexcache_prompt_tokens=75000,
         eval_num_threads=64,
         eval_max_tokens=32768,
+        eval_min_context_length=75000,
         output_dir=tmp_path / "out",
         dry_run=False,
         eagle_off_confirmed=True,
@@ -62,6 +64,8 @@ def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp
     assert "indexcache=http://indexcache" in cmd
     assert "long-context" in cmd
     assert "reasoning" in cmd
+    assert "--min-context-length" in cmd
+    assert "75000" in cmd
     assert "mmlu" not in cmd
     assert "gsm8k" not in cmd
 
@@ -72,6 +76,15 @@ def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profi
     cmd = workflow.profile_cmd(_args(tmp_path))
 
     assert "--eagle-off-confirmed" in cmd
+
+
+def test_dsv4_index_cache_validation_workflow_passes_context_floor_to_profile(
+    tmp_path,
+):
+    cmd = workflow.profile_cmd(_args(tmp_path))
+
+    assert "--min-indexcache-prompt-tokens" in cmd
+    assert "75000" in cmd
 
 
 def test_dsv4_index_cache_validation_workflow_requires_eagle_off_for_real_runs(
@@ -92,3 +105,23 @@ def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confi
     args.eagle_off_confirmed = False
 
     workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_short_profile_prompt(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.profile_prompt_tokens = 20000
+
+    with pytest.raises(SystemExit, match="--profile-prompt-tokens"):
+        workflow.validate_args(args)
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_short_eval_context(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.eval_min_context_length = 20000
+
+    with pytest.raises(SystemExit, match="--eval-min-context-length"):
+        workflow.validate_args(args)

@@ -109,6 +109,11 @@ def validate_args(args) -> None:
             "--eagle-off-confirmed is required for real profile runs; "
             "speculative decoding must be disabled for base-path validation"
         )
+    if args.prompt_tokens < args.min_indexcache_prompt_tokens:
+        raise SystemExit(
+            "--prompt-tokens must be at least --min-indexcache-prompt-tokens "
+            "for DSV4 IndexCache validation"
+        )
 
 
 def main() -> None:
@@ -122,6 +127,7 @@ def main() -> None:
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--profile-requests", type=int, default=4)
     parser.add_argument("--prompt-tokens", type=int, default=128000)
+    parser.add_argument("--min-indexcache-prompt-tokens", type=int, default=75000)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--trace-flush-sleep", type=float, default=5.0)
@@ -143,6 +149,7 @@ def main() -> None:
         "endpoint": args.endpoint,
         "profile_dir": str(args.profile_dir),
         "profile_prefix": args.profile_prefix,
+        "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
         "request_results": request_results,
         "trace_files": [str(path) for path in trace_files],
         "trace_summaries": [summarize_trace(path) for path in trace_files],
