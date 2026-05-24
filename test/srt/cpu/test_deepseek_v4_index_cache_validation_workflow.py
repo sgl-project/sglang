@@ -44,6 +44,7 @@ def _args(tmp_path: Path) -> Namespace:
         output_dir=tmp_path / "out",
         dry_run=False,
         eagle_off_confirmed=True,
+        indexcache_profile_env_confirmed=True,
     )
 
 
@@ -78,6 +79,14 @@ def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profi
     assert "--eagle-off-confirmed" in cmd
 
 
+def test_dsv4_index_cache_validation_workflow_passes_profile_env_confirmation(
+    tmp_path,
+):
+    cmd = workflow.profile_cmd(_args(tmp_path))
+
+    assert "--indexcache-profile-env-confirmed" in cmd
+
+
 def test_dsv4_index_cache_validation_workflow_passes_context_floor_to_profile(
     tmp_path,
 ):
@@ -97,12 +106,23 @@ def test_dsv4_index_cache_validation_workflow_requires_eagle_off_for_real_runs(
         workflow.validate_args(args)
 
 
+def test_dsv4_index_cache_validation_workflow_requires_profile_env_for_real_runs(
+    tmp_path,
+):
+    args = _args(tmp_path)
+    args.indexcache_profile_env_confirmed = False
+
+    with pytest.raises(SystemExit, match="--indexcache-profile-env-confirmed"):
+        workflow.validate_args(args)
+
+
 def test_dsv4_index_cache_validation_workflow_allows_dry_run_without_eagle_confirmation(
     tmp_path,
 ):
     args = _args(tmp_path)
     args.dry_run = True
     args.eagle_off_confirmed = False
+    args.indexcache_profile_env_confirmed = False
 
     workflow.validate_args(args)
 

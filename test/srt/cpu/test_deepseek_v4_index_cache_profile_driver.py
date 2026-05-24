@@ -48,6 +48,7 @@ def test_dsv4_index_cache_profile_driver_requires_eagle_off_for_real_runs():
     args = Namespace(
         dry_run=False,
         eagle_off_confirmed=False,
+        indexcache_profile_env_confirmed=True,
         prompt_tokens=128000,
         min_indexcache_prompt_tokens=75000,
     )
@@ -60,6 +61,7 @@ def test_dsv4_index_cache_profile_driver_allows_dry_run_without_eagle_confirmati
     args = Namespace(
         dry_run=True,
         eagle_off_confirmed=False,
+        indexcache_profile_env_confirmed=False,
         prompt_tokens=128000,
         min_indexcache_prompt_tokens=75000,
     )
@@ -71,9 +73,23 @@ def test_dsv4_index_cache_profile_driver_rejects_short_prompt_profiles():
     args = Namespace(
         dry_run=True,
         eagle_off_confirmed=False,
+        indexcache_profile_env_confirmed=False,
         prompt_tokens=20000,
         min_indexcache_prompt_tokens=75000,
     )
 
     with pytest.raises(SystemExit, match="--prompt-tokens"):
+        profile_driver.validate_args(args)
+
+
+def test_dsv4_index_cache_profile_driver_requires_marker_env_for_real_runs():
+    args = Namespace(
+        dry_run=False,
+        eagle_off_confirmed=True,
+        indexcache_profile_env_confirmed=False,
+        prompt_tokens=128000,
+        min_indexcache_prompt_tokens=75000,
+    )
+
+    with pytest.raises(SystemExit, match="--indexcache-profile-env-confirmed"):
         profile_driver.validate_args(args)

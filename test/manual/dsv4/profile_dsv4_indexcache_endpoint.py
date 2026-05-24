@@ -109,6 +109,11 @@ def validate_args(args) -> None:
             "--eagle-off-confirmed is required for real profile runs; "
             "speculative decoding must be disabled for base-path validation"
         )
+    if not args.dry_run and not args.indexcache_profile_env_confirmed:
+        raise SystemExit(
+            "--indexcache-profile-env-confirmed is required for real profile runs; "
+            "the server must run with SGLANG_DSV4_INDEXCACHE_PROFILE=true"
+        )
     if args.prompt_tokens < args.min_indexcache_prompt_tokens:
         raise SystemExit(
             "--prompt-tokens must be at least --min-indexcache-prompt-tokens "
@@ -135,6 +140,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--eagle-off-confirmed", action="store_true")
+    parser.add_argument("--indexcache-profile-env-confirmed", action="store_true")
     args = parser.parse_args()
     validate_args(args)
 
@@ -153,6 +159,11 @@ def main() -> None:
         "request_results": request_results,
         "trace_files": [str(path) for path in trace_files],
         "trace_summaries": [summarize_trace(path) for path in trace_files],
+        "indexcache_profile_env": (
+            "confirmed SGLANG_DSV4_INDEXCACHE_PROFILE=true"
+            if args.indexcache_profile_env_confirmed
+            else "dry run; profiler marker env not exercised"
+        ),
         "eagle": (
             "confirmed off"
             if args.eagle_off_confirmed
