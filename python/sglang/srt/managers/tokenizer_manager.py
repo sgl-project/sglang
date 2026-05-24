@@ -1051,6 +1051,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
+                remote_kv_reuse_plan=obj.remote_kv_reuse_plan,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
                 routing_key=obj.routing_key,

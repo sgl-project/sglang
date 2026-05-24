@@ -551,6 +551,55 @@ class SchedulerMetricsCollector:
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            router_kv_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
+            self.router_kv_reuse_events_total = Counter(
+                name="sglang:router_kv_reuse_events_total",
+                documentation="Router-directed KV reuse events by backend, outcome, and reason.",
+                labelnames=router_kv_labels,
+            )
+            self.router_kv_reuse_tokens_total = Counter(
+                name="sglang:router_kv_reuse_tokens_total",
+                documentation="Tokens staged by router-directed KV reuse by backend, outcome, and reason.",
+                labelnames=router_kv_labels,
+            )
+            self.router_kv_reuse_wait_ms = Histogram(
+                name="sglang:router_kv_reuse_wait_ms",
+                documentation="Scheduler wait time for router-directed KV reuse in ms.",
+                labelnames=router_kv_labels,
+                buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
+            )
+            self.router_kv_reuse_insert_ms = Histogram(
+                name="sglang:router_kv_reuse_insert_ms",
+                documentation="Scheduler cache insertion time for router-directed KV reuse in ms.",
+                labelnames=router_kv_labels,
+                buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100),
+            )
+            self.router_kv_reuse_transfer_mb = Histogram(
+                name="sglang:router_kv_reuse_transfer_mb",
+                documentation="Router-directed KV reuse transfer size in MB.",
+                labelnames=router_kv_labels,
+                buckets=(0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000),
+            )
+            router_kv_quarantine_labels = list(labels.keys()) + [
+                "backend",
+                "reason",
+            ]
+            self.router_kv_reuse_quarantine_events_total = Counter(
+                name="sglang:router_kv_reuse_quarantine_events_total",
+                documentation="Router-directed KV reuse target-page quarantine events.",
+                labelnames=router_kv_quarantine_labels,
+            )
+            self.router_kv_reuse_quarantined_tokens_total = Counter(
+                name="sglang:router_kv_reuse_quarantined_tokens_total",
+                documentation="Total target KV tokens quarantined by router-directed KV reuse.",
+                labelnames=router_kv_quarantine_labels,
+            )
+            self.router_kv_reuse_quarantined_tokens = Gauge(
+                name="sglang:router_kv_reuse_quarantined_tokens",
+                documentation="Current target KV tokens held out of the allocator after indeterminate router-directed KV reuse transfers.",
+                labelnames=list(labels.keys()) + ["backend"],
+                multiprocess_mode="mostrecent",
+            )
 
         # =================================================================
         # Streaming session metrics (only created when streaming sessions are enabled)
@@ -1053,6 +1102,70 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
+    def observe_router_kv_reuse(
+        self,
+        *,
+        backend: str,
+        outcome: str,
+        reason: str,
+        tokens: int = 0,
+        wait_ms: Optional[float] = None,
+        insert_ms: Optional[float] = None,
+        transfer_bytes: Optional[int] = None,
+    ) -> None:
+        events_total = getattr(self, "router_kv_reuse_events_total", None)
+        if events_total is None:
+            return
+
+        labels = {
+            **self.labels,
+            "backend": backend,
+            "outcome": outcome,
+            "reason": reason,
+        }
+        events_total.labels(**labels).inc(1)
+
+        if tokens > 0:
+            self.router_kv_reuse_tokens_total.labels(**labels).inc(tokens)
+        if wait_ms is not None:
+            self.router_kv_reuse_wait_ms.labels(**labels).observe(float(wait_ms))
+        if insert_ms is not None:
+            self.router_kv_reuse_insert_ms.labels(**labels).observe(float(insert_ms))
+        if transfer_bytes is not None:
+            transfer_mb = max(0.0, float(transfer_bytes) / (1024 * 1024))
+            self.router_kv_reuse_transfer_mb.labels(**labels).observe(transfer_mb)
+
+    def observe_router_kv_reuse_quarantine(
+        self,
+        *,
+        backend: str,
+        reason: str,
+        tokens: int,
+        current_tokens: int,
+    ) -> None:
+        events_total = getattr(
+            self, "router_kv_reuse_quarantine_events_total", None
+        )
+        current_gauge = getattr(self, "router_kv_reuse_quarantined_tokens", None)
+        if events_total is None or current_gauge is None:
+            return
+
+        event_labels = {
+            **self.labels,
+            "backend": backend,
+            "reason": reason,
+        }
+        gauge_labels = {
+            **self.labels,
+            "backend": backend,
+        }
+        if tokens > 0:
+            events_total.labels(**event_labels).inc(1)
+            self.router_kv_reuse_quarantined_tokens_total.labels(
+                **event_labels
+            ).inc(tokens)
+        current_gauge.labels(**gauge_labels).set(max(0, int(current_tokens)))
+
     def observe_per_stage_req_latency(self, stage: str, latency: float) -> None:
         labels_with_stage = {**self.labels, "stage": stage}
         self.per_stage_req_latency_seconds.labels(**labels_with_stage).observe(latency)
@@ -1413,7 +1526,7 @@ class TokenizerMetricsCollector:
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
-            documentation="Number of cached prompt tokens by source (device/host/storage).",
+            documentation="Number of cached prompt tokens by source (device/host/remote_g2/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
 
@@ -1565,6 +1678,9 @@ class TokenizerMetricsCollector:
 
                 report_cache_source("device", cached_tokens_details.get("device", 0))
                 report_cache_source("host", cached_tokens_details.get("host", 0))
+                report_cache_source(
+                    "remote_g2", cached_tokens_details.get("remote_g2", 0)
+                )
 
                 # Storage fields are only present when L3 storage backend is enabled
                 if "storage" in cached_tokens_details:

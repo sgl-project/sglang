@@ -158,6 +158,7 @@ class CachedTokensDetails(BaseModel):
 
     device: int = 0  # Tokens from device cache (GPU)
     host: int = 0  # Tokens from host cache (CPU memory)
+    remote_g2: Optional[int] = None  # Tokens staged from router-directed remote G2
     # L3 storage fields are only present when storage backend is enabled
     storage: Optional[int] = None  # Tokens from L3 storage backend
     storage_backend: Optional[str] = None  # Type of storage backend used
@@ -165,7 +166,9 @@ class CachedTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Remove None fields so they don't appear in response when L3 is disabled
+        # Remove None fields so optional cache tiers do not appear when disabled.
+        if self.remote_g2 is None:
+            data.pop("remote_g2", None)
         if self.storage is None:
             data.pop("storage", None)
         if self.storage_backend is None:

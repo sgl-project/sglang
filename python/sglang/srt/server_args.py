@@ -184,6 +184,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
+G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl", "http"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -647,6 +648,8 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    enable_router_kv_reuse: bool = False
+    g2plus_config: Optional[Union[str, Dict[str, Any]]] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -849,6 +852,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
+        self._handle_router_kv_reuse()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3640,6 +3644,171 @@ class ServerArgs:
                 "flashinfer" if is_sm100_supported() else "triton"
             )
         return False
+
+    def _load_json_object_config(
+        self, raw: Optional[Union[str, Dict[str, Any]]], arg_name: str
+    ) -> Optional[Dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            data = dict(raw)
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return None
+            if text.startswith("{"):
+                data = json.loads(text)
+            else:
+                path = os.path.expanduser(os.path.expandvars(text))
+                with open(path) as f:
+                    data = json.load(f)
+        else:
+            raise ValueError(f"{arg_name} must be a JSON object or path")
+
+        if not isinstance(data, dict):
+            raise ValueError(f"{arg_name} must be a JSON object")
+        return data
+
+    def _normalize_g2plus_endpoint_map(
+        self, value: object, field_name: str
+    ) -> Optional[Union[str, Dict[str, str]]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError(f"{field_name} must be non-empty")
+            return value
+        if not isinstance(value, dict):
+            raise ValueError(f"{field_name} must be a string or JSON object")
+        normalized: Dict[str, str] = {}
+        for key, endpoint in value.items():
+            if not isinstance(endpoint, str) or not endpoint.strip():
+                raise ValueError(
+                    f"{field_name} values must be non-empty strings; "
+                    f"got {endpoint!r} for {key!r}"
+                )
+            normalized[str(key)] = endpoint
+        return normalized
+
+    def _handle_router_kv_reuse(self):
+        """Normalize router-directed HiCache reuse knobs."""
+        raw_config = self._load_json_object_config(
+            self.g2plus_config, "--g2plus-config"
+        )
+        if raw_config is not None:
+            self.enable_router_kv_reuse = True
+
+        if not self.enable_router_kv_reuse:
+            self.g2plus_config = None
+            return
+
+        self.enable_hierarchical_cache = True
+        if raw_config is None:
+            self.g2plus_config = None
+            return
+
+        config: Dict[str, Any] = dict(raw_config)
+        if "peer_endpoints" in config:
+            raise ValueError(
+                "g2plus_config.peer_endpoints is not supported for production "
+                "control-plane discovery; use http_control.static_peer_endpoints "
+                "only for standalone HTTP tests"
+            )
+        if "fetch_workers" in config:
+            raise ValueError(
+                "g2plus_config.fetch_workers is not supported; use "
+                "SGLANG_G2PLUS_FETCH_WORKERS"
+            )
+        if "transfer_parallelism" in config:
+            raise ValueError(
+                "g2plus_config.transfer_parallelism is not supported; use "
+                "SGLANG_G2PLUS_TRANSFER_PARALLELISM"
+            )
+
+        control_config = config.get("control") or {}
+        if not isinstance(control_config, dict):
+            raise ValueError("g2plus_config.control must be a JSON object")
+        if "workers" in control_config:
+            raise ValueError(
+                "g2plus_config.control.workers is not supported; use "
+                "SGLANG_G2PLUS_FETCH_WORKERS"
+            )
+        http_control = config.get("http_control") or {}
+        if not isinstance(http_control, dict):
+            raise ValueError("g2plus_config.http_control must be a JSON object")
+        transfer_config = config.get("transfer") or {}
+        if not isinstance(transfer_config, dict):
+            raise ValueError("g2plus_config.transfer must be a JSON object")
+        if "parallelism" in transfer_config:
+            raise ValueError(
+                "g2plus_config.transfer.parallelism is not supported; use "
+                "SGLANG_G2PLUS_TRANSFER_PARALLELISM"
+            )
+
+        worker_id = config.get("worker_id")
+        if worker_id is None:
+            raise ValueError("--g2plus-config requires worker_id")
+        if isinstance(worker_id, bool):
+            raise ValueError("g2plus_config.worker_id must be a non-negative integer")
+        try:
+            worker_id = int(worker_id)
+        except (TypeError, ValueError) as err:
+            raise ValueError(
+                "g2plus_config.worker_id must be a non-negative integer"
+            ) from err
+        if worker_id < 0:
+            raise ValueError("g2plus_config.worker_id must be a non-negative integer")
+
+        control_backend = str(
+            config.get(
+                "control_backend",
+                control_config.get("backend", "http" if http_control else "dynamo"),
+            )
+        ).lower()
+        if control_backend not in {"dynamo", "http"}:
+            raise ValueError(
+                "g2plus_config.control.backend must be one of ['dynamo', 'http'], "
+                f"got {control_backend!r}"
+            )
+
+        transfer_backend = str(
+            config.get(
+                "transfer_backend", transfer_config.get("backend", "auto")
+            )
+        ).lower()
+        if transfer_backend not in G2PLUS_TRANSFER_BACKEND_CHOICES:
+            raise ValueError(
+                "g2plus_config.transfer_backend must be one of "
+                f"{G2PLUS_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
+            )
+
+        timeout_secs = float(
+            config.get(
+                "timeout_secs",
+                transfer_config.get("timeout_secs", control_config.get("timeout_secs", 1.0)),
+            )
+        )
+        if timeout_secs <= 0:
+            raise ValueError("g2plus_config.timeout_secs must be > 0")
+
+        self.g2plus_config = {
+            "worker_id": worker_id,
+            "control_backend": control_backend,
+            "http_control": {
+                "endpoint": self._normalize_g2plus_endpoint_map(
+                    http_control.get("endpoint", config.get("endpoint")),
+                    "g2plus_config.http_control.endpoint",
+                ),
+                "static_peer_endpoints": self._normalize_g2plus_endpoint_map(
+                    http_control.get(
+                        "static_peer_endpoints", config.get("static_peer_endpoints")
+                    ),
+                    "g2plus_config.http_control.static_peer_endpoints",
+                ),
+            },
+            "timeout_secs": timeout_secs,
+            "transfer_backend": transfer_backend,
+        }
 
     def _handle_load_format(self):
         if (
@@ -6488,6 +6657,17 @@ class ServerArgs:
             "--enable-return-indexer-topk",
             action="store_true",
             help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
+            "--g2plus-config",
+            type=str,
+            default=ServerArgs.g2plus_config,
+            help=(
+                "JSON object or JSON file path for G2plus router-directed remote "
+                "G2(host-pinned)->G1(GPU) KV reuse. Keys: worker_id, control, "
+                "http_control, transfer, timeout_secs, transfer_backend. Runtime "
+                "parallelism is controlled by SGLANG_G2PLUS_* env vars."
+            ),
         )
         parser.add_argument(
             "--scheduler-recv-interval",

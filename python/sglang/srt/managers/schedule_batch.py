@@ -665,6 +665,7 @@ class Req(ReqDllmMixin):
         disagg_mode: Optional[DisaggregationMode] = None,
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
+        remote_kv_reuse_plan: Optional[Any] = None,
         vocab_size: Optional[int] = None,
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
@@ -743,6 +744,7 @@ class Req(ReqDllmMixin):
         self.extra_key = extra_key
         self.lora_id = lora_id
         self.routing_key = routing_key
+        self.remote_kv_reuse_plan = remote_kv_reuse_plan
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -806,6 +808,8 @@ class Req(ReqDllmMixin):
         self.host_hit_length = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
+        # Tokens staged into local cache from a router-provided remote G2 plan.
+        self.remote_g2_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -896,6 +900,7 @@ class Req(ReqDllmMixin):
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
+        self.cached_tokens_remote_g2 = 0  # Tokens staged by router-directed remote G2
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
@@ -1905,7 +1910,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # - len(prefix_indices) = device_original + host_loaded
                     # - host_hit_length = total tokens from host cache (including storage-prefetched)
                     # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
+                    # - remote_g2_hit_length = tokens inserted into the device prefix by router reuse
+                    # - device_portion = len(prefix_indices) - host_hit_length - remote_g2_portion
                     #
                     # Storage hits are now tracked via scheduler after prefetch completes.
                     # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
@@ -1913,11 +1919,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # Clamp storage to host_total to handle edge cases
                     storage_portion = min(host_total, req.storage_hit_length)
                     host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    device_total = max(0, len(req.prefix_indices) - host_total)
+                    remote_g2_portion = min(
+                        device_total, max(0, req.remote_g2_hit_length)
+                    )
+                    device_portion = device_total - remote_g2_portion
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
+                    req.cached_tokens_remote_g2 = remote_g2_portion
                     req._cache_breakdown_computed = True
 
                 req.already_computed = seq_len

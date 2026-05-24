@@ -452,6 +452,23 @@ def hash_str_to_int64(hash_str: str) -> int:
     return uint64_val
 
 
+def block_hash_aliases(block_hash: int) -> set[int]:
+    """Return signed/unsigned aliases for a 64-bit block hash.
+
+    Dynamo and SGLang can cross a JSON boundary with either signed int64 event
+    values or unsigned uint64-looking values. Keep lookup tolerant while still
+    indexing the exact value.
+    """
+    value = int(block_hash)
+    aliases = {value}
+    uint64_max = 2**64 - 1
+    if -(2**63) <= value < 2**63:
+        aliases.add(value & uint64_max)
+    if 0 <= value <= uint64_max:
+        aliases.add(value if value < 2**63 else value - 2**64)
+    return aliases
+
+
 def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
     """Compute SHA256-based hash values for position-aware KV block IDs."""
     hash_values = []
