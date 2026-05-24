@@ -40,7 +40,6 @@ from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import CanaryEndpoint
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
-from sglang.srt.kv_canary.perturb.manager import PerturbManager
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.runner.enable_warner import _CanaryEnableWarner
 from sglang.srt.kv_canary.runner.kernel_launch import (
@@ -96,11 +95,10 @@ class SingleForwardManager:
     region; phase 4 consumes the snapshot outside the graph.
 
     KV-cache / device-state / endpoints / buffer groups are shared with
-    the owning :class:`CanaryManager`. The perturb manager is only
-    installed on SingleForwardManager(0) (the perturb owner for the outer
-    cycle); SingleForwardManager(i>0) receives ``perturb_manager=None`` so
-    that perturb fires exactly once per cycle regardless of
-    speculative-num-steps.
+    the owning :class:`CanaryManager`. Perturb (cycle-level fault
+    injection) is dispatched by the CanaryManager itself in its
+    ``_pre_ops_outside_graph`` / ``_post_ops_outside_graph`` —
+    SingleForwardManager does not own perturb dispatch.
     """
 
     def __init__(
@@ -113,7 +111,6 @@ class SingleForwardManager:
         endpoints: tuple[CanaryEndpoint, ...],
         req_to_token_pool: "ReqToTokenPool",
         swa_window_size: int,
-        perturb_manager: Optional[PerturbManager],
         per_forward_verify_capacity: int,
         per_forward_write_req_capacity: int,
         per_forward_write_entry_capacity: int,
@@ -129,7 +126,6 @@ class SingleForwardManager:
         self._endpoints = endpoints
         self._req_to_token_pool = req_to_token_pool
         self._swa_window_size = swa_window_size
-        self._perturb_manager: Optional[PerturbManager] = perturb_manager
         self._d2h_stream = d2h_stream
         self._token_oracle_manager: Optional[TokenOracleManager] = token_oracle_manager
         self._swa_divergence_report: Optional[SwaDivergenceReport] = (
@@ -197,11 +193,6 @@ class SingleForwardManager:
                 f"write_entry_capacity={self._write_entry_capacity}; raise "
                 f"--chunked-prefill-size / --max-prefill-tokens or check "
                 f"CanaryLaunchCapacities.from_args"
-            )
-
-        if self._perturb_manager is not None:
-            self._perturb_manager.perturb(
-                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
             )
 
     def pre_ops_maybe_inside_graph(
@@ -351,10 +342,6 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.post_ops_outside_graph",
         )
 
-        if self._perturb_manager is not None:
-            self._perturb_manager.perturb_post_forward(
-                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
-            )
         self._enable_warner.tick(self._output_buffer.verify_plan_enable)
 
     def _should_enable_input_check_for_launch(
