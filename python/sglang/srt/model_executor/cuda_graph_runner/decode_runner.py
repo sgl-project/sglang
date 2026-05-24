@@ -47,10 +47,13 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_tp_rank,
+    get_attention_tp_size,
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_backend.breakable_cudagraph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -157,7 +160,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_pdmux = model_runner.server_args.enable_pdmux
 
-        self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.attn_tp_size = get_attention_tp_size()
+        self.attn_tp_rank = get_attention_tp_rank()
+        # True if a DSACPLayerCommunicator-style prefill-CP flavor is active
+        # (DSA or MLA). These flavors feed a zigzag-split rank-local layout
+        # into the runner; MHA-arch prefill CP (Qwen3/Qwen2 MoE via PR
+        # #18233) uses the plain LayerCommunicator with an attn_tp-replicated
+        # layout and is intentionally excluded so the attn_tp-local
+        # num_token_non_padded adjustment still runs for it.
+        self.enable_prefill_cp = (
+            is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled()
+        )
 
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
@@ -503,7 +516,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if (
             enable_num_token_non_padded()
             and self.require_gathered_buffer
-            and not self.dsa_enable_prefill_cp
+            and not self.enable_prefill_cp
         ):
             local = compute_local_num_token_non_padded(
                 global_num_token_non_padded=buffers.num_token_non_padded,
@@ -738,7 +751,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
             num_tokens_per_bs=self.num_tokens_per_bs,
-            dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
+            # Parameter name retained for API stability; semantically this is
+            # "any prefill-CP flavor enabled" (DSA CP or MLA CP).
+            dsa_enable_prefill_cp=self.enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(),
             pp_proxy_tensors=pp_proxy_tensors,
         )

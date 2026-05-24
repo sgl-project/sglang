@@ -1,4 +1,5 @@
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -75,6 +76,12 @@ def _support_mha_one_shot(attn, forward_batch, backend_name):
 def _handle_attention_backend(attn, forward_batch, backend_name):
     if is_in_tc_piecewise_cuda_graph():
         return AttnForwardMethod.MLA
+
+    # MLA prefill CP forces absorbed MLA regardless of prefix length: the
+    # CP path gathers latent KV via rebuild_cp_kv_cache and feeds the
+    # backend's absorbed-MLA kernel.
+    if mla_use_prefill_cp(forward_batch):
+        return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)
     disable_ragged = (
