@@ -45,13 +45,17 @@ class SyncExecutor(PipelineExecutor):
         self.begin_component_residency_request(stages, payload, server_args)
         try:
             for stage_index, stage in enumerate(stages):
-                # Use the registered (snake_case) stage name so the umbrella
-                # NVTX range matches the per-submodule prefix emitted by
+                # Use the stage's own registered name (set by ``add_stage``) so the
+                # umbrella NVTX range matches the per-submodule prefix emitted by
                 # ``ComponentResidencyManager`` (e.g. ``stage_denoising_stage``
-                # + ``denoising_stage.transformer.*``).
+                # + ``denoising_stage.transformer.*``). ``_component_stage_name``
+                # returns ``_registered_stage_name or __class__.__name__`` directly
+                # — without consulting ``manager.state.stage_name``, which only
+                # advances inside ``before_stage`` and would otherwise leak the
+                # previous iteration's label onto the current stage's umbrella.
                 stage_name = getattr(
                     stage,
-                    "_active_component_stage_name",
+                    "_component_stage_name",
                     lambda: stage.__class__.__name__,
                 )()
                 self.before_stage(stage, stage_index, payload, server_args)
