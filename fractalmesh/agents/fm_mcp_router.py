@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     79,
+        "agents":     82,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -193,6 +193,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "cronjob":           7831,
             "swarm":             7832,
             "admin_dashboard":   7833,
+            "deep_scan":         7834,
+            "metrics":           7835,
+            "logic_bucket":      7836,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -473,6 +476,9 @@ _INTENTS = {
     "cron_job":                lambda a, k: {"action": "cron_queued", "name": k.get("name", ""), "schedule": k.get("schedule", "")},
     "swarm_batch":             lambda a, k: {"action": "swarm_queued", "batch_name": k.get("name", ""), "strategy": k.get("strategy", "parallel")},
     "admin_query":             lambda a, k: {"action": "admin_queued", "query": k.get("query", "dashboard")},
+    "deep_scan":               lambda a, k: {"action": "deep_scan_queued", "target": k.get("target", ""), "scan_type": k.get("scan_type", "domain")},
+    "metrics_push":            lambda a, k: {"action": "metrics_push_queued", "name": k.get("name", ""), "value": k.get("value", 0)},
+    "committee_ask":           lambda a, k: {"action": "committee_queued", "question": k.get("question", ""), "strategy": k.get("strategy", "consensus")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
