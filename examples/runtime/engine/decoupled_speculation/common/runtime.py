@@ -51,10 +51,15 @@ except ImportError:
 from .types import DecoupledSpecEndpointConfig, DecoupledSpecTopology
 
 
+def format_host_port(ip: str, port: int | str) -> str:
+    """Return a host:port string, preserving IPv6 bracket formatting."""
+    host = f"[{ip}]" if is_valid_ipv6_address(ip) else ip
+    return f"{host}:{port}"
+
+
 def format_tcp_address(ip: str, port: int | str) -> str:
     """Return a ZMQ TCP endpoint, preserving IPv6 bracket formatting."""
-    host = f"[{ip}]" if is_valid_ipv6_address(ip) else ip
-    return f"tcp://{host}:{port}"
+    return f"tcp://{format_host_port(ip, port)}"
 
 
 def get_decoupled_spec_actor_env_vars() -> dict[str, str]:
@@ -121,15 +126,29 @@ def pin_actor_to_assigned_gpus(expected_num_gpus: int) -> list[str]:
 def reserve_tcp_port(
     preferred_port: int | None = None,
     avoid_ports: set[int] | None = None,
+    bind_host: str | None = None,
 ) -> tuple[int, socket.socket]:
     """Bind and hold a TCP port, returning both the port and lock socket."""
     avoid_ports = set(avoid_ports or ())
+    bind_host = (bind_host or "0.0.0.0").strip()
+    if bind_host.startswith("[") and bind_host.endswith("]"):
+        bind_host = bind_host[1:-1]
+    is_ipv6 = is_valid_ipv6_address(bind_host)
+    socket_family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
 
     def bind_port(port: int) -> socket.socket:
-        """Bind a listening socket to all interfaces on a specific port."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        """Bind a listening socket to the same address family as the endpoint."""
+        sock = socket.socket(socket_family, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", port))
+        if is_ipv6 and hasattr(socket, "IPV6_V6ONLY"):
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        if is_ipv6:
+            sock.bind((bind_host, port, 0, 0))
+        else:
+            sock.bind((bind_host, port))
         sock.listen(1)
         return sock
 
@@ -142,19 +161,32 @@ def reserve_tcp_port(
         return preferred_port, bind_port(preferred_port)
 
     for _ in range(256):
-        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        probe.bind(("0.0.0.0", 0))
-        probe.listen(1)
+        probe = bind_port(0)
         candidate_port = int(probe.getsockname()[1])
-        probe.close()
         if candidate_port in avoid_ports:
+            probe.close()
             continue
-        try:
-            return candidate_port, bind_port(candidate_port)
-        except OSError:
-            continue
+        return candidate_port, probe
 
     raise RuntimeError("failed to reserve a TCP port")
+
+
+def _iter_candidate_ports(
+    preferred_port: int | None,
+    fallback_ports: list[int] | None = None,
+):
+    """Yield candidate ports in priority order, without duplicates."""
+    seen_ports = set()
+    if preferred_port is not None:
+        seen_ports.add(preferred_port)
+        yield preferred_port
+    for port in fallback_ports or ():
+        if port in seen_ports:
+            continue
+        seen_ports.add(port)
+        yield port
+    if preferred_port is None and not seen_ports:
+        yield None
 
 
 def _get_alive_gpu_nodes() -> list[dict[str, Any]]:
@@ -232,13 +264,15 @@ class PortActor:
     ) -> dict[str, Any]:
         """Reserve a TCP port on this actor's node and report host and port."""
         self.release_port()
+        bind_host = ray.util.get_node_ip_address()
         port, sock = reserve_tcp_port(
             preferred_port,
             avoid_ports=set(avoid_ports or ()),
+            bind_host=bind_host,
         )
         self._reserved_socket = sock
         return {
-            "host": ray.util.get_node_ip_address(),
+            "host": bind_host,
             "port": port,
         }
 
@@ -262,6 +296,7 @@ def create_result_endpoint_from_pg(
     avoid_port: int | None = None,
     avoid_ports: set[int] | None = None,
     preferred_port: int | None = None,
+    fallback_ports: list[int] | None = None,
 ) -> str:
     """Reserve a verifier result endpoint on target placement-group rank 0."""
     avoid_ports = set(avoid_ports or ())
@@ -271,15 +306,22 @@ def create_result_endpoint_from_pg(
         placement_group=pg,
         placement_group_bundle_index=0,
     )
-    for _ in range(16):
+    last_error: Exception | None = None
+    for candidate_port in _iter_candidate_ports(preferred_port, fallback_ports):
+        if candidate_port is not None and candidate_port in avoid_ports:
+            continue
         actor = PortActor.options(
             num_cpus=0,
             scheduling_strategy=scheduling_strategy,
         ).remote()
         try:
-            reservation = ray.get(
-                actor.reserve_port.remote(preferred_port, sorted(avoid_ports))
-            )
+            try:
+                reservation = ray.get(
+                    actor.reserve_port.remote(candidate_port, sorted(avoid_ports))
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
             host = reservation["host"]
             port = int(reservation["port"])
             ray.get(actor.release_port.remote())
@@ -288,13 +330,15 @@ def create_result_endpoint_from_pg(
 
         if port not in avoid_ports:
             return format_tcp_address(host, port)
-        if preferred_port is not None:
-            raise RuntimeError(
-                f"preferred result endpoint port {preferred_port} conflicts with "
-                f"avoid_ports {sorted(avoid_ports)}"
-            )
 
-    raise RuntimeError("failed to reserve a result endpoint port")
+    candidate_ports = list(_iter_candidate_ports(preferred_port, fallback_ports))
+    message = (
+        "failed to reserve a result endpoint port from candidates "
+        f"{candidate_ports} with avoid_ports {sorted(avoid_ports)}"
+    )
+    if last_error is not None:
+        raise RuntimeError(message) from last_error
+    raise RuntimeError(message)
 
 
 def create_endpoint_on_node(
@@ -302,19 +346,27 @@ def create_endpoint_on_node(
     *,
     avoid_ports: set[int] | None = None,
     preferred_port: int | None = None,
+    fallback_ports: list[int] | None = None,
 ) -> str:
     """Reserve an endpoint on the requested Ray node."""
     avoid_ports = set(avoid_ports or ())
     scheduling_strategy = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-    for _ in range(16):
+    last_error: Exception | None = None
+    for candidate_port in _iter_candidate_ports(preferred_port, fallback_ports):
+        if candidate_port is not None and candidate_port in avoid_ports:
+            continue
         actor = PortActor.options(
             num_cpus=0,
             scheduling_strategy=scheduling_strategy,
         ).remote()
         try:
-            reservation = ray.get(
-                actor.reserve_port.remote(preferred_port, sorted(avoid_ports))
-            )
+            try:
+                reservation = ray.get(
+                    actor.reserve_port.remote(candidate_port, sorted(avoid_ports))
+                )
+            except Exception as exc:
+                last_error = exc
+                continue
             host = reservation["host"]
             port = int(reservation["port"])
             ray.get(actor.release_port.remote())
@@ -323,13 +375,15 @@ def create_endpoint_on_node(
 
         if port not in avoid_ports:
             return format_tcp_address(host, port)
-        if preferred_port is not None:
-            raise RuntimeError(
-                f"preferred endpoint port {preferred_port} conflicts with "
-                f"avoid_ports {sorted(avoid_ports)}"
-            )
 
-    raise RuntimeError("failed to reserve an endpoint port")
+    candidate_ports = list(_iter_candidate_ports(preferred_port, fallback_ports))
+    message = (
+        "failed to reserve an endpoint port from candidates "
+        f"{candidate_ports} with avoid_ports {sorted(avoid_ports)}"
+    )
+    if last_error is not None:
+        raise RuntimeError(message) from last_error
+    raise RuntimeError(message)
 
 
 @ray.remote
@@ -436,6 +490,7 @@ def create_remote_decoupled_spec_topology(
     avoid_ports: set[int] | None = None,
     preferred_result_ports: list[int | None] | None = None,
     preferred_control_ports: list[int | None] | None = None,
+    fallback_ports: list[int] | None = None,
 ) -> DecoupledSpecTopology:
     """Create Ray/multi-node decoupled-spec endpoints and draft actors."""
     if not isinstance(verifier_pgs, list):
@@ -472,6 +527,7 @@ def create_remote_decoupled_spec_topology(
             pg,
             avoid_ports=used_ports,
             preferred_port=preferred_result_port,
+            fallback_ports=fallback_ports,
         )
         result_endpoints.append(result_endpoint)
         try:
@@ -490,6 +546,7 @@ def create_remote_decoupled_spec_topology(
             node_id,
             avoid_ports=used_ports,
             preferred_port=preferred_control_port,
+            fallback_ports=fallback_ports,
         )
         control_endpoints.append(control_endpoint)
         try:

@@ -324,6 +324,14 @@ def load_prompt_samples(
 
 
 def _parse_host_port(addr: str) -> tuple[str, int | None]:
+    if addr.startswith("["):
+        end = addr.find("]")
+        if end != -1:
+            host = addr[1:end]
+            rest = addr[end + 1 :]
+            if rest.startswith(":") and len(rest) > 1:
+                return host, int(rest[1:])
+        return addr, None
     if addr.count(":") == 1:
         host, raw_port = addr.rsplit(":", 1)
         if raw_port:
@@ -381,11 +389,12 @@ def _split_reserved_ports(
     dict[str, list[int]],
     list[int],
     list[int],
+    list[int],
     list[int] | None,
 ]:
     reserved_ports = _parse_reserved_ports(args.reserved_ports)
     if not reserved_ports:
-        return [], {}, [], [], None
+        return [], {}, [], [], [], None
 
     if args.dist_init_addr is not None or args.dist_init_port is not None:
         raise ValueError(
@@ -423,7 +432,16 @@ def _split_reserved_ports(
     result_ports = reserved_ports[cursor : cursor + num_verifiers]
     cursor += num_verifiers
     control_ports = reserved_ports[cursor : cursor + num_drafters]
-    return spec_ports, baseline_ports_by_mode, result_ports, control_ports, reserved_ports
+    cursor += num_drafters
+    extra_ports = reserved_ports[cursor:]
+    return (
+        spec_ports,
+        baseline_ports_by_mode,
+        result_ports,
+        control_ports,
+        extra_ports,
+        reserved_ports,
+    )
 
 
 def derive_dist_init_addr(
@@ -449,7 +467,7 @@ def derive_dist_init_addr(
             "dist-init-addr must include a port or dist-init-port must be set"
         )
 
-    return f"{host}:{base_port + port_offset}"
+    return common.format_host_port(host, base_port + port_offset)
 
 
 def derive_dist_init_addr_from_pg(
@@ -486,7 +504,7 @@ def derive_dist_init_addr_from_pg(
     finally:
         ray.kill(actor, no_restart=True)
 
-    return f"{host}:{port}"
+    return common.format_host_port(host, port)
 
 
 def init_ray(address: str, namespace: str, nnodes: int) -> None:
@@ -936,6 +954,7 @@ def main() -> None:
             baseline_reserved_ports,
             result_reserved_ports,
             control_reserved_ports,
+            extra_reserved_ports,
             reserved_ports,
         ) = _split_reserved_ports(args)
         if reserved_ports is not None:
@@ -1016,6 +1035,7 @@ def main() -> None:
             avoid_ports=reserved_dist_init_ports,
             preferred_result_ports=preferred_result_ports,
             preferred_control_ports=preferred_control_ports,
+            fallback_ports=extra_reserved_ports,
         )
         print_decoupled_spec_layout(
             args=args,
