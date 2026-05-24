@@ -246,7 +246,7 @@ class SharedHiCacheManager:
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
             worker_id=worker_id,
-            dp_rank=scheduler.dp_rank or 0,
+            dp_rank=getattr(scheduler, "dp_rank", 0) or 0,
             direct_transfer=direct_transfer,
             metrics_collector=(
                 scheduler.metrics_collector
