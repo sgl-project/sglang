@@ -591,6 +591,7 @@ class SchedulerBatchResultProcessor:
         # need per-req boundaries; the legacy `hidden_states[i]` indexing only
         # ever pulled one row per step.
         spec_v1_hs_offsets = None
+        spec_v1_hidden_states_list = None
         if (
             is_spec_v1
             and logits_output.hidden_states is not None
@@ -604,6 +605,10 @@ class SchedulerBatchResultProcessor:
                     f"spec-v1 hidden_states offset total {spec_v1_hs_offsets[-1]} "
                     f"!= hidden_states.shape[0] {logits_output.hidden_states.shape[0]}"
                 )
+            # One GPU->CPU sync for the whole batch instead of N per-request
+            # `.cpu().tolist()` calls in the loop below. `.tolist()` already
+            # copies into fresh Python objects, so `.clone()` is unnecessary.
+            spec_v1_hidden_states_list = logits_output.hidden_states.tolist()
 
         for i, req in enumerate(batch.reqs):
             req: Req
@@ -623,14 +628,15 @@ class SchedulerBatchResultProcessor:
                     if spec_v1_hs_offsets is not None:
                         start, end = spec_v1_hs_offsets[i], spec_v1_hs_offsets[i + 1]
                         req.hidden_states.extend(
-                            logits_output.hidden_states[start:end]
-                            .cpu()
-                            .clone()
-                            .tolist()
+                            spec_v1_hidden_states_list[start:end]
                         )
                     else:
+                        # Legacy single-row path for any spec-v1 worker that
+                        # populates hidden_states without num_correct_drafts_per_req_cpu.
+                        # Currently unreachable for known workers; kept as a safety
+                        # fallback.
                         req.hidden_states.append(
-                            logits_output.hidden_states[i].cpu().clone().tolist()
+                            logits_output.hidden_states[i].cpu().tolist()
                         )
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
