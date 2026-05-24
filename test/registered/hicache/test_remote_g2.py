@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -158,7 +159,7 @@ def _make_plan(block_hashes, **overrides):
         "target_dp_rank": 0,
         "source_worker_id": 7,
         "source_dp_rank": 0,
-        "source_tier": "host_pinned",
+        "source_tier": StorageMedium.CPU.value,
         "block_hashes": block_hashes,
         "planned_prefix_blocks": len(block_hashes),
         "block_size_tokens": 2,
@@ -330,7 +331,7 @@ class TestRemoteG2(unittest.TestCase):
             )
         )
 
-        self.assertEqual(plan.source_tier, "host_pinned")
+        self.assertEqual(plan.source_tier, StorageMedium.CPU.value)
         self.assertEqual(plan.block_hashes, (11, 22, 33))
         self.assertEqual(plan.kv_block_hashes, (111, 222, 333))
         self.assertEqual(plan.start_block_index, 4)

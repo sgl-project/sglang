@@ -4,14 +4,14 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
 
+from sglang.srt.disaggregation.kv_events import StorageMedium
 from sglang.srt.mem_cache.utils import block_hash_aliases
 
 REMOTE_G2_PLAN_EXTRA_ARGS_KEY = "remote_g2_plan"
 REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_g2_no_plan_reason"
 REMOTE_G2_PLAN_VERSION = 1
 REMOTE_G2_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
-
-_REMOTE_G2_TIERS = {"g2", "host_pinned", "hostpinned", "cpu_pinned", "cpu_tier1"}
+REMOTE_G2_SOURCE_TIER = StorageMedium.CPU.value
 
 
 def _now_ms() -> int:
@@ -27,12 +27,12 @@ def normalize_endpoint(endpoint: str) -> str:
     return endpoint.rstrip("/")
 
 
-def _normalize_tier(tier: str) -> str:
-    return str(tier).strip().lower().replace("-", "_")
-
-
-def _is_remote_g2_tier(tier: str) -> bool:
-    return _normalize_tier(tier) in _REMOTE_G2_TIERS
+def _canonical_source_tier(tier: Any) -> str:
+    if tier != REMOTE_G2_SOURCE_TIER:
+        raise ValueError(
+            f"source_tier must be {REMOTE_G2_SOURCE_TIER!r}, got {tier!r}"
+        )
+    return REMOTE_G2_SOURCE_TIER
 
 
 def _coerce_int(value: Any, field_name: str) -> int:
@@ -170,8 +170,10 @@ class RemoteG2Plan:
                     "source_dp_rank",
                 ),
                 source_endpoint=source_endpoint,
-                source_tier=str(
-                    _first_present(data, "source_tier", default="host_pinned")
+                source_tier=_canonical_source_tier(
+                    _first_present(
+                        data, "source_tier", default=REMOTE_G2_SOURCE_TIER
+                    )
                 ),
                 block_hashes=block_hashes,
                 planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
@@ -210,7 +212,7 @@ class RemoteG2Plan:
         return self.kv_block_hashes[: self.planned_prefix_blocks]
 
     def is_remote_g2(self) -> bool:
-        return _is_remote_g2_tier(self.source_tier)
+        return self.source_tier == REMOTE_G2_SOURCE_TIER
 
     def is_expired(self, now_ms: Optional[int] = None) -> bool:
         return self.expires_at_ms <= (now_ms if now_ms is not None else _now_ms())
