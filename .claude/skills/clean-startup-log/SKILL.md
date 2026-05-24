@@ -178,11 +178,11 @@ Any `logger.info()` or `logger.warning()` in `ModelConfig.__init__()` or `get_to
 - **Source:** `layers/attention/flashinfer_backend.py` (line 249)
 - **Fix applied:** Changed "B200" to "SM100 GPUs" (the condition checks `is_sm100_supported()` which matches SM10x, not just B200). Downgraded from `logger.warning()` to `logger.info()` since it's an expected automatic fallback.
 
-### 15. `max_total_num_tokens` and `Tree cache initialized` log ordering (FIXED)
+### 15. `max_total_num_tokens` and `Tree cache initialized` log ordering
 
-- **Issue:** `max_total_num_tokens=...` appeared before `Tree cache initialized:...` even though tree cache is conceptually part of memory setup.
-- **Root cause:** `max_total_num_tokens` was logged inside `init_model_worker()` (scheduler.py:972), which runs before `build_kv_cache()` (scheduler.py:425) where tree cache is created.
-- **Fix applied:** Moved the `max_total_num_tokens` log to after `build_kv_cache()` returns, so the order is now: Tree cache → max_total_num_tokens.
+- **Issue:** `max_total_num_tokens=...` appears before `Tree cache initialized:...` even though tree cache is conceptually part of memory setup.
+- **Root cause:** `max_total_num_tokens` is logged inside `init_model_worker()` (scheduler.py:972), which runs before `build_kv_cache()` (scheduler.py:425) where tree cache is created.
+- **Status:** Not fixed — reordering was reverted. Acceptable as-is.
 
 ### 16. `Ignore import error when loading sglang.srt.models.midashenglm`
 
