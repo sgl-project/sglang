@@ -49,6 +49,7 @@ def dequantize_k_cache_paged(
     num_tokens = page_table_1_flattened.shape[0]
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
+    assert DIM_NOPE % 2 == 0 and NOPE_ROPE_BYTES % 2 == 0
 
     # Three typed views over the same underlying bytes.
     buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
@@ -131,6 +132,7 @@ def _dequantize_k_cache_paged_kernel(
         )
 
     rope_offs = tl.arange(0, DIM_ROPE)
-    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+    rope_byte_off = token_data_base + DIM_NOPE
+    bf16_off = rope_byte_off // 2 + rope_offs
     rope_data = tl.load(buf_bf16_ptr + bf16_off)
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)

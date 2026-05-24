@@ -48,6 +48,7 @@ Some other notes:
     c4_sparse: means "compressed by 4" but only attend to top-512 tokens.
                all related length will be clipped to 512.
 """
+# FlashMLA decode scheduler SMEM cap: 4 * (b * 5 + 1) <= 228 KiB.
 _LARGE_INDEXER_QUERY_THRESHOLD = 11673
 
 
@@ -85,14 +86,14 @@ def copy_metadata(
 
     provided_fields = check_eq_fields + copy_fields + assign_fields
     provided_fields_unique = set(provided_fields)
-    assert len(provided_fields) == len(
-        provided_fields_unique
-    ), f"{provided_fields=} has dup"
+    assert len(provided_fields) == len(provided_fields_unique), (
+        f"{provided_fields=} has dup"
+    )
     all_fields = {f.name for f in fields(src)}
     provided_fields = set(provided_fields)
-    assert (
-        provided_fields == all_fields
-    ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
+    assert provided_fields == all_fields, (
+        f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
+    )
 
 
 @dataclass
@@ -165,6 +166,6 @@ class PagedIndexerMetadata:
 
 
 def maybe_copy_inplace(dst, *, src) -> None:
-    assert type(src) == type(dst)
+    assert type(src) is type(dst)
     if dst is not None:
         dst.copy_(src)
