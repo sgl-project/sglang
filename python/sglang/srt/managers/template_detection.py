@@ -199,6 +199,16 @@ def _is_glm45(ctx):
     )
 
 
+def _is_xml_kv_tool_call(ctx):
+    # Structural signature for the GLM-4.5 / GLM-4.6 style tool-call format
+    # (`<tool_call>name<arg_key>k</arg_key>\n<arg_value>v</arg_value>...</tool_call>`).
+    # Matches any model whose tokenizer carries `<arg_key>` and `<arg_value>` as
+    # added tokens — e.g., inclusionAI/Ring-2.6, which borrows GLM's tool-call
+    # format but doesn't share the `[gMASK]<sop>` / `enable_thinking` family
+    # signature checked by `_is_glm45`.
+    return ctx.has_vocab("<arg_key>") and ctx.has_vocab("<arg_value>")
+
+
 def _is_mimo(ctx):
     return ctx.reasoning_config == ReasoningToggleConfig(
         toggle_param="enable_thinking", default_enabled=False
@@ -207,6 +217,12 @@ def _is_mimo(ctx):
 
 def _is_minimax(ctx):
     return ctx.has_text("<minimax:tool_call>")
+
+
+def _is_minicpm5(ctx):
+    if ctx.has_vocab("<function") and ctx.has_vocab("<param"):
+        return True
+    return ctx.has_pattern(r"<function\s+name=") and ctx.has_pattern(r"<param\s+name=")
 
 
 def _is_qwen3(ctx):
@@ -268,6 +284,10 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="interns1", value="interns1", predicate=_is_interns1),
     DetectionRule(name="mistral", value="mistral", predicate=_is_mistral),
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm45),
+    DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
+    DetectionRule(
+        name="xml_kv_tool_call", value="glm45", predicate=_is_xml_kv_tool_call
+    ),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="qwen", value="qwen", predicate=_is_qwen3),
     DetectionRule(name="deepseek_v3", value="deepseekv3", predicate=_is_deepseek_v3),
