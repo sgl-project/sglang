@@ -317,7 +317,12 @@ class MQALayer(nn.Module):
                 )
 
         self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32))
-        self.fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        _is_gptq_quant = quant_config is not None and getattr(
+            quant_config, "get_name", lambda: ""
+        )() in ("gptq", "gptq_marlin", "auto-round")
+        self.fuse_wqa_wkv = (
+            not _is_hip and not _is_gptq_quant and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        )
         if self.fuse_wqa_wkv:
             self.wqkv_a = ReplicatedLinear(
                 self.hidden_size,
@@ -1573,6 +1578,28 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 logger.info("Skip dequant fp8 wo_a")
 
+        # Dequantize GPTQ weights for layers constructed without quant_config
+        # (wo_a, compressor wkv/wgate, indexer weights_proj).
+        _gptq_dequant_suffixes = (
+            ".wo_a.qweight",
+            ".compressor.wkv.qweight",
+            ".compressor.wgate.qweight",
+            ".weights_proj.qweight",
+        )
+        if not isinstance(weights, list):
+            weights = list(weights)
+        has_gptq_unquant = any(
+            any(n.endswith(sfx) for sfx in _gptq_dequant_suffixes) for n, _ in weights
+        )
+        if has_gptq_unquant:
+            logger.info(
+                "Dequantizing GPTQ weights for unquantized layers "
+                "(wo_a, compressor, weights_proj)"
+            )
+            _bits = getattr(self.quant_config, "weight_bits", 4)
+            _gs = getattr(self.quant_config, "group_size", 128)
+            weights = list(_dequant_gptq_for_unquant_layers(weights, _bits, _gs))
+
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
@@ -1593,7 +1620,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
-        fuse_wqa_wkv = not _is_hip and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        _is_gptq_quant = self.quant_config is not None and getattr(
+            self.quant_config, "get_name", lambda: ""
+        )() in ("gptq", "gptq_marlin", "auto-round")
+        fuse_wqa_wkv = (
+            not _is_hip and not _is_gptq_quant and envs.SGLANG_OPT_FUSE_WQA_WKV.get()
+        )
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
         def auto_weight_loader(module):
@@ -1938,5 +1970,103 @@ def _dequant_fp8_wo_a(
         weight = weights_dict.pop(name)
         scale = weights_dict.pop(scale_name)
         yield name, _dequant_fp8(weight, scale)
+
+    yield from weights_dict.items()
+
+
+# ---------------------------------------------------------------------------
+# GPTQ dequantization for layers constructed with quant_config=None
+# ---------------------------------------------------------------------------
+
+# Layer name patterns (after remap) whose checkpoint weights are GPTQ-packed
+# but the model expects plain bf16.  Suffixes checked against the *remapped*
+# weight name before the main loading loop.
+_GPTQ_UNQUANT_LAYER_MARKERS = (
+    ".wo_a.",
+    ".compressor.wkv.",
+    ".compressor.wgate.",
+    ".weights_proj.",
+)
+
+
+def _dequant_gptq_weight(
+    qweight: torch.Tensor,
+    qzeros: torch.Tensor,
+    scales: torch.Tensor,
+    bits: int = 4,
+    group_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize a single GPTQ-packed weight to dense bf16.
+
+    Args:
+        qweight: int32, shape [in_size // pack_factor, out_size]
+        qzeros:  int32, shape [n_groups, out_size // pack_factor]
+        scales:  float16/bf16, shape [n_groups, out_size]
+    """
+    from sglang.srt.layers.quantization.gptq import unpack_from_int32
+
+    # qweight is packed along dim-0 (input dimension)
+    w = unpack_from_int32(qweight, bits, packed_dim=0)  # [in, out] int8
+    # qzeros is packed along dim-1 (output dimension)
+    z = unpack_from_int32(qzeros, bits, packed_dim=1)  # [n_groups, out] int8
+
+    # unpack_from_int32 subtracts offset = 2^(bits-1), undo that for zeros
+    # then add 1 for GPTQ v1 format (the common case for AutoRound)
+    offset = (1 << bits) // 2
+    z = z.to(torch.int32) + offset + 1
+
+    in_size, out_size = w.shape
+    n_groups = scales.shape[0]
+    assert in_size == n_groups * group_size, (
+        f"Shape mismatch: in_size={in_size}, n_groups={n_groups}, "
+        f"group_size={group_size}"
+    )
+
+    # Expand zeros and scales to per-element
+    z_expanded = z.repeat_interleave(group_size, dim=0)  # [in, out]
+    s_expanded = scales.repeat_interleave(group_size, dim=0)  # [in, out]
+
+    w_unsigned = w.to(torch.int32) + offset
+    result = (w_unsigned - z_expanded).float() * s_expanded.float()
+    return result.to(torch.bfloat16)
+
+
+def _dequant_gptq_for_unquant_layers(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+    bits: int = 4,
+    group_size: int = 128,
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Pre-process weight stream: dequantize GPTQ weights for layers that are
+    constructed with quant_config=None in the DeepSeek V4 model.
+
+    Converts  .qweight / .qzeros / .scales  →  .weight  (bf16)
+    for layers matching ``_GPTQ_UNQUANT_LAYER_MARKERS``.
+    All other weights are passed through unchanged.
+    """
+    weights_dict = dict(weights)
+
+    for name in list(weights_dict.keys()):
+        if name not in weights_dict:
+            continue
+        if not name.endswith(".qweight"):
+            continue
+        prefix = name[: -len(".qweight")]
+        if not any(m in name for m in _GPTQ_UNQUANT_LAYER_MARKERS):
+            continue
+
+        qzeros_name = prefix + ".qzeros"
+        scales_name = prefix + ".scales"
+        g_idx_name = prefix + ".g_idx"
+
+        if qzeros_name not in weights_dict or scales_name not in weights_dict:
+            continue
+
+        qw = weights_dict.pop(name)
+        qz = weights_dict.pop(qzeros_name)
+        sc = weights_dict.pop(scales_name)
+        weights_dict.pop(g_idx_name, None)
+
+        dense = _dequant_gptq_weight(qw, qz, sc, bits, group_size)
+        yield prefix + ".weight", dense
 
     yield from weights_dict.items()
