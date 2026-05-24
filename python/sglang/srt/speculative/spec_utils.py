@@ -42,6 +42,9 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.speculative.triton_ops.cache_locs import (
     get_target_cache_loc as get_target_cache_loc,
 )
+from sglang.srt.speculative.triton_ops.cache_locs import (
+    get_src_tgt_cache_loc as get_src_tgt_cache_loc,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 
 _is_cuda = is_cuda()

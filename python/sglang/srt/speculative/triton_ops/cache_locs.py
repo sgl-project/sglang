@@ -336,6 +336,25 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
+def get_src_tgt_cache_loc(
+    seq_lens: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    accept_index: torch.Tensor,
+    num_correct_drafts: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+):
+    src_cache_loc = out_cache_loc[accept_index]
+    tgt_cache_loc = torch.empty_like(src_cache_loc)
+    extended_len = seq_lens + draft_token_num
+    keep_len = torch.minimum(
+        (seq_lens + num_correct_drafts + 1 + page_size - 1) // page_size * page_size,
+        extended_len,
+    )
+    to_free_num_slots = extended_len - keep_len
+    return src_cache_loc, tgt_cache_loc, to_free_num_slots
+
+
 @triton.jit
 def get_target_cache_loc(
     tgt_cache_loc,
