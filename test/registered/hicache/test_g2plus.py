@@ -124,6 +124,10 @@ class FakeTree:
         self.insert_prefix_len = 0
         self.locked_nodes = []
         self.unlocked_nodes = []
+        self.flush_write_through_acks_calls = 0
+
+    def flush_write_through_acks(self):
+        self.flush_write_through_acks_calls += 1
 
     def _insert_helper_host(self, node, key, host_value, hash_value):
         self.insert_calls.append((node, key, host_value.clone(), list(hash_value)))
@@ -776,7 +780,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(len(lookup_calls), 1)
         self.assertEqual(lookup_calls[0], {block_hash})
 
-    def test_source_resolver_does_not_drive_hicache_async_acks(self):
+    def test_source_resolver_flushes_hicache_write_through_acks_before_lookup(self):
         tree = FakeTree(page_size=2)
         node = TreeNode()
         node.parent = tree.root_node
@@ -786,9 +790,6 @@ class TestRouterKVReuse(unittest.TestCase):
         tree.root_node.children[node.key.child_key(tree.page_size)] = node
         tree.cache_controller.mem_pool_host.pages[0] = torch.tensor(
             [1, 2, 3, 4], dtype=torch.uint8
-        )
-        tree.flush_write_through_acks = lambda: self.fail(
-            "source resolver must not mutate HiCache async state"
         )
         block_hash = hash_str_to_int64(node.hash_value[0])
         plan = RemoteKvReusePlan.from_dict(_make_plan([block_hash]))
@@ -804,6 +805,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
         self.assertEqual(reason, "ok")
         self.assertEqual([page.block_hash for page in pages], [block_hash])
+        self.assertEqual(tree.flush_write_through_acks_calls, 1)
 
     def test_source_resolver_concurrency_guard_is_bounded(self):
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
@@ -2851,6 +2853,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertNotIn("pages", response)
         self.assertEqual(len(transfer.calls), 1)
         self.assertEqual(node.host_ref_counter, 0)
+        self.assertEqual(tree.flush_write_through_acks_calls, 1)
 
     def test_source_direct_transfer_timeout_returns_indeterminate_reason(self):
         tree = FakeTree(page_size=2)

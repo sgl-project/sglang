@@ -344,6 +344,12 @@ def _host_lookup_guard(tree_cache):
     return getattr(tree_cache, "router_kv_lock", nullcontext())
 
 
+def _flush_hicache_write_through_acks(tree_cache) -> None:
+    flush = getattr(tree_cache, "flush_write_through_acks", None)
+    if callable(flush):
+        flush()
+
+
 def _host_page_start_indices(
     entries: list[tuple[int, str, TreeNode, int]], page_size: int
 ) -> list[int]:
@@ -401,6 +407,7 @@ def resolve_host_pages(
     entries: list[tuple[int, str, TreeNode, int]] = []
     protected_nodes: list[TreeNode] = []
     protected_ids: set[int] = set()
+    _flush_hicache_write_through_acks(tree_cache)
     with _host_lookup_guard(tree_cache):
         block_index = _build_host_block_index(
             tree_cache, set(requested_kv_hashes)
@@ -484,6 +491,7 @@ def _resolve_host_page_locations(
     entries: list[tuple[int, str, TreeNode, int]] = []
     protected_nodes: list[TreeNode] = []
     protected_ids: set[int] = set()
+    _flush_hicache_write_through_acks(tree_cache)
     with _host_lookup_guard(tree_cache):
         block_index = _build_host_block_index(
             tree_cache, set(requested_kv_hashes)
