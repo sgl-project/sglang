@@ -128,6 +128,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
+        self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
 
         # --- backend ---------------------------------------------------
         # Backends needing stable addresses for captured prefill segments
@@ -255,6 +256,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             self.quant_config,
             self.moe_layers,
             self.moe_fusions,
+            dsa_indexers=self.dsa_indexers,
         ):
             return self.model_runner.model.forward(
                 forward_batch.input_ids,
@@ -482,6 +484,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.quant_config,
                 self.moe_layers,
                 self.moe_fusions,
+                dsa_indexers=self.dsa_indexers,
             ):
                 output = self.backend.replay(
                     self._static_num_tokens, static_forward_batch, **kwargs

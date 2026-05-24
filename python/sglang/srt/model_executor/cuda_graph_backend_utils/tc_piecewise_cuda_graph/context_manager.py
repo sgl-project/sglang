@@ -68,6 +68,7 @@ class ForwardContext:
     quant_config: Any = None
     moe_layers: Optional[List[Any]] = field(default=None)
     moe_fusions: Optional[List[Any]] = field(default=None)
+    dsa_indexers: Optional[List[Any]] = field(default=None)
 
 
 _forward_context: Optional[ForwardContext] = None
@@ -84,6 +85,7 @@ def set_forward_context(
     quant_config: Any,
     moe_layers: List[Any],
     moe_fusions: List[Any],
+    dsa_indexers: Optional[List[Any]] = None,
 ):
     global _forward_context
     _forward_context = ForwardContext(
@@ -92,6 +94,7 @@ def set_forward_context(
         quant_config=quant_config,
         moe_layers=moe_layers,
         moe_fusions=moe_fusions,
+        dsa_indexers=dsa_indexers,
     )
     try:
         yield
