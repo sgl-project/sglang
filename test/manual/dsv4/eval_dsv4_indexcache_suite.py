@@ -331,6 +331,53 @@ def summarize_primary_metrics(rows: list[dict]) -> dict:
     return summary
 
 
+def compare_primary_metrics(summary: dict, baseline_label: str) -> dict:
+    baseline = summary.get(baseline_label, {})
+    comparisons = {}
+    for endpoint, task_metrics in summary.items():
+        if endpoint == baseline_label:
+            continue
+        for task, item in task_metrics.items():
+            baseline_item = baseline.get(task)
+            comparison = {
+                "metric": item["metric"],
+                "mean": item["mean"],
+                "baseline_mean": None,
+                "delta": None,
+                "status": "missing_baseline",
+            }
+            if baseline_item is not None:
+                comparison["baseline_mean"] = baseline_item["mean"]
+                if baseline_item["metric"] == item["metric"]:
+                    comparison["delta"] = item["mean"] - baseline_item["mean"]
+                    comparison["status"] = "compared"
+                else:
+                    comparison["status"] = "metric_mismatch"
+                    comparison["baseline_metric"] = baseline_item["metric"]
+            comparisons.setdefault(endpoint, {})[task] = comparison
+    return comparisons
+
+
+def enforce_quality_drop(comparisons: dict, max_drop: float | None) -> None:
+    if max_drop is None:
+        return
+    failures = []
+    for endpoint, task_metrics in comparisons.items():
+        for task, comparison in task_metrics.items():
+            if comparison["status"] != "compared":
+                failures.append(f"{endpoint}/{task}: {comparison['status']}")
+                continue
+            if comparison["delta"] < -max_drop:
+                failures.append(
+                    f"{endpoint}/{task}: delta {comparison['delta']:.6g} "
+                    f"< allowed {-max_drop:.6g}"
+                )
+    if failures:
+        raise RuntimeError(
+            "quality metric drop exceeded threshold: " + "; ".join(failures)
+        )
+
+
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -355,6 +402,8 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--out-dir", type=Path, default=Path("/tmp/sgl-eval-out"))
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--baseline-label", default="baseline")
+    parser.add_argument("--max-primary-metric-drop", type=float)
     parser.add_argument("--require-metrics", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -374,6 +423,7 @@ def main(argv: list[str] | None = None) -> None:
         "server_checks": {},
         "results": [],
         "primary_metric_summary": {},
+        "primary_metric_comparison": {},
     }
 
     for label, base_url in args.endpoint:
@@ -407,6 +457,14 @@ def main(argv: list[str] | None = None) -> None:
                 print(json.dumps(results["results"][-1], default=str), flush=True)
 
     results["primary_metric_summary"] = summarize_primary_metrics(results["results"])
+    results["primary_metric_comparison"] = compare_primary_metrics(
+        results["primary_metric_summary"],
+        args.baseline_label,
+    )
+    enforce_quality_drop(
+        results["primary_metric_comparison"],
+        args.max_primary_metric_drop,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2, default=str) + "\n")
 

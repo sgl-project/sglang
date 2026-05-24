@@ -119,7 +119,11 @@ def eval_cmd(args) -> list[str]:
         str(args.eval_min_context_length),
         "--output",
         str(args.output_dir / "quality_eval.json"),
+        "--baseline-label",
+        "baseline",
     ]
+    if args.max_primary_metric_drop is not None:
+        cmd += ["--max-primary-metric-drop", str(args.max_primary_metric_drop)]
     if args.require_eval_metrics:
         cmd.append("--require-metrics")
     for label, endpoint in quality_eval_endpoints(args):
@@ -195,6 +199,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--eval-repeats", type=int, default=3)
     parser.add_argument("--eval-max-tokens", type=int, default=32768)
     parser.add_argument("--eval-min-context-length", type=int, default=75000)
+    parser.add_argument("--max-primary-metric-drop", type=float)
     parser.add_argument(
         "--require-eval-metrics",
         action=argparse.BooleanOptionalAction,

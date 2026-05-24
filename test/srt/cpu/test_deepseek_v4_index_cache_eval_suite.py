@@ -178,6 +178,7 @@ def test_dsv4_index_cache_eval_suite_dry_run_writes_server_checks(tmp_path):
     ]
     assert {row["task"] for row in result["results"]} == {"ruler"}
     assert result["primary_metric_summary"] == {}
+    assert result["primary_metric_comparison"] == {}
 
 
 def test_dsv4_index_cache_eval_suite_extracts_stdout_metrics():
@@ -235,3 +236,49 @@ def test_dsv4_index_cache_eval_suite_summarizes_primary_metrics():
     assert summary["baseline"]["ruler"]["max"] == 0.9
     assert summary["baseline"]["ruler"]["n"] == 2
     assert summary["searched_1_2"]["ruler"]["mean"] == pytest.approx(0.85)
+
+
+def test_dsv4_index_cache_eval_suite_compares_primary_metrics():
+    summary = {
+        "baseline": {
+            "ruler": {"metric": "score", "mean": 0.9, "min": 0.9, "max": 0.9, "n": 1}
+        },
+        "searched_1_2": {
+            "ruler": {
+                "metric": "score",
+                "mean": 0.87,
+                "min": 0.87,
+                "max": 0.87,
+                "n": 1,
+            }
+        },
+    }
+
+    comparison = eval_suite.compare_primary_metrics(summary, "baseline")
+
+    assert comparison["searched_1_2"]["ruler"] == {
+        "metric": "score",
+        "mean": 0.87,
+        "baseline_mean": 0.9,
+        "delta": pytest.approx(-0.03),
+        "status": "compared",
+    }
+
+
+def test_dsv4_index_cache_eval_suite_enforces_quality_drop():
+    comparisons = {
+        "searched_1_4": {
+            "ruler": {
+                "metric": "score",
+                "mean": 0.84,
+                "baseline_mean": 0.9,
+                "delta": -0.06,
+                "status": "compared",
+            }
+        }
+    }
+
+    with pytest.raises(RuntimeError, match="searched_1_4/ruler"):
+        eval_suite.enforce_quality_drop(comparisons, 0.05)
+
+    eval_suite.enforce_quality_drop(comparisons, 0.07)
