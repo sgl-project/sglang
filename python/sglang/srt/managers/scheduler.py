@@ -2343,6 +2343,8 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        self._maybe_update_speculative_pressure()
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
@@ -2389,6 +2391,15 @@ class Scheduler(
                 ret.fpm_start_time = self._fpm_batch_t0
 
         return ret
+
+    def _maybe_update_speculative_pressure(self) -> None:
+        on_pressure = getattr(self.model_worker, "on_scheduler_pressure_cpu", None)
+        if on_pressure is not None:
+            on_pressure(
+                len(self.running_batch.reqs),
+                len(self.waiting_queue),
+                self.max_running_requests,
+            )
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs

@@ -218,6 +218,61 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
         self.assertEqual(params.current_steps, 1)
         self.assertEqual(params.ema_accept_len, 0.375)
 
+    def test_queue_pressure_forces_low_steps_and_restores(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [1, 3],
+                "queue_pressure_adaptive": True,
+                "pressure_running_threshold": 0.75,
+                "pressure_queue_threshold": 0.75,
+                "pressure_restore_threshold": 0.5,
+                "pressure_target_steps": 1,
+                "warmup_batches": 0,
+                "update_interval": 1,
+            },
+        )
+
+        self.assertTrue(params.update_pressure(12, 18, 32))
+        self.assertTrue(params.pressure_active)
+        self.assertEqual(params.current_steps, 1)
+
+        self.assertFalse(params.update([3, 3]))
+        self.assertEqual(params.current_steps, 1)
+
+        self.assertTrue(params.update_pressure(2, 0, 32))
+        self.assertFalse(params.pressure_active)
+        self.assertEqual(params.current_steps, 3)
+
+    def test_queue_pressure_can_be_disabled(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [1, 3],
+                "queue_pressure_adaptive": False,
+            },
+        )
+
+        self.assertFalse(params.update_pressure(32, 32, 32))
+        self.assertEqual(params.current_steps, 3)
+
+    def test_queue_pressure_respects_acceptance_gate(self):
+        params = self._make_params_from_config(
+            3,
+            {
+                "candidate_steps": [1, 3],
+                "queue_pressure_adaptive": True,
+                "pressure_max_accept_len": 1.0,
+            },
+        )
+
+        self.assertFalse(params.update_pressure(32, 32, 32))
+        self.assertEqual(params.current_steps, 3)
+
+        params.ema_accept_len = 0.5
+        self.assertTrue(params.update_pressure(32, 32, 32))
+        self.assertEqual(params.current_steps, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

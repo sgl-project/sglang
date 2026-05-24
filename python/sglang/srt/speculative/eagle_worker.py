@@ -347,6 +347,17 @@ class EAGLEWorker(TpModelWorker):
             state.speculative_num_draft_tokens
         )
 
+    def on_scheduler_pressure_cpu(
+        self,
+        running_reqs: int,
+        waiting_reqs: int,
+        max_running_requests: int,
+    ) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_scheduler_pressure(
+                running_reqs, waiting_reqs, max_running_requests
+            )
+
     def build_adaptive_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
     ) -> SpecRuntimeState:

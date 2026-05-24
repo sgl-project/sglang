@@ -57,7 +57,10 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
 
     The file may contain any subset of the following keys:
         ema_alpha, update_interval, warmup_batches,
-        down_hysteresis, up_hysteresis, candidate_steps
+        down_hysteresis, up_hysteresis, candidate_steps,
+        queue_pressure_adaptive, pressure_running_threshold,
+        pressure_queue_threshold, pressure_restore_threshold,
+        pressure_target_steps, pressure_max_accept_len
 
     Returns an empty dict when *path* is ``None``.
     """
@@ -131,8 +134,31 @@ class AdaptiveSpeculativeParams:
         self.warmup_batches = cfg.get("warmup_batches", 10)
         self.down_hysteresis = cfg.get("down_hysteresis", -0.25)
         self.up_hysteresis = cfg.get("up_hysteresis", 0.0)
+        self.queue_pressure_adaptive = bool(cfg.get("queue_pressure_adaptive", False))
+        self.pressure_running_threshold = float(
+            cfg.get("pressure_running_threshold", 0.75)
+        )
+        self.pressure_queue_threshold = float(
+            cfg.get("pressure_queue_threshold", 0.75)
+        )
+        self.pressure_restore_threshold = float(
+            cfg.get("pressure_restore_threshold", 0.50)
+        )
+        self.pressure_target_steps = int(
+            cfg.get("pressure_target_steps", self.candidate_steps[0])
+        )
+        self.pressure_max_accept_len = cfg.get("pressure_max_accept_len")
+        if self.pressure_max_accept_len is not None:
+            self.pressure_max_accept_len = float(self.pressure_max_accept_len)
+        if self.pressure_target_steps not in self.candidate_steps:
+            raise ValueError(
+                "pressure_target_steps must be included in candidate_steps; "
+                f"got {self.pressure_target_steps}, candidates={self.candidate_steps}"
+            )
 
         self.current_steps = initial_steps
+        self.pressure_active = False
+        self._pre_pressure_steps = initial_steps
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
@@ -162,10 +188,60 @@ class AdaptiveSpeculativeParams:
         if self._batch_count <= self.warmup_batches:
             return False
 
+        if self.pressure_active:
+            return False
+
         if (self._batch_count - self.warmup_batches) % self.update_interval != 0:
             return False
 
         return self._recompute_params()
+
+    def update_pressure(
+        self,
+        running_reqs: int,
+        waiting_reqs: int,
+        max_running_requests: int,
+    ) -> bool:
+        if not self.queue_pressure_adaptive or max_running_requests <= 0:
+            return False
+
+        running_pressure = running_reqs / max_running_requests
+        queue_pressure = (running_reqs + waiting_reqs) / max_running_requests
+        overloaded = (
+            running_pressure >= self.pressure_running_threshold
+            or queue_pressure >= self.pressure_queue_threshold
+        )
+        if self.pressure_max_accept_len is not None:
+            overloaded = (
+                overloaded and self.ema_accept_len <= self.pressure_max_accept_len
+            )
+        relieved = (
+            running_pressure <= self.pressure_restore_threshold
+            and queue_pressure <= self.pressure_restore_threshold
+        )
+
+        old_steps = self.current_steps
+        if overloaded and not self.pressure_active:
+            self._pre_pressure_steps = self.current_steps
+            self.current_steps = self.pressure_target_steps
+            self.pressure_active = True
+            log_info_on_rank0(
+                logger,
+                f"Adaptive spec pressure active: steps {old_steps} -> "
+                f"{self.current_steps} (running={running_reqs}, "
+                f"waiting={waiting_reqs}, max={max_running_requests})",
+            )
+        elif self.pressure_active and relieved:
+            self.current_steps = self._pre_pressure_steps
+            self.pressure_active = False
+            log_info_on_rank0(
+                logger,
+                f"Adaptive spec pressure relieved: steps {old_steps} -> "
+                f"{self.current_steps} (running={running_reqs}, "
+                f"waiting={waiting_reqs}, max={max_running_requests})",
+            )
+
+        return self.current_steps != old_steps
 
     def _recompute_params(self) -> bool:
         """Recompute steps from EMA. Returns True if params changed."""

@@ -838,6 +838,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    def on_scheduler_pressure_cpu(
+        self,
+        running_reqs: int,
+        waiting_reqs: int,
+        max_running_requests: int,
+    ) -> None:
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_scheduler_pressure(
+                running_reqs, waiting_reqs, max_running_requests
+            )
+
     # -- Adaptive speculative decoding protocol --
 
     def build_adaptive_runtime_state(

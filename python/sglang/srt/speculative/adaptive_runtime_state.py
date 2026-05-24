@@ -108,6 +108,18 @@ class AdaptiveController:
         if self.params.update(num_correct_drafts_per_req):
             self._activate(self.params.current_steps)
 
+    def on_scheduler_pressure(
+        self,
+        running_reqs: int,
+        waiting_reqs: int,
+        max_running_requests: int,
+    ) -> None:
+        """Feed scheduler pressure; switch runtime state if queue pressure warrants it."""
+        if self.params.update_pressure(
+            running_reqs, waiting_reqs, max_running_requests
+        ):
+            self._activate(self.params.current_steps)
+
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
         if state is None:

@@ -40,3 +40,11 @@ class BaseSpecWorker(ABC):
         controller without forcing a GPU→CPU sync in the worker hot path.
         """
         pass
+
+    def on_scheduler_pressure_cpu(
+        self,
+        running_reqs: int,
+        waiting_reqs: int,
+        max_running_requests: int,
+    ) -> None:
+        pass
