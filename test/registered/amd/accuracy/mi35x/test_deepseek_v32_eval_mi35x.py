@@ -78,9 +78,9 @@ MI35X_DEEPSEEK_V32_MODELS = [
         variant="basic",
         other_args=[
             "--trust-remote-code",
-            "--nsa-prefill-backend",
+            "--dsa-prefill-backend",
             "tilelang",
-            "--nsa-decode-backend",
+            "--dsa-decode-backend",
             "tilelang",
             "--mem-fraction-static",
             "0.85",

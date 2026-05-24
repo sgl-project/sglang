@@ -61,7 +61,6 @@ export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export HCCL_OP_EXPANSION_MODE=AIV
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --device npu \
@@ -82,7 +81,6 @@ export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export STREAMS_PER_DEVICE=32
 export HCCL_BUFFSIZE=1536
 export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
-export SGLANG_DEEPEP_BF16_DISPATCH=1
 
 python -m sglang.launch_server \
    --model-path Qwen/Qwen3-235B-A22B-Instruct-2507 \
@@ -114,7 +112,6 @@ MODEL_PATH=/root/.cache/modelscope/hub/models/zcgy26/Qwen3-235B-A22B-Instruct-25
 
 ```shell
 export ASCEND_LAUNCH_BLOCKING=1
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 export HCCL_BUFFSIZE=1500
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
@@ -146,7 +143,6 @@ python3 -m sglang.launch_server \
 **Decode node:**
 
 ```shell
-export SGLANG_DEEPEP_BF16_DISPATCH=0
 export HCCL_BUFFSIZE=4000
 export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
 export DEEPEP_NORMAL_LONG_SEQ_ROUND=16

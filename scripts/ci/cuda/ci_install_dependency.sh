@@ -56,13 +56,16 @@ configure_environment() {
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
         if [ -n "${GITHUB_ENV:-}" ]; then
-            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV"
-            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV"
-            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV"
+            # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
+            mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
+            echo "VIRTUAL_ENV=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "SGLANG_CI_VENV_PATH=$UV_VENV" >> "$GITHUB_ENV" || true
+            echo "BASH_ENV=$UV_VENV/env.sh" >> "$GITHUB_ENV" || true
             touch "$UV_VENV/env.sh"
         fi
         if [ -n "${GITHUB_PATH:-}" ]; then
-            echo "$UV_VENV/bin" >> "$GITHUB_PATH"
+            mkdir -p "$(dirname "$GITHUB_PATH")" 2>/dev/null || true
+            echo "$UV_VENV/bin" >> "$GITHUB_PATH" || true
         fi
     else
         echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
@@ -186,8 +189,8 @@ uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
     # - flashinfer-jit-cache: 1.2+ GB
-    FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_python==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
-    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 '(?<=flashinfer_cubin==)[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    FLASHINFER_PYTHON_REQUIRED=$(grep -Po -m1 'flashinfer_python(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
+    FLASHINFER_CUBIN_REQUIRED=$(grep -Po -m1 'flashinfer_cubin(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' python/pyproject.toml || echo "")
     FLASHINFER_CUBIN_INSTALLED=$(pip show flashinfer-cubin 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
     FLASHINFER_JIT_INSTALLED=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//' || echo "")
     FLASHINFER_JIT_CU_VERSION=$(pip show flashinfer-jit-cache 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+//p' || echo "")
@@ -331,6 +334,34 @@ download_flashinfer_cache() {
         PIP_CMD="$PIP_CMD" \
         PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
         bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+force_reinstall_cutlass_dsl_libs_cu13() {
+    # nvidia-cutlass-dsl[cu13] has additive PyPI extras: installing it pulls in
+    # both -libs-base and -libs-cu13. The two wheels ship intentionally-different
+    # content for the same paths (cutlass/_mlir/dialects/_gpu_ops_gen.py and
+    # cutlass/_mlir/_mlir_libs/_cutlass_ir.cpython-*.so) -- each Python wrapper
+    # is paired with a matching pybind11 .so. If install order leaves the .py
+    # from one wheel and the .so from the other, GPUModuleOp.__init__ raises
+    # TypeError: incompatible function arguments at kernel-compile time.
+    #
+    # Force-reinstall -libs-cu13 LAST so both files come from the same wheel
+    # (BOTH-cu13 state), eliminating the mismatch. The version is parsed from
+    # pyproject.toml so this stays in sync with whatever nvidia-cutlass-dsl
+    # version the project pins.
+    if [ "$CU_MAJOR" != "13" ]; then
+        return
+    fi
+
+    CUTLASS_DSL_VERSION=$(grep -Po -m1 'nvidia-cutlass-dsl(\[[^]]+\])?==\K[0-9A-Za-z\.\-]+' "${REPO_ROOT}/python/pyproject.toml" || echo "")
+    if [ -z "$CUTLASS_DSL_VERSION" ]; then
+        echo "WARNING: could not detect nvidia-cutlass-dsl version from pyproject.toml; skipping libs-cu13 force-reinstall"
+        return
+    fi
+
+    $PIP_CMD install --force-reinstall --no-deps "nvidia-cutlass-dsl-libs-cu13==${CUTLASS_DSL_VERSION}" $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -488,6 +519,7 @@ main() {
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
+    force_reinstall_cutlass_dsl_libs_cu13
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools

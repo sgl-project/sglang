@@ -36,12 +36,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
-    attach_hybrid_nsa_pool_to_hiradix_cache,
+    attach_hybrid_dsa_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
-    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MHATokenToKVPoolHost,
@@ -82,8 +82,8 @@ class HiRadixCache(RadixCache):
                 server_args.hicache_mem_layout,
                 allocator_type=server_args.hicache_storage_backend,
             )
-        elif isinstance(self.kv_cache, NSATokenToKVPool):
-            # Filled by attach_hybrid_nsa_pool_to_hiradix_cache after storage extra_config is parsed.
+        elif isinstance(self.kv_cache, DSATokenToKVPool):
+            # Filled by attach_hybrid_dsa_pool_to_hiradix_cache after storage extra_config is parsed.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
@@ -95,9 +95,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(
-                "HiRadixCache only supports MHA, MLA, and NSA (DSA) models"
-            )
+            raise ValueError("HiRadixCache only supports MHA, MLA, and DSA models")
 
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
@@ -122,8 +120,8 @@ class HiRadixCache(RadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        if isinstance(self.kv_cache, NSATokenToKVPool):
-            attach_hybrid_nsa_pool_to_hiradix_cache(
+        if isinstance(self.kv_cache, DSATokenToKVPool):
+            attach_hybrid_dsa_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -643,10 +641,11 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, DSATokenToKVPool):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
+                indices_from_pool=PoolName.KV,
             )
             return {"extra_pools": [pool]}
         else:
@@ -804,10 +803,6 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
-
-    def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
-        """Convert raw token_ids to a RadixKey; must be list (not tuple) for paged match."""
-        return RadixKey(token_ids=list(token_ids))
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
         if self.disable:
@@ -1046,7 +1041,7 @@ class HiRadixCache(RadixCache):
         self,
         params: InitLoadBackParams,
     ):
-        last_node = params.last_host_node
+        last_node = params.best_match_node
         mem_quota = params.mem_quota
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
@@ -1251,6 +1246,8 @@ class HiRadixCache(RadixCache):
             device_indices=value,
             last_device_node=last_node,
             last_host_node=last_host_node,
+            # TODO(ispobock): use best_match_node as start node for load_back
+            best_match_node=last_host_node,
             host_hit_length=host_hit_length,
         )
 

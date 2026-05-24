@@ -118,6 +118,14 @@ class BaseLayerWithLoRA(nn.Module):
     def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         return B
 
+    @staticmethod
+    def _as_mutable_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        # lora can be reconfigured after executor forwards create inference tensors
+        if tensor.is_inference():
+            with torch.inference_mode(False):
+                return tensor.detach().clone()
+        return tensor
+
     def set_lora_weights(
         self,
         A: torch.Tensor,
@@ -291,6 +299,7 @@ class BaseLayerWithLoRA(nn.Module):
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()
             ).full_tensor()
+            data = self._as_mutable_tensor(data)
             target_dtype = data.dtype
             if (
                 merge_in_fp32
@@ -302,13 +311,16 @@ class BaseLayerWithLoRA(nn.Module):
             self._merge_lora_into_data(data, lora_list)
 
             unsharded_base_layer.weight = nn.Parameter(
-                data.to(current_device, dtype=target_dtype)
+                self._as_mutable_tensor(data.to(current_device, dtype=target_dtype))
             )
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
-                unsharded_base_layer.bias = nn.Parameter(
+                bias_data = (
                     self.base_layer.bias.to(get_local_torch_device(), non_blocking=True)
                     .full_tensor()
                     .to(current_device)
+                )
+                unsharded_base_layer.bias = nn.Parameter(
+                    self._as_mutable_tensor(bias_data)
                 )
 
             offload_policy = (
@@ -325,6 +337,7 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
+            data = self._as_mutable_tensor(data)
             target_dtype = data.dtype
             if (
                 merge_in_fp32
@@ -335,8 +348,8 @@ class BaseLayerWithLoRA(nn.Module):
 
             self._merge_lora_into_data(data, lora_list)
 
-            self.base_layer.weight.data = data.to(
-                current_device, dtype=target_dtype, non_blocking=True
+            self.base_layer.weight.data = self._as_mutable_tensor(
+                data.to(current_device, dtype=target_dtype, non_blocking=True)
             )
 
         self.merged = True
@@ -356,13 +369,20 @@ class BaseLayerWithLoRA(nn.Module):
         if isinstance(self.base_layer.weight, DTensor):
             device = self.base_layer.weight.data.device
             old_weight = self.base_layer.weight
-            new_weight_data = self.cpu_weight.to(device, non_blocking=True)
+            new_weight_data = self._as_mutable_tensor(
+                self.cpu_weight.to(device, non_blocking=True)
+            )
             self.base_layer.weight = nn.Parameter(new_weight_data)
             del old_weight
         else:
             current_device = self.base_layer.weight.data.device
             cpu_weight_on_device = self.cpu_weight.to(current_device, non_blocking=True)
-            self.base_layer.weight.data.copy_(cpu_weight_on_device)
+            if self.base_layer.weight.data.is_inference():
+                self.base_layer.weight.data = self._as_mutable_tensor(
+                    cpu_weight_on_device
+                )
+            else:
+                self.base_layer.weight.data.copy_(cpu_weight_on_device)
             if (
                 cpu_weight_on_device.data_ptr()
                 != self.base_layer.weight.data.data_ptr()
@@ -403,6 +423,9 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_rank, lora_alpha)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.merged or self.disable_lora:
+            return self.base_layer(input_)
+
         lora_A = self.lora_A
         lora_B = self.lora_B
         if isinstance(self.lora_B, DTensor):

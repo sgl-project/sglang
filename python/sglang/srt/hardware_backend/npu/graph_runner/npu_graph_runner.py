@@ -26,7 +26,7 @@ import numpy as np
 import torch
 
 import sglang
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_nsa
+from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
@@ -108,11 +108,14 @@ class NPUGraphRunner(CudaGraphRunner):
         else:
             skip_guard_context = empty_context()
 
-        with skip_guard_context, torch.npu.graph(
-            graph,
-            pool=pool,
-            stream=stream,
-            auto_dispatch_capture=True,
+        with (
+            skip_guard_context,
+            torch.npu.graph(
+                graph,
+                pool=pool,
+                stream=stream,
+                auto_dispatch_capture=True,
+            ),
         ):
             out = run_once_fn()
         return out
@@ -185,7 +188,7 @@ class NPUGraphRunner(CudaGraphRunner):
         self.update_attr_name = self._get_update_attr_name()
         self.update_attr_type = self._get_update_attr_type()
         # Replay
-        if not is_deepseek_nsa(self.model_runner.model_config.hf_config):
+        if not is_deepseek_dsa(self.model_runner.model_config.hf_config):
             if forward_batch.forward_mode.is_target_verify():
                 seq_lens_cpu = forward_batch.seq_lens.cpu() + self.num_tokens_per_bs
                 seq_lens = seq_lens_cpu.tolist() + [0] * (self.bs - self.raw_bs)
