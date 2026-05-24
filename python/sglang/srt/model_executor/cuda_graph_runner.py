@@ -147,6 +147,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    rids_int: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -238,6 +239,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
+            # Static buffer for ``ForwardBatch.rids_int`` — needed so callers
+            # that read it inside cuda-graph capture (notably kv_canary
+            # token-oracle input-check) see a real tensor instead of None.
+            # Refreshed from the real ForwardBatch in populate_from_forward_batch
+            # before each replay. Gated on the same env var that populates
+            # ForwardBatch.rids_int upstream in prepare_forward_batch.
+            rids_int = (
+                torch.zeros((max_bs,), dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
+
         # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
             (max_bs,),
@@ -265,6 +278,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            rids_int=rids_int,
         )
 
     def populate_from_forward_batch(
@@ -334,6 +348,14 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if forward_batch.mrope_positions is not None:
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
+
+        # ``rids_int`` is captured as a static buffer so kv_canary's
+        # token-oracle input-check (which reads it inside the graph) sees a
+        # real tensor instead of None on PP/TP ranks where rids_int would
+        # otherwise be absent at capture time.
+        if self.rids_int is not None and forward_batch.rids_int is not None:
+            dsts.append(self.rids_int[:raw_bs])
+            srcs.append(forward_batch.rids_int)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -920,6 +942,7 @@ class CudaGraphRunner:
             encoder_lens = None
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -1038,6 +1061,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
         )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
