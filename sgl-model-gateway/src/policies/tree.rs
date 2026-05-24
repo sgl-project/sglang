@@ -35,6 +35,12 @@ fn new_tenant_map() -> DashMap<TenantId, u64> {
     DashMap::with_shard_amount(NODE_SHARD_COUNT)
 }
 
+/// Create a terminal tenant DashMap for non-root nodes.
+#[inline]
+fn new_terminal_tenant_map() -> DashMap<TenantId, ()> {
+    DashMap::with_shard_amount(NODE_SHARD_COUNT)
+}
+
 /// Interned tenant ID to avoid repeated string allocations.
 /// Using Arc<str> allows cheap cloning and comparison.
 pub type TenantId = Arc<str>;
@@ -48,6 +54,10 @@ pub struct PrefixMatchResult {
     pub matched_char_count: usize,
     /// Total number of characters in the input text
     pub input_char_count: usize,
+    /// True when the match stopped inside a radix node instead of at a node boundary.
+    pub ended_on_partial_match: bool,
+    /// True when the matched node is the terminal boundary of an inserted request.
+    pub matched_node_is_terminal: bool,
 }
 
 /// A fast identity hasher for single-character keys (used in children DashMap).
@@ -235,6 +245,8 @@ struct Node {
     text: RwLock<NodeText>,
     /// Per-tenant last access epoch for LRU ordering. Using TenantId (Arc<str>) for cheap cloning.
     tenant_last_access_time: DashMap<TenantId, u64>,
+    /// Tenants for which this node is an exact inserted request boundary.
+    terminal_tenants: DashMap<TenantId, ()>,
     /// Parent pointer for upward traversal during timestamp updates
     parent: RwLock<Option<NodeRef>>,
     /// Cached last-accessed tenant for O(1) lookup during prefix match.
@@ -352,6 +364,7 @@ impl Tree {
                 ),
                 text: RwLock::new(NodeText::empty()),
                 tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+                terminal_tenants: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
                 parent: RwLock::new(None),
                 last_tenant: parking_lot::RwLock::new(None),
             }),
@@ -405,6 +418,7 @@ impl Tree {
                         children: new_children_map(),
                         text: RwLock::new(NodeText::new(remaining.to_string())),
                         tenant_last_access_time: new_tenant_map(),
+                        terminal_tenants: new_terminal_tenant_map(),
                         parent: RwLock::new(Some(Arc::clone(&prev))),
                         last_tenant: parking_lot::RwLock::new(Some(Arc::clone(&tenant_id))),
                     });
@@ -417,6 +431,7 @@ impl Tree {
                     new_node
                         .tenant_last_access_time
                         .insert(Arc::clone(&tenant_id), epoch);
+                    new_node.terminal_tenants.insert(Arc::clone(&tenant_id), ());
 
                     entry.insert(new_node);
                     InsertStep::Done
@@ -446,6 +461,7 @@ impl Tree {
                             children: new_children_map(),
                             parent: RwLock::new(Some(Arc::clone(&prev))),
                             tenant_last_access_time: matched_node.tenant_last_access_time.clone(),
+                            terminal_tenants: new_terminal_tenant_map(),
                             last_tenant: parking_lot::RwLock::new(
                                 matched_node.last_tenant.read().clone(),
                             ),
@@ -524,6 +540,9 @@ impl Tree {
         let epoch = get_epoch();
         prev.tenant_last_access_time
             .insert(Arc::clone(&tenant_id), epoch);
+        if !text.is_empty() {
+            prev.terminal_tenants.insert(Arc::clone(&tenant_id), ());
+        }
     }
 
     /// Performs prefix matching and returns detailed result with char counts.
@@ -532,6 +551,7 @@ impl Tree {
         let mut remaining = text;
         let mut matched_chars = 0;
         let mut prev = Arc::clone(&self.root);
+        let mut ended_on_partial_match = false;
 
         while !remaining.is_empty() {
             let first_char = remaining.chars().next().unwrap();
@@ -555,6 +575,7 @@ impl Tree {
                     // Partial match - still use this node for tenant selection
                     matched_chars += shared_count;
                     prev = matched_node;
+                    ended_on_partial_match = true;
                     break;
                 }
             } else {
@@ -564,12 +585,34 @@ impl Tree {
         }
 
         let curr = prev;
+        let matched_node_is_terminal =
+            matched_chars > 0 && !ended_on_partial_match && !curr.terminal_tenants.is_empty();
 
         // Try cached tenant first (O(1)) before falling back to O(shards) DashMap iteration.
         // The cache is valid if the tenant still exists in tenant_last_access_time.
         let tenant: TenantId = {
             let cached = curr.last_tenant.read();
-            if let Some(ref t) = *cached {
+            let terminal_cached = if let Some(ref t) = *cached {
+                curr.terminal_tenants
+                    .contains_key(t.as_ref())
+                    .then(|| Arc::clone(t))
+            } else {
+                None
+            };
+
+            if let Some(t) = terminal_cached {
+                t
+            } else if matched_node_is_terminal {
+                drop(cached);
+                let t = curr
+                    .terminal_tenants
+                    .iter()
+                    .next()
+                    .map(|kv| Arc::clone(kv.key()))
+                    .unwrap_or_else(|| Arc::from("empty"));
+                *curr.last_tenant.write() = Some(Arc::clone(&t));
+                t
+            } else if let Some(ref t) = *cached {
                 if curr.tenant_last_access_time.contains_key(t.as_ref()) {
                     Arc::clone(t)
                 } else {
@@ -615,6 +658,8 @@ impl Tree {
             tenant,
             matched_char_count: matched_chars,
             input_char_count,
+            ended_on_partial_match,
+            matched_node_is_terminal,
         }
     }
 
@@ -775,12 +820,16 @@ impl Tree {
 
             // Remove tenant from node
             node.tenant_last_access_time.remove(tenant.as_ref());
+            node.terminal_tenants.remove(tenant.as_ref());
 
             // Get parent reference outside of the borrow scope
             let parent_opt = node.parent.read().unwrap().clone();
 
             // Remove empty nodes
-            if node.children.is_empty() && node.tenant_last_access_time.is_empty() {
+            if node.children.is_empty()
+                && node.tenant_last_access_time.is_empty()
+                && node.terminal_tenants.is_empty()
+            {
                 if let Some(ref parent) = parent_opt {
                     if let Some(fc) = node.text.read().unwrap().first_char() {
                         parent.children.remove(&fc);
@@ -855,12 +904,16 @@ impl Tree {
         while let Some(curr) = queue.pop_front() {
             // Remove tenant from node
             curr.tenant_last_access_time.remove(tenant_id.as_ref());
+            curr.terminal_tenants.remove(tenant_id.as_ref());
 
             // Get parent reference outside of the borrow scope
             let parent_opt = curr.parent.read().unwrap().clone();
 
             // Remove empty nodes
-            if curr.children.is_empty() && curr.tenant_last_access_time.is_empty() {
+            if curr.children.is_empty()
+                && curr.tenant_last_access_time.is_empty()
+                && curr.terminal_tenants.is_empty()
+            {
                 if let Some(ref parent) = parent_opt {
                     if let Some(fc) = curr.text.read().unwrap().first_char() {
                         parent.children.remove(&fc);
@@ -1846,6 +1899,44 @@ mod tests {
         let result = tree.prefix_match_with_counts("goodbye");
         assert_eq!(result.matched_char_count, 0);
         assert_eq!(result.input_char_count, 7);
+        assert!(!result.matched_node_is_terminal);
+    }
+
+    #[test]
+    fn test_prefix_match_reports_terminal_boundary() {
+        let tree = Tree::new();
+
+        tree.insert("hello", "tenant1");
+        tree.insert("hello world", "tenant2");
+
+        let result = tree.prefix_match_with_counts("hello");
+        assert_eq!(result.matched_char_count, 5);
+        assert_eq!(result.input_char_count, 5);
+        assert!(result.matched_node_is_terminal);
+        assert!(!result.ended_on_partial_match);
+        assert_eq!(&*result.tenant, "tenant1");
+
+        let result = tree.prefix_match_with_counts("hello world and more");
+        assert_eq!(result.matched_char_count, 11);
+        assert!(result.matched_node_is_terminal);
+        assert_eq!(&*result.tenant, "tenant2");
+
+        let result = tree.prefix_match_with_counts("helipad");
+        assert_eq!(result.matched_char_count, 3);
+        assert!(result.ended_on_partial_match);
+        assert!(!result.matched_node_is_terminal);
+    }
+
+    #[test]
+    fn test_empty_insert_does_not_make_zero_match_terminal() {
+        let tree = Tree::new();
+
+        tree.insert("", "tenant1");
+        tree.insert("hello", "tenant2");
+
+        let result = tree.prefix_match_with_counts("goodbye");
+        assert_eq!(result.matched_char_count, 0);
+        assert!(!result.matched_node_is_terminal);
     }
 
     #[test]
