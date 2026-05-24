@@ -1053,7 +1053,7 @@ class DeepseekV4AttnBackend(
                 q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
             )
-            if use_sparse_prefill and forward_batch.attn_cp_metadata is not None:
+            if use_sparse_prefill:
                 from sglang.srt.layers.attention.dsa.utils import (
                     is_dsa_prefill_cp_round_robin_split,
                 )
@@ -1135,10 +1135,7 @@ class DeepseekV4AttnBackend(
                 is_dsa_prefill_cp_round_robin_split,
             )
 
-            if (
-                forward_batch.attn_cp_metadata is not None
-                and is_dsa_prefill_cp_round_robin_split()
-            ):
+            if is_dsa_prefill_cp_round_robin_split():
                 assert seq_lens.numel() == 1
                 assert core_attn_metadata.positions_casual.shape[0] == q_flat.shape[0]
                 local_extend_seq_lens = seq_lens.new_tensor([q_flat.shape[0]])
