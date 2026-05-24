@@ -1080,12 +1080,16 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items from processor output. Initially creates one item per modality;
-        these are later split into per-image/video items by get_new_expanded_mm_items.
+        Create mm_items from processor output (real multimodal payload only, e.g., feature).
+        Initially creates one item per modality; these are later split into per-image/video items by get_new_expanded_mm_items.
 
-        Note that the data_dict can be passed via offline engine api
+        Note that the data_dict can be hf processor output, or passed via offline engine api
+
+        Args:
+            modality: if provided, force the data into a single MultimodalDataItem of that modality
         """
 
+        # universal getter for data_dict
         get_data_value = (
             data_dict.get
             if hasattr(data_dict, "get")
@@ -1101,6 +1105,7 @@ class BaseMultimodalProcessor(ABC):
                 "pad_value",
                 "offsets",
             ):
+                # metadata fields are explicitly set later, filter them here to avoid side-effects
                 continue
 
             # Get modality for this attribute
@@ -1127,14 +1132,19 @@ class BaseMultimodalProcessor(ABC):
 
                 items[current_modality].set(attr_name, value)
 
+        # deal with metadata fileds: convert from tensor to expected python types
+        # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
         if len(items) == 1:
             item = next(iter(items.values()))
+
+            # adjust offset
             offsets = get_data_value("offsets")
             if offsets is not None:
                 if isinstance(offsets, torch.Tensor):
                     offsets = offsets.detach().cpu().tolist()
                 item.offsets = [(int(start), int(end)) for start, end in offsets]
 
+            # adjust hash_value
             hash_value = get_data_value("hash")
             if hash_value is not None:
                 if isinstance(hash_value, torch.Tensor):
