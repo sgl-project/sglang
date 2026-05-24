@@ -12,7 +12,7 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_indexer import rotate_activation
 from sglang.srt.layers.attention.dsv4.compressor import Compressor as _CompressorBase
-from sglang.srt.layers.attention.dsv4.fused_compress_kernel import (
+from sglang.srt.layers.attention.dsv4.fused_compress_triton import (
     fused_ape_pool_norm_rope,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
