@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     76,
+        "agents":     79,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -190,6 +190,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "nft_engine":        7828,
             "data_api":          7829,
             "aiaas":             7830,
+            "cronjob":           7831,
+            "swarm":             7832,
+            "admin_dashboard":   7833,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -466,6 +469,10 @@ _INTENTS = {
     "nft_mint":                _handle_nft_engine,
     "data_query":              _handle_data_api,
     "ai_infer":                _handle_aiaas,
+    # ── automation / orchestration ────────────────────────────────────────────
+    "cron_job":                lambda a, k: {"action": "cron_queued", "name": k.get("name", ""), "schedule": k.get("schedule", "")},
+    "swarm_batch":             lambda a, k: {"action": "swarm_queued", "batch_name": k.get("name", ""), "strategy": k.get("strategy", "parallel")},
+    "admin_query":             lambda a, k: {"action": "admin_queued", "query": k.get("query", "dashboard")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
