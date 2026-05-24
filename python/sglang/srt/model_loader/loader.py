@@ -646,7 +646,7 @@ class DefaultModelLoader(BaseModelLoader):
                 trust_remote_code=True,
             )
         with init_empty_weights():
-            torch_dtype = getattr(hf_config, "dtype", torch.float16)
+            torch_dtype = getattr(hf_config, "torch_dtype", torch.float16)
             model = AutoModelForCausalLM.from_config(
                 hf_config, torch_dtype=torch_dtype, trust_remote_code=True
             )
