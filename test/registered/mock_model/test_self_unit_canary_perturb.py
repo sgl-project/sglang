@@ -28,7 +28,7 @@ class TestCanaryPerturb(CustomTestCase):
         # the early-return branch before any slot is picked.
         with self.assertLogs(real_kv_used.logger.name, level=logging.INFO) as logs:
             real_kv_used.run(
-                forward_batch=Mock(),
+                maybe_inaccurate_forward_batch=Mock(),
                 config=config,
                 req_to_token_pool=Mock(),
                 buffer_groups=(),
