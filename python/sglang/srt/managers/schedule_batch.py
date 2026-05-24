@@ -680,12 +680,10 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids_unpadded = (
-            origin_input_ids_unpadded
-            if origin_input_ids_unpadded
-            else origin_input_ids  # Before image padding
-        )
-        self.origin_input_ids = origin_input_ids
+        self.origin_input_ids_unpadded = array(
+            "q", origin_input_ids_unpadded or origin_input_ids
+        )  # Before image padding
+        self.origin_input_ids = array("q", origin_input_ids)
         # Each decode stage's output ids
         self.output_ids = array("q")
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
