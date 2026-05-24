@@ -20,8 +20,10 @@ import os
 import signal
 import sys
 import time
+from array import array
 from collections import deque
 from contextlib import contextmanager, nullcontext
+from functools import partial
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
 
@@ -145,7 +147,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
-from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -969,6 +970,7 @@ class Scheduler(
         )
         self.dp_tp_cpu_group = self.dp_tp_group.cpu_group
 
+        # TODO(Jialin): Migrate pad_input_ids implementations to return array.
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
@@ -1792,8 +1794,7 @@ class Scheduler(
             if recv_req.input_embeds is not None:
                 # Generate fake input_ids based on the length of input_embeds
                 seq_length = len(recv_req.input_embeds)
-                fake_input_ids = [1] * seq_length
-                recv_req.input_ids = fake_input_ids
+                recv_req.input_ids = array("q", [1]) * seq_length
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
@@ -1919,8 +1920,8 @@ class Scheduler(
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
@@ -2192,8 +2193,9 @@ class Scheduler(
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
             if self.pad_input_ids_func:
-                req.origin_input_ids = self.pad_input_ids_func(
-                    req.origin_input_ids, image_inputs
+                # See companion call site above for the array.array wrap rationale.
+                req.origin_input_ids = array(
+                    "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
 
             req.extend_image_inputs(image_inputs)
@@ -2851,18 +2853,31 @@ class Scheduler(
         # Run forward
         if self.is_generation:
             if self.enable_overlap:
-                # Refresh BEFORE _overlap_forward_isolation so snapshot
-                # captures fresh values and restore preserves them.
-                batch.refresh_seq_lens_cpu()
+                # Self-gates on batch.spec_info.future_indices; non-spec_v2
+                # no-ops (ForwardBatch.init_new lazily computes the sum).
+                self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self._overlap_forward_isolation(batch):
-                    future_indices = FutureIndices(indices=batch.req_pool_indices)
+                    future_indices = batch.req_pool_indices
+
+                    # Spec_v2 fires on_publish mid-worker (between verify and
+                    # draft_extend) so schedule prep can overlap with draft_extend.
+                    # Non-spec has no later work — scheduler publishes after return.
+                    fwd_kwargs = (
+                        {"on_publish": partial(self.future_map.publish, future_indices)}
+                        if batch.is_spec_v2
+                        else {}
+                    )
 
                     with self.forward_stream_ctx:
                         self.forward_stream.wait_stream(self.schedule_stream)
                         self.future_map.resolve_future(batch)
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(batch)
+                        batch_result = self.model_worker.forward_batch_generation(
+                            batch, **fwd_kwargs
+                        )
+                        if not batch.is_spec_v2:
+                            self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -2873,7 +2888,12 @@ class Scheduler(
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
                         if batch_result.delay_sample_func is None:
-                            self.future_map.store_to_map(future_indices, batch_result)
+                            stash_payload = (
+                                batch_result.next_draft_input
+                                if batch.is_spec_v2
+                                else batch_result.next_token_ids
+                            )
+                            self.future_map.stash(future_indices, stash_payload)
                             batch_result.copy_to_cpu(
                                 return_logprob=batch.return_logprob,
                                 return_hidden_states=batch.return_hidden_states,
@@ -2881,20 +2901,11 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # Placeholder for next iter's resolve_future to look up the
-                # real token from token_ids_buf via the negated indices.
-                batch.input_ids = -future_indices.indices
+                self.future_map.set_input_ids_sentinel(batch, future_indices)
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -2978,7 +2989,10 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
-            self.future_map.store_to_map(batch_result.future_indices, batch_result)
+            # Delay-sample is non-spec only; stash takes next_token_ids tensor.
+            self.future_map.stash(
+                batch_result.future_indices, batch_result.next_token_ids
+            )
             batch_result.copy_to_cpu(
                 return_logprob=self.cur_batch.return_logprob,
                 return_hidden_states=self.cur_batch.return_hidden_states,
