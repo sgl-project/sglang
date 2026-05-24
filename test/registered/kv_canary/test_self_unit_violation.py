@@ -191,7 +191,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
         """Empty ring (write_index=0) emits no warning and leaves reporter non-raised."""
         reporter = _make_reporter(rows=[], write_index=0, ring_capacity=4, mode="log")
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
-            reporter.log_or_raise_violation(step_counter=0)
+            reporter.log_or_raise_violation(outer_step_counter=0)
         mock_warning.assert_not_called()
         self.assertFalse(reporter.is_raised)
 
@@ -212,7 +212,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             rows=rows, write_index=3, ring_capacity=4, mode="log"
         )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
-            reporter.log_or_raise_violation(step_counter=7)
+            reporter.log_or_raise_violation(outer_step_counter=7)
 
         self.assertEqual(mock_warning.call_count, 3)
         messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
@@ -271,7 +271,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             rows=rows, write_index=3, ring_capacity=4, mode="raise"
         )
         with self.assertRaises(RuntimeError) as ctx:
-            reporter.log_or_raise_violation(step_counter=5)
+            reporter.log_or_raise_violation(outer_step_counter=5)
 
         self.assertEqual(
             str(ctx.exception),
@@ -315,7 +315,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
             rows=rows, write_index=5, ring_capacity=2, mode="log"
         )
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
-            reporter.log_or_raise_violation(step_counter=0)
+            reporter.log_or_raise_violation(outer_step_counter=0)
 
         self.assertEqual(mock_warning.call_count, 2)
         messages: list[str] = [call.args[0] for call in mock_warning.call_args_list]
