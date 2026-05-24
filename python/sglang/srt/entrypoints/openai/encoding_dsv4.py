@@ -7,6 +7,7 @@ with tool calling, thinking mode, and quick instruction task support.
 """
 
 import copy
+import html
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -171,11 +172,12 @@ def encode_arguments_to_dsml(tool_call: Dict[str, Any]) -> str:
         )
 
     for k, v in arguments.items():
+        raw_value = v if isinstance(v, str) else to_json(v)
         p_dsml_str = p_dsml_template.format(
             dsml_token=dsml_token,
-            key=k,
+            key=html.escape(k, quote=True),
             is_str="true" if isinstance(v, str) else "false",
-            value=v if isinstance(v, str) else to_json(v),
+            value=html.escape(raw_value, quote=False),
         )
         P_dsml_strs.append(p_dsml_str)
 
