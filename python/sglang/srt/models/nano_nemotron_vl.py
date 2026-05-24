@@ -76,7 +76,7 @@ class NemotronH_Nano_VL_V2(EVS):
         vision_projection_hidden_size = config.projector_hidden_size
         llm_hidden_size = config.llm_config.hidden_size
         self.llm_hidden_size = llm_hidden_size
-        self.model_dtype = self.language_model.config.torch_dtype
+        self.model_dtype = self.language_model.config.dtype
 
         self.mlp1 = nn.Sequential(
             RMSNorm(
@@ -99,7 +99,7 @@ class NemotronH_Nano_VL_V2(EVS):
             )
             self.sound_encoder = ProjectedParakeet(
                 config.sound_config,
-                dtype=self.language_model.config.torch_dtype,
+                dtype=self.language_model.config.dtype,
                 llm_hidden_size=llm_hidden_size,
                 max_model_len=getattr(config, "max_model_len", 8192),
             )
@@ -281,7 +281,7 @@ class NemotronH_Nano_VL_V2(EVS):
 
         target_device = next(self.sound_encoder.parameters()).device
         input_audio_features = input_audio_features.to(
-            dtype=self.language_model.config.torch_dtype, device=target_device
+            dtype=self.language_model.config.dtype, device=target_device
         )
         feature_attention_mask = feature_attention_mask.to(device=target_device)
 

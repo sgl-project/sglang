@@ -729,12 +729,12 @@ class LlavaForConditionalGeneration(LlavaBaseForCausalLM):
         self.config = config
         self.text_config = self.config.text_config
         self.vision_config = self.config.vision_config
-        self.torch_dtype = getattr(self.config, "torch_dtype")
+        self.torch_dtype = getattr(self.config, "dtype")
 
-        if not getattr(self.text_config, "torch_dtype"):
-            self.text_config.torch_dtype = self.torch_dtype
-        if not getattr(self.vision_config, "torch_dtype"):
-            self.vision_config.torch_dtype = self.torch_dtype
+        if not getattr(self.text_config, "dtype", None):
+            self.text_config.dtype = self.torch_dtype
+        if not getattr(self.vision_config, "dtype", None):
+            self.vision_config.dtype = self.torch_dtype
 
         if not hasattr(self.config, "vocab_size"):
             self.config.vocab_size = self.text_config.vocab_size

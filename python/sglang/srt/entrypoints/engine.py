@@ -1232,8 +1232,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     if os.environ.get("CUTE_DSL_LOG_LEVEL") is None:
-        # Default to warning level, to avoid too many logs
-        os.environ["CUTE_DSL_LOG_LEVEL"] = "30"
+        # Default to error level, to suppress noisy warnings during package walk
+        os.environ["CUTE_DSL_LOG_LEVEL"] = "40"
 
     if os.environ.get("CUTE_DSL_LOG_TO_CONSOLE") is None:
         # Need to set log to console, otherwise the log level won't take effect

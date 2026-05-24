@@ -494,7 +494,7 @@ class ModelConfig:
         )
 
         if self.is_hybrid_swa:
-            logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+            logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
             self.is_deepseek_v4_arch = any(
                 arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
@@ -1233,7 +1233,7 @@ class ModelConfig:
             from sglang.srt.layers import deep_gemm_wrapper
 
             if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                logger.warning(
+                logger.debug(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
 
@@ -1450,15 +1450,15 @@ def _get_and_verify_dtype(
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
-            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Upcasting %s to %s.", config_dtype, torch_dtype)
             pass
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
-            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Downcasting %s to %s.", config_dtype, torch_dtype)
             pass
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
-            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Casting %s to %s.", config_dtype, torch_dtype)
 
     return torch_dtype
 
