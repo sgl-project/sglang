@@ -186,7 +186,7 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
         )
 
 
-def main() -> None:
+def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--endpoint", required=True)
     parser.add_argument(
@@ -215,8 +215,13 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--eagle-off-confirmed", action="store_true")
     parser.add_argument("--indexcache-profile-env-confirmed", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_args(args)
+    return args
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
 
     args.profile_dir.mkdir(parents=True, exist_ok=True)
     if args.dry_run:

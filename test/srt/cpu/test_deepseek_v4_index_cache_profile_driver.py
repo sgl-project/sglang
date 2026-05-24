@@ -202,3 +202,38 @@ def test_dsv4_index_cache_profile_driver_records_profile_dir_visibility_note():
 
     assert "/tmp/profiles" in note
     assert "remote endpoints" in note
+
+
+def test_dsv4_index_cache_profile_driver_dry_run_writes_manifest(tmp_path):
+    output = tmp_path / "profile.json"
+
+    profile_driver.main(
+        [
+            "--endpoint",
+            "http://indexcache",
+            "--profile-dir",
+            str(tmp_path / "profiles"),
+            "--prompt-tokens",
+            "128000",
+            "--min-indexcache-prompt-tokens",
+            "75000",
+            "--output",
+            str(output),
+            "--dry-run",
+        ]
+    )
+
+    result = json.loads(output.read_text())
+
+    assert result["endpoint"] == "http://indexcache"
+    assert result["min_indexcache_prompt_tokens"] == 75000
+    assert result["request_results"] == []
+    assert result["trace_files"] == []
+    assert result["server_checks"] == {
+        "server_info_checked": False,
+        "speculative_decode": "dry run; /server_info not queried",
+    }
+    assert result["indexcache_profile_env"] == (
+        "dry run; profiler marker env not exercised"
+    )
+    assert result["eagle"] == "dry run; speculative decoding not exercised"
