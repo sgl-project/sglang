@@ -759,7 +759,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 return self.forward_with_npu_graph(x, grid_thw)
             return self.forward_with_cuda_graph(x, grid_thw)
 
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
@@ -912,7 +912,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         torch.Tensor,
         torch.Tensor,
     ]:
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
         x = self.patch_embed(x)
 
         if isinstance(grid_thw, list):
