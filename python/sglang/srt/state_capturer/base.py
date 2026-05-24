@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -11,10 +12,33 @@ logger = logging.getLogger(__name__)
 
 _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
+_REPLAY_AUDIT_CAPTURE_KINDS = {
+    "routed_experts": "routing",
+    "indexer_topk": "indexer",
+}
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def get_tensor_size_bytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
+
+
+def _dump_replay_audit_capture(name: str, layer_id: int, topk_indices: torch.Tensor):
+    kind = _REPLAY_AUDIT_CAPTURE_KINDS.get(name)
+    if kind is None:
+        return
+    if os.environ.get("MILES_REPLAY_AUDIT_ENABLE", "0").lower() not in _TRUE_ENV_VALUES:
+        return
+    try:
+        from miles.utils.debug_utils import replay_audit
+    except ImportError:
+        return
+    replay_audit.dump_sglang_capture_topk(
+        kind=kind,
+        stream_id=layer_id,
+        top_indices=topk_indices,
+        dims="t topk # tp:replicated",
+    )
 
 
 class BaseDeviceCache:
@@ -123,6 +147,11 @@ class BaseTopkCapturer:
         )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        _dump_replay_audit_capture(
+            self.device_cache.name,
+            layer_id,
+            topk_indices[:, : self.topk_size],
+        )
         self.device_cache.capture(layer_id, topk_indices)
 
     def _get_local_slice(
