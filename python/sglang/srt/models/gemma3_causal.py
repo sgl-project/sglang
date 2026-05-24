@@ -59,6 +59,55 @@ def get_attention_sliding_window_size(config):
     return config.sliding_window - 1
 
 
+def get_gemma3_rope_parameters(
+    rope_params: Optional[dict],
+    layer_type: str,
+    default_theta: float,
+) -> dict:
+    is_nested = isinstance(rope_params, dict) and (
+        "full_attention" in rope_params or "sliding_attention" in rope_params
+    )
+    if isinstance(rope_params, dict) and layer_type in rope_params:
+        layer_rope_params = rope_params[layer_type]
+        rope_parameters = (
+            dict(layer_rope_params) if isinstance(layer_rope_params, dict) else {}
+        )
+    elif is_nested:
+        rope_parameters = {}
+    else:
+        rope_parameters = dict(rope_params) if isinstance(rope_params, dict) else {}
+
+    if "rope_type" not in rope_parameters:
+        rope_parameters["rope_type"] = rope_parameters.get("type", "default")
+    rope_parameters.setdefault("rope_theta", default_theta)
+    return rope_parameters
+
+
+def get_gemma3_text_rope_parameters(
+    rope_params: Optional[dict],
+    rope_local_base_freq: float,
+) -> tuple[dict, dict]:
+    is_nested = isinstance(rope_params, dict) and (
+        "full_attention" in rope_params or "sliding_attention" in rope_params
+    )
+    if is_nested:
+        return (
+            get_gemma3_rope_parameters(rope_params, "full_attention", 1000000.0),
+            get_gemma3_rope_parameters(
+                rope_params, "sliding_attention", rope_local_base_freq
+            ),
+        )
+
+    global_theta = rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
+    return (
+        get_gemma3_rope_parameters(rope_params, "full_attention", global_theta),
+        {
+            "rope_type": "default",
+            "rope_theta": rope_local_base_freq,
+        },
+    )
+
+
 # Adapted from:
 # https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/models/gemma3.py
 def extract_layer_index(prefix: str) -> int:
@@ -568,30 +617,17 @@ class Gemma3TextModel(PreTrainedModel):
         #    "full_attention":    {"rope_type": ..., "rope_theta": 1000000}}
         # Flatten into the format Gemma3RotaryEmbedding expects.
         rope_params = config.rope_parameters
-        if isinstance(rope_params, dict) and "full_attention" in rope_params:
-            global_theta = rope_params["full_attention"].get("rope_theta", 1000000.0)
-            local_theta = rope_params["sliding_attention"].get("rope_theta", 10000.0)
-        else:
-            # v4 flat format fallback
-            global_theta = (
-                rope_params.get("rope_theta", 10000.0) if rope_params else 10000.0
-            )
-            local_theta = getattr(config, "rope_local_base_freq", 10000.0)
+        global_rope_parameters, local_rope_parameters = get_gemma3_text_rope_parameters(
+            rope_params, getattr(config, "rope_local_base_freq", 10000.0)
+        )
 
         global_config = copy.deepcopy(config)
-        global_config.rope_parameters = {
-            "rope_theta": global_theta,
-            "factor": config.rope_parameters["full_attention"]["factor"],
-            "rope_type": "linear",
-        }
+        global_config.rope_parameters = global_rope_parameters
         self.rotary_emb = Gemma3RotaryEmbedding(config=global_config)
         self.gradient_checkpointing = False
 
         local_config = copy.deepcopy(config)
-        local_config.rope_parameters = {
-            "rope_type": "default",
-            "rope_theta": local_theta,
-        }
+        local_config.rope_parameters = local_rope_parameters
         self.rotary_emb_local = Gemma3RotaryEmbedding(config=local_config)
 
         self.layers = make_layers(
