@@ -10,17 +10,87 @@ Usage:
 """
 
 import unittest
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from sglang.srt.layers.attention.dsv4.compress_plan_hip import (
-    FusedCompressPlan,
-)
-from sglang.srt.layers.attention.dsv4.fused_compress_kernel import (
-    fused_compress_attn,
-    write_current_token_to_state,
-)
+
+@dataclass
+class FusedCompressPlan:
+    compress_plan_gpu: torch.Tensor
+    write_plan_gpu: torch.Tensor
+    num_compress: int
+    num_write: int
+
+
+def write_current_token_to_state(
+    kv_score_input: torch.Tensor,
+    write_plan: torch.Tensor,
+    state_pool_buffer: torch.Tensor,
+    head_dim: int,
+    overlap: bool,
+    ratio: int,
+) -> None:
+    """Reference write path used by this manual test.
+
+    Plan row layout: [ragged_id, batch_id, position, window_len, state_base].
+    """
+    del head_dim  # layout is already encoded in kv_score_input/state_pool_buffer shape.
+    state_size = (2 if overlap else 1) * ratio
+    plan_cpu = write_plan.cpu()
+    for row in plan_cpu:
+        ragged_id = int(row[0].item())
+        position = int(row[2].item())
+        state_base = int(row[4].item())
+        if ragged_id < 0 or position < 0:
+            continue
+        dst = state_base + (position % state_size)
+        if (
+            0 <= dst < state_pool_buffer.shape[0]
+            and 0 <= ragged_id < kv_score_input.shape[0]
+        ):
+            state_pool_buffer[dst] = kv_score_input[ragged_id]
+
+
+def fused_compress_attn(
+    state_pool_buffer: torch.Tensor,
+    plan: torch.Tensor,
+    ape: torch.Tensor,
+    rms_weight: torch.Tensor,
+    rms_eps: float,
+    freqs_cis_real: torch.Tensor,
+    head_dim: int,
+    rope_head_dim: int,
+    overlap: bool,
+    ratio: int,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Reference compress path for manual parity tests.
+
+    This keeps the test runnable after removing `fused_compress_kernel.py`.
+    """
+    freqs_cis = torch.view_as_complex(
+        freqs_cis_real.view(freqs_cis_real.shape[0], -1, 2).contiguous()
+    )
+    result = _ref_compress(
+        kv_score_input=torch.empty(
+            0, device=state_pool_buffer.device, dtype=torch.float32
+        ),
+        state_pool=state_pool_buffer,
+        plan=plan,
+        ape=ape,
+        rms_weight=rms_weight,
+        rms_eps=rms_eps,
+        freqs_cis=freqs_cis,
+        head_dim=head_dim,
+        rope_head_dim=rope_head_dim,
+        overlap=overlap,
+        ratio=ratio,
+        num_compress=plan.shape[0],
+    )
+    out.copy_(result)
+    return out
 
 
 def _make_plan_from_params(
