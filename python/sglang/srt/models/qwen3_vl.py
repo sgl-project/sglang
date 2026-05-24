@@ -1271,9 +1271,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return kwargs
 
         real_deepstack_embeds = kwargs.get("input_deepstack_embeds", None)
-        static_deepstack_embeds = getattr(
-            forward_batch, "input_deepstack_embeds", None
-        )
+        static_deepstack_embeds = getattr(forward_batch, "input_deepstack_embeds", None)
         if static_deepstack_embeds is not None:
             static_deepstack_embeds.zero_()
             if real_deepstack_embeds is not None:

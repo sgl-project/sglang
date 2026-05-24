@@ -177,9 +177,7 @@ class CUDAPiecewiseBackend:
                     # capture a new cudagraph here. Fall back to the compiled
                     # (non-cudagraph) path and mark this entry so we skip the
                     # capture attempt next time.
-                    if not getattr(
-                        self, "_warned_runtime_recompile", False
-                    ):
+                    if not getattr(self, "_warned_runtime_recompile", False):
                         logger.warning(
                             "PCG capture stream is not set for runtime_shape=%d. "
                             "This usually indicates a runtime recompilation "
