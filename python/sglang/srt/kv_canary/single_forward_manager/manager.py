@@ -1,4 +1,4 @@
-"""SingleForwardManager and its per-step snapshot dataclass.
+"""SingleForwardManager — per-step state of one inner ``model.forward``.
 
 One SingleForwardManager owns the per-step state of one inner
 ``model.forward`` invocation inside an outer canary cycle. The outer
@@ -28,7 +28,6 @@ must be capture-safe.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional
 
@@ -154,11 +153,7 @@ class SingleForwardManager:
             initial_phase=_SingleForwardPhase.IDLE, device=device
         )
 
-        # Pre-allocated snapshot buffers populated by ``post_ops_maybe_inside_graph``.
-        # Snapshot captures only the in-graph signals whose live device-state
-        # might be mutated by later steps in the cycle (verify-plan enable,
-        # kernel / slot counters, violation write index, swa verify totals).
-        self._snapshot_buffers = _allocate_snapshot_buffers(
+        self._snapshot = PostOpsInsideGraphOutputSnapshot.allocate(
             num_kernel_tags=int(device_state.kernel_run_counters.shape[0]),
             num_slot_tags=int(device_state.slot_run_counters.shape[0]),
             swa_verify_total_count_shape=(
@@ -171,7 +166,7 @@ class SingleForwardManager:
 
     @property
     def snapshot(self) -> PostOpsInsideGraphOutputSnapshot:
-        return self._snapshot_buffers.as_snapshot()
+        return self._snapshot
 
     @property
     def phase_checker(self) -> SimplePhaseChecker:
@@ -313,10 +308,16 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
-        self._snapshot_buffers.copy_from(
-            verify_plan=self._verify_plan,
-            device_state=self._device_state,
-            swa_divergence_report=self._swa_divergence_report,
+        self._snapshot.copy_from(
+            verify_plan_enable=self._verify_plan.enable,
+            kernel_run_counters=self._device_state.kernel_run_counters,
+            slot_run_counters=self._device_state.slot_run_counters,
+            violation_write_index=self._device_state.violation_log.violation_write_index,
+            swa_verify_total_count=(
+                None
+                if self._swa_divergence_report is None
+                else self._swa_divergence_report.verify_total_count_device
+            ),
         )
 
     def post_ops_outside_graph(
@@ -362,73 +363,6 @@ class SingleForwardManager:
         return True
 
 
-@dataclass(slots=True, kw_only=True)
-class _SnapshotBuffers:
-    """Mutable storage for the per-SingleForwardManager snapshot. ``copy_from`` is called
-    from phase 3 (inside cuda graph capture on DECODE), so every write
-    must be an in-place ``copy_`` into pre-allocated tensors — no
-    allocation, no shape change.
-    """
-
-    verify_plan_enable: torch.Tensor
-    kernel_run_counters: torch.Tensor
-    slot_run_counters: torch.Tensor
-    violation_write_index: torch.Tensor
-    swa_verify_total_count: torch.Tensor | None
-
-    def as_snapshot(self) -> PostOpsInsideGraphOutputSnapshot:
-        return PostOpsInsideGraphOutputSnapshot(
-            verify_plan_enable=self.verify_plan_enable,
-            kernel_run_counters=self.kernel_run_counters,
-            slot_run_counters=self.slot_run_counters,
-            violation_write_index=self.violation_write_index,
-            swa_verify_total_count=self.swa_verify_total_count,
-        )
-
-    def copy_from(
-        self,
-        *,
-        verify_plan: VerifyPlan,
-        device_state: CanaryDeviceState,
-        swa_divergence_report: Optional[SwaDivergenceReport],
-    ) -> None:
-        self.verify_plan_enable.copy_(verify_plan.enable)
-        self.kernel_run_counters.copy_(device_state.kernel_run_counters)
-        self.slot_run_counters.copy_(device_state.slot_run_counters)
-        self.violation_write_index.copy_(
-            device_state.violation_log.violation_write_index
-        )
-        if (
-            self.swa_verify_total_count is not None
-            and swa_divergence_report is not None
-        ):
-            self.swa_verify_total_count.copy_(
-                swa_divergence_report.verify_total_count_device
-            )
-
-
-def _allocate_snapshot_buffers(
-    *,
-    num_kernel_tags: int,
-    num_slot_tags: int,
-    swa_verify_total_count_shape: tuple[int, ...] | None,
-    device: torch.device,
-) -> _SnapshotBuffers:
-    return _SnapshotBuffers(
-        verify_plan_enable=torch.zeros(1, dtype=torch.int32, device=device),
-        kernel_run_counters=torch.zeros(
-            num_kernel_tags, dtype=torch.int64, device=device
-        ),
-        slot_run_counters=torch.zeros(num_slot_tags, dtype=torch.int64, device=device),
-        violation_write_index=torch.zeros(1, dtype=torch.int32, device=device),
-        swa_verify_total_count=(
-            None
-            if swa_verify_total_count_shape is None
-            else torch.zeros(
-                swa_verify_total_count_shape, dtype=torch.int32, device=device
-            )
-        ),
-    )
 
 
 def _is_head_tag(tag: CanaryLaunchTag) -> bool:
