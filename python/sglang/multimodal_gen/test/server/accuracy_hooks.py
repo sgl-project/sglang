@@ -38,6 +38,7 @@ DEFAULT_TRANSFORMER_TEXT_CHANNELS = 4096
 DEFAULT_TRANSFORMER_POOLED_CHANNELS = 768
 DEFAULT_VAE_LATENT_CHANNELS = 16
 DEFAULT_VAE_LATENT_SPATIAL_SIZE = 32
+DEFAULT_VAE_VIDEO_LATENT_FRAMES = 3
 LARGE_CHANNEL_LAYOUT_THRESHOLD = 128
 
 
@@ -610,17 +611,35 @@ def _infer_vae_latent_channels(model: nn.Module) -> int:
 def _build_vae_hook_inputs(
     case: Any, model: nn.Module, device: str, ref_model: Optional[nn.Module] = None
 ) -> Inputs:
-    del case, ref_model
+    del ref_model
     latent_channels = _infer_vae_latent_channels(model)
+    model_path = getattr(getattr(case, "server_args", None), "model_path", "").lower()
+    modality = getattr(getattr(case, "server_args", None), "modality", None)
+    use_wan_video_latent = (
+        modality == "video"
+        and "wan" in model_path
+        and any(isinstance(module, nn.Conv3d) for module in model.modules())
+    )
+    shape = (
+        (
+            1,
+            latent_channels,
+            DEFAULT_VAE_VIDEO_LATENT_FRAMES,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+        )
+        if use_wan_video_latent
+        else (
+            1,
+            latent_channels,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+            DEFAULT_VAE_LATENT_SPATIAL_SIZE,
+        )
+    )
     rng = _DeterministicRNG()
     return {
         "z": rng.randn(
-            (
-                1,
-                latent_channels,
-                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
-                DEFAULT_VAE_LATENT_SPATIAL_SIZE,
-            ),
+            shape,
             device,
             torch.bfloat16,
         )
