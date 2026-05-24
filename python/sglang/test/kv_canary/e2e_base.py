@@ -27,12 +27,61 @@ _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).stri
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
-class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
+class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
+    """E2E test base that owns the boilerplate around a launched server with
+    captured stdout/stderr:
+
+    - ``process`` / ``base_url`` / ``_stdout_buf`` / ``_stderr_buf`` ClassVars
+    - ``tearDownClass`` kills the process and closes the buffers
+    - ``_captured_log_text(side)`` concatenates the two buffers
+    - violation-log assertions inherited from ``CanaryViolationAssertMixin``
+    - ``assert_log_contains`` for free-form substring checks
+
+    Subclasses provide their own ``setUpClass`` that populates ``cls.process``,
+    ``cls._stdout_buf``, ``cls._stderr_buf``.
+    """
+
+    process: ClassVar[Optional[object]] = None
+    base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
+    _stdout_buf: ClassVar[Optional[io.StringIO]] = None
+    _stderr_buf: ClassVar[Optional[io.StringIO]] = None
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if cls.process is not None:
+            kill_process_tree(cls.process.pid)
+        for buf in (cls._stdout_buf, cls._stderr_buf):
+            if buf is not None:
+                buf.close()
+        cls._stdout_buf = None
+        cls._stderr_buf = None
+
+    def _captured_log_text(
+        self, side: Optional[Literal["prefill", "decode"]] = None
+    ) -> str:
+        stdout_text = (
+            self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
+        )
+        stderr_text = (
+            self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
+        )
+        return stdout_text + stderr_text
+
+    def assert_log_contains(self, substring: str) -> None:
+        log_text = self._captured_log_text()
+        if substring not in log_text:
+            raise AssertionError(
+                f"Expected substring {substring!r} not found in captured log. "
+                f"Log tail:\n{log_text[-2000:]}"
+            )
+
+
+class CanaryE2EBase(CapturedServerE2EBase):
     """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
     ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
 
     ``setUpClass`` launches the server with mode-specific args + canary env;
-    ``tearDownClass`` kills the server.
+    ``tearDownClass`` (inherited) kills the server.
 
     Violation log assertions parse the stable one-line summary emitted by
     ViolationReporter (see python/sglang/srt/kv_canary/runner/violation_reporter.py):
@@ -45,10 +94,6 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
 
-    process: ClassVar[Optional[object]] = None
-    base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
-    _stdout_buf: ClassVar[Optional[io.StringIO]] = None
-    _stderr_buf: ClassVar[Optional[io.StringIO]] = None
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
     @classmethod
@@ -91,16 +136,6 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
             env=server_env,
             return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
         )
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
-        for buf in (cls._stdout_buf, cls._stderr_buf):
-            if buf is not None:
-                buf.close()
-        cls._stdout_buf = None
-        cls._stderr_buf = None
 
     def make_prompts(self, n: int) -> list[str]:
         if self.use_unique_prompts:
@@ -178,18 +213,6 @@ class CanaryE2EBase(CanaryViolationAssertMixin, CustomTestCase):
                 f"not strictly less than verify_full={last_parsed.verify_full}. "
                 f"Line: {last_line}"
             )
-
-    def _captured_log_text(
-        self, side: Optional[Literal["prefill", "decode"]] = None
-    ) -> str:
-        stdout_text = (
-            self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
-        )
-        stderr_text = (
-            self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
-        )
-        return stdout_text + stderr_text
-
 
 def _make_unique_prompts(n: int) -> list[str]:
     """Each prompt has a unique high-entropy prefix so no two share a radix prefix path.

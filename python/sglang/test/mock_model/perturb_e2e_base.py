@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import time
-from typing import ClassVar, Literal, Optional
+from typing import ClassVar
 
-from sglang.srt.utils import kill_process_tree
+from sglang.test.kv_canary.e2e_base import CapturedServerE2EBase
 from sglang.test.kv_canary.utils import post_parallel_generate
-from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
 from sglang.test.kv_canary.violation_log_utils import find_violation_in_log
 from sglang.test.mock_model_utils import (
     MOCK_MODEL_PATH,
@@ -16,27 +16,22 @@ from sglang.test.mock_model_utils import (
 )
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
     popen_launch_server,
 )
 
+logger = logging.getLogger(__name__)
 
-class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
+
+class MockModelPerturbE2EBase(CapturedServerE2EBase):
     """Base for mock-model self-test perturb e2e tests.
 
-    Launches the mock-model + canary server with subclass-provided extra env
-    and extra server args, then exposes helpers to send parallel requests and
-    assert kv_canary violation lines (or their absence) in the captured log.
+    ``setUpClass`` launches the mock-model + canary server with subclass-provided
+    extra env / extra server args. Server lifecycle, log capture, and the generic
+    violation-log assertions are inherited from ``CapturedServerE2EBase``.
     """
 
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
-
-    process: ClassVar[Optional[object]] = None
-    base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
-    _stdout_buf: ClassVar[Optional[io.StringIO]] = None
-    _stderr_buf: ClassVar[Optional[io.StringIO]] = None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -56,27 +51,6 @@ class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
             return_stdout_stderr=(cls._stdout_buf, cls._stderr_buf),
         )
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        if cls.process is not None:
-            kill_process_tree(cls.process.pid)
-        for buf in (cls._stdout_buf, cls._stderr_buf):
-            if buf is not None:
-                buf.close()
-        cls._stdout_buf = None
-        cls._stderr_buf = None
-
-    def _captured_log_text(
-        self, side: Optional[Literal["prefill", "decode"]] = None
-    ) -> str:
-        stdout_text = (
-            self._stdout_buf.getvalue() if self._stdout_buf is not None else ""
-        )
-        stderr_text = (
-            self._stderr_buf.getvalue() if self._stderr_buf is not None else ""
-        )
-        return stdout_text + stderr_text
-
     def send_parallel_requests(
         self,
         n: int = 4,
@@ -92,6 +66,28 @@ class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
             timeout=timeout,
         )
 
+    def best_effort_send_parallel_requests(
+        self,
+        n: int = 4,
+        *,
+        max_new_tokens: int = 256,
+        timeout: float = 30.0,
+    ) -> None:
+        """Send parallel requests in scenarios where the server is expected to
+        abort mid-response (e.g. ``--kv-canary raise`` + perturb). Client-side
+        errors are swallowed at DEBUG level — the test's real assertions live
+        in the captured server log, not in the responses."""
+        try:
+            self.send_parallel_requests(
+                n=n, max_new_tokens=max_new_tokens, timeout=timeout
+            )
+        except Exception:
+            logger.debug(
+                "best_effort_send_parallel_requests: client raised; assertions "
+                "depend on captured server log",
+                exc_info=True,
+            )
+
     def assert_any_launch_tag_violation_reported(
         self,
         *,
@@ -99,8 +95,10 @@ class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
-        """Like assert_violation_logged_any but with retries: mock-model log may
-        still be draining when the first poll happens."""
+        """Like ``assert_violation_logged_any`` (inherited from the mixin) but
+        with retries: mock-model log may still be draining when the first poll
+        happens, and the launch_tag is wildcarded since the mock-model self-test
+        doesn't care which HEAD/TAIL/FULL/SWA produced the violation."""
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
             if find_violation_in_log(
@@ -122,13 +120,5 @@ class MockModelPerturbE2EBase(CanaryViolationAssertMixin, CustomTestCase):
         ):
             raise AssertionError(
                 f"Unexpected kv_canary violation line with fail_reason={fail_reason!r}. "
-                f"Log tail:\n{log_text[-2000:]}"
-            )
-
-    def assert_log_contains(self, substring: str) -> None:
-        log_text = self._captured_log_text()
-        if substring not in log_text:
-            raise AssertionError(
-                f"Expected substring {substring!r} not found in captured log. "
                 f"Log tail:\n{log_text[-2000:]}"
             )
