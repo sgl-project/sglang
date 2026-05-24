@@ -121,6 +121,25 @@ def test_dsv4_index_cache_profile_driver_rejects_missing_required_regions():
         profile_driver.validate_trace_summaries(args, summaries)
 
 
+def test_dsv4_index_cache_profile_driver_rejects_missing_cuda_graph_paths():
+    args = Namespace(dry_run=False)
+    summaries = [
+        {
+            "categories": {
+                "csa_indexer": {},
+                "raw_to_page_translation": {},
+                "core_attention_c4": {},
+                "ffn_moe": {},
+                "cuda_graph": {},
+            },
+            "cuda_graph_paths": {},
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="replay/fallback path stats"):
+        profile_driver.validate_trace_summaries(args, summaries)
+
+
 def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
     args = Namespace(dry_run=False)
     summaries = [
@@ -131,7 +150,8 @@ def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
                 "core_attention_c4": {},
                 "ffn_moe": {},
                 "cuda_graph": {},
-            }
+            },
+            "cuda_graph_paths": {"decode.replay": 1},
         }
     ]
 

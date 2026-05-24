@@ -157,8 +157,10 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
             "directory is visible to this driver"
         )
     observed = {}
+    cuda_graph_paths = {}
     for summary in trace_summaries:
         observed.update(summary.get("categories", {}))
+        cuda_graph_paths.update(summary.get("cuda_graph_paths", {}))
     missing = [
         category
         for category in REQUIRED_PROFILE_CATEGORIES
@@ -169,6 +171,11 @@ def validate_trace_summaries(args, trace_summaries: list[dict]) -> None:
             "profile traces are missing required DSV4 IndexCache regions "
             f"{missing}; check SGLANG_DSV4_INDEXCACHE_PROFILE=true and that "
             "IndexCache reuse was exercised"
+        )
+    if not cuda_graph_paths:
+        raise RuntimeError(
+            "profile traces are missing CUDA graph replay/fallback path stats; "
+            "check that DSV4 IndexCache profiling reached ModelRunner.forward"
         )
 
 
