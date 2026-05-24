@@ -179,6 +179,11 @@ def test_dsv4_index_cache_eval_suite_dry_run_writes_server_checks(tmp_path):
     assert {row["task"] for row in result["results"]} == {"ruler"}
     assert result["primary_metric_summary"] == {}
     assert result["primary_metric_comparison"] == {}
+    assert result["quality_gate"] == {
+        "max_primary_metric_drop": None,
+        "passed": True,
+        "failures": [],
+    }
 
 
 def test_dsv4_index_cache_eval_suite_extracts_stdout_metrics():
@@ -282,3 +287,49 @@ def test_dsv4_index_cache_eval_suite_enforces_quality_drop():
         eval_suite.enforce_quality_drop(comparisons, 0.05)
 
     eval_suite.enforce_quality_drop(comparisons, 0.07)
+
+
+def test_dsv4_index_cache_eval_suite_writes_output_before_quality_gate_failure(
+    tmp_path, monkeypatch
+):
+    output = tmp_path / "eval.json"
+
+    def fake_run_eval_task(task, base_url, args):
+        metric = 0.9 if args.endpoint_label == "baseline" else 0.82
+        return {
+            "cmd": ["fake"],
+            "returncode": 0,
+            "elapsed_sec": 0.1,
+            "output": "",
+            "metrics": {"score": metric},
+            "primary_metric": {"name": "score", "value": metric},
+        }
+
+    monkeypatch.setattr(eval_suite, "run_eval_task", fake_run_eval_task)
+
+    with pytest.raises(RuntimeError, match="quality metric drop"):
+        eval_suite.main(
+            [
+                "--endpoint",
+                "baseline=http://baseline",
+                "--endpoint",
+                "searched_1_4=http://searched-quarter",
+                "--task",
+                "ruler",
+                "--max-primary-metric-drop",
+                "0.05",
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )
+
+    result = json.loads(output.read_text())
+
+    assert result["primary_metric_comparison"]["searched_1_4"]["ruler"][
+        "delta"
+    ] == pytest.approx(-0.08)
+    assert result["quality_gate"]["passed"] is False
+    assert result["quality_gate"]["failures"] == [
+        "searched_1_4/ruler: delta -0.08 < allowed -0.05"
+    ]

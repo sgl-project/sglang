@@ -359,8 +359,16 @@ def compare_primary_metrics(summary: dict, baseline_label: str) -> dict:
 
 
 def enforce_quality_drop(comparisons: dict, max_drop: float | None) -> None:
+    failures = quality_drop_failures(comparisons, max_drop)
+    if failures:
+        raise RuntimeError(
+            "quality metric drop exceeded threshold: " + "; ".join(failures)
+        )
+
+
+def quality_drop_failures(comparisons: dict, max_drop: float | None) -> list[str]:
     if max_drop is None:
-        return
+        return []
     failures = []
     for endpoint, task_metrics in comparisons.items():
         for task, comparison in task_metrics.items():
@@ -372,10 +380,7 @@ def enforce_quality_drop(comparisons: dict, max_drop: float | None) -> None:
                     f"{endpoint}/{task}: delta {comparison['delta']:.6g} "
                     f"< allowed {-max_drop:.6g}"
                 )
-    if failures:
-        raise RuntimeError(
-            "quality metric drop exceeded threshold: " + "; ".join(failures)
-        )
+    return failures
 
 
 def parse_args(argv: list[str] | None = None):
@@ -424,6 +429,7 @@ def main(argv: list[str] | None = None) -> None:
         "results": [],
         "primary_metric_summary": {},
         "primary_metric_comparison": {},
+        "quality_gate": {},
     }
 
     for label, base_url in args.endpoint:
@@ -461,12 +467,21 @@ def main(argv: list[str] | None = None) -> None:
         results["primary_metric_summary"],
         args.baseline_label,
     )
-    enforce_quality_drop(
+    failures = quality_drop_failures(
         results["primary_metric_comparison"],
         args.max_primary_metric_drop,
     )
+    results["quality_gate"] = {
+        "max_primary_metric_drop": args.max_primary_metric_drop,
+        "passed": not failures,
+        "failures": failures,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(results, indent=2, default=str) + "\n")
+    if failures:
+        raise RuntimeError(
+            "quality metric drop exceeded threshold: " + "; ".join(failures)
+        )
 
 
 if __name__ == "__main__":
