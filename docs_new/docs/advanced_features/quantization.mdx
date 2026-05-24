@@ -142,10 +142,10 @@ The following table summarizes quantization method support across NVIDIA and AMD
     </tr>
     <tr>
       <td><code>modelopt_fp4</code></td>
-      <td>Yes (Blackwell/SM100+)</td>
+      <td>Yes (SM80-SM90 via Marlin; SM100+ native FP4)</td>
       <td>No</td>
       <td>No</td>
-      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; native FP4 on Blackwell (B200, GB200)</td>
+      <td><a href="https://github.com/NVIDIA/Model-Optimizer">NVIDIA ModelOpt</a>; use Marlin W4A16 fallback on Ampere/Hopper and native FP4 backends on Blackwell</td>
     </tr>
     <tr>
       <td><code>petit_nvfp4</code></td>
@@ -257,8 +257,8 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
   <tbody>
     <tr>
       <td><code>auto</code></td>
-      <td>SM100/120</td>
-      <td>Auto-selects: <code>flashinfer_cudnn</code> on SM120; <code>flashinfer_cutlass</code> on SM100</td>
+      <td>SM80+</td>
+      <td>Auto-selects: <code>flashinfer_cudnn</code> on SM120; <code>flashinfer_cutedsl</code> on SM100; <code>marlin</code> on SM80-SM90; <code>flashinfer_cutlass</code> otherwise</td>
     </tr>
     <tr>
       <td><code>cutlass</code></td>
@@ -276,14 +276,24 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
       <td>FlashInfer cuDNN backend; used on SM120 for performance</td>
     </tr>
     <tr>
+      <td><code>flashinfer_cutedsl</code></td>
+      <td>SM100</td>
+      <td>FlashInfer CuTe DSL backend</td>
+    </tr>
+    <tr>
       <td><code>flashinfer_trtllm</code></td>
       <td>SM100</td>
       <td>FlashInfer TensorRT-LLM backend</td>
     </tr>
+    <tr>
+      <td><code>marlin</code></td>
+      <td>SM80-SM90</td>
+      <td>Weight-only W4A16 fallback for NVFP4 checkpoints</td>
+    </tr>
   </tbody>
 </table>
 
-When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
+On Blackwell, when FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback. On SM80-SM90, `auto` selects Marlin for NVFP4.
 
 ## Offline Quantization
 
