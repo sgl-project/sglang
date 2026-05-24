@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     90,
+        "agents":     93,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -204,6 +204,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "affiliate_engine":  7842,
             "tunnel_manager":    7843,
             "geosignal":         7844,
+            "email_listener":    7845,
+            "licensing":         7846,
+            "gitops":            7847,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -495,6 +498,9 @@ _INTENTS = {
     "affiliate_click":         lambda a, k: {"action": "affiliate_click_queued", "program_id": k.get("program_id", 0)},
     "tunnel_start":            lambda a, k: {"action": "tunnel_start_queued", "port": k.get("port", 7777), "provider": k.get("provider", "cloudflare")},
     "geo_scan":                lambda a, k: {"action": "geo_scan_queued", "target": k.get("target", "Albury CBD")},
+    "email_process":           lambda a, k: {"action": "email_process_queued", "email_id": k.get("email_id", 0)},
+    "license_verify":          lambda a, k: {"action": "license_verify_queued", "license_key": k.get("license_key", ""), "machine_id": k.get("machine_id", "")},
+    "gitops_deploy":           lambda a, k: {"action": "gitops_deploy_queued", "branch": k.get("branch", "main")},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
