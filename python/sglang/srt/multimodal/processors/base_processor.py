@@ -1080,7 +1080,8 @@ class BaseMultimodalProcessor(ABC):
         self, data_dict: dict, modality: Modality = None
     ) -> List[MultimodalDataItem]:
         """
-        Create mm_items from processor output (real multimodal payload only, e.g., feature).
+        Create mm_items from processor output.
+
         Initially creates one item per modality; these are later split into per-image/video items by get_new_expanded_mm_items.
 
         Note that the data_dict can be hf processor output, or passed via offline engine api
@@ -1095,6 +1096,8 @@ class BaseMultimodalProcessor(ABC):
             if hasattr(data_dict, "get")
             else lambda name, default=None: getattr(data_dict, name, default)
         )
+
+        # decide explicitly-set modality
         explicit_modality = modality
         modality_value = get_data_value("modality")
         if explicit_modality is None and modality_value is not None:
@@ -1137,7 +1140,7 @@ class BaseMultimodalProcessor(ABC):
 
                 items[current_modality].set(attr_name, value)
 
-        # deal with metadata fields from preprocessed input
+        # deal with metadata fields when data_dict is preprocessed input: convert from tensor to expected python types
         # the attribution of the metadata fields is only clear when number of MultimodalDataItem is 1
         if len(items) == 1:
             item = next(iter(items.values()))
