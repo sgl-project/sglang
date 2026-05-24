@@ -59,10 +59,29 @@ class _EaglePositionsBase(CanaryE2EBase):
         )
 
         if self.revert_pr:
-            self.assert_violation_logged_any(
-                launch_tag_patterns=("*",),
-                fail_reason="position",
-                flush_wait_seconds=0.0,
+            # Reverting PR #25015 shifts every eagle draft position by +1. The
+            # mismatch manifests as either a direct ``position`` bit (if the
+            # write-side stored_position differs from verify-side
+            # expected_position on a slot that gets per-forward-verified) or a
+            # propagated ``chain_hash`` bit (if the affected slot is reached
+            # transitively through the per-forward chain on a sibling slot
+            # — happens when canary mode is RAISE so the first detected
+            # violation kills the scheduler before the draft slot itself
+            # appears in a later prefix). Either signal proves canary caught
+            # the regression; accept whichever fires first.
+            for reason in ("position", "chain_hash"):
+                try:
+                    self.assert_violation_logged_any(
+                        launch_tag_patterns=("*",),
+                        fail_reason=reason,
+                        flush_wait_seconds=0.0,
+                    )
+                    return
+                except AssertionError:
+                    continue
+            raise AssertionError(
+                "Expected canary to fire one of fail_reason ∈ {position, chain_hash} "
+                "after reverting PR #25015, but neither was logged."
             )
         else:
             self.assert_no_violation(wait_seconds=2.0)
