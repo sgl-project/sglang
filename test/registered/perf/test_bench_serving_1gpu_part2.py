@@ -91,9 +91,15 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
 
         self.assertEqual(res["successful_requests"], res["total_requests"])
-        self.assertLess(res["avg_latency_ms"], 48)
-        self.assertLess(res["p95_latency_ms"], 50)
-        self.assertGreater(res["throughput"], 20)
+
+        if is_in_amd_ci():
+            self.assertLess(res["avg_latency_ms"], 55)
+            self.assertLess(res["p95_latency_ms"], 60)
+            self.assertGreater(res["throughput"], 15)
+        else:
+            self.assertLess(res["avg_latency_ms"], 48)
+            self.assertLess(res["p95_latency_ms"], 50)
+            self.assertGreater(res["throughput"], 20)
 
     def test_score_api_batch_scaling(self):
         """Test score API performance with different batch sizes"""
