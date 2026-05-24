@@ -551,52 +551,52 @@ class SchedulerMetricsCollector:
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
-            router_kv_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
-            self.router_kv_reuse_events_total = Counter(
-                name="sglang:router_kv_reuse_events_total",
-                documentation="Router-directed KV reuse events by backend, outcome, and reason.",
-                labelnames=router_kv_labels,
+            remote_g2_labels = list(labels.keys()) + ["backend", "outcome", "reason"]
+            self.remote_g2_events_total = Counter(
+                name="sglang:remote_g2_events_total",
+                documentation="RemoteG2 KV reuse events by backend, outcome, and reason.",
+                labelnames=remote_g2_labels,
             )
-            self.router_kv_reuse_tokens_total = Counter(
-                name="sglang:router_kv_reuse_tokens_total",
-                documentation="Tokens staged by router-directed KV reuse by backend, outcome, and reason.",
-                labelnames=router_kv_labels,
+            self.remote_g2_tokens_total = Counter(
+                name="sglang:remote_g2_tokens_total",
+                documentation="Tokens staged by RemoteG2 KV reuse by backend, outcome, and reason.",
+                labelnames=remote_g2_labels,
             )
-            self.router_kv_reuse_wait_ms = Histogram(
-                name="sglang:router_kv_reuse_wait_ms",
-                documentation="Scheduler wait time for router-directed KV reuse in ms.",
-                labelnames=router_kv_labels,
+            self.remote_g2_wait_ms = Histogram(
+                name="sglang:remote_g2_wait_ms",
+                documentation="Scheduler wait time for RemoteG2 KV reuse in ms.",
+                labelnames=remote_g2_labels,
                 buckets=(0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500),
             )
-            self.router_kv_reuse_insert_ms = Histogram(
-                name="sglang:router_kv_reuse_insert_ms",
-                documentation="Scheduler cache insertion time for router-directed KV reuse in ms.",
-                labelnames=router_kv_labels,
+            self.remote_g2_insert_ms = Histogram(
+                name="sglang:remote_g2_insert_ms",
+                documentation="Scheduler cache insertion time for RemoteG2 KV reuse in ms.",
+                labelnames=remote_g2_labels,
                 buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 25, 50, 100),
             )
-            self.router_kv_reuse_transfer_mb = Histogram(
-                name="sglang:router_kv_reuse_transfer_mb",
-                documentation="Router-directed KV reuse transfer size in MB.",
-                labelnames=router_kv_labels,
+            self.remote_g2_transfer_mb = Histogram(
+                name="sglang:remote_g2_transfer_mb",
+                documentation="RemoteG2 KV reuse transfer size in MB.",
+                labelnames=remote_g2_labels,
                 buckets=(0.1, 0.5, 1, 5, 10, 50, 100, 500, 1000, 5000),
             )
-            router_kv_quarantine_labels = list(labels.keys()) + [
+            remote_g2_quarantine_labels = list(labels.keys()) + [
                 "backend",
                 "reason",
             ]
-            self.router_kv_reuse_quarantine_events_total = Counter(
-                name="sglang:router_kv_reuse_quarantine_events_total",
-                documentation="Router-directed KV reuse target-page quarantine events.",
-                labelnames=router_kv_quarantine_labels,
+            self.remote_g2_quarantine_events_total = Counter(
+                name="sglang:remote_g2_quarantine_events_total",
+                documentation="RemoteG2 KV reuse target-page quarantine events.",
+                labelnames=remote_g2_quarantine_labels,
             )
-            self.router_kv_reuse_quarantined_tokens_total = Counter(
-                name="sglang:router_kv_reuse_quarantined_tokens_total",
-                documentation="Total target KV tokens quarantined by router-directed KV reuse.",
-                labelnames=router_kv_quarantine_labels,
+            self.remote_g2_quarantined_tokens_total = Counter(
+                name="sglang:remote_g2_quarantined_tokens_total",
+                documentation="Total target KV tokens quarantined by RemoteG2 KV reuse.",
+                labelnames=remote_g2_quarantine_labels,
             )
-            self.router_kv_reuse_quarantined_tokens = Gauge(
-                name="sglang:router_kv_reuse_quarantined_tokens",
-                documentation="Current target KV tokens held out of the allocator after indeterminate router-directed KV reuse transfers.",
+            self.remote_g2_quarantined_tokens = Gauge(
+                name="sglang:remote_g2_quarantined_tokens",
+                documentation="Current target KV tokens held out of the allocator after indeterminate RemoteG2 KV reuse transfers.",
                 labelnames=list(labels.keys()) + ["backend"],
                 multiprocess_mode="mostrecent",
             )
@@ -1102,7 +1102,7 @@ class SchedulerMetricsCollector:
         self._log_histogram(self.kv_transfer_bootstrap_ms, bootstrap_ms)
         self._log_histogram(self.kv_transfer_alloc_ms, alloc_ms)
 
-    def observe_router_kv_reuse(
+    def observe_remote_g2(
         self,
         *,
         backend: str,
@@ -1113,7 +1113,7 @@ class SchedulerMetricsCollector:
         insert_ms: Optional[float] = None,
         transfer_bytes: Optional[int] = None,
     ) -> None:
-        events_total = getattr(self, "router_kv_reuse_events_total", None)
+        events_total = getattr(self, "remote_g2_events_total", None)
         if events_total is None:
             return
 
@@ -1126,16 +1126,16 @@ class SchedulerMetricsCollector:
         events_total.labels(**labels).inc(1)
 
         if tokens > 0:
-            self.router_kv_reuse_tokens_total.labels(**labels).inc(tokens)
+            self.remote_g2_tokens_total.labels(**labels).inc(tokens)
         if wait_ms is not None:
-            self.router_kv_reuse_wait_ms.labels(**labels).observe(float(wait_ms))
+            self.remote_g2_wait_ms.labels(**labels).observe(float(wait_ms))
         if insert_ms is not None:
-            self.router_kv_reuse_insert_ms.labels(**labels).observe(float(insert_ms))
+            self.remote_g2_insert_ms.labels(**labels).observe(float(insert_ms))
         if transfer_bytes is not None:
             transfer_mb = max(0.0, float(transfer_bytes) / (1024 * 1024))
-            self.router_kv_reuse_transfer_mb.labels(**labels).observe(transfer_mb)
+            self.remote_g2_transfer_mb.labels(**labels).observe(transfer_mb)
 
-    def observe_router_kv_reuse_quarantine(
+    def observe_remote_g2_quarantine(
         self,
         *,
         backend: str,
@@ -1144,9 +1144,9 @@ class SchedulerMetricsCollector:
         current_tokens: int,
     ) -> None:
         events_total = getattr(
-            self, "router_kv_reuse_quarantine_events_total", None
+            self, "remote_g2_quarantine_events_total", None
         )
-        current_gauge = getattr(self, "router_kv_reuse_quarantined_tokens", None)
+        current_gauge = getattr(self, "remote_g2_quarantined_tokens", None)
         if events_total is None or current_gauge is None:
             return
 
@@ -1161,7 +1161,7 @@ class SchedulerMetricsCollector:
         }
         if tokens > 0:
             events_total.labels(**event_labels).inc(1)
-            self.router_kv_reuse_quarantined_tokens_total.labels(
+            self.remote_g2_quarantined_tokens_total.labels(
                 **event_labels
             ).inc(tokens)
         current_gauge.labels(**gauge_labels).set(max(0, int(current_tokens)))

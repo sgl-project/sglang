@@ -4,14 +4,12 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
 
-import numpy as np
-
 from sglang.srt.mem_cache.utils import block_hash_aliases
 
-REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = "remote_kv_reuse_plan"
-REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_kv_reuse_no_plan_reason"
-REMOTE_KV_REUSE_PLAN_VERSION = 1
-REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
+REMOTE_G2_PLAN_EXTRA_ARGS_KEY = "remote_g2_plan"
+REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_g2_no_plan_reason"
+REMOTE_G2_PLAN_VERSION = 1
+REMOTE_G2_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
 
 _REMOTE_G2_TIERS = {"g2", "host_pinned", "hostpinned", "cpu_pinned", "cpu_tier1"}
 
@@ -40,18 +38,8 @@ def _is_remote_g2_tier(tier: str) -> bool:
 def _coerce_int(value: Any, field_name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be an integer, got {value!r}")
-    if isinstance(value, (int, np.integer)):
+    if isinstance(value, int):
         return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError(f"{field_name} must be an integer, got empty string")
-        try:
-            return int(value, 10)
-        except ValueError as err:
-            raise ValueError(
-                f"{field_name} must be an integer, got {value!r}"
-            ) from err
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
@@ -89,7 +77,7 @@ def _first_present(data: Mapping[str, Any], *names: str, default: Any = None) ->
 
 
 @dataclass(frozen=True)
-class RemoteKvReusePlan:
+class RemoteG2Plan:
     plan_id: str
     request_id: str
     target_worker_id: int
@@ -104,17 +92,17 @@ class RemoteKvReusePlan:
     created_at_ms: int
     expires_at_ms: int
     start_block_index: int = 0
-    plan_version: int = REMOTE_KV_REUSE_PLAN_VERSION
+    plan_version: int = REMOTE_G2_PLAN_VERSION
     kv_block_hashes: tuple[int, ...] = ()
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RemoteKvReusePlan":
+    def from_dict(cls, data: Mapping[str, Any]) -> "RemoteG2Plan":
         if not isinstance(data, Mapping):
-            raise ValueError("remote KV reuse plan must be a mapping")
+            raise ValueError("RemoteG2 plan must be a mapping")
 
         block_hashes_raw = _first_present(data, "block_hashes", "hashes")
         if block_hashes_raw is None:
-            raise ValueError("remote KV reuse plan missing block_hashes")
+            raise ValueError("RemoteG2 plan missing block_hashes")
         block_hashes = tuple(
             _coerce_block_hash(item)
             for item in _coerce_array(block_hashes_raw, "block_hashes")
@@ -198,14 +186,14 @@ class RemoteKvReusePlan:
                 start_block_index=start_block_index,
                 plan_version=_coerce_int(
                     _first_present(
-                        data, "plan_version", default=REMOTE_KV_REUSE_PLAN_VERSION
+                        data, "plan_version", default=REMOTE_G2_PLAN_VERSION
                     ),
                     "plan_version",
                 ),
                 kv_block_hashes=kv_block_hashes,
             )
         except KeyError as err:
-            raise ValueError(f"remote KV reuse plan missing {err.args[0]}") from err
+            raise ValueError(f"RemoteG2 plan missing {err.args[0]}") from err
 
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)

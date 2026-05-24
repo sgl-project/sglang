@@ -6,7 +6,7 @@ from enum import IntEnum
 from typing import Any, Optional
 
 
-G2PLUS_DEFAULT_TRANSFER_PARALLELISM = 4
+REMOTE_G2_DEFAULT_TRANSFER_PARALLELISM = 4
 
 
 @contextmanager
@@ -341,10 +341,8 @@ class Envs:
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
     # Mooncake KV Transfer
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
-    SGLANG_G2PLUS_FETCH_WORKERS = EnvInt(4)
-    SGLANG_MOONCAKE_TE_PROTOCOL = EnvStr(None)
-    SGLANG_G2PLUS_TRANSFER_PARALLELISM = EnvInt(None)
-    SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM = EnvInt(None)
+    SGLANG_REMOTE_G2_FETCH_WORKERS = EnvInt(4)
+    SGLANG_REMOTE_G2_TRANSFER_PARALLELISM = EnvInt(None)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
@@ -728,12 +726,10 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-def default_g2plus_transfer_parallelism() -> int:
-    value = envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.get()
+def default_remote_g2_transfer_parallelism() -> int:
+    value = envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.get()
     if value is None:
-        value = envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.get()
-    if value is None:
-        value = G2PLUS_DEFAULT_TRANSFER_PARALLELISM
+        value = REMOTE_G2_DEFAULT_TRANSFER_PARALLELISM
     return max(1, int(value))
 
 

@@ -1,6 +1,5 @@
 import argparse
 import json
-import os
 import threading
 import time
 import unittest
@@ -13,11 +12,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    _get_mooncake_transfer_protocol,
-    apply_mooncake_nvlink_env_defaults,
-)
-from sglang.srt.environ import envs, temp_set_env
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
@@ -31,17 +26,16 @@ from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.entrypoints.openai.utils import cached_tokens_details_from_dict
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.mem_cache.g2plus_transfer import (
-    MooncakeG2plusTransferBackend,
-    default_g2plus_transfer_parallelism,
-    make_g2plus_transfer_backend,
+from sglang.srt.mem_cache.remote_g2.transfer import (
+    MooncakeRemoteG2TransferBackend,
+    default_remote_g2_transfer_parallelism,
+    make_remote_g2_transfer_backend,
 )
-from sglang.srt.mem_cache.router_kv_reuse import (
-    RemoteG2ReuseHandler,
-    RemoteKvReusePlan,
+from sglang.srt.mem_cache.remote_g2.manager import (
+    RemoteG2Manager,
+    RemoteG2Plan,
     ResolvedHostPage,
-    RouterKVReuseResult,
-    RouterKVReuseManager,
+    RemoteG2Result,
     _RemoteG2PendingFetch,
     resolve_host_pages,
 )
@@ -286,15 +280,15 @@ class FakeExecutor:
         self.shutdown_calls.append(kwargs)
 
 
-class FakeRouterMetricsCollector:
+class FakeRemoteG2MetricsCollector:
     def __init__(self):
         self.events = []
         self.quarantines = []
 
-    def observe_router_kv_reuse(self, **kwargs):
+    def observe_remote_g2(self, **kwargs):
         self.events.append(kwargs)
 
-    def observe_router_kv_reuse_quarantine(self, **kwargs):
+    def observe_remote_g2_quarantine(self, **kwargs):
         self.quarantines.append(kwargs)
 
 
@@ -318,74 +312,7 @@ class FakePrometheusMetric:
         return LabeledMetric()
 
 
-class TestMooncakeTransferProtocol(unittest.TestCase):
-    def test_defaults_to_rdma(self):
-        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
-            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override(None):
-                self.assertEqual(_get_mooncake_transfer_protocol(), "rdma")
-
-    def test_nvlink_pool_selects_nvlink_protocol(self):
-        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
-            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
-                self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
-
-    def test_true_pool_selects_nvlink_protocol(self):
-        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override(None):
-            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("true"):
-                self.assertEqual(_get_mooncake_transfer_protocol(), "nvlink")
-
-    def test_protocol_override_wins(self):
-        with envs.SGLANG_MOONCAKE_TE_PROTOCOL.override("RDMA"):
-            with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
-                self.assertEqual(_get_mooncake_transfer_protocol(), "rdma")
-
-    def test_nvlink_pool_applies_external_env_defaults(self):
-        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
-            with temp_set_env(
-                MC_FORCE_MNNVL=None,
-                NCCL_MNNVL_ENABLE=None,
-                NCCL_CUMEM_ENABLE=None,
-            ):
-                applied = apply_mooncake_nvlink_env_defaults()
-                self.assertEqual(
-                    applied,
-                    {
-                        "MC_FORCE_MNNVL": "True",
-                        "NCCL_MNNVL_ENABLE": "1",
-                        "NCCL_CUMEM_ENABLE": "1",
-                    },
-                )
-                self.assertEqual(os.environ["MC_FORCE_MNNVL"], "True")
-                self.assertEqual(os.environ["NCCL_MNNVL_ENABLE"], "1")
-                self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "1")
-
-    def test_nvlink_pool_respects_external_env_overrides(self):
-        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override("NVLINK"):
-            with temp_set_env(
-                MC_FORCE_MNNVL="False",
-                NCCL_MNNVL_ENABLE="0",
-                NCCL_CUMEM_ENABLE="0",
-            ):
-                applied = apply_mooncake_nvlink_env_defaults()
-                self.assertEqual(applied, {})
-                self.assertEqual(os.environ["MC_FORCE_MNNVL"], "False")
-                self.assertEqual(os.environ["NCCL_MNNVL_ENABLE"], "0")
-                self.assertEqual(os.environ["NCCL_CUMEM_ENABLE"], "0")
-
-    def test_non_nvlink_pool_does_not_apply_external_env_defaults(self):
-        with envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.override(None):
-            with temp_set_env(
-                MC_FORCE_MNNVL=None,
-                NCCL_MNNVL_ENABLE=None,
-                NCCL_CUMEM_ENABLE=None,
-            ):
-                self.assertEqual(apply_mooncake_nvlink_env_defaults(), {})
-                self.assertNotIn("MC_FORCE_MNNVL", os.environ)
-                self.assertNotIn("NCCL_MNNVL_ENABLE", os.environ)
-                self.assertNotIn("NCCL_CUMEM_ENABLE", os.environ)
-
-
-class TestRouterKVReuse(unittest.TestCase):
+class TestRemoteG2(unittest.TestCase):
     def test_block_hash_aliases_cover_signed_unsigned_int64_forms(self):
         signed = -(2**63) + 7
         unsigned = signed + 2**64
@@ -394,10 +321,10 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(block_hash_aliases(unsigned), {signed, unsigned})
         self.assertEqual(block_hash_aliases(123), {123})
 
-    def test_remote_kv_reuse_plan_parses_dynamo_shape(self):
-        plan = RemoteKvReusePlan.from_dict(
+    def test_remote_g2_plan_parses_dynamo_shape(self):
+        plan = RemoteG2Plan.from_dict(
             _make_plan(
-                ["11", 22, {"value": 33}],
+                [11, 22, {"value": 33}],
                 start_block_index=4,
                 kv_block_hashes=[111, 222, 333],
             )
@@ -410,11 +337,14 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertTrue(plan.is_remote_g2())
         self.assertFalse(plan.is_expired())
 
-    def test_remote_kv_reuse_plan_rejects_non_integer_fields(self):
+    def test_remote_g2_plan_rejects_non_integer_fields(self):
         cases = [
             ("block_hashes", [1.25]),
+            ("block_hashes", ["11"]),
             ("kv_block_hashes", [True]),
+            ("kv_block_hashes", ["22"]),
             ("target_worker_id", True),
+            ("target_worker_id", "42"),
             ("target_dp_rank", 0.5),
             ("source_worker_id", 7.9),
             ("source_dp_rank", False),
@@ -432,9 +362,9 @@ class TestRouterKVReuse(unittest.TestCase):
                 else:
                     plan_data = _make_plan([11], **{field_name: value})
                 with self.assertRaisesRegex(ValueError, "integer"):
-                    RemoteKvReusePlan.from_dict(plan_data)
+                    RemoteG2Plan.from_dict(plan_data)
 
-    def test_remote_kv_reuse_plan_rejects_non_array_hash_fields(self):
+    def test_remote_g2_plan_rejects_non_array_hash_fields(self):
         cases = [
             ("block_hashes", 11),
             ("block_hashes", "11"),
@@ -446,32 +376,32 @@ class TestRouterKVReuse(unittest.TestCase):
                 plan_data = _make_plan([11])
                 plan_data[field_name] = value
                 with self.assertRaisesRegex(ValueError, "array"):
-                    RemoteKvReusePlan.from_dict(plan_data)
+                    RemoteG2Plan.from_dict(plan_data)
 
-    def test_remote_kv_reuse_plan_rejects_missing_required_fields(self):
+    def test_remote_g2_plan_rejects_missing_required_fields(self):
         plan_data = _make_plan([11])
         del plan_data["target_worker_id"]
 
         with self.assertRaisesRegex(ValueError, "missing target_worker_id"):
-            RemoteKvReusePlan.from_dict(plan_data)
+            RemoteG2Plan.from_dict(plan_data)
 
     def test_remote_g2_handler_detects_valid_reuse_plan(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.worker_id = 42
         handler.dp_rank = 0
         handler.tree_cache = FakeTree(page_size=2)
         handler.direct_transfer = _fake_direct_transfer()
         req = SimpleNamespace(
-            remote_kv_reuse_plan=_make_plan([11], target_worker_id=42)
+            remote_g2_plan=_make_plan([11], target_worker_id=42)
         )
 
         self.assertTrue(handler.has_reuse_plan(req))
 
-        req.remote_kv_reuse_plan = _make_plan([11], target_worker_id=99)
+        req.remote_g2_plan = _make_plan([11], target_worker_id=99)
         self.assertFalse(handler.has_reuse_plan(req))
 
     def test_remote_g2_handler_requires_worker_identity(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.worker_id = None
         handler.dp_rank = 0
         handler.tree_cache = FakeTree(page_size=2)
@@ -479,41 +409,41 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.metrics_collector = None
         req = SimpleNamespace(
             rid="r-missing-worker",
-            remote_kv_reuse_plan=_make_plan([11], target_worker_id=42),
+            remote_g2_plan=_make_plan([11], target_worker_id=42),
         )
 
         self.assertFalse(handler.has_reuse_plan(req))
-        self.assertEqual(handler.check_remote_prefix(req), RouterKVReuseResult())
+        self.assertEqual(handler.check_remote_prefix(req), RemoteG2Result())
 
     def test_remote_g2_handler_does_not_reserve_prefetch_for_unexecutable_plan(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.worker_id = 42
         handler.dp_rank = 0
         handler.tree_cache = FakeTree(page_size=2)
         handler.direct_transfer = None
         req = SimpleNamespace(
-            remote_kv_reuse_plan=_make_plan([11], target_worker_id=42)
+            remote_g2_plan=_make_plan([11], target_worker_id=42)
         )
 
         self.assertFalse(handler.has_reuse_plan(req))
 
     def test_remote_g2_handler_treats_disabled_direct_backend_as_unavailable(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.worker_id = 42
         handler.dp_rank = 0
         handler.tree_cache = FakeTree(page_size=2)
         handler.direct_transfer = SimpleNamespace(name="mooncake", enabled=False)
         req = SimpleNamespace(
-            remote_kv_reuse_plan=_make_plan([11], target_worker_id=42)
+            remote_g2_plan=_make_plan([11], target_worker_id=42)
         )
 
         self.assertFalse(handler.has_reuse_plan(req))
         self.assertEqual(handler._current_backend_label(), "none")
 
     def test_source_resolver_rejects_oversized_control_payload(self):
-        handler = RemoteG2ReuseHandler(
+        handler = RemoteG2Manager(
             server_args=SimpleNamespace(
-                g2plus_config={
+                remote_g2_config={
                     "worker_id": 7,
                     "control_endpoint": "127.0.0.1:0",
                     "timeout_secs": 1,
@@ -541,15 +471,15 @@ class TestRouterKVReuse(unittest.TestCase):
             self.assertEqual(cm.exception.code, 413)
             payload = json.loads(cm.exception.read().decode("utf-8"))
             self.assertEqual(payload["reason"], "control_payload_too_large")
-            self.assertEqual(payload["pages"], [])
+            self.assertNotIn("pages", payload)
             self.assertTrue(_wait_until_no_pending(handler))
         finally:
             handler.shutdown()
 
     def test_source_resolver_http_staging_endpoints_are_removed(self):
-        handler = RemoteG2ReuseHandler(
+        handler = RemoteG2Manager(
             server_args=SimpleNamespace(
-                g2plus_config={
+                remote_g2_config={
                     "worker_id": 7,
                     "control_endpoint": "127.0.0.1:0",
                     "timeout_secs": 1,
@@ -587,9 +517,9 @@ class TestRouterKVReuse(unittest.TestCase):
             handler.shutdown()
 
     def test_source_resolver_rejects_malformed_json_control_payload(self):
-        handler = RemoteG2ReuseHandler(
+        handler = RemoteG2Manager(
             server_args=SimpleNamespace(
-                g2plus_config={
+                remote_g2_config={
                     "worker_id": 7,
                     "control_endpoint": "127.0.0.1:0",
                     "timeout_secs": 1,
@@ -617,15 +547,15 @@ class TestRouterKVReuse(unittest.TestCase):
             self.assertTrue(
                 payload["reason"].startswith("malformed_control_payload:json:")
             )
-            self.assertEqual(payload["pages"], [])
+            self.assertNotIn("pages", payload)
             self.assertTrue(_wait_until_no_pending(handler))
         finally:
             handler.shutdown()
 
     def test_source_resolver_rejects_malformed_plan_without_500(self):
-        handler = RemoteG2ReuseHandler(
+        handler = RemoteG2Manager(
             server_args=SimpleNamespace(
-                g2plus_config={
+                remote_g2_config={
                     "worker_id": 7,
                     "control_endpoint": "127.0.0.1:0",
                     "timeout_secs": 1,
@@ -660,7 +590,7 @@ class TestRouterKVReuse(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertFalse(payload["ok"])
             self.assertIn("block_hashes must be an array", payload["reason"])
-            self.assertEqual(payload["pages"], [])
+            self.assertNotIn("pages", payload)
             self.assertTrue(_wait_until_no_pending(handler))
         finally:
             handler.shutdown()
@@ -680,7 +610,7 @@ class TestRouterKVReuse(unittest.TestCase):
             [5, 6, 7, 8], dtype=torch.uint8
         )
         block_hashes = [hash_str_to_int64(hash_value) for hash_value in node.hash_value]
-        plan = RemoteKvReusePlan.from_dict(_make_plan(block_hashes))
+        plan = RemoteG2Plan.from_dict(_make_plan(block_hashes))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -699,7 +629,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_source_resolver_requires_worker_identity(self):
         tree = FakeTree(page_size=2)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11]))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -729,15 +659,15 @@ class TestRouterKVReuse(unittest.TestCase):
         block_hashes = [hash_str_to_int64(hash_value) for hash_value in node.hash_value]
         lookup_calls = []
 
-        def lookup_router_kv_host_blocks(wanted_hashes):
+        def lookup_remote_g2_host_blocks(wanted_hashes):
             lookup_calls.append(set(wanted_hashes))
             return {
                 block_hashes[0]: (node, 0, node.hash_value[0]),
                 block_hashes[1]: (node, 1, node.hash_value[1]),
             }
 
-        tree.lookup_router_kv_host_blocks = lookup_router_kv_host_blocks
-        plan = RemoteKvReusePlan.from_dict(_make_plan(block_hashes))
+        tree.lookup_remote_g2_host_blocks = lookup_remote_g2_host_blocks
+        plan = RemoteG2Plan.from_dict(_make_plan(block_hashes))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -753,9 +683,9 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(len(lookup_calls), 1)
         self.assertEqual(lookup_calls[0], set(block_hashes))
 
-    def test_source_resolver_does_not_scan_tree_when_router_kv_index_misses(self):
+    def test_source_resolver_does_not_scan_tree_when_remote_g2_index_misses(self):
         tree = FakeTree(page_size=2)
-        tree.router_kv_block_index = {}
+        tree.remote_g2_host_block_index = {}
         node = TreeNode()
         node.parent = tree.root_node
         node.key = RadixKey([1, 2])
@@ -768,12 +698,12 @@ class TestRouterKVReuse(unittest.TestCase):
         block_hash = hash_str_to_int64(node.hash_value[0])
         lookup_calls = []
 
-        def lookup_router_kv_host_blocks(wanted_hashes):
+        def lookup_remote_g2_host_blocks(wanted_hashes):
             lookup_calls.append(set(wanted_hashes))
             return {}
 
-        tree.lookup_router_kv_host_blocks = lookup_router_kv_host_blocks
-        plan = RemoteKvReusePlan.from_dict(_make_plan([block_hash]))
+        tree.lookup_remote_g2_host_blocks = lookup_remote_g2_host_blocks
+        plan = RemoteG2Plan.from_dict(_make_plan([block_hash]))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -801,7 +731,7 @@ class TestRouterKVReuse(unittest.TestCase):
             [1, 2, 3, 4], dtype=torch.uint8
         )
         block_hash = hash_str_to_int64(node.hash_value[0])
-        plan = RemoteKvReusePlan.from_dict(_make_plan([block_hash]))
+        plan = RemoteG2Plan.from_dict(_make_plan([block_hash]))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -817,7 +747,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(tree.flush_write_through_acks_calls, 1)
 
     def test_source_resolver_concurrency_guard_is_bounded(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler._source_resolver_semaphore = threading.BoundedSemaphore(1)
 
         self.assertTrue(handler._try_enter_source_resolver())
@@ -827,10 +757,10 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertTrue(handler._try_enter_source_resolver())
         handler._exit_source_resolver()
 
-    def test_hiradix_router_kv_index_tracks_host_pages_and_aliases(self):
+    def test_hiradix_remote_g2_index_tracks_host_pages_and_aliases(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 2
-        cache.router_kv_block_index = {}
+        cache.remote_g2_host_block_index = {}
 
         node = TreeNode()
         node.key = RadixKey([0, 1, 2, 3])
@@ -838,12 +768,12 @@ class TestRouterKVReuse(unittest.TestCase):
         node.hash_value = compute_node_hash_values(node, cache.page_size)
         block_hashes = [hash_str_to_int64(hash_value) for hash_value in node.hash_value]
 
-        cache._index_router_kv_host_node(node)
+        cache._index_remote_g2_host_node(node)
 
         wanted_hashes = set()
         for block_hash in block_hashes:
             wanted_hashes.update(block_hash_aliases(block_hash))
-        matches = cache.lookup_router_kv_host_blocks(wanted_hashes)
+        matches = cache.lookup_remote_g2_host_blocks(wanted_hashes)
 
         self.assertEqual(set(matches), wanted_hashes)
         for block_hash in block_hashes:
@@ -852,19 +782,19 @@ class TestRouterKVReuse(unittest.TestCase):
 
         node.hash_value[0] = "00" * 32
         stale_aliases = set(block_hash_aliases(block_hashes[0]))
-        self.assertEqual(cache.lookup_router_kv_host_blocks(stale_aliases), {})
+        self.assertEqual(cache.lookup_remote_g2_host_blocks(stale_aliases), {})
         for alias in stale_aliases:
-            self.assertNotIn(alias, cache.router_kv_block_index)
+            self.assertNotIn(alias, cache.remote_g2_host_block_index)
 
-        cache._drop_router_kv_host_node(node)
+        cache._drop_remote_g2_host_node(node)
         for alias in block_hash_aliases(block_hashes[1]):
-            self.assertNotIn(alias, cache.router_kv_block_index)
+            self.assertNotIn(alias, cache.remote_g2_host_block_index)
 
-    def test_hiradix_reset_clears_router_kv_index(self):
+    def test_hiradix_reset_clears_remote_g2_index(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 2
-        cache.router_kv_lock = threading.RLock()
-        cache.router_kv_block_index = {123: ("stale-node", 0, "aa" * 32)}
+        cache.remote_g2_host_index_lock = threading.RLock()
+        cache.remote_g2_host_block_index = {123: ("stale-node", 0, "aa" * 32)}
         cache.cache_controller = SimpleNamespace(reset=lambda: None)
         cache.token_to_kv_pool_host = SimpleNamespace(clear=lambda: None)
         cache.prefetch_loaded_tokens_by_reqid = {"rid": 2}
@@ -876,16 +806,16 @@ class TestRouterKVReuse(unittest.TestCase):
 
         cache.reset()
 
-        self.assertEqual(cache.router_kv_block_index, {})
+        self.assertEqual(cache.remote_g2_host_block_index, {})
         self.assertEqual(cache.prefetch_loaded_tokens_by_reqid, {})
         self.assertEqual(cache.evictable_host_leaves, set())
 
-    def test_hiradix_router_kv_index_publishes_after_write_ack(self):
+    def test_hiradix_remote_g2_index_publishes_after_write_ack(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 2
         cache.enable_storage = False
-        cache.enable_router_kv_reuse = True
-        cache.router_kv_block_index = {}
+        cache.enable_remote_g2 = True
+        cache.remote_g2_host_block_index = {}
         cache.ongoing_write_through = {}
         cache.root_node = TreeNode()
         cache.root_node.key = RadixKey([])
@@ -921,20 +851,20 @@ class TestRouterKVReuse(unittest.TestCase):
         wanted_hashes = set()
         for block_hash in block_hashes:
             wanted_hashes.update(block_hash_aliases(block_hash))
-        self.assertEqual(cache.lookup_router_kv_host_blocks(wanted_hashes), {})
+        self.assertEqual(cache.lookup_remote_g2_host_blocks(wanted_hashes), {})
 
         cache.writing_check(write_back=True)
 
-        matches = cache.lookup_router_kv_host_blocks(wanted_hashes)
+        matches = cache.lookup_remote_g2_host_blocks(wanted_hashes)
         self.assertEqual(set(matches), wanted_hashes)
         for block_hash in block_hashes:
             for alias in block_hash_aliases(block_hash):
                 self.assertIs(matches[alias][0], node)
 
-    def test_hiradix_router_kv_index_rewrites_aliases_on_host_node_split(self):
+    def test_hiradix_remote_g2_index_rewrites_aliases_on_host_node_split(self):
         cache = HiRadixCache.__new__(HiRadixCache)
         cache.page_size = 2
-        cache.router_kv_block_index = {}
+        cache.remote_g2_host_block_index = {}
         cache.root_node = TreeNode()
         cache.root_node.key = RadixKey([])
 
@@ -952,10 +882,10 @@ class TestRouterKVReuse(unittest.TestCase):
         for block_hash in block_hashes:
             wanted_hashes.update(block_hash_aliases(block_hash))
 
-        cache._index_router_kv_host_node(child)
+        cache._index_remote_g2_host_node(child)
         new_node = cache._split_node(child.key, child, 2)
 
-        matches = cache.lookup_router_kv_host_blocks(wanted_hashes)
+        matches = cache.lookup_remote_g2_host_blocks(wanted_hashes)
 
         for alias in block_hash_aliases(block_hashes[0]):
             self.assertIs(matches[alias][0], new_node)
@@ -981,7 +911,7 @@ class TestRouterKVReuse(unittest.TestCase):
         kv_block_hashes = [
             hash_str_to_int64(hash_value) for hash_value in node.hash_value
         ]
-        plan = RemoteKvReusePlan.from_dict(
+        plan = RemoteG2Plan.from_dict(
             _make_plan([101, 102], kv_block_hashes=kv_block_hashes)
         )
 
@@ -1018,7 +948,7 @@ class TestRouterKVReuse(unittest.TestCase):
             [9, 8, 7, 6], dtype=torch.uint8
         )
         unsigned_hash = signed_hash + (1 << 64)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([unsigned_hash]))
+        plan = RemoteG2Plan.from_dict(_make_plan([unsigned_hash]))
 
         pages, reason = resolve_host_pages(
             tree,
@@ -1035,7 +965,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_handler_respects_plan_start_block(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1076,7 +1006,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22], start_block_index=1),
+            remote_g2_plan=_make_plan([11, 22], start_block_index=1),
         )
 
         first = handler.check_remote_prefix(req)
@@ -1092,7 +1022,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_inserts_device_node(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1133,7 +1063,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         first = handler.check_remote_prefix(req)
@@ -1150,7 +1080,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_accepts_real_req(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1180,7 +1110,7 @@ class TestRouterKVReuse(unittest.TestCase):
             origin_input_text="",
             origin_input_ids=[10, 11, 12, 13, 14, 15],
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
         req.fill_ids = req.origin_input_ids
         req.last_node = tree.root_node
@@ -1197,7 +1127,7 @@ class TestRouterKVReuse(unittest.TestCase):
     def test_remote_g2_direct_transfer_attaches_after_device_prefix(self):
         tree = FakeTree(page_size=2)
         tree.insert_prefix_len = 2
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1237,7 +1167,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22, 33]),
+            remote_g2_plan=_make_plan([11, 22, 33]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1253,7 +1183,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_partial_result_frees_unused_device_pages(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1293,7 +1223,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22, 33]),
+            remote_g2_plan=_make_plan([11, 22, 33]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1309,16 +1239,16 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_timeout_quarantines_target_pages(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
         handler._quarantined_device_indices = []
         handler._quarantined_tokens_by_backend = {}
-        handler.metrics_collector = FakeRouterMetricsCollector()
+        handler.metrics_collector = FakeRemoteG2MetricsCollector()
 
         device_indices = torch.arange(200, 204)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         pending = SimpleNamespace(
             plan=plan,
             future=_completed_future(
@@ -1333,7 +1263,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
         result = handler._finish_pending_fetch(req, pending)
 
-        self.assertEqual(result, RouterKVReuseResult())
+        self.assertEqual(result, RemoteG2Result())
         self.assertEqual(tree.device_allocator.freed, [])
         self.assertEqual(len(handler._quarantined_device_indices), 1)
         self.assertEqual(
@@ -1370,7 +1300,7 @@ class TestRouterKVReuse(unittest.TestCase):
     def test_remote_g2_direct_transfer_frees_insert_matched_device_prefix(self):
         tree = FakeTree(page_size=2)
         tree.insert_prefix_len = 2
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1407,7 +1337,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1423,7 +1353,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_protects_local_prefix_while_pending(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1460,7 +1390,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22, 33]),
+            remote_g2_plan=_make_plan([11, 22, 33]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1488,7 +1418,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_failure_becomes_cache_miss(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1518,7 +1448,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1532,8 +1462,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_insert_failure_becomes_cache_miss(self):
         tree = FakeTree(page_size=2)
-        metrics = FakeRouterMetricsCollector()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        metrics = FakeRemoteG2MetricsCollector()
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1581,7 +1511,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1604,8 +1534,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_records_hit_metrics(self):
         tree = FakeTree(page_size=2)
-        metrics = FakeRouterMetricsCollector()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        metrics = FakeRemoteG2MetricsCollector()
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1647,7 +1577,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1666,8 +1596,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_records_miss_reason_metrics(self):
         tree = FakeTree(page_size=2)
-        metrics = FakeRouterMetricsCollector()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        metrics = FakeRemoteG2MetricsCollector()
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1703,7 +1633,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1721,8 +1651,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_transfer_rejects_too_many_pages(self):
         tree = FakeTree(page_size=2)
-        metrics = FakeRouterMetricsCollector()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        metrics = FakeRemoteG2MetricsCollector()
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1765,7 +1695,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1783,7 +1713,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_allocation_failure_marks_plan_finished(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1809,7 +1739,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         result = handler.check_remote_prefix(req)
@@ -1824,7 +1754,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_fetch_worker_backpressure_skips_hbm_allocation(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1837,7 +1767,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 "busy fetch pool must not submit direct transfer"
             )
         )
-        plan = RemoteKvReusePlan.from_dict(
+        plan = RemoteG2Plan.from_dict(
             _make_plan([11, 22], source_endpoint="http://127.0.0.1:39007")
         )
 
@@ -1853,7 +1783,7 @@ class TestRouterKVReuse(unittest.TestCase):
     def test_remote_g2_direct_rejects_unaligned_device_allocation(self):
         tree = FakeTree(page_size=2)
         tree.device_allocator.next_index = 201
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1864,7 +1794,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 "unaligned target allocation must not start direct transfer"
             )
         )
-        plan = RemoteKvReusePlan.from_dict(
+        plan = RemoteG2Plan.from_dict(
             _make_plan([11, 22], source_endpoint="http://127.0.0.1:39007")
         )
 
@@ -1878,7 +1808,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_auto_without_direct_backend_marks_plan_finished(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1897,7 +1827,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         result = handler.check_remote_prefix(req)
@@ -1911,7 +1841,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_direct_skips_host_hit(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1939,7 +1869,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         result = handler.check_remote_prefix(req)
@@ -1951,7 +1881,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_release_request_cancels_pending_direct_transfer(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -1979,7 +1909,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -1991,7 +1921,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(handler._finished_plan_keys, {("other", "plan")})
 
     def test_remote_g2_release_request_clears_finished_plan_without_pending(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler._pending_fetches = {}
         handler._finished_plan_keys = {
             ("r-finished", "old-plan"),
@@ -2005,7 +1935,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_release_request_unlocks_pending_prefix(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -2040,7 +1970,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22, 33]),
+            remote_g2_plan=_make_plan([11, 22, 33]),
         )
 
         self.assertTrue(handler.check_remote_prefix(req).pending)
@@ -2055,7 +1985,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_released_running_direct_transfer_remains_pending(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
@@ -2064,7 +1994,7 @@ class TestRouterKVReuse(unittest.TestCase):
         running_future = Future()
         self.assertTrue(running_future.set_running_or_notify_cancel())
         device_indices = torch.arange(200, 204)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         handler._pending_fetches = {
             "r-running-release": SimpleNamespace(
                 plan=plan,
@@ -2088,7 +2018,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_released_running_direct_transfer_frees_after_error(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
@@ -2097,7 +2027,7 @@ class TestRouterKVReuse(unittest.TestCase):
         running_future = Future()
         self.assertTrue(running_future.set_running_or_notify_cancel())
         device_indices = torch.arange(200, 204)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         handler._pending_fetches = {
             "r-running-error": SimpleNamespace(
                 plan=plan,
@@ -2121,14 +2051,14 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_release_request_quarantines_completed_direct_timeout(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
         handler._quarantined_device_indices = []
 
         device_indices = torch.arange(200, 204)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         handler._pending_fetches = {
             "r-completed-timeout-release": SimpleNamespace(
                 plan=plan,
@@ -2152,7 +2082,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_released_running_direct_timeout_quarantines_when_done(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
@@ -2162,7 +2092,7 @@ class TestRouterKVReuse(unittest.TestCase):
         running_future = Future()
         self.assertTrue(running_future.set_running_or_notify_cancel())
         device_indices = torch.arange(200, 204)
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         handler._pending_fetches = {
             "r-running-timeout-release": SimpleNamespace(
                 plan=plan,
@@ -2192,7 +2122,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
     def test_remote_g2_active_source_resolver_counts_as_pending(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler._pending_fetches = {}
         handler._detached_fetches = set()
         handler._source_activity_lock = threading.Lock()
@@ -2209,8 +2139,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_best_effort_policy_does_not_wait_for_pending_transfer(self):
         tree = FakeTree(page_size=2)
-        metrics = FakeRouterMetricsCollector()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        metrics = FakeRemoteG2MetricsCollector()
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -2223,7 +2153,7 @@ class TestRouterKVReuse(unittest.TestCase):
         handler._detached_fetches = set()
         handler._finished_plan_keys = set()
         handler._quarantined_device_indices = []
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
         running_future = FakeRunningFuture()
         handler._pending_fetches["r-best-effort"] = _RemoteG2PendingFetch(
             plan=plan,
@@ -2248,7 +2178,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         result = handler.check_remote_prefix(req)
@@ -2263,14 +2193,14 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_plan_change_releases_old_pending_direct_transfer(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
         handler.direct_transfer = SimpleNamespace(enabled=True)
         old_future = Future()
         old_indices = torch.arange(200, 204)
-        old_plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22], plan_id="old-plan"))
+        old_plan = RemoteG2Plan.from_dict(_make_plan([11, 22], plan_id="old-plan"))
         locked_node = TreeNode()
         locked_node.parent = tree.root_node
         locked_node.key = RadixKey([10, 11])
@@ -2305,7 +2235,7 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22], plan_id="new-plan"),
+            remote_g2_plan=_make_plan([11, 22], plan_id="new-plan"),
         )
 
         result = handler.check_remote_prefix(req)
@@ -2320,7 +2250,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_shutdown_frees_running_direct_transfer_when_done(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._shutdown = False
         handler._source_server = None
@@ -2352,7 +2282,7 @@ class TestRouterKVReuse(unittest.TestCase):
     def test_remote_g2_shutdown_defers_backend_close_until_direct_transfer_done(self):
         tree = FakeTree(page_size=2)
         shutdown_calls = []
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler._shutdown = False
         handler._source_server = None
@@ -2391,7 +2321,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_shutdown_closes_idle_direct_transfer_backend(self):
         shutdown_calls = []
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler._shutdown = False
         handler._source_server = None
         handler._source_thread = None
@@ -2410,7 +2340,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
     def test_remote_g2_queue_prefetch_skips_direct_backend(self):
         tree = FakeTree(page_size=2)
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.tree_cache = tree
         handler.worker_id = 42
         handler.dp_rank = 0
@@ -2441,16 +2371,16 @@ class TestRouterKVReuse(unittest.TestCase):
             logprob_start_len=-1,
             positional_embed_overrides=None,
             remote_g2_hit_length=0,
-            remote_kv_reuse_plan=_make_plan([11, 22]),
+            remote_g2_plan=_make_plan([11, 22]),
         )
 
         result = handler.prefetch_remote_prefix(req)
 
-        self.assertEqual(result, RouterKVReuseResult())
+        self.assertEqual(result, RemoteG2Result())
         self.assertEqual(handler._pending_fetches, {})
 
     def test_direct_transfer_control_plane_uses_backend_neutral_route(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
@@ -2463,7 +2393,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 "session_id": "target-session",
             },
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
 
         def fake_urlopen(request, timeout):
             requests.append((request.full_url, json.loads(request.data.decode())))
@@ -2472,10 +2402,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 {
                     "ok": True,
                     "reason": "ok",
-                    "pages": [
-                        {"block_hash": 11, "hash_value": "aa" * 32},
-                        {"block_hash": 22, "hash_value": "bb" * 32},
-                    ],
+                    "transferred_blocks": 2,
                 }
             )
 
@@ -2497,8 +2424,8 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(payload["target_metadata"]["session_id"], "target-session")
         self.assertEqual(payload["target_page_indices"], [3, 4])
 
-    def test_mooncake_direct_transfer_does_not_retry_legacy_alias(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+    def test_mooncake_direct_transfer_does_not_retry_after_rejection(self):
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
@@ -2511,7 +2438,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 "session_id": "target-session",
             },
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11]))
 
         def fake_urlopen(request, timeout):
             requests.append(request.full_url)
@@ -2519,7 +2446,6 @@ class TestRouterKVReuse(unittest.TestCase):
                 {
                     "ok": False,
                     "reason": "direct_transfer_failed:ret=-1",
-                    "pages": [],
                 }
             )
 
@@ -2538,7 +2464,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(requests, ["http://127.0.0.1:39000/transfer_direct"])
 
     def test_direct_transfer_control_plane_timeout_is_indeterminate(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
             name="mooncake",
@@ -2547,7 +2473,7 @@ class TestRouterKVReuse(unittest.TestCase):
             target_kv_item_lens=[64],
             target_descriptor=lambda: {"backend": "mooncake"},
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11]))
 
         def fake_urlopen(request, timeout):
             self.assertEqual(timeout, 1)
@@ -2569,7 +2495,7 @@ class TestRouterKVReuse(unittest.TestCase):
     def test_direct_transfer_control_plane_stops_on_indeterminate_source_rejection(
         self,
     ):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
@@ -2579,7 +2505,7 @@ class TestRouterKVReuse(unittest.TestCase):
             target_kv_item_lens=[64],
             target_descriptor=lambda: {"backend": "mooncake"},
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11]))
 
         def fake_urlopen(request, timeout):
             requests.append(request.full_url)
@@ -2587,7 +2513,6 @@ class TestRouterKVReuse(unittest.TestCase):
                 {
                     "ok": False,
                     "reason": "source_transfer_timeout_maybe_inflight:source:timed out",
-                    "pages": [],
                 }
             )
 
@@ -2608,7 +2533,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(requests, ["http://127.0.0.1:39000/transfer_direct"])
 
     def test_direct_transfer_control_plane_accepts_compact_block_count(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
             name="mooncake",
@@ -2617,7 +2542,7 @@ class TestRouterKVReuse(unittest.TestCase):
             target_kv_item_lens=[64],
             target_descriptor=lambda: {"backend": "mooncake"},
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22, 33]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22, 33]))
 
         def fake_urlopen(request, timeout):
             return FakeUrlopenResponse(
@@ -2643,7 +2568,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual([page.hash_value for page in pages], ["", ""])
 
     def test_direct_transfer_control_plane_returns_miss_on_source_rejection(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
             name="mooncake",
@@ -2652,14 +2577,13 @@ class TestRouterKVReuse(unittest.TestCase):
             target_kv_item_lens=[64],
             target_descriptor=lambda: {"backend": "mooncake"},
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11, 22]))
 
         def fake_urlopen(request, timeout):
             return FakeUrlopenResponse(
                 {
                     "ok": False,
                     "reason": "direct_transfer_failed:ucx_error",
-                    "pages": [],
                 }
             )
 
@@ -2677,7 +2601,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(reason, "direct_transfer_failed:ucx_error")
 
     def test_direct_transfer_control_plane_skips_malformed_source_response(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
@@ -2687,7 +2611,7 @@ class TestRouterKVReuse(unittest.TestCase):
             target_kv_item_lens=[64],
             target_descriptor=lambda: {"backend": "mooncake"},
         )
-        plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
+        plan = RemoteG2Plan.from_dict(_make_plan([11]))
 
         def fake_urlopen(request, timeout):
             requests.append(request.full_url)
@@ -2697,7 +2621,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 {
                     "ok": True,
                     "reason": "ok",
-                    "pages": [{"block_hash": 11, "hash_value": "aa" * 32}],
+                    "transferred_blocks": 1,
                 }
             )
 
@@ -2737,7 +2661,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls.append(kwargs)
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -2786,7 +2710,7 @@ class TestRouterKVReuse(unittest.TestCase):
             def transfer_pages(self, **kwargs):
                 raise TimeoutError("transport timed out")
 
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = TimeoutTransfer()
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -2811,7 +2735,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 "source_transfer_timeout_maybe_inflight:source:"
             )
         )
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(node.host_ref_counter, 0)
 
     def test_source_direct_transfer_batches_host_value_reads_by_node(self):
@@ -2835,7 +2759,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.source_page_indices = kwargs["source_page_indices"].tolist()
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -2876,7 +2800,7 @@ class TestRouterKVReuse(unittest.TestCase):
             def transfer_pages(self, **kwargs):
                 raise RuntimeError("rdma_write_failed")
 
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = FailingTransfer()
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -2896,7 +2820,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(response["reason"], "direct_transfer_failed:rdma_write_failed")
         self.assertEqual(response["transfer_bytes"], 128)
         self.assertGreaterEqual(response["resolve_ms"], 0)
@@ -2905,7 +2829,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(node.host_ref_counter, 0)
 
     def test_source_direct_transfer_rejects_disabled_backend(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = SimpleNamespace(name="mooncake", enabled=False)
 
         response = handler._handle_source_transfer(
@@ -2918,11 +2842,11 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(response["reason"], "direct_transfer_unavailable")
 
     def test_source_direct_transfer_rejects_malformed_plan_before_lookup(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = SimpleNamespace(name="mooncake", enabled=True)
         handler.tree_cache = FakeTree(page_size=2)
         handler.worker_id = 7
@@ -2940,11 +2864,11 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertIn("block_hashes must be an array", response["reason"])
 
     def test_source_direct_transfer_rejects_non_integer_bounds_before_lookup(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = SimpleNamespace(name="mooncake", enabled=True)
         handler.tree_cache = FakeTree(page_size=2)
         handler.worker_id = 7
@@ -2960,7 +2884,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertIn("start_block must be an integer", response["reason"])
 
     def test_source_direct_transfer_rejects_short_target_indices_before_te(self):
@@ -2984,7 +2908,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3004,7 +2928,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(
             response["reason"],
             "malformed_transfer_request:target_page_indices_too_short:1<2",
@@ -3038,7 +2962,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3058,7 +2982,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(
             response["reason"],
             "malformed_transfer_request:target_page_indices_must_be_array",
@@ -3087,7 +3011,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3107,7 +3031,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(response["reason"], "source_host_page_index_unaligned")
         self.assertEqual(transfer.calls, 0)
         self.assertEqual(node.host_ref_counter, 0)
@@ -3138,7 +3062,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3158,7 +3082,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(
             response["reason"],
             "malformed_transfer_request:target_page_index_out_of_range",
@@ -3193,7 +3117,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3213,7 +3137,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertIn("target_kv_ptrs_len_2", response["reason"])
         self.assertEqual(transfer.calls, 0)
         self.assertEqual(node.host_ref_counter, 0)
@@ -3242,7 +3166,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3262,7 +3186,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertIn("target_kv_item_lens_mismatch", response["reason"])
         self.assertEqual(transfer.calls, 0)
         self.assertEqual(node.host_ref_counter, 0)
@@ -3288,7 +3212,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 self.calls += 1
 
         transfer = RecordingTransfer()
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.direct_transfer = transfer
         handler.tree_cache = tree
         handler.worker_id = 7
@@ -3312,7 +3236,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertFalse(response["ok"])
-        self.assertEqual(response["pages"], [])
+        self.assertNotIn("pages", response)
         self.assertEqual(
             response["reason"],
             "malformed_transfer_request:target_session_id_mismatch",
@@ -3338,7 +3262,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[target_k_ptr, target_v_ptr],
@@ -3403,8 +3327,8 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        with envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(2):
-            backend = MooncakeG2plusTransferBackend(
+        with envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.override(2):
+            backend = MooncakeRemoteG2TransferBackend(
                 engine=engine,
                 tree_cache=tree,
                 target_kv_ptrs=[target_k_ptr, target_v_ptr],
@@ -3493,7 +3417,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1_000_000, 2_000_000],
@@ -3528,8 +3452,8 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        with envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(3):
-            backend = MooncakeG2plusTransferBackend(
+        with envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.override(3):
+            backend = MooncakeRemoteG2TransferBackend(
                 engine=FakeMooncakeEngine(ib_device="mlx5_0"),
                 tree_cache=tree,
                 target_kv_ptrs=[1, 2],
@@ -3550,7 +3474,7 @@ class TestRouterKVReuse(unittest.TestCase):
             },
         )
 
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=FakeMooncakeEngine(),
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3563,7 +3487,7 @@ class TestRouterKVReuse(unittest.TestCase):
             descriptor["transport"]["path_hint"], "no_explicit_ib_device"
         )
 
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=FakeMooncakeEngine(protocol="nvlink"),
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3589,7 +3513,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3615,7 +3539,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3640,7 +3564,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1],
@@ -3666,7 +3590,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3694,7 +3618,7 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        backend = MooncakeG2plusTransferBackend(
+        backend = MooncakeRemoteG2TransferBackend(
             engine=engine,
             tree_cache=tree,
             target_kv_ptrs=[1, 2],
@@ -3709,115 +3633,72 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertFalse(backend.enabled)
         self.assertEqual(engine.deregistered, [])
 
-    def test_g2plus_transfer_parallelism_prefers_backend_neutral_env(self):
-        with envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.override(
-            None
-        ), envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(None):
-            self.assertEqual(default_g2plus_transfer_parallelism(), 4)
+    def test_remote_g2_transfer_parallelism_prefers_backend_neutral_env(self):
+        with envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.override(None):
+            self.assertEqual(default_remote_g2_transfer_parallelism(), 4)
 
-        with envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.override(
-            5
-        ), envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(2):
-            self.assertEqual(default_g2plus_transfer_parallelism(), 5)
+        with envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.override(5):
+            self.assertEqual(default_remote_g2_transfer_parallelism(), 5)
 
-        with envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.override(
-            None
-        ), envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(3):
-            self.assertEqual(default_g2plus_transfer_parallelism(), 3)
-
-    def test_explicit_g2plus_direct_backend_fails_fast_when_unavailable(self):
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(g2plus_transfer_backend="mooncake")
-        )
-        with patch.object(
-            MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
-        ):
-            with self.assertRaisesRegex(RuntimeError, "Mooncake"):
-                make_g2plus_transfer_backend(scheduler)
-
-    def test_explicit_g2plus_direct_backend_error_includes_diagnostics(self):
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(g2plus_transfer_backend="mooncake")
-        )
-
-        def unavailable(_scheduler, diagnostics=None):
-            diagnostics.append("mooncake target KV registration failed")
-            return None
-
-        with patch.object(
-            MooncakeG2plusTransferBackend, "from_scheduler", side_effect=unavailable
-        ):
-            with self.assertRaisesRegex(
-                RuntimeError, "mooncake target KV registration failed"
-            ):
-                make_g2plus_transfer_backend(scheduler, diagnostics=[])
-
-    def test_explicit_g2plus_direct_backend_rejects_unsupported_topology(self):
+    def test_explicit_remote_g2_direct_backend_fails_fast_when_unavailable(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                g2plus_transfer_backend="mooncake",
+                remote_g2_config={"transfer_backend": "mooncake"}
+            )
+        )
+        with patch.object(
+            MooncakeRemoteG2TransferBackend, "from_scheduler", return_value=None
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Mooncake"):
+                make_remote_g2_transfer_backend(scheduler)
+
+    def test_explicit_remote_g2_direct_backend_rejects_unsupported_topology(self):
+        scheduler = SimpleNamespace(
+            server_args=SimpleNamespace(
+                remote_g2_config={"transfer_backend": "mooncake"},
                 tp_size=2,
                 pp_size=1,
                 attn_cp_size=1,
             )
         )
         with patch.object(
-            MooncakeG2plusTransferBackend,
+            MooncakeRemoteG2TransferBackend,
             "from_scheduler",
             side_effect=AssertionError("must reject before initializing backend"),
         ):
             with self.assertRaisesRegex(RuntimeError, "tp_size=2"):
-                make_g2plus_transfer_backend(scheduler)
+                make_remote_g2_transfer_backend(scheduler)
 
-    def test_auto_g2plus_direct_backend_rejects_unsupported_topology_without_init(self):
+    def test_auto_remote_g2_direct_backend_rejects_unsupported_topology_without_init(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                g2plus_transfer_backend="auto",
+                remote_g2_config={"transfer_backend": "auto"},
                 tp_size=1,
                 pp_size=2,
                 attn_cp_size=1,
             )
         )
         with patch.object(
-            MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
+            MooncakeRemoteG2TransferBackend, "from_scheduler", return_value=None
         ) as mooncake_from_scheduler:
-            self.assertIsNone(make_g2plus_transfer_backend(scheduler))
+            self.assertIsNone(make_remote_g2_transfer_backend(scheduler))
 
         mooncake_from_scheduler.assert_not_called()
 
-    def test_auto_g2plus_backend_without_direct_te_returns_none(self):
+    def test_auto_remote_g2_backend_without_direct_te_returns_none(self):
         scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(g2plus_transfer_backend="auto")
+            server_args=SimpleNamespace(remote_g2_config={"transfer_backend": "auto"})
         )
         with patch.object(
-            MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
+            MooncakeRemoteG2TransferBackend, "from_scheduler", return_value=None
         ):
-            self.assertIsNone(make_g2plus_transfer_backend(scheduler))
+            self.assertIsNone(make_remote_g2_transfer_backend(scheduler))
 
-    def test_auto_g2plus_backend_records_unavailable_diagnostics(self):
-        scheduler = SimpleNamespace(
-            server_args=SimpleNamespace(g2plus_transfer_backend="auto")
-        )
-        diagnostics = []
-
-        with patch.object(
-            MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
-        ) as mooncake_from_scheduler:
-            self.assertIsNone(
-                make_g2plus_transfer_backend(scheduler, diagnostics=diagnostics)
-            )
-
-        mooncake_from_scheduler.assert_called_once_with(
-            scheduler, diagnostics=diagnostics
-        )
-        self.assertEqual(diagnostics, ["mooncake unavailable"])
-
-    def test_remote_g2_from_scheduler_logs_transfer_diagnostics(self):
+    def test_remote_g2_from_scheduler_warns_when_transfer_backend_unavailable(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                enable_router_kv_reuse=True,
-                enable_g2plus=False,
-                g2plus_config={
+                enable_remote_g2=True,
+                remote_g2_config={
                     "worker_id": 42,
                     "timeout_secs": 1,
                     "transfer_backend": "auto",
@@ -3829,43 +3710,38 @@ class TestRouterKVReuse(unittest.TestCase):
             enable_metrics=False,
         )
 
-        def make_backend(_scheduler, diagnostics=None):
-            diagnostics.append("mooncake initialization failed: missing transfer engine")
-            return None
-
         with patch(
-            "sglang.srt.mem_cache.router_kv_reuse.make_g2plus_transfer_backend",
-            side_effect=make_backend,
+            "sglang.srt.mem_cache.remote_g2.manager.make_remote_g2_transfer_backend",
+            return_value=None,
         ), self.assertLogs(
-            "sglang.srt.mem_cache.router_kv_reuse", level="WARNING"
+            "sglang.srt.mem_cache.remote_g2.manager", level="WARNING"
         ) as logs:
-            handler = RemoteG2ReuseHandler.from_scheduler(scheduler)
+            handler = RemoteG2Manager.from_scheduler(scheduler)
             self.assertIsNotNone(handler)
             handler.shutdown()
 
         self.assertIn(
-            "Diagnostics: mooncake initialization failed: missing transfer engine",
+            "no direct transfer backend is available",
             "\n".join(logs.output),
         )
 
     def test_remote_g2_from_scheduler_requires_worker_identity(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                enable_router_kv_reuse=True,
-                enable_g2plus=False,
-                g2plus_worker_id=None,
+                enable_remote_g2=True,
+                remote_g2_config={},
             ),
             enable_hierarchical_cache=True,
             tree_cache=FakeTree(page_size=2),
         )
 
         with patch(
-            "sglang.srt.mem_cache.router_kv_reuse.make_g2plus_transfer_backend",
+            "sglang.srt.mem_cache.remote_g2.manager.make_remote_g2_transfer_backend",
             side_effect=AssertionError("must not initialize transfer backend"),
         ):
-            self.assertIsNone(RemoteG2ReuseHandler.from_scheduler(scheduler))
+            self.assertIsNone(RemoteG2Manager.from_scheduler(scheduler))
 
-    def test_server_args_cli_wires_g2plus_config(self):
+    def test_server_args_cli_wires_remote_g2_config(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -3873,12 +3749,11 @@ class TestRouterKVReuse(unittest.TestCase):
             [
                 "--model-path",
                 "dummy",
-                "--g2plus-config",
+                "--remote-g2-config",
                 json.dumps(
                     {
                         "worker_id": 7,
                         "control": {
-                            "backend": "dynamo",
                             "endpoint": "127.0.0.1:39007",
                         },
                         "transfer": {
@@ -3891,18 +3766,18 @@ class TestRouterKVReuse(unittest.TestCase):
         )
         server_args = ServerArgs.from_cli_args(args)
 
-        self.assertTrue(server_args.enable_router_kv_reuse)
+        self.assertTrue(server_args.enable_remote_g2)
         self.assertTrue(server_args.enable_hierarchical_cache)
-        self.assertEqual(server_args.g2plus_config["worker_id"], 7)
-        self.assertEqual(server_args.g2plus_config["control_backend"], "dynamo")
+        self.assertEqual(server_args.remote_g2_config["worker_id"], 7)
+        self.assertNotIn("control_backend", server_args.remote_g2_config)
         self.assertEqual(
-            server_args.g2plus_config["control_endpoint"],
+            server_args.remote_g2_config["control_endpoint"],
             "127.0.0.1:39007",
         )
-        self.assertEqual(server_args.g2plus_config["timeout_secs"], 2.5)
-        self.assertEqual(server_args.g2plus_config["transfer_backend"], "mooncake")
+        self.assertEqual(server_args.remote_g2_config["timeout_secs"], 2.5)
+        self.assertEqual(server_args.remote_g2_config["transfer_backend"], "mooncake")
 
-    def test_server_args_g2plus_control_backend_defaults_to_router(self):
+    def test_server_args_rejects_remote_g2_control_backend(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -3910,31 +3785,15 @@ class TestRouterKVReuse(unittest.TestCase):
             [
                 "--model-path",
                 "dummy",
-                "--g2plus-config",
-                json.dumps({"worker_id": 7}),
-            ]
-        )
-        server_args = ServerArgs.from_cli_args(args)
-
-        self.assertEqual(server_args.g2plus_config["control_backend"], "router")
-
-    def test_server_args_rejects_unknown_g2plus_control_backend(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        args = parser.parse_args(
-            [
-                "--model-path",
-                "dummy",
-                "--g2plus-config",
-                json.dumps({"worker_id": 7, "control": {"backend": "static"}}),
+                "--remote-g2-config",
+                json.dumps({"worker_id": 7, "control": {"backend": "dynamo"}}),
             ]
         )
 
         with self.assertRaisesRegex(ValueError, "control.backend"):
             ServerArgs.from_cli_args(args)
 
-    def test_server_args_rejects_g2plus_nixl_backend(self):
+    def test_server_args_rejects_remote_g2_nixl_backend(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -3942,7 +3801,7 @@ class TestRouterKVReuse(unittest.TestCase):
             [
                 "--model-path",
                 "dummy",
-                "--g2plus-config",
+                "--remote-g2-config",
                 json.dumps({"worker_id": 7, "transfer_backend": "nixl"}),
             ]
         )
@@ -3950,27 +3809,27 @@ class TestRouterKVReuse(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "transfer_backend"):
             ServerArgs.from_cli_args(args)
 
-    def test_server_args_rejects_g2plus_config_without_worker_id(self):
+    def test_server_args_rejects_remote_g2_config_without_worker_id(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
-        args = parser.parse_args(["--model-path", "dummy", "--g2plus-config", "{}"])
+        args = parser.parse_args(["--model-path", "dummy", "--remote-g2-config", "{}"])
 
         with self.assertRaisesRegex(
-            ValueError, "--g2plus-config requires worker_id"
+            ValueError, "--remote-g2-config requires worker_id"
         ):
             ServerArgs.from_cli_args(args)
 
-    def test_server_args_allows_generic_router_reuse_without_g2plus_worker_id(self):
+    def test_server_args_requires_config_when_remote_g2_enabled(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
         args = parser.parse_args(["--model-path", "dummy"])
-        args.enable_router_kv_reuse = True
-        server_args = ServerArgs.from_cli_args(args)
-
-        self.assertTrue(server_args.enable_router_kv_reuse)
-        self.assertIsNone(server_args.g2plus_config)
+        args.enable_remote_g2 = True
+        with self.assertRaisesRegex(
+            ValueError, "--remote-g2-config requires worker_id"
+        ):
+            ServerArgs.from_cli_args(args)
 
     def test_server_args_rejects_static_peer_endpoints(self):
         parser = argparse.ArgumentParser()
@@ -3980,7 +3839,7 @@ class TestRouterKVReuse(unittest.TestCase):
             [
                 "--model-path",
                 "dummy",
-                "--g2plus-config",
+                "--remote-g2-config",
                 '{"worker_id": 7, "peer_endpoints": {"8": "127.0.0.1:39008"}}',
             ]
         )
@@ -3990,7 +3849,7 @@ class TestRouterKVReuse(unittest.TestCase):
         ):
             ServerArgs.from_cli_args(args)
 
-    def test_server_args_rejects_invalid_g2plus_control_endpoint_values(self):
+    def test_server_args_rejects_invalid_remote_g2_control_endpoint_values(self):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)
 
@@ -3998,19 +3857,19 @@ class TestRouterKVReuse(unittest.TestCase):
             [
                 "--model-path",
                 "dummy",
-                "--g2plus-config",
+                "--remote-g2-config",
                 '{"worker_id": 7, "control": {"endpoint": {"0": null}}}',
             ]
         )
 
         with self.assertRaisesRegex(
-            ValueError, "g2plus_config.control.endpoint must be a non-empty string"
+            ValueError, "remote_g2_config.control.endpoint must be a non-empty string"
         ):
             ServerArgs.from_cli_args(args)
 
     def test_remote_g2_handler_rejects_invalid_dp_endpoint_values(self):
         server_args = SimpleNamespace(
-            g2plus_config={
+            remote_g2_config={
                 "timeout_secs": 1,
                 "transfer_backend": "auto",
                 "control_endpoint": {"0": 123},
@@ -4018,9 +3877,9 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(
-            ValueError, "g2plus_config.control.endpoint values must be non-empty strings"
+            ValueError, "remote_g2_config.control.endpoint values must be non-empty strings"
         ):
-            RemoteG2ReuseHandler(
+            RemoteG2Manager(
                 server_args=server_args,
                 tree_cache=FakeTree(page_size=2),
                 worker_id=42,
@@ -4033,7 +3892,7 @@ class TestRouterKVReuse(unittest.TestCase):
         source_item_len = 8
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                g2plus_transfer_backend="mooncake",
+                remote_g2_config={"transfer_backend": "mooncake"},
                 mooncake_ib_device=None,
                 tp_size=1,
                 pp_size=1,
@@ -4063,8 +3922,8 @@ class TestRouterKVReuse(unittest.TestCase):
             "sglang.srt.distributed.parallel_state.get_mooncake_transfer_engine",
             return_value=engine,
         ):
-            with envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.override(4):
-                backend = MooncakeG2plusTransferBackend.from_scheduler(scheduler)
+            with envs.SGLANG_REMOTE_G2_TRANSFER_PARALLELISM.override(4):
+                backend = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
 
         self.assertIsNotNone(backend)
         self.assertEqual(
@@ -4077,7 +3936,7 @@ class TestRouterKVReuse(unittest.TestCase):
         source_item_len = 8
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(
-                g2plus_transfer_backend="mooncake",
+                remote_g2_config={"transfer_backend": "mooncake"},
                 mooncake_ib_device=None,
                 tp_size=1,
                 pp_size=1,
@@ -4106,118 +3965,31 @@ class TestRouterKVReuse(unittest.TestCase):
                 )
             ),
         )
-        diagnostics = []
 
         with patch(
             "sglang.srt.distributed.parallel_state.get_mooncake_transfer_engine",
             return_value=engine,
         ):
-            backend = MooncakeG2plusTransferBackend.from_scheduler(
-                scheduler, diagnostics=diagnostics
-            )
+            backend = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
 
         self.assertIsNone(backend)
         self.assertEqual(engine.checked_registered, [(1, 128), (2, 128)])
         self.assertEqual(engine.registered, [])
-        self.assertEqual(diagnostics, ["mooncake target KV registration failed"])
 
-    def test_scheduler_initializes_router_reuse_manager(self):
+    def test_scheduler_initializes_remote_g2_manager(self):
         manager = object()
         scheduler = SimpleNamespace()
 
         with patch(
-            "sglang.srt.managers.scheduler.RouterKVReuseManager.from_scheduler",
+            "sglang.srt.managers.scheduler.RemoteG2Manager.from_scheduler",
             return_value=manager,
         ) as from_scheduler:
-            Scheduler.init_router_kv_reuse(scheduler)
+            Scheduler.init_remote_g2(scheduler)
 
         from_scheduler.assert_called_once_with(scheduler)
-        self.assertIs(scheduler.router_kv_reuse_manager, manager)
+        self.assertIs(scheduler.remote_g2_manager, manager)
 
-    def test_router_manager_dispatches_through_generic_interface(self):
-        req = object()
-        handler = SimpleNamespace(maybe_stage_remote_prefix=lambda request: 2)
-        manager = RouterKVReuseManager([handler])
-
-        self.assertEqual(manager.maybe_stage_reuse_plan(req), 2)
-
-    def test_router_manager_reports_pending_reuse(self):
-        req = object()
-        handler = SimpleNamespace(
-            check_remote_prefix=lambda request: RouterKVReuseResult(pending=True)
-        )
-        manager = RouterKVReuseManager([handler])
-
-        result = manager.check_reuse_plan_progress(req)
-
-        self.assertTrue(result.pending)
-
-    def test_router_manager_prefetches_through_generic_interface(self):
-        req = object()
-        handler = SimpleNamespace(
-            prefetch_remote_prefix=lambda request: RouterKVReuseResult(pending=True)
-        )
-        manager = RouterKVReuseManager([handler])
-
-        result = manager.prefetch_reuse_plan(req)
-
-        self.assertTrue(result.pending)
-
-    def test_router_manager_reports_pending_handlers(self):
-        manager = RouterKVReuseManager(
-            [
-                SimpleNamespace(has_pending=lambda: False),
-                SimpleNamespace(has_pending=lambda: True),
-            ]
-        )
-
-        self.assertTrue(manager.has_pending())
-
-    def test_router_manager_treats_pending_check_error_as_pending(self):
-        def raise_has_pending():
-            raise RuntimeError("pending check failed")
-
-        manager = RouterKVReuseManager([SimpleNamespace(has_pending=raise_has_pending)])
-
-        self.assertTrue(manager.has_pending())
-
-    def test_router_manager_shutdown_continues_after_handler_error(self):
-        calls = []
-
-        def raise_shutdown():
-            calls.append("bad")
-            raise RuntimeError("shutdown failed")
-
-        manager = RouterKVReuseManager(
-            [
-                SimpleNamespace(shutdown=raise_shutdown),
-                SimpleNamespace(shutdown=lambda: calls.append("good")),
-            ]
-        )
-
-        manager.shutdown()
-
-        self.assertEqual(calls, ["bad", "good"])
-
-    def test_router_manager_release_request_continues_after_handler_error(self):
-        calls = []
-
-        def raise_release(rid):
-            calls.append(("bad", rid))
-            raise RuntimeError("release failed")
-
-        manager = RouterKVReuseManager(
-            [
-                SimpleNamespace(release_request=raise_release),
-                SimpleNamespace(release_request=lambda rid: calls.append(("good", rid))),
-            ]
-        )
-
-        manager.release_request("rid-1")
-
-        self.assertEqual(calls, [("bad", "rid-1"), ("good", "rid-1")])
-
-    def test_scheduler_idle_waits_for_pending_router_reuse(self):
+    def test_scheduler_idle_waits_for_pending_remote_g2(self):
         empty_batch = SimpleNamespace(is_empty=lambda: True)
         scheduler = SimpleNamespace(
             running_batch=empty_batch,
@@ -4239,15 +4011,15 @@ class TestRouterKVReuse(unittest.TestCase):
                 ongoing_load_back={},
                 enable_storage=False,
             ),
-            router_kv_reuse_manager=SimpleNamespace(has_pending=lambda: True),
+            remote_g2_manager=SimpleNamespace(has_pending=lambda: True),
         )
 
         self.assertFalse(Scheduler.is_fully_idle(scheduler))
 
-    def test_scheduler_shutdown_releases_router_reuse_manager(self):
+    def test_scheduler_shutdown_releases_remote_g2_manager(self):
         shutdown_calls = []
         scheduler = SimpleNamespace(
-            router_kv_reuse_manager=SimpleNamespace(
+            remote_g2_manager=SimpleNamespace(
                 shutdown=lambda: shutdown_calls.append("shutdown")
             )
         )
@@ -4258,7 +4030,7 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual(shutdown_calls, ["shutdown"])
         self.assertTrue(scheduler._shutdown_called)
 
-    def test_scheduler_prepares_router_reuse_before_prefill_schedule(self):
+    def test_scheduler_prepares_remote_g2_before_prefill_schedule(self):
         calls = []
         req = SimpleNamespace(
             rid="r-prepare",
@@ -4268,83 +4040,83 @@ class TestRouterKVReuse(unittest.TestCase):
         )
         scheduler = SimpleNamespace(
             tree_cache="tree",
-            router_kv_reuse_manager=SimpleNamespace(
+            remote_g2_manager=SimpleNamespace(
                 has_reuse_plan=lambda request: True,
-                check_reuse_plan_progress=lambda request: RouterKVReuseResult(
+                check_reuse_plan_progress=lambda request: RemoteG2Result(
                     pending=True
                 ),
             ),
         )
 
-        self.assertFalse(Scheduler._prepare_router_kv_reuse_for_schedule(scheduler, req))
+        self.assertFalse(Scheduler._prepare_remote_g2_for_schedule(scheduler, req))
         self.assertEqual(calls, [("tree", False)])
 
-    def test_scheduler_router_reuse_error_falls_back_to_local_prefill(self):
+    def test_scheduler_remote_g2_error_falls_back_to_local_prefill(self):
         calls = []
         release_calls = []
         req = SimpleNamespace(
-            rid="r-router-error",
-            remote_kv_reuse_plan={"plan_id": "plan-1"},
+            rid="r-remote_g2-error",
+            remote_g2_plan={"plan_id": "plan-1"},
             init_next_round_input=lambda tree_cache, cow_mamba=None: calls.append(
                 (tree_cache, cow_mamba)
             ),
         )
 
         def raise_progress(request):
-            raise RuntimeError("router reuse failed")
+            raise RuntimeError("RemoteG2 failed")
 
         scheduler = SimpleNamespace(
             tree_cache="tree",
-            router_kv_reuse_manager=SimpleNamespace(
+            remote_g2_manager=SimpleNamespace(
                 has_reuse_plan=lambda request: True,
                 check_reuse_plan_progress=raise_progress,
                 release_request=lambda rid: release_calls.append(rid),
             ),
         )
 
-        self.assertTrue(Scheduler._prepare_router_kv_reuse_for_schedule(scheduler, req))
+        self.assertTrue(Scheduler._prepare_remote_g2_for_schedule(scheduler, req))
         self.assertEqual(calls, [("tree", False)])
-        self.assertIsNone(req.remote_kv_reuse_plan)
-        self.assertEqual(release_calls, ["r-router-error"])
+        self.assertIsNone(req.remote_g2_plan)
+        self.assertEqual(release_calls, ["r-remote_g2-error"])
 
-    def test_scheduler_router_reuse_plan_probe_error_falls_back_to_local_prefill(self):
+    def test_scheduler_remote_g2_plan_probe_error_falls_back_to_local_prefill(self):
         release_calls = []
         req = SimpleNamespace(
-            rid="r-router-probe-error",
-            remote_kv_reuse_plan={"plan_id": "plan-1"},
+            rid="r-remote_g2-probe-error",
+            remote_g2_plan={"plan_id": "plan-1"},
             init_next_round_input=lambda tree_cache, cow_mamba=None: (_ for _ in ()).throw(
                 AssertionError("prefix probe should not run after has_reuse_plan failure")
             ),
         )
 
         def raise_has_reuse_plan(request):
-            raise RuntimeError("router plan probe failed")
+            raise RuntimeError("RemoteG2 plan probe failed")
 
         scheduler = SimpleNamespace(
             tree_cache="tree",
-            router_kv_reuse_manager=SimpleNamespace(
+            remote_g2_manager=SimpleNamespace(
                 has_reuse_plan=raise_has_reuse_plan,
                 release_request=lambda rid: release_calls.append(rid),
             ),
         )
 
-        self.assertTrue(Scheduler._prepare_router_kv_reuse_for_schedule(scheduler, req))
-        self.assertIsNone(req.remote_kv_reuse_plan)
-        self.assertEqual(release_calls, ["r-router-probe-error"])
+        self.assertTrue(Scheduler._prepare_remote_g2_for_schedule(scheduler, req))
+        self.assertIsNone(req.remote_g2_plan)
+        self.assertEqual(release_calls, ["r-remote_g2-probe-error"])
 
-    def test_scheduler_releases_router_reuse_for_aborted_request(self):
+    def test_scheduler_releases_remote_g2_for_aborted_request(self):
         release_calls = []
         scheduler = SimpleNamespace(
-            router_kv_reuse_manager=SimpleNamespace(
+            remote_g2_manager=SimpleNamespace(
                 release_request=lambda rid: release_calls.append(rid)
             )
         )
 
-        Scheduler._release_router_kv_reuse_request(scheduler, "r-abort")
+        Scheduler._release_remote_g2_request(scheduler, "r-abort")
 
         self.assertEqual(release_calls, ["r-abort"])
 
-    def test_finished_request_releases_router_reuse_state(self):
+    def test_finished_request_releases_remote_g2_state(self):
         release_calls = []
         release_kv_calls = []
         req = SimpleNamespace(
@@ -4363,7 +4135,7 @@ class TestRouterKVReuse(unittest.TestCase):
             _maybe_collect_indexer_topk=lambda request: None,
             _maybe_collect_customized_info=lambda i, request, logits_output: None,
             tree_cache=object(),
-            release_router_kv_reuse_request=lambda rid: release_calls.append(rid),
+            release_remote_g2_request=lambda rid: release_calls.append(rid),
         )
 
         with patch(
@@ -4400,16 +4172,16 @@ class TestRouterKVReuse(unittest.TestCase):
             {"device": 8, "host": 0, "remote_g2": 4},
         )
 
-    def test_scheduler_metrics_collector_observes_router_kv_reuse(self):
+    def test_scheduler_metrics_collector_observes_remote_g2(self):
         collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
         collector.labels = {"model_name": "dummy"}
-        collector.router_kv_reuse_events_total = FakePrometheusMetric()
-        collector.router_kv_reuse_tokens_total = FakePrometheusMetric()
-        collector.router_kv_reuse_wait_ms = FakePrometheusMetric()
-        collector.router_kv_reuse_insert_ms = FakePrometheusMetric()
-        collector.router_kv_reuse_transfer_mb = FakePrometheusMetric()
+        collector.remote_g2_events_total = FakePrometheusMetric()
+        collector.remote_g2_tokens_total = FakePrometheusMetric()
+        collector.remote_g2_wait_ms = FakePrometheusMetric()
+        collector.remote_g2_insert_ms = FakePrometheusMetric()
+        collector.remote_g2_transfer_mb = FakePrometheusMetric()
 
-        collector.observe_router_kv_reuse(
+        collector.observe_remote_g2(
             backend="mooncake",
             outcome="hit",
             reason="ok",
@@ -4426,34 +4198,34 @@ class TestRouterKVReuse(unittest.TestCase):
             "reason": "ok",
         }
         self.assertEqual(
-            collector.router_kv_reuse_events_total.calls,
+            collector.remote_g2_events_total.calls,
             [("inc", labels, 1)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_tokens_total.calls,
+            collector.remote_g2_tokens_total.calls,
             [("inc", labels, 4)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_wait_ms.calls,
+            collector.remote_g2_wait_ms.calls,
             [("observe", labels, 12.5)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_insert_ms.calls,
+            collector.remote_g2_insert_ms.calls,
             [("observe", labels, 0.25)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_transfer_mb.calls,
+            collector.remote_g2_transfer_mb.calls,
             [("observe", labels, 2.0)],
         )
 
-    def test_scheduler_metrics_collector_observes_router_kv_reuse_quarantine(self):
+    def test_scheduler_metrics_collector_observes_remote_g2_quarantine(self):
         collector = SchedulerMetricsCollector.__new__(SchedulerMetricsCollector)
         collector.labels = {"model_name": "dummy"}
-        collector.router_kv_reuse_quarantine_events_total = FakePrometheusMetric()
-        collector.router_kv_reuse_quarantined_tokens_total = FakePrometheusMetric()
-        collector.router_kv_reuse_quarantined_tokens = FakePrometheusMetric()
+        collector.remote_g2_quarantine_events_total = FakePrometheusMetric()
+        collector.remote_g2_quarantined_tokens_total = FakePrometheusMetric()
+        collector.remote_g2_quarantined_tokens = FakePrometheusMetric()
 
-        collector.observe_router_kv_reuse_quarantine(
+        collector.observe_remote_g2_quarantine(
             backend="mooncake",
             reason="source_transfer_timeout_maybe_inflight",
             tokens=4,
@@ -4470,19 +4242,19 @@ class TestRouterKVReuse(unittest.TestCase):
             "backend": "mooncake",
         }
         self.assertEqual(
-            collector.router_kv_reuse_quarantine_events_total.calls,
+            collector.remote_g2_quarantine_events_total.calls,
             [("inc", event_labels, 1)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_quarantined_tokens_total.calls,
+            collector.remote_g2_quarantined_tokens_total.calls,
             [("inc", event_labels, 4)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_quarantined_tokens.calls,
+            collector.remote_g2_quarantined_tokens.calls,
             [("set", gauge_labels, 6)],
         )
 
-        collector.observe_router_kv_reuse_quarantine(
+        collector.observe_remote_g2_quarantine(
             backend="mooncake",
             reason="released",
             tokens=0,
@@ -4490,20 +4262,20 @@ class TestRouterKVReuse(unittest.TestCase):
         )
 
         self.assertEqual(
-            collector.router_kv_reuse_quarantine_events_total.calls,
+            collector.remote_g2_quarantine_events_total.calls,
             [("inc", event_labels, 1)],
         )
         self.assertEqual(
-            collector.router_kv_reuse_quarantined_tokens.calls[-1],
+            collector.remote_g2_quarantined_tokens.calls[-1],
             ("set", gauge_labels, 0),
         )
 
-    def test_remote_g2_handler_uses_router_provided_source_endpoint(self):
-        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+    def test_remote_g2_handler_uses_remote_g2_provided_source_endpoint(self):
+        handler = RemoteG2Manager.__new__(RemoteG2Manager)
         handler.worker_id = None
         handler.dp_rank = 0
         handler.endpoint = None
-        plan = RemoteKvReusePlan.from_dict(
+        plan = RemoteG2Plan.from_dict(
             _make_plan(
                 [1],
                 source_worker_id=99,
@@ -4523,13 +4295,13 @@ class TestRouterKVReuse(unittest.TestCase):
             text=["hello", "world"],
             sampling_params=[{}, {}],
             rid=["r0", "r1"],
-            remote_kv_reuse_plan=[plan_0, plan_1],
+            remote_g2_plan=[plan_0, plan_1],
         )
 
         req.normalize_batch_and_arguments()
 
-        self.assertEqual(req[0].remote_kv_reuse_plan, plan_0)
-        self.assertEqual(req[1].remote_kv_reuse_plan, plan_1)
+        self.assertEqual(req[0].remote_g2_plan, plan_0)
+        self.assertEqual(req[1].remote_g2_plan, plan_1)
 
 
 if __name__ == "__main__":

@@ -7,34 +7,34 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 from urllib.parse import urlparse
 
 import numpy as np
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
-from sglang.srt.mem_cache.g2plus_transfer import (
-    G2plusTransferBackend,
-    g2plus_config,
-    g2plus_config_value,
-    g2plus_timeout_secs,
-    make_g2plus_transfer_backend,
+from sglang.srt.mem_cache.remote_g2.transfer import (
+    RemoteG2TransferBackend,
+    remote_g2_config,
+    remote_g2_config_value,
+    remote_g2_timeout_secs,
+    make_remote_g2_transfer_backend,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
-from sglang.srt.mem_cache.router_kv_control import (
+from sglang.srt.mem_cache.remote_g2.control import (
     is_indeterminate_direct_transfer_reason,
     request_source_transfer,
     start_source_transfer_server,
 )
-from sglang.srt.mem_cache.router_kv_plan import (
-    REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
-    REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
-    REMOTE_KV_REUSE_PLAN_VERSION as _PLAN_VERSION,
-    RemoteKvReusePlan,
+from sglang.srt.mem_cache.remote_g2.plan import (
+    REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
+    REMOTE_G2_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
+    REMOTE_G2_PLAN_VERSION as _PLAN_VERSION,
+    RemoteG2Plan,
     normalize_endpoint,
 )
-from sglang.srt.mem_cache.router_kv_source import (
+from sglang.srt.mem_cache.remote_g2.source import (
     ResolvedHostPage,
     handle_source_transfer,
     resolve_host_pages as _resolve_host_pages,
@@ -47,10 +47,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
-REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
-REMOTE_KV_REUSE_PLAN_VERSION = _PLAN_VERSION
-REMOTE_KV_REUSE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
+REMOTE_G2_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
+REMOTE_G2_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
+REMOTE_G2_PLAN_VERSION = _PLAN_VERSION
+REMOTE_G2_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
 resolve_host_pages = _resolve_host_pages
 
 
@@ -61,37 +61,19 @@ def _normalize_metric_label(value: Any, default: str = "unknown") -> str:
     return (value or default)[:80]
 
 
-def _coerce_int(value: Any, field_name: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{field_name} must be an integer, got {value!r}")
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError(f"{field_name} must be an integer, got empty string")
-        try:
-            return int(value, 10)
-        except ValueError as err:
-            raise ValueError(
-                f"{field_name} must be an integer, got {value!r}"
-            ) from err
-    raise ValueError(f"{field_name} must be an integer, got {value!r}")
-
-
 def _normalize_endpoint(endpoint: str) -> str:
     return normalize_endpoint(endpoint)
 
 
 @dataclass(frozen=True)
-class RouterKVReuseResult:
+class RemoteG2Result:
     staged_tokens: int = 0
     pending: bool = False
 
 
 @dataclass
 class _RemoteG2PendingFetch:
-    plan: RemoteKvReusePlan
+    plan: RemoteG2Plan
     plan_offset: int
     target_start_block: int
     expected_hashes: tuple[int, ...]
@@ -129,13 +111,13 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "g2plus_config.control.endpoint values must be non-empty strings; "
+                "remote_g2_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
     if not isinstance(endpoint_spec, str):
         raise ValueError(
-            "g2plus_config.control.endpoint must be a string or JSON object"
+            "remote_g2_config.control.endpoint must be a string or JSON object"
         )
     spec = endpoint_spec.strip()
     if not spec:
@@ -143,13 +125,13 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     if spec.startswith("{"):
         endpoints = json.loads(spec)
         if not isinstance(endpoints, Mapping):
-            raise ValueError("g2plus_config.control.endpoint must be a JSON object")
+            raise ValueError("remote_g2_config.control.endpoint must be a JSON object")
         endpoint = endpoints.get(str(dp_rank))
         if endpoint is None:
             return None
         if not isinstance(endpoint, str) or not endpoint.strip():
             raise ValueError(
-                "g2plus_config.control.endpoint values must be non-empty strings; "
+                "remote_g2_config.control.endpoint values must be non-empty strings; "
                 f"got {endpoint!r} for dp_rank={dp_rank}"
             )
         return _normalize_endpoint(endpoint)
@@ -158,30 +140,12 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     return _normalize_endpoint(spec)
 
 
-def _router_kv_reuse_enabled(server_args: "ServerArgs") -> bool:
-    config = g2plus_config(server_args)
-    return bool(
-        getattr(server_args, "enable_router_kv_reuse", False)
-        or config
-        or getattr(server_args, "enable_g2plus", False)
-    )
+def _remote_g2_enabled(server_args: "ServerArgs") -> bool:
+    config = remote_g2_config(server_args)
+    return bool(getattr(server_args, "enable_remote_g2", False) or config)
 
 
-class RouterKVReuseHandler(Protocol):
-    def has_reuse_plan(self, req: "Req") -> bool: ...
-
-    def has_pending(self) -> bool: ...
-
-    def prefetch_remote_prefix(self, req: "Req") -> RouterKVReuseResult: ...
-
-    def check_remote_prefix(self, req: "Req") -> RouterKVReuseResult: ...
-
-    def maybe_stage_remote_prefix(self, req: "Req") -> int: ...
-
-    def release_request(self, rid: str) -> None: ...
-
-
-class RemoteG2ReuseHandler:
+class RemoteG2Manager:
     def __init__(
         self,
         *,
@@ -189,14 +153,13 @@ class RemoteG2ReuseHandler:
         tree_cache,
         worker_id: Optional[int],
         dp_rank: int,
-        direct_transfer: Optional[G2plusTransferBackend] = None,
-        direct_transfer_diagnostics: Optional[list[str]] = None,
+        direct_transfer: Optional[RemoteG2TransferBackend] = None,
         metrics_collector=None,
     ):
         self.tree_cache = tree_cache
         self.worker_id = worker_id
         self.dp_rank = dp_rank
-        self.timeout_secs = g2plus_timeout_secs(server_args)
+        self.timeout_secs = remote_g2_timeout_secs(server_args)
         self.prefetch_stop_policy = getattr(
             server_args, "hicache_storage_prefetch_policy", "timeout"
         )
@@ -205,21 +168,12 @@ class RemoteG2ReuseHandler:
         )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
-        self.control_backend = str(
-            g2plus_config_value(server_args, "control_backend", "router")
-        ).lower()
         if not self._direct_transfer_enabled():
-            diagnostic_suffix = ""
-            if direct_transfer_diagnostics:
-                diagnostic_suffix = (
-                    " Diagnostics: " + "; ".join(direct_transfer_diagnostics)
-                )
             logger.warning(
-                "Router KV reuse is enabled but no direct G2plus transfer backend "
-                "is available; remote KV reuse plans will be treated as cache misses.%s",
-                diagnostic_suffix,
+                "RemoteG2 is enabled but no direct transfer backend is available; "
+                "RemoteG2 plans will be treated as cache misses."
             )
-        endpoint_spec = g2plus_config_value(
+        endpoint_spec = remote_g2_config_value(
             server_args,
             "control_endpoint",
             None,
@@ -230,7 +184,7 @@ class RemoteG2ReuseHandler:
         self._shutdown = False
         worker_limit = max(
             1,
-            int(envs.SGLANG_G2PLUS_FETCH_WORKERS.get()),
+            int(envs.SGLANG_REMOTE_G2_FETCH_WORKERS.get()),
         )
         self._source_activity_lock = threading.Lock()
         self._active_source_resolver_ops = 0
@@ -238,14 +192,14 @@ class RemoteG2ReuseHandler:
         self._fetch_semaphore = threading.BoundedSemaphore(worker_limit)
         self._fetch_executor = ThreadPoolExecutor(
             max_workers=worker_limit,
-            thread_name_prefix=f"g2plus-fetch-dp{dp_rank}",
+            thread_name_prefix=f"remote_g2-fetch-dp{dp_rank}",
         )
         self._pending_fetches: dict[str, _RemoteG2PendingFetch] = {}
         self._detached_fetches: set[Future] = set()
         self._quarantined_device_indices: list[torch.Tensor] = []
         self._quarantined_tokens_by_backend: dict[str, int] = {}
         self._finished_plan_keys: set[tuple[str, str]] = set()
-        self.max_control_body_bytes = REMOTE_KV_REUSE_MAX_CONTROL_BODY_BYTES
+        self.max_control_body_bytes = REMOTE_G2_MAX_CONTROL_BODY_BYTES
         self._direct_transfer_shutdown_done = False
         self._direct_transfer_shutdown_deferred = False
         self._direct_transfer_shutdown_lock = threading.Lock()
@@ -255,40 +209,34 @@ class RemoteG2ReuseHandler:
         atexit.register(self.shutdown)
 
     @classmethod
-    def from_scheduler(cls, scheduler) -> Optional["RemoteG2ReuseHandler"]:
+    def from_scheduler(cls, scheduler) -> Optional["RemoteG2Manager"]:
         server_args = scheduler.server_args
-        if not _router_kv_reuse_enabled(server_args):
+        if not _remote_g2_enabled(server_args):
             return None
         if not scheduler.enable_hierarchical_cache:
             logger.warning(
-                "Router KV reuse disabled because hierarchical cache is not enabled"
+                "RemoteG2 disabled because hierarchical cache is not enabled"
             )
             return None
         if not hasattr(scheduler.tree_cache, "_insert_helper_host"):
             logger.warning(
-                "Router KV reuse disabled because the active tree cache does not support host inserts"
+                "RemoteG2 disabled because the active tree cache does not support host inserts"
             )
             return None
-        worker_id = g2plus_config_value(
-            server_args, "worker_id", getattr(server_args, "g2plus_worker_id", None)
-        )
+        worker_id = remote_g2_config_value(server_args, "worker_id", None)
         if worker_id is None:
             logger.warning(
-                "Router KV reuse disabled because G2plus worker identity is not set; "
-                "set worker_id in --g2plus-config when enabling G2plus remote KV reuse"
+                "RemoteG2 disabled because worker_id is not set; "
+                "set worker_id in --remote-g2-config"
             )
             return None
-        transfer_diagnostics: list[str] = []
-        direct_transfer = make_g2plus_transfer_backend(
-            scheduler, diagnostics=transfer_diagnostics
-        )
+        direct_transfer = make_remote_g2_transfer_backend(scheduler)
         return cls(
             server_args=server_args,
             tree_cache=scheduler.tree_cache,
             worker_id=worker_id,
             dp_rank=scheduler.dp_rank or 0,
             direct_transfer=direct_transfer,
-            direct_transfer_diagnostics=transfer_diagnostics,
             metrics_collector=(
                 scheduler.metrics_collector
                 if getattr(scheduler, "enable_metrics", False)
@@ -320,7 +268,7 @@ class RemoteG2ReuseHandler:
         transfer_bytes: Optional[int] = None,
     ) -> None:
         metrics_collector = getattr(self, "metrics_collector", None)
-        observe = getattr(metrics_collector, "observe_router_kv_reuse", None)
+        observe = getattr(metrics_collector, "observe_remote_g2", None)
         if observe is None:
             return
         try:
@@ -334,7 +282,7 @@ class RemoteG2ReuseHandler:
                 transfer_bytes=transfer_bytes,
             )
         except Exception:
-            logger.debug("Failed to record router KV reuse metrics", exc_info=True)
+            logger.debug("Failed to record RemoteG2 metrics", exc_info=True)
 
     def _pending_wait_ms(self, pending: _RemoteG2PendingFetch) -> Optional[float]:
         submitted_at = getattr(pending, "submitted_at", 0.0)
@@ -368,7 +316,7 @@ class RemoteG2ReuseHandler:
     def _pending_ready_wait_ms(
         self, pending: _RemoteG2PendingFetch
     ) -> Optional[float]:
-        done_at = getattr(pending.future, "_g2plus_done_at", 0.0)
+        done_at = getattr(pending.future, "_remote_g2_done_at", 0.0)
         if done_at <= 0:
             return None
         return max(0.0, (time.perf_counter() - done_at) * 1000)
@@ -386,7 +334,7 @@ class RemoteG2ReuseHandler:
             getattr(
                 self,
                 "max_control_body_bytes",
-                REMOTE_KV_REUSE_MAX_CONTROL_BODY_BYTES,
+                REMOTE_G2_MAX_CONTROL_BODY_BYTES,
             )
         )
 
@@ -421,11 +369,11 @@ class RemoteG2ReuseHandler:
         try:
             semaphore.release()
         except ValueError:
-            logger.debug("G2plus fetch worker semaphore release ignored", exc_info=True)
+            logger.debug("RemoteG2 fetch worker semaphore release ignored", exc_info=True)
 
     def _on_fetch_worker_done(self, future: Future) -> None:
         try:
-            setattr(future, "_g2plus_done_at", time.perf_counter())
+            setattr(future, "_remote_g2_done_at", time.perf_counter())
         finally:
             self._release_fetch_worker()
 
@@ -475,13 +423,13 @@ class RemoteG2ReuseHandler:
                 self._shutdown_direct_transfer_backend()
             except Exception:
                 logger.warning(
-                    "G2plus deferred direct transfer backend shutdown failed",
+                    "RemoteG2 deferred direct transfer backend shutdown failed",
                     exc_info=True,
                 )
 
         thread = threading.Thread(
             target=_wait_for_pending_and_shutdown,
-            name="g2plus-direct-transfer-shutdown",
+            name="remote_g2-direct-transfer-shutdown",
             daemon=True,
         )
         self._direct_transfer_shutdown_thread = thread
@@ -524,7 +472,7 @@ class RemoteG2ReuseHandler:
 
         if self.has_pending():
             logger.warning(
-                "Deferring direct transfer backend shutdown while G2plus work is still pending"
+                "Deferring direct transfer backend shutdown while RemoteG2 work is still pending"
             )
             self._defer_direct_transfer_shutdown()
             return
@@ -532,7 +480,7 @@ class RemoteG2ReuseHandler:
         self._release_quarantined_device_indices()
         self._shutdown_direct_transfer_backend()
 
-    def _candidate_endpoints_for_plan(self, plan: RemoteKvReusePlan) -> list[str]:
+    def _candidate_endpoints_for_plan(self, plan: RemoteG2Plan) -> list[str]:
         endpoints: list[str] = []
 
         def add(endpoint: Optional[str]) -> None:
@@ -545,9 +493,9 @@ class RemoteG2ReuseHandler:
     def _request_source_transfer(
         self,
         *,
-        transfer_backend: G2plusTransferBackend,
+        transfer_backend: RemoteG2TransferBackend,
         endpoints: list[str],
-        plan: RemoteKvReusePlan,
+        plan: RemoteG2Plan,
         start_block: int,
         max_blocks: int,
         target_page_indices: list[int],
@@ -579,7 +527,7 @@ class RemoteG2ReuseHandler:
             max_prefix_len = 0
         return max_prefix_len // self.tree_cache.page_size
 
-    def _validate_plan(self, plan: RemoteKvReusePlan) -> Optional[str]:
+    def _validate_plan(self, plan: RemoteG2Plan) -> Optional[str]:
         if self.worker_id is None:
             return "missing_worker_id"
         if plan.target_worker_id != self.worker_id:
@@ -591,7 +539,7 @@ class RemoteG2ReuseHandler:
             and plan.source_dp_rank == plan.target_dp_rank
         ):
             return "source_is_target"
-        if plan.plan_version != REMOTE_KV_REUSE_PLAN_VERSION:
+        if plan.plan_version != REMOTE_G2_PLAN_VERSION:
             return "unsupported_plan_version"
         if plan.is_expired():
             return "plan_expired"
@@ -601,7 +549,7 @@ class RemoteG2ReuseHandler:
             return "incompatible_block_size"
         return None
 
-    def _plan_key(self, req: "Req", plan: RemoteKvReusePlan) -> tuple[str, str]:
+    def _plan_key(self, req: "Req", plan: RemoteG2Plan) -> tuple[str, str]:
         return str(req.rid), plan.plan_id
 
     def _alloc_device_indices(self, token_count: int) -> Optional[torch.Tensor]:
@@ -624,7 +572,7 @@ class RemoteG2ReuseHandler:
     ) -> None:
         metrics_collector = getattr(self, "metrics_collector", None)
         observe = getattr(
-            metrics_collector, "observe_router_kv_reuse_quarantine", None
+            metrics_collector, "observe_remote_g2_quarantine", None
         )
         if observe is None:
             return
@@ -637,7 +585,7 @@ class RemoteG2ReuseHandler:
             )
         except Exception:
             logger.debug(
-                "Failed to record router KV reuse quarantine metrics", exc_info=True
+                "Failed to record RemoteG2 quarantine metrics", exc_info=True
             )
 
     def _quarantine_device_indices(
@@ -661,7 +609,7 @@ class RemoteG2ReuseHandler:
             current_tokens=current_tokens,
         )
         logger.error(
-            "Quarantining %d G2plus target KV indices after indeterminate direct transfer: %s",
+            "Quarantining %d RemoteG2 target KV indices after indeterminate direct transfer: %s",
             token_count,
             reason,
         )
@@ -779,7 +727,7 @@ class RemoteG2ReuseHandler:
 
     def _submit_direct_transfer(
         self,
-        plan: RemoteKvReusePlan,
+        plan: RemoteG2Plan,
         *,
         start_block: int,
         max_blocks: int,
@@ -827,20 +775,29 @@ class RemoteG2ReuseHandler:
     def maybe_stage_remote_prefix(self, req: "Req") -> int:
         return self.check_remote_prefix(req).staged_tokens
 
+    def maybe_stage_reuse_plan(self, req: "Req") -> int:
+        return self.maybe_stage_remote_prefix(req)
+
     def has_reuse_plan(self, req: "Req") -> bool:
-        plan_data = getattr(req, "remote_kv_reuse_plan", None)
+        plan_data = getattr(req, "remote_g2_plan", None)
         if plan_data is None:
             return False
         try:
-            plan = RemoteKvReusePlan.from_dict(plan_data)
+            plan = RemoteG2Plan.from_dict(plan_data)
         except ValueError:
             return False
         if self._validate_plan(plan) is not None:
             return False
         return self._direct_transfer_enabled()
 
-    def prefetch_remote_prefix(self, req: "Req") -> RouterKVReuseResult:
-        return RouterKVReuseResult()
+    def prefetch_remote_prefix(self, req: "Req") -> RemoteG2Result:
+        return RemoteG2Result()
+
+    def prefetch_reuse_plan(self, req: "Req") -> RemoteG2Result:
+        return self.prefetch_remote_prefix(req)
+
+    def check_reuse_plan_progress(self, req: "Req") -> RemoteG2Result:
+        return self.check_remote_prefix(req)
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
@@ -853,13 +810,13 @@ class RemoteG2ReuseHandler:
             key for key in self._finished_plan_keys if key[0] != rid
         }
 
-    def check_remote_prefix(self, req: "Req") -> RouterKVReuseResult:
-        plan_data = getattr(req, "remote_kv_reuse_plan", None)
+    def check_remote_prefix(self, req: "Req") -> RemoteG2Result:
+        plan_data = getattr(req, "remote_g2_plan", None)
         if plan_data is None:
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         try:
-            plan = RemoteKvReusePlan.from_dict(plan_data)
+            plan = RemoteG2Plan.from_dict(plan_data)
         except ValueError as err:
             logger.debug("Ignoring invalid remote G2 plan for rid=%s: %s", req.rid, err)
             self._observe_reuse(
@@ -867,7 +824,7 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason="invalid_plan",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         rejection = self._validate_plan(plan)
         if rejection is not None:
@@ -882,11 +839,11 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason=rejection,
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         plan_key = self._plan_key(req, plan)
         if plan_key in self._finished_plan_keys:
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         page_size = self.tree_cache.page_size
         matched_tokens = len(req.prefix_indices) + req.host_hit_length
@@ -903,7 +860,7 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason="unaligned_matched_tokens",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
         computed_blocks = matched_tokens // page_size
         if computed_blocks < plan.start_block_index:
             logger.debug(
@@ -918,7 +875,7 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason="before_plan_start",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         max_plan_blocks = max(
             self._max_cacheable_blocks(req) - plan.start_block_index, 0
@@ -939,7 +896,7 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason="no_remaining_planned_blocks",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         pending = self._pending_fetches.get(str(req.rid))
         if pending is not None:
@@ -958,8 +915,8 @@ class RemoteG2ReuseHandler:
                         reason=reason,
                         wait_ms=self._pending_wait_ms(pending),
                     )
-                    return RouterKVReuseResult()
-                return RouterKVReuseResult(pending=True)
+                    return RemoteG2Result()
+                return RemoteG2Result(pending=True)
             else:
                 return self._finish_pending_fetch(req, pending)
 
@@ -991,7 +948,7 @@ class RemoteG2ReuseHandler:
                 outcome="miss",
                 reason="direct_transfer_unavailable",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
         if direct_transfer_enabled and req.host_hit_length > 0:
             self._finished_plan_keys.add(plan_key)
             self._observe_reuse(
@@ -999,7 +956,7 @@ class RemoteG2ReuseHandler:
                 outcome="skip",
                 reason="local_host_hit",
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
         locked_node = None
         if req.host_hit_length == 0:
             if direct_transfer_enabled:
@@ -1024,7 +981,7 @@ class RemoteG2ReuseHandler:
                     outcome="miss",
                     reason="direct_submit_unavailable",
                 )
-                return RouterKVReuseResult()
+                return RemoteG2Result()
         backend = "none"
         bytes_per_page = 0
         if device_indices is not None and direct_transfer_enabled:
@@ -1049,11 +1006,11 @@ class RemoteG2ReuseHandler:
             bytes_per_page=bytes_per_page,
             submitted_at=time.perf_counter(),
         )
-        return RouterKVReuseResult(pending=True)
+        return RemoteG2Result(pending=True)
 
     def _finish_pending_fetch(
         self, req: "Req", pending: _RemoteG2PendingFetch
-    ) -> RouterKVReuseResult:
+    ) -> RemoteG2Result:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
 
@@ -1073,7 +1030,7 @@ class RemoteG2ReuseHandler:
                 reason="fetch_exception",
                 wait_ms=self._pending_wait_ms(pending),
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         if not pages:
             logger.debug(
@@ -1102,7 +1059,7 @@ class RemoteG2ReuseHandler:
                 reason=reason,
                 wait_ms=self._pending_wait_ms(pending),
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         if len(pages) > len(pending.expected_hashes):
             logger.warning(
@@ -1123,7 +1080,7 @@ class RemoteG2ReuseHandler:
                 wait_ms=self._pending_wait_ms(pending),
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         expected_hashes = pending.expected_hashes[: len(pages)]
         if tuple(page.block_hash for page in pages) != expected_hashes:
@@ -1143,7 +1100,7 @@ class RemoteG2ReuseHandler:
                 wait_ms=self._pending_wait_ms(pending),
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
 
         insert_start = time.perf_counter()
         try:
@@ -1158,7 +1115,7 @@ class RemoteG2ReuseHandler:
                     reason="missing_target_device_indices",
                     wait_ms=self._pending_wait_ms(pending),
                 )
-                return RouterKVReuseResult()
+                return RemoteG2Result()
             staged_tokens = self._insert_device_pages(
                 req,
                 pages,
@@ -1181,7 +1138,7 @@ class RemoteG2ReuseHandler:
                 insert_ms=insert_ms,
                 transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
             )
-            return RouterKVReuseResult()
+            return RemoteG2Result()
         finally:
             self._unlock_pending_prefix(pending)
         insert_ms = (time.perf_counter() - insert_start) * 1000
@@ -1214,7 +1171,7 @@ class RemoteG2ReuseHandler:
             insert_ms=insert_ms,
             transfer_bytes=self._transfer_bytes_for_pages(pending, pages),
         )
-        return RouterKVReuseResult(staged_tokens=staged_tokens)
+        return RemoteG2Result(staged_tokens=staged_tokens)
 
     def _insert_device_pages(
         self,
@@ -1282,104 +1239,3 @@ class RemoteG2ReuseHandler:
         except Exception:
             self._free_device_indices(device_indices)
             raise
-
-
-class RouterKVReuseManager:
-    """Scheduler-facing router reuse control plane.
-
-    The external wire key stays `remote_kv_reuse_plan`. Internally, the
-    scheduler only calls this generic manager so future router-directed reuse
-    plans can install a different handler without changing request plumbing.
-    """
-
-    def __init__(self, handlers: Iterable[RouterKVReuseHandler]):
-        self.handlers = list(handlers)
-
-    @classmethod
-    def from_scheduler(cls, scheduler) -> Optional["RouterKVReuseManager"]:
-        if not _router_kv_reuse_enabled(scheduler.server_args):
-            return None
-
-        handlers: list[RouterKVReuseHandler] = []
-        remote_g2_handler = RemoteG2ReuseHandler.from_scheduler(scheduler)
-        if remote_g2_handler is not None:
-            handlers.append(remote_g2_handler)
-
-        if not handlers:
-            return None
-        return cls(handlers)
-
-    def maybe_stage_reuse_plan(self, req: "Req") -> int:
-        return self.check_reuse_plan_progress(req).staged_tokens
-
-    def has_reuse_plan(self, req: "Req") -> bool:
-        for handler in self.handlers:
-            has_reuse_plan = getattr(handler, "has_reuse_plan", None)
-            if has_reuse_plan is not None and has_reuse_plan(req):
-                return True
-        return False
-
-    def has_pending(self) -> bool:
-        for handler in self.handlers:
-            has_pending = getattr(handler, "has_pending", None)
-            if has_pending is None:
-                continue
-            try:
-                if has_pending():
-                    return True
-            except Exception:
-                logger.exception("Router KV reuse handler pending check failed")
-                return True
-        return False
-
-    def prefetch_reuse_plan(self, req: "Req") -> RouterKVReuseResult:
-        for handler in self.handlers:
-            prefetch = getattr(handler, "prefetch_remote_prefix", None)
-            if prefetch is not None:
-                result = prefetch(req)
-            else:
-                check = getattr(handler, "check_remote_prefix", None)
-                if check is None:
-                    continue
-                result = check(req)
-            if result.pending or result.staged_tokens > 0:
-                return result
-        return RouterKVReuseResult()
-
-    def check_reuse_plan_progress(self, req: "Req") -> RouterKVReuseResult:
-        for handler in self.handlers:
-            if hasattr(handler, "check_remote_prefix"):
-                result = handler.check_remote_prefix(req)
-            else:
-                result = RouterKVReuseResult(
-                    staged_tokens=handler.maybe_stage_remote_prefix(req)
-                )
-            if result.pending or result.staged_tokens > 0:
-                return result
-        return RouterKVReuseResult()
-
-    def maybe_stage_remote_prefix(self, req: "Req") -> int:
-        return self.maybe_stage_reuse_plan(req)
-
-    def shutdown(self) -> None:
-        for handler in self.handlers:
-            shutdown = getattr(handler, "shutdown", None)
-            if shutdown is not None:
-                try:
-                    shutdown()
-                except Exception:
-                    logger.exception("Router KV reuse handler shutdown failed")
-
-    def release_request(self, rid: str) -> None:
-        for handler in self.handlers:
-            release = getattr(handler, "release_request", None)
-            if release is not None:
-                try:
-                    release(rid)
-                except Exception:
-                    logger.exception(
-                        "Router KV reuse handler failed to release rid=%s", rid
-                    )
-
-
-G2plusManager = RemoteG2ReuseHandler

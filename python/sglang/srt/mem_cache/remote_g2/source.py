@@ -9,11 +9,11 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 import numpy as np
 import torch
 
-from sglang.srt.mem_cache.g2plus_transfer import G2plusTransferBackend
+from sglang.srt.mem_cache.remote_g2.transfer import RemoteG2TransferBackend
 from sglang.srt.mem_cache.radix_cache import TreeNode
-from sglang.srt.mem_cache.router_kv_plan import (
-    REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON,
-    RemoteKvReusePlan,
+from sglang.srt.mem_cache.remote_g2.plan import (
+    REMOTE_G2_DIRECT_TIMEOUT_REASON,
+    RemoteG2Plan,
     expand_block_hash_aliases,
 )
 from sglang.srt.mem_cache.utils import (
@@ -55,12 +55,12 @@ def _iter_tree_nodes(root: TreeNode) -> Iterable[TreeNode]:
 def _build_host_block_index(
     tree_cache, wanted_hashes: set[int]
 ) -> Dict[int, tuple[TreeNode, int, str]]:
-    lookup_index = getattr(tree_cache, "lookup_router_kv_host_blocks", None)
+    lookup_index = getattr(tree_cache, "lookup_remote_g2_host_blocks", None)
     if lookup_index is not None:
         index = lookup_index(wanted_hashes)
         if len(index) >= len(wanted_hashes):
             return index
-        if getattr(tree_cache, "router_kv_block_index", None) is not None:
+        if getattr(tree_cache, "remote_g2_host_block_index", None) is not None:
             return index
         wanted_hashes = wanted_hashes - set(index.keys())
     else:
@@ -87,7 +87,7 @@ def _build_host_block_index(
 
 
 def _host_lookup_guard(tree_cache):
-    return getattr(tree_cache, "router_kv_lock", nullcontext())
+    return getattr(tree_cache, "remote_g2_host_index_lock", nullcontext())
 
 
 def _flush_hicache_write_through_acks(tree_cache) -> None:
@@ -119,7 +119,7 @@ def _host_page_start_indices(
 
 def resolve_host_pages(
     tree_cache,
-    plan: RemoteKvReusePlan,
+    plan: RemoteG2Plan,
     *,
     start_block: int,
     max_blocks: int,
@@ -154,7 +154,7 @@ def resolve_host_pages(
 
 def resolve_host_page_locations(
     tree_cache,
-    plan: RemoteKvReusePlan,
+    plan: RemoteG2Plan,
     *,
     start_block: int,
     max_blocks: int,
@@ -237,16 +237,6 @@ def _coerce_int(value: Any, field_name: str) -> int:
         raise ValueError(f"{field_name} must be an integer, got {value!r}")
     if isinstance(value, (int, np.integer)):
         return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError(f"{field_name} must be an integer, got empty string")
-        try:
-            return int(value, 10)
-        except ValueError as err:
-            raise ValueError(
-                f"{field_name} must be an integer, got {value!r}"
-            ) from err
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
@@ -255,16 +245,6 @@ def _coerce_transfer_int(value: Any, field_name: str) -> int:
         raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
     if isinstance(value, (int, np.integer)):
         return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError(f"{field_name}_contains_non_integer:empty")
-        try:
-            return int(value, 10)
-        except ValueError as err:
-            raise ValueError(
-                f"{field_name}_contains_non_integer:{value!r}"
-            ) from err
     raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
 
 
@@ -288,7 +268,7 @@ def _is_timeout_error(err: BaseException) -> bool:
 
 
 def _parse_target_kv_metadata(
-    payload: Mapping[str, Any], transfer_backend: G2plusTransferBackend
+    payload: Mapping[str, Any], transfer_backend: RemoteG2TransferBackend
 ) -> tuple[Optional[str], Optional[list[int]], Optional[list[int]], Optional[str]]:
     try:
         target_session_id_raw = payload["target_session_id"]
@@ -365,13 +345,13 @@ def _parse_target_kv_metadata(
 def handle_source_transfer(
     *,
     payload: Mapping[str, Any],
-    transfer_backend: Optional[G2plusTransferBackend],
+    transfer_backend: Optional[RemoteG2TransferBackend],
     tree_cache,
     worker_id: Optional[int],
     dp_rank: int,
 ) -> Mapping[str, Any]:
     if transfer_backend is None or not getattr(transfer_backend, "enabled", False):
-        return {"ok": False, "reason": "direct_transfer_unavailable", "pages": []}
+        return {"ok": False, "reason": "direct_transfer_unavailable"}
     requested_backend = str(payload.get("transfer_backend", "mooncake")).lower()
     if requested_backend != transfer_backend.name:
         return {
@@ -380,11 +360,10 @@ def handle_source_transfer(
                 f"unsupported_transfer_backend:{requested_backend}:"
                 f"local={transfer_backend.name}"
             ),
-            "pages": [],
         }
 
     try:
-        plan = RemoteKvReusePlan.from_dict(payload["plan"])
+        plan = RemoteG2Plan.from_dict(payload["plan"])
         start_block = _coerce_int(payload.get("start_block", 0), "start_block")
         max_blocks = _coerce_int(
             payload.get("max_blocks", len(plan.block_hashes)), "max_blocks"
@@ -393,7 +372,6 @@ def handle_source_transfer(
         return {
             "ok": False,
             "reason": f"malformed_transfer_request:plan:{err}",
-            "pages": [],
         }
 
     (
@@ -407,7 +385,6 @@ def handle_source_transfer(
             "ok": False,
             "reason": f"malformed_transfer_request:{target_kv_metadata_error}",
             "block_size_tokens": tree_cache.page_size,
-            "pages": [],
         }
     try:
         target_page_indices_list = _coerce_transfer_int_list(
@@ -418,14 +395,12 @@ def handle_source_transfer(
             "ok": False,
             "reason": f"malformed_transfer_request:target_page_indices_missing:{err}",
             "block_size_tokens": tree_cache.page_size,
-            "pages": [],
         }
     except ValueError as err:
         return {
             "ok": False,
             "reason": f"malformed_transfer_request:{err}",
             "block_size_tokens": tree_cache.page_size,
-            "pages": [],
         }
     max_int32 = np.iinfo(np.int32).max
     if any(idx < 0 or idx > max_int32 for idx in target_page_indices_list):
@@ -433,7 +408,6 @@ def handle_source_transfer(
             "ok": False,
             "reason": "malformed_transfer_request:target_page_index_out_of_range",
             "block_size_tokens": tree_cache.page_size,
-            "pages": [],
         }
 
     total_start = time.perf_counter()
@@ -461,14 +435,12 @@ def handle_source_transfer(
                         "ok": False,
                         "reason": "source_host_page_index_out_of_range",
                         "block_size_tokens": tree_cache.page_size,
-                        "pages": [],
                     }
                 if host_index % page_size != 0:
                     return {
                         "ok": False,
                         "reason": "source_host_page_index_unaligned",
                         "block_size_tokens": tree_cache.page_size,
-                        "pages": [],
                     }
                 page_index = host_index // page_size
                 if page_index > max_int32:
@@ -476,7 +448,6 @@ def handle_source_transfer(
                         "ok": False,
                         "reason": "source_page_index_out_of_range",
                         "block_size_tokens": tree_cache.page_size,
-                        "pages": [],
                     }
                 source_page_indices_list.append(page_index)
             source_page_indices = np.array(source_page_indices_list, dtype=np.int32)
@@ -489,7 +460,6 @@ def handle_source_transfer(
                         f"target_page_indices_too_short:{len(target_page_indices_list)}<{len(pages)}"
                     ),
                     "block_size_tokens": tree_cache.page_size,
-                    "pages": [],
                 }
             target_page_indices_list = target_page_indices_list[: len(pages)]
             target_page_indices = np.array(target_page_indices_list, dtype=np.int32)
@@ -507,12 +477,12 @@ def handle_source_transfer(
                 transfer_ms = (time.perf_counter() - transfer_start) * 1000
                 if _is_timeout_error(err):
                     failure_reason = (
-                        f"{REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON}:source:{err}"
+                        f"{REMOTE_G2_DIRECT_TIMEOUT_REASON}:source:{err}"
                     )
                 else:
                     failure_reason = f"direct_transfer_failed:{err}"
                 logger.warning(
-                    "G2plus source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
+                    "RemoteG2 source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
                     len(pages),
                     resolve_ms,
                     transfer_ms,
@@ -527,12 +497,11 @@ def handle_source_transfer(
                     "transfer_ms": transfer_ms,
                     "total_ms": (time.perf_counter() - total_start) * 1000,
                     "transfer_bytes": transfer_bytes,
-                    "pages": [],
                 }
             transfer_ms = (time.perf_counter() - transfer_start) * 1000
         total_ms = (time.perf_counter() - total_start) * 1000
         logger.debug(
-            "G2plus source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
+            "RemoteG2 source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
             len(pages),
             reason,
             resolve_ms,

@@ -9,12 +9,12 @@ from typing import Any, Mapping, Optional, Protocol
 import numpy as np
 
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.environ import default_g2plus_transfer_parallelism
+from sglang.srt.environ import default_remote_g2_transfer_parallelism
 
 logger = logging.getLogger(__name__)
 
 
-class G2plusTransferBackend(Protocol):
+class RemoteG2TransferBackend(Protocol):
     name: str
     target_session_id: str
     target_kv_ptrs: list[int]
@@ -40,11 +40,11 @@ class G2plusTransferBackend(Protocol):
 
 
 def _target_kv_infos_from_scheduler(scheduler):
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
     target_pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-    if isinstance(target_pool, HybridLinearKVPool):
-        target_pool = target_pool.full_kv_pool
+    if hasattr(target_pool, "full_kv_pool") and hasattr(target_pool, "full_layer_nums"):
+        raise RuntimeError(
+            "RemoteG2 direct transfer does not support hybrid linear-attention KV pools"
+        )
     return target_pool.get_contiguous_buf_infos()
 
 
@@ -63,46 +63,34 @@ def _direct_topology_rejection(scheduler) -> Optional[str]:
     if not unsupported:
         return None
     return (
-        "G2plus direct transfer V0 supports only tp_size=1, pp_size=1, "
+        "RemoteG2 direct transfer V0 supports only tp_size=1, pp_size=1, "
         f"and attn_cp_size=1; got {', '.join(unsupported)}"
     )
 
 
-def _record_diagnostic(diagnostics: Optional[list[str]], message: str) -> None:
-    if diagnostics is not None:
-        diagnostics.append(message)
-
-
-def _diagnostic_suffix(diagnostics: Optional[list[str]]) -> str:
-    if not diagnostics:
-        return ""
-    return ": " + "; ".join(diagnostics)
-
-
-def g2plus_config(server_args) -> Mapping[str, Any]:
-    config = getattr(server_args, "g2plus_config", None)
+def remote_g2_config(server_args) -> Mapping[str, Any]:
+    config = getattr(server_args, "remote_g2_config", None)
     return config if isinstance(config, Mapping) else {}
 
 
-def g2plus_config_value(server_args, key: str, default=None):
-    config = g2plus_config(server_args)
-    legacy_name = f"g2plus_{key}"
-    return config.get(key, getattr(server_args, legacy_name, default))
+def remote_g2_config_value(server_args, key: str, default=None):
+    config = remote_g2_config(server_args)
+    return config.get(key, default)
 
 
-def g2plus_transfer_backend_name(server_args, default: str = "auto") -> str:
-    return str(g2plus_config_value(server_args, "transfer_backend", default)).lower()
+def remote_g2_transfer_backend_name(server_args, default: str = "auto") -> str:
+    return str(remote_g2_config_value(server_args, "transfer_backend", default)).lower()
 
 
-def g2plus_timeout_secs(server_args, default: float = 1.0) -> float:
-    return float(g2plus_config_value(server_args, "timeout_secs", default))
+def remote_g2_timeout_secs(server_args, default: float = 1.0) -> float:
+    return float(remote_g2_config_value(server_args, "timeout_secs", default))
 
 
 def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     host_pool = tree_cache.cache_controller.mem_pool_host
     if getattr(host_pool, "layout", None) != "layer_first":
         raise RuntimeError(
-            "G2plus direct transfer requires layer_first host layout, "
+            "RemoteG2 direct transfer requires layer_first host layout, "
             f"got {getattr(host_pool, 'layout', None)!r}"
         )
 
@@ -111,7 +99,7 @@ def _source_host_buf_infos(tree_cache) -> tuple[list[int], list[int]]:
     elif hasattr(host_pool, "data_refs"):
         refs = host_pool.data_refs
     else:
-        raise RuntimeError("Unsupported HiCache host pool for G2plus direct transfer")
+        raise RuntimeError("Unsupported HiCache host pool for RemoteG2 direct transfer")
 
     page_size = tree_cache.page_size
     ptrs = [int(ref.data_ptr()) for ref in refs]
@@ -186,7 +174,7 @@ def _mooncake_register_regions(
 
     # Mooncake 0.3.10 can return success from batch_register_memory even when
     # individual CUDA registrations fail. Prefer the scalar API when available
-    # so G2plus does not advertise a target whose GPU KV addresses are absent
+    # so RemoteG2 does not advertise a target whose GPU KV addresses are absent
     # from Mooncake's segment descriptor.
     underlying_engine = getattr(engine, "engine", None)
     register_memory = getattr(underlying_engine, "register_memory", None)
@@ -250,7 +238,7 @@ def _build_grouped_transfer_arrays(
     return src_addrs, dst_addrs, lengths, len(src_blocks)
 
 
-class MooncakeG2plusTransferBackend:
+class MooncakeRemoteG2TransferBackend:
     """Mooncake-backed source-G2-host to target-G1-device transfer helper."""
 
     name = "mooncake"
@@ -276,33 +264,30 @@ class MooncakeG2plusTransferBackend:
         self.ib_device = _mooncake_ib_device(engine)
         self.protocol = _mooncake_protocol(engine)
         if transfer_parallelism is None:
-            transfer_parallelism = default_g2plus_transfer_parallelism()
+            transfer_parallelism = default_remote_g2_transfer_parallelism()
         self._transfer_parallelism = max(1, int(transfer_parallelism))
         self._transfer_executor: Optional[ThreadPoolExecutor] = None
         self._transfer_executor_lock = threading.Lock()
         self._shutdown = False
 
     @classmethod
-    def from_scheduler(
-        cls, scheduler, diagnostics: Optional[list[str]] = None
-    ) -> Optional["MooncakeG2plusTransferBackend"]:
+    def from_scheduler(cls, scheduler) -> Optional["MooncakeRemoteG2TransferBackend"]:
         server_args = scheduler.server_args
-        backend = g2plus_transfer_backend_name(server_args)
+        backend = remote_g2_transfer_backend_name(server_args)
         if backend not in {"auto", "mooncake"}:
             return None
         topology_rejection = _direct_topology_rejection(scheduler)
         if topology_rejection is not None:
             if backend == "mooncake":
                 logger.warning(
-                    "G2plus Mooncake direct transfer disabled: %s",
+                    "RemoteG2 Mooncake direct transfer disabled: %s",
                     topology_rejection,
                 )
             else:
                 logger.debug(
-                    "G2plus Mooncake direct transfer disabled: %s",
+                    "RemoteG2 Mooncake direct transfer disabled: %s",
                     topology_rejection,
                 )
-            _record_diagnostic(diagnostics, f"mooncake topology: {topology_rejection}")
             return None
 
         try:
@@ -330,12 +315,8 @@ class MooncakeG2plusTransferBackend:
             )
             if not registered:
                 logger.warning(
-                    "G2plus Mooncake disabled: target KV registration failed (%s)",
+                    "RemoteG2 Mooncake disabled: target KV registration failed (%s)",
                     register_reason,
-                )
-                _record_diagnostic(
-                    diagnostics,
-                    "mooncake target KV registration failed",
                 )
                 return None
             transfer = cls(
@@ -350,25 +331,17 @@ class MooncakeG2plusTransferBackend:
                 transfer._log_ready()
                 return transfer
             transfer.shutdown()
-            _record_diagnostic(
-                diagnostics,
-                "mooncake source host pool registration did not enable direct transfer",
-            )
             return None
-        except Exception as err:
+        except Exception:
             if backend == "mooncake":
                 logger.exception(
-                    "G2plus Mooncake direct transfer initialization failed"
+                    "RemoteG2 Mooncake direct transfer initialization failed"
                 )
             else:
                 logger.debug(
-                    "G2plus Mooncake direct transfer unavailable; using fallback",
+                    "RemoteG2 Mooncake direct transfer unavailable; using fallback",
                     exc_info=True,
                 )
-            _record_diagnostic(
-                diagnostics,
-                f"mooncake initialization failed: {err}",
-            )
             return None
 
     @property
@@ -391,7 +364,7 @@ class MooncakeG2plusTransferBackend:
         path_hint = _mooncake_path_hint(self.protocol, self.ib_device)
         if self.protocol == "rdma" and self.ib_device is None:
             logger.warning(
-                "G2plus Mooncake direct transfer enabled session=%s "
+                "RemoteG2 Mooncake direct transfer enabled session=%s "
                 "protocol=rdma ib_device=<none> path_hint=no_explicit_ib_device "
                 "parallelism=%d; benchmark labels should not treat this as a "
                 "configured RDMA/GDR path",
@@ -400,7 +373,7 @@ class MooncakeG2plusTransferBackend:
             )
             return
         logger.info(
-            "G2plus Mooncake direct transfer enabled session=%s protocol=%s "
+            "RemoteG2 Mooncake direct transfer enabled session=%s protocol=%s "
             "ib_device=%s path_hint=%s parallelism=%d",
             self.target_session_id,
             self.protocol,
@@ -413,13 +386,13 @@ class MooncakeG2plusTransferBackend:
         host_pool = self.tree_cache.cache_controller.mem_pool_host
         if getattr(host_pool, "layout", None) != "layer_first":
             logger.info(
-                "G2plus Mooncake direct transfer disabled for HiCache layout=%s; "
+                "RemoteG2 Mooncake direct transfer disabled for HiCache layout=%s; "
                 "source host pool must be layer_first",
                 getattr(host_pool, "layout", None),
             )
             return
         if not hasattr(host_pool, "kv_buffer"):
-            logger.info("G2plus Mooncake direct transfer disabled: no host kv_buffer")
+            logger.info("RemoteG2 Mooncake direct transfer disabled: no host kv_buffer")
             return
         try:
             _, source_kv_item_lens = _source_host_buf_infos(self.tree_cache)
@@ -427,14 +400,14 @@ class MooncakeG2plusTransferBackend:
                 source_kv_item_lens, self.target_kv_item_lens
             )
         except RuntimeError as err:
-            logger.info("G2plus Mooncake direct transfer disabled: %s", err)
+            logger.info("RemoteG2 Mooncake direct transfer disabled: %s", err)
             return
         registered, register_reason = _mooncake_register_regions(
             self.engine, [host_pool.kv_buffer.data_ptr()], [host_pool.kv_buffer.nbytes]
         )
         if not registered:
             logger.warning(
-                "G2plus Mooncake direct transfer disabled: host registration failed (%s)",
+                "RemoteG2 Mooncake direct transfer disabled: host registration failed (%s)",
                 register_reason,
             )
             return
@@ -448,7 +421,7 @@ class MooncakeG2plusTransferBackend:
 
         # Keep Mooncake memory registrations process-lifetime, matching existing
         # Mooncake disagg/staging users of the shared transfer engine. The same
-        # pointer can be registered by multiple in-process features, and G2plus
+        # pointer can be registered by multiple in-process features, and RemoteG2
         # cannot safely infer global ownership at scheduler shutdown.
         self._source_registered_ptrs = []
         self._source_registered = False
@@ -464,7 +437,7 @@ class MooncakeG2plusTransferBackend:
             if self._transfer_executor is None:
                 self._transfer_executor = ThreadPoolExecutor(
                     max_workers=self._transfer_parallelism,
-                    thread_name_prefix="g2plus-mooncake-transfer",
+                    thread_name_prefix="remote_g2-mooncake-transfer",
                 )
             return self._transfer_executor
 
@@ -543,7 +516,7 @@ class MooncakeG2plusTransferBackend:
             )
             transfer_ms = (time.perf_counter() - start) * 1000
             logger.debug(
-                "G2plus Mooncake transferred blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
+                "RemoteG2 Mooncake transferred blocks=%d slices=%d bytes=%d parallelism=%d ms=%.3f",
                 num_blocks,
                 len(src_addrs),
                 int(lengths.sum()),
@@ -554,41 +527,30 @@ class MooncakeG2plusTransferBackend:
                 raise RuntimeError(f"Mooncake direct KV transfer failed with ret={ret}")
 
 
-def make_g2plus_transfer_backend(
-    scheduler, diagnostics: Optional[list[str]] = None
-) -> Optional[G2plusTransferBackend]:
-    backend = g2plus_transfer_backend_name(scheduler.server_args)
+def make_remote_g2_transfer_backend(scheduler) -> Optional[RemoteG2TransferBackend]:
+    backend = remote_g2_transfer_backend_name(scheduler.server_args)
     topology_rejection = _direct_topology_rejection(scheduler)
     if topology_rejection is not None:
         if backend == "mooncake":
             raise RuntimeError(topology_rejection)
-        logger.warning("G2plus direct transfer unavailable: %s", topology_rejection)
-        _record_diagnostic(diagnostics, f"topology: {topology_rejection}")
+        logger.warning("RemoteG2 direct transfer unavailable: %s", topology_rejection)
         return None
 
     if backend == "mooncake":
-        transfer = MooncakeG2plusTransferBackend.from_scheduler(
-            scheduler, diagnostics=diagnostics
-        )
+        transfer = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
         if transfer is None:
             raise RuntimeError(
-                "G2plus Mooncake transfer backend was requested but unavailable"
-                f"{_diagnostic_suffix(diagnostics)}"
+                "RemoteG2 Mooncake transfer backend was requested but unavailable"
             )
         return transfer
 
     if backend != "auto":
         raise RuntimeError(
-            f"G2plus transfer backend {backend!r} is not supported; "
+            f"RemoteG2 transfer backend {backend!r} is not supported; "
             "this path supports only 'mooncake'"
         )
 
-    diagnostic_count = len(diagnostics) if diagnostics is not None else 0
-    transfer = MooncakeG2plusTransferBackend.from_scheduler(
-        scheduler, diagnostics=diagnostics
-    )
+    transfer = MooncakeRemoteG2TransferBackend.from_scheduler(scheduler)
     if transfer is not None:
         return transfer
-    if diagnostics is not None and len(diagnostics) == diagnostic_count:
-        _record_diagnostic(diagnostics, "mooncake unavailable")
     return None

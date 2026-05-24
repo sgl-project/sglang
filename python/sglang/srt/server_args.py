@@ -184,7 +184,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
+REMOTE_G2_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -648,8 +648,8 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
-    enable_router_kv_reuse: bool = False
-    g2plus_config: Optional[Union[str, Dict[str, Any]]] = None
+    enable_remote_g2: bool = False
+    remote_g2_config: Optional[Union[str, Dict[str, Any]]] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -852,7 +852,7 @@ class ServerArgs:
 
         # Validate PD disaggregation flags early (before dummy-model short-circuit).
         self._handle_pd_disaggregation()
-        self._handle_router_kv_reuse()
+        self._handle_remote_g2()
 
         # Validate --prefill-only-disable-kv-cache args early (before dummy-model
         # short-circuit). The backend check is run later after backends settle.
@@ -3669,7 +3669,9 @@ class ServerArgs:
             raise ValueError(f"{arg_name} must be a JSON object")
         return data
 
-    def _normalize_g2plus_endpoint(self, value: object, field_name: str) -> Optional[str]:
+    def _normalize_remote_g2_endpoint(
+        self, value: object, field_name: str
+    ) -> Optional[str]:
         if value is None:
             return None
         if isinstance(value, str):
@@ -3678,22 +3680,21 @@ class ServerArgs:
             return value.strip()
         raise ValueError(f"{field_name} must be a non-empty string")
 
-    def _handle_router_kv_reuse(self):
-        """Normalize router-directed HiCache reuse knobs."""
+    def _handle_remote_g2(self):
+        """Normalize RemoteG2 HiCache reuse knobs."""
         raw_config = self._load_json_object_config(
-            self.g2plus_config, "--g2plus-config"
+            self.remote_g2_config, "--remote-g2-config"
         )
         if raw_config is not None:
-            self.enable_router_kv_reuse = True
+            self.enable_remote_g2 = True
 
-        if not self.enable_router_kv_reuse:
-            self.g2plus_config = None
+        if not self.enable_remote_g2:
+            self.remote_g2_config = None
             return
 
         self.enable_hierarchical_cache = True
         if raw_config is None:
-            self.g2plus_config = None
-            return
+            raise ValueError("--remote-g2-config requires worker_id")
 
         config: Dict[str, Any] = dict(raw_config)
         if any(
@@ -3706,63 +3707,53 @@ class ServerArgs:
             )
         ):
             raise ValueError(
-                "g2plus_config static endpoint maps are not supported; put the "
-                "local bind endpoint under control.endpoint and let the router "
-                "provide source_endpoint per plan"
+                "remote_g2_config static endpoint maps are not supported; put the "
+                "local bind endpoint under control.endpoint and let each RemoteG2 "
+                "plan provide source_endpoint"
             )
         if "fetch_workers" in config:
             raise ValueError(
-                "g2plus_config.fetch_workers is not supported; use "
-                "SGLANG_G2PLUS_FETCH_WORKERS"
+                "remote_g2_config.fetch_workers is not supported; use "
+                "SGLANG_REMOTE_G2_FETCH_WORKERS"
             )
         if "transfer_parallelism" in config:
             raise ValueError(
-                "g2plus_config.transfer_parallelism is not supported; use "
-                "SGLANG_G2PLUS_TRANSFER_PARALLELISM"
+                "remote_g2_config.transfer_parallelism is not supported; use "
+                "SGLANG_REMOTE_G2_TRANSFER_PARALLELISM"
             )
 
         control_config = config.get("control") or {}
         if not isinstance(control_config, dict):
-            raise ValueError("g2plus_config.control must be a JSON object")
+            raise ValueError("remote_g2_config.control must be a JSON object")
         if any(
             key in control_config
             for key in ("workers", "peer_endpoints", "static_peer_endpoints")
         ):
             raise ValueError(
-                "g2plus_config.control static worker maps are not supported; "
-                "use router-provided source_endpoint per plan"
+                "remote_g2_config.control static worker maps are not supported; "
+                "use source_endpoint from each RemoteG2 plan"
             )
         transfer_config = config.get("transfer") or {}
         if not isinstance(transfer_config, dict):
-            raise ValueError("g2plus_config.transfer must be a JSON object")
+            raise ValueError("remote_g2_config.transfer must be a JSON object")
         if "parallelism" in transfer_config:
             raise ValueError(
-                "g2plus_config.transfer.parallelism is not supported; use "
-                "SGLANG_G2PLUS_TRANSFER_PARALLELISM"
+                "remote_g2_config.transfer.parallelism is not supported; use "
+                "SGLANG_REMOTE_G2_TRANSFER_PARALLELISM"
             )
 
         worker_id = config.get("worker_id")
         if worker_id is None:
-            raise ValueError("--g2plus-config requires worker_id")
-        if isinstance(worker_id, bool):
-            raise ValueError("g2plus_config.worker_id must be a non-negative integer")
-        try:
-            worker_id = int(worker_id)
-        except (TypeError, ValueError) as err:
-            raise ValueError(
-                "g2plus_config.worker_id must be a non-negative integer"
-            ) from err
+            raise ValueError("--remote-g2-config requires worker_id")
+        if not isinstance(worker_id, int) or isinstance(worker_id, bool):
+            raise ValueError("remote_g2_config.worker_id must be a non-negative integer")
         if worker_id < 0:
-            raise ValueError("g2plus_config.worker_id must be a non-negative integer")
+            raise ValueError("remote_g2_config.worker_id must be a non-negative integer")
 
-        control_backend = str(
-            config.get("control_backend", control_config.get("backend", "router"))
-        ).lower()
-        if control_backend not in ("router", "dynamo"):
+        if "control_backend" in config or "backend" in control_config:
             raise ValueError(
-                "g2plus_config.control.backend must be one of "
-                "['router', 'dynamo'], "
-                f"got {control_backend!r}"
+                "remote_g2_config.control.backend is not supported; "
+                "RemoteG2 plans carry the source endpoint directly"
             )
 
         transfer_backend = str(
@@ -3770,29 +3761,27 @@ class ServerArgs:
                 "transfer_backend", transfer_config.get("backend", "auto")
             )
         ).lower()
-        if transfer_backend not in G2PLUS_TRANSFER_BACKEND_CHOICES:
+        if transfer_backend not in REMOTE_G2_TRANSFER_BACKEND_CHOICES:
             raise ValueError(
-                "g2plus_config.transfer_backend must be one of "
-                f"{G2PLUS_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
+                "remote_g2_config.transfer_backend must be one of "
+                f"{REMOTE_G2_TRANSFER_BACKEND_CHOICES}, got {transfer_backend!r}"
             )
 
-        timeout_secs = float(
-            config.get(
-                "timeout_secs",
-                transfer_config.get(
-                    "timeout_secs", control_config.get("timeout_secs", 1.0)
-                ),
-            )
+        timeout_secs = config.get(
+            "timeout_secs",
+            transfer_config.get("timeout_secs", control_config.get("timeout_secs", 1.0)),
         )
+        if not isinstance(timeout_secs, (int, float)) or isinstance(timeout_secs, bool):
+            raise ValueError("remote_g2_config.timeout_secs must be a positive number")
+        timeout_secs = float(timeout_secs)
         if timeout_secs <= 0:
-            raise ValueError("g2plus_config.timeout_secs must be > 0")
+            raise ValueError("remote_g2_config.timeout_secs must be > 0")
 
-        self.g2plus_config = {
+        self.remote_g2_config = {
             "worker_id": worker_id,
-            "control_backend": control_backend,
-            "control_endpoint": self._normalize_g2plus_endpoint(
+            "control_endpoint": self._normalize_remote_g2_endpoint(
                 control_config.get("endpoint", config.get("control_endpoint")),
-                "g2plus_config.control.endpoint",
+                "remote_g2_config.control.endpoint",
             ),
             "timeout_secs": timeout_secs,
             "transfer_backend": transfer_backend,
@@ -6646,20 +6635,20 @@ class ServerArgs:
             help="Enable returning indexer topk indices of layers with indexer with responses.",
         )
         parser.add_argument(
-            "--enable-router-kv-reuse",
+            "--enable-remote-g2",
             action="store_true",
-            default=ServerArgs.enable_router_kv_reuse,
-            help=argparse.SUPPRESS,
+            default=ServerArgs.enable_remote_g2,
+            help="Enable RemoteG2 host-pinned KV cache sharing between workers.",
         )
         parser.add_argument(
-            "--g2plus-config",
+            "--remote-g2-config",
             type=str,
-            default=ServerArgs.g2plus_config,
+            default=ServerArgs.remote_g2_config,
             help=(
-                "JSON object or JSON file path for G2plus router-directed remote "
+                "JSON object or JSON file path for RemoteG2 remote "
                 "G2(host-pinned)->G1(GPU) KV reuse. Keys: worker_id, control, "
                 "transfer, timeout_secs, transfer_backend. Runtime "
-                "parallelism is controlled by SGLANG_G2PLUS_* env vars."
+                "parallelism is controlled by SGLANG_REMOTE_G2_* env vars."
             ),
         )
         parser.add_argument(

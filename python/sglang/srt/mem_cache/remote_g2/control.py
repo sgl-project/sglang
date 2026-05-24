@@ -10,12 +10,12 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping
 
-from sglang.srt.mem_cache.g2plus_transfer import G2plusTransferBackend
-from sglang.srt.mem_cache.router_kv_plan import (
-    REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON,
-    RemoteKvReusePlan,
+from sglang.srt.mem_cache.remote_g2.transfer import RemoteG2TransferBackend
+from sglang.srt.mem_cache.remote_g2.plan import (
+    REMOTE_G2_DIRECT_TIMEOUT_REASON,
+    RemoteG2Plan,
 )
-from sglang.srt.mem_cache.router_kv_source import ResolvedHostPage
+from sglang.srt.mem_cache.remote_g2.source import ResolvedHostPage
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
         try:
             request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
-            logger.debug("Failed to set TCP_NODELAY on G2plus control socket")
+            logger.debug("Failed to set TCP_NODELAY on RemoteG2 control socket")
         return request, client_address
 
 
@@ -44,7 +44,7 @@ def is_timeout_error(err: BaseException) -> bool:
 
 
 def is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    return str(reason).startswith(REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON)
+    return str(reason).startswith(REMOTE_G2_DIRECT_TIMEOUT_REASON)
 
 
 def start_source_transfer_server(
@@ -72,7 +72,6 @@ def start_source_transfer_server(
                     {
                         "ok": False,
                         "reason": "source_resolver_busy",
-                        "pages": [],
                     },
                 )
                 return
@@ -85,7 +84,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "malformed_content_length",
-                            "pages": [],
                         },
                     )
                     return
@@ -95,7 +93,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "empty_request_body",
-                            "pages": [],
                         },
                     )
                     return
@@ -105,7 +102,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "control_payload_too_large",
-                            "pages": [],
                         },
                     )
                     return
@@ -119,7 +115,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "truncated_request_body",
-                            "pages": [],
                         },
                     )
                     return
@@ -132,7 +127,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": f"malformed_control_payload:json:{err}",
-                            "pages": [],
                         },
                     )
                     return
@@ -143,7 +137,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "malformed_control_payload:not_object",
-                            "pages": [],
                         },
                     )
                     return
@@ -153,7 +146,6 @@ def start_source_transfer_server(
                         {
                             "ok": False,
                             "reason": "direct_transfer_unavailable",
-                            "pages": [],
                         },
                     )
                     return
@@ -171,7 +163,7 @@ def start_source_transfer_server(
                 self._write_json(200, response)
                 write_ms = (time.perf_counter() - write_start) * 1000
                 logger.debug(
-                    "G2plus source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
+                    "RemoteG2 source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
                     self.path,
                     pre_handler_ms,
                     body_read_ms,
@@ -181,7 +173,7 @@ def start_source_transfer_server(
                 )
             except Exception as err:
                 logger.exception("Remote G2 source transfer failed")
-                self._write_json(500, {"ok": False, "reason": str(err), "pages": []})
+                self._write_json(500, {"ok": False, "reason": str(err)})
             finally:
                 exit_resolver()
 
@@ -199,7 +191,7 @@ def start_source_transfer_server(
     server = _ReusableThreadingHTTPServer((host, port), Handler)
     thread = threading.Thread(
         target=server.serve_forever,
-        name=f"g2plus-source-{host}:{port}",
+        name=f"remote_g2-source-{host}:{port}",
         daemon=True,
     )
     thread.start()
@@ -217,37 +209,16 @@ def _coerce_int(value: Any, field_name: str) -> int:
         raise ValueError(f"{field_name} must be an integer, got {value!r}")
     if isinstance(value, int):
         return int(value)
-    if isinstance(value, str):
-        value = value.strip()
-        if not value:
-            raise ValueError(f"{field_name} must be an integer, got empty string")
-        try:
-            return int(value, 10)
-        except ValueError as err:
-            raise ValueError(
-                f"{field_name} must be an integer, got {value!r}"
-            ) from err
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
-def pages_from_direct_transfer_payload(
+def pages_from_transfer_result(
     payload: Mapping[str, Any],
-    plan: RemoteKvReusePlan,
+    plan: RemoteG2Plan,
     *,
     start_block: int,
     max_blocks: int,
 ) -> list[ResolvedHostPage]:
-    page_payload = payload.get("pages")
-    if page_payload is not None:
-        return [
-            ResolvedHostPage(
-                block_hash=int(page["block_hash"]),
-                hash_value=str(page.get("hash_value", "")),
-                data=b"",
-            )
-            for page in page_payload
-        ]
-
     transferred_blocks = _coerce_int(
         payload.get("transferred_blocks", 0), "transferred_blocks"
     )
@@ -263,9 +234,9 @@ def pages_from_direct_transfer_payload(
 
 def request_source_transfer(
     *,
-    transfer_backend: G2plusTransferBackend,
+    transfer_backend: RemoteG2TransferBackend,
     endpoints: list[str],
-    plan: RemoteKvReusePlan,
+    plan: RemoteG2Plan,
     start_block: int,
     max_blocks: int,
     target_page_indices: list[int],
@@ -314,7 +285,7 @@ def request_source_transfer(
             UnicodeDecodeError,
         ) as err:
             if is_timeout_error(err):
-                last_reason = f"{REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON}:{err}"
+                last_reason = f"{REMOTE_G2_DIRECT_TIMEOUT_REASON}:{err}"
                 logger.warning(
                     "Remote G2 direct transfer timed out endpoint=%s ms=%.3f; target pages will be quarantined reason=%s",
                     endpoint,
@@ -373,7 +344,7 @@ def request_source_transfer(
             continue
         try:
             parse_start = time.perf_counter()
-            pages = pages_from_direct_transfer_payload(
+            pages = pages_from_transfer_result(
                 payload,
                 plan,
                 start_block=start_block,

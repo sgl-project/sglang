@@ -108,12 +108,11 @@ class HiRadixCache(RadixCache):
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
-        self.enable_router_kv_reuse = bool(
-            getattr(server_args, "enable_router_kv_reuse", False)
-            or getattr(server_args, "enable_g2plus", False)
+        self.enable_remote_g2 = bool(
+            getattr(server_args, "enable_remote_g2", False)
         )
-        self.router_kv_lock = threading.RLock()
-        self.router_kv_block_index = {} if self.enable_router_kv_reuse else None
+        self.remote_g2_host_index_lock = threading.RLock()
+        self.remote_g2_host_block_index = {} if self.enable_remote_g2 else None
 
         (
             extra_config,
@@ -637,54 +636,58 @@ class HiRadixCache(RadixCache):
         # Clear per-request tracking dicts
         self.prefetch_loaded_tokens_by_reqid.clear()
         self.evictable_host_leaves.clear()
-        if getattr(self, "router_kv_block_index", None) is not None:
-            with self.router_kv_lock:
-                self.router_kv_block_index.clear()
+        if getattr(self, "remote_g2_host_block_index", None) is not None:
+            with self.remote_g2_host_index_lock:
+                self.remote_g2_host_block_index.clear()
         super().reset()
 
-    def _index_router_kv_host_node(self, node: TreeNode) -> None:
-        if getattr(self, "router_kv_block_index", None) is None:
+    def _index_remote_g2_host_node(self, node: TreeNode) -> None:
+        if getattr(self, "remote_g2_host_block_index", None) is None:
             return
         if node.host_value is None:
-            self._drop_router_kv_host_node(node)
+            self._drop_remote_g2_host_node(node)
             return
         if node.hash_value is None:
             node.hash_value = compute_node_hash_values(node, self.page_size)
 
         num_pages = min(len(node.hash_value), len(node.host_value) // self.page_size)
-        with self._router_kv_index_lock():
-            self._drop_router_kv_host_node(node, locked=True)
+        with self._remote_g2_index_lock():
+            self._drop_remote_g2_host_node(node, locked=True)
             for page_idx in range(num_pages):
                 hash_value = node.hash_value[page_idx]
                 block_hash = hash_str_to_int64(hash_value)
                 for alias in block_hash_aliases(block_hash):
-                    self.router_kv_block_index[alias] = (node, page_idx, hash_value)
+                    self.remote_g2_host_block_index[alias] = (
+                        node,
+                        page_idx,
+                        hash_value,
+                    )
 
-    def _drop_router_kv_host_node(
+    def _drop_remote_g2_host_node(
         self, node: TreeNode, *, locked: bool = False
     ) -> None:
-        if getattr(self, "router_kv_block_index", None) is None:
+        if getattr(self, "remote_g2_host_block_index", None) is None:
             return
 
         def drop() -> None:
             stale = [
                 block_hash
-                for block_hash, entry in self.router_kv_block_index.items()
+                for block_hash, entry in self.remote_g2_host_block_index.items()
                 if entry[0] is node
             ]
             for block_hash in stale:
-                self.router_kv_block_index.pop(block_hash, None)
+                self.remote_g2_host_block_index.pop(block_hash, None)
 
         if locked:
             drop()
         else:
-            with self._router_kv_index_lock():
+            with self._remote_g2_index_lock():
                 drop()
 
-    def lookup_router_kv_host_blocks(
+    def lookup_remote_g2_host_blocks(
         self, wanted_hashes: set[int]
     ) -> dict[int, tuple[TreeNode, int, str]]:
-        if getattr(self, "router_kv_block_index", None) is None:
+        if getattr(self, "remote_g2_host_block_index", None) is None:
             return {}
 
         matches: dict[int, tuple[TreeNode, int, str]] = {}
@@ -693,9 +696,9 @@ class HiRadixCache(RadixCache):
             wanted_aliases.update(block_hash_aliases(block_hash))
 
         stale_aliases = []
-        with self._router_kv_index_lock():
+        with self._remote_g2_index_lock():
             for alias in wanted_aliases:
-                entry = self.router_kv_block_index.get(alias)
+                entry = self.remote_g2_host_block_index.get(alias)
                 if entry is None:
                     continue
                 node, page_idx, hash_value = entry
@@ -712,14 +715,14 @@ class HiRadixCache(RadixCache):
                     stale_aliases.append(alias)
 
             for alias in stale_aliases:
-                self.router_kv_block_index.pop(alias, None)
+                self.remote_g2_host_block_index.pop(alias, None)
         return matches
 
-    def _router_kv_index_lock(self):
-        lock = getattr(self, "router_kv_lock", None)
+    def _remote_g2_index_lock(self):
+        lock = getattr(self, "remote_g2_host_index_lock", None)
         if lock is None:
             lock = threading.RLock()
-            self.router_kv_lock = lock
+            self.remote_g2_host_index_lock = lock
         return lock
 
     def get_height(self, node: TreeNode):
@@ -845,7 +848,7 @@ class HiRadixCache(RadixCache):
                         self._record_store_event(
                             backuped_node, medium=StorageMedium.CPU
                         )
-                        self._index_router_kv_host_node(backuped_node)
+                        self._index_remote_g2_host_node(backuped_node)
                         if self.enable_storage:
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
@@ -873,7 +876,7 @@ class HiRadixCache(RadixCache):
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 # DMA confirmed -- block is now on host.
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
-                self._index_router_kv_host_node(backuped_node)
+                self._index_remote_g2_host_node(backuped_node)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
                     self.write_backup_storage(backuped_node)
@@ -931,7 +934,7 @@ class HiRadixCache(RadixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -1495,8 +1498,8 @@ class HiRadixCache(RadixCache):
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
-        self._index_router_kv_host_node(new_node)
-        self._index_router_kv_host_node(child)
+        self._index_remote_g2_host_node(new_node)
+        self._index_remote_g2_host_node(child)
 
         return new_node
 

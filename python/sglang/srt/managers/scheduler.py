@@ -220,7 +220,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.mem_cache.router_kv_reuse import RouterKVReuseManager
+from sglang.srt.mem_cache.remote_g2.manager import RemoteG2Manager
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -486,8 +486,8 @@ class Scheduler(
             page_size=self.page_size,
         )
 
-        # Init router-directed KV reuse once HiCache pools are available.
-        self.init_router_kv_reuse()
+        # Init RemoteG2 once HiCache pools are available.
+        self.init_remote_g2()
 
         # Init running status
         self.init_running_status()
@@ -701,7 +701,7 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             abort_request=self.abort_request,
-            release_router_kv_reuse_request=self._release_router_kv_reuse_request,
+            release_remote_g2_request=self._release_remote_g2_request,
         )
 
         self.is_initializing = False
@@ -998,8 +998,8 @@ class Scheduler(
                 startup_available_gpu_memory_gb=avail_mem,
             )
 
-    def init_router_kv_reuse(self):
-        self.router_kv_reuse_manager = RouterKVReuseManager.from_scheduler(self)
+    def init_remote_g2(self):
+        self.remote_g2_manager = RemoteG2Manager.from_scheduler(self)
 
     def init_running_status(self):
         self.waiting_queue: List[Req] = []
@@ -1824,7 +1824,7 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
-                remote_kv_reuse_plan=recv_req.remote_kv_reuse_plan,
+                remote_g2_plan=recv_req.remote_g2_plan,
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2034,40 +2034,40 @@ class Scheduler(
                     prefix_keys,
                 )
 
-    def _prepare_router_kv_reuse_for_schedule(self, req: Req) -> bool:
-        router_manager = getattr(self, "router_kv_reuse_manager", None)
-        if router_manager is None:
+    def _prepare_remote_g2_for_schedule(self, req: Req) -> bool:
+        remote_g2_manager = getattr(self, "remote_g2_manager", None)
+        if remote_g2_manager is None:
             return True
 
         try:
-            if not router_manager.has_reuse_plan(req):
+            if not remote_g2_manager.has_reuse_plan(req):
                 return True
-            # Probe the current local prefix without taking COW/Mamba allocations.
+            # Probe the current local prefix without taking COW allocations.
             # The final schedule path below recomputes the prefix after remote pages land.
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
-            result = router_manager.check_reuse_plan_progress(req)
+            result = remote_g2_manager.check_reuse_plan_progress(req)
         except Exception:
             logger.exception(
-                "Router KV reuse failed for rid=%s; continuing with local prefill",
+                "RemoteG2 failed for rid=%s; continuing with local prefill",
                 req.rid,
             )
-            req.remote_kv_reuse_plan = None
-            release = getattr(router_manager, "release_request", None)
+            req.remote_g2_plan = None
+            release = getattr(remote_g2_manager, "release_request", None)
             if release is not None:
                 try:
                     release(req.rid)
                 except Exception:
                     logger.debug(
-                        "Failed to release router KV reuse state after error",
+                        "Failed to release RemoteG2 state after error",
                         exc_info=True,
                     )
             return True
         return not result.pending
 
-    def _release_router_kv_reuse_request(self, rid: str) -> None:
-        router_manager = getattr(self, "router_kv_reuse_manager", None)
-        if router_manager is not None:
-            router_manager.release_request(rid)
+    def _release_remote_g2_request(self, rid: str) -> None:
+        remote_g2_manager = getattr(self, "remote_g2_manager", None)
+        if remote_g2_manager is not None:
+            remote_g2_manager.release_request(rid)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
@@ -2149,7 +2149,7 @@ class Scheduler(
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
-                self._release_router_kv_reuse_request(candidate_req.rid)
+                self._release_remote_g2_request(candidate_req.rid)
                 self.waiting_queue.pop(idx)
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
@@ -2167,7 +2167,7 @@ class Scheduler(
         )
         if req_to_abort.time_stats is not None:
             req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        self._release_router_kv_reuse_request(req_to_abort.rid)
+        self._release_remote_g2_request(req_to_abort.rid)
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
@@ -2182,7 +2182,7 @@ class Scheduler(
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
                     self.tree_cache.release_aborted_request(req.rid)
-                self._release_router_kv_reuse_request(req.rid)
+                self._release_remote_g2_request(req.rid)
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2584,7 +2584,7 @@ class Scheduler(
                     req.rid
                 )
 
-            if not self._prepare_router_kv_reuse_for_schedule(req):
+            if not self._prepare_remote_g2_for_schedule(req):
                 continue
 
             req.init_next_round_input(self.tree_cache)
@@ -3210,9 +3210,9 @@ class Scheduler(
                     idle &= len(tc.ongoing_prefetch) == 0
                     idle &= len(tc.ongoing_backup) == 0
 
-            router_manager = getattr(self, "router_kv_reuse_manager", None)
-            if router_manager is not None:
-                idle &= not router_manager.has_pending()
+            remote_g2_manager = getattr(self, "remote_g2_manager", None)
+            if remote_g2_manager is not None:
+                idle &= not remote_g2_manager.has_pending()
 
         return idle
 
@@ -3220,9 +3220,9 @@ class Scheduler(
         if getattr(self, "_shutdown_called", False):
             return
         self._shutdown_called = True
-        router_manager = getattr(self, "router_kv_reuse_manager", None)
-        if router_manager is not None:
-            router_manager.shutdown()
+        remote_g2_manager = getattr(self, "remote_g2_manager", None)
+        if remote_g2_manager is not None:
+            remote_g2_manager.shutdown()
 
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
@@ -3472,7 +3472,7 @@ class Scheduler(
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)
-            self._release_router_kv_reuse_request(req.rid)
+            self._release_remote_g2_request(req.rid)
             self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:

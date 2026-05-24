@@ -1,7 +1,7 @@
 import json
 import logging
 import os
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import NetworkAddress, get_free_port
@@ -10,56 +10,6 @@ logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
-
-_MOONCAKE_NVLINK_ENV_DEFAULTS = {
-    "MC_FORCE_MNNVL": "True",
-    "NCCL_MNNVL_ENABLE": "1",
-    "NCCL_CUMEM_ENABLE": "1",
-}
-
-
-def _normalize_mooncake_custom_mem_pool(custom_pool: Optional[str]) -> Optional[str]:
-    if custom_pool is None:
-        return None
-    custom_pool = custom_pool.strip().upper()
-    if custom_pool == "TRUE":
-        return "NVLINK"
-    return custom_pool or None
-
-
-def _get_mooncake_transfer_protocol() -> str:
-    protocol = envs.SGLANG_MOONCAKE_TE_PROTOCOL.get()
-    if protocol:
-        return protocol.strip().lower()
-
-    custom_pool = _normalize_mooncake_custom_mem_pool(
-        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
-    )
-    if custom_pool == "NVLINK":
-        return "nvlink"
-
-    return "rdma"
-
-
-def apply_mooncake_nvlink_env_defaults() -> Dict[str, str]:
-    custom_pool = _normalize_mooncake_custom_mem_pool(
-        envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get()
-    )
-    if custom_pool != "NVLINK":
-        return {}
-
-    applied = {}
-    for name, value in _MOONCAKE_NVLINK_ENV_DEFAULTS.items():
-        if name not in os.environ:
-            os.environ[name] = value
-            applied[name] = value
-
-    if applied:
-        logger.info(
-            "Applied Mooncake NVLink environment defaults: %s",
-            ", ".join(f"{name}={value}" for name, value in applied.items()),
-        )
-    return applied
 
 
 def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
@@ -162,7 +112,6 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         self.ib_device = get_ib_devices_for_gpu(ib_device, self.gpu_id)
-        self.protocol: Optional[str] = None
 
         self.initialize(
             hostname=self.hostname,
@@ -228,7 +177,6 @@ class MooncakeTransferEngine:
     ) -> None:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
-            self.protocol = "ascend"
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             if npu_phy_id == -1:
                 hostname += f":{get_free_port()}:npu_{self.gpu_id}"
@@ -241,12 +189,10 @@ class MooncakeTransferEngine:
                 device_name if device_name is not None else "",
             )
         else:
-            protocol = _get_mooncake_transfer_protocol()
-            self.protocol = protocol
             ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
-                protocol,
+                "rdma",
                 device_name if device_name is not None else "",
             )
         if ret_value != 0:
@@ -316,9 +262,6 @@ class MooncakeTransferEngine:
 
     def get_ib_device(self):
         return self.ib_device
-
-    def get_protocol(self):
-        return self.protocol
 
 
 def init_mooncake_transfer_engine(
