@@ -1076,6 +1076,33 @@ def suppress_noisy_warnings():
         category=FutureWarning,
     )
 
+    # cutlass-dsl emits these inside `catch_warnings()+simplefilter("always")`,
+    # which bypasses filterwarnings; override showwarning to drop them too.
+    cutlass_dsl_noisy = {
+        (
+            DeprecationWarning,
+            "Use explicit `struct.scalar.ptr` for pointer instead.",
+        ),
+        (
+            UserWarning,
+            "NamedBarrier wait also arrives on the barrier. "
+            "Routing call to NamedBarrier.arrive_and_wait().",
+        ),
+    }
+    for cat, msg in cutlass_dsl_noisy:
+        warnings.filterwarnings("ignore", message=re.escape(msg), category=cat)
+
+    if not getattr(warnings.showwarning, "_sglang_patched_cutlass_dsl", False):
+        prev_showwarning = warnings.showwarning
+
+        def _filtered_showwarning(message, category, *args, **kwargs):
+            if (category, str(message)) in cutlass_dsl_noisy:
+                return
+            prev_showwarning(message, category, *args, **kwargs)
+
+        _filtered_showwarning._sglang_patched_cutlass_dsl = True
+        warnings.showwarning = _filtered_showwarning
+
     # Suppress noisy third-party HTTP loggers.
     # huggingface_hub uses httpx which logs every HTTP request at INFO level.
     for name in ("httpx", "httpcore"):
