@@ -1145,6 +1145,7 @@ class BaseMultimodalProcessor(ABC):
         return torch.tensor(input_ids, dtype=torch.long).flatten()
 
     def _wrap_tensor_for_cuda_ipc(self, tensor: torch.Tensor):
+        """helper function to turn a tensor into a cuda-ipc tensor"""
         if not tensor.is_cuda:
             return tensor
 
@@ -1294,7 +1295,7 @@ class BaseMultimodalProcessor(ABC):
         """
 
         if SGL_USE_CUDA_IPC:
-            # post-process
+            # post-process, prepare for cuda-ipc transfer
             for item in all_collected_items:
                 if isinstance(item.feature, torch.Tensor):
                     item.feature = self._wrap_tensor_for_cuda_ipc(item.feature)

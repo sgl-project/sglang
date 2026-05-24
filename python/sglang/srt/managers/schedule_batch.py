@@ -348,6 +348,7 @@ class MultimodalDataItem:
         return ret
 
     def reconstruct(self):
+        """materialize cuda ipc proxy tensors in-place on target_device"""
         has_ipc_proxy = isinstance(
             self.feature, CudaIpcTensorTransportProxy
         ) or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
@@ -357,6 +358,7 @@ class MultimodalDataItem:
                 for value in self.model_specific_data.values()
             )
         if not has_ipc_proxy:
+            # if no cuda-ipc tensor is involved
             return
 
         reconstruct_device = torch.cuda.current_device()
