@@ -106,4 +106,3 @@ class LongCatVideoPipelineConfig(PipelineConfig):
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {"encoder_attention_mask": batch.negative_attention_mask[0]}
-

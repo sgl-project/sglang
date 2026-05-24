@@ -156,7 +156,9 @@ def test_longcat_synthesizes_diffusers_model_index_for_official_layout(tmp_path:
     )
     # path field was removed from LongCatComponentSpec (it was dead data — never read by load_modules)
     assert model_index["transformer"]["library"] == "diffusers"
-    assert model_index["transformer"]["architecture"] == "LongCatVideoTransformer3DModel"
+    assert (
+        model_index["transformer"]["architecture"] == "LongCatVideoTransformer3DModel"
+    )
 
 
 @pytest.mark.parametrize(
@@ -224,9 +226,9 @@ def test_longcat_latent_shape_no_double_compression():
     config = _longcat_pipeline_config_cls()()
     batch = SimpleNamespace(height=480, width=832)
     shape = config.prepare_latent_shape(batch, batch_size=1, num_frames=7)
-    assert shape[2] == 7, (
-        f"Expected latent frame dim == 7 (no double compression), got {shape[2]}"
-    )
+    assert (
+        shape[2] == 7
+    ), f"Expected latent frame dim == 7 (no double compression), got {shape[2]}"
 
 
 def test_longcat_synthesize_model_index_structure(tmp_path):
@@ -235,8 +237,15 @@ def test_longcat_synthesize_model_index_structure(tmp_path):
     model_dir = tmp_path / "LongCat-Video"
     model_dir.mkdir()
     index = helpers.synthesize_longcat_model_index(model_dir)
-    required_keys = {"_class_name", "tokenizer", "text_encoder", "vae", "scheduler", "transformer"}
-    assert required_keys <= set(index.keys()), (
-        f"Missing keys: {required_keys - set(index.keys())}"
-    )
+    required_keys = {
+        "_class_name",
+        "tokenizer",
+        "text_encoder",
+        "vae",
+        "scheduler",
+        "transformer",
+    }
+    assert required_keys <= set(
+        index.keys()
+    ), f"Missing keys: {required_keys - set(index.keys())}"
     assert index["_class_name"] == "LongCatVideoPipeline"

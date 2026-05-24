@@ -19,7 +19,10 @@ class LongCatVideoArchConfig(DiTArchConfig):
     # SAGE_ATTN, AITER, VIDEO_SPARSE_ATTN, etc. are not implemented in
     # LongCatSingleStreamBlock and would silently fall back to SDPA or crash.
     _supported_attention_backends: set[AttentionBackendEnum] = field(
-        default_factory=lambda: {AttentionBackendEnum.TORCH_SDPA, AttentionBackendEnum.FA}
+        default_factory=lambda: {
+            AttentionBackendEnum.TORCH_SDPA,
+            AttentionBackendEnum.FA,
+        }
     )
 
     # Keep official LongCat checkpoint keys unchanged.

@@ -55,10 +55,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.glm_image import (
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_video import (
     LongCatVideoPipelineConfig,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -100,13 +100,13 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
+from sglang.multimodal_gen.configs.sample.longcat_video import (
+    LongCatVideoT2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
     LTX23SamplingParams,
-)
-from sglang.multimodal_gen.configs.sample.longcat_video import (
-    LongCatVideoT2VSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -358,9 +358,7 @@ def _get_config_info(
             # If detectors are registered for this model, they take precedence:
             # a detector returning False means this path is explicitly excluded.
             candidate_detectors = [
-                det
-                for mid, det in _MODEL_NAME_DETECTORS
-                if mid == candidate_model_id
+                det for mid, det in _MODEL_NAME_DETECTORS if mid == candidate_model_id
             ]
             if candidate_detectors and not any(
                 det(model_path) for det in candidate_detectors
@@ -407,7 +405,7 @@ def _get_config_info(
     if len(matched_model_names) >= 1:
         if len(matched_model_names) > 1:
             logger.warning(
-                f"More than one model name is matched, using the first matched"
+                "More than one model name is matched, using the first matched"
             )
         model_id = matched_model_names[0]
         return _CONFIG_REGISTRY.get(model_id)

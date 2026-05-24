@@ -4,12 +4,12 @@ from typing import Any, Literal, overload
 
 import torch
 
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
     DenoisingStage,
     DenoisingStepState,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
@@ -88,7 +88,9 @@ class LongCatVideoDenoisingStage(DenoisingStage):
         # it uses an explicit CFG pass via longcat_optimized_cfg instead.
         # The parameter is accepted here to match the DenoisingStage signature
         # but is intentionally not forwarded to the model.
-        kwargs = {key: self._assert_single_encoder(value) for key, value in kwargs.items()}
+        kwargs = {
+            key: self._assert_single_encoder(value) for key, value in kwargs.items()
+        }
         return current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
@@ -131,7 +133,8 @@ class LongCatVideoDenoisingStage(DenoisingStage):
             )
 
         pos_cond_kwargs = {
-            key: self._assert_single_encoder(value) for key, value in pos_cond_kwargs.items()
+            key: self._assert_single_encoder(value)
+            for key, value in pos_cond_kwargs.items()
         }
         if not batch.do_classifier_free_guidance:
             noise_pred = self._predict_noise(
@@ -149,7 +152,8 @@ class LongCatVideoDenoisingStage(DenoisingStage):
             return -noise_pred
 
         neg_cond_kwargs = {
-            key: self._assert_single_encoder(value) for key, value in neg_cond_kwargs.items()
+            key: self._assert_single_encoder(value)
+            for key, value in neg_cond_kwargs.items()
         }
         latent_model_input = torch.cat([latent_model_input, latent_model_input], dim=0)
         if isinstance(timestep, torch.Tensor):

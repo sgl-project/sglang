@@ -1,7 +1,6 @@
 import os
 from typing import Any
 
-import torch
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -38,7 +37,9 @@ class LongCatComponentSpec(dict):
         yield self["architecture"]
 
 
-def synthesize_longcat_model_index(model_path: str | os.PathLike[str]) -> dict[str, Any]:
+def synthesize_longcat_model_index(
+    model_path: str | os.PathLike[str],
+) -> dict[str, Any]:
     """Synthesize a diffusers-compatible model_index for a LongCat-Video checkpoint.
 
     LongCat-Video does not ship a standard diffusers model_index.json — its on-disk

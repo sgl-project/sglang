@@ -107,9 +107,9 @@ class PatchEmbed3D(nn.Module):
 
 
 def modulate_fp32(norm_func, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    assert shift.dtype == torch.float32 and scale.dtype == torch.float32, (
-        f"modulate_fp32 requires float32 inputs; got shift={shift.dtype}, scale={scale.dtype}"
-    )
+    assert (
+        shift.dtype == torch.float32 and scale.dtype == torch.float32
+    ), f"modulate_fp32 requires float32 inputs; got shift={shift.dtype}, scale={scale.dtype}"
     dtype = x.dtype
     x = norm_func(x.to(torch.float32))
     x = x * (scale + 1) + shift
@@ -123,9 +123,7 @@ class FinalLayer_FP32(nn.Module):
         self.num_patch = num_patch
         self.out_channels = out_channels
         self.adaln_tembed_dim = adaln_tembed_dim
-        self.norm_final = FP32LayerNorm(
-            hidden_size, elementwise_affine=False, eps=1e-6
-        )
+        self.norm_final = FP32LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, num_patch * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(), nn.Linear(adaln_tembed_dim, 2 * hidden_size, bias=True)
@@ -169,7 +167,9 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
         return embedding
 
     def forward(self, t: torch.Tensor, dtype: torch.dtype):
@@ -263,7 +263,11 @@ class RotaryPositionalEmbedding(nn.Module):
         freqs_h = repeat(freqs_h, "... n -> ... (n r)", r=2)
         freqs_w = repeat(freqs_w, "... n -> ... (n r)", r=2)
         freqs = broadcat(
-            (freqs_t[:, None, None, :], freqs_h[None, :, None, :], freqs_w[None, None, :, :]),
+            (
+                freqs_t[:, None, None, :],
+                freqs_h[None, :, None, :],
+                freqs_w[None, None, :, :],
+            ),
             dim=-1,
         )
         return rearrange(freqs, "T H W D -> (T H W) D")
@@ -275,13 +279,13 @@ class RotaryPositionalEmbedding(nn.Module):
         freqs_cis = self.freqs_dict[grid_size]
         if freqs_cis.device != q.device:
             freqs_cis = freqs_cis.to(q.device)
-            self.freqs_dict[grid_size] = freqs_cis  # Cache GPU tensor to avoid repeated CPU→GPU copies
+            self.freqs_dict[grid_size] = (
+                freqs_cis  # Cache GPU tensor to avoid repeated CPU→GPU copies
+            )
         q_, k_ = q.float(), k.float()
         freqs_cis = freqs_cis.float()
         cos, sin = freqs_cis.cos(), freqs_cis.sin()
-        cos, sin = rearrange(cos, "n d -> 1 1 n d"), rearrange(
-            sin, "n d -> 1 1 n d"
-        )
+        cos, sin = rearrange(cos, "n d -> 1 1 n d"), rearrange(sin, "n d -> 1 1 n d")
         q_ = (q_ * cos) + (rotate_half(q_) * sin)
         k_ = (k_ * cos) + (rotate_half(k_) * sin)
         return q_.type_as(q), k_.type_as(k)
@@ -355,12 +359,16 @@ class Attention(nn.Module):
             q = rearrange(q, "B H M K -> B M H K")
             k = rearrange(k, "B H M K -> B M H K")
             v = rearrange(v, "B H M K -> B M H K")
-            x = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=None)
+            x = xformers.ops.memory_efficient_attention(
+                q, k, v, attn_bias=None, op=None
+            )
             return rearrange(x, "B M H K -> B H M K")
 
         return F.scaled_dot_product_attention(q, k, v, scale=self.scale)
 
-    def forward(self, x: torch.Tensor, shape=None, num_cond_latents=None, return_kv=False):
+    def forward(
+        self, x: torch.Tensor, shape=None, num_cond_latents=None, return_kv=False
+    ):
         bsz, n_tokens, channels = x.shape
         qkv = self.qkv(x)
         qkv = qkv.view(bsz, n_tokens, 3, self.num_heads, self.head_dim).permute(
@@ -467,9 +475,9 @@ class MultiHeadCrossAttention(nn.Module):
                 q=q[0],
                 k=k[0],
                 v=v[0],
-                cu_seqlens_q=torch.tensor(
-                    [0] + [n_tokens] * bsz, device=q.device
-                ).cumsum(0).to(torch.int32),
+                cu_seqlens_q=torch.tensor([0] + [n_tokens] * bsz, device=q.device)
+                .cumsum(0)
+                .to(torch.int32),
                 cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
                 .cumsum(0)
                 .to(torch.int32),
@@ -484,9 +492,9 @@ class MultiHeadCrossAttention(nn.Module):
                     q=q[0],
                     k=k[0],
                     v=v[0],
-                    cu_seqlens_q=torch.tensor(
-                        [0] + [n_tokens] * bsz, device=q.device
-                    ).cumsum(0).to(torch.int32),
+                    cu_seqlens_q=torch.tensor([0] + [n_tokens] * bsz, device=q.device)
+                    .cumsum(0)
+                    .to(torch.int32),
                     cu_seqlens_k=torch.tensor([0] + kv_seqlen, device=q.device)
                     .cumsum(0)
                     .to(torch.int32),
@@ -731,7 +739,9 @@ class LongCatVideoTransformer3DModel(CachableDiT):
         self.num_channels_latents = config.num_channels_latents
         self.cp_split_hw = config.cp_split_hw
 
-        self.x_embedder = PatchEmbed3D(self.patch_size, self.in_channels, self.hidden_size)
+        self.x_embedder = PatchEmbed3D(
+            self.patch_size, self.in_channels, self.hidden_size
+        )
         self.t_embedder = TimestepEmbedder(
             t_embed_dim=config.adaln_tembed_dim,
             frequency_embedding_size=config.frequency_embedding_size,
@@ -765,8 +775,8 @@ class LongCatVideoTransformer3DModel(CachableDiT):
         )
         self.gradient_checkpointing = False
         self.text_tokens_zero_pad = config.text_tokens_zero_pad
-        self.lora_dict = {}    # TODO: LoRA not yet implemented for LongCat-Video
-        self.active_loras = [] # TODO: LoRA not yet implemented for LongCat-Video
+        self.lora_dict = {}  # TODO: LoRA not yet implemented for LongCat-Video
+        self.active_loras = []  # TODO: LoRA not yet implemented for LongCat-Video
 
     def post_load_weights(self) -> None:
         # Pre-warm RoPE cache for common generation grid sizes to avoid
@@ -777,9 +787,9 @@ class LongCatVideoTransformer3DModel(CachableDiT):
         #   latent_W = width  // 16
         default_grid_sizes = [
             (23, 30, 52),  # 93 frames, 480×832
-            (7,  30, 52),  # 25 frames,  480×832
+            (7, 30, 52),  # 25 frames,  480×832
             (23, 52, 30),  # 93 frames, 832×480
-            (7,  52, 30),  # 25 frames,  832×480
+            (7, 52, 30),  # 25 frames,  832×480
         ]
         try:
             device = next(self.parameters()).device
@@ -871,7 +881,9 @@ class LongCatVideoTransformer3DModel(CachableDiT):
             )
             y_seqlens = encoder_attention_mask.sum(dim=1).tolist()
         else:
-            y_seqlens = [encoder_hidden_states.shape[2]] * encoder_hidden_states.shape[0]
+            y_seqlens = [encoder_hidden_states.shape[2]] * encoder_hidden_states.shape[
+                0
+            ]
             encoder_hidden_states = encoder_hidden_states.squeeze(1).view(
                 1, -1, hidden_states.shape[-1]
             )
