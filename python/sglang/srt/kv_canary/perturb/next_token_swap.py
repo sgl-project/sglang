@@ -29,7 +29,7 @@ class NextTokenSwapConfig:
     def from_env(cls) -> "NextTokenSwapConfig":
         return cls(
             prob=envs.SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB.get(),
-            warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_WARMUP_STEPS.get(),
+            warmup_steps=envs.SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS.get(),
         )
 
 

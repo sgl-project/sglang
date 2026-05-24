@@ -18,7 +18,7 @@ class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
 
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB": "0.1",
-        "SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_WARMUP_STEPS": "0",
+        "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
     }
     extra_server_args = ("--skip-server-warmup",)
 
