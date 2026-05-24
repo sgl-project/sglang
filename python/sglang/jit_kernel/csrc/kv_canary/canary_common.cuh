@@ -32,14 +32,13 @@ SGL_DEVICE uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-// 4-arg chain step: nested splitmix64 of the four uint64 inputs. Each input is folded into the running
+// 3-arg chain step: nested splitmix64 of the three uint64 inputs. Each input is folded into the running
 // accumulator via `acc = splitmix64(acc ^ next)`, so order is significant and a pair of equal inputs no
-// longer self-cancels. Matches the Python helper splitmix64_mix4 in kv_canary/verify_ref.py.
-SGL_DEVICE uint64_t splitmix64_mix4(uint64_t a, uint64_t b, uint64_t c, uint64_t d) {
+// longer self-cancels. Matches the Python helper splitmix64_mix3 in kv_canary/consts.py.
+SGL_DEVICE uint64_t splitmix64_mix3(uint64_t a, uint64_t b, uint64_t c) {
   uint64_t h = splitmix64(a);
   h = splitmix64(h ^ b);
   h = splitmix64(h ^ c);
-  h = splitmix64(h ^ d);
   return h;
 }
 
@@ -162,9 +161,17 @@ canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, in
   p[field] = value;
 }
 
-// Compute the chain-step hash of ``source_slot_idx``: load that slot's four stored fields (token, position,
-// prev_hash, real_kv_hash) and fold them through splitmix64_mix4. The result is the chain hash that the slot
-// immediately following ``source_slot_idx`` should store as its prev_hash.
+// Compute the chain-step hash of ``source_slot_idx``: load (token, position, prev_hash) from that slot
+// and fold them through splitmix64_mix3. The result is the chain hash that the slot immediately following
+// ``source_slot_idx`` should store as its prev_hash.
+//
+// real_kv_hash is intentionally NOT folded in: under radix prefix sharing, ``RadixCache.cache_unfinished_req``
+// remaps ``req_to_token[req, P]`` from a req's own freshly-written slot to a shared slot owned by another
+// req. The shared slot's (token, position, prev_hash) match by definition (same prompt → same content
+// chain), but its real_kv_hash reflects the donor req's KV values and would not equal the consumer req's
+// stored chain. Excluding real_kv_hash keeps the chain pure-content and immune to legitimate radix folding.
+// real_kv_hash field corruption is still caught by the standalone real_kv_hash field check on each slot
+// (per-forward verify + periodic sweep).
 //
 // ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on splitmix64(kCanaryChainAnchor).
 // Shared by the verify path (recompute expected prev_hash from a slot's predecessor) and the write path
@@ -176,13 +183,10 @@ SGL_DEVICE uint64_t compute_slot_hash(const uint8_t* canary_buf, int64_t slot_st
   const int64_t token = canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldToken);
   const int64_t position = canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldPosition);
   const int64_t prev_hash = canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldPrevHash);
-  const int64_t real_kv_hash =
-      canary_load_field(canary_buf, source_slot_idx, slot_stride_bytes, kCanaryFieldRealKvHash);
-  return splitmix64_mix4(
+  return splitmix64_mix3(
       static_cast<uint64_t>(prev_hash),
       static_cast<uint64_t>(token),
-      static_cast<uint64_t>(position),
-      static_cast<uint64_t>(real_kv_hash));
+      static_cast<uint64_t>(position));
 }
 
 }  // namespace canary

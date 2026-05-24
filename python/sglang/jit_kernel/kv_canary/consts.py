@@ -63,13 +63,12 @@ def splitmix64(value: int) -> int:
     return (x ^ (x >> 31)) & _U64_MASK
 
 
-def splitmix64_mix4(a: int, b: int, c: int, d: int) -> int:
-    """Chained 4-input splitmix64. Folds each input into a running accumulator via
+def splitmix64_mix3(a: int, b: int, c: int) -> int:
+    """Chained 3-input splitmix64. Folds each input into a running accumulator via
     ``acc = splitmix64(acc ^ next)``; order-sensitive, no XOR self-cancellation between equal inputs.
-    Must stay byte-equal to ``splitmix64_mix4`` in csrc/kv_canary/canary_common.cuh.
+    Must stay byte-equal to ``splitmix64_mix3`` in csrc/kv_canary/canary_common.cuh.
     """
     h = splitmix64(a & _U64_MASK)
     h = splitmix64(h ^ (b & _U64_MASK))
     h = splitmix64(h ^ (c & _U64_MASK))
-    h = splitmix64(h ^ (d & _U64_MASK))
     return h

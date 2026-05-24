@@ -10,7 +10,7 @@ from sglang.jit_kernel.kv_canary.verify_ref import (
     _compute_real_kv_hash_scalar,
     _to_signed_int64,
     compute_slot_hash,
-    splitmix64_mix4,
+    splitmix64_mix3,
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 
@@ -154,8 +154,8 @@ def launch_canary_write_kernel_torch_reference(
                 real_kv_hash_u64
             )
 
-            running_prev_hash = splitmix64_mix4(
-                running_prev_hash, token, position, real_kv_hash_u64
+            running_prev_hash = splitmix64_mix3(
+                running_prev_hash, token, position
             )
 
             total_slots_written += 1

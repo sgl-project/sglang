@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
 from sglang.jit_kernel.kv_canary.verify import VerifyPlan
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._constants import (
@@ -295,8 +295,8 @@ def stamp_clean_chain(
                 real_kv_hash=to_signed_int64(real_kv_hash),
             )
         stored_prev_hashes.append(signed_prev)
-        running_prev_hash = splitmix64_mix4(
-            running_prev_hash, token, position, real_kv_hash
+        running_prev_hash = splitmix64_mix3(
+            running_prev_hash, token, position
         )
     return stored_prev_hashes
 

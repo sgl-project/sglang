@@ -9,7 +9,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary import consts
 from sglang.jit_kernel.kv_canary import write as write_module
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
 from sglang.jit_kernel.kv_canary.verify import (
     CANARY_SLOT_BYTES,
     CanaryLaunchTag,
@@ -170,9 +170,8 @@ class TestSeedSlot:
             expected_input_positions=pseudo_positions,
         )
 
-        expected_prev_hash = splitmix64_mix4(
-            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
-        )
+        expected_prev_hash = splitmix64_mix3(
+            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position)
         _, _, stored_prev_hash, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=2)
         assert stored_prev_hash == to_signed_int64(expected_prev_hash)
 
@@ -248,9 +247,8 @@ class TestSeedSlot:
             prev_hash=seed_prev_hash_signed,
         )
 
-        predecessor_advance = splitmix64_mix4(
-            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position, 0
-        )
+        predecessor_advance = splitmix64_mix3(
+            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position)
 
         tokens = [101, 202, 303, 404, 505]
         positions = [11, 12, 13, 14, 15]
@@ -261,7 +259,7 @@ class TestSeedSlot:
         running = predecessor_advance
         for t, p, r in zip(tokens, positions, real_kv):
             expected_prev_hashes.append(running)
-            running = splitmix64_mix4(running, t, p, r)
+            running = splitmix64_mix3(running, t, p)
 
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 5],
@@ -294,7 +292,7 @@ class TestSeedSlot:
         assert int(cuda_log.write_index[0].item()) == 0
 
     def test_seed_continues_existing_chain(self) -> None:
-        """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix4(seed.*)."""
+        """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix3(seed.*)."""
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -304,20 +302,15 @@ class TestSeedSlot:
         seed_real_kv = 0
         expected_seed_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         stamp_pair(
-            buf_pair,
-            slot_idx=seed_slot,
-            token=seed_token,
-            position=seed_position,
-            prev_hash=to_signed_int64(expected_seed_prev_hash),
+            buf_pair),
             real_kv_hash=to_signed_int64(seed_real_kv),
         )
 
         new_slot = 4
         new_token = 13
         new_position = 2
-        expected_running = splitmix64_mix4(
-            expected_seed_prev_hash, seed_token, seed_position, seed_real_kv
-        )
+        expected_running = splitmix64_mix3(
+            expected_seed_prev_hash, seed_token, seed_position)
 
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
@@ -388,7 +381,7 @@ class TestChain:
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
             expected_prev_hashes_u64.append(running)
-            running = splitmix64_mix4(running, token, position, real_kv_hash)
+            running = splitmix64_mix3(running, token, position)
         expected_prev_hashes_signed = [
             to_signed_int64(h) for h in expected_prev_hashes_u64
         ]
@@ -462,7 +455,7 @@ class TestChain:
             assert stored_prev_signed == to_signed_int64(
                 running
             ), f"slot {slot_idx}: stored prev_hash != recomputed chain step"
-            running = splitmix64_mix4(running, token, position, stored_real_kv_hash)
+            running = splitmix64_mix3(running, token, position)
 
 
 class TestMockMode:

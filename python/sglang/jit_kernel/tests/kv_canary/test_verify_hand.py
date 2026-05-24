@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix4
+from sglang.jit_kernel.kv_canary.consts import splitmix64, splitmix64_mix3
 from sglang.jit_kernel.kv_canary.verify import (
     CanaryLaunchTag,
     RealKvSource,
@@ -205,7 +205,7 @@ class TestChain:
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
             expected_prev_hashes_u64.append(running)
-            running = splitmix64_mix4(running, token, position, real_kv_hash)
+            running = splitmix64_mix3(running, token, position)
         expected_prev_hashes_signed = [
             to_signed_int64(h) for h in expected_prev_hashes_u64
         ]
@@ -247,36 +247,32 @@ class TestChain:
     def test_chain_advance_formula_matches_spec(self) -> None:
         """Ref impl agrees with the chained splitmix64 chain-step formula.
 
-        The chain step folds each of the 4 inputs into the accumulator sequentially via
-        ``acc = splitmix64(acc ^ next)``, starting from ``splitmix64(prev_hash)``. ``splitmix64_mix4``
-        must produce the same result as the explicit chain.
+        The chain step folds each of the 3 inputs into the accumulator sequentially via
+        ``acc = splitmix64(acc ^ next)``, starting from ``splitmix64(prev_hash)``. ``splitmix64_mix3``
+        must produce the same result as the explicit chain. ``real_kv_hash`` is intentionally NOT
+        part of the chain hash — see ``compute_slot_hash`` for the radix-folding rationale.
         """
         cases = [
-            (consts.CANARY_CHAIN_ANCHOR, 0, 0, 0),
-            (0x1234567890ABCDEF, 100, 5, 0xDEADBEEF),
-            (0, 0xFFFF, 0x7FFFFFFF, 0xCAFEBABE),
-            (0x123, 1, 1, 1),
-            (0xFFFFFFFFFFFFFFFF, 0xFFFF, 0xFFFF, 0xFFFF),
+            (consts.CANARY_CHAIN_ANCHOR, 0, 0),
+            (0x1234567890ABCDEF, 100, 5),
+            (0, 0xFFFF, 0x7FFFFFFF),
+            (0x123, 1, 1),
+            (0xFFFFFFFFFFFFFFFF, 0xFFFF, 0xFFFF),
         ]
-        for prev_hash, token, position, real_kv_hash in cases:
+        for prev_hash, token, position in cases:
             u64_mask = (1 << 64) - 1
             h = splitmix64(prev_hash & u64_mask)
             h = splitmix64(h ^ (token & u64_mask))
-            h = splitmix64(h ^ (position & u64_mask))
-            expected = splitmix64(h ^ (real_kv_hash & u64_mask))
+            expected = splitmix64(h ^ (position & u64_mask))
 
             actual = (
-                splitmix64_mix4(
-                    prev_hash & u64_mask,
-                    token & u64_mask,
-                    position & u64_mask,
-                    real_kv_hash & u64_mask,
-                )
+                splitmix64_mix3(
+                    prev_hash & u64_mask, token & u64_mask, position & u64_mask)
                 & u64_mask
             )
             assert actual == expected, (
                 f"chain advance mismatch: prev={prev_hash:#x} token={token:#x} pos={position:#x} "
-                f"rkv={real_kv_hash:#x} expected={expected:#x} actual={actual:#x}"
+                f"expected={expected:#x} actual={actual:#x}"
             )
 
     def test_chain_head_anchored_on_constant(self) -> None:
@@ -950,7 +946,7 @@ class TestRealKvHash:
                 prev_hash=signed_prev,
                 real_kv_hash=to_signed_int64(rkv),
             )
-            running = splitmix64_mix4(running, token, position, rkv)
+            running = splitmix64_mix3(running, token, position)
 
         plan_pair = make_verify_plan_pair(
             slot_indices=slot_indices,
@@ -1384,7 +1380,7 @@ class TestLayoutAndScheduling:
                 prev_hash=signed_prev,
                 real_kv_hash=to_signed_int64(rkv),
             )
-            running = splitmix64_mix4(running, token, position, rkv)
+            running = splitmix64_mix3(running, token, position)
 
         plan_pair = make_verify_plan_pair(
             slot_indices=slot_indices,

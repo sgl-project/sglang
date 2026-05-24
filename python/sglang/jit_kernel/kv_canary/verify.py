@@ -236,9 +236,11 @@ def launch_canary_verify_kernel(
     any mismatch (chain hash / position / real_kv_hash) to violation_ring. Read-only on canary_buf.
 
     Canary slot layout: each slot is canary_buf.shape[1] bytes holding 4 int64 fields (token_id, position,
-    prev_hash, real_kv_hash). Chain link: next.prev_hash == splitmix64_mix4(this.prev_hash, this.token_id,
-    this.position, this.real_kv_hash), where splitmix64_mix4 folds each input into a running accumulator
-    via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev_hash)``. Chain head anchors on
+    prev_hash, real_kv_hash). Chain link: next.prev_hash == splitmix64_mix3(this.prev_hash, this.token_id,
+    this.position), where splitmix64_mix3 folds each input into a running accumulator
+    via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev_hash)``. ``real_kv_hash`` is NOT
+    folded into the chain (see ``compute_slot_hash`` rationale: keeps chain content-only and immune to
+    legitimate radix prefix folding). Chain head anchors on
     splitmix64(CANARY_CHAIN_ANCHOR), where CANARY_CHAIN_ANCHOR is a hardcoded module-level constant (no
     runtime seed parameter — the canary is for bug detection, not adversarial security, so a fixed anchor
     is sufficient).

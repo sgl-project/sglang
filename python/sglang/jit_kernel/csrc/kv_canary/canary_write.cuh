@@ -131,11 +131,10 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
         p.canary_buf, slot, p.slot_stride_bytes, kCanaryFieldPrevHash, static_cast<int64_t>(running_prev_hash));
     canary_store_field(p.canary_buf, slot, p.slot_stride_bytes, kCanaryFieldRealKvHash, real_kv_hash);
 
-    running_prev_hash = splitmix64_mix4(
+    running_prev_hash = splitmix64_mix3(
         running_prev_hash,
         static_cast<uint64_t>(token),
-        static_cast<uint64_t>(position),
-        static_cast<uint64_t>(real_kv_hash));
+        static_cast<uint64_t>(position));
   }
 
   // Each block contributes its non-skipped entry count to slot_run_counter once at exit.

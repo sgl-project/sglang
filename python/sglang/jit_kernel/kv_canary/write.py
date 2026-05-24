@@ -89,12 +89,14 @@ def launch_canary_write_kernel(
     - ``token / position`` = ``input_ids[i] / positions[i]``.
     - ``real_kv_hash`` = ``real_kv_fold_sources(real_kv_sources, slot)`` if ``real_kv_hash_mode != OFF`` else 0.
     - Store 4 int64s ``(token, position, running_prev_hash, real_kv_hash)`` into ``canary_buf[slot]``.
-    - Advance ``running_prev_hash = splitmix64_mix4(prev, token, position, real_kv_hash)``, where
-      splitmix64_mix4 folds each input via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev)``.
+    - Advance ``running_prev_hash = splitmix64_mix3(prev, token, position)``, where
+      splitmix64_mix3 folds each input via ``acc = splitmix64(acc ^ next)`` starting from ``splitmix64(prev)``.
+      ``real_kv_hash`` is intentionally not folded into the chain — see ``compute_slot_hash`` in
+      ``csrc/kv_canary/canary_common.cuh`` for the radix-folding rationale.
 
-    Initial ``running_prev_hash`` when ``seed_slot_idx >= 0``: load the 4 int64 fields from
+    Initial ``running_prev_hash`` when ``seed_slot_idx >= 0``: load (token, position, prev_hash) from
     ``canary_buf[plan.write_seed_slot_indices[r]]`` and set
-    ``running_prev_hash = splitmix64_mix4(seed.prev_hash, seed.token, seed.position, seed.real_kv_hash)``
+    ``running_prev_hash = splitmix64_mix3(seed.prev_hash, seed.token, seed.position)``
     (i.e. apply the same advance step that produced ``seed``'s successor — this keeps slot[0]'s stored
     ``prev_hash`` consistent with the chain link). Else
     ``running_prev_hash = splitmix64(CANARY_CHAIN_ANCHOR)``. ``write_seed_slot_indices`` is already
@@ -142,9 +144,9 @@ def launch_canary_write_kernel(
         - Per block, early-exit on r >= plan.write_num_valid_reqs[0]. Else load entry_start = plan.write_offsets[r],
           entry_count = plan.write_offsets[r+1] - entry_start, seed_slot_idx = plan.write_seed_slot_indices[r] into
           registers.
-        - Initialize running_prev_hash: if seed_slot_idx >= 0, load the 4 int64 fields from
-          canary_buf[seed_slot_idx] and set running_prev_hash = splitmix64_mix4(prev_hash, token, position,
-          real_kv_hash); else running_prev_hash = splitmix64(kCanaryChainAnchor).
+        - Initialize running_prev_hash: if seed_slot_idx >= 0, load (token, position, prev_hash) from
+          canary_buf[seed_slot_idx] and set running_prev_hash = splitmix64_mix3(prev_hash, token, position);
+          else running_prev_hash = splitmix64(kCanaryChainAnchor).
         - Serial chain loop `for j in range(entry_count)`:
               i = entry_start + j;
               slot = out_cache_loc[i];  // caller-pre-translated; the kernel never consults a LUT
@@ -156,7 +158,7 @@ def launch_canary_write_kernel(
                   if token != expected_input_tokens[i] or position != expected_input_positions[i]:
                       record_violation();  // chain still advances on the ACTUAL (token, position) below
               store (token, position, running_prev_hash, real_kv_hash) to canary_buf[slot] as 4 int64 fields;
-              running_prev_hash = splitmix64_mix4(running_prev_hash, token, position, real_kv_hash);
+              running_prev_hash = splitmix64_mix3(running_prev_hash, token, position);
         - All chain state lives in the block's single thread's registers. No shared memory, no cross-block
           coordination.
         - record_violation() identical to verify (atomicAdd + atomic-write).
