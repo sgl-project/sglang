@@ -9,6 +9,7 @@ Samuel James Hiotis | ABN 56 628 117 363
 import os
 import json
 import time
+import socket
 import sqlite3
 import logging
 import threading
@@ -16,7 +17,7 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # ── vault ─────────────────────────────────────────────────────────────────────
 _vault = Path(os.path.expanduser("~/.secrets/fractal.env"))
@@ -47,7 +48,9 @@ logging.basicConfig(
 log = logging.getLogger("fm_metrics")
 
 # ── known agents (name → port) ────────────────────────────────────────────────
+# 79 agents: ports 7785-7833 (49 slots) + 30 additional agents
 AGENTS: Dict[str, int] = {
+    # Core infrastructure (7785-7833)
     "fm-mcp-router":          7785,
     "fm-strategy-engine":     7786,
     "fm-revenue-aggregator":  7787,
@@ -97,10 +100,41 @@ AGENTS: Dict[str, int] = {
     "fm-cronjob":             7831,
     "fm-swarm":               7832,
     "fm-admin-dashboard":     7833,
+    # Additional agents (7834+ and other ports)
+    "fm-affiliate":           7836,
+    "fm-analytics":           7837,
+    "fm-ais-monitor":         7838,
+    "fm-auto-advert":         7839,
+    "fm-azr-rl":              7840,
+    "fm-bounty":              7841,
+    "fm-carbon-credits":      7842,
+    "fm-contract-forge":      7843,
+    "fm-delivery":            7844,
+    "fm-device-bridge":       7845,
+    "fm-domain":              7846,
+    "fm-dork-engine":         7847,
+    "fm-drip-agent":          7848,
+    "fm-email-listener":      7849,
+    "fm-enochian-hash":       7850,
+    "fm-enterprise-bus":      7851,
+    "fm-figma":               7852,
+    "fm-geo-validator":       7853,
+    "fm-geosignal":           7854,
+    "fm-gitops-runner":       7855,
+    "fm-healer":              7856,
+    "fm-immortality":         7857,
+    "fm-ipfs":                7858,
+    "fm-lba-bridge":          7859,
+    "fm-licensing":           7860,
+    "fm-live-tokenomics":     7861,
+    "fm-mesh-integrator":     7862,
+    "fm-methane-reports":     7863,
+    "fm-negotiator":          7864,
+    "fm-oversight":           7865,
 }
 
 # ── known SQLite tables to row-count ─────────────────────────────────────────
-TRACKED_TABLES = [
+TRACKED_TABLES: List[str] = [
     "leads", "campaigns", "sequences", "gumroad_sales", "printful_orders",
     "coinbase_orders", "kucoin_orders", "pionex_orders", "twitter_posts",
     "sendgrid_sends", "alchemy_events", "coingecko_queries", "osint_reports",
@@ -111,10 +145,12 @@ TRACKED_TABLES = [
 ]
 
 # ── in-memory metrics store ───────────────────────────────────────────────────
+# Keys are unique internal identifiers; each entry carries its own labels dict
+# so that multiple series under the same metric family are represented cleanly.
 _metrics_lock = threading.Lock()
 _metrics: Dict[str, Dict[str, Any]] = {}
 
-# Track when each agent was last seen up (for alert age calculation)
+# Track when each agent was first observed down (for alert age calculation)
 _agent_down_since: Dict[str, float] = {}
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -127,52 +163,75 @@ def _prom_escape(s: str) -> str:
 def _set_metric(
     name: str,
     value: float,
-    labels: Dict[str, str] = None,
+    labels: Optional[Dict[str, str]] = None,
     help_text: str = "",
     metric_type: str = "gauge",
 ) -> None:
-    """Thread-safe update of a single metric in the in-memory store."""
+    """
+    Thread-safe update of a single metric in the in-memory store.
+
+    *name* is the Prometheus metric family name (e.g. ``fm_agent_up``).
+    Multiple series within the same family are stored under a unique key
+    formed as ``name`` + a deterministic label suffix so they don't overwrite
+    each other, while ``_format_prometheus`` can still group them correctly.
+    """
     if labels is None:
         labels = {}
+    # Build a unique storage key from the family name and sorted label pairs
+    if labels:
+        label_suffix = "__{" + ",".join(
+            f"{k}={v}" for k, v in sorted(labels.items())
+        ) + "}"
+    else:
+        label_suffix = ""
+    storage_key = name + label_suffix
     with _metrics_lock:
-        _metrics[name] = {
-            "value":      value,
-            "labels":     labels,
-            "help":       help_text,
-            "type":       metric_type,
-            "updated_at": time.time(),
+        _metrics[storage_key] = {
+            "metric_name": name,           # Prometheus family name
+            "value":       value,
+            "labels":      labels,
+            "help":        help_text,
+            "type":        metric_type,
+            "updated_at":  time.time(),
         }
 
 
 def _format_prometheus() -> str:
     """Build the complete Prometheus text exposition from _metrics."""
     now_ms = int(time.time() * 1000)
-    lines: list[str] = []
     with _metrics_lock:
         snapshot = dict(_metrics)
 
-    # Group by base metric name (strip label suffix for HELP/TYPE blocks)
-    seen_headers: set[str] = set()
-    for metric_name, data in sorted(snapshot.items()):
-        # Derive the base metric family name (everything before first "{")
-        base = metric_name.split("{")[0]
-        if base not in seen_headers:
-            if data["help"]:
-                lines.append(f"# HELP {base} {data['help']}")
-            lines.append(f"# TYPE {base} {data['type']}")
-            seen_headers.add(base)
+    # Group entries by their Prometheus family name, preserving insertion order
+    families: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+    for storage_key, data in sorted(snapshot.items()):
+        family = data.get("metric_name", storage_key.split("__{")[0])
+        families.setdefault(family, []).append((storage_key, data))
 
-        label_str = ""
-        if data["labels"]:
-            pairs = ",".join(
-                f'{k}="{_prom_escape(str(v))}"'
-                for k, v in sorted(data["labels"].items())
-            )
-            label_str = f"{{{pairs}}}"
+    lines: List[str] = []
+    for family, entries in families.items():
+        # Emit HELP and TYPE once per family, from the first entry
+        first_data = entries[0][1]
+        if first_data.get("help"):
+            lines.append(f"# HELP {family} {first_data['help']}")
+        lines.append(f"# TYPE {family} {first_data['type']}")
 
-        val = data["value"]
-        val_str = f"{val:.6g}" if val != int(val) else str(int(val))
-        lines.append(f"{base}{label_str} {val_str} {now_ms}")
+        for _storage_key, data in entries:
+            label_str = ""
+            if data["labels"]:
+                pairs = ",".join(
+                    f'{k}="{_prom_escape(str(v))}"'
+                    for k, v in sorted(data["labels"].items())
+                )
+                label_str = f"{{{pairs}}}"
+
+            val = data["value"]
+            # Compact float representation: no trailing zeros
+            if val == int(val):
+                val_str = str(int(val))
+            else:
+                val_str = f"{val:.6g}"
+            lines.append(f"{family}{label_str} {val_str} {now_ms}")
 
     return "\n".join(lines) + "\n"
 
@@ -180,7 +239,7 @@ def _format_prometheus() -> str:
 def _try_get(url: str, timeout: float = 1.0) -> Tuple[Optional[float], int]:
     """
     Perform a GET request.  Returns (response_time_ms, status_code).
-    On connection error returns (None, 0).
+    On any connection error returns (None, 0).
     """
     t0 = time.monotonic()
     try:
@@ -193,7 +252,7 @@ def _try_get(url: str, timeout: float = 1.0) -> Tuple[Optional[float], int]:
 
 
 def _read_proc_meminfo() -> Dict[str, int]:
-    """Parse /proc/meminfo and return a dict of field → kB values."""
+    """Parse /proc/meminfo and return a dict of field → kB integer values."""
     result: Dict[str, int] = {}
     try:
         with open("/proc/meminfo", "r") as fh:
@@ -223,6 +282,7 @@ def _safe_count(conn: sqlite3.Connection, table: str, where: str = "") -> int:
 
 
 def _open_db() -> sqlite3.Connection:
+    """Open the sovereign SQLite database with WAL mode enabled."""
     conn = sqlite3.connect(str(DB), timeout=15, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.row_factory = sqlite3.Row
@@ -263,23 +323,28 @@ def _load_custom_metrics() -> None:
     try:
         conn = _open_db()
         rows = conn.execute(
-            "SELECT name, value, labels, help_text, metric_type, updated_at FROM custom_metrics"
+            "SELECT name, value, labels, help_text, metric_type, updated_at "
+            "FROM custom_metrics"
         ).fetchall()
         conn.close()
         for row in rows:
-            labels = {}
+            labels: Dict[str, str] = {}
             try:
                 labels = json.loads(row["labels"] or "{}")
             except (json.JSONDecodeError, TypeError):
                 pass
+            _set_metric(
+                name=row["name"],
+                value=float(row["value"] or 0),
+                labels=labels,
+                help_text=row["help_text"] or "",
+                metric_type=row["metric_type"] or "gauge",
+            )
+            # Override updated_at to the stored timestamp
             with _metrics_lock:
-                _metrics[row["name"]] = {
-                    "value":      float(row["value"] or 0),
-                    "labels":     labels,
-                    "help":       row["help_text"] or "",
-                    "type":       row["metric_type"] or "gauge",
-                    "updated_at": float(row["updated_at"] or time.time()),
-                }
+                for key in list(_metrics.keys()):
+                    if _metrics[key].get("metric_name") == row["name"] and _metrics[key]["labels"] == labels:
+                        _metrics[key]["updated_at"] = float(row["updated_at"] or time.time())
         log.info("Loaded %d custom metrics from DB.", len(rows))
     except Exception as exc:
         log.warning("Could not load custom metrics: %s", exc)
@@ -289,7 +354,7 @@ def _load_custom_metrics() -> None:
 
 def _poll_agent_health() -> None:
     """Poll every 30 s; probe each known agent's /health endpoint."""
-    log.info("Agent health poller started.")
+    log.info("Agent health poller started (%d agents).", len(AGENTS))
     while True:
         for name, port in AGENTS.items():
             url = f"http://127.0.0.1:{port}/health"
@@ -298,33 +363,23 @@ def _poll_agent_health() -> None:
             labels = {"name": name, "port": str(port)}
 
             _set_metric(
-                f"fm_agent_up__{name}",
+                "fm_agent_up",
                 float(up),
                 labels=labels,
                 help_text="Agent health status (1=up, 0=down)",
                 metric_type="gauge",
             )
-            if elapsed_ms is not None:
-                _set_metric(
-                    f"fm_agent_response_ms__{name}",
-                    elapsed_ms,
-                    labels=labels,
-                    help_text="Agent HTTP response time in milliseconds",
-                    metric_type="gauge",
-                )
-            else:
-                _set_metric(
-                    f"fm_agent_response_ms__{name}",
-                    0.0,
-                    labels=labels,
-                    help_text="Agent HTTP response time in milliseconds",
-                    metric_type="gauge",
-                )
+            _set_metric(
+                "fm_agent_response_ms",
+                elapsed_ms if elapsed_ms is not None else 0.0,
+                labels=labels,
+                help_text="Agent HTTP response time in milliseconds",
+                metric_type="gauge",
+            )
 
             now = time.time()
             if up == 0:
-                if name not in _agent_down_since:
-                    _agent_down_since[name] = now
+                _agent_down_since.setdefault(name, now)
             else:
                 _agent_down_since.pop(name, None)
 
@@ -342,27 +397,27 @@ def _poll_db_metrics() -> None:
             for table in TRACKED_TABLES:
                 count = _safe_count(conn, table)
                 _set_metric(
-                    f"fm_table_rows__{table}",
+                    "fm_table_rows",
                     float(count),
                     labels={"table": table},
                     help_text="Number of rows in the named SQLite table",
                     metric_type="gauge",
                 )
 
-            # Revenue metrics
+            # Revenue: total Gumroad revenue
             try:
                 row = conn.execute(
                     "SELECT COALESCE(SUM(price), 0) FROM gumroad_sales"
                 ).fetchone()
-                _set_metric(
-                    "fm_gumroad_revenue_total",
-                    float(row[0]) if row else 0.0,
-                    help_text="Total Gumroad revenue (sum of price column)",
-                    metric_type="counter",
-                )
+                gumroad_rev = float(row[0]) if row else 0.0
             except sqlite3.OperationalError:
-                _set_metric("fm_gumroad_revenue_total", 0.0,
-                            help_text="Total Gumroad revenue", metric_type="counter")
+                gumroad_rev = 0.0
+            _set_metric(
+                "fm_gumroad_revenue_total",
+                gumroad_rev,
+                help_text="Total Gumroad revenue (sum of price column)",
+                metric_type="counter",
+            )
 
             _set_metric(
                 "fm_gumroad_sales_total",
@@ -453,7 +508,7 @@ def _poll_system() -> None:
 
 class MetricsHandler(BaseHTTPRequestHandler):
 
-    def log_message(self, fmt: str, *args: Any) -> None:  # suppress default stdout
+    def log_message(self, fmt: str, *args: Any) -> None:
         log.debug("HTTP %s", fmt % args)
 
     # ── routing ──────────────────────────────────────────────────────────────
@@ -488,10 +543,10 @@ class MetricsHandler(BaseHTTPRequestHandler):
 
     def _handle_health(self) -> None:
         self._send_json(200, {
-            "status":            "ok",
-            "service":           "fm-metrics",
-            "port":              PORT,
-            "agents_monitored":  len(AGENTS),
+            "status":           "ok",
+            "service":          "fm-metrics",
+            "port":             PORT,
+            "agents_monitored": len(AGENTS),
         })
 
     def _handle_metrics_prom(self) -> None:
@@ -508,12 +563,21 @@ class MetricsHandler(BaseHTTPRequestHandler):
         self._send_json(200, snapshot)
 
     def _handle_metric_single(self, name: str) -> None:
+        """
+        Look up a metric by its Prometheus family name or its storage key.
+        Returns the first match found.
+        """
         with _metrics_lock:
-            data = _metrics.get(name)
-        if data is None:
-            self._send_json(404, {"error": "metric not found", "name": name})
-        else:
-            self._send_json(200, {"name": name, **data})
+            # Exact storage-key match first
+            if name in _metrics:
+                self._send_json(200, {"name": name, **_metrics[name]})
+                return
+            # Fall back to matching by Prometheus family name
+            for storage_key, data in _metrics.items():
+                if data.get("metric_name") == name:
+                    self._send_json(200, {"name": name, **data})
+                    return
+        self._send_json(404, {"error": "metric not found", "name": name})
 
     def _handle_push(self) -> None:
         try:
@@ -529,28 +593,27 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "name is required"})
             return
 
-        value      = float(payload.get("value", 0))
-        labels     = payload.get("labels") or {}
-        help_text  = payload.get("help", "")
-        mtype      = payload.get("type", "gauge")
-        now        = time.time()
+        value     = float(payload.get("value", 0))
+        labels    = payload.get("labels") or {}
+        help_text = payload.get("help", "")
+        mtype     = payload.get("type", "gauge")
+        now       = time.time()
 
-        # Update in-memory store
+        # Update in-memory store via standard helper (respects label-based key)
+        _set_metric(name, value, labels=labels, help_text=help_text, metric_type=mtype)
+        # Override updated_at to exactly now (set_metric already sets it, but be explicit)
         with _metrics_lock:
-            _metrics[name] = {
-                "value":      value,
-                "labels":     labels,
-                "help":       help_text,
-                "type":       mtype,
-                "updated_at": now,
-            }
+            for key in list(_metrics.keys()):
+                if _metrics[key].get("metric_name") == name and _metrics[key]["labels"] == labels:
+                    _metrics[key]["updated_at"] = now
 
         # Upsert into custom_metrics table
         try:
             conn = _open_db()
             conn.execute(
                 """
-                INSERT INTO custom_metrics (name, value, labels, help_text, metric_type, updated_at)
+                INSERT INTO custom_metrics
+                    (name, value, labels, help_text, metric_type, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     value       = excluded.value,
@@ -573,13 +636,17 @@ class MetricsHandler(BaseHTTPRequestHandler):
             snap = dict(_metrics)
 
         agents_up = sum(
-            1 for k, v in snap.items()
-            if k.startswith("fm_agent_up__") and v["value"] == 1
+            1 for data in snap.values()
+            if data.get("metric_name") == "fm_agent_up" and data["value"] == 1
         )
         agents_total = len(AGENTS)
 
-        def _val(key: str, default: float = 0.0) -> float:
-            return float(snap.get(key, {}).get("value", default))
+        def _val(family: str, default: float = 0.0) -> float:
+            """Return the value of the first entry matching the given family name."""
+            for data in snap.values():
+                if data.get("metric_name") == family:
+                    return float(data["value"])
+            return default
 
         summary = {
             "agents": {
@@ -588,9 +655,9 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 "down":  agents_total - agents_up,
             },
             "revenue": {
-                "gumroad_total":      _val("fm_gumroad_revenue_total"),
-                "gumroad_sales":      _val("fm_gumroad_sales_total"),
-                "coinbase_orders":    _val("fm_coinbase_orders_total"),
+                "gumroad_total":   _val("fm_gumroad_revenue_total"),
+                "gumroad_sales":   _val("fm_gumroad_sales_total"),
+                "coinbase_orders": _val("fm_coinbase_orders_total"),
             },
             "leads": {
                 "total":     _val("fm_leads_total"),
@@ -598,16 +665,16 @@ class MetricsHandler(BaseHTTPRequestHandler):
                 "converted": _val("fm_leads_converted"),
             },
             "system": {
-                "cpu_load_1m":        _val("fm_cpu_percent"),
-                "memory_used_bytes":  _val("fm_memory_used_bytes"),
-                "disk_used_bytes":    _val("fm_disk_used_bytes"),
+                "cpu_load_1m":       _val("fm_cpu_percent"),
+                "memory_used_bytes": _val("fm_memory_used_bytes"),
+                "disk_used_bytes":   _val("fm_disk_used_bytes"),
             },
             "timestamp": time.time(),
         }
         self._send_json(200, summary)
 
     def _handle_alerts(self) -> None:
-        alerts: list[dict] = []
+        alerts: List[Dict[str, Any]] = []
         now = time.time()
 
         # Agents down for > 60 seconds
@@ -621,7 +688,7 @@ class MetricsHandler(BaseHTTPRequestHandler):
                     "seconds": secs_down,
                 })
 
-        # Tables that should have data but have 0 rows
+        # Tables that should have data but show 0 rows
         with _metrics_lock:
             snap = dict(_metrics)
 
@@ -629,10 +696,13 @@ class MetricsHandler(BaseHTTPRequestHandler):
             "leads", "gumroad_sales", "cron_jobs", "swarm_batches",
             "api_requests", "campaigns",
         }
-        for table in critical_tables:
-            key = f"fm_table_rows__{table}"
-            entry = snap.get(key)
-            if entry is not None and entry["value"] == 0:
+        for data in snap.values():
+            if (
+                data.get("metric_name") == "fm_table_rows"
+                and data["labels"].get("table") in critical_tables
+                and data["value"] == 0
+            ):
+                table = data["labels"]["table"]
                 alerts.append({
                     "level":   "warn",
                     "message": f"Table '{table}' has 0 rows — expected data",
@@ -657,9 +727,21 @@ class MetricsHandler(BaseHTTPRequestHandler):
 def _start_background_threads() -> None:
     """Launch the three daemon polling threads."""
     threads = [
-        threading.Thread(target=_poll_agent_health, name="agent-health-poller", daemon=True),
-        threading.Thread(target=_poll_db_metrics,   name="db-metrics-poller",   daemon=True),
-        threading.Thread(target=_poll_system,        name="system-poller",       daemon=True),
+        threading.Thread(
+            target=_poll_agent_health,
+            name="agent-health-poller",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_poll_db_metrics,
+            name="db-metrics-poller",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_poll_system,
+            name="system-poller",
+            daemon=True,
+        ),
     ]
     for t in threads:
         t.start()
@@ -673,7 +755,7 @@ def main() -> None:
     _start_background_threads()
 
     server = HTTPServer(("0.0.0.0", PORT), MetricsHandler)
-    server.socket.setsockopt(1, 2, 1)  # SO_REUSEADDR via SOL_SOCKET / SO_REUSEADDR
+    server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     log.info("Metrics server listening on http://0.0.0.0:%d", PORT)
     try:
         server.serve_forever()

@@ -1145,6 +1145,8 @@ module.exports = {
             ['fm-deep-scan',      'fm_deep_scan',      '40M'],
             ['fm-metrics',        'fm_metrics',        '30M'],
             ['fm-logic-bucket',   'fm_logic_bucket',   '45M'],
+            ['fm-webhook-hub',    'fm_webhook_hub',    '30M'],
+            ['fm-content-engine', 'fm_content_engine', '35M'],
             ['fm-dork-engine',    'fm_dork_engine',    '80M'],
             ['fm-contract-forge', 'fm_contract_forge', '80M'],
             ['fm-wigle-oracle',   'fm_wigle_oracle',   '80M'],
