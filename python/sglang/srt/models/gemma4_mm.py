@@ -596,7 +596,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 "You must specify exactly one of input_ids or inputs_embeds"
             )
 
-        positions += 1
+        # Out-of-place shift: Gemma RoPE expects 1-indexed positions, but
+        # ``forward_batch.positions`` must stay canonical 0-indexed for downstream
+        # consumers (e.g. kv_canary write/verify).
+        positions = positions + 1
         per_layer_inputs = None
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
