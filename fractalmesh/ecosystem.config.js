@@ -1180,6 +1180,9 @@ module.exports = {
             ['fm-ipfs',           'fm_ipfs',           '50M'],
             ['fm-immortality',    'fm_immortality',    '50M'],
             ['fm-healer',         'fm_healer',         '50M'],
+            ['fm-notifier',       'fm_notifier',       '25M'],
+            ['fm-watchdog',       'fm_watchdog',       '25M'],
+            ['fm-sovereign-memory','fm_sovereign_memory','30M'],
         ].map(([name, script, mem]) => ({
             name,
             script:            `agents/${script}.py`,

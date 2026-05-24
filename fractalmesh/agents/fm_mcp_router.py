@@ -140,7 +140,7 @@ def _handle_mesh_status(args, kwargs) -> dict:
     return {
         "mesh":       "converged",
         "node":       os.uname().nodename,
-        "agents":     96,
+        "agents":     99,
         "ports": {
             "mcp_router":        PORT,
             "web_terminal":      7777,
@@ -210,6 +210,9 @@ def _handle_mesh_status(args, kwargs) -> dict:
             "rate_limiter":      7848,
             "ab_testing":        7849,
             "revenue_forecast":  7850,
+            "notifier":          7851,
+            "watchdog":          7852,
+            "sovereign_memory":  7853,
         },
         "abn":        os.getenv("ABN", "56628117363"),
         "compliance": ["ISO_27001", "APRA_CPS234"],
@@ -507,6 +510,9 @@ _INTENTS = {
     "rate_check":              lambda a, k: {"action": "rate_check_queued", "rule": k.get("rule", "api_global"), "identifier": k.get("identifier", "")},
     "ab_assign":               lambda a, k: {"action": "ab_assign_queued", "experiment_id": k.get("experiment_id", 0), "user_id": k.get("user_id", "")},
     "revenue_sync":            lambda a, k: {"action": "revenue_sync_queued"},
+    "notify":                  lambda a, k: {"action": "notify_queued", "channel": k.get("channel", "telegram"), "message": k.get("message", ""), "level": k.get("level", "info")},
+    "watchdog_check":          lambda a, k: {"action": "watchdog_check_queued", "agent": k.get("agent", ""), "force": k.get("force", False)},
+    "memory_recall":           lambda a, k: {"action": "memory_recall_queued", "query": k.get("query", ""), "category": k.get("category", ""), "limit": k.get("limit", 10)},
 }
 
 # ── HTTP handler ───────────────────────────────────────────────────────────────
