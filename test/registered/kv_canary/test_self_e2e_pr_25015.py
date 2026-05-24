@@ -105,7 +105,7 @@ class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
     ``position == seed.position + 1 + entry_offset``. Eagle DRAFT under the
     reverted PR perturbs position by +1, breaking that arithmetic and firing
     ``fail_reason = position``. The assert is gated on
-    ``CanaryDeviceState.runtime_assert_enable`` (flipped from 0 to 1 in
+    ``CanaryDeviceState.enable_runtime_assert`` (flipped from 0 to 1 in
     ``CanaryManager.mark_init_finished()``) so warmup / cuda-graph capture
     paths — whose seed slots may hold synthetic positions — don't misfire.
     """

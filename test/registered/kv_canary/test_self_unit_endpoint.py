@@ -34,7 +34,7 @@ def _make_endpoint(*, device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL, swa_lut=N
     canary_buf = torch.zeros(4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=device)
     slot_view = torch.zeros(1, dtype=torch.int64, device=device)
     kernel_view = torch.zeros(1, dtype=torch.int64, device=device)
-    runtime_assert_enable = torch.ones(1, dtype=torch.int32, device=device)
+    enable_runtime_assert = torch.ones(1, dtype=torch.int32, device=device)
     return CanaryEndpoint(
         kernel_kind=kernel_kind,
         canary_buf=canary_buf,
@@ -42,7 +42,7 @@ def _make_endpoint(*, device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL, swa_lut=N
         real_kv_sources=(),
         slot_run_counter_view=slot_view,
         kernel_run_counter_view=kernel_view,
-        runtime_assert_enable=runtime_assert_enable,
+        enable_runtime_assert=enable_runtime_assert,
     )
 
 

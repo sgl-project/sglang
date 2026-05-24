@@ -51,7 +51,7 @@ struct WriteKernelParams {
   // Runtime-only assert gate. Read by the kernel as a single int32 cell on every launch. Starts at 0
   // during warmup / cuda-graph capture (writes use synthetic positions that may not be geometric); host
   // flips to 1 in CanaryManager.mark_init_finished() to enable the geometric write_position check.
-  const int32_t* runtime_assert_enable;
+  const int32_t* enable_runtime_assert;
 
   // Real-KV sources.
   RealKvSourceHandle sources[kMaxRealKvSources];
@@ -97,7 +97,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   // Asserts ``position == running_prev_position + 1`` per chain step; running_prev_position starts at
   // the seed's stored position and advances to ``position`` after each entry.
   const bool do_chain_position_assert =
-      (entry_count == 1) && (seed_slot_idx >= 0) && (*p.runtime_assert_enable != 0);
+      (entry_count == 1) && (seed_slot_idx >= 0) && (*p.enable_runtime_assert != 0);
   int64_t running_prev_position = 0;
   if (do_chain_position_assert) {
     running_prev_position =
@@ -212,7 +212,7 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
     tvm::ffi::TensorView kernel_run_counter,
-    tvm::ffi::TensorView runtime_assert_enable,
+    tvm::ffi::TensorView enable_runtime_assert,
     tvm::ffi::TensorView real_kv_buf_0,
     tvm::ffi::TensorView real_kv_buf_1,
     tvm::ffi::TensorView real_kv_buf_2,
@@ -270,7 +270,7 @@ inline void canary_write_step_cuda(
       .with_device<kDLCUDA>(device_)
       .verify(slot_run_counter)
       .verify(kernel_run_counter);
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(runtime_assert_enable);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(enable_runtime_assert);
 
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
@@ -346,7 +346,7 @@ inline void canary_write_step_cuda(
   p.violation_sink.kernel_kind = static_cast<int32_t>(kernel_kind);
   p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
-  p.runtime_assert_enable = static_cast<const int32_t*>(runtime_assert_enable.data_ptr());
+  p.enable_runtime_assert = static_cast<const int32_t*>(enable_runtime_assert.data_ptr());
 
   const int32_t* params = static_cast<const int32_t*>(real_kv_source_params.data_ptr());
   tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};
