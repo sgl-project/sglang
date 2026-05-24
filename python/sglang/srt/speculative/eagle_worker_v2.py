@@ -495,7 +495,7 @@ class EagleDraftWorker(BaseDraftWorker):
             # Run forward. SingleForwardManager index ``i`` tells the monkey-patched
             # model.forward wrap which SingleForwardManager owns this step.
             sfm_index_ctx = (
-                canary_manager.with_single_forward_manager_index(i)
+                canary_manager.with_active_single_forward_manager(i)
                 if canary_manager is not None
                 else contextlib.nullcontext()
             )
@@ -609,7 +609,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 maybe_inaccurate_forward_batch=forward_batch
             )
         sfm_index_ctx = (
-            canary_manager.with_single_forward_manager_index(0)
+            canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
             else contextlib.nullcontext()
         )
@@ -685,7 +685,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 maybe_inaccurate_forward_batch=forward_batch
             )
         sfm_index_ctx = (
-            canary_manager.with_single_forward_manager_index(0)
+            canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
             else contextlib.nullcontext()
         )

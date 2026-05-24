@@ -28,7 +28,7 @@ def _run_one_cycle(manager, forward_batch) -> None:
     single_forward_manager.pre_ops_outside_graph(
         maybe_inaccurate_forward_batch=forward_batch
     )
-    with manager.with_single_forward_manager_index(0):
+    with manager.with_active_single_forward_manager(0):
         pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
             forward_batch
         )
@@ -71,7 +71,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         single_forward_manager.pre_ops_outside_graph(
             maybe_inaccurate_forward_batch=forward_batch
         )
-        with manager.with_single_forward_manager_index(0):
+        with manager.with_active_single_forward_manager(0):
             single_forward_manager.pre_ops_maybe_inside_graph(forward_batch)
 
         cache = make_radix_cache([[], [10, 11, 12]], device=self.device)

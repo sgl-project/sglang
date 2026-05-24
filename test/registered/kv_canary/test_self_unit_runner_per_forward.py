@@ -50,7 +50,7 @@ class TestManagerPerForward(CanaryManagerTestCase):
             single_forward_manager.pre_ops_outside_graph(
                 maybe_inaccurate_forward_batch=forward_batch
             )
-            with manager.with_single_forward_manager_index(0):
+            with manager.with_active_single_forward_manager(0):
                 pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
                     forward_batch
                 )
@@ -236,7 +236,7 @@ def _drive_one_cycle(manager, forward_batch) -> None:
     single_forward_manager.pre_ops_outside_graph(
         maybe_inaccurate_forward_batch=forward_batch
     )
-    with manager.with_single_forward_manager_index(0):
+    with manager.with_active_single_forward_manager(0):
         pre_ops_output = single_forward_manager.pre_ops_maybe_inside_graph(
             forward_batch
         )
@@ -254,7 +254,7 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
     ) -> None:
         """Verify the strict accessor returns the bracketed SingleForwardManager."""
         manager = make_manager(device=self.device, speculative_num_steps=3)
-        with manager.with_single_forward_manager_index(1):
+        with manager.with_active_single_forward_manager(1):
             self.assertIs(
                 manager.get_current_single_forward_manager(),
                 manager.get_single_forward_manager(1),
@@ -264,7 +264,7 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
         self,
     ) -> None:
         """Every call to the patched model.forward must be inside a
-        with_single_forward_manager_index(i) bracket — including cuda
+        with_active_single_forward_manager(i) bracket — including cuda
         graph capture/warmup. The strict accessor protects against silent
         contract violations."""
         manager = make_manager(device=self.device)

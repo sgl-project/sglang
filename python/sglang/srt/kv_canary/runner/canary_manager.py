@@ -9,7 +9,7 @@ violation, health, stats, swa-divergence). Replaces the previous
 Dispatch model: the monkey-patched ``model.forward`` wrap calls into
 ``get_current_single_forward_manager()`` to fire phase 2/3 on the
 currently-active SingleForwardManager. The caller marks the active
-SingleForwardManager with ``with_single_forward_manager_index(i)``.
+SingleForwardManager with ``with_active_single_forward_manager(i)``.
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ class CanaryManager:
         self._swa_window_size = swa_window_size
         self._swa_allocator: Optional["SWATokenToKVPoolAllocator"] = swa_allocator
         self._outer_step_counter: int = 0
-        self._active_index: Optional[int] = None
+        self._active_single_forward_manager_index: Optional[int] = None
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
 
@@ -195,26 +195,26 @@ class CanaryManager:
     def get_current_single_forward_manager(self) -> SingleForwardManager:
         """Used by the monkey-patched ``model.forward`` wrap to find the
         active SingleForwardManager. Asserts the caller has bracketed the call with
-        :meth:`with_single_forward_manager_index`."""
-        assert self._active_index is not None, (
+        :meth:`with_active_single_forward_manager`."""
+        assert self._active_single_forward_manager_index is not None, (
             "kv-canary: monkey-patched model.forward fired without an active "
             "SingleForwardManager index; the caller must wrap the forward in "
-            "CanaryManager.with_single_forward_manager_index(i)"
+            "CanaryManager.with_active_single_forward_manager(i)"
         )
-        return self._single_forward_managers[self._active_index]
+        return self._single_forward_managers[self._active_single_forward_manager_index]
 
     @contextlib.contextmanager
-    def with_single_forward_manager_index(self, index: int) -> Iterator[None]:
+    def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
         """Mark SingleForwardManager ``index`` as active for the duration of the with-block.
         Used by callers around each inner ``model.forward`` call."""
         assert (
-            self._active_index is None
-        ), "kv-canary: nested with_single_forward_manager_index is forbidden"
-        self._active_index = index
+            self._active_single_forward_manager_index is None
+        ), "kv-canary: nested with_active_single_forward_manager is forbidden"
+        self._active_single_forward_manager_index = index
         try:
             yield
         finally:
-            self._active_index = None
+            self._active_single_forward_manager_index = None
 
     def mark_init_finished(self) -> None:
         """Reset every SingleForwardManager's phase tensor and enable its assert. Called

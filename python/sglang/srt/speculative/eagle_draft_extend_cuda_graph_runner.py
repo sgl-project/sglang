@@ -426,7 +426,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         canary_manager = self.model_runner.canary_runner
         canary_ctx = (
-            canary_manager.with_single_forward_manager_index(0)
+            canary_manager.with_active_single_forward_manager(0)
             if canary_manager is not None
             else contextlib.nullcontext()
         )
