@@ -109,6 +109,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_DETOKENIZER_MAX_STATES` | Maximum states for detokenizer | Default value based on system |
 | `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK` | Enable checks for memory imbalance across Tensor Parallel ranks | `true` |
 | `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` | Configure the custom memory pool type for Mooncake. Supports `NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`. If set to `true`, it defaults to `NVLINK`. | `None` |
+| `SGLANG_MOONCAKE_TE_PROTOCOL` | Override the Mooncake transfer engine protocol. If unset, SGLang uses `nvlink` when `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK`; otherwise it uses `rdma`. | `None` |
 
 ## Model-Specific Options
 
