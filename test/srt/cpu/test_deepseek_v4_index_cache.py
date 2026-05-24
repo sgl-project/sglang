@@ -228,6 +228,26 @@ def test_dsv4_index_cache_rebuilds_physical_indices_from_raw_cache():
     assert copied_raw is target.c4_sparse_raw_indices
 
 
+def test_dsv4_index_cache_clamps_invalid_raw_indices_before_gather():
+    source = SimpleNamespace(
+        c4_sparse_raw_indices=torch.tensor([[0, 9999, -1]], dtype=torch.int32),
+    )
+    target = SimpleNamespace(
+        c4_sparse_page_indices=torch.full((1, 3), -1, dtype=torch.int32),
+        c4_sparse_raw_indices=torch.full((1, 3), -1, dtype=torch.int32),
+        page_table=torch.tensor([[10, 11]], dtype=torch.int32),
+    )
+    indexer_metadata = SimpleNamespace(
+        c4_seq_lens=torch.tensor([64], dtype=torch.int32),
+        c4_page_size=64,
+    )
+
+    cached = index_cache.make_index_cache_from_metadata(source)
+    index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)
+
+    assert target.c4_sparse_page_indices.tolist() == [[640, -1, -1]]
+
+
 def test_dsv4_index_cache_rejects_missing_raw_indices():
     source = SimpleNamespace(
         c4_sparse_page_indices=torch.tensor([[3, 4, -1]], dtype=torch.int32),

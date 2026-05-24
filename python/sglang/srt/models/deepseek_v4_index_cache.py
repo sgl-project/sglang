@@ -64,7 +64,7 @@ def _translate_raw_indices_to_page_indices(
     if seq_lens.dim() > 1:
         seq_lens = seq_lens.squeeze(-1)
     valid = valid & (raw_indices < seq_lens.unsqueeze(1))
-    page_idx = torch.clamp(raw_indices >> page_bits, min=0)
+    page_idx = torch.clamp(raw_indices >> page_bits, min=0, max=page_table.shape[1] - 1)
     offset_in_page = raw_indices & page_mask
     physical_pages = torch.gather(page_table, dim=1, index=page_idx.long())
     page_indices = ((physical_pages << page_bits) | offset_in_page).to(torch.int32)
