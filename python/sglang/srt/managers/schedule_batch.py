@@ -505,7 +505,7 @@ class MultimodalInputs:
 
         # try reconstructing from cuda-ipc
         reconstruct_device = None
-        for mm_item in mm_items :
+        for mm_item in mm_items:
             if mm_item.has_cuda_ipc_proxy():
                 if reconstruct_device is None:
                     reconstruct_device = torch.cuda.current_device()
