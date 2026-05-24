@@ -508,11 +508,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
+        # Pass swa_evicted_seqlen (as cache_finished_req does) so leading tokens
+        # with no SWA slot are inserted as tombstones, not counted as
+        # swa_evictable. It is 0 in the aggregated path, so behavior is unchanged.
         result = self.insert(
             InsertParams(
                 key=radix_key,
                 value=values,
                 prev_prefix_len=old_prefix_len,
+                swa_evicted_seqlen=req.swa_evicted_seqlen,
             )
         )
         new_prefix_len = result.prefix_len
