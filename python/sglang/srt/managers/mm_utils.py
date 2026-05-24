@@ -1558,14 +1558,14 @@ class ShmPointerMMData:
         )
 
     def materialize(self) -> torch.Tensor:
-        """Return a tensor view backed by shm, then unlink the shared name."""
-        tensor = self.tensor
+        """Clone tensor from shm to owned memory, then release shm handle."""
+        tensor = self.tensor.clone()
         if self._shm_handle is not None:
+            self._shm_handle.close()
             try:
                 self._shm_handle.unlink()
             except FileNotFoundError:
                 pass  # Another rank already unlinked
-            tensor._sglang_shm_handle = self._shm_handle
             self._shm_handle = None
         return tensor
 
