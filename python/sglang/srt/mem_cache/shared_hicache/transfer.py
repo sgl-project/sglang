@@ -96,9 +96,12 @@ def _get_or_init_mooncake_transfer_engine(scheduler):
     engine = get_mooncake_transfer_engine()
     if engine is not None:
         return engine
+    gpu_id = getattr(scheduler, "gpu_id", None)
+    if gpu_id is None:
+        gpu_id = getattr(getattr(scheduler, "ps", None), "gpu_id", None)
     return init_mooncake_transfer_engine(
         get_local_ip_auto(),
-        gpu_id=scheduler.gpu_id,
+        gpu_id=gpu_id,
         ib_device=scheduler.server_args.mooncake_ib_device,
     )
 

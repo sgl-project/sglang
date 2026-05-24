@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.shared_hicache.source import (
 )
 from sglang.srt.mem_cache.shared_hicache.transfer import (
     MooncakeSharedHiCacheTransferBackend,
+    _get_or_init_mooncake_transfer_engine,
     make_shared_hicache_transfer_backend,
 )
 from sglang.srt.mem_cache.utils import block_hash_aliases, hash_str_to_int64
@@ -464,6 +465,35 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertIsNone(backend)
         self.assertEqual(engine.registered, [(1, 128), (2, 128)])
+
+    def test_mooncake_engine_init_uses_scheduler_parallel_state_gpu_id(self):
+        calls = []
+        scheduler = SimpleNamespace(
+            ps=SimpleNamespace(gpu_id=3),
+            server_args=SimpleNamespace(mooncake_ib_device="mlx5_0"),
+        )
+
+        with (
+            patch(
+                "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.get_mooncake_transfer_engine",
+                return_value=None,
+            ),
+            patch(
+                "sglang.srt.distributed.device_communicators.mooncake_transfer_engine.init_mooncake_transfer_engine",
+                side_effect=lambda ip, gpu_id, ib_device: calls.append(
+                    (ip, gpu_id, ib_device)
+                )
+                or "engine",
+            ),
+            patch(
+                "sglang.srt.utils.network.get_local_ip_auto",
+                return_value="127.0.0.1",
+            ),
+        ):
+            engine = _get_or_init_mooncake_transfer_engine(scheduler)
+
+        self.assertEqual(engine, "engine")
+        self.assertEqual(calls, [("127.0.0.1", 3, "mlx5_0")])
 
     def test_make_transfer_backend_rejects_unsupported_topology_when_requested(self):
         scheduler = SimpleNamespace(
