@@ -112,10 +112,8 @@ def launch_canary_write_kernel_torch_reference(
         seed_slot = int(seed_slot_indices_host[r].item())
         running_prev_hash = compute_slot_hash(buf_i64, seed_slot)
 
-        do_chain_position_assert = (
-            (entry_count == 1)
-            and (seed_slot >= 0)
-            and (enable_runtime_assert_value != 0)
+        do_chain_position_assert = (seed_slot >= 0) and (
+            enable_runtime_assert_value != 0
         )
         if do_chain_position_assert:
             running_prev_position = int(

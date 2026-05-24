@@ -90,14 +90,14 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   // Chain-step position assert (only enabled when:
   //   1. after CanaryManager.mark_init_finished() — warmup / cuda-graph capture may write synthetic
   //      positions whose seed has unrelated stored_position, which is not a real bug;
-  //   2. entry_count == 1 — single-token decode shape (eagle DRAFT, regular DECODE). Multi-token
-  //      writes (extend prefill, target_verify with a token tree) carry positions that aren't a
-  //      simple prev + 1 arithmetic progression;
-  //   3. seed_slot_idx >= 0 — chain heads have no predecessor stored_position to compare against.
+  //   2. seed_slot_idx >= 0 — chain heads have no predecessor stored_position to compare against.
   // Asserts ``position == running_prev_position + 1`` per chain step; running_prev_position starts at
-  // the seed's stored position and advances to ``position`` after each entry.
-  const bool do_chain_position_assert =
-      (entry_count == 1) && (seed_slot_idx >= 0) && (*p.enable_runtime_assert != 0);
+  // the seed's stored position and advances to ``position`` after each entry. Holds across DECODE,
+  // EXTEND prefill, DRAFT_EXTEND_V2, and TARGET_VERIFY since this branch only supports eagle topk=1
+  // — every multi-token write produces a strictly +1 sequential progression. (If topk>1 is added
+  // later, target_verify becomes a token tree with sibling positions sharing parent.pos+1; this
+  // assert would misfire there and needs gating via a per-launch tree flag.)
+  const bool do_chain_position_assert = (seed_slot_idx >= 0) && (*p.enable_runtime_assert != 0);
   int64_t running_prev_position = 0;
   if (do_chain_position_assert) {
     running_prev_position =
