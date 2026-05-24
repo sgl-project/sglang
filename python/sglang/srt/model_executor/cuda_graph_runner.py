@@ -148,6 +148,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
     rids_int: Optional[torch.Tensor]
+    bootstrap_room_ids_int: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -239,17 +240,24 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 else None
             )
 
-            # Static buffer for ``ForwardBatch.rids_int`` — needed so callers
-            # that read it inside cuda-graph capture (notably kv_canary
-            # token-oracle input-check) see a real tensor instead of None.
+            # Static buffers for ``ForwardBatch.rids_int`` and
+            # ``ForwardBatch.bootstrap_room_ids_int`` — needed so callers
+            # that read them inside cuda-graph capture (notably kv_canary
+            # token-oracle input-check) see real tensors instead of None.
             # Refreshed from the real ForwardBatch in populate_from_forward_batch
             # before each replay. Gated on the same env var that populates
-            # ForwardBatch.rids_int upstream in prepare_forward_batch.
-            rids_int = (
-                torch.zeros((max_bs,), dtype=torch.int64)
-                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
-                else None
-            )
+            # them upstream in prepare_forward_batch. The bootstrap-room
+            # buffer is seeded with -1 so the synthetic capture batch makes
+            # select_generalized_req_ids fall back to rids_int (matches the
+            # non-PD path); per-replay overwrite drives the actual content.
+            if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
+                rids_int = torch.zeros((max_bs,), dtype=torch.int64)
+                bootstrap_room_ids_int = torch.full(
+                    (max_bs,), -1, dtype=torch.int64
+                )
+            else:
+                rids_int = None
+                bootstrap_room_ids_int = None
 
         # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
@@ -279,6 +287,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
             rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
     def populate_from_forward_batch(
@@ -349,13 +358,22 @@ class DecodeInputBuffers(ForwardInputBuffers):
             dsts.append(self.mrope_positions[:, :raw_num_token])
             srcs.append(forward_batch.mrope_positions)
 
-        # ``rids_int`` is captured as a static buffer so kv_canary's
-        # token-oracle input-check (which reads it inside the graph) sees a
-        # real tensor instead of None on PP/TP ranks where rids_int would
-        # otherwise be absent at capture time.
+        # ``rids_int`` / ``bootstrap_room_ids_int`` are captured as static
+        # buffers so kv_canary's token-oracle input-check (which reads them
+        # inside the graph) sees real tensors instead of None on PP/TP/PD
+        # ranks where they would otherwise be absent at capture time. PD
+        # specifically needs ``bootstrap_room_ids_int`` so D-side oracle ids
+        # match P-side ones; capturing the rids_int-only path would freeze
+        # the wrong branch of ``select_generalized_req_ids``.
         if self.rids_int is not None and forward_batch.rids_int is not None:
             dsts.append(self.rids_int[:raw_bs])
             srcs.append(forward_batch.rids_int)
+        if (
+            self.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
+            srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if require_gathered_buffer:
             self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
@@ -943,6 +961,11 @@ class CudaGraphRunner:
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
         next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
         rids_int = buffers.rids_int[:bs] if buffers.rids_int is not None else None
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:bs]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
 
         # Adjust for attention TP if needed (matching replay path in
         # populate_from_forward_batch).
@@ -1062,6 +1085,7 @@ class CudaGraphRunner:
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
             rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
         # HiSparse: set coordinator so the hisparse code path is captured into the graph
