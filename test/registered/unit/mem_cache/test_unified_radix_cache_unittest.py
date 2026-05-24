@@ -1657,6 +1657,41 @@ class UnifiedRadixCacheSuite:
                 )
         tree.sanity_check()
 
+    def test_hicache_write_through_offloads_swa_split_leaf(self):
+        """A SWA boundary-split leaf should offload normally under write-through."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the split setup simple")
+
+        ps = self.cfg.page_size
+        tree, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(tree)
+        tree.write_through_threshold = 1
+
+        seq = self._make_seq(1, 2)
+        value = self._alloc(allocator, len(seq))
+        result = tree.insert(
+            InsertParams(
+                key=RadixKey(seq),
+                value=value,
+                swa_evicted_seqlen=ps,
+            )
+        )
+        self.assertEqual(result.prefix_len, 0)
+
+        self.assertEqual(len(tree.root_node.children), 1)
+        split_parent = next(iter(tree.root_node.children.values()))
+        self.assertEqual(len(split_parent.children), 1)
+        split_leaf = next(iter(split_parent.children.values()))
+
+        tree.writing_check(write_back=True)
+        tree.evict(EvictParams(num_tokens=len(seq)))
+        self.assertTrue(split_leaf.evicted)
+        self.assertTrue(split_leaf.backuped)
+        self.assertIn(split_leaf, tree.evictable_host_leaves)
+        tree.sanity_check()
+
     def test_hicache_evict_to_host_updates_aux_lru(self):
         """Aux components (MAMBA / SWA) move from device LRU to host LRU on D->H eviction."""
         aux_types = [
