@@ -285,7 +285,6 @@ class CanaryManager:
         residual phase state left by captured (init-time) kernels is
         cleared and post-init lifecycle starts from a known good IDLE."""
         for single_forward_manager in self._single_forward_managers:
-            single_forward_manager.phase_checker.reset_to_idle()
             single_forward_manager.phase_checker.enable_assert()
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
