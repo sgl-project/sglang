@@ -3,6 +3,13 @@
 from sglang.multimodal_gen.configs.sample.diffusers_generic import (
     DiffusersGenericSamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.longcat_video import (
+    LongCatVideoT2VSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 
-__all__ = ["SamplingParams", "DiffusersGenericSamplingParams"]
+__all__ = [
+    "SamplingParams",
+    "DiffusersGenericSamplingParams",
+    "LongCatVideoT2VSamplingParams",
+]

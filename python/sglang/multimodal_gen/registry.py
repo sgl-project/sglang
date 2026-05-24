@@ -56,6 +56,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.longcat_video import (
+    LongCatVideoPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.mova import (
     MOVA360PConfig,
     MOVA720PConfig,
@@ -101,6 +104,9 @@ from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
     LTX23HQSamplingParams,
     LTX23SamplingParams,
+)
+from sglang.multimodal_gen.configs.sample.longcat_video import (
+    LongCatVideoT2VSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.mova import (
     MOVA_360P_SamplingParams,
@@ -348,11 +354,22 @@ def _get_config_info(
         registered_model_name = get_model_short_name(registered_model_hf_id.lower())
 
         if registered_model_name in model_short_name:
+            candidate_model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
+            # If detectors are registered for this model, they take precedence:
+            # a detector returning False means this path is explicitly excluded.
+            candidate_detectors = [
+                det
+                for mid, det in _MODEL_NAME_DETECTORS
+                if mid == candidate_model_id
+            ]
+            if candidate_detectors and not any(
+                det(model_path) for det in candidate_detectors
+            ):
+                continue
             logger.debug(
                 f"Resolved model name '{registered_model_hf_id}' from partial path match."
             )
-            model_id = _MODEL_HF_PATH_TO_NAME[registered_model_hf_id]
-            return _CONFIG_REGISTRY.get(model_id)
+            return _CONFIG_REGISTRY.get(candidate_model_id)
 
     # 2b. Match local HuggingFace cache snapshot/blob paths such as:
     #   .../models--org--repo/snapshots/<hash>
@@ -554,7 +571,6 @@ def get_model_info(
                     model_path=model_path, model_id=model_id
                 )
             return None
-
         pipeline_class_name = config.get("_class_name")
         if not pipeline_class_name:
             logger.error(
@@ -611,6 +627,12 @@ def get_model_info(
     logger.debug(f"Found model info: {model_info}")
 
     return model_info
+
+
+def _is_longcat_video_model_path(model_path: str) -> bool:
+    """Detect LongCat-Video model paths, excluding Avatar variants."""
+    path_lower = model_path.lower()
+    return "longcat-video" in path_lower and "avatar" not in path_lower
 
 
 # Registration of model configs
@@ -746,6 +768,15 @@ def _register_configs():
         hf_model_paths=[
             "FastVideo/FastWan2.1-T2V-1.3B-Diffusers",
         ],
+    )
+    # LongCat-Video
+    register_configs(
+        sampling_param_cls=LongCatVideoT2VSamplingParams,
+        pipeline_config_cls=LongCatVideoPipelineConfig,
+        hf_model_paths=[
+            "meituan-longcat/LongCat-Video",
+        ],
+        model_detectors=[_is_longcat_video_model_path],
     )
     # MOVA
     register_configs(
@@ -979,5 +1010,8 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
     model_path_lower = model_path.lower()
     for pattern, pipeline_name in KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS.items():
         if pattern in model_path_lower:
+            # Exclude LongCat-Video-Avatar variant (it's a different model family)
+            if pattern == "longcat-video" and "avatar" in model_path_lower:
+                continue
             return pipeline_name
     return None

@@ -3,6 +3,7 @@
 from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuanvideo import HunyuanVideoConfig
+from sglang.multimodal_gen.configs.models.dits.longcat_video import LongCatVideoConfig
 from sglang.multimodal_gen.configs.models.dits.mova_audio import MOVAAudioConfig
 from sglang.multimodal_gen.configs.models.dits.mova_video import MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.dits.stablediffusion3 import (
@@ -13,6 +14,7 @@ from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 __all__ = [
     "HeliosConfig",
     "HunyuanVideoConfig",
+    "LongCatVideoConfig",
     "WanVideoConfig",
     "Hunyuan3DDiTConfig",
     "MOVAAudioConfig",
