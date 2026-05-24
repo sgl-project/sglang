@@ -321,6 +321,10 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
         """
         if not input_ids or not mm_inputs.mm_items:
             return input_ids
+        if isinstance(mm_inputs.padded_input_ids, list) and len(
+            mm_inputs.padded_input_ids
+        ) == len(input_ids):
+            return mm_inputs.padded_input_ids
 
         input_ids_tensor = torch.as_tensor(input_ids)
 
