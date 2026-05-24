@@ -27,6 +27,7 @@ _MOCK_MODEL_SERVER_ARGS_NO_CANARY: list[str] = [
     "dummy",
     "--sampling-backend",
     "token_oracle",
+    "--disable-piecewise-cuda-graph",
 ]
 
 
