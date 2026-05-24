@@ -7,10 +7,7 @@ import pytest
 
 
 def _load_eval_suite_module():
-    path = (
-        Path(__file__).parents[3]
-        / "test/manual/dsv4/eval_dsv4_indexcache_suite.py"
-    )
+    path = Path(__file__).parents[3] / "test/manual/dsv4/eval_dsv4_indexcache_suite.py"
     spec = importlib.util.spec_from_file_location("eval_dsv4_indexcache_suite", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None

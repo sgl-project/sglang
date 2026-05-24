@@ -163,9 +163,9 @@ class DSV4AttnMetadata:
 
     def init_compression_metadata(self):
         assert self.page_table.dim() == 2
-        assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
-            f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
-        )
+        assert (
+            self.raw_out_loc.shape == self.seq_lens_casual.shape
+        ), f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
 
         (
             self.c4_out_loc,
@@ -217,9 +217,9 @@ class DSV4AttnMetadata:
         expected_local_len = pre_global_len // cp_size
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
-            assert isinstance(val, torch.Tensor), (
-                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
-            )
+            assert isinstance(
+                val, torch.Tensor
+            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
@@ -340,9 +340,9 @@ class DeepseekV4HipRadixBackend(
         super().__init__()
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
-        assert head_dim == 512, (
-            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
-        )
+        assert (
+            head_dim == 512
+        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -1022,13 +1022,13 @@ class DeepseekV4HipRadixBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert swa_page_indices.shape[-1] % 64 == 0, (
-                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
-            )
+            assert (
+                swa_page_indices.shape[-1] % 64 == 0
+            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
             if extra_indices is not None:
-                assert extra_indices.shape[-1] % 64 == 0, (
-                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
-                )
+                assert (
+                    extra_indices.shape[-1] % 64 == 0
+                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
             import os
 

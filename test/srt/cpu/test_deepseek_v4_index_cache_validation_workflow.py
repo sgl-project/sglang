@@ -8,10 +8,11 @@ import pytest
 
 def _load_workflow_module():
     path = (
-        Path(__file__).parents[3]
-        / "test/manual/dsv4/run_dsv4_indexcache_validation.py"
+        Path(__file__).parents[3] / "test/manual/dsv4/run_dsv4_indexcache_validation.py"
     )
-    spec = importlib.util.spec_from_file_location("run_dsv4_indexcache_validation", path)
+    spec = importlib.util.spec_from_file_location(
+        "run_dsv4_indexcache_validation", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

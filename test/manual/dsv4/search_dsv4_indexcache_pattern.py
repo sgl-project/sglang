@@ -212,8 +212,7 @@ def main() -> None:
 
     result = {
         "retentions": {
-            retention: search(args, retention)
-            for retention in args.retention
+            retention: search(args, retention) for retention in args.retention
         }
     }
     if args.output:

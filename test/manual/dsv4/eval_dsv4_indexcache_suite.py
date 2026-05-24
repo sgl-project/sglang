@@ -10,7 +10,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 FORBIDDEN_TASKS = {"mmlu", "gsm8k"}
 
 

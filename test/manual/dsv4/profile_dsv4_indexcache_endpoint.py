@@ -14,7 +14,9 @@ import requests
 
 def _load_profile_analyzer():
     path = Path(__file__).with_name("analyze_dsv4_indexcache_profile.py")
-    spec = importlib.util.spec_from_file_location("analyze_dsv4_indexcache_profile", path)
+    spec = importlib.util.spec_from_file_location(
+        "analyze_dsv4_indexcache_profile", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -50,7 +52,9 @@ def make_prompt(token_target: int, seed: str) -> str:
     return " ".join(chunks) + "\n\nSummarize the recurring technical theme."
 
 
-def post_json(base_url: str, path: str, payload: dict, timeout: int) -> requests.Response:
+def post_json(
+    base_url: str, path: str, payload: dict, timeout: int
+) -> requests.Response:
     return requests.post(base_url.rstrip("/") + path, json=payload, timeout=timeout)
 
 

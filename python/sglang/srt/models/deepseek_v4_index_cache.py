@@ -19,14 +19,16 @@ def assign_index_cache_to_metadata(
     index_cache: DSV4IndexCache, core_metadata, indexer_metadata
 ) -> Optional[torch.Tensor]:
     _check_cache_shape(index_cache)
-    assert core_metadata.c4_sparse_raw_indices is not None, (
-        "raw index cache cannot be reused when c4_sparse_raw_indices is unavailable"
-    )
+    assert (
+        core_metadata.c4_sparse_raw_indices is not None
+    ), "raw index cache cannot be reused when c4_sparse_raw_indices is unavailable"
     assert core_metadata.c4_sparse_raw_indices.shape == index_cache.raw_indices.shape, (
         f"raw index cache shape mismatch: {core_metadata.c4_sparse_raw_indices.shape=} "
         f"{index_cache.raw_indices.shape=}"
     )
-    assert core_metadata.c4_sparse_page_indices.shape == index_cache.raw_indices.shape, (
+    assert (
+        core_metadata.c4_sparse_page_indices.shape == index_cache.raw_indices.shape
+    ), (
         f"physical index target shape mismatch: "
         f"{core_metadata.c4_sparse_page_indices.shape=} "
         f"{index_cache.raw_indices.shape=}"
@@ -44,9 +46,9 @@ def assign_index_cache_to_metadata(
 
 def _check_cache_shape(index_cache: DSV4IndexCache) -> None:
     assert index_cache.raw_indices is not None, "raw index cache is required"
-    assert index_cache.raw_indices.dim() == 2, (
-        f"expected raw index cache to be 2D, got {index_cache.raw_indices.shape=}"
-    )
+    assert (
+        index_cache.raw_indices.dim() == 2
+    ), f"expected raw index cache to be 2D, got {index_cache.raw_indices.shape=}"
 
 
 def _translate_raw_indices_to_page_indices(
@@ -170,7 +172,6 @@ def get_index_cache_policy(
 
     skip_topk = c4_index % index_topk_freq != 0
     next_skip_topk = (
-        c4_index < len(c4_layer_ids) - 1
-        and (c4_index + 1) % index_topk_freq != 0
+        c4_index < len(c4_layer_ids) - 1 and (c4_index + 1) % index_topk_freq != 0
     )
     return skip_topk, next_skip_topk

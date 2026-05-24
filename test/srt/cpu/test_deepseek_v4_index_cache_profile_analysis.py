@@ -9,7 +9,9 @@ def _load_analyzer_module():
         Path(__file__).parents[3]
         / "test/manual/dsv4/analyze_dsv4_indexcache_profile.py"
     )
-    spec = importlib.util.spec_from_file_location("analyze_dsv4_indexcache_profile", path)
+    spec = importlib.util.spec_from_file_location(
+        "analyze_dsv4_indexcache_profile", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

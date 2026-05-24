@@ -7,10 +7,11 @@ import pytest
 
 def _load_search_module():
     path = (
-        Path(__file__).parents[3]
-        / "test/manual/dsv4/search_dsv4_indexcache_pattern.py"
+        Path(__file__).parents[3] / "test/manual/dsv4/search_dsv4_indexcache_pattern.py"
     )
-    spec = importlib.util.spec_from_file_location("search_dsv4_indexcache_pattern", path)
+    spec = importlib.util.spec_from_file_location(
+        "search_dsv4_indexcache_pattern", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

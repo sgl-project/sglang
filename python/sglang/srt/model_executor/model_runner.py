@@ -103,7 +103,6 @@ from sglang.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
 )
-from sglang.srt.models.deepseek_v4_index_cache_profile import record_cuda_graph_path
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
@@ -169,6 +168,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_v4_index_cache_profile import record_cuda_graph_path
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
@@ -3261,11 +3261,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             graph_mode = (
                 "decode"
                 if forward_batch.forward_mode.is_decode()
-                else "extend"
-                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
-                else "idle"
-                if forward_batch.forward_mode.is_idle()
-                else "split_prefill"
+                else (
+                    "extend"
+                    if forward_batch.forward_mode.is_extend(
+                        include_draft_extend_v2=True
+                    )
+                    else (
+                        "idle"
+                        if forward_batch.forward_mode.is_idle()
+                        else "split_prefill"
+                    )
+                )
             )
             record_cuda_graph_path(graph_mode, can_run_graph)
 

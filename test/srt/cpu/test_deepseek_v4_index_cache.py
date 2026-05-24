@@ -1,5 +1,5 @@
-import importlib.util
 import ast
+import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -221,6 +221,4 @@ def test_dsv4_index_cache_rejects_shape_mismatch():
     )
     cached = index_cache.make_index_cache_from_metadata(source)
     with pytest.raises(AssertionError, match="raw index cache shape mismatch"):
-        index_cache.assign_index_cache_to_metadata(
-            cached, target, indexer_metadata
-        )
+        index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)

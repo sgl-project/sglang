@@ -12,7 +12,9 @@ def _load_profile_driver_module():
         Path(__file__).parents[3]
         / "test/manual/dsv4/profile_dsv4_indexcache_endpoint.py"
     )
-    spec = importlib.util.spec_from_file_location("profile_dsv4_indexcache_endpoint", path)
+    spec = importlib.util.spec_from_file_location(
+        "profile_dsv4_indexcache_endpoint", path
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

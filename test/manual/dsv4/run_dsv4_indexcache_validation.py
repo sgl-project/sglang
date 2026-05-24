@@ -89,7 +89,9 @@ def search_cmd(args) -> list[str]:
 
 def quality_eval_endpoints(args) -> list[tuple[str, str]]:
     searched_half_endpoint = args.searched_half_endpoint or args.indexcache_endpoint
-    searched_quarter_endpoint = args.searched_quarter_endpoint or args.indexcache_endpoint
+    searched_quarter_endpoint = (
+        args.searched_quarter_endpoint or args.indexcache_endpoint
+    )
     return [
         ("baseline", args.baseline_endpoint),
         ("searched_1_2", searched_half_endpoint),
