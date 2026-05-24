@@ -2030,7 +2030,8 @@ def _dequant_gptq_weight(
 
     w_unsigned = w.to(torch.int32) + offset
     result = (w_unsigned - z_expanded).float() * s_expanded.float()
-    return result.to(torch.bfloat16)
+    # GPTQ packs as [in, out] but nn.Linear stores [out, in]
+    return result.to(torch.bfloat16).t().contiguous()
 
 
 def _dequant_gptq_for_unquant_layers(

@@ -53,9 +53,9 @@ class TestDequantGPTQWeight(CustomTestCase):
 
         result = _dequant_gptq_weight(qweight, qzeros, scales, bits, group_size)
 
-        expected = (raw_uint.float() - 8.0).to(torch.bfloat16)
+        expected = (raw_uint.float() - 8.0).to(torch.bfloat16).t().contiguous()
 
-        self.assertEqual(result.shape, (in_size, out_size))
+        self.assertEqual(result.shape, (out_size, in_size))
         self.assertEqual(result.dtype, torch.bfloat16)
         torch.testing.assert_close(result, expected, atol=0.1, rtol=0.01)
 
@@ -79,7 +79,7 @@ class TestDequantGPTQWeight(CustomTestCase):
                     sc = torch.ones(n_groups, out_size, dtype=torch.float16)
 
                     result = _dequant_gptq_weight(qw, qz, sc, bits, group_size)
-                    self.assertEqual(result.shape, (in_size, out_size))
+                    self.assertEqual(result.shape, (out_size, in_size))
                     self.assertEqual(result.dtype, torch.bfloat16)
 
 
