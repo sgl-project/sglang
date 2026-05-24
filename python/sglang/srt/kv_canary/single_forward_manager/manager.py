@@ -157,6 +157,16 @@ class SingleForwardManager:
             device=device,
         )
 
+        # Pre-allocated host-side fill target for token-oracle expected inputs.
+        # Filled in phase 1 (outside cuda-graph capture) with the real
+        # ForwardBatch — the synthetic batch passed during capture lacks
+        # ``rids_int`` so any in-capture fill would crash. Phase 2 reuses the
+        # same buffer so the captured kernel sees a fixed device address and
+        # the host overwrite before each replay drives the actual content.
+        self._expected_inputs = ExpectedInputs.allocate(
+            capacity=self._write_entry_capacity, device=device
+        )
+
     @property
     def phase_checker(self) -> SimplePhaseChecker:
         return self._phase_checker
@@ -195,6 +205,25 @@ class SingleForwardManager:
                 f"CanaryLaunchCapacities.from_args"
             )
 
+        # ``fill_expected_inputs`` must run host-side OUTSIDE the cuda graph:
+        # it reads ``forward_batch.rids_int`` which is None on the synthetic
+        # batch passed during cuda-graph capture. The captured kernel only
+        # binds the device address of ``self._expected_inputs``; the per-
+        # request content is whatever we drop into that buffer right before
+        # each replay.
+        if self._should_enable_input_check_for_launch(maybe_inaccurate_forward_batch):
+            manager = self._token_oracle_manager
+            if manager is None:
+                raise RuntimeError(
+                    "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
+                    "token_oracle_manager=install_oracle_sampler(oracle=...) into "
+                    "install_canary(...)"
+                )
+            manager.fill_expected_inputs(
+                forward_batch=maybe_inaccurate_forward_batch,
+                expected_inputs_out=self._expected_inputs,
+            )
+
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> "_PreOpsMaybeInsideGraphOutput":
@@ -216,26 +245,15 @@ class SingleForwardManager:
         write_plan = WritePlan.allocate(
             write_req_capacity=self._write_req_capacity, device=self._device
         )
-        expected_inputs = ExpectedInputs.allocate(
-            capacity=self._write_entry_capacity, device=self._device
-        )
+        # Reuses the persistent buffer filled in phase 1; the cuda graph
+        # captures its address and replays will see whatever phase 1 just
+        # wrote for the current real ForwardBatch.
+        expected_inputs = self._expected_inputs
         plan_input = PlanInput.allocate(
             bs_capacity=self._write_req_capacity, device=self._device
         )
 
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
-        if input_check_mode:
-            manager = self._token_oracle_manager
-            if manager is None:
-                raise RuntimeError(
-                    "kv-canary: input_check_mode=True requires a TokenOracleManager; pass "
-                    "token_oracle_manager=install_oracle_sampler(oracle=...) into "
-                    "install_canary(...)"
-                )
-            manager.fill_expected_inputs(
-                forward_batch=forward_batch,
-                expected_inputs_out=expected_inputs,
-            )
 
         plan_input.fill_from_forward_batch(forward_batch=forward_batch)
 
