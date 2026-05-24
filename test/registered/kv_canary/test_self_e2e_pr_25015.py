@@ -32,6 +32,11 @@ _SPEC_EAGLE_SERVER_ARGS = (
     str(_CUDA_GRAPH_MAX_BS),
     "--max-running-requests",
     "32",
+    # Skip server-stage warmup: under revert_pr=True the eagle-draft position mismatch fires the
+    # canary on the first warmup decode request, which kills the server in CanaryMode.RAISE before
+    # setUpClass even returns. The test sends its own parallel requests after the server is up; the
+    # geometric assert still triggers there and surfaces the regression.
+    "--skip-server-warmup",
 )
 
 
