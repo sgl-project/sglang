@@ -699,11 +699,11 @@ class Scheduler(
             abort_request=self.abort_request,
         )
 
-        self.log_init_summary()
+        self.log_post_init_info()
 
         self.is_initializing = False
 
-    def log_init_summary(self):
+    def log_post_init_info(self):
         if self.ps.tp_rank == 0:
             avail_mem = get_available_gpu_memory(
                 self.device, self.ps.gpu_id, empty_cache=False

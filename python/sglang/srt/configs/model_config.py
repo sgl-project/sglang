@@ -1233,7 +1233,7 @@ class ModelConfig:
             from sglang.srt.layers import deep_gemm_wrapper
 
             if not self.use_scale_ue8m0 and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
-                logger.debug(
+                logger.warning(
                     "DeepGemm is enabled but the scale_fmt of checkpoint is not ue8m0. This might cause accuracy degradation on Blackwell."
                 )
 
