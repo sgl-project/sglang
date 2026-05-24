@@ -676,11 +676,27 @@ class DeepseekV4AttnBackend(
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # Multi-step EAGLE draft (topk > 0, num_steps > 1) shares one
+            # out_cache_loc buffer across all draft steps; layout matches
+            # EagleWorkerV2.draft_forward: [bs, topk, num_steps] flattened.
+            # Pick this step's slice so the per-step backend sees a buffer
+            # whose length matches its own seq_lens.
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.topk > 0 and self.speculative_num_steps > 1:
+                out_cache_loc = (
+                    out_cache_loc.view(
+                        forward_batch.batch_size,
+                        self.topk,
+                        self.speculative_num_steps,
+                    )
+                    .permute(2, 0, 1)[self.speculative_step_id]
+                    .reshape(-1)
+                )
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
@@ -1199,31 +1215,8 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        # forward_batch.out_cache_loc carries the full multi-step write buffer
-        # with layout [bs, topk, num_steps] flattened. Match the per-step view
-        # produced by EagleWorkerV2.draft_forward (which does the same reshape
-        # before each step's model forward): permute to [num_steps, bs * topk]
-        # and feed step i's slice to attn_backends[i] so the single-step
-        # init_forward_metadata_decode sees out_cache_loc.shape[0] == bs * topk
-        # (matching its assert rather than bs * topk * num_steps).
-        full_out_cache_loc = forward_batch.out_cache_loc
-        if self.speculative_num_steps > 1 and full_out_cache_loc is not None:
-            bs = forward_batch.batch_size
-            per_step = (
-                full_out_cache_loc.reshape(bs, self.topk, self.speculative_num_steps)
-                .permute(2, 0, 1)
-                .reshape(self.speculative_num_steps, -1)
-            )
-        else:
-            per_step = None
-
-        try:
-            for i in range(self.speculative_num_steps - 1):
-                if per_step is not None:
-                    forward_batch.out_cache_loc = per_step[i]
-                self.attn_backends[i].init_forward_metadata(forward_batch)
-        finally:
-            forward_batch.out_cache_loc = full_out_cache_loc
+        for i in range(self.speculative_num_steps - 1):
+            self.attn_backends[i].init_forward_metadata(forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for i in range(self.speculative_num_steps):
