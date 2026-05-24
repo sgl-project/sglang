@@ -184,7 +184,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl", "http"]
+G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -6220,7 +6220,6 @@ class ServerArgs:
             default=ServerArgs.hicache_storage_backend_extra_config,
             help="A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",
         )
-
         # Hierarchical sparse attention
         parser.add_argument(
             "--enable-hisparse",

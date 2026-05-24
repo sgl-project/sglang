@@ -172,6 +172,14 @@ def _completed_future(result):
     return future
 
 
+def _fake_direct_transfer(name="mooncake", target_kv_item_lens=None):
+    if target_kv_item_lens is None:
+        target_kv_item_lens = [64]
+    return SimpleNamespace(
+        name=name, enabled=True, target_kv_item_lens=list(target_kv_item_lens)
+    )
+
+
 def _wait_until_no_pending(handler, timeout_secs=1.0):
     deadline = time.monotonic() + timeout_secs
     while time.monotonic() < deadline:
@@ -403,6 +411,7 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.worker_id = 42
         handler.dp_rank = 0
         handler.tree_cache = FakeTree(page_size=2)
+        handler.direct_transfer = _fake_direct_transfer()
         req = SimpleNamespace(
             remote_kv_reuse_plan=_make_plan([11], target_worker_id=42)
         )
@@ -470,7 +479,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
         handler.max_control_body_bytes = 8
         host, port = handler._source_server.server_address
-        url = f"http://{host}:{port}/resolve"
+        url = f"http://{host}:{port}/transfer_direct"
 
         try:
             request = urllib.request.Request(
@@ -489,7 +498,7 @@ class TestRouterKVReuse(unittest.TestCase):
         finally:
             handler.shutdown()
 
-    def test_source_resolver_rejects_http_staging_when_not_explicit_http(self):
+    def test_source_resolver_http_staging_endpoints_are_removed(self):
         handler = RemoteG2ReuseHandler(
             server_args=SimpleNamespace(
                 g2plus_timeout_secs=1,
@@ -523,10 +532,7 @@ class TestRouterKVReuse(unittest.TestCase):
                     )
                     with self.assertRaises(urllib.error.HTTPError) as cm:
                         urllib.request.urlopen(request, timeout=1)
-                    self.assertEqual(cm.exception.code, 501)
-                    payload = json.loads(cm.exception.read().decode("utf-8"))
-                    self.assertEqual(payload["reason"], "http_staging_disabled")
-                    self.assertEqual(payload["pages"], [])
+                    self.assertEqual(cm.exception.code, 404)
                     self.assertTrue(_wait_until_no_pending(handler))
         finally:
             handler.shutdown()
@@ -549,7 +555,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
         try:
             request = urllib.request.Request(
-                f"http://{host}:{port}/resolve",
+                f"http://{host}:{port}/transfer_direct",
                 data=b"{",
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -566,50 +572,11 @@ class TestRouterKVReuse(unittest.TestCase):
         finally:
             handler.shutdown()
 
-    def test_source_resolver_allows_http_staging_when_explicit_http(self):
-        handler = RemoteG2ReuseHandler(
-            server_args=SimpleNamespace(
-                g2plus_timeout_secs=1,
-                g2plus_transfer_backend="http",
-                g2plus_endpoint="127.0.0.1:0",
-                g2plus_peer_endpoints=None,
-                g2plus_fetch_workers=1,
-            ),
-            tree_cache=FakeTree(page_size=2),
-            worker_id=7,
-            dp_rank=0,
-            direct_transfer=None,
-        )
-        host, port = handler._source_server.server_address
-        request_body = json.dumps(
-            {
-                "plan": _make_plan([11]),
-                "start_block": 0,
-                "max_blocks": 1,
-            }
-        ).encode("utf-8")
-
-        try:
-            request = urllib.request.Request(
-                f"http://{host}:{port}/resolve",
-                data=request_body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=1) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            self.assertEqual(response.status, 200)
-            self.assertNotEqual(payload["reason"], "http_staging_disabled")
-            self.assertEqual(payload["pages"], [])
-            self.assertTrue(_wait_until_no_pending(handler))
-        finally:
-            handler.shutdown()
-
     def test_source_resolver_rejects_malformed_plan_without_500(self):
         handler = RemoteG2ReuseHandler(
             server_args=SimpleNamespace(
                 g2plus_timeout_secs=1,
-                g2plus_transfer_backend="http",
+                g2plus_transfer_backend="mooncake",
                 g2plus_endpoint="127.0.0.1:0",
                 g2plus_peer_endpoints=None,
                 g2plus_fetch_workers=1,
@@ -617,7 +584,7 @@ class TestRouterKVReuse(unittest.TestCase):
             tree_cache=FakeTree(page_size=2),
             worker_id=7,
             dp_rank=0,
-            direct_transfer=None,
+            direct_transfer=_fake_direct_transfer(),
         )
         host, port = handler._source_server.server_address
         plan_data = _make_plan([11])
@@ -632,15 +599,15 @@ class TestRouterKVReuse(unittest.TestCase):
 
         try:
             request = urllib.request.Request(
-                f"http://{host}:{port}/resolve",
+                f"http://{host}:{port}/transfer_direct",
                 data=request_body,
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with self.assertRaises(urllib.error.HTTPError) as cm:
-                urllib.request.urlopen(request, timeout=1)
-            self.assertEqual(cm.exception.code, 400)
-            payload = json.loads(cm.exception.read().decode("utf-8"))
+            with urllib.request.urlopen(request, timeout=1) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(response.status, 200)
+            self.assertFalse(payload["ok"])
             self.assertIn("block_hashes must be an array", payload["reason"])
             self.assertEqual(payload["pages"], [])
             self.assertTrue(_wait_until_no_pending(handler))
@@ -1062,22 +1029,32 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.dp_rank = 0
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
+        handler.direct_transfer = _fake_direct_transfer()
         captured = {}
 
-        def submit_fetch(plan, *, start_block, max_blocks):
+        device_indices = torch.arange(200, 204)
+
+        def submit_direct(plan, *, start_block, max_blocks, token_count):
             captured["start_block"] = start_block
             captured["max_blocks"] = max_blocks
-            return _completed_future(
-                (
-                    [
-                        ResolvedHostPage(11, "aa" * 32, bytes([1, 2, 3, 4])),
-                        ResolvedHostPage(22, "bb" * 32, bytes([5, 6, 7, 8])),
-                    ],
-                    "ok",
-                )
+            captured["token_count"] = token_count
+            return (
+                _completed_future(
+                    (
+                        [
+                            ResolvedHostPage(11, "aa" * 32, b""),
+                            ResolvedHostPage(22, "bb" * 32, b""),
+                        ],
+                        "ok",
+                    )
+                ),
+                device_indices,
             )
 
-        handler._submit_fetch = submit_fetch
+        handler._submit_direct_transfer = submit_direct
+        handler._submit_fetch = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("direct-enabled path should not use HTTP staging")
+        )
         req = SimpleNamespace(
             rid="r0",
             fill_ids=[10, 11, 12, 13, 14, 15, 16, 17],
@@ -1099,9 +1076,10 @@ class TestRouterKVReuse(unittest.TestCase):
 
         self.assertEqual(second.staged_tokens, 4)
         self.assertEqual(req.remote_g2_hit_length, 4)
-        self.assertEqual(captured, {"start_block": 0, "max_blocks": 2})
-        _, key, _, _ = tree.insert_calls[0]
-        self.assertEqual(key.token_ids, [12, 13, 14, 15])
+        self.assertEqual(captured, {"start_block": 0, "max_blocks": 2, "token_count": 4})
+        key, value = tree.insert_device_calls[0]
+        self.assertEqual(key.token_ids, [10, 11, 12, 13, 14, 15])
+        self.assertEqual(value.tolist(), [0, 1, 200, 201, 202, 203])
 
     def test_remote_g2_direct_transfer_inserts_device_node(self):
         tree = FakeTree(page_size=2)
@@ -1135,6 +1113,7 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("HTTP fallback should not run for direct transfer")
 
+        handler.direct_transfer = _fake_direct_transfer()
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -1245,6 +1224,7 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("HTTP fallback should not run for direct transfer")
 
+        handler.direct_transfer = _fake_direct_transfer()
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -1540,6 +1520,8 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("direct transfer failures should not use HTTP staging")
 
+        handler.direct_transfer = _fake_direct_transfer()
+
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -1600,6 +1582,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
         def fail_insert(params):
             raise RuntimeError("insert failed")
+
+        handler.direct_transfer = _fake_direct_transfer(target_kv_item_lens=[10, 20])
 
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -1732,6 +1716,8 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("direct transfer failures should not use HTTP staging")
 
+        handler.direct_transfer = _fake_direct_transfer()
+
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -1845,6 +1831,8 @@ class TestRouterKVReuse(unittest.TestCase):
             raise AssertionError(
                 "direct allocation failures should not use HTTP staging"
             )
+
+        handler.direct_transfer = _fake_direct_transfer()
 
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
@@ -1964,7 +1952,7 @@ class TestRouterKVReuse(unittest.TestCase):
             handler._finished_plan_keys, {("r-auto-no-direct", "plan-1")}
         )
 
-    def test_remote_g2_http_fetch_worker_backpressure_becomes_cache_miss(self):
+    def test_remote_g2_http_staging_flag_is_ignored(self):
         tree = FakeTree(page_size=2)
         metrics = FakeRouterMetricsCollector()
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
@@ -1976,15 +1964,13 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.metrics_collector = metrics
         handler._pending_fetches = {}
         handler._finished_plan_keys = set()
-        handler._fetch_semaphore = threading.BoundedSemaphore(1)
-        handler._fetch_semaphore.acquire()
-        handler._fetch_executor = SimpleNamespace(
-            submit=lambda *args, **kwargs: self.fail(
-                "busy fetch pool must not submit HTTP staging fetch"
-            )
-        )
+
+        def submit_fetch(plan, *, start_block, max_blocks):
+            raise AssertionError("HTTP staging flag should not submit a fetch")
+
+        handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
-            rid="r-http-busy",
+            rid="r-http-ignored",
             fill_ids=[10, 11, 12, 13, 14, 15],
             extra_key=None,
             last_node=tree.root_node,
@@ -2003,10 +1989,10 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertFalse(result.pending)
         self.assertEqual(result.staged_tokens, 0)
         self.assertEqual(handler._pending_fetches, {})
-        self.assertEqual(handler._finished_plan_keys, {("r-http-busy", "plan-1")})
+        self.assertEqual(handler._finished_plan_keys, {("r-http-ignored", "plan-1")})
         self.assertEqual(len(metrics.events), 1)
         self.assertEqual(metrics.events[0]["outcome"], "miss")
-        self.assertEqual(metrics.events[0]["reason"], "fetch_workers_busy")
+        self.assertEqual(metrics.events[0]["reason"], "direct_transfer_unavailable")
 
     def test_remote_g2_direct_skips_host_hit_http_staging(self):
         tree = FakeTree(page_size=2)
@@ -2025,6 +2011,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("direct-enabled path should not use HTTP staging")
+
+        handler.direct_transfer = _fake_direct_transfer()
 
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
@@ -2068,6 +2056,8 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("HTTP fallback should not run for direct transfer")
 
+        handler.direct_transfer = _fake_direct_transfer()
+
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -2085,7 +2075,7 @@ class TestRouterKVReuse(unittest.TestCase):
             remote_kv_reuse_plan=_make_plan([11, 22]),
         )
 
-        self.assertTrue(handler.prefetch_remote_prefix(req).pending)
+        self.assertTrue(handler.check_remote_prefix(req).pending)
         handler.release_request("r-direct-cancel")
 
         self.assertTrue(pending_future.cancelled())
@@ -2127,6 +2117,8 @@ class TestRouterKVReuse(unittest.TestCase):
 
         def submit_direct(plan, *, start_block, max_blocks, token_count):
             return pending_future, device_indices
+
+        handler.direct_transfer = _fake_direct_transfer()
 
         handler._submit_direct_transfer = submit_direct
         req = SimpleNamespace(
@@ -2340,6 +2332,8 @@ class TestRouterKVReuse(unittest.TestCase):
         def submit_fetch(plan, *, start_block, max_blocks):
             raise AssertionError("direct-enabled path should not use HTTP staging")
 
+        handler.direct_transfer = _fake_direct_transfer()
+
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch
         req = SimpleNamespace(
@@ -2474,6 +2468,8 @@ class TestRouterKVReuse(unittest.TestCase):
             raise AssertionError(
                 "queue prefetch must not fall back when direct is enabled"
             )
+
+        handler.direct_transfer = _fake_direct_transfer()
 
         handler._submit_direct_transfer = submit_direct
         handler._submit_fetch = submit_fetch

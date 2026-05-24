@@ -671,8 +671,7 @@ class RemoteG2ReuseHandler:
                 )
             logger.warning(
                 "Router KV reuse is enabled but no direct G2plus transfer backend "
-                "is available; remote KV reuse plans will be treated as cache misses. "
-                "Use --g2plus-transfer-backend http only for development staging.%s",
+                "is available; remote KV reuse plans will be treated as cache misses.%s",
                 diagnostic_suffix,
             )
         http_control = g2plus_config_value(server_args, "http_control", {}) or {}
@@ -768,8 +767,6 @@ class RemoteG2ReuseHandler:
         if self._direct_transfer_enabled():
             direct_transfer = getattr(self, "direct_transfer", None)
             return str(getattr(direct_transfer, "name", "direct"))
-        if bool(getattr(self, "allow_http_staging", False)):
-            return "http"
         return "none"
 
     def _direct_transfer_enabled(self) -> bool:
@@ -893,9 +890,8 @@ class RemoteG2ReuseHandler:
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
+                request_start = time.perf_counter()
                 if self.path not in {
-                    "/resolve",
-                    "/resolve_binary",
                     "/transfer_direct",
                     "/transfer_mooncake",
                 }:
@@ -945,7 +941,9 @@ class RemoteG2ReuseHandler:
                         )
                         return
 
+                    body_read_start = time.perf_counter()
                     raw_body = self.rfile.read(content_len)
+                    body_read_ms = (time.perf_counter() - body_read_start) * 1000
                     if len(raw_body) != content_len:
                         self._write_json(
                             400,
@@ -956,6 +954,7 @@ class RemoteG2ReuseHandler:
                             },
                         )
                         return
+                    decode_start = time.perf_counter()
                     try:
                         payload = json.loads(raw_body)
                     except (UnicodeDecodeError, json.JSONDecodeError) as err:
@@ -968,6 +967,7 @@ class RemoteG2ReuseHandler:
                             },
                         )
                         return
+                    decode_ms = (time.perf_counter() - decode_start) * 1000
                     if not isinstance(payload, Mapping):
                         self._write_json(
                             400,
@@ -978,17 +978,6 @@ class RemoteG2ReuseHandler:
                             },
                         )
                         return
-                    if self.path in {"/resolve", "/resolve_binary"}:
-                        if not manager.allow_http_staging:
-                            self._write_json(
-                                501,
-                                {
-                                    "ok": False,
-                                    "reason": "http_staging_disabled",
-                                    "pages": [],
-                                },
-                            )
-                            return
                     if self.path in {"/transfer_direct", "/transfer_mooncake"}:
                         if not manager._direct_transfer_enabled():
                             self._write_json(
@@ -1000,65 +989,30 @@ class RemoteG2ReuseHandler:
                                 },
                             )
                             return
-                        response = manager._handle_source_transfer(payload)
-                        self._write_json(200, response)
-                        return
-
-                    try:
-                        plan = RemoteKvReusePlan.from_dict(payload["plan"])
-                        start_block = _coerce_int(
-                            payload.get("start_block", 0), "start_block"
-                        )
-                        max_blocks = _coerce_int(
-                            payload.get("max_blocks", len(plan.block_hashes)),
-                            "max_blocks",
-                        )
-                    except (KeyError, ValueError) as err:
-                        self._write_json(
-                            400,
+                        pre_handler_ms = (
+                            time.perf_counter() - request_start
+                        ) * 1000
+                        response = dict(manager._handle_source_transfer(payload))
+                        response.update(
                             {
-                                "ok": False,
-                                "reason": f"malformed_control_payload:{err}",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    pages, reason = resolve_host_pages(
-                        manager.tree_cache,
-                        plan,
-                        start_block=start_block,
-                        max_blocks=max_blocks,
-                        worker_id=manager.worker_id,
-                        dp_rank=manager.dp_rank,
-                    )
-                    response = {
-                        "ok": bool(pages) or reason in {"ok", "already_local"},
-                        "reason": reason,
-                        "block_size_tokens": manager.tree_cache.page_size,
-                        "source_worker_id": manager.worker_id,
-                        "source_dp_rank": manager.dp_rank,
-                        "pages": [
-                            {
-                                "block_hash": page.block_hash,
-                                "hash_value": page.hash_value,
-                                "byte_length": len(page.data),
-                                **(
-                                    {}
-                                    if self.path == "/resolve_binary"
-                                    else {
-                                        "data_b64": base64.b64encode(page.data).decode(
-                                            "ascii"
-                                        )
-                                    }
-                                ),
+                                "source_control_pre_handler_ms": pre_handler_ms,
+                                "source_control_body_read_ms": body_read_ms,
+                                "source_control_json_decode_ms": decode_ms,
                             }
-                            for page in pages
-                        ],
-                    }
-                    if self.path == "/resolve_binary":
-                        self._write_binary(200, response, pages)
-                    else:
+                        )
+                        write_start = time.perf_counter()
                         self._write_json(200, response)
+                        write_ms = (time.perf_counter() - write_start) * 1000
+                        logger.debug(
+                            "G2plus source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
+                            self.path,
+                            pre_handler_ms,
+                            body_read_ms,
+                            decode_ms,
+                            write_ms,
+                            (time.perf_counter() - request_start) * 1000,
+                        )
+                        return
                 except Exception as err:
                     logger.exception("Remote G2 source resolve failed")
                     self._write_json(
@@ -2036,12 +1990,7 @@ class RemoteG2ReuseHandler:
     def _submit_fetch(
         self, plan: RemoteKvReusePlan, *, start_block: int, max_blocks: int
     ) -> Optional[Future]:
-        return self._submit_fetch_worker(
-            self._fetch_pages,
-            plan,
-            start_block=start_block,
-            max_blocks=max_blocks,
-        )
+        return None
 
     def _submit_direct_transfer(
         self,
@@ -2103,14 +2052,10 @@ class RemoteG2ReuseHandler:
             return False
         if self._validate_plan(plan) is not None:
             return False
-        return self._direct_transfer_enabled() or bool(
-            getattr(self, "allow_http_staging", True)
-        )
+        return self._direct_transfer_enabled()
 
     def prefetch_remote_prefix(self, req: "Req") -> RouterKVReuseResult:
-        if self._direct_transfer_enabled():
-            return RouterKVReuseResult()
-        return self.check_remote_prefix(req)
+        return RouterKVReuseResult()
 
     def release_request(self, rid: str) -> None:
         rid = str(rid)
@@ -2236,10 +2181,8 @@ class RemoteG2ReuseHandler:
         token_count = max_blocks * page_size
         future = None
         device_indices = None
-        direct_transfer = getattr(self, "direct_transfer", None)
         direct_transfer_enabled = self._direct_transfer_enabled()
-        allow_http_staging = bool(getattr(self, "allow_http_staging", True))
-        if not direct_transfer_enabled and not allow_http_staging:
+        if not direct_transfer_enabled:
             logger.debug(
                 "Skipping remote G2 plan rid=%s plan_id=%s reason=direct_transfer_unavailable",
                 req.rid,
@@ -2285,23 +2228,10 @@ class RemoteG2ReuseHandler:
                     reason="direct_submit_unavailable",
                 )
                 return RouterKVReuseResult()
-        if future is None:
-            future = self._submit_fetch(
-                plan,
-                start_block=plan_offset,
-                max_blocks=max_blocks,
-            )
-            if future is None:
-                self._finished_plan_keys.add(plan_key)
-                self._observe_reuse(
-                    backend="http",
-                    outcome="miss",
-                    reason="fetch_workers_busy",
-                )
-                return RouterKVReuseResult()
-        backend = "http"
+        backend = "none"
         bytes_per_page = 0
         if device_indices is not None and direct_transfer_enabled:
+            direct_transfer = getattr(self, "direct_transfer", None)
             backend = str(getattr(direct_transfer, "name", "direct"))
             try:
                 bytes_per_page = sum(

@@ -93,7 +93,7 @@ def g2plus_config_value(server_args, key: str, default=None):
     return config.get(key, getattr(server_args, legacy_name, default))
 
 
-def g2plus_transfer_backend_name(server_args, default: str = "http") -> str:
+def g2plus_transfer_backend_name(server_args, default: str = "auto") -> str:
     return str(g2plus_config_value(server_args, "transfer_backend", default)).lower()
 
 
@@ -320,7 +320,6 @@ class MooncakeG2plusTransferBackend:
                     "mooncake target KV registration failed",
                 )
                 return None
-
             transfer = cls(
                 engine=engine,
                 tree_cache=scheduler.tree_cache,
@@ -536,7 +535,6 @@ class MooncakeG2plusTransferBackend:
             )
             if ret != 0:
                 raise RuntimeError(f"Mooncake direct KV transfer failed with ret={ret}")
-
 
 class NixlG2plusTransferBackend:
     """NIXL-backed source-G2-host to target-G1-device transfer helper."""
