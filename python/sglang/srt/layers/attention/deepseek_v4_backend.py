@@ -1112,17 +1112,40 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
+            seq_lens = forward_batch.seq_lens.to(torch.int32)
+            extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+            req_pool_indices = forward_batch.req_pool_indices.to(torch.int32)
+            local_extend_seq_lens = None
+            positions = None
+            from sglang.srt.layers.attention.dsa.utils import (
+                dsa_cp_round_robin_split_q_seqs,
+                dsa_use_prefill_cp,
+                is_dsa_prefill_cp_round_robin_split,
+            )
+
+            if dsa_use_prefill_cp(
+                forward_batch
+            ) and is_dsa_prefill_cp_round_robin_split():
+                _, local_extend_seq_lens, _, bs_idx = dsa_cp_round_robin_split_q_seqs(
+                    forward_batch.extend_seq_lens_cpu,
+                    extend_seq_lens,
+                )
+                seq_lens = seq_lens[bs_idx]
+                extend_seq_lens = extend_seq_lens[bs_idx]
+                req_pool_indices = req_pool_indices[bs_idx]
+                positions = core_attn_metadata.positions_casual.to(torch.int32)
+
             cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                seq_lens=seq_lens,
+                extend_seq_lens=extend_seq_lens,
+                req_pool_indices=req_pool_indices,
                 req_to_token=self.req_to_token,
                 full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
                 swa_window_size=SWA_WINDOW,
                 swa_page_size=token_to_kv_pool.swa_window_size,
                 num_qo_tokens=q_flat.shape[0],
+                local_extend_seq_lens=local_extend_seq_lens,
+                positions=positions,
             )
             self.forward_metadata.sparse_prefill_cache = cache
 
