@@ -245,27 +245,42 @@ def _drive_one_cycle(manager, forward_batch) -> None:
 
 
 class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase):
-    def test_get_current_single_forward_manager_returns_active_inside_bracket(
+    def test_pre_ops_maybe_inside_graph_dispatches_to_bracketed_sfm(
         self,
     ) -> None:
-        """Verify the strict accessor returns the bracketed SingleForwardManager."""
+        """Verify the dispatcher routes phase 2 to the bracketed SingleForwardManager."""
         manager = make_manager(device=self.device, speculative_num_steps=3)
-        with manager.with_active_single_forward_manager(1):
-            self.assertIs(
-                manager.get_current_single_forward_manager(),
-                manager.get_single_forward_manager(1),
-            )
+        forward_batch = make_forward_batch(self.device)
+        target_sfm = manager.get_single_forward_manager(1)
+        observed: list[object] = []
+        original_phase_2 = target_sfm.pre_ops_maybe_inside_graph
 
-    def test_get_current_single_forward_manager_asserts_outside_bracket(
+        def _record(fb):
+            observed.append(fb)
+            return original_phase_2(fb)
+
+        target_sfm.pre_ops_maybe_inside_graph = _record
+        manager.get_single_forward_manager(0).pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        manager.get_single_forward_manager(1).pre_ops_outside_graph(
+            maybe_inaccurate_forward_batch=forward_batch
+        )
+        with manager.with_active_single_forward_manager(1):
+            manager.pre_ops_maybe_inside_graph(forward_batch)
+        self.assertEqual(observed, [forward_batch])
+
+    def test_pre_ops_maybe_inside_graph_asserts_outside_bracket(
         self,
     ) -> None:
         """Every call to the patched model.forward must be inside a
         with_active_single_forward_manager(i) bracket — including cuda
-        graph capture/warmup. The strict accessor protects against silent
+        graph capture/warmup. The dispatcher protects against silent
         contract violations."""
         manager = make_manager(device=self.device)
+        forward_batch = make_forward_batch(self.device)
         with self.assertRaises(AssertionError):
-            manager.get_current_single_forward_manager()
+            manager.pre_ops_maybe_inside_graph(forward_batch)
 
 
 if __name__ == "__main__":

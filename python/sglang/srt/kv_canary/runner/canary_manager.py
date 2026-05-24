@@ -7,9 +7,10 @@ violation, health, stats, swa-divergence). Replaces the previous
 ``CanaryRunner`` wholesale — there is no backward-compat shim.
 
 Dispatch model: the monkey-patched ``model.forward`` wrap calls into
-``get_current_single_forward_manager()`` to fire phase 2/3 on the
-currently-active SingleForwardManager. The caller marks the active
-SingleForwardManager with ``with_active_single_forward_manager(i)``.
+``pre_ops_maybe_inside_graph`` / ``post_ops_maybe_inside_graph`` to fire
+phase 2/3 on the currently-active SingleForwardManager. The caller marks
+the active SingleForwardManager with
+``with_active_single_forward_manager(i)``.
 """
 
 from __future__ import annotations
@@ -195,17 +196,6 @@ class CanaryManager:
     def get_single_forward_manager(self, index: int) -> SingleForwardManager:
         return self._single_forward_managers[index]
 
-    def get_current_single_forward_manager(self) -> SingleForwardManager:
-        """Used by the monkey-patched ``model.forward`` wrap to find the
-        active SingleForwardManager. Asserts the caller has bracketed the call with
-        :meth:`with_active_single_forward_manager`."""
-        assert self._active_single_forward_manager_index is not None, (
-            "kv-canary: monkey-patched model.forward fired without an active "
-            "SingleForwardManager index; the caller must wrap the forward in "
-            "CanaryManager.with_active_single_forward_manager(i)"
-        )
-        return self._single_forward_managers[self._active_single_forward_manager_index]
-
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
         """Mark SingleForwardManager ``index`` as active for the duration of the with-block.
@@ -306,36 +296,6 @@ class CanaryManager:
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
         self._perturb_manager.attach_radix_cache(radix_cache)
-
-    def step_shared_facilities(
-        self,
-        *,
-        maybe_inaccurate_forward_batch: Optional["ForwardBatch"] = None,
-    ) -> None:
-        """Fire the per-cycle shared facilities (sweep, violation drain,
-        health, stats, swa-divergence). Caller invokes this once after all
-        SingleForwardManagers in the cycle have finished phase 4.
-
-        ``maybe_inaccurate_forward_batch`` is the same instance handed to
-        phase 4; the swa-divergence report reads its req_pool_indices /
-        seq_lens to compute the FULL-vs-SWA index divergence. By cycle
-        end the outer scheduler may already have advanced this batch,
-        but the divergence metric is a coarse trend signal and tolerates
-        the slight staleness.
-        """
-        if self.config.mode == "off":
-            return
-
-        self._sweep_orchestrator.maybe_run_sweep()
-        self._outer_step_counter += 1
-        self._violation_manager.step()
-        self._health_checker.step()
-        self._stats_logger.step()
-        if self._swa_divergence_report is not None:
-            self._swa_divergence_report.step(
-                outer_step_counter=self._outer_step_counter,
-                forward_batch=maybe_inaccurate_forward_batch,
-            )
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter
