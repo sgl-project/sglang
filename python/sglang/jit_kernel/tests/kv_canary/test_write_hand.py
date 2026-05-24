@@ -171,7 +171,8 @@ class TestSeedSlot:
         )
 
         expected_prev_hash = splitmix64_mix3(
-            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position)
+            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position
+        )
         _, _, stored_prev_hash, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=2)
         assert stored_prev_hash == to_signed_int64(expected_prev_hash)
 
@@ -248,7 +249,8 @@ class TestSeedSlot:
         )
 
         predecessor_advance = splitmix64_mix3(
-            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position)
+            splitmix64(consts.CANARY_CHAIN_ANCHOR), seed_token, seed_position
+        )
 
         tokens = [101, 202, 303, 404, 505]
         positions = [11, 12, 13, 14, 15]
@@ -302,7 +304,11 @@ class TestSeedSlot:
         seed_real_kv = 0
         expected_seed_prev_hash = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         stamp_pair(
-            buf_pair),
+            buf_pair,
+            slot_idx=seed_slot,
+            token=seed_token,
+            position=seed_position,
+            prev_hash=to_signed_int64(expected_seed_prev_hash),
             real_kv_hash=to_signed_int64(seed_real_kv),
         )
 
@@ -310,7 +316,8 @@ class TestSeedSlot:
         new_token = 13
         new_position = 2
         expected_running = splitmix64_mix3(
-            expected_seed_prev_hash, seed_token, seed_position)
+            expected_seed_prev_hash, seed_token, seed_position
+        )
 
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
