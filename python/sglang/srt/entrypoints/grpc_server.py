@@ -11,6 +11,7 @@ is set.
 """
 
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -122,6 +123,64 @@ def _patch_grpc_request_manager_shm_transport() -> None:
 
     send_to_scheduler_with_shm._sglang_wraps_shm_features = True
     cls._send_to_scheduler = send_to_scheduler_with_shm
+
+
+def _hash_grpc_bytes(chunks) -> int:
+    hasher = hashlib.sha256()
+    for chunk in chunks:
+        hasher.update(len(chunk).to_bytes(8, byteorder="big", signed=False))
+        hasher.update(chunk)
+    return int.from_bytes(hasher.digest()[:8], byteorder="big", signed=False)
+
+
+def _encode_grpc_shape(shape) -> bytes:
+    return b"".join(
+        int(dim).to_bytes(8, byteorder="big", signed=False) for dim in shape
+    )
+
+
+def _hash_grpc_mm_proto(mm_proto):
+    if mm_proto.image_data:
+        return _hash_grpc_bytes(mm_proto.image_data)
+
+    if not mm_proto.HasField("pixel_values"):
+        return None
+
+    chunks = [
+        mm_proto.pixel_values.dtype.encode(),
+        _encode_grpc_shape(mm_proto.pixel_values.shape),
+        mm_proto.pixel_values.data,
+    ]
+    for key in sorted(mm_proto.model_specific_tensors):
+        tensor_data = mm_proto.model_specific_tensors[key]
+        chunks.extend(
+            [
+                key.encode(),
+                tensor_data.dtype.encode(),
+                _encode_grpc_shape(tensor_data.shape),
+                tensor_data.data,
+            ]
+        )
+    return _hash_grpc_bytes(chunks)
+
+
+def _patch_grpc_multimodal_hashes() -> None:
+    from smg_grpc_servicer.sglang import servicer as grpc_servicer
+
+    cls = grpc_servicer.SGLangSchedulerServicer
+    original_parse = cls._parse_mm_inputs
+    if getattr(original_parse, "_sglang_sets_mm_hash", False):
+        return
+
+    def parse_mm_inputs_with_hash(self, mm_proto):
+        mm_inputs = original_parse(self, mm_proto)
+        mm_hash = _hash_grpc_mm_proto(mm_proto)
+        if mm_hash is not None and len(mm_inputs.mm_items) == 1:
+            mm_inputs.mm_items[0].hash = mm_hash
+        return mm_inputs
+
+    parse_mm_inputs_with_hash._sglang_sets_mm_hash = True
+    cls._parse_mm_inputs = parse_mm_inputs_with_hash
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -268,6 +327,7 @@ async def serve_grpc(server_args, model_info=None):
 
     set_global_server_args_for_tokenizer(server_args)
     _patch_grpc_message_size_options()
+    _patch_grpc_multimodal_hashes()
     _patch_grpc_request_manager_shm_transport()
 
     sidecar_app = web.Application()
