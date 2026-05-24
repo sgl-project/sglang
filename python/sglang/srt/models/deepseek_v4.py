@@ -521,7 +521,9 @@ class MQALayer(nn.Module):
         q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
         q_lora_ready = current_stream.record_event()
 
-        skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
+        skip_indexer = self._should_reuse_topk(
+            prev_topk_indices, attn_backend, forward_batch
+        )
         if self.indexer is not None and not skip_indexer:
             with torch.cuda.stream(stream_indexer):
                 with profile_region("csa_indexer", self.layer_id):
@@ -532,7 +534,9 @@ class MQALayer(nn.Module):
                         attn_backend=attn_backend,
                         enable_multi_stream=True,
                         q_lora_ready=q_lora_ready,
-                        return_raw_indices=self._should_return_topk(attn_backend),
+                        return_raw_indices=self._should_return_topk(
+                            attn_backend, forward_batch
+                        ),
                     )
         elif skip_indexer:
             self._reuse_topk(prev_topk_indices, attn_backend)
@@ -663,7 +667,9 @@ class MQALayer(nn.Module):
 
         del qkv_a
 
-        skip_indexer = self._should_reuse_topk(prev_topk_indices, attn_backend)
+        skip_indexer = self._should_reuse_topk(
+            prev_topk_indices, attn_backend, forward_batch
+        )
         if self.indexer is not None and not skip_indexer:
             with profile_region("csa_indexer", self.layer_id):
                 self.indexer(
@@ -671,7 +677,9 @@ class MQALayer(nn.Module):
                     q_lora=q_lora,
                     forward_batch=forward_batch,
                     attn_backend=attn_backend,
-                    return_raw_indices=self._should_return_topk(attn_backend),
+                    return_raw_indices=self._should_return_topk(
+                        attn_backend, forward_batch
+                    ),
                 )
         elif skip_indexer:
             self._reuse_topk(prev_topk_indices, attn_backend)
@@ -685,23 +693,26 @@ class MQALayer(nn.Module):
 
         return q, kv
 
-    def _should_reuse_topk(self, prev_topk_indices, attn_backend) -> bool:
+    def _should_reuse_topk(self, prev_topk_indices, attn_backend, forward_batch) -> bool:
         return should_reuse_index_cache(
             self.skip_topk,
             prev_topk_indices,
             getattr(attn_backend, "hisparse_coordinator", None),
-        ) and self._index_cache_enabled_for_batch(attn_backend)
+        ) and self._index_cache_enabled_for_batch(forward_batch)
 
-    def _should_return_topk(self, attn_backend) -> bool:
+    def _should_return_topk(self, attn_backend, forward_batch) -> bool:
         return should_return_index_cache(
             self.next_skip_topk, getattr(attn_backend, "hisparse_coordinator", None)
-        ) and self._index_cache_enabled_for_batch(attn_backend)
+        ) and self._index_cache_enabled_for_batch(forward_batch)
 
-    def _index_cache_enabled_for_batch(self, attn_backend) -> bool:
+    def _index_cache_enabled_for_batch(self, forward_batch: ForwardBatch) -> bool:
         if self.index_topk_min_seq_len <= 0:
             return True
-        attn_backend._maybe_upgrade_forward_metadata()
-        seq_lens = attn_backend.forward_metadata.indexer_metadata.c4_seq_lens
+        if get_is_capture_mode():
+            return True
+        seq_lens = forward_batch.seq_lens_cpu
+        if seq_lens is None:
+            seq_lens = forward_batch.seq_lens
         return index_cache_enabled_for_seq_lens(
             seq_lens,
             self.index_topk_min_seq_len,
@@ -725,8 +736,10 @@ class MQALayer(nn.Module):
                 ].compress_layer_id
                 indexer_capturer.capture(compress_layer_id, raw_indices)
 
-    def _next_topk_indices(self, attn_backend) -> Optional[DSV4IndexCache]:
-        if not self._should_return_topk(attn_backend):
+    def _next_topk_indices(
+        self, attn_backend, forward_batch: ForwardBatch
+    ) -> Optional[DSV4IndexCache]:
+        if not self._should_return_topk(attn_backend, forward_batch):
             return None
         attn_backend._maybe_upgrade_forward_metadata()
         return make_index_cache_from_metadata(
@@ -845,7 +858,7 @@ class MQALayer(nn.Module):
         o, _ = self.wo_b(o.flatten(1))
 
         if self.next_skip_topk is not None:
-            return o, self._next_topk_indices(attn_backend)
+            return o, self._next_topk_indices(attn_backend, forward_batch)
 
         return o
 

@@ -61,6 +61,8 @@ def test_dsv4_index_cache_validation_workflow_uses_searched_half_and_quarter(tmp
     assert "--pp-block-c4-layers" in cmd
     assert "--command-template" in cmd
     assert "modal deploy endpoint.py --pattern {pattern}" in cmd
+    assert "--min-indexcache-prompt-tokens" in cmd
+    assert "75000" in cmd
 
 
 def test_dsv4_index_cache_validation_workflow_runs_paper_relevant_eval_suite(tmp_path):

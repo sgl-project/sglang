@@ -102,3 +102,24 @@ def test_dsv4_index_cache_search_requires_pattern_placeholder():
 
     with pytest.raises(SystemExit, match=r"\{pattern\}"):
         search_mod.validate_args(args)
+
+
+def test_dsv4_index_cache_search_rejects_short_tokenized_calibration(
+    monkeypatch,
+):
+    class Response:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"meta_info": {"input_token_logprobs": [[-1.0], [-2.0]]}}
+
+    monkeypatch.setattr(search_mod.requests, "post", lambda *_, **__: Response())
+
+    with pytest.raises(RuntimeError, match="below IndexCache floor"):
+        search_mod.score_endpoint(
+            "http://endpoint",
+            ["short prompt"],
+            timeout=1,
+            min_prompt_tokens=3,
+        )

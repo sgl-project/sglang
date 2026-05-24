@@ -58,7 +58,9 @@ def finite_logprobs(meta_info: dict) -> Iterable[float]:
             yield float(value)
 
 
-def score_endpoint(endpoint: str, texts: list[str], timeout: int) -> float:
+def score_endpoint(
+    endpoint: str, texts: list[str], timeout: int, min_prompt_tokens: int
+) -> float:
     losses = []
     for text in texts:
         res = requests.post(
@@ -75,6 +77,11 @@ def score_endpoint(endpoint: str, texts: list[str], timeout: int) -> float:
         logprobs = list(finite_logprobs(res.json().get("meta_info", {})))
         if not logprobs:
             raise RuntimeError("endpoint returned no input_token_logprobs")
+        if min_prompt_tokens > 0 and len(logprobs) < min_prompt_tokens:
+            raise RuntimeError(
+                f"calibration prompt has {len(logprobs)} tokens, below "
+                f"IndexCache floor {min_prompt_tokens}"
+            )
         losses.append(-sum(logprobs) / len(logprobs))
     return sum(losses) / len(losses)
 
@@ -97,6 +104,7 @@ def run_candidate(
     startup_timeout: int,
     texts: list[str],
     request_timeout: int,
+    min_prompt_tokens: int,
 ) -> float:
     proc = None
     try:
@@ -104,11 +112,15 @@ def run_candidate(
             cmd = command_template.format(pattern=pattern)
             proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
             wait_for_endpoint(endpoint, startup_timeout)
-        return score_endpoint(endpoint, texts, request_timeout)
+        return score_endpoint(endpoint, texts, request_timeout, min_prompt_tokens)
     finally:
         if proc is not None:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            proc.wait(timeout=60)
+            try:
+                proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=60)
 
 
 def greedy_search_pattern(
@@ -180,6 +192,7 @@ def search(args, retention: str) -> dict:
             args.startup_timeout,
             texts,
             args.request_timeout,
+            args.min_indexcache_prompt_tokens,
         )
 
     return greedy_search_pattern(
@@ -217,6 +230,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--startup-timeout", type=int, default=900)
     parser.add_argument("--request-timeout", type=int, default=300)
+    parser.add_argument("--min-indexcache-prompt-tokens", type=int, default=75000)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     validate_args(args)

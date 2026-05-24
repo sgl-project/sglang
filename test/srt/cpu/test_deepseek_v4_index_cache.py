@@ -188,6 +188,36 @@ def test_dsv4_index_cache_min_seq_len_gate_uses_raw_token_length():
     )
 
 
+def test_dsv4_index_cache_graph_gate_disables_short_context_graphs():
+    config = SimpleNamespace(
+        index_topk_freq=2,
+        index_topk_pattern=None,
+        index_topk_min_seq_len=75000,
+    )
+
+    assert index_cache.should_disable_cuda_graph_for_index_cache_gate(
+        config,
+        torch.tensor([1000, 12000], dtype=torch.int32),
+    )
+    assert not index_cache.should_disable_cuda_graph_for_index_cache_gate(
+        config,
+        torch.tensor([20000], dtype=torch.int32),
+    )
+
+
+def test_dsv4_index_cache_graph_gate_ignores_disabled_indexcache():
+    config = SimpleNamespace(
+        index_topk_freq=1,
+        index_topk_pattern=None,
+        index_topk_min_seq_len=75000,
+    )
+
+    assert not index_cache.should_disable_cuda_graph_for_index_cache_gate(
+        config,
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+
 def test_dsv4_index_cache_config_defaults_to_long_context_gate():
     path = Path(__file__).parents[3] / "python/sglang/srt/configs/deepseek_v4.py"
     module = ast.parse(path.read_text())

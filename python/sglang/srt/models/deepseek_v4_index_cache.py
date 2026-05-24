@@ -104,6 +104,23 @@ def index_cache_enabled_for_seq_lens(
     return int(seq_lens.max().item()) * compress_ratio >= min_seq_len
 
 
+def should_disable_cuda_graph_for_index_cache_gate(
+    config,
+    seq_lens_cpu: Optional[torch.Tensor],
+) -> bool:
+    min_seq_len = getattr(config, "index_topk_min_seq_len", 0)
+    if min_seq_len <= 0:
+        return False
+    if (
+        getattr(config, "index_topk_pattern", None) is None
+        and getattr(config, "index_topk_freq", 1) <= 1
+    ):
+        return False
+    if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        return True
+    return int(seq_lens_cpu.max().item()) * 4 < min_seq_len
+
+
 def get_c4_layer_ids(config) -> list[int]:
     return [
         idx

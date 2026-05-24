@@ -168,6 +168,9 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 )
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.deepseek_v4_index_cache import (
+    should_disable_cuda_graph_for_index_cache_gate,
+)
 from sglang.srt.models.deepseek_v4_index_cache_profile import record_cuda_graph_path
 from sglang.srt.platforms import current_platform
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -3064,6 +3067,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
+        if can_run_graph and should_disable_cuda_graph_for_index_cache_gate(
+            self.model_config.hf_config,
+            forward_batch.seq_lens_cpu,
+        ):
+            can_run_graph = False
         record_cuda_graph_path("extend_piecewise", can_run_graph)
         if can_run_graph:
             # TODO: device_timer.wrap is too broad here — it also includes
@@ -3258,6 +3266,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 and self.graph_runner
                 and self.graph_runner.can_run(forward_batch)
             )
+            if can_run_graph and should_disable_cuda_graph_for_index_cache_gate(
+                self.model_config.hf_config,
+                forward_batch.seq_lens_cpu,
+            ):
+                can_run_graph = False
             graph_mode = (
                 "decode"
                 if forward_batch.forward_mode.is_decode()

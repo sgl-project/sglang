@@ -81,6 +81,8 @@ def search_cmd(args) -> list[str]:
         str(args.output_dir / "searched_patterns.json"),
         "--command-template",
         args.pattern_command_template,
+        "--min-indexcache-prompt-tokens",
+        str(args.min_indexcache_prompt_tokens),
     ]
     if args.calibration_limit > 0:
         cmd += ["--limit", str(args.calibration_limit)]
