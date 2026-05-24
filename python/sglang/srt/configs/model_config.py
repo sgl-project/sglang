@@ -1450,15 +1450,15 @@ def _get_and_verify_dtype(
     if torch_dtype != config_dtype:
         if torch_dtype == torch.float32:
             # Upcasting to float32 is allowed.
-            logger.info("Upcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Upcasting %s to %s.", config_dtype, torch_dtype)
             pass
         elif config_dtype == torch.float32:
             # Downcasting from float32 to float16 or bfloat16 is allowed.
-            logger.info("Downcasting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Downcasting %s to %s.", config_dtype, torch_dtype)
             pass
         else:
             # Casting between float16 and bfloat16 is allowed with a warning.
-            logger.warning("Casting %s to %s.", config_dtype, torch_dtype)
+            logger.debug("Casting %s to %s.", config_dtype, torch_dtype)
 
     return torch_dtype
 
