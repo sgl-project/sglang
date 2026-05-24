@@ -82,18 +82,18 @@ class FutureTensors:
     def wait(self) -> _TensorOrDict:
         data = self._data
         event = self._event
+        retained_device_clones = self._retained_device_clones
         self._data = None
         self._event = None
-        # Releasing clones AFTER event.synchronize() so the d2h copy
-        # finishes reading from them before they become free-able.
-        retained = self._retained_device_clones
         self._retained_device_clones = None
 
         if data is None or event is None:
             raise RuntimeError("FutureTensors.wait() was called more than once")
 
+        # Releasing clones AFTER event.synchronize() so the d2h copy
+        # finishes reading from them before they become free-able.
         event.synchronize()
-        del retained
+        del retained_device_clones
 
         if _DUMMY_DICT_KEY in data:
             data = data[_DUMMY_DICT_KEY]
