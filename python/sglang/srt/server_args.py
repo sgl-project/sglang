@@ -184,7 +184,7 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
-G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake", "nixl"]
+G2PLUS_TRANSFER_BACKEND_CHOICES = ["auto", "mooncake"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
@@ -3756,11 +3756,12 @@ class ServerArgs:
             raise ValueError("g2plus_config.worker_id must be a non-negative integer")
 
         control_backend = str(
-            config.get("control_backend", control_config.get("backend", "dynamo"))
+            config.get("control_backend", control_config.get("backend", "router"))
         ).lower()
-        if control_backend != "dynamo":
+        if control_backend not in ("router", "dynamo"):
             raise ValueError(
-                "g2plus_config.control.backend must be 'dynamo', "
+                "g2plus_config.control.backend must be one of "
+                "['router', 'dynamo'], "
                 f"got {control_backend!r}"
             )
 
@@ -3778,7 +3779,9 @@ class ServerArgs:
         timeout_secs = float(
             config.get(
                 "timeout_secs",
-                transfer_config.get("timeout_secs", control_config.get("timeout_secs", 1.0)),
+                transfer_config.get(
+                    "timeout_secs", control_config.get("timeout_secs", 1.0)
+                ),
             )
         )
         if timeout_secs <= 0:

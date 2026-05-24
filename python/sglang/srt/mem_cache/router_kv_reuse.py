@@ -3,16 +3,11 @@ from __future__ import annotations
 import atexit
 import json
 import logging
-import socket
 import threading
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext
-from dataclasses import asdict, dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Mapping, Optional, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional, Protocol
 from urllib.parse import urlparse
 
 import numpy as np
@@ -27,10 +22,22 @@ from sglang.srt.mem_cache.g2plus_transfer import (
     make_g2plus_transfer_backend,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
-from sglang.srt.mem_cache.utils import (
-    block_hash_aliases,
-    compute_node_hash_values,
-    hash_str_to_int64,
+from sglang.srt.mem_cache.router_kv_control import (
+    is_indeterminate_direct_transfer_reason,
+    request_source_transfer,
+    start_source_transfer_server,
+)
+from sglang.srt.mem_cache.router_kv_plan import (
+    REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY as _NO_PLAN_REASON_KEY,
+    REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY as _PLAN_EXTRA_ARGS_KEY,
+    REMOTE_KV_REUSE_PLAN_VERSION as _PLAN_VERSION,
+    RemoteKvReusePlan,
+    normalize_endpoint,
+)
+from sglang.srt.mem_cache.router_kv_source import (
+    ResolvedHostPage,
+    handle_source_transfer,
+    resolve_host_pages as _resolve_host_pages,
 )
 from sglang.srt.environ import envs
 
@@ -40,21 +47,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = "remote_kv_reuse_plan"
-REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY = "remote_kv_reuse_no_plan_reason"
-REMOTE_KV_REUSE_PLAN_VERSION = 1
+REMOTE_KV_REUSE_PLAN_EXTRA_ARGS_KEY = _PLAN_EXTRA_ARGS_KEY
+REMOTE_KV_REUSE_NO_PLAN_REASON_EXTRA_ARGS_KEY = _NO_PLAN_REASON_KEY
+REMOTE_KV_REUSE_PLAN_VERSION = _PLAN_VERSION
 REMOTE_KV_REUSE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
-REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON = "source_transfer_timeout_maybe_inflight"
-
-_REMOTE_G2_TIERS = {"g2", "host_pinned", "hostpinned", "cpu_pinned", "cpu_tier1"}
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def _normalize_tier(tier: str) -> str:
-    return str(tier).strip().lower().replace("-", "_")
+resolve_host_pages = _resolve_host_pages
 
 
 def _normalize_metric_label(value: Any, default: str = "unknown") -> str:
@@ -62,10 +59,6 @@ def _normalize_metric_label(value: Any, default: str = "unknown") -> str:
     chars = [ch if ch.isalnum() or ch == "_" else "_" for ch in value]
     value = "".join(chars).strip("_")
     return (value or default)[:80]
-
-
-def _is_remote_g2_tier(tier: str) -> bool:
-    return _normalize_tier(tier) in _REMOTE_G2_TIERS
 
 
 def _coerce_int(value: Any, field_name: str) -> int:
@@ -86,191 +79,8 @@ def _coerce_int(value: Any, field_name: str) -> int:
     raise ValueError(f"{field_name} must be an integer, got {value!r}")
 
 
-def _coerce_array(value: Any, field_name: str) -> list[Any]:
-    if isinstance(value, (str, bytes, Mapping)):
-        raise ValueError(f"{field_name} must be an array")
-    try:
-        return list(value)
-    except TypeError as err:
-        raise ValueError(f"{field_name} must be an array") from err
-
-
-def _coerce_block_hash(value: Any) -> int:
-    if isinstance(value, Mapping):
-        for key in ("block_hash", "hash", "value", "0"):
-            if key in value:
-                return _coerce_int(value[key], "block_hash")
-        if len(value) == 1:
-            return _coerce_int(next(iter(value.values())), "block_hash")
-    return _coerce_int(value, "block_hash")
-
-
-def _expand_block_hash_aliases(values: Iterable[int]) -> set[int]:
-    aliases: set[int] = set()
-    for value in values:
-        aliases.update(block_hash_aliases(value))
-    return aliases
-
-
-def _first_present(data: Mapping[str, Any], *names: str, default: Any = None) -> Any:
-    for name in names:
-        if name in data:
-            return data[name]
-    return default
-
-
-@dataclass(frozen=True)
-class RemoteKvReusePlan:
-    plan_id: str
-    request_id: str
-    target_worker_id: int
-    target_dp_rank: int
-    source_worker_id: int
-    source_dp_rank: int
-    source_endpoint: Optional[str]
-    source_tier: str
-    block_hashes: tuple[int, ...]
-    planned_prefix_blocks: int
-    block_size_tokens: int
-    created_at_ms: int
-    expires_at_ms: int
-    start_block_index: int = 0
-    plan_version: int = REMOTE_KV_REUSE_PLAN_VERSION
-    kv_block_hashes: tuple[int, ...] = ()
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "RemoteKvReusePlan":
-        if not isinstance(data, Mapping):
-            raise ValueError("remote KV reuse plan must be a mapping")
-
-        block_hashes_raw = _first_present(data, "block_hashes", "hashes")
-        if block_hashes_raw is None:
-            raise ValueError("remote KV reuse plan missing block_hashes")
-        block_hashes = tuple(
-            _coerce_block_hash(item)
-            for item in _coerce_array(block_hashes_raw, "block_hashes")
-        )
-        kv_block_hashes_raw = _first_present(
-            data, "kv_block_hashes", "source_block_hashes", default=()
-        )
-        if kv_block_hashes_raw is None:
-            kv_block_hashes_raw = ()
-        kv_block_hashes = tuple(
-            _coerce_block_hash(item)
-            for item in _coerce_array(kv_block_hashes_raw, "kv_block_hashes")
-        )
-        if kv_block_hashes and len(kv_block_hashes) != len(block_hashes):
-            raise ValueError(
-                "kv_block_hashes length must match block_hashes when provided"
-            )
-
-        planned_prefix_blocks = _coerce_int(
-            _first_present(
-                data,
-                "planned_prefix_blocks",
-                "planned_blocks",
-                "num_blocks",
-                default=len(block_hashes),
-            ),
-            "planned_prefix_blocks",
-        )
-        if planned_prefix_blocks < 0:
-            raise ValueError("planned_prefix_blocks must be non-negative")
-        start_block_index = _coerce_int(
-            _first_present(data, "start_block_index", default=0),
-            "start_block_index",
-        )
-        if start_block_index < 0:
-            raise ValueError("start_block_index must be non-negative")
-
-        source_endpoint = _first_present(
-            data,
-            "source_endpoint",
-            "source_control_endpoint",
-            default=None,
-        )
-        if source_endpoint is not None:
-            if not isinstance(source_endpoint, str) or not source_endpoint.strip():
-                raise ValueError("source_endpoint must be a non-empty string")
-            source_endpoint = _normalize_endpoint(source_endpoint)
-
-        try:
-            return cls(
-                plan_id=str(_first_present(data, "plan_id", default="")),
-                request_id=str(_first_present(data, "request_id", default="")),
-                target_worker_id=_coerce_int(
-                    data["target_worker_id"], "target_worker_id"
-                ),
-                target_dp_rank=_coerce_int(
-                    _first_present(data, "target_dp_rank", default=0),
-                    "target_dp_rank",
-                ),
-                source_worker_id=_coerce_int(
-                    data["source_worker_id"], "source_worker_id"
-                ),
-                source_dp_rank=_coerce_int(
-                    _first_present(data, "source_dp_rank", default=0),
-                    "source_dp_rank",
-                ),
-                source_endpoint=source_endpoint,
-                source_tier=str(
-                    _first_present(data, "source_tier", default="host_pinned")
-                ),
-                block_hashes=block_hashes,
-                planned_prefix_blocks=min(planned_prefix_blocks, len(block_hashes)),
-                block_size_tokens=_coerce_int(
-                    _first_present(data, "block_size_tokens", "block_size"),
-                    "block_size_tokens",
-                ),
-                created_at_ms=_coerce_int(
-                    _first_present(data, "created_at_ms", default=0), "created_at_ms"
-                ),
-                expires_at_ms=_coerce_int(data["expires_at_ms"], "expires_at_ms"),
-                start_block_index=start_block_index,
-                plan_version=_coerce_int(
-                    _first_present(
-                        data, "plan_version", default=REMOTE_KV_REUSE_PLAN_VERSION
-                    ),
-                    "plan_version",
-                ),
-                kv_block_hashes=kv_block_hashes,
-            )
-        except KeyError as err:
-            raise ValueError(f"remote KV reuse plan missing {err.args[0]}") from err
-
-    def to_dict(self) -> Dict[str, Any]:
-        value = asdict(self)
-        value["block_hashes"] = list(self.block_hashes)
-        value["kv_block_hashes"] = list(self.kv_block_hashes)
-        return value
-
-    @property
-    def planned_hashes(self) -> tuple[int, ...]:
-        return self.block_hashes[: self.planned_prefix_blocks]
-
-    @property
-    def planned_kv_block_hashes(self) -> tuple[int, ...]:
-        return self.kv_block_hashes[: self.planned_prefix_blocks]
-
-    def is_remote_g2(self) -> bool:
-        return _is_remote_g2_tier(self.source_tier)
-
-    def is_expired(self, now_ms: Optional[int] = None) -> bool:
-        return self.expires_at_ms <= (now_ms if now_ms is not None else _now_ms())
-
-
-@dataclass(frozen=True)
-class ResolvedHostPage:
-    block_hash: int
-    hash_value: str
-    data: bytes
-
-
-@dataclass(frozen=True)
-class ResolvedHostPageLocation:
-    block_hash: int
-    hash_value: str
-    host_index: int
+def _normalize_endpoint(endpoint: str) -> str:
+    return normalize_endpoint(endpoint)
 
 
 @dataclass(frozen=True)
@@ -293,266 +103,12 @@ class _RemoteG2PendingFetch:
     submitted_at: float = 0.0
 
 
-def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
-    tensor = tensor.detach().cpu().contiguous()
-    return tensor.view(torch.uint8).numpy().tobytes()
-
-
-def _iter_tree_nodes(root: TreeNode) -> Iterable[TreeNode]:
-    stack = list(root.children.values())
-    while stack:
-        node = stack.pop()
-        yield node
-        stack.extend(node.children.values())
-
-
-def _build_host_block_index(
-    tree_cache, wanted_hashes: set[int]
-) -> Dict[int, tuple[TreeNode, int, str]]:
-    lookup_index = getattr(tree_cache, "lookup_router_kv_host_blocks", None)
-    if lookup_index is not None:
-        index = lookup_index(wanted_hashes)
-        if len(index) >= len(wanted_hashes):
-            return index
-        if getattr(tree_cache, "router_kv_block_index", None) is not None:
-            return index
-        wanted_hashes = wanted_hashes - set(index.keys())
-    else:
-        index: Dict[int, tuple[TreeNode, int, str]] = {}
-
-    wanted_hashes = _expand_block_hash_aliases(wanted_hashes)
-    page_size = tree_cache.page_size
-    for node in _iter_tree_nodes(tree_cache.root_node):
-        if node.host_value is None:
-            continue
-        if node.hash_value is None:
-            node.hash_value = compute_node_hash_values(node, page_size)
-
-        num_pages = min(len(node.hash_value), len(node.host_value) // page_size)
-        for page_idx in range(num_pages):
-            hash_value = node.hash_value[page_idx]
-            block_hash = hash_str_to_int64(hash_value)
-            for alias in block_hash_aliases(block_hash):
-                if alias in wanted_hashes and alias not in index:
-                    index[alias] = (node, page_idx, hash_value)
-        if len(index) >= len(wanted_hashes):
-            break
-    return index
-
-
-def _host_lookup_guard(tree_cache):
-    return getattr(tree_cache, "router_kv_lock", nullcontext())
-
-
-def _flush_hicache_write_through_acks(tree_cache) -> None:
-    flush = getattr(tree_cache, "flush_write_through_acks", None)
-    if callable(flush):
-        flush()
-
-
-def _host_page_start_indices(
-    entries: list[tuple[int, str, TreeNode, int]], page_size: int
-) -> list[int]:
-    host_indices = [0] * len(entries)
-    grouped_entries: dict[int, tuple[TreeNode, list[tuple[int, int]]]] = {}
-    for output_idx, (_, _, node, page_idx) in enumerate(entries):
-        group = grouped_entries.get(node.id)
-        if group is None:
-            grouped_entries[node.id] = (node, [(output_idx, page_idx)])
-        else:
-            group[1].append((output_idx, page_idx))
-
-    for node, refs in grouped_entries.values():
-        offsets = [page_idx * page_size for _, page_idx in refs]
-        starts = node.host_value[offsets].detach().cpu().tolist()
-        for (output_idx, _), host_index in zip(refs, starts):
-            host_indices[output_idx] = int(host_index)
-
-    return host_indices
-
-
-def resolve_host_pages(
-    tree_cache,
-    plan: RemoteKvReusePlan,
-    *,
-    start_block: int,
-    max_blocks: int,
-    worker_id: Optional[int],
-    dp_rank: int,
-) -> tuple[list[ResolvedHostPage], str]:
-    if worker_id is None:
-        return [], "missing_source_worker_id"
-    if plan.source_worker_id != worker_id:
-        return [], "wrong_source_worker"
-    if plan.source_dp_rank != dp_rank:
-        return [], "wrong_source_dp_rank"
-    if plan.is_expired():
-        return [], "plan_expired"
-    if not plan.is_remote_g2():
-        return [], "unsupported_source_tier"
-    if plan.block_size_tokens != tree_cache.page_size:
-        return [], "incompatible_block_size"
-
-    if start_block < 0 or max_blocks <= 0:
-        return [], "empty_request"
-
-    identity_hashes = plan.planned_hashes
-    kv_hashes = plan.planned_kv_block_hashes or identity_hashes
-    if start_block >= len(identity_hashes):
-        return [], "already_local"
-
-    requested_identity_hashes = identity_hashes[start_block : start_block + max_blocks]
-    requested_kv_hashes = kv_hashes[start_block : start_block + max_blocks]
-    pages: list[ResolvedHostPage] = []
-    entries: list[tuple[int, str, TreeNode, int]] = []
-    protected_nodes: list[TreeNode] = []
-    protected_ids: set[int] = set()
-    _flush_hicache_write_through_acks(tree_cache)
-    with _host_lookup_guard(tree_cache):
-        block_index = _build_host_block_index(
-            tree_cache, set(requested_kv_hashes)
-        )
-        try:
-            reason = "ok"
-            for identity_hash, kv_hash in zip(
-                requested_identity_hashes, requested_kv_hashes
-            ):
-                entry = block_index.get(kv_hash)
-                if entry is None:
-                    reason = "partial" if entries else "missing_first_block"
-                    break
-                node, page_idx, hash_value = entry
-                if node.id not in protected_ids:
-                    node.protect_host()
-                    protected_nodes.append(node)
-                    protected_ids.add(node.id)
-                entries.append((identity_hash, hash_value, node, page_idx))
-
-            for (identity_hash, hash_value, _, _), page_start in zip(
-                entries,
-                _host_page_start_indices(entries, tree_cache.page_size),
-            ):
-                data_page = tree_cache.cache_controller.mem_pool_host.get_data_page(
-                    page_start, flat=True
-                )
-                pages.append(
-                    ResolvedHostPage(
-                        block_hash=identity_hash,
-                        hash_value=hash_value,
-                        data=_tensor_to_bytes(data_page),
-                    )
-                )
-            if reason != "ok":
-                return pages, reason
-        finally:
-            for node in protected_nodes:
-                try:
-                    node.release_host()
-                except RuntimeError:
-                    logger.exception(
-                        "Failed to release remote G2 source host page protection"
-                    )
-
-    return pages, "ok"
-
-
-def _resolve_host_page_locations(
-    tree_cache,
-    plan: RemoteKvReusePlan,
-    *,
-    start_block: int,
-    max_blocks: int,
-    worker_id: Optional[int],
-    dp_rank: int,
-) -> tuple[list[ResolvedHostPageLocation], str, list[TreeNode]]:
-    if worker_id is None:
-        return [], "missing_source_worker_id", []
-    if plan.source_worker_id != worker_id:
-        return [], "wrong_source_worker", []
-    if plan.source_dp_rank != dp_rank:
-        return [], "wrong_source_dp_rank", []
-    if plan.is_expired():
-        return [], "plan_expired", []
-    if not plan.is_remote_g2():
-        return [], "unsupported_source_tier", []
-    if plan.block_size_tokens != tree_cache.page_size:
-        return [], "incompatible_block_size", []
-
-    if start_block < 0 or max_blocks <= 0:
-        return [], "empty_request", []
-
-    identity_hashes = plan.planned_hashes
-    kv_hashes = plan.planned_kv_block_hashes or identity_hashes
-    if start_block >= len(identity_hashes):
-        return [], "already_local", []
-
-    requested_identity_hashes = identity_hashes[start_block : start_block + max_blocks]
-    requested_kv_hashes = kv_hashes[start_block : start_block + max_blocks]
-    entries: list[tuple[int, str, TreeNode, int]] = []
-    protected_nodes: list[TreeNode] = []
-    protected_ids: set[int] = set()
-    _flush_hicache_write_through_acks(tree_cache)
-    with _host_lookup_guard(tree_cache):
-        block_index = _build_host_block_index(
-            tree_cache, set(requested_kv_hashes)
-        )
-        reason = "ok"
-        for identity_hash, kv_hash in zip(
-            requested_identity_hashes, requested_kv_hashes
-        ):
-            entry = block_index.get(kv_hash)
-            if entry is None:
-                reason = "partial" if entries else "missing_first_block"
-                break
-            node, page_idx, hash_value = entry
-            if node.id not in protected_ids:
-                node.protect_host()
-                protected_nodes.append(node)
-                protected_ids.add(node.id)
-            entries.append((identity_hash, hash_value, node, page_idx))
-
-        pages = [
-            ResolvedHostPageLocation(
-                block_hash=identity_hash,
-                hash_value=hash_value,
-                host_index=host_index,
-            )
-            for (identity_hash, hash_value, _, _), host_index in zip(
-                entries,
-                _host_page_start_indices(entries, tree_cache.page_size),
-            )
-        ]
-        if reason != "ok":
-            return pages, reason, protected_nodes
-
-    return pages, "ok", protected_nodes
-
-
-def _normalize_endpoint(endpoint: str) -> str:
-    endpoint = endpoint.strip()
-    if not endpoint:
-        return endpoint
-    if "://" not in endpoint:
-        endpoint = f"http://{endpoint}"
-    return endpoint.rstrip("/")
-
-
 def _format_optional_ms(value: Optional[float]) -> str:
     return "n/a" if value is None else f"{value:.3f}"
 
 
-def _is_timeout_error(err: BaseException) -> bool:
-    if isinstance(err, TimeoutError):
-        return True
-    if isinstance(err, urllib.error.URLError):
-        reason = getattr(err, "reason", None)
-        if isinstance(reason, TimeoutError):
-            return True
-    return "timed out" in str(err).lower()
-
-
 def _is_indeterminate_direct_transfer_reason(reason: str) -> bool:
-    return str(reason).startswith(REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON)
+    return is_indeterminate_direct_transfer_reason(reason)
 
 
 def _endpoint_to_bind(endpoint: str) -> tuple[str, int]:
@@ -602,19 +158,6 @@ def _select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     return _normalize_endpoint(spec)
 
 
-class _ReusableThreadingHTTPServer(ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-    def get_request(self):
-        request, client_address = super().get_request()
-        try:
-            request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError:
-            logger.debug("Failed to set TCP_NODELAY on G2plus resolver socket")
-        return request, client_address
-
-
 def _router_kv_reuse_enabled(server_args: "ServerArgs") -> bool:
     config = g2plus_config(server_args)
     return bool(
@@ -654,10 +197,16 @@ class RemoteG2ReuseHandler:
         self.worker_id = worker_id
         self.dp_rank = dp_rank
         self.timeout_secs = g2plus_timeout_secs(server_args)
+        self.prefetch_stop_policy = getattr(
+            server_args, "hicache_storage_prefetch_policy", "timeout"
+        )
+        self.prefetch_timeout_config = getattr(
+            tree_cache, "prefetch_timeout_config", None
+        )
         self.direct_transfer = direct_transfer
         self.metrics_collector = metrics_collector
         self.control_backend = str(
-            g2plus_config_value(server_args, "control_backend", "dynamo")
+            g2plus_config_value(server_args, "control_backend", "router")
         ).lower()
         if not self._direct_transfer_enabled():
             diagnostic_suffix = ""
@@ -676,7 +225,7 @@ class RemoteG2ReuseHandler:
             None,
         )
         self.endpoint = _select_dp_endpoint(endpoint_spec, dp_rank)
-        self._source_server: Optional[ThreadingHTTPServer] = None
+        self._source_server: Optional[Any] = None
         self._source_thread: Optional[threading.Thread] = None
         self._shutdown = False
         worker_limit = max(
@@ -793,6 +342,29 @@ class RemoteG2ReuseHandler:
             return None
         return (time.perf_counter() - submitted_at) * 1000
 
+    def _pending_timeout_secs(self, pending: _RemoteG2PendingFetch) -> float:
+        cfg = getattr(self, "prefetch_timeout_config", None)
+        if cfg is None:
+            return float(getattr(self, "timeout_secs", 0.0))
+        num_tokens = len(pending.expected_hashes) * self.tree_cache.page_size
+        return float(min(cfg.max, cfg.base + cfg.per_ki_token * num_tokens / 1024))
+
+    def _pending_should_stop_waiting(
+        self, pending: _RemoteG2PendingFetch
+    ) -> tuple[bool, str]:
+        policy = str(getattr(self, "prefetch_stop_policy", "timeout"))
+        if policy == "best_effort":
+            return True, "best_effort_incomplete"
+        if policy == "wait_complete":
+            return False, ""
+        if policy == "timeout":
+            timeout_secs = self._pending_timeout_secs(pending)
+            elapsed = time.perf_counter() - pending.submitted_at
+            if timeout_secs >= 0 and elapsed > timeout_secs:
+                return True, "prefetch_timeout"
+            return False, ""
+        return True, "unknown_prefetch_policy"
+
     def _pending_ready_wait_ms(
         self, pending: _RemoteG2PendingFetch
     ) -> Optional[float]:
@@ -859,164 +431,17 @@ class RemoteG2ReuseHandler:
 
     def _start_source_resolver(self) -> None:
         host, port = _endpoint_to_bind(self.endpoint)
-        manager = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_POST(self):  # noqa: N802
-                request_start = time.perf_counter()
-                if self.path not in {
-                    "/transfer_direct",
-                    "/transfer_mooncake",
-                }:
-                    self.send_error(404)
-                    return
-                if not manager._try_enter_source_resolver():
-                    self._write_json(
-                        503,
-                        {
-                            "ok": False,
-                            "reason": "source_resolver_busy",
-                            "pages": [],
-                        },
-                    )
-                    return
-                try:
-                    try:
-                        content_len = int(self.headers.get("Content-Length", "0"))
-                    except ValueError:
-                        self._write_json(
-                            400,
-                            {
-                                "ok": False,
-                                "reason": "malformed_content_length",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    if content_len <= 0:
-                        self._write_json(
-                            400,
-                            {
-                                "ok": False,
-                                "reason": "empty_request_body",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    if content_len > manager._max_control_body_bytes():
-                        self._write_json(
-                            413,
-                            {
-                                "ok": False,
-                                "reason": "control_payload_too_large",
-                                "pages": [],
-                            },
-                        )
-                        return
-
-                    body_read_start = time.perf_counter()
-                    raw_body = self.rfile.read(content_len)
-                    body_read_ms = (time.perf_counter() - body_read_start) * 1000
-                    if len(raw_body) != content_len:
-                        self._write_json(
-                            400,
-                            {
-                                "ok": False,
-                                "reason": "truncated_request_body",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    decode_start = time.perf_counter()
-                    try:
-                        payload = json.loads(raw_body)
-                    except (UnicodeDecodeError, json.JSONDecodeError) as err:
-                        self._write_json(
-                            400,
-                            {
-                                "ok": False,
-                                "reason": f"malformed_control_payload:json:{err}",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    decode_ms = (time.perf_counter() - decode_start) * 1000
-                    if not isinstance(payload, Mapping):
-                        self._write_json(
-                            400,
-                            {
-                                "ok": False,
-                                "reason": "malformed_control_payload:not_object",
-                                "pages": [],
-                            },
-                        )
-                        return
-                    if self.path in {"/transfer_direct", "/transfer_mooncake"}:
-                        if not manager._direct_transfer_enabled():
-                            self._write_json(
-                                501,
-                                {
-                                    "ok": False,
-                                    "reason": "direct_transfer_unavailable",
-                                    "pages": [],
-                                },
-                            )
-                            return
-                        pre_handler_ms = (
-                            time.perf_counter() - request_start
-                        ) * 1000
-                        response = dict(manager._handle_source_transfer(payload))
-                        response.update(
-                            {
-                                "source_control_pre_handler_ms": pre_handler_ms,
-                                "source_control_body_read_ms": body_read_ms,
-                                "source_control_json_decode_ms": decode_ms,
-                            }
-                        )
-                        write_start = time.perf_counter()
-                        self._write_json(200, response)
-                        write_ms = (time.perf_counter() - write_start) * 1000
-                        logger.debug(
-                            "G2plus source control handled path=%s pre_handler_ms=%.3f body_read_ms=%.3f json_decode_ms=%.3f response_write_ms=%.3f request_total_ms=%.3f",
-                            self.path,
-                            pre_handler_ms,
-                            body_read_ms,
-                            decode_ms,
-                            write_ms,
-                            (time.perf_counter() - request_start) * 1000,
-                        )
-                        return
-                except Exception as err:
-                    logger.exception("Remote G2 source resolve failed")
-                    self._write_json(
-                        500, {"ok": False, "reason": str(err), "pages": []}
-                    )
-                finally:
-                    manager._exit_source_resolver()
-
-            def log_message(self, fmt, *args):
-                logger.debug("Remote G2 source resolver: " + fmt, *args)
-
-            def _write_json(self, status_code: int, response: Mapping[str, Any]):
-                data = json.dumps(response).encode("utf-8")
-                self.send_response(status_code)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        self._source_server = _ReusableThreadingHTTPServer((host, port), Handler)
-        self._source_thread = threading.Thread(
-            target=self._source_server.serve_forever,
-            name=f"g2plus-source-{host}:{port}",
-            daemon=True,
-        )
-        self._source_thread.start()
-        logger.info(
-            "Remote G2 source resolver listening on %s for worker_id=%s dp_rank=%s",
-            self.endpoint,
-            self.worker_id,
-            self.dp_rank,
+        self._source_server, self._source_thread = start_source_transfer_server(
+            host=host,
+            port=port,
+            endpoint=self.endpoint,
+            worker_id=self.worker_id,
+            dp_rank=self.dp_rank,
+            max_body_bytes=self._max_control_body_bytes,
+            try_enter=self._try_enter_source_resolver,
+            exit_resolver=self._exit_source_resolver,
+            direct_transfer_enabled=self._direct_transfer_enabled,
+            handle_source_transfer=self._handle_source_transfer,
         )
 
     def _shutdown_direct_transfer_backend(self) -> None:
@@ -1117,39 +542,6 @@ class RemoteG2ReuseHandler:
         add(plan.source_endpoint)
         return endpoints
 
-    def _pages_from_direct_transfer_payload(
-        self,
-        payload: Mapping[str, Any],
-        plan: RemoteKvReusePlan,
-        *,
-        start_block: int,
-        max_blocks: int,
-    ) -> list[ResolvedHostPage]:
-        page_payload = payload.get("pages")
-        if page_payload is not None:
-            return [
-                ResolvedHostPage(
-                    block_hash=int(page["block_hash"]),
-                    hash_value=str(page.get("hash_value", "")),
-                    data=b"",
-                )
-                for page in page_payload
-            ]
-
-        transferred_blocks = _coerce_int(
-            payload.get("transferred_blocks", 0), "transferred_blocks"
-        )
-        if transferred_blocks < 0:
-            raise ValueError("transferred_blocks must be non-negative")
-        transferred_blocks = min(transferred_blocks, max_blocks)
-        block_hashes = plan.planned_hashes[
-            start_block : start_block + transferred_blocks
-        ]
-        return [
-            ResolvedHostPage(block_hash=block_hash, hash_value="", data=b"")
-            for block_hash in block_hashes
-        ]
-
     def _request_source_transfer(
         self,
         *,
@@ -1160,456 +552,24 @@ class RemoteG2ReuseHandler:
         max_blocks: int,
         target_page_indices: list[int],
     ) -> tuple[list[ResolvedHostPage], str]:
-        encode_start = time.perf_counter()
-        body = json.dumps(
-            {
-                "plan": plan.to_dict(),
-                "start_block": start_block,
-                "max_blocks": max_blocks,
-                "target_session_id": transfer_backend.target_session_id,
-                "transfer_backend": transfer_backend.name,
-                "target_metadata": transfer_backend.target_descriptor(),
-                "target_kv_ptrs": transfer_backend.target_kv_ptrs,
-                "target_kv_item_lens": transfer_backend.target_kv_item_lens,
-                "target_page_indices": target_page_indices,
-            }
-        ).encode("utf-8")
-        encode_ms = (time.perf_counter() - encode_start) * 1000
-
-        last_reason = "missing_source_endpoint"
-        for endpoint in endpoints:
-            paths = ["/transfer_direct"]
-            for path in paths:
-                request = urllib.request.Request(
-                    f"{endpoint}{path}",
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                request_start = time.perf_counter()
-                http_read_ms = 0.0
-                decode_ms = 0.0
-                response_bytes = 0
-                try:
-                    with urllib.request.urlopen(
-                        request, timeout=self.timeout_secs
-                    ) as response:
-                        response_body = response.read()
-                    http_read_ms = (time.perf_counter() - request_start) * 1000
-                    response_bytes = len(response_body)
-                    decode_start = time.perf_counter()
-                    payload = json.loads(response_body.decode("utf-8"))
-                    decode_ms = (time.perf_counter() - decode_start) * 1000
-                except (
-                    urllib.error.URLError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                ) as err:
-                    if _is_timeout_error(err):
-                        last_reason = f"{REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON}:{err}"
-                        logger.warning(
-                            "Remote G2 direct transfer timed out endpoint=%s path=%s ms=%.3f; target pages will be quarantined reason=%s",
-                            endpoint,
-                            path,
-                            (time.perf_counter() - request_start) * 1000,
-                            last_reason,
-                        )
-                        return [], last_reason
-                    last_reason = f"source_transfer_failed:{err}"
-                    logger.debug(
-                        "Remote G2 direct transfer request failed endpoint=%s path=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
-                        endpoint,
-                        path,
-                        (time.perf_counter() - request_start) * 1000,
-                        encode_ms,
-                        http_read_ms,
-                        decode_ms,
-                        len(body),
-                        response_bytes,
-                        last_reason,
-                    )
-                    continue
-
-                if not isinstance(payload, Mapping):
-                    last_reason = "malformed_source_transfer_response:not_object"
-                    logger.debug(
-                        "Remote G2 direct transfer returned malformed response endpoint=%s path=%s ms=%.3f reason=%s",
-                        endpoint,
-                        path,
-                        (time.perf_counter() - request_start) * 1000,
-                        last_reason,
-                    )
-                    continue
-
-                last_reason = str(payload.get("reason", "ok"))
-                if not payload.get("ok"):
-                    if _is_indeterminate_direct_transfer_reason(last_reason):
-                        logger.warning(
-                            "Remote G2 direct transfer rejected with indeterminate target-page state endpoint=%s path=%s ms=%.3f reason=%s",
-                            endpoint,
-                            path,
-                            (time.perf_counter() - request_start) * 1000,
-                            last_reason,
-                        )
-                        return [], last_reason
-                    logger.debug(
-                        "Remote G2 direct transfer rejected endpoint=%s path=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s reason=%s",
-                        endpoint,
-                        path,
-                        (time.perf_counter() - request_start) * 1000,
-                        encode_ms,
-                        http_read_ms,
-                        decode_ms,
-                        len(body),
-                        response_bytes,
-                        payload.get("resolve_ms"),
-                        payload.get("transfer_ms"),
-                        payload.get("total_ms"),
-                        last_reason,
-                    )
-                    continue
-                try:
-                    parse_start = time.perf_counter()
-                    pages = self._pages_from_direct_transfer_payload(
-                        payload,
-                        plan,
-                        start_block=start_block,
-                        max_blocks=max_blocks,
-                    )
-                    parse_ms = (time.perf_counter() - parse_start) * 1000
-                except (TypeError, KeyError, ValueError) as err:
-                    last_reason = f"malformed_source_transfer_response:{err}"
-                    logger.debug(
-                        "Remote G2 direct transfer returned malformed pages endpoint=%s path=%s ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f request_bytes=%d response_bytes=%d reason=%s",
-                        endpoint,
-                        path,
-                        (time.perf_counter() - request_start) * 1000,
-                        encode_ms,
-                        http_read_ms,
-                        decode_ms,
-                        len(body),
-                        response_bytes,
-                        last_reason,
-                    )
-                    continue
-                logger.debug(
-                    "Remote G2 direct transfer response endpoint=%s path=%s pages=%d ms=%.3f request_encode_ms=%.3f http_read_ms=%.3f response_decode_ms=%.3f response_parse_ms=%.3f request_bytes=%d response_bytes=%d source_resolve_ms=%s source_transfer_ms=%s source_total_ms=%s source_bytes=%s reason=%s",
-                    endpoint,
-                    path,
-                    len(pages),
-                    (time.perf_counter() - request_start) * 1000,
-                    encode_ms,
-                    http_read_ms,
-                    decode_ms,
-                    parse_ms,
-                    len(body),
-                    response_bytes,
-                    payload.get("resolve_ms"),
-                    payload.get("transfer_ms"),
-                    payload.get("total_ms"),
-                    payload.get("transfer_bytes"),
-                    last_reason,
-                )
-                if pages or last_reason in {"ok", "already_local"}:
-                    return pages, last_reason
-
-        return [], last_reason
-
-    def _parse_target_kv_metadata(
-        self, payload: Mapping[str, Any], transfer_backend: G2plusTransferBackend
-    ) -> tuple[Optional[str], Optional[list[int]], Optional[list[int]], Optional[str]]:
-        try:
-            target_session_id_raw = payload["target_session_id"]
-            target_kv_ptrs_raw = payload["target_kv_ptrs"]
-            target_kv_item_lens_raw = payload["target_kv_item_lens"]
-        except KeyError as err:
-            return None, None, None, f"target_kv_metadata_missing:{err}"
-
-        target_session_id = str(target_session_id_raw)
-        if not target_session_id or target_session_id_raw is None:
-            return None, None, None, "target_session_id_empty"
-        target_metadata = payload.get("target_metadata")
-        if isinstance(target_metadata, Mapping) and "session_id" in target_metadata:
-            metadata_session_id = str(target_metadata["session_id"])
-            if not metadata_session_id or target_metadata["session_id"] is None:
-                return None, None, None, "target_metadata_session_id_empty"
-            if metadata_session_id != target_session_id:
-                return None, None, None, "target_session_id_mismatch"
-
-        try:
-            target_kv_ptrs = self._coerce_transfer_int_list(
-                target_kv_ptrs_raw, "target_kv_ptrs"
-            )
-            target_kv_item_lens = self._coerce_transfer_int_list(
-                target_kv_item_lens_raw, "target_kv_item_lens"
-            )
-        except ValueError as err:
-            return None, None, None, str(err)
-
-        if not target_kv_ptrs:
-            return None, None, None, "target_kv_ptrs_empty"
-        if len(target_kv_ptrs) != len(target_kv_item_lens):
-            return (
-                None,
-                None,
-                None,
-                f"target_kv_ptrs_len_{len(target_kv_ptrs)}!=target_kv_item_lens_len_{len(target_kv_item_lens)}",
-            )
-
-        uint64_max = int(np.iinfo(np.uint64).max)
-        if any(ptr <= 0 or ptr > uint64_max for ptr in target_kv_ptrs):
-            return None, None, None, "target_kv_ptr_out_of_range"
-        if any(length <= 0 or length > uint64_max for length in target_kv_item_lens):
-            return None, None, None, "target_kv_item_len_out_of_range"
-
-        expected_item_lens = getattr(transfer_backend, "target_kv_item_lens", None)
-        if expected_item_lens is not None:
-            try:
-                expected_item_lens = [int(length) for length in expected_item_lens]
-            except (TypeError, ValueError) as err:
-                return None, None, None, f"local_target_kv_item_lens:{err}"
-            if len(expected_item_lens) != len(target_kv_item_lens):
-                return (
-                    None,
-                    None,
-                    None,
-                    f"target_kv_item_lens_count_mismatch:expected={len(expected_item_lens)}:got={len(target_kv_item_lens)}",
-                )
-            for idx, (expected, actual) in enumerate(
-                zip(expected_item_lens, target_kv_item_lens)
-            ):
-                if expected != actual:
-                    return (
-                        None,
-                        None,
-                        None,
-                        "target_kv_item_lens_mismatch:"
-                        f"idx={idx}:expected={expected}:got={actual}",
-                    )
-
-        return target_session_id, target_kv_ptrs, target_kv_item_lens, None
-
-    def _coerce_transfer_int_list(self, raw: Any, field_name: str) -> list[int]:
-        if isinstance(raw, (str, bytes, Mapping)):
-            raise ValueError(f"{field_name}_must_be_array")
-        try:
-            values = list(raw)
-        except TypeError as err:
-            raise ValueError(f"{field_name}_must_be_array") from err
-        return [
-            self._coerce_transfer_int(value, f"{field_name}[{idx}]")
-            for idx, value in enumerate(values)
-        ]
-
-    def _coerce_transfer_int(self, value: Any, field_name: str) -> int:
-        if isinstance(value, bool):
-            raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
-        if isinstance(value, (int, np.integer)):
-            return int(value)
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                raise ValueError(f"{field_name}_contains_non_integer:empty")
-            try:
-                return int(value, 10)
-            except ValueError as err:
-                raise ValueError(
-                    f"{field_name}_contains_non_integer:{value!r}"
-                ) from err
-        raise ValueError(f"{field_name}_contains_non_integer:{value!r}")
-
-    def _handle_source_transfer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
-        transfer_backend = self.direct_transfer
-        if transfer_backend is None or not getattr(transfer_backend, "enabled", False):
-            return {"ok": False, "reason": "direct_transfer_unavailable", "pages": []}
-        requested_backend = str(payload.get("transfer_backend", "mooncake")).lower()
-        if requested_backend != transfer_backend.name:
-            return {
-                "ok": False,
-                "reason": (
-                    f"unsupported_transfer_backend:{requested_backend}:"
-                    f"local={transfer_backend.name}"
-                ),
-                "pages": [],
-            }
-
-        try:
-            plan = RemoteKvReusePlan.from_dict(payload["plan"])
-            start_block = _coerce_int(payload.get("start_block", 0), "start_block")
-            max_blocks = _coerce_int(
-                payload.get("max_blocks", len(plan.block_hashes)), "max_blocks"
-            )
-        except (KeyError, ValueError) as err:
-            return {
-                "ok": False,
-                "reason": f"malformed_transfer_request:plan:{err}",
-                "pages": [],
-            }
-        (
-            target_session_id,
-            target_kv_ptrs,
-            target_kv_item_lens,
-            target_kv_metadata_error,
-        ) = self._parse_target_kv_metadata(payload, transfer_backend)
-        if target_kv_metadata_error is not None:
-            return {
-                "ok": False,
-                "reason": f"malformed_transfer_request:{target_kv_metadata_error}",
-                "block_size_tokens": self.tree_cache.page_size,
-                "pages": [],
-            }
-        try:
-            target_page_indices_list = self._coerce_transfer_int_list(
-                payload["target_page_indices"], "target_page_indices"
-            )
-        except KeyError as err:
-            return {
-                "ok": False,
-                "reason": f"malformed_transfer_request:target_page_indices_missing:{err}",
-                "block_size_tokens": self.tree_cache.page_size,
-                "pages": [],
-            }
-        except ValueError as err:
-            return {
-                "ok": False,
-                "reason": f"malformed_transfer_request:{err}",
-                "block_size_tokens": self.tree_cache.page_size,
-                "pages": [],
-            }
-        max_int32 = np.iinfo(np.int32).max
-        if any(idx < 0 or idx > max_int32 for idx in target_page_indices_list):
-            return {
-                "ok": False,
-                "reason": "malformed_transfer_request:target_page_index_out_of_range",
-                "block_size_tokens": self.tree_cache.page_size,
-                "pages": [],
-            }
-        total_start = time.perf_counter()
-        resolve_start = total_start
-        pages, reason, protected_nodes = _resolve_host_page_locations(
-            self.tree_cache,
-            plan,
+        return request_source_transfer(
+            transfer_backend=transfer_backend,
+            endpoints=endpoints,
+            plan=plan,
             start_block=start_block,
             max_blocks=max_blocks,
-            worker_id=self.worker_id,
-            dp_rank=self.dp_rank,
+            target_page_indices=target_page_indices,
+            timeout_secs=self.timeout_secs,
         )
-        resolve_ms = (time.perf_counter() - resolve_start) * 1000
-        transfer_ms = 0.0
-        transfer_bytes = 0
-        try:
-            if pages:
-                page_size = self.tree_cache.page_size
-                source_page_indices_list: list[int] = []
-                max_int32 = np.iinfo(np.int32).max
-                for page in pages:
-                    host_index = int(page.host_index)
-                    if host_index < 0:
-                        return {
-                            "ok": False,
-                            "reason": "source_host_page_index_out_of_range",
-                            "block_size_tokens": self.tree_cache.page_size,
-                            "pages": [],
-                        }
-                    if host_index % page_size != 0:
-                        return {
-                            "ok": False,
-                            "reason": "source_host_page_index_unaligned",
-                            "block_size_tokens": self.tree_cache.page_size,
-                            "pages": [],
-                        }
-                    page_index = host_index // page_size
-                    if page_index > max_int32:
-                        return {
-                            "ok": False,
-                            "reason": "source_page_index_out_of_range",
-                            "block_size_tokens": self.tree_cache.page_size,
-                            "pages": [],
-                        }
-                    source_page_indices_list.append(page_index)
-                source_page_indices = np.array(
-                    source_page_indices_list, dtype=np.int32
-                )
-                transfer_bytes = len(pages) * sum(int(x) for x in target_kv_item_lens)
-                if len(target_page_indices_list) < len(pages):
-                    return {
-                        "ok": False,
-                        "reason": (
-                            "malformed_transfer_request:"
-                            f"target_page_indices_too_short:{len(target_page_indices_list)}<{len(pages)}"
-                        ),
-                        "block_size_tokens": self.tree_cache.page_size,
-                        "pages": [],
-                    }
-                target_page_indices_list = target_page_indices_list[: len(pages)]
-                target_page_indices = np.array(
-                    target_page_indices_list, dtype=np.int32
-                )
-                transfer_start = time.perf_counter()
-                try:
-                    transfer_backend.transfer_pages(
-                        target_session_id=target_session_id,
-                        source_page_indices=source_page_indices,
-                        target_page_indices=target_page_indices,
-                        target_kv_ptrs=target_kv_ptrs,
-                        target_kv_item_lens=target_kv_item_lens,
-                        target_metadata=payload.get("target_metadata"),
-                    )
-                except Exception as err:
-                    transfer_ms = (time.perf_counter() - transfer_start) * 1000
-                    if _is_timeout_error(err):
-                        failure_reason = (
-                            f"{REMOTE_KV_REUSE_DIRECT_TIMEOUT_REASON}:source:{err}"
-                        )
-                    else:
-                        failure_reason = f"direct_transfer_failed:{err}"
-                    logger.warning(
-                        "G2plus source direct transfer failed pages=%d resolve_ms=%.3f transfer_ms=%.3f reason=%s",
-                        len(pages),
-                        resolve_ms,
-                        transfer_ms,
-                        err,
-                        exc_info=True,
-                    )
-                    return {
-                        "ok": False,
-                        "reason": failure_reason,
-                        "block_size_tokens": self.tree_cache.page_size,
-                        "resolve_ms": resolve_ms,
-                        "transfer_ms": transfer_ms,
-                        "total_ms": (time.perf_counter() - total_start) * 1000,
-                        "transfer_bytes": transfer_bytes,
-                        "pages": [],
-                    }
-                transfer_ms = (time.perf_counter() - transfer_start) * 1000
-            total_ms = (time.perf_counter() - total_start) * 1000
-            logger.debug(
-                "G2plus source transfer handled pages=%d reason=%s resolve_ms=%.3f transfer_ms=%.3f total_ms=%.3f",
-                len(pages),
-                reason,
-                resolve_ms,
-                transfer_ms,
-                total_ms,
-            )
-            return {
-                "ok": bool(pages) or reason in {"ok", "already_local"},
-                "reason": reason,
-                "block_size_tokens": self.tree_cache.page_size,
-                "resolve_ms": resolve_ms,
-                "transfer_ms": transfer_ms,
-                "total_ms": total_ms,
-                "transfer_bytes": transfer_bytes,
-                "transferred_blocks": len(pages),
-            }
-        finally:
-            for node in protected_nodes:
-                try:
-                    node.release_host()
-                except RuntimeError:
-                    logger.exception(
-                        "Failed to release remote G2 source host page protection"
-                    )
+
+    def _handle_source_transfer(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        return handle_source_transfer(
+            payload=payload,
+            transfer_backend=self.direct_transfer,
+            tree_cache=getattr(self, "tree_cache", None),
+            worker_id=getattr(self, "worker_id", None),
+            dp_rank=getattr(self, "dp_rank", 0),
+        )
 
     def _max_cacheable_blocks(self, req: "Req") -> int:
         max_prefix_len = max(len(req.fill_ids) - 1, 0)
@@ -1987,6 +947,18 @@ class RemoteG2ReuseHandler:
                 self._pending_fetches.pop(str(req.rid), None)
                 self._release_pending_fetch(pending)
             elif not pending.future.done():
+                stop_waiting, reason = self._pending_should_stop_waiting(pending)
+                if stop_waiting:
+                    self._pending_fetches.pop(str(req.rid), None)
+                    self._release_pending_fetch(pending)
+                    self._finished_plan_keys.add(self._plan_key(req, pending.plan))
+                    self._observe_reuse(
+                        backend=pending.backend,
+                        outcome="miss",
+                        reason=reason,
+                        wait_ms=self._pending_wait_ms(pending),
+                    )
+                    return RouterKVReuseResult()
                 return RouterKVReuseResult(pending=True)
             else:
                 return self._finish_pending_fetch(req, pending)

@@ -1,5 +1,4 @@
 import argparse
-import base64
 import json
 import os
 import threading
@@ -34,9 +33,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.mem_cache.g2plus_transfer import (
     MooncakeG2plusTransferBackend,
-    NixlG2plusTransferBackend,
-    _apply_nixl_backend_thread_params,
-    _default_nixl_num_threads,
     default_g2plus_transfer_parallelism,
     make_g2plus_transfer_backend,
 )
@@ -46,6 +42,7 @@ from sglang.srt.mem_cache.router_kv_reuse import (
     ResolvedHostPage,
     RouterKVReuseResult,
     RouterKVReuseManager,
+    _RemoteG2PendingFetch,
     resolve_host_pages,
 )
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -243,51 +240,6 @@ class FakeCheckedMooncakeEngine(FakeMooncakeEngine):
         if self._register_returns:
             return self._register_returns.pop(0)
         return 0
-
-
-class FakeNixlAgent:
-    name = "source-agent"
-
-    def __init__(self):
-        self.remote_agents = []
-        self.desc_calls = []
-        self.registered = []
-        self.xfers = []
-        self.released_handles = []
-        self.unregistered = []
-        self.next_handle = 1
-
-    def get_agent_metadata(self):
-        return b"source-metadata"
-
-    def add_remote_agent(self, metadata):
-        self.remote_agents.append(metadata)
-
-    def register_memory(self, addrs, memory_type):
-        self.registered.append((memory_type, addrs))
-        return [(memory_type, addrs)]
-
-    def get_xfer_descs(self, reqs, memory_type):
-        self.desc_calls.append((memory_type, reqs.copy()))
-        return (memory_type, reqs.copy())
-
-    def initialize_xfer(self, op, src_descs, dst_descs, peer_name, notif):
-        self.xfers.append((op, src_descs, dst_descs, peer_name, notif))
-        handle = f"handle-{self.next_handle}"
-        self.next_handle += 1
-        return handle
-
-    def transfer(self, handle):
-        return "PROC"
-
-    def check_xfer_state(self, handle):
-        return "DONE"
-
-    def release_xfer_handle(self, handle):
-        self.released_handles.append(handle)
-
-    def unregister_memory(self, descs):
-        self.unregistered.append(descs)
 
 
 class FakeUrlopenResponse:
@@ -2255,6 +2207,60 @@ class TestRouterKVReuse(unittest.TestCase):
 
         self.assertFalse(handler.has_pending())
 
+    def test_remote_g2_best_effort_policy_does_not_wait_for_pending_transfer(self):
+        tree = FakeTree(page_size=2)
+        metrics = FakeRouterMetricsCollector()
+        handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
+        handler.tree_cache = tree
+        handler.worker_id = 42
+        handler.dp_rank = 0
+        handler.direct_transfer = _fake_direct_transfer()
+        handler.prefetch_stop_policy = "best_effort"
+        handler.prefetch_timeout_config = None
+        handler.timeout_secs = 1
+        handler.metrics_collector = metrics
+        handler._pending_fetches = {}
+        handler._detached_fetches = set()
+        handler._finished_plan_keys = set()
+        handler._quarantined_device_indices = []
+        plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
+        running_future = FakeRunningFuture()
+        handler._pending_fetches["r-best-effort"] = _RemoteG2PendingFetch(
+            plan=plan,
+            plan_offset=0,
+            target_start_block=0,
+            expected_hashes=(11, 22),
+            future=running_future,
+            device_indices=torch.arange(200, 204),
+            locked_node=None,
+            backend="mooncake",
+            submitted_at=time.perf_counter(),
+        )
+        req = SimpleNamespace(
+            rid="r-best-effort",
+            fill_ids=[10, 11, 12, 13, 14, 15],
+            extra_key=None,
+            last_node=tree.root_node,
+            last_host_node=None,
+            prefix_indices=torch.empty((0,), dtype=torch.int64),
+            host_hit_length=0,
+            return_logprob=False,
+            logprob_start_len=-1,
+            positional_embed_overrides=None,
+            remote_g2_hit_length=0,
+            remote_kv_reuse_plan=_make_plan([11, 22]),
+        )
+
+        result = handler.check_remote_prefix(req)
+
+        self.assertFalse(result.pending)
+        self.assertEqual(handler._pending_fetches, {})
+        self.assertEqual(handler._finished_plan_keys, {("r-best-effort", "plan-1")})
+        self.assertEqual(tree.device_allocator.freed, [])
+        self.assertEqual(len(running_future.callbacks), 1)
+        self.assertEqual(metrics.events[-1]["outcome"], "miss")
+        self.assertEqual(metrics.events[-1]["reason"], "best_effort_incomplete")
+
     def test_remote_g2_plan_change_releases_old_pending_direct_transfer(self):
         tree = FakeTree(page_size=2)
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
@@ -2448,15 +2454,13 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000, 2000],
             target_kv_item_lens=[64, 64],
             target_descriptor=lambda: {
-                "backend": "nixl",
-                "agent_name": "target-agent",
-                "agent_metadata_b64": "dGFyZ2V0",
-                "gpu_id": 1,
+                "backend": "mooncake",
+                "session_id": "target-session",
             },
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
@@ -2489,8 +2493,8 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertEqual([page.block_hash for page in pages], [11, 22])
         self.assertEqual(requests[0][0], "http://127.0.0.1:39000/transfer_direct")
         payload = requests[0][1]
-        self.assertEqual(payload["transfer_backend"], "nixl")
-        self.assertEqual(payload["target_metadata"]["agent_name"], "target-agent")
+        self.assertEqual(payload["transfer_backend"], "mooncake")
+        self.assertEqual(payload["target_metadata"]["session_id"], "target-session")
         self.assertEqual(payload["target_page_indices"], [3, 4])
 
     def test_mooncake_direct_transfer_does_not_retry_legacy_alias(self):
@@ -2537,11 +2541,11 @@ class TestRouterKVReuse(unittest.TestCase):
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000],
             target_kv_item_lens=[64],
-            target_descriptor=lambda: {"backend": "nixl"},
+            target_descriptor=lambda: {"backend": "mooncake"},
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
 
@@ -2569,11 +2573,11 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000],
             target_kv_item_lens=[64],
-            target_descriptor=lambda: {"backend": "nixl"},
+            target_descriptor=lambda: {"backend": "mooncake"},
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
 
@@ -2607,11 +2611,11 @@ class TestRouterKVReuse(unittest.TestCase):
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000],
             target_kv_item_lens=[64],
-            target_descriptor=lambda: {"backend": "nixl"},
+            target_descriptor=lambda: {"backend": "mooncake"},
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22, 33]))
 
@@ -2642,11 +2646,11 @@ class TestRouterKVReuse(unittest.TestCase):
         handler = RemoteG2ReuseHandler.__new__(RemoteG2ReuseHandler)
         handler.timeout_secs = 1
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000],
             target_kv_item_lens=[64],
-            target_descriptor=lambda: {"backend": "nixl"},
+            target_descriptor=lambda: {"backend": "mooncake"},
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11, 22]))
 
@@ -2677,11 +2681,11 @@ class TestRouterKVReuse(unittest.TestCase):
         handler.timeout_secs = 1
         requests = []
         transfer_backend = SimpleNamespace(
-            name="nixl",
-            target_session_id="target-agent",
+            name="mooncake",
+            target_session_id="target-session",
             target_kv_ptrs=[1000],
             target_kv_item_lens=[64],
-            target_descriptor=lambda: {"backend": "nixl"},
+            target_descriptor=lambda: {"backend": "mooncake"},
         )
         plan = RemoteKvReusePlan.from_dict(_make_plan([11]))
 
@@ -3705,288 +3709,6 @@ class TestRouterKVReuse(unittest.TestCase):
         self.assertFalse(backend.enabled)
         self.assertEqual(engine.deregistered, [])
 
-    def test_nixl_transfer_backend_groups_source_host_to_target_gpu_pages(self):
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * page_size
-        target_k_ptr = 1_000_000
-        target_v_ptr = 2_000_000
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[target_k_ptr, target_v_ptr],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=1,
-            transfer_parallelism=1,
-        )
-        target_metadata = {
-            "agent_name": "target-agent",
-            "agent_metadata_b64": base64.b64encode(b"target-metadata").decode("ascii"),
-            "gpu_id": 3,
-        }
-
-        backend.transfer_pages(
-            target_session_id="unused",
-            source_page_indices=torch.tensor([3, 4, 7], dtype=torch.int32).numpy(),
-            target_page_indices=torch.tensor([10, 11, 12], dtype=torch.int32).numpy(),
-            target_kv_ptrs=[target_k_ptr, target_v_ptr],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            target_metadata=target_metadata,
-        )
-
-        self.assertEqual(agent.remote_agents, [b"target-metadata"])
-        self.assertEqual(len(agent.desc_calls), 2)
-        src_type, src_reqs = agent.desc_calls[0]
-        dst_type, dst_reqs = agent.desc_calls[1]
-        self.assertEqual(src_type, "DRAM")
-        self.assertEqual(dst_type, "VRAM")
-        self.assertEqual(
-            src_reqs.tolist(),
-            [
-                [source_k.data_ptr() + 3 * source_item_len, source_item_len * 2, 0],
-                [source_k.data_ptr() + 7 * source_item_len, source_item_len, 0],
-                [source_v.data_ptr() + 3 * source_item_len, source_item_len * 2, 0],
-                [source_v.data_ptr() + 7 * source_item_len, source_item_len, 0],
-            ],
-        )
-        self.assertEqual(
-            dst_reqs.tolist(),
-            [
-                [target_k_ptr + 10 * source_item_len, source_item_len * 2, 3],
-                [target_k_ptr + 12 * source_item_len, source_item_len, 3],
-                [target_v_ptr + 10 * source_item_len, source_item_len * 2, 3],
-                [target_v_ptr + 12 * source_item_len, source_item_len, 3],
-            ],
-        )
-        self.assertEqual(agent.xfers[0][0], "WRITE")
-        self.assertEqual(agent.xfers[0][3], "target-agent")
-        self.assertEqual(agent.released_handles, ["handle-1"])
-
-    def test_nixl_transfer_backend_can_post_parallel_transfers(self):
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * page_size
-        target_k_ptr = 1_000_000
-        target_v_ptr = 2_000_000
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[target_k_ptr, target_v_ptr],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=1,
-            transfer_parallelism=2,
-        )
-        target_metadata = {
-            "agent_name": "target-agent",
-            "agent_metadata_b64": base64.b64encode(b"target-metadata").decode("ascii"),
-            "gpu_id": 3,
-        }
-
-        backend.transfer_pages(
-            target_session_id="unused",
-            source_page_indices=torch.tensor([3, 4, 7], dtype=torch.int32).numpy(),
-            target_page_indices=torch.tensor([10, 11, 12], dtype=torch.int32).numpy(),
-            target_kv_ptrs=[target_k_ptr, target_v_ptr],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            target_metadata=target_metadata,
-        )
-
-        self.assertEqual(len(agent.xfers), 2)
-        self.assertEqual(len(agent.desc_calls), 4)
-        self.assertEqual(agent.released_handles, ["handle-1", "handle-2"])
-        self.assertTrue(all(xfer[0] == "WRITE" for xfer in agent.xfers))
-        self.assertTrue(all(xfer[3] == "target-agent" for xfer in agent.xfers))
-
-    def test_nixl_transfer_backend_drains_handles_after_error(self):
-        class ErrorThenSlowDoneAgent(FakeNixlAgent):
-            def __init__(self):
-                super().__init__()
-                self.checks = []
-                self.handle_2_checks = 0
-
-            def check_xfer_state(self, handle):
-                self.checks.append(handle)
-                if handle == "handle-1":
-                    return "ERR"
-                if handle == "handle-2":
-                    self.handle_2_checks += 1
-                    return "DONE" if self.handle_2_checks >= 2 else "PROC"
-                return "DONE"
-
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * page_size
-        agent = ErrorThenSlowDoneAgent()
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=1,
-            transfer_parallelism=2,
-        )
-        target_metadata = {
-            "agent_name": "target-agent",
-            "agent_metadata_b64": base64.b64encode(b"target-metadata").decode("ascii"),
-            "gpu_id": 3,
-        }
-
-        with self.assertRaisesRegex(RuntimeError, "encountered ERR"):
-            backend.transfer_pages(
-                target_session_id="unused",
-                source_page_indices=torch.tensor([3, 4, 7], dtype=torch.int32).numpy(),
-                target_page_indices=torch.tensor(
-                    [10, 11, 12], dtype=torch.int32
-                ).numpy(),
-                target_kv_ptrs=[1_000_000, 2_000_000],
-                target_kv_item_lens=[source_item_len, source_item_len],
-                target_metadata=target_metadata,
-            )
-
-        self.assertEqual(agent.released_handles, ["handle-1", "handle-2"])
-        self.assertGreaterEqual(agent.handle_2_checks, 2)
-
-    def test_nixl_transfer_backend_reports_timeout_if_error_drain_does_not_finish(self):
-        class ErrorThenStuckAgent(FakeNixlAgent):
-            def __init__(self):
-                super().__init__()
-                self.checks = []
-
-            def check_xfer_state(self, handle):
-                self.checks.append(handle)
-                if handle == "handle-1":
-                    return "ERR"
-                return "PROC"
-
-        page_size = 2
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * page_size
-        agent = ErrorThenStuckAgent()
-        tree = SimpleNamespace(
-            page_size=page_size,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=0,
-            transfer_parallelism=2,
-        )
-        target_metadata = {
-            "agent_name": "target-agent",
-            "agent_metadata_b64": base64.b64encode(b"target-metadata").decode("ascii"),
-            "gpu_id": 3,
-        }
-
-        with self.assertRaisesRegex(TimeoutError, "1 handles to drain") as cm:
-            backend.transfer_pages(
-                target_session_id="unused",
-                source_page_indices=torch.tensor([3, 4, 7], dtype=torch.int32).numpy(),
-                target_page_indices=torch.tensor(
-                    [10, 11, 12], dtype=torch.int32
-                ).numpy(),
-                target_kv_ptrs=[1_000_000, 2_000_000],
-                target_kv_item_lens=[source_item_len, source_item_len],
-                target_metadata=target_metadata,
-            )
-
-        self.assertIsInstance(cm.exception.__cause__, RuntimeError)
-        self.assertEqual(agent.released_handles, ["handle-1", "handle-2"])
-
-    def test_nixl_transfer_backend_reports_transport_status(self):
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                    v_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1, 2],
-            target_kv_lens=[128, 256],
-            target_kv_item_lens=[8, 8],
-            gpu_id=3,
-            timeout_secs=1,
-            backend_name="UCX",
-            transfer_parallelism=4,
-        )
-
-        descriptor = backend.target_descriptor()
-
-        self.assertEqual(descriptor["backend"], "nixl")
-        self.assertEqual(descriptor["agent_name"], "source-agent")
-        self.assertEqual(descriptor["gpu_id"], 3)
-        self.assertEqual(
-            descriptor["transport"],
-            {
-                "backend": "UCX",
-                "gpu_id": 3,
-                "transfer_parallelism": 4,
-            },
-        )
-        self.assertEqual(
-            base64.b64decode(descriptor["agent_metadata_b64"]),
-            b"source-metadata",
-        )
-
     def test_g2plus_transfer_parallelism_prefers_backend_neutral_env(self):
         with envs.SGLANG_G2PLUS_TRANSFER_PARALLELISM.override(
             None
@@ -4003,210 +3725,6 @@ class TestRouterKVReuse(unittest.TestCase):
         ), envs.SGLANG_G2PLUS_MOONCAKE_TRANSFER_PARALLELISM.override(3):
             self.assertEqual(default_g2plus_transfer_parallelism(), 3)
 
-    def test_nixl_thread_params_mirror_disagg_defaults(self):
-        with envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.override(None):
-            self.assertEqual(_default_nixl_num_threads(), 8)
-        with envs.SGLANG_DISAGGREGATION_THREAD_POOL_SIZE.override(6):
-            self.assertEqual(_default_nixl_num_threads(), 6)
-
-        params = {}
-        _apply_nixl_backend_thread_params("UCX", params, 6)
-        self.assertEqual(params, {"num_threads": "6"})
-
-        params = {"num_threads": "9"}
-        _apply_nixl_backend_thread_params("UCX", params, 6)
-        self.assertEqual(params, {"num_threads": "9"})
-
-        params = {}
-        _apply_nixl_backend_thread_params("GDS_MT", params, 6)
-        self.assertEqual(params, {"thread_count": "6"})
-
-        params = {}
-        _apply_nixl_backend_thread_params("UCCL", params, 6)
-        self.assertEqual(params, {"num_cpus": "6"})
-
-    def test_nixl_transfer_backend_rejects_invalid_target_metadata_before_te(self):
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * 2
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=1,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "invalid agent_metadata_b64"):
-            backend.transfer_pages(
-                target_session_id="unused",
-                source_page_indices=torch.tensor([3], dtype=torch.int32).numpy(),
-                target_page_indices=torch.tensor([10], dtype=torch.int32).numpy(),
-                target_kv_ptrs=[1_000_000, 2_000_000],
-                target_kv_item_lens=[source_item_len, source_item_len],
-                target_metadata={
-                    "agent_name": "target-agent",
-                    "agent_metadata_b64": "not-base64!!",
-                    "gpu_id": 3,
-                },
-            )
-
-        self.assertEqual(agent.remote_agents, [])
-        self.assertEqual(agent.desc_calls, [])
-        self.assertEqual(agent.xfers, [])
-
-    def test_nixl_transfer_backend_rejects_invalid_target_gpu_before_te(self):
-        source_k = torch.zeros((20, 4), dtype=torch.uint8)
-        source_v = torch.zeros((20, 4), dtype=torch.uint8)
-        source_item_len = source_k[0].nbytes * 2
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    k_data_refs=[source_k],
-                    v_data_refs=[source_v],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1_000_000, 2_000_000],
-            target_kv_lens=[10_000, 10_000],
-            target_kv_item_lens=[source_item_len, source_item_len],
-            gpu_id=3,
-            timeout_secs=1,
-        )
-
-        with self.assertRaisesRegex(RuntimeError, "gpu_id out of range"):
-            backend.transfer_pages(
-                target_session_id="unused",
-                source_page_indices=torch.tensor([3], dtype=torch.int32).numpy(),
-                target_page_indices=torch.tensor([10], dtype=torch.int32).numpy(),
-                target_kv_ptrs=[1_000_000, 2_000_000],
-                target_kv_item_lens=[source_item_len, source_item_len],
-                target_metadata={
-                    "agent_name": "target-agent",
-                    "agent_metadata_b64": base64.b64encode(
-                        b"target-metadata"
-                    ).decode("ascii"),
-                    "gpu_id": -1,
-                },
-            )
-
-        self.assertEqual(agent.remote_agents, [])
-        self.assertEqual(agent.desc_calls, [])
-        self.assertEqual(agent.xfers, [])
-
-    def test_nixl_transfer_backend_shutdown_unregisters_memory(self):
-        host_buffer = torch.zeros((32,), dtype=torch.uint8)
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    kv_buffer=host_buffer,
-                    k_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                    v_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1, 2],
-            target_kv_lens=[128, 256],
-            target_kv_item_lens=[8, 8],
-            gpu_id=3,
-            timeout_secs=1,
-        )
-        backend._register_target_device_pool()
-        backend._register_source_host_pool()
-
-        backend.shutdown()
-        backend.shutdown()
-
-        self.assertFalse(backend.enabled)
-        self.assertEqual(
-            agent.unregistered,
-            [
-                [("DRAM", [(host_buffer.data_ptr(), host_buffer.nbytes, 0, "")])],
-                [("VRAM", [(1, 128, 3, ""), (2, 256, 3, "")])],
-            ],
-        )
-
-    def test_nixl_transfer_backend_rejects_host_pool_without_refs(self):
-        host_buffer = torch.zeros((32,), dtype=torch.uint8)
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    kv_buffer=host_buffer,
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1],
-            target_kv_lens=[128],
-            target_kv_item_lens=[8],
-            gpu_id=3,
-            timeout_secs=1,
-        )
-
-        backend._register_source_host_pool()
-
-        self.assertFalse(backend.enabled)
-        self.assertEqual(agent.registered, [])
-
-    def test_nixl_transfer_backend_rejects_host_target_shape_mismatch(self):
-        host_buffer = torch.zeros((32,), dtype=torch.uint8)
-        agent = FakeNixlAgent()
-        tree = SimpleNamespace(
-            page_size=2,
-            cache_controller=SimpleNamespace(
-                mem_pool_host=SimpleNamespace(
-                    layout="layer_first",
-                    kv_buffer=host_buffer,
-                    k_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                    v_data_refs=[torch.zeros((2, 4), dtype=torch.uint8)],
-                )
-            ),
-        )
-        backend = NixlG2plusTransferBackend(
-            agent=agent,
-            tree_cache=tree,
-            target_kv_ptrs=[1, 2],
-            target_kv_lens=[128, 256],
-            target_kv_item_lens=[8, 16],
-            gpu_id=3,
-            timeout_secs=1,
-        )
-
-        backend._register_source_host_pool()
-
-        self.assertFalse(backend.enabled)
-        self.assertEqual(agent.registered, [])
-
     def test_explicit_g2plus_direct_backend_fails_fast_when_unavailable(self):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(g2plus_transfer_backend="mooncake")
@@ -4215,13 +3733,6 @@ class TestRouterKVReuse(unittest.TestCase):
             MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
         ):
             with self.assertRaisesRegex(RuntimeError, "Mooncake"):
-                make_g2plus_transfer_backend(scheduler)
-
-        scheduler.server_args.g2plus_transfer_backend = "nixl"
-        with patch.object(
-            NixlG2plusTransferBackend, "from_scheduler", return_value=None
-        ):
-            with self.assertRaisesRegex(RuntimeError, "NIXL"):
                 make_g2plus_transfer_backend(scheduler)
 
     def test_explicit_g2plus_direct_backend_error_includes_diagnostics(self):
@@ -4269,13 +3780,10 @@ class TestRouterKVReuse(unittest.TestCase):
         )
         with patch.object(
             MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
-        ) as mooncake_from_scheduler, patch.object(
-            NixlG2plusTransferBackend, "from_scheduler", return_value=None
-        ) as nixl_from_scheduler:
+        ) as mooncake_from_scheduler:
             self.assertIsNone(make_g2plus_transfer_backend(scheduler))
 
         mooncake_from_scheduler.assert_not_called()
-        nixl_from_scheduler.assert_not_called()
 
     def test_auto_g2plus_backend_without_direct_te_returns_none(self):
         scheduler = SimpleNamespace(
@@ -4283,7 +3791,7 @@ class TestRouterKVReuse(unittest.TestCase):
         )
         with patch.object(
             MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
-        ), patch.object(NixlG2plusTransferBackend, "from_scheduler", return_value=None):
+        ):
             self.assertIsNone(make_g2plus_transfer_backend(scheduler))
 
     def test_auto_g2plus_backend_records_unavailable_diagnostics(self):
@@ -4294,9 +3802,7 @@ class TestRouterKVReuse(unittest.TestCase):
 
         with patch.object(
             MooncakeG2plusTransferBackend, "from_scheduler", return_value=None
-        ) as mooncake_from_scheduler, patch.object(
-            NixlG2plusTransferBackend, "from_scheduler", return_value=None
-        ) as nixl_from_scheduler:
+        ) as mooncake_from_scheduler:
             self.assertIsNone(
                 make_g2plus_transfer_backend(scheduler, diagnostics=diagnostics)
             )
@@ -4304,8 +3810,7 @@ class TestRouterKVReuse(unittest.TestCase):
         mooncake_from_scheduler.assert_called_once_with(
             scheduler, diagnostics=diagnostics
         )
-        nixl_from_scheduler.assert_called_once_with(scheduler, diagnostics=diagnostics)
-        self.assertEqual(diagnostics, ["mooncake unavailable", "nixl unavailable"])
+        self.assertEqual(diagnostics, ["mooncake unavailable"])
 
     def test_remote_g2_from_scheduler_logs_transfer_diagnostics(self):
         scheduler = SimpleNamespace(
@@ -4326,7 +3831,6 @@ class TestRouterKVReuse(unittest.TestCase):
 
         def make_backend(_scheduler, diagnostics=None):
             diagnostics.append("mooncake initialization failed: missing transfer engine")
-            diagnostics.append("nixl initialization failed: missing nixl")
             return None
 
         with patch(
@@ -4340,8 +3844,7 @@ class TestRouterKVReuse(unittest.TestCase):
             handler.shutdown()
 
         self.assertIn(
-            "Diagnostics: mooncake initialization failed: missing transfer engine; "
-            "nixl initialization failed: missing nixl",
+            "Diagnostics: mooncake initialization failed: missing transfer engine",
             "\n".join(logs.output),
         )
 
@@ -4379,7 +3882,7 @@ class TestRouterKVReuse(unittest.TestCase):
                             "endpoint": "127.0.0.1:39007",
                         },
                         "transfer": {
-                            "backend": "nixl",
+                            "backend": "mooncake",
                             "timeout_secs": 2.5,
                         },
                     }
@@ -4397,7 +3900,55 @@ class TestRouterKVReuse(unittest.TestCase):
             "127.0.0.1:39007",
         )
         self.assertEqual(server_args.g2plus_config["timeout_secs"], 2.5)
-        self.assertEqual(server_args.g2plus_config["transfer_backend"], "nixl")
+        self.assertEqual(server_args.g2plus_config["transfer_backend"], "mooncake")
+
+    def test_server_args_g2plus_control_backend_defaults_to_router(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--g2plus-config",
+                json.dumps({"worker_id": 7}),
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+
+        self.assertEqual(server_args.g2plus_config["control_backend"], "router")
+
+    def test_server_args_rejects_unknown_g2plus_control_backend(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--g2plus-config",
+                json.dumps({"worker_id": 7, "control": {"backend": "static"}}),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "control.backend"):
+            ServerArgs.from_cli_args(args)
+
+    def test_server_args_rejects_g2plus_nixl_backend(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy",
+                "--g2plus-config",
+                json.dumps({"worker_id": 7, "transfer_backend": "nixl"}),
+            ]
+        )
+
+        with self.assertRaisesRegex(ValueError, "transfer_backend"):
+            ServerArgs.from_cli_args(args)
 
     def test_server_args_rejects_g2plus_config_without_worker_id(self):
         parser = argparse.ArgumentParser()
