@@ -78,6 +78,29 @@ def summarize_cuda_graph_paths(graph_paths: dict[str, int]) -> dict:
     }
 
 
+def summarize_objective_buckets(categories: dict[str, dict]) -> dict:
+    bucket_categories = {
+        "csa_indexer": ["csa_indexer"],
+        "raw_to_page_translation": ["raw_to_page_translation"],
+        "sparse_core_attention": [
+            category for category in categories if category.startswith("core_attention")
+        ],
+        "ffn_moe": ["ffn_moe"],
+        "cuda_graph": ["cuda_graph"],
+    }
+    buckets = {}
+    for bucket, names in bucket_categories.items():
+        present = [name for name in names if name in categories]
+        total_ms = sum(categories[name]["total_ms"] for name in present)
+        count = sum(categories[name]["count"] for name in present)
+        buckets[bucket] = {
+            "categories": present,
+            "count": count,
+            "total_ms": total_ms,
+        }
+    return buckets
+
+
 def summarize_trace(path: Path) -> dict:
     trace = open_trace(path)
     totals = defaultdict(float)
@@ -101,17 +124,19 @@ def summarize_trace(path: Path) -> dict:
             by_layer[layer_id][category] += dur
 
     total_us = sum(totals.values())
+    categories = {
+        category: {
+            "count": counts[category],
+            "total_ms": total / 1000.0,
+            "pct": (total / total_us * 100.0) if total_us else 0.0,
+        }
+        for category, total in sorted(totals.items())
+    }
     return {
         "path": str(path),
         "total_ms": total_us / 1000.0,
-        "categories": {
-            category: {
-                "count": counts[category],
-                "total_ms": total / 1000.0,
-                "pct": (total / total_us * 100.0) if total_us else 0.0,
-            }
-            for category, total in sorted(totals.items())
-        },
+        "categories": categories,
+        "objective_buckets": summarize_objective_buckets(categories),
         "cuda_graph_paths": dict(sorted(graph_paths.items())),
         "cuda_graph_summary": summarize_cuda_graph_paths(graph_paths),
         "layers": {
