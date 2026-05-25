@@ -1,8 +1,11 @@
+import importlib
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -625,11 +628,6 @@ class TestSamplingBackendTokenOracleEnvGate(CustomTestCase):
     """
 
     def _reload_server_args_with_env(self, *, enabled: bool):
-        import importlib
-        import os
-
-        import sglang.srt.server_args as server_args_module
-
         previous = os.environ.get("SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE")
         os.environ["SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE"] = "1" if enabled else "0"
         try:
