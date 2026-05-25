@@ -638,7 +638,7 @@ class LongcatFlashModel(nn.Module):
         self.alt_stream = device_module.Stream()
         if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
             self.moe_alt_stream = device_module.Stream()
-            self.first_attn_finished = device_module.Event()
+            self.double_stream_state = _LongcatDoubleStreamState()
             self.double_stream_state.first_attn_finished = device_module.Event()
         else:
             self.moe_alt_stream = None
