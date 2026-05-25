@@ -478,9 +478,7 @@ class LongcatFlashDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # first_attn
         if get_moe_a2a_backend().is_deepep() and not self.is_first_layer:
-            residual = residual.tensor_split(self.attn_tp_size)[
-                self.attn_tp_rank
-            ].contiguous()
+            residual = residual.tensor_split(self.attn_tp_size)[self.attn_tp_rank]
         hidden_states, residual = self.moe_layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -522,7 +520,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                 mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
-                ].contiguous()
+                ]
 
             with self.device_module.stream(self.double_stream_state.moe_alt_stream):
                 self.double_stream_state.moe_alt_stream.wait_event(self.double_stream_state.first_attn_finished)
@@ -553,7 +551,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             if not self.is_last_layer and get_moe_a2a_backend().is_deepep():
                 hidden_states = hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
-                ].contiguous()
+                ]
 
             hidden_states = moe_hidden_states + hidden_states
         return hidden_states, residual
