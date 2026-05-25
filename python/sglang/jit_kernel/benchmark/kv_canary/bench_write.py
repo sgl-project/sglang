@@ -126,8 +126,6 @@ def _build_write_inputs(
         positions[:total_entries] = (case.prefix_len + per_req_idx).to(torch.int64)
         out_cache_loc[:total_entries] = slots.to(torch.int64)
 
-    # SWA endpoints would gather the LUT here; identity LUT keeps the bench self-consistent while still
-    # exercising the host gather cost.
     if case.pool_kind == "swa_window_128":
         full_to_swa = torch.arange(num_slots + 1, dtype=torch.int64, device=device)
         full_to_swa[-1] = -1
