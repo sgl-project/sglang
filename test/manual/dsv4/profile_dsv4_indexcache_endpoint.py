@@ -40,6 +40,14 @@ REQUIRED_PROFILE_CATEGORIES = (
     "cuda_graph",
 )
 
+REQUIRED_OBJECTIVE_BUCKETS = (
+    "csa_indexer",
+    "raw_to_page_translation",
+    "sparse_core_attention",
+    "ffn_moe",
+    "cuda_graph",
+)
+
 
 def make_prompt(token_target: int, seed: str) -> str:
     rng = random.Random(seed)
@@ -170,9 +178,11 @@ def profile_validation_failures(args, trace_summaries: list[dict]) -> list[str]:
             "directory is visible to this driver"
         ]
     observed = {}
+    objective_buckets = {}
     cuda_graph_paths = {}
     for summary in trace_summaries:
         observed.update(summary.get("categories", {}))
+        objective_buckets.update(summary.get("objective_buckets", {}))
         cuda_graph_paths.update(summary.get("cuda_graph_paths", {}))
     missing = [
         category
@@ -185,6 +195,16 @@ def profile_validation_failures(args, trace_summaries: list[dict]) -> list[str]:
             "profile traces are missing required DSV4 IndexCache regions "
             f"{missing}; check SGLANG_DSV4_INDEXCACHE_PROFILE=true and that "
             "IndexCache reuse was exercised"
+        )
+    missing_buckets = [
+        bucket
+        for bucket in REQUIRED_OBJECTIVE_BUCKETS
+        if objective_buckets.get(bucket, {}).get("count", 0) <= 0
+    ]
+    if missing_buckets:
+        failures.append(
+            "profile traces are missing required objective timing buckets "
+            f"{missing_buckets}; rerun profile analysis with objective_buckets support"
         )
     if not cuda_graph_paths:
         failures.append(

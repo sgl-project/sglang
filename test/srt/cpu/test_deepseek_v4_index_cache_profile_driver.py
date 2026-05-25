@@ -140,6 +140,31 @@ def test_dsv4_index_cache_profile_driver_rejects_missing_cuda_graph_paths():
         profile_driver.validate_trace_summaries(args, summaries)
 
 
+def test_dsv4_index_cache_profile_driver_rejects_missing_objective_buckets():
+    args = Namespace(dry_run=False)
+    summaries = [
+        {
+            "categories": {
+                "csa_indexer": {},
+                "raw_to_page_translation": {},
+                "core_attention_c4": {},
+                "ffn_moe": {},
+                "cuda_graph": {},
+            },
+            "cuda_graph_paths": {"decode.indexcache_on.replay": 1},
+            "objective_buckets": {
+                "csa_indexer": {"count": 1},
+                "raw_to_page_translation": {"count": 1},
+                "sparse_core_attention": {"count": 1},
+                "ffn_moe": {"count": 1},
+            },
+        }
+    ]
+
+    with pytest.raises(RuntimeError, match="objective timing buckets"):
+        profile_driver.validate_trace_summaries(args, summaries)
+
+
 def test_dsv4_index_cache_profile_driver_rejects_missing_indexcache_on_graph_path():
     args = Namespace(dry_run=False)
     summaries = [
@@ -171,6 +196,13 @@ def test_dsv4_index_cache_profile_driver_accepts_required_profile_regions():
                 "cuda_graph": {},
             },
             "cuda_graph_paths": {"decode.indexcache_on.replay": 1},
+            "objective_buckets": {
+                "csa_indexer": {"count": 1},
+                "raw_to_page_translation": {"count": 1},
+                "sparse_core_attention": {"count": 1},
+                "ffn_moe": {"count": 1},
+                "cuda_graph": {"count": 1},
+            },
         }
     ]
 
