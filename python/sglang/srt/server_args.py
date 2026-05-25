@@ -695,6 +695,7 @@ class ServerArgs:
     hicache_storage_backend: Optional[str] = None
     hicache_storage_prefetch_policy: str = "timeout"
     hicache_storage_backend_extra_config: Optional[str] = None
+    hicache_disable_mamba: bool = False
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
@@ -3751,6 +3752,10 @@ class ServerArgs:
             self.enable_hierarchical_cache
             or self.disaggregation_decode_enable_offload_kvcache
         ):
+            if self.hicache_disable_mamba:
+                logger.warning(
+                    "--hicache-disable-mamba has no effect unless hierarchical cache is enabled."
+                )
             return
 
         # Step 1: Initial layout-io compatibility normalization.
@@ -6279,6 +6284,11 @@ class ServerArgs:
             choices=["direct", "kernel", "kernel_ascend"],
             default=ServerArgs.hicache_io_backend,
             help="The IO backend for KV cache transfer between CPU and GPU",
+        )
+        parser.add_argument(
+            "--hicache-disable-mamba",
+            action="store_true",
+            help="Disable hierarchical-cache offloading for Mamba states while keeping KV HiCache enabled.",
         )
         parser.add_argument(
             "--hicache-mem-layout",

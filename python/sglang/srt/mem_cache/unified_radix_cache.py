@@ -1200,6 +1200,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         trigger: TreeComponent,
         tracker: dict[ComponentType, int],
         target: EvictLayer = EvictLayer.DEVICE,
+        evict_mamba: bool = True,
     ):
         """Cascade eviction from trigger to lower-or-equal priority components."""
 
@@ -1212,6 +1213,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         for comp in self._components_tuple:
+            if not evict_mamba and comp.component_type == ComponentType.MAMBA:
+                continue
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
                     cd = node.component_data[comp.component_type]
@@ -1389,8 +1392,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             self.evictable_host_leaves.discard(node)
 
+    def _should_evict_mamba_with_full(self) -> bool:
+        mamba_component = self.components.get(ComponentType.MAMBA)
+        return (
+            mamba_component is None
+            or getattr(mamba_component, "_mamba_pool_host", None) is not None
+        )
+
     def _evict_to_host(
-        self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
+        self,
+        node: UnifiedTreeNode,
+        tracker: Optional[dict[ComponentType, int]] = None,
+        *,
+        evict_mamba: bool = True,
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
@@ -1398,7 +1412,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
-        self._cascade_evict(node, trigger, tracker)
+        self._cascade_evict(node, trigger, tracker, evict_mamba=evict_mamba)
         self._record_remove_event(node, medium=StorageMedium.GPU)
 
         # after device eviction, insert aux components into host LRU.
@@ -1408,7 +1422,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(node.parent)
 
     def _evict_device_leaf(
-        self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]
+        self,
+        node: UnifiedTreeNode,
+        tracker: dict[ComponentType, int],
+        *,
+        evict_mamba: bool = True,
     ) -> None:
         """Evict a device leaf node, choosing the right strategy:
 
@@ -1426,7 +1444,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 self.write_backup(node, write_back=True)
                 self.writing_check(write_back=True)
-                self._evict_to_host(node, tracker)
+                self._evict_to_host(node, tracker, evict_mamba=evict_mamba)
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
@@ -1441,7 +1459,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)
                 return
-        self._evict_to_host(node, tracker)
+        self._evict_to_host(node, tracker, evict_mamba=evict_mamba)
 
     def _evict_host_leaf(
         self, node: UnifiedTreeNode, tracker: dict[ComponentType, int]

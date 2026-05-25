@@ -385,6 +385,8 @@ class MambaComponent(TreeComponent):
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
+        if self._mamba_pool_host is None:
+            return None
 
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
