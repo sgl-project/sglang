@@ -20,8 +20,8 @@ register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 
-_QWEN3_MODEL = "Qwen/Qwen3-0.6B"
-_QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
+_QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
+_QWEN3_SCENARIO_MODEL = "qwen3-30b-a3b"
 
 _PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
