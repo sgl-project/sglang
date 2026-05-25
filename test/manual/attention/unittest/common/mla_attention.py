@@ -64,11 +64,43 @@ def make_mla_cases(backend: str) -> tuple[MLAAttentionCase, ...]:
     common = dict(backend=backend, num_heads=4)
     return (
         MLAAttentionCase(
+            name="mla_extend_page_size_1",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=1,
+            prefix_lens=(2, 4),
+            extend_lens=(3, 1),
+            **common,
+        ),
+        MLAAttentionCase(
             name="mla_extend_zero_prefix_exact_page",
             forward_mode=ForwardMode.EXTEND,
             page_size=16,
             prefix_lens=(0,),
             extend_lens=(16,),
+            **common,
+        ),
+        MLAAttentionCase(
+            name="mla_extend_zero_prefix_input_page_edges",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(15, 16, 17),
+            **common,
+        ),
+        MLAAttentionCase(
+            name="mla_extend_prefix_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(16,),
+            extend_lens=(2,),
+            **common,
+        ),
+        MLAAttentionCase(
+            name="mla_extend_total_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(8,),
             **common,
         ),
         MLAAttentionCase(
@@ -85,6 +117,14 @@ def make_mla_cases(backend: str) -> tuple[MLAAttentionCase, ...]:
             page_size=16,
             prefix_lens=(0, 8, 16),
             extend_lens=(15, 8, 1),
+            **common,
+        ),
+        MLAAttentionCase(
+            name="mla_extend_page32_cross_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=32,
+            prefix_lens=(31,),
+            extend_lens=(2,),
             **common,
         ),
         MLAAttentionCase(

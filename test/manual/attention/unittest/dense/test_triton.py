@@ -30,6 +30,24 @@ class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
             page_size=16,
             prefix_lens=(14, 15, 16),
         ),
+        DenseAttentionCase(
+            name="runner_cuda_graph_gqa_decode_page_boundary",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+        DenseAttentionCase(
+            name="runner_cuda_graph_mqa_decode_bsz1",
+            backend="triton",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=16,
+            prefix_lens=(7,),
+        ),
     )
 
     def test_projected_dense_attention_cases(self):

@@ -27,9 +27,10 @@ Implemented:
   GDN kernels.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
-  decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
-  against a fixed padded decode batch and replay distinct request metadata/input
-  tensors, so capture data is not identical to forward data.
+  decode mode for `triton` and `flashinfer`. Runner coverage now includes MHA,
+  GQA, and MQA decode variants; the CUDA-graph tests capture against a fixed padded
+  decode batch and replay distinct request metadata/input tensors, so capture data
+  is not identical to forward data.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -43,6 +44,11 @@ Implemented:
   `triton` and `flashinfer`; `triton` also covers prefix lengths below/equal/above
   the window. Prefix+SWA for FlashInfer needs a more faithful metadata fixture
   before enabling.
+- MLA and GDN representative Triton cases now mirror the dense input-shape edge
+  coverage more closely: page size 1, zero-prefix exact page, input lengths
+  below/equal/above a page, prefix exact page, total exact page, page-boundary
+  crossing, ragged page-boundary batches, page-size-32 crossing, decode
+  page-boundary batches, and bsz=1 decode.
 - The harness uses random shared weights, real `ForwardBatch` metadata, and real
   KV/request pools. Reference implementations must be independent HF-style
   PyTorch modules or functions; they may receive copied weights from the actual
@@ -54,17 +60,11 @@ Implemented:
 
 In progress:
 - No active representative-reference split remains for dense/SWA/MLA/GDN.
-- Priority is now to complete Phase 2, Phase 3, and Phase 4 comprehensively for the
-  representative backend set before expanding Phase 2 to additional attention
-  backends.
+- Phase 2/3 representative coverage has been widened for dense, SWA, MLA, and GDN.
+  The next implementation slice is Phase 4 synthetic speculative metadata coverage
+  for representative valid backends.
 
 Next implementation steps:
-- Finish Phase 2 module-level backend correctness for the representative backend
-  set: `torch_native`, `triton`, and `flashinfer`, plus method-specific
-  representative paths such as Triton GDN and Triton MLA.
-- Finish Phase 3 runner/graph integration for the same representative backend set,
-  including eager, CUDA graph, BCG, PCG where supported, and realistic capture vs.
-  replay metadata.
 - Finish Phase 4 speculative metadata coverage for representative valid backends
   before adding more Phase 2 backend files.
 - After representative Phase 2/3/4 coverage is stable, expand Phase 2 to additional
@@ -81,6 +81,9 @@ Latest verification:
 - `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---
@@ -669,7 +672,7 @@ Initial implementation slice:
 - `common/dense_attention.py` contains a projected attention target that owns
   Q/K/V/O projections and dispatches through `RadixAttention`.
 - `dense/test_torch_native.py`, `dense/test_triton.py`, and
-  `dense/test_flashinfer.py` cover representative MHA and GQA cases.
+  `dense/test_flashinfer.py` cover representative MHA, GQA, and MQA cases.
 - Dense tests exercise page size 1, exact-page extend, page-boundary decode
   (`seq_len = page_size - 1`, `page_size`, `page_size + 1`), zero/nonzero prefix,
   and GQA head grouping as an attention-config case.
@@ -681,9 +684,10 @@ Initial implementation slice:
   because the current synthetic metadata fixture does not faithfully match that
   production path.
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
-- Future representative-first slices should complete missing attention families,
-  runner modes, and speculative modes for `torch_native`, `triton`, and
-  `flashinfer` before adding additional Phase 2 backend files.
+- `mla/test_triton.py` and `gdn/test_triton.py` cover the representative dense-style
+  input edge cases for method-specific Triton paths.
+- Future representative-first slices should complete speculative modes for
+  `triton` and `flashinfer` before adding additional Phase 2 backend files.
 
 ---
 

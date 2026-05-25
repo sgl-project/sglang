@@ -29,6 +29,34 @@ class TestTorchNativeDenseAttentionBackendCorrectness(CustomTestCase):
             page_size=16,
             prefix_lens=(14, 15, 16),
         ),
+        DenseAttentionCase(
+            name="runner_eager_extend_ragged_page_boundary",
+            backend="torch_native",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 8, 16),
+            extend_lens=(15, 8, 1),
+        ),
+        DenseAttentionCase(
+            name="runner_eager_gqa_decode_page_boundary",
+            backend="torch_native",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+        DenseAttentionCase(
+            name="runner_eager_mqa_decode_bsz1",
+            backend="torch_native",
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=16,
+            prefix_lens=(7,),
+        ),
     )
 
     def test_projected_dense_attention_cases(self):
