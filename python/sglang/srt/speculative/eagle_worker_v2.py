@@ -1040,10 +1040,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
-        # skip_attn_backend_init only when cuda-graph already ran
-        # replay_prepare inside prepare_for_v2_verify. For the non-cuda-graph
-        # path, metadata must be initialized inside forward_extend after
-        # _forward_raw's prepare_mlp_sync_batch pads the forward batch.
+        # Only skip metadata init when cuda-graph already ran replay_prepare;
+        # the non-cuda-graph path needs forward_extend's init (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

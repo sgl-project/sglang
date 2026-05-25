@@ -306,15 +306,9 @@ class EagleVerifyInputV2Mixin:
         )
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        # Non-cuda-graph path: do NOT init_forward_metadata here. The forward
-        # batch has not yet been padded by `_forward_raw -> prepare_mlp_sync_batch`,
-        # so metadata built now uses pre-pad shapes while the actual forward
-        # consumes post-pad input_ids / out_cache_loc. Backends that bake those
-        # shapes into metadata (e.g. DSv4 indexer's c4/c128 write targets +
-        # the symbolic-shape TVM kernel) then crash on shape mismatch.
-        # Defer init to forward_extend, which runs after prepare_mlp_sync_batch
-        # -- the caller (`eagle_worker_v2.verify`) now passes
-        # `skip_attn_backend_init=can_run_cuda_graph` instead of always True.
+        # Non-cuda-graph: defer init to forward_extend, which runs after
+        # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
+        # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
         return verify_forward_batch, can_run_cuda_graph
 
