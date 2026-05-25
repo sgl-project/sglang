@@ -87,8 +87,11 @@ class SiluAndMul(MultiPlatformOp):
         super().__init__(*args, **kwargs)
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-        elif _use_aiter:
-            self._forward_method = self.forward_aiter
+        # NOTE(debug pr26208): temporarily disable AITer SiluAndMul to isolate
+        # whether this routing is the cause of test_session_control divergence
+        # on AMD. Restore once verified.
+        # elif _use_aiter:
+        #     self._forward_method = self.forward_aiter
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
