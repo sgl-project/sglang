@@ -12,6 +12,8 @@ Implemented:
   `flashinfer`.
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
+- MLA attention backend correctness exists under
+  `test/manual/attention/unittest/mla/` for `triton`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
@@ -33,14 +35,18 @@ Implemented:
 - The harness uses a small projected attention module with random shared weights,
   real `ForwardBatch` metadata, real KV/request pools, and a dense PyTorch
   reference.
+- RoPE is intentionally omitted from the current unit-level runner x attention
+  tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
+  orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- No active dense/SWA/representative Phase 3 work remains. The next implementation
-  slice should start MLA or another method that needs a real model-family module.
+- Triton GDN coverage is the next active implementation slice.
 
 Next implementation steps:
 - Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
   `trtllm_mla`.
+- Add `gdn/test_triton.py` for hybrid GDN with full-attention backend `triton`
+  and linear-attention kernel backend `triton`.
 - Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
   speculative draft/verify forward modes inside the affected method folders.
 - Add focused Phase 3 composition coverage for `hybrid_attn` and TBO after the
@@ -67,6 +73,8 @@ Verified:
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
 
 ---
 
@@ -86,9 +94,12 @@ test/manual/attention/unittest/
     test_triton.py
     test_flashinfer.py
   mla/
+    test_triton.py
     test_flashinfer.py
     test_flashmla.py
     test_trtllm_mla.py
+  gdn/
+    test_triton.py
 ```
 
 Each `test_<attn_backend>.py` file verifies one attention method against one
@@ -124,11 +135,11 @@ represents the model family under test. Do not call backend methods directly, an
 not force every case through `RadixAttention`.
 
 Reason:
-- For standard MHA/GQA/SWA, the natural boundary can be a small model attention
-  module that owns QKV projection and RoPE before calling `RadixAttention`.
+- For standard MHA/GQA/SWA, the natural boundary can be a small projected
+  attention module before calling `RadixAttention`.
 - For MLA, DSA, DSV4, linear attention, Mamba, and speculative verify paths, the
-  real behavior includes projections, RoPE, compression, sparse index metadata,
-  state updates, tree masks, or other side effects before backend dispatch.
+  real behavior includes projections, compression, sparse index metadata, state
+  updates, tree masks, or other side effects before backend dispatch.
 - Backend-only tests miss auxiliary calls such as
   `get_attn_backend().init_mha_chunk_metadata(forward_batch)` in the DeepSeek
   chunked-KV path.
@@ -197,12 +208,10 @@ reference before comparison.
 
 ### RoPE handling
 
-RoPE is part of the module boundary for the primary matrix. Tests feed hidden states
-and positions to both SGLang and the reference module. The module applies QKV
-projection, RoPE, compression/indexing, and backend dispatch.
-
-The direct `RadixAttention` smoke tests remain post-RoPE leaf tests and may use random
-Q/K/V directly.
+RoPE is deliberately out of scope for these runner x attention unit tests. Use
+post-RoPE-equivalent Q/K tensors or set the model-specific RoPE dimension to zero
+when the backend supports that shape. RoPE-specific coverage should live in focused
+model/rotary tests, not in every runner/backend compatibility case.
 
 ### Forward context
 
