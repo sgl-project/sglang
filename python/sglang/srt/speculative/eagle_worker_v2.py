@@ -53,7 +53,11 @@ from sglang.srt.speculative.eagle_info_v2 import (
     fill_accepted_out_cache_loc,
     fill_bonus_tokens,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    per_step_draft_out_cache_loc,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
@@ -438,11 +442,11 @@ class EagleDraftWorker(BaseDraftWorker):
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
 
-        out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
-        )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
+        out_cache_loc = per_step_draft_out_cache_loc(
+            out_cache_loc,
+            forward_batch.batch_size,
+            self.topk,
+            self.speculative_num_steps,
         )
 
         # Return values
@@ -1035,12 +1039,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        # Run target verify batch in the main compute stream (GPU compute)
+        # Run target verify batch in the main compute stream (GPU compute).
+        # Only skip metadata init when cuda-graph already ran replay_prepare;
+        # the non-cuda-graph path needs forward_extend's init (post-pad).
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=True,
+            skip_attn_backend_init=can_run_cuda_graph,
         )
         logits_output = forward_batch_output.logits_output
 
