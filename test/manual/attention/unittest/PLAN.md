@@ -53,21 +53,23 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- No active representative-reference split remains for dense/SWA/MLA/GDN. The next
-  implementation slice should either add MLA-specialized backends or replace the
-  tiny MLA actual module with direct `DeepseekV2AttentionMLA` instantiation.
+- No active representative-reference split remains for dense/SWA/MLA/GDN.
+- Priority is now to complete Phase 2, Phase 3, and Phase 4 comprehensively for the
+  representative backend set before expanding Phase 2 to additional attention
+  backends.
 
 Next implementation steps:
-- Decide whether the MLA actual target should move from the current tiny
-  DeepSeek-shaped module to direct instantiation of `DeepseekV2AttentionMLA`; that
-  stricter target requires more global server-args/config scaffolding but would
-  exercise dispatch decisions from `forward_mla.py` directly.
-- Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
-  `trtllm_mla`.
-- Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
-  speculative draft/verify forward modes inside the affected method folders.
-- Add focused Phase 3 composition coverage for `hybrid_attn` and TBO after the
-  base method/backend files are stable.
+- Finish Phase 2 module-level backend correctness for the representative backend
+  set: `torch_native`, `triton`, and `flashinfer`, plus method-specific
+  representative paths such as Triton GDN and Triton MLA.
+- Finish Phase 3 runner/graph integration for the same representative backend set,
+  including eager, CUDA graph, BCG, PCG where supported, and realistic capture vs.
+  replay metadata.
+- Finish Phase 4 speculative metadata coverage for representative valid backends
+  before adding more Phase 2 backend files.
+- After representative Phase 2/3/4 coverage is stable, expand Phase 2 to additional
+  attention backends such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
+  `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 
@@ -177,7 +179,7 @@ Recommended targets:
 | Standard MHA | Small GPT/LLaMA-style attention module |
 | GQA | Small LLaMA/Qwen-style attention module |
 | SWA | Small Mistral/Gemma-style sliding-window attention module |
-| MLA | DeepSeek MLA attention module from `deepseek_v2.py` |
+| MLA | Small DeepSeek-style MLA contract module; direct `DeepseekV2AttentionMLA` tests are optional dispatch/performance-path coverage |
 | DSA | DeepSeek sparse attention module |
 | DSV4 | DeepSeek V4 attention module |
 | Linear KDA/Lightning/GDN | Model-specific linear attention module, falling back to `RadixLinearAttention` only if no smaller model module is exposed |
@@ -201,10 +203,11 @@ Reference strategy by family:
   projections and RoPE as the SGLang module. Use `F.scaled_dot_product_attention`
   with causal or sliding-window masks.
 - MLA: explicit DeepSeek MLA math or a minimal HF-compatible attention module with
-  copied random projection/compression weights. The actual path should mirror
-  `deepseek_common/attention_forward_methods/forward_mla.py` closely enough to
-  exercise `q_nope -> w_kc`, latent KV cache writes through
-  `get_token_to_kv_pool()`, `attn_mqa`, and `w_vc`.
+  copied random projection/compression weights. The actual path should exercise the
+  MLA backend-facing contract: `q_nope -> w_kc`, latent KV cache writes through
+  `get_token_to_kv_pool()`, `attn_mqa`, and `w_vc`. It does not need to reproduce
+  every `DeepseekV2AttentionMLA` forward-method dispatch choice because those
+  choices are performance paths that should be mathematically equivalent.
 - DSA/DSV4: model-family reference that builds the equivalent sparse or compressed
   attention mask/index result, then compares the final module output.
 - Linear KDA/Lightning/GDN and Mamba: compact PyTorch implementations whenever
@@ -364,12 +367,20 @@ Minimum capability dimensions:
 
 ### Phase 2 matrix: module-level backend correctness
 
+Execute the matrix in two passes:
+1. **Representative-first pass**: finish comprehensive Phase 2 coverage for
+   `torch_native`, `triton`, and `flashinfer`, plus method-specific representative
+   paths already in scope such as Triton MLA and Triton GDN.
+2. **Backend-expansion pass**: after Phase 2/3/4 are stable for the representative
+   set, add more backend files such as `flashmla`, `cutlass_mla`, `trtllm_mha`,
+   `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
+
 | Dimension | Values |
 |---|---|
 | **Attention family** | Standard MHA, GQA, SWA, MLA, DSA, DSV4, linear KDA/Lightning/GDN, Mamba |
 | **Attention config** | MHA, GQA with `num_heads / num_kv_heads > 1`, MQA with `num_kv_heads=1`, finite-window SWA, MLA rank variants, sparse-index variants |
-| **Backend** | Capability-gated subset from the backend list |
-| **Forward mode** | `DECODE`, `EXTEND`, `MIXED`; DeepSeek chunked-KV path as a model forward-method case |
+| **Backend** | Representative-first subset, then capability-gated expansion subset |
+| **Forward mode** | `DECODE`, `EXTEND`, `MIXED` |
 | **Input shape** | Small ragged batch, exact-page batch, page-boundary batch, long prefix batch, bsz=1 decode |
 | **Page size** | 1, representative paged value such as 32 or 64 |
 
@@ -388,16 +399,18 @@ Representative configs, hardcoded with no network access:
 | Linear GDN | Hybrid GDN config | GDN config |
 | Mamba | Mamba-2 | SSM config |
 
-DeepSeek `MHA_CHUNKED_KV` is not a `ForwardMode`. It is a model forward method chosen
-inside the DeepSeek attention path. Trigger it by configuring the DeepSeek attention
-module threshold or environment to a small value, then run through the DeepSeek module.
+DeepSeek `MHA_CHUNKED_KV`, absorbed MLA, one-shot, ragged, and paged variants are
+model forward-method choices, not `ForwardMode` values. They are intended to be
+mathematically equivalent performance paths. Runner x attention compatibility tests do
+not need to strictly reproduce every DeepSeek dispatch choice; add focused
+dispatch-path tests only when validating those production dispatch decisions.
 
 ### Phase 3 matrix: runner and graph integration
 
 | Dimension | Values |
 |---|---|
 | **Runner mode** | eager baseline, CUDA graph, BCG, PCG |
-| **Backend** | Capability-gated subset: flashinfer, triton, torch_native, flex_attention, fa3, fa4, flashmla, cutlass_mla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn, tbo |
+| **Backend** | Representative-first subset: `torch_native`, `triton`, `flashinfer`; add wrappers such as `hybrid_attn` and TBO after base runner coverage is stable |
 | **Forward mode** | `DECODE`, `EXTEND`; selected speculative graph modes in Phase 4 |
 | **Attention family** | Small representative subset, not the full Phase 2 matrix |
 
@@ -423,7 +436,7 @@ module output directly.
 | **Forward mode** | `TARGET_VERIFY`, `DRAFT_EXTEND`, `DRAFT_EXTEND_V2` |
 | **topk** | 1 and 4 |
 | **num_draft_steps** | 1 and 4 |
-| **Backend** | Capability-gated subset: flashinfer, triton, fa3, fa4, cutlass_mla, flashmla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn |
+| **Backend** | Representative valid backends first, usually `triton` and `flashinfer`; expand only after synthetic spec metadata and graph replay are stable |
 | **Execution mode** | eager and CUDA graph where supported |
 
 Reference strategy:
@@ -643,9 +656,14 @@ Required input cases:
 - Extend with zero prefix and with nonzero prefix.
 - SWA with `seq_len < window_size`, `seq_len == window_size`, and
   `seq_len > window_size`.
-- DeepSeek chunked-KV path, triggered through the DeepSeek module.
 
 Invalid combinations are `skipIf`-guarded through the capability helper.
+
+Optional dispatch-path cases:
+- DeepSeek chunked-KV and other `attn_forward_method` choices can be covered by
+  focused tests that intentionally instantiate the production DeepSeek module. These
+  are not required for the main runner x attention compatibility matrix because the
+  forward methods are performance paths with equivalent math.
 
 Initial implementation slice:
 - `common/dense_attention.py` contains a projected attention target that owns
@@ -663,9 +681,9 @@ Initial implementation slice:
   because the current synthetic metadata fixture does not faithfully match that
   production path.
 - FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
-- Future slices should replace or extend this tiny projected target with real
-  model-specific modules for MLA, DSA, DSV4, linear attention, Mamba, and spec
-  decode forward modes.
+- Future representative-first slices should complete missing attention families,
+  runner modes, and speculative modes for `torch_native`, `triton`, and
+  `flashinfer` before adding additional Phase 2 backend files.
 
 ---
 
