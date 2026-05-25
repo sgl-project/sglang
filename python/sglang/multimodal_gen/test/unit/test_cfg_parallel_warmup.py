@@ -26,6 +26,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
     DEFAULT_PLACEHOLDER_PROMPT,
     build_warmup_reqs,
+    should_include_warmup_image,
 )
 
 # Patch path for get_global_server_args used by Stage.__init__
@@ -198,6 +199,36 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             (req.width, req.height),
             DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
         )
+
+    def test_warmup_image_inclusion_policy_all_task_types(self):
+        server_based_expected = {
+            ModelTaskType.T2I: False,
+            ModelTaskType.T2V: False,
+            ModelTaskType.TI2I: False,
+            ModelTaskType.TI2V: True,
+            ModelTaskType.I2I: True,
+            ModelTaskType.I2V: True,
+            ModelTaskType.I2M: True,
+        }
+
+        for task_type in ModelTaskType:
+            server_args = MagicMock()
+            server_args.pipeline_config.task_type = task_type
+
+            self.assertEqual(
+                should_include_warmup_image(
+                    server_args, server_based_warmup=True
+                ),
+                server_based_expected[task_type],
+                task_type.name,
+            )
+            self.assertEqual(
+                should_include_warmup_image(
+                    server_args, server_based_warmup=False
+                ),
+                task_type.accepts_image_input(),
+                task_type.name,
+            )
 
     def test_server_based_warmup_does_not_force_optional_image_input(self):
         server_args = MagicMock()

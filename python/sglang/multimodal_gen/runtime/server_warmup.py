@@ -122,7 +122,7 @@ def _effective_cfg_scale(sampling_defaults: SamplingParams) -> float | None:
     return sampling_defaults.guidance_scale
 
 
-def _should_include_warmup_image(
+def should_include_warmup_image(
     server_args: ServerArgs, server_based_warmup: bool
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
@@ -166,7 +166,7 @@ def build_warmup_reqs(
     )
 
     warmup_reqs = []
-    include_warmup_image = _should_include_warmup_image(
+    include_warmup_image = should_include_warmup_image(
         server_args, server_based_warmup
     )
     for width, height in resolutions:

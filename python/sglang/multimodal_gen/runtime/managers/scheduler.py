@@ -54,6 +54,7 @@ from sglang.multimodal_gen.runtime.server_warmup import (
     is_server_based_warmup,
     is_warmup_req,
     prepare_warmup_image_path_sync,
+    should_include_warmup_image,
     should_return_warmup_result,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
@@ -915,7 +916,9 @@ class Scheduler(SchedulerDisaggMixin):
         self._warmup_processed = 0
 
         warmup_input_path = None
-        if self.server_args.pipeline_config.task_type.accepts_image_input():
+        if should_include_warmup_image(
+            self.server_args, server_based_warmup=False
+        ):
             warmup_input_path = self._prepare_shared_warmup_image_path()
 
         warmup_reqs = build_warmup_reqs(

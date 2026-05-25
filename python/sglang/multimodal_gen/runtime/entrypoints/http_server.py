@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_ser
 from sglang.multimodal_gen.runtime.server_warmup import (
     build_warmup_reqs,
     prepare_warmup_image_path,
+    should_include_warmup_image,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
@@ -80,7 +81,7 @@ async def _run_server_warmup_after_http_ready(
         await _wait_until_http_ready(server_args)
 
         warmup_input_path = None
-        if server_args.pipeline_config.task_type.accepts_image_input():
+        if should_include_warmup_image(server_args, server_based_warmup=True):
             warmup_input_path = await prepare_warmup_image_path(server_args)
 
         warmup_reqs = build_warmup_reqs(
