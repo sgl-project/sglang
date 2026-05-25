@@ -585,12 +585,15 @@ def _check_common(
 ) -> None:
     coff = 2 if compress_ratio == 4 else 1
     assert kv_score_input.is_cuda and kv_score_buffer.is_cuda
-    assert kv_score_input.dim() == 2 and kv_score_input.dtype == torch.float32
+    assert kv_score_input.dim() == 2 and kv_score_input.dtype in (
+        torch.float32,
+        torch.bfloat16,
+    )
     assert kv_score_input.shape[1] == 2 * coff * head_dim
     assert kv_score_buffer.dim() == 3 and kv_score_buffer.dtype == torch.float32
     assert kv_score_buffer.shape[1:] == (compress_ratio, 2 * coff * head_dim)
     assert out.shape == (kv_score_input.shape[0], head_dim)
-    assert out.dtype == torch.float32 and out.is_cuda
+    assert out.is_cuda and out.dtype in (torch.float32, torch.bfloat16)
     assert ape.shape == (compress_ratio * coff, head_dim)
     assert ape.dtype == torch.float32 and ape.is_cuda
     assert indices.dtype == torch.int32 and indices.is_cuda
