@@ -134,7 +134,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         kwargs["extend_prefix_lens"] = s["extend_prefix_lens"][:bs]
         kwargs["extend_start_loc"] = s["extend_start_loc"][:bs]
 
-    def commit_prefill_serving_inputs(self, forward_batch: "ForwardBatch") -> None:
+    def commit_prefill_serving_inputs(self, forward_batch: ForwardBatch) -> None:
         """Replay-time: copy serving values into the static buffers so
         the addresses captured segments hold stay live with current data.
         """
@@ -149,7 +149,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         if forward_batch.orig_seq_lens is not None:
             s["orig_seq_lens"][:bs].copy_(forward_batch.orig_seq_lens)
 
-    def can_run(self, forward_batch: "ForwardBatch") -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         # Breakable-prefill captures bs=1 only — multi-req would silently return
         # wrong-shaped logits, corrupting downstream output_ids. The
         # presence of ``_prefill_static`` marks "this Breakable instance is
@@ -206,7 +206,7 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     def replay(
         self,
         shape_key: Any,
-        static_forward_batch: "ForwardBatch",
+        static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
         # static_forward_batch / kwargs are unused — Breakable replays

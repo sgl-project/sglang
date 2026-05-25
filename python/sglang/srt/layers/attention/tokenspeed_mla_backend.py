@@ -222,7 +222,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         k_pe: torch.Tensor,
         positions: torch.Tensor,
         layer: "DeepseekV2AttentionMLA",
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
         kv = layer.kv_b_proj(kv_a)[0]

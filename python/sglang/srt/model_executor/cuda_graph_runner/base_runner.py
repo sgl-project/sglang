@@ -166,7 +166,7 @@ class BaseCudaGraphRunner(ABC):
     # Abstract contract
     # -----------------------------------------------------------------
     @abstractmethod
-    def can_run(self, forward_batch: "ForwardBatch") -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         """Decide whether ``forward_batch`` should go through cuda graph
         replay (vs falling back to eager forward). Subclasses should AND
         their phase-level checks with ``self.backend.can_run(fb)``.
@@ -189,7 +189,7 @@ class BaseCudaGraphRunner(ABC):
     @abstractmethod
     def replay_prepare(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
         """Replay-time setup: pad to nearest captured bucket, populate
@@ -202,7 +202,7 @@ class BaseCudaGraphRunner(ABC):
     @abstractmethod
     def replay(
         self,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
         """Dispatch one batch through cuda graph replay."""

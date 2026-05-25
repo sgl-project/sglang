@@ -57,7 +57,7 @@ class BaseCudaGraphBackend(ABC):
     def prepare(self, runner) -> None: ...
 
     @abstractmethod
-    def can_run(self, forward_batch: "ForwardBatch") -> bool: ...
+    def can_run(self, forward_batch: ForwardBatch) -> bool: ...
 
     @abstractmethod
     @contextmanager
@@ -84,7 +84,7 @@ class BaseCudaGraphBackend(ABC):
     def replay(
         self,
         shape_key: Any,
-        static_forward_batch: "ForwardBatch",
+        static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any: ...
 
@@ -127,7 +127,7 @@ class BaseCudaGraphBackend(ABC):
         """
         pass
 
-    def commit_prefill_serving_inputs(self, forward_batch: "ForwardBatch") -> None:
+    def commit_prefill_serving_inputs(self, forward_batch: ForwardBatch) -> None:
         """Replay-time hook: copy serving-batch values into backend
         static buffers (Breakable); other backends no-op.
         """

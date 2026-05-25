@@ -63,7 +63,7 @@ def enable_tc_piecewise_cuda_graph():
 
 @dataclass
 class ForwardContext:
-    forward_batch: Optional["ForwardBatch"] = None
+    forward_batch: Optional[ForwardBatch] = None
     attention_layers: Optional[List[Any]] = field(default=None)
     quant_config: Any = None
     moe_layers: Optional[List[Any]] = field(default=None)

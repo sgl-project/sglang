@@ -114,7 +114,7 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
 def forward_mega_moe(
     moe: "DeepseekV2MoE",
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"] = None,
+    forward_batch: Optional[ForwardBatch] = None,
     input_ids_global: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
@@ -151,7 +151,7 @@ def forward_mega_moe(
 def _run_mega_routed(
     moe: "DeepseekV2MoE",
     hidden_states: torch.Tensor,
-    forward_batch: Optional["ForwardBatch"],
+    forward_batch: Optional[ForwardBatch],
     input_ids_global: Optional[torch.Tensor],
     num_tokens: int,
 ) -> torch.Tensor:

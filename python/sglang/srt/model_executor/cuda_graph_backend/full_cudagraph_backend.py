@@ -55,7 +55,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
         )
 
-    def can_run(self, forward_batch: "ForwardBatch") -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         return True
 
     @contextmanager
@@ -113,7 +113,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     def replay(
         self,
         shape_key: Any,
-        static_forward_batch: "ForwardBatch",
+        static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
         # static_forward_batch / kwargs are unused — Full backend replays

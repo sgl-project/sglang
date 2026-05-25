@@ -2731,7 +2731,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def maybe_update_ngram_token_table(
         self,
         next_token_ids: torch.Tensor,
-        forward_batch: "ForwardBatch",
+        forward_batch: ForwardBatch,
     ):
         """Update the ngram embedding token table after sampling."""
         ngram_embedding_info = forward_batch.ngram_embedding_info

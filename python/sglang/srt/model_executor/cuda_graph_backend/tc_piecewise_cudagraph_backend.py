@@ -229,7 +229,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         # by that wrapper.
         self._compiled_fn = runner.model_runner.model.forward
 
-    def can_run(self, forward_batch: "ForwardBatch") -> bool:
+    def can_run(self, forward_batch: ForwardBatch) -> bool:
         return True
 
     def has_shape(self, shape_key: Any) -> bool:
@@ -272,7 +272,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     def replay(
         self,
         shape_key: Any,
-        static_forward_batch: "ForwardBatch",
+        static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
         # The same compiled callable serves every shape — torch.compile's
