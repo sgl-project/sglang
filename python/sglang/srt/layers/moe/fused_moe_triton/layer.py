@@ -94,7 +94,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             group = get_tp_group()
         elif (
             a2a_backend.is_deepep()
-            and envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get()
+            and get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false")
         ):
             group = get_double_stream_ep_group().device_group
         else:

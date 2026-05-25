@@ -72,7 +72,7 @@ def _deepep_precompile_tp_barrier() -> None:
     if not envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         return
 
-    if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+    if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
         get_double_stream_ep_group().barrier()
     else:
         get_tp_group().barrier()

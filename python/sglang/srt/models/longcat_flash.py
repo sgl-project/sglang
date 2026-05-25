@@ -101,6 +101,7 @@ from sglang.srt.utils import (
     bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
+    get_bool_env_var,
     get_device_sm,
     is_cpu,
     is_cuda,
@@ -481,7 +482,7 @@ class LongcatFlashDecoderLayer(nn.Module):
             and self.double_stream_state.moe_alt_stream is not None
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
-        if enable_double_stream:
+        if enable_double_stream and self.double_stream_state.main_stream is None:
             self.double_stream_state.main_stream = torch.get_device_module().current_stream()
 
         # first_attn
@@ -638,7 +639,7 @@ class LongcatFlashModel(nn.Module):
 
         device_module = torch.get_device_module()
         self.alt_stream = device_module.Stream()
-        if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+        if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
             self.double_stream_state = _LongcatDoubleStreamState()
             self.double_stream_state.first_attn_finished = device_module.Event()
             self.double_stream_state.moe_alt_stream = device_module.Stream()

@@ -45,6 +45,7 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -1845,7 +1846,7 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
-    if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+    if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
         global _DOUBLE_STREAM_EP
         assert (
             _DOUBLE_STREAM_EP is None
