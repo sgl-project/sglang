@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from: https://github.com/vllm-project/vllm/blob/d4d2751732c3ccae162a5a0160c7d4fe05d2779a/vllm/model_executor/layers/quantization/bitsandbytes.py
 from __future__ import annotations
 

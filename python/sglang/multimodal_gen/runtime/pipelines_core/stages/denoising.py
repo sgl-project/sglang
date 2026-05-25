@@ -67,8 +67,10 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
+    ComponentUse,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -172,6 +174,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         super().__init__()
         self.transformer = transformer
         self.transformer_2 = transformer_2
+        # cache-dit state (for delayed mounting and idempotent control)
+        self._cache_dit_enabled = False
+        self._cached_num_steps = None
+        self._torch_compiled_module_ids: set[int] = set()
 
         hidden_size = self.server_args.pipeline_config.dit_config.hidden_size
         num_attention_heads = (
@@ -199,9 +205,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # misc
         self.profiler = None
-        # cache-dit state (for delayed mounting and idempotent control)
-        self._cache_dit_enabled = False
-        self._cached_num_steps = None
         self._is_warmed_up = False
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
@@ -218,12 +221,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if not backends:
             return None
         if len(backends) > 1:
+            sparse_backends = {backend for backend in backends if backend.is_sparse}
+            selected_backend = (
+                sorted(sparse_backends, key=lambda backend: backend.name)[0]
+                if sparse_backends
+                else sorted(backends, key=lambda backend: backend.name)[0]
+            )
             logger.warning(
                 "Multiple transformer attention backends detected: %s. "
-                "Using one backend for denoising metadata.",
+                "Using %s for denoising metadata.",
                 sorted(backend.name.lower() for backend in backends),
+                selected_backend.name.lower(),
             )
-        return sorted(backends, key=lambda backend: backend.name)[0]
+            return selected_backend
+        return next(iter(backends))
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -277,6 +288,13 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             module, nn.Module
         ):
             return
+        if envs.SGLANG_CACHE_DIT_ENABLED and not self._cache_dit_enabled:
+            logger.debug("Deferring torch.compile until cache-dit is enabled")
+            return
+        module_id = id(module)
+        if module_id in self._torch_compiled_module_ids:
+            return
+
         compile_kwargs: dict[str, Any] = {"fullgraph": False, "dynamic": None}
 
         if current_platform.is_npu():
@@ -306,6 +324,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
         module.compile(**compile_kwargs)
+        self._torch_compiled_module_ids.add(module_id)
+
+    def _maybe_enable_cache_dit_and_torch_compile(
+        self, num_inference_steps: int | tuple[int, int], batch: Req
+    ) -> None:
+        """Apply request-dependent transformer acceleration in trace-safe order."""
+        self._maybe_enable_cache_dit(num_inference_steps, batch)
+        for transformer in filter(None, [self.transformer, self.transformer_2]):
+            self._maybe_enable_torch_compile(transformer)
 
     @staticmethod
     def _needs_nvfp4_jit_prewarm(module: nn.Module) -> bool:
@@ -352,8 +379,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 )
             return
 
-        # check if cache-dit is enabled in config
-        if not envs.SGLANG_CACHE_DIT_ENABLED or batch.is_warmup:
+        # Keep cache-dit disabled for ordinary warmup, but allow torch.compile
+        # warmup to mount cache-dit before Dynamo traces the transformer.
+        if not envs.SGLANG_CACHE_DIT_ENABLED:
+            return
+        if batch.is_warmup and not self.server_args.enable_torch_compile:
             return
 
         world_size = get_world_size()
@@ -593,20 +623,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         else:
             cache_dit_num_inference_steps = num_inference_steps
 
-        if not server_args.model_loaded["transformer"]:
+        transformer_was_loaded = server_args.model_loaded["transformer"]
+        if not transformer_was_loaded:
             # FIXME: reuse more code
             loader = TransformerLoader()
             self.transformer = loader.load(
                 server_args.model_paths["transformer"], server_args, "transformer"
             )
-            # enable cache-dit before torch.compile (delayed mounting)
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_enable_torch_compile(self.transformer)
+
+        self._maybe_enable_cache_dit_and_torch_compile(
+            cache_dit_num_inference_steps, batch
+        )
+
+        if not transformer_was_loaded:
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True
-        else:
-            self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
@@ -618,7 +650,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # Setup precision and autocast settings
-        target_dtype = torch.bfloat16
+        target_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
@@ -1450,12 +1482,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN
             or self.attn_backend.get_enum() == AttentionBackendEnum.VIDEO_SPARSE_ATTN
         ):
+            attention_backend_config = server_args.attention_backend_config or {}
+            vsa_sparsity = attention_backend_config.get(
+                "VSA_sparsity", attention_backend_config.get("sparsity", 0.0)
+            )
             attn_metadata = self.attn_metadata_builder.build(
                 current_timestep=i,
                 raw_latent_shape=batch.raw_latent_shape[2:5],
                 patch_size=server_args.pipeline_config.dit_config.patch_size,
                 STA_param=batch.STA_param,
-                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
+                VSA_sparsity=vsa_sparsity,
                 device=get_local_torch_device(),
             )
         elif (
@@ -1557,6 +1593,35 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
+            )
+        elif self.attn_backend.get_enum() in [
+            AttentionBackendEnum.BLOCK_SPARSE_ATTN,
+            AttentionBackendEnum.RAIN_FUSION_ATTN,
+        ]:
+            sparse_config = server_args.attention_backend_config
+
+            current_timestep = i
+            skip_first_steps = sparse_config.get("skip_first_steps", 10)
+            sparsity = sparse_config.get("sparsity", 0.2)
+
+            raw_latent_shape = batch.raw_latent_shape
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                if patch_size_t is not None:
+                    patch_size = (patch_size_t, patch_size, patch_size)
+                else:
+                    patch_size = (patch_size, patch_size, patch_size)
+
+            attn_metadata = self.attn_metadata_builder.build(
+                current_timestep=current_timestep,
+                skip_first_steps=skip_first_steps,
+                sparsity=sparsity,
+                raw_latent_shape=raw_latent_shape,
+                patch_size=patch_size,
             )
         else:
             # attn_metadata can be None for SDPA attention backend

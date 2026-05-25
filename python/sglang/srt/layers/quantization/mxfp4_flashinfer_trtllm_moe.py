@@ -445,12 +445,20 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
     from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
         Mxfp4MarlinMoEMethod,
     )
 
     fused = isinstance(
-        experts.quant_method, (Mxfp4FlashinferTrtllmMoEMethod, Mxfp4MarlinMoEMethod)
+        experts.quant_method,
+        (
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4MarlinMoEMethod,
+        ),
     )
     if fused:
         if shared is not None:
