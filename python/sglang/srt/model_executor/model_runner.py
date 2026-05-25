@@ -34,8 +34,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from kv_canary.runner.canary_manager import context_tuple
 from sglang.jit_kernel.ngram_embedding import update_token_table
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
