@@ -2,15 +2,22 @@ from __future__ import annotations
 
 import logging
 import unittest
+from unittest.mock import Mock
+
+import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
+from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner import canary_manager as manager_module
+from sglang.srt.kv_canary.runner.health import KernelRunCounterHealthChecker
+from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
     make_config,
     make_manager,
 )
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
@@ -59,6 +66,62 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         log_text = "\n".join(cm.output)
         self.assertIn("protected_tokens=", log_text)
         self.assertTrue("step=5" in log_text or "step=10" in log_text)
+
+
+class TestKernelRunCounterDeltaCheck(CustomTestCase):
+    """Pure host-side regression tests for the watchdog's delta semantics."""
+
+    def _make_checker(
+        self,
+        *,
+        active_tags: tuple[CanaryLaunchTag, ...],
+        outer_step: int,
+    ) -> KernelRunCounterHealthChecker:
+        config = Mock(spec=CanaryConfig)
+        config.sweep_interval = 0
+        num_tags = len(CanaryLaunchTag)
+        device_state = Mock(spec=CanaryDeviceState)
+        device_state.kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64)
+        return KernelRunCounterHealthChecker(
+            config=config,
+            device_state=device_state,
+            active_tags=active_tags,
+            outer_step_counter_getter=lambda: outer_step,
+            d2h_stream=Mock(),
+        )
+
+    def _host_tensor(self, value: int) -> torch.Tensor:
+        return torch.full((len(CanaryLaunchTag),), value, dtype=torch.int64)
+
+    def test_first_check_raises_when_counter_never_incremented(self) -> None:
+        active_tags = (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.TAIL_K_FULL)
+        checker = self._make_checker(active_tags=active_tags, outer_step=100)
+
+        host_counters = torch.zeros(len(CanaryLaunchTag), dtype=torch.int64)
+        with self.assertRaises(RuntimeError) as cm:
+            checker._postprocess_on_host(host_counters)
+        message = str(cm.exception)
+        self.assertIn(CanaryLaunchTag.HEAD_K_FULL.name, message)
+        self.assertIn(CanaryLaunchTag.TAIL_K_FULL.name, message)
+        self.assertIn("did not increase", message)
+
+    def test_second_check_raises_when_delta_is_zero(self) -> None:
+        active_tags = (CanaryLaunchTag.HEAD_K_FULL,)
+        checker = self._make_checker(active_tags=active_tags, outer_step=100)
+
+        checker._postprocess_on_host(self._host_tensor(1))
+        with self.assertRaises(RuntimeError) as cm:
+            checker._postprocess_on_host(self._host_tensor(1))
+        message = str(cm.exception)
+        self.assertIn(CanaryLaunchTag.HEAD_K_FULL.name, message)
+        self.assertIn("did not increase", message)
+
+    def test_no_raise_when_counter_increases(self) -> None:
+        active_tags = (CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.TAIL_K_FULL)
+        checker = self._make_checker(active_tags=active_tags, outer_step=100)
+
+        for value in (1, 5, 12, 100):
+            checker._postprocess_on_host(self._host_tensor(value))
 
 
 if __name__ == "__main__":
