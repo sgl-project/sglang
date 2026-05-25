@@ -426,7 +426,30 @@ python -m sglang_router.launch_router --pd-disaggregation \
 
 For production deployments (RBG / LWS-based, DeepEP EP parallelism), see [multi_node_deployment docs](../../../docs/references/multi_node_deployment/rbg_pd/deepseekv32_pd).
 
-#### 4.2.5 Enabling PP, CP and TP with FP8 KV cache
+#### 4.2.5 DSA Long-Sequence Context Parallel and PP/CP
+
+SGLang provides two context parallel (CP) modes for long-sequence workloads, controlled with `--dsa-prefill-cp-mode`.
+
+**In-sequence splitting** (`--dsa-prefill-cp-mode in-seq-split`): Each CP rank handles a uniform shard of the sequence; KV cache is gathered via all-gather. Batch size is restricted to 1 during prefill. See [PR #12065](https://github.com/sgl-project/sglang/pull/12065).
+
+```bash Command
+# In-seq splitting mode — EP + DP, batch size 1
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --tp 8 --ep 8 --dp 2 --enable-dp-attention \
+  --enable-dsa-prefill-context-parallel --attn-cp-size 4 \
+  --dsa-prefill-cp-mode in-seq-split --max-running-requests 32
+```
+
+**Round-robin splitting** (`--dsa-prefill-cp-mode round-robin-split`, default): Distributes tokens by `token_idx % cp_size`. Supports fused MoE, FP8 KV cache, and multi-batch prefill. Cannot be combined with DP attention. See [PR #13959](https://github.com/sgl-project/sglang/pull/13959).
+
+```bash Command
+# Round-robin splitting — FusedMoE + CP8
+python -m sglang.launch_server --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --tp 8 --enable-dsa-prefill-context-parallel --attn-cp-size 8 \
+  --dsa-prefill-cp-mode round-robin-split --max-running-requests 32
+```
+
+**PP + CP (multi-node):** Combines Pipeline Parallelism and Context Parallelism for cross-node scaling. The production-optimized configurations below have been verified on Hopper:
 
 We suggested `DP2` + `MTP` for local deployment of agentic workflow with DeepSeek V3.2 on Hopper platform:
 
