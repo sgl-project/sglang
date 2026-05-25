@@ -23,6 +23,7 @@ class TestPerturbNextTokenSwap(MockModelPerturbE2EBase):
     extra_server_args = ("--skip-server-warmup",)
 
     def test_swap_triggers_input_check_violation_but_kv_paths_silent(self) -> None:
+        """Verify next_token swap fires write_token violation while KV reasons stay silent."""
         self.send_parallel_requests(n=4, timeout=30.0)
         self.assert_log_contains("mock_perturb next_token_swap: swapped")
         self.assert_any_launch_tag_violation_reported(fail_reason="write_token")

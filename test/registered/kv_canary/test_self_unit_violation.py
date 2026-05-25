@@ -46,6 +46,7 @@ def _make_row(
 
 class TestViolationReporter(CustomTestCase):
     def test_format_violation_verify_path_labels_each_bit(self) -> None:
+        """Verify verify-path violations render each fail-reason bit."""
         row = _make_row(
             stored_chain_hash=0x1111111111111111,
             expected_aux=0x2222222222222222,
@@ -70,6 +71,7 @@ class TestViolationReporter(CustomTestCase):
         )
 
     def test_format_violation_write_token_mismatch_labels_and_position(self) -> None:
+        """Verify write-token violations render token and position details."""
         row = _make_row(
             position=42,
             stored_token=999,
@@ -97,6 +99,7 @@ class TestViolationReporter(CustomTestCase):
     def test_format_violation_write_position_mismatch_uses_expected_aux_as_position(
         self,
     ) -> None:
+        """Verify write-position violations render expected_aux as a position."""
         row = _make_row(
             position=42,
             stored_token=111,
@@ -121,6 +124,7 @@ class TestViolationReporter(CustomTestCase):
         )
 
     def test_format_violation_combined_write_bits_render_both_labels(self) -> None:
+        """Verify combined write violation bits render both labels."""
         row = _make_row(
             fail_reason_bits=int(
                 FailReason.WRITE_TOKEN_MISMATCH | FailReason.WRITE_POSITION_MISMATCH
@@ -143,6 +147,7 @@ class TestViolationReporter(CustomTestCase):
         )
 
     def test_format_violation_unknown_kernel_kind_renders_unknown_label(self) -> None:
+        """Verify unknown kernel kinds render an unknown label."""
         row = _make_row(fail_reason_bits=int(FailReason.CHAIN_HASH))
         row[consts.VIOLATION_FIELD_KERNEL_KIND] = 9999
         out = _format_violation(
@@ -183,6 +188,7 @@ def _make_reporter(
 
 class TestLogOrRaiseViolation(CustomTestCase):
     def test_log_or_raise_violation_empty_ring_is_noop(self) -> None:
+        """Empty ring (write_index=0) emits no warning and leaves reporter non-raised."""
         reporter = _make_reporter(rows=[], write_index=0, ring_capacity=4, mode="log")
         with patch.object(violation_reporter_module.logger, "warning") as mock_warning:
             reporter.log_or_raise_violation(outer_step_counter=0)
@@ -190,6 +196,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
         self.assertFalse(reporter.is_raised)
 
     def test_log_mode_emits_one_warning_per_violation(self) -> None:
+        """Log mode with 3 valid rows emits 3 warnings, each a full _format_violation snapshot for that row."""
         rows = [
             _make_row(
                 slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
@@ -246,6 +253,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
         self.assertFalse(reporter.is_raised)
 
     def test_raise_mode_raises_one_error_containing_all_violations(self) -> None:
+        """Raise mode raises a single RuntimeError whose text is the 3 formatted rows joined with single newlines."""
         rows = [
             _make_row(
                 slot_idx=11, position=101, fail_reason_bits=int(FailReason.CHAIN_HASH)
@@ -296,6 +304,7 @@ class TestLogOrRaiseViolation(CustomTestCase):
         self.assertTrue(reporter.is_raised)
 
     def test_log_mode_ring_overflow_marks_overflow_in_each_row(self) -> None:
+        """Log mode with write_index=5 but ring_capacity=2 emits 2 warnings, each a full snapshot with overflow footer."""
         rows = [
             _make_row(slot_idx=11, position=101),
             _make_row(slot_idx=22, position=202),

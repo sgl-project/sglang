@@ -25,6 +25,7 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 class TestManagerPerForward(CanaryManagerTestCase):
     def test_per_forward_orchestrates_plan_head_tail(self) -> None:
+        """Verify per-forward execution launches plan, head/tail verify kernels, and write kernels in order."""
         calls: list[object] = []
         with patch.object(
             kernel_launch_module,
@@ -72,6 +73,7 @@ class TestManagerPerForward(CanaryManagerTestCase):
 
 class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_keeps_padded_token_tensors(self) -> None:
+        """Verify endpoint launch preserves contiguous int64 tensor shapes/values through the canonicalizer."""
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -123,7 +125,9 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_promotes_int32_boundary_tensors_to_int64(
         self,
     ) -> None:
-        """The canonicalize helper runs ``.to(torch.int64).contiguous()`` on
+        """Verify int32 boundary tensors are promoted to int64 at the launch boundary.
+
+        The canonicalize helper runs ``.to(torch.int64).contiguous()`` on
         each boundary tensor. Allocation inside cuda graph capture is
         legal (the graph memory pool absorbs it — see qwen3.py forward
         for the same pattern with ``.to(dtype)`` conversions).
@@ -164,7 +168,9 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_materializes_strided_boundary_tensors(
         self,
     ) -> None:
-        """``.contiguous()`` allocates a fresh copy; that allocation is fine
+        """Verify non-contiguous boundary views are materialized contiguous at launch.
+
+        ``.contiguous()`` allocates a fresh copy; that allocation is fine
         inside cuda graph capture (graph memory pool absorbs it).
         """
         group = make_buffer_group(device=self.device)
@@ -203,13 +209,13 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
 
 class TestManagerBeforeForward(CanaryManagerTestCase):
     def test_before_forward_does_not_throw_on_oversized_prefix_sum(self) -> None:
-        # On overflow, the plan kernel sets VerifyPlan.enable=0 and the verify kernel
-        # skips the step on-device; host logs a throttled warning instead.
+        """Verify oversized prefix sums are handled without host-side errors."""
         manager = make_manager(device=self.device, per_forward_verify_capacity=4)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
         _drive_one_cycle(manager, forward_batch)
 
     def test_before_forward_passes_when_sum_prefix_lens_fits(self) -> None:
+        """Verify prefix sums within capacity pass before-forward handling."""
         manager = make_manager(device=self.device, per_forward_verify_capacity=16)
         forward_batch = make_forward_batch(self.device, bs=2, seq_lens_list=(5, 5))
         _drive_one_cycle(manager, forward_batch)
@@ -229,6 +235,7 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
     def test_pre_ops_maybe_inside_graph_dispatches_to_bracketed_sfm(
         self,
     ) -> None:
+        """Verify the dispatcher routes phase 2 to the bracketed SingleForwardManager."""
         manager = make_manager(device=self.device, speculative_num_steps=3)
         forward_batch = make_forward_batch(self.device)
         target_sfm = manager._single_forward_managers[1]

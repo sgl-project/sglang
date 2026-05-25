@@ -50,6 +50,7 @@ def mock_model_server_args(*extra_args: str, canary_mode: str = "raise") -> list
 
 
 def mock_model_server_env(*, input_check_enabled: bool = True) -> dict[str, str]:
+    """Return env overrides for popen_launch_server in mock-model + canary mode."""
     return {
         "SGLANG_KV_CANARY_INPUT_CHECK": "1" if input_check_enabled else "0",
         "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",

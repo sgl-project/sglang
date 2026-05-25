@@ -54,7 +54,6 @@ class PlanInvariants:
         # downstream entry-shape invariants only hold when the kernel actually emitted
         # the full set, so guard them on enable=1.
         verify_enabled = int(verify_plan.enable[0].item()) == 1
-
         if verify_enabled:
             PlanInvariants._assert_extras_land_at_tail(
                 verify_plan=verify_plan,

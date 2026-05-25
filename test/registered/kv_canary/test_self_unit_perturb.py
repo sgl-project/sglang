@@ -47,6 +47,7 @@ class TestParseTargetGroupKind(CustomTestCase):
     def test_parse_target_group_kind_accepts_valid_values_case_insensitively(
         self,
     ) -> None:
+        """Verify target group kind parsing accepts valid names case-insensitively."""
         cases = [
             ("full", TargetGroupKind.FULL),
             ("FULL", TargetGroupKind.FULL),
@@ -58,10 +59,12 @@ class TestParseTargetGroupKind(CustomTestCase):
                 self.assertEqual(_parse_target_group_kind(raw), expected)
 
     def test_parse_target_group_kind_rejects_invalid_value(self) -> None:
+        """Verify target group kind parsing rejects unknown names."""
         with self.assertRaisesRegex(ValueError, "must be one of"):
             _parse_target_group_kind("prefix")
 
     def test_parse_target_group_kind_rejects_missing_or_any(self) -> None:
+        """Verify target group kind parsing requires an explicit concrete group."""
         for raw in [None, "", "any", " Any "]:
             with self.subTest(raw=raw):
                 with self.assertRaisesRegex(
@@ -72,6 +75,7 @@ class TestParseTargetGroupKind(CustomTestCase):
     def test_from_env_allows_missing_target_when_real_kv_perturb_is_disabled(
         self,
     ) -> None:
+        """Verify normal canary startup does not require a perturb target group."""
         with patch.dict(
             os.environ,
             {
@@ -90,6 +94,7 @@ class TestParseTargetGroupKind(CustomTestCase):
 
 class TestPickTargetGroup(CustomTestCase):
     def test_pick_target_group_filters_exact_kind(self) -> None:
+        """Verify target group selection returns only the requested pool kind."""
         cases = [
             (TargetGroupKind.FULL, PoolKind.FULL),
             (TargetGroupKind.SWA, PoolKind.SWA),
@@ -109,6 +114,7 @@ class TestPickTargetGroup(CustomTestCase):
                 self.assertEqual(group.kind, expected_kind)
 
     def test_pick_target_group_rejects_unsupported_kind(self) -> None:
+        """Verify target group selection rejects unsupported enum values."""
         full_group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
 
         with self.assertRaisesRegex(ValueError, "Unsupported target_group_kind"):
@@ -118,6 +124,7 @@ class TestPickTargetGroup(CustomTestCase):
             )
 
     def test_pick_target_group_ignores_groups_without_real_kv_sources(self) -> None:
+        """Verify target group selection skips groups without real KV sources."""
         full_group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=False)
         swa_group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True)
 
@@ -133,6 +140,7 @@ class TestPerturbManager(CustomTestCase):
     def test_perturb_manager_perturb_post_forward_dispatches_real_kv_post_forward(
         self,
     ) -> None:
+        """Verify perturb_post_forward() routes only to the post_forward dispatch."""
         device = DEFAULT_DEVICE
         manager = PerturbManager(
             config=PerturbConfig(
@@ -174,6 +182,7 @@ class TestPerturbManager(CustomTestCase):
 
 class TestRealKvPostForwardPerturb(CustomTestCase):
     def test_real_kv_post_forward_flips_a_byte_in_out_cache_loc_slot(self) -> None:
+        """Verify post-forward perturbation flips one real-KV byte and leaves canary buffers untouched."""
         device = DEFAULT_DEVICE
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
@@ -219,6 +228,7 @@ class TestRealKvPostForwardPerturb(CustomTestCase):
 
 class TestReqToTokenPerturb(CustomTestCase):
     def test_req_to_token_perturb_uses_live_slot_as_replacement(self) -> None:
+        """Verify req_to_token perturbation replaces a slot with another live slot."""
         device = DEFAULT_DEVICE
         pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token[1, :3] = torch.tensor(
@@ -262,6 +272,7 @@ class TestReqToTokenPerturb(CustomTestCase):
         self.assertFalse(bool(diff[1, 0].item()))
 
     def test_collect_active_slots_ignores_padded_out_cache_loc(self) -> None:
+        """Verify out_cache_loc padding does not exclude a live slot."""
         device = DEFAULT_DEVICE
         pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token[1, :2] = torch.tensor(
@@ -285,6 +296,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
     def test_real_kv_used_flips_first_real_kv_byte_for_active_full_slot(
         self,
     ) -> None:
+        """Verify real_kv_used flips only the first real KV byte for an active FULL slot."""
         device = DEFAULT_DEVICE
         pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token.fill_(-1)
@@ -325,6 +337,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
     def test_flip_first_byte_in_source_maps_swa_logical_slot_through_lut(
         self,
     ) -> None:
+        """Verify SWA groups map logical slots through swa_index_lut before flipping bytes."""
         source = RealKvSource(
             tensor=torch.arange(64, dtype=torch.uint8).view(2, 32),
             page_size=2,
@@ -347,6 +360,7 @@ class TestRealKvUsedPerturb(CustomTestCase):
         self.assertTrue(torch.equal(source.tensor, expected))
 
     def test_warmup_gate_prevents_perturbation_when_probabilities_are_one(self) -> None:
+        """Verify warmup prevents all perturbations even when every probability is one."""
         device = DEFAULT_DEVICE
         pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         pool.req_to_token.fill_(-1)
@@ -394,6 +408,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
     def test_real_kv_unused_cache_flips_first_real_kv_byte_for_orphan_slot(
         self,
     ) -> None:
+        """Verify real_kv_unused_cache flips only the first real KV byte for an orphan slot."""
         device = DEFAULT_DEVICE
         pool = make_req_to_token_pool(device, max_reqs=4, max_seq_len=8)
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
@@ -432,6 +447,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         self.assertTrue(torch.equal(source.tensor, expected))
 
     def test_pick_sweep_slot_for_group_skips_locked_radix_nodes(self) -> None:
+        """Verify unused-cache perturbation chooses only unlocked radix-cache slots."""
         device = DEFAULT_DEVICE
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         cache = make_radix_cache([[], [1, 2], [3]], device=device)
@@ -448,6 +464,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
         self.assertEqual(slot, 3)
 
     def test_pick_sweep_slot_for_group_translates_swa_slots(self) -> None:
+        """Verify unused-cache SWA perturbation translates full slots to physical SWA slots."""
         device = DEFAULT_DEVICE
         lut = torch.tensor([-1, 2], dtype=torch.int64, device=device)
         group = make_buffer_group(
@@ -467,6 +484,7 @@ class TestRealKvUnusedCachePerturb(CustomTestCase):
     def test_real_kv_unused_cache_skips_without_radix_cache_when_forward_batch_is_none(
         self,
     ) -> None:
+        """Verify unused-cache perturbation accepts no forward batch but skips without radix_cache."""
         device = DEFAULT_DEVICE
         group = make_buffer_group(kind=PoolKind.FULL, has_real_kv=True)
         source = group.real_kv_sources_k[0]
@@ -501,7 +519,7 @@ class TestPerturbUtils(CustomTestCase):
     def test_flip_first_byte_in_physical_swa_slot_does_not_translate_twice(
         self,
     ) -> None:
-        # Physical SWA slot selected from sweep must not be LUT-translated again.
+        """Verify a physical SWA slot selected from sweep is not LUT-translated again."""
         group = make_buffer_group(kind=PoolKind.SWA, has_real_kv=True)
         source = group.real_kv_sources_k[0]
         source.tensor[2, 0] = 0x12

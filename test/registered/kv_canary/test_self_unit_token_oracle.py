@@ -23,6 +23,7 @@ class TestTokenOracleManager(CustomTestCase):
     def test_fill_expected_inputs_expands_draft_extend_generalized_req_ids_per_token(
         self,
     ) -> None:
+        """Verify EAGLE draft extend maps one request row to every draft token."""
         forward_batch = SimpleNamespace(
             forward_mode=ForwardMode.DRAFT_EXTEND,
             spec_info=SimpleNamespace(num_tokens_per_req=4),

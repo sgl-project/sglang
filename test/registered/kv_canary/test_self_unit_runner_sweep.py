@@ -36,6 +36,7 @@ def _run_one_cycle(manager, forward_batch) -> None:
 
 class TestSelfUnitManagerSweep(CanaryManagerTestCase):
     def test_sweep_every_n_cadence(self) -> None:
+        """Verify sweep execution follows the configured step cadence."""
         config = make_config(sweep_interval=4)
         manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
@@ -55,6 +56,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         self.assertEqual(sweep_calls, [0, 4, 8])
 
     def test_sweep_path_launches_sweep_kernels(self) -> None:
+        """Verify sweep paths launch sweep verify kernels."""
         config = make_config(sweep_interval=1)
         manager = make_manager(device=self.device, config=config)
         forward_batch = make_forward_batch(self.device)
@@ -80,6 +82,7 @@ class TestSelfUnitManagerSweep(CanaryManagerTestCase):
         self.assertTrue(any("SWEEP" in kind for kind in sweep_kernel_kinds))
 
     def test_sweep_allocates_verify_plan_from_walker_output(self) -> None:
+        """Verify sweep planning sizes the verify plan from walker output."""
         manager = make_manager(device=self.device)
         cache = make_radix_cache([[], [10, 11], [12, 13, 14]], device=self.device)
         cache.req_to_token_pool = make_req_to_token_pool(self.device)

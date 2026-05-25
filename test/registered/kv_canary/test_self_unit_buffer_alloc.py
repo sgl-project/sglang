@@ -31,9 +31,11 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
 
 class TestResolveRealKvReadBytes(CustomTestCase):
     def test_resolve_real_kv_read_bytes_off_returns_zero(self) -> None:
+        """Verify OFF mode disables real KV byte reads."""
         self.assertEqual(resolve_real_kv_read_bytes(_config(RealKvHashMode.NONE)), 0)
 
     def test_resolve_real_kv_read_bytes_partial_returns_16(self) -> None:
+        """Verify PARTIAL mode reads the fixed byte prefix."""
         self.assertEqual(
             resolve_real_kv_read_bytes(_config(RealKvHashMode.PARTIAL)), 16
         )
@@ -41,6 +43,7 @@ class TestResolveRealKvReadBytes(CustomTestCase):
     def test_resolve_real_kv_read_bytes_all_returns_sentinel_so_full_stride_used(
         self,
     ) -> None:
+        """Verify ALL mode requests the full token stride."""
         self.assertEqual(
             resolve_real_kv_read_bytes(_config(RealKvHashMode.ALL)), sys.maxsize
         )
@@ -48,6 +51,7 @@ class TestResolveRealKvReadBytes(CustomTestCase):
 
 class TestMakeRowSource(CustomTestCase):
     def test_make_row_source_large_stride(self) -> None:
+        """Verify row sources with 128-byte stride return the requested clip / full stride."""
         bytes_per_token = 128
         layer_buf = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
         cases = [
@@ -62,7 +66,7 @@ class TestMakeRowSource(CustomTestCase):
                 self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
 
     def test_make_row_source_small_stride_raises(self) -> None:
-        # 8-byte strides cannot satisfy 16-byte aligned loads.
+        """Verify row sources reject 8-byte strides (cannot satisfy 16-byte aligned loads)."""
         layer_buf = torch.zeros(4, 8, dtype=torch.uint8)
         for label, read_bytes in [("partial", 32), ("all", sys.maxsize)]:
             with self.subTest(label=label):
@@ -72,6 +76,7 @@ class TestMakeRowSource(CustomTestCase):
 
 class TestMakePackedSource(CustomTestCase):
     def test_make_packed_source_large_stride(self) -> None:
+        """Verify packed sources with 128-byte stride return the requested clip / full stride."""
         bytes_per_token = 128
         page_size = 2
         page_buffer = torch.zeros(4, bytes_per_token * page_size, dtype=torch.uint8)
@@ -92,7 +97,7 @@ class TestMakePackedSource(CustomTestCase):
                 self.assertEqual(sources[0].num_bytes_per_token, bytes_per_token)
 
     def test_make_packed_source_small_stride_raises(self) -> None:
-        # 8-byte strides cannot satisfy 16-byte aligned loads.
+        """Verify packed sources reject 8-byte strides (cannot satisfy 16-byte aligned loads)."""
         bytes_per_token = 8
         page_size = 1
         page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
@@ -107,6 +112,7 @@ class TestMakePackedSource(CustomTestCase):
                     )
 
     def test_make_packed_source_unaligned_read_bytes_raises(self) -> None:
+        """Verify packed sources reject unaligned explicit reads."""
         bytes_per_token = 128
         page_size = 1
         page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
@@ -119,6 +125,7 @@ class TestMakePackedSource(CustomTestCase):
             )
 
     def test_make_packed_source_oversized_read_bytes_raises(self) -> None:
+        """Verify packed sources reject oversized explicit reads."""
         bytes_per_token = 128
         page_size = 1
         page_buffer = torch.zeros(4, bytes_per_token, dtype=torch.uint8)
