@@ -1,4 +1,3 @@
-import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List
@@ -15,11 +14,18 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.test.test_utils import CustomTestCase
 
 # Unit tests run without distributed initialization. Backends that size buffers by
 # attention tensor-parallel degree should see the single-rank default.
 _dp_attention.get_attention_tp_size = lambda: 1
+
+DEFAULT_HEAD_DIM = 16
+DEFAULT_HIDDEN_SIZE = 64
+DEFAULT_MAX_CONTEXT_LEN = 64
+DEFAULT_DTYPE = torch.float16
+DEFAULT_DEVICE = "cuda"
+DENSE_ATOL = 3e-2
+DENSE_RTOL = 3e-2
 
 
 @dataclass(frozen=True)
@@ -104,8 +110,13 @@ class MockModelRunner(ModelRunner):
             chunked_prefill_size=-1,
             disable_cuda_graph=True,
             disable_piecewise_cuda_graph=True,
+            dllm_algorithm=None,
+            dllm_algorithm_config=None,
             enable_deterministic_inference=False,
             enable_mis=False,
+            max_running_requests=None,
+            model_path=None,
+            revision=None,
             speculative_algorithm=None,
             speculative_num_draft_tokens=0,
             speculative_num_steps=0,
@@ -396,137 +407,74 @@ def _populate_prefix_kv(
     )
 
 
-@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
-class TestDenseAttentionBackendCorrectness(CustomTestCase):
-    HEAD_DIM = 16
-    HIDDEN_SIZE = 64
-    MAX_CONTEXT_LEN = 64
-    DTYPE = torch.float16
-    DEVICE = "cuda"
+def run_dense_attention_case(
+    testcase,
+    case: DenseAttentionCase,
+    *,
+    head_dim: int = DEFAULT_HEAD_DIM,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    max_context_len: int = DEFAULT_MAX_CONTEXT_LEN,
+    dtype: torch.dtype = DEFAULT_DTYPE,
+    device: str = DEFAULT_DEVICE,
+):
+    seed = 2026 + len(case.name) + case.num_kv_heads
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    CASES = (
-        DenseAttentionCase(
-            name="mha_extend_page1",
-            backend="torch_native",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=1,
-            prefix_lens=(2, 4),
-            extend_lens=(3, 1),
-        ),
-        DenseAttentionCase(
-            name="mha_extend_exact_page",
-            backend="torch_native",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(0, 8),
-            extend_lens=(16, 8),
-        ),
-        DenseAttentionCase(
-            name="gqa_decode_page_boundary",
-            backend="torch_native",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=4,
-            num_kv_heads=2,
-            page_size=16,
-            prefix_lens=(14, 15, 16),
-        ),
-        DenseAttentionCase(
-            name="mha_extend_exact_page",
-            backend="triton",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(0, 8),
-            extend_lens=(16, 8),
-        ),
-        DenseAttentionCase(
-            name="gqa_decode_page_boundary",
-            backend="triton",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=4,
-            num_kv_heads=2,
-            page_size=16,
-            prefix_lens=(14, 15, 16),
-        ),
+    model_config = TinyModelConfig(
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=head_dim,
+        context_len=max_context_len,
+    )
+    runner = MockModelRunner(
+        case=case,
+        model_config=model_config,
+        dtype=dtype,
+        device=device,
+        max_context_len=max_context_len,
+        head_dim=head_dim,
+    )
+    try:
+        backend = ATTENTION_BACKENDS[case.backend](runner)
+    except (AssertionError, ImportError, ModuleNotFoundError) as exc:
+        testcase.skipTest(f"{case.backend} backend is not available: {exc}")
+
+    module = ProjectedDenseAttention(
+        hidden_size=hidden_size,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    prefix_hidden = [
+        torch.randn(length, hidden_size, dtype=dtype, device=device)
+        for length in case.prefix_lens
+    ]
+    input_hidden = torch.randn(
+        case.num_input_tokens,
+        hidden_size,
+        dtype=dtype,
+        device=device,
+    )
+    forward_batch = _make_forward_batch(
+        case,
+        runner,
+        max_context_len=max_context_len,
+        device=device,
+    )
+    _populate_prefix_kv(
+        module,
+        case,
+        runner,
+        prefix_hidden,
+        max_context_len=max_context_len,
     )
 
-    def _build_backend(self, case: DenseAttentionCase, runner: MockModelRunner):
-        try:
-            return ATTENTION_BACKENDS[case.backend](runner)
-        except (AssertionError, ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"{case.backend} backend is not available: {exc}")
+    with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
+        backend.init_forward_metadata(forward_batch)
+        actual = module(input_hidden, forward_batch)
+        expected = _dense_attention_reference(module, case, prefix_hidden, input_hidden)
 
-    def _run_case(self, case: DenseAttentionCase):
-        seed = 2026 + len(case.name) + case.num_kv_heads
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-        model_config = TinyModelConfig(
-            num_heads=case.num_heads,
-            num_kv_heads=case.num_kv_heads,
-            head_dim=self.HEAD_DIM,
-            context_len=self.MAX_CONTEXT_LEN,
-        )
-        runner = MockModelRunner(
-            case=case,
-            model_config=model_config,
-            dtype=self.DTYPE,
-            device=self.DEVICE,
-            max_context_len=self.MAX_CONTEXT_LEN,
-            head_dim=self.HEAD_DIM,
-        )
-        backend = self._build_backend(case, runner)
-        module = ProjectedDenseAttention(
-            hidden_size=self.HIDDEN_SIZE,
-            num_heads=case.num_heads,
-            num_kv_heads=case.num_kv_heads,
-            head_dim=self.HEAD_DIM,
-            dtype=self.DTYPE,
-            device=self.DEVICE,
-        )
-        prefix_hidden = [
-            torch.randn(length, self.HIDDEN_SIZE, dtype=self.DTYPE, device=self.DEVICE)
-            for length in case.prefix_lens
-        ]
-        input_hidden = torch.randn(
-            case.num_input_tokens,
-            self.HIDDEN_SIZE,
-            dtype=self.DTYPE,
-            device=self.DEVICE,
-        )
-        forward_batch = _make_forward_batch(
-            case,
-            runner,
-            max_context_len=self.MAX_CONTEXT_LEN,
-            device=self.DEVICE,
-        )
-        _populate_prefix_kv(
-            module,
-            case,
-            runner,
-            prefix_hidden,
-            max_context_len=self.MAX_CONTEXT_LEN,
-        )
-
-        with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
-            backend.init_forward_metadata(forward_batch)
-            actual = module(input_hidden, forward_batch)
-            expected = _dense_attention_reference(
-                module, case, prefix_hidden, input_hidden
-            )
-
-        torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
-
-    def test_projected_dense_attention_cases(self):
-        for case in self.CASES:
-            with self.subTest(case=case.name, backend=case.backend):
-                self._run_case(case)
-
-
-if __name__ == "__main__":
-    unittest.main()
+    torch.testing.assert_close(actual, expected, atol=DENSE_ATOL, rtol=DENSE_RTOL)

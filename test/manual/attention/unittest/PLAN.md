@@ -1,5 +1,36 @@
 # Attention Backend Unit Test Plan
 
+## Current progress
+
+Last updated: 2026-05-25
+
+Implemented:
+- Shared dense MHA/GQA correctness helpers exist in
+  `test/manual/attention/unittest/utils.py`.
+- Backend-specific dense correctness files exist for `torch_native` and `triton`.
+- The first representative cases cover extend, decode, GQA, paged KV, and exact
+  page-size boundary inputs.
+- The harness uses a small projected attention module with random shared weights,
+  real `ForwardBatch` metadata, real KV/request pools, and a dense PyTorch
+  reference.
+
+In progress:
+- Add the next representative dense backend, starting with `flashinfer` when the
+  local environment supports it.
+- Keep input coverage separate from attention-config coverage. For example, GQA is
+  an attention config case, while exact page-size matching is an input case.
+
+Next implementation steps:
+- Add separate model-family files for MLA, SWA, sparse/chunked KV, linear attention,
+  Mamba, and speculative draft/verify paths.
+
+Verified:
+- `python -m py_compile test/manual/attention/unittest/utils.py test/manual/attention/unittest/test_torch_native_backend_correctness.py test/manual/attention/unittest/test_triton_backend_correctness.py`
+- `python test/manual/attention/unittest/test_torch_native_backend_correctness.py -v`
+- `python test/manual/attention/unittest/test_triton_backend_correctness.py -v`
+
+---
+
 ## Problem
 
 ### Issue 1 — Coverage gaps
