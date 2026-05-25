@@ -129,7 +129,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FLASHINFER_AUTOTUNE_CACHE`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Persist FlashInfer autotune results to `SGLANG_CACHE_DIR` and reuse them across runs. Set to `0` to disable the cache (re-autotunes on every startup).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Reuse persisted FlashInfer autotune results from `SGLANG_CACHE_DIR` across runs. Set to `0` to force re-autotuning on every startup; the fresh result is written to a `runs/<rank>.<timestamp>.json` sibling file (the canonical cache is left untouched).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`true`</td>
     </tr>
     <tr>
