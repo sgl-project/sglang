@@ -18,22 +18,27 @@ class SharedHiCacheConfig:
     timeout_secs: float
     transfer_backend: str
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "worker_id": self.worker_id,
-            "control_endpoint": self.control_endpoint,
-            "timeout_secs": self.timeout_secs,
-            "transfer_backend": self.transfer_backend,
-        }
+
+SharedHiCacheConfigInput = Union[str, Dict[str, Any], SharedHiCacheConfig]
+SharedHiCacheConfigView = Union[SharedHiCacheConfig, Mapping[str, Any]]
 
 
-def shared_hicache_config(server_args) -> Mapping[str, Any]:
+def shared_hicache_config(server_args) -> Optional[SharedHiCacheConfigView]:
     config = getattr(server_args, "shared_hicache_config", None)
-    return config if isinstance(config, Mapping) else {}
+    if isinstance(config, SharedHiCacheConfig):
+        return config
+    if isinstance(config, Mapping):
+        return config
+    return None
 
 
 def shared_hicache_config_value(server_args, key: str, default=None):
-    return shared_hicache_config(server_args).get(key, default)
+    config = shared_hicache_config(server_args)
+    if config is None:
+        return default
+    if isinstance(config, SharedHiCacheConfig):
+        return getattr(config, key, default)
+    return config.get(key, default)
 
 
 def shared_hicache_transfer_backend_name(server_args, default: str = "auto") -> str:
@@ -47,10 +52,12 @@ def shared_hicache_timeout_secs(server_args, default: float = 1.0) -> float:
 
 
 def _load_json_object_config(
-    raw: Optional[Union[str, Dict[str, Any]]], arg_name: str
-) -> Optional[Dict[str, Any]]:
+    raw: Optional[SharedHiCacheConfigInput], arg_name: str
+) -> Optional[Union[SharedHiCacheConfig, Dict[str, Any]]]:
     if raw is None:
         return None
+    if isinstance(raw, SharedHiCacheConfig):
+        return raw
     if isinstance(raw, dict):
         data = dict(raw)
     elif isinstance(raw, str):
@@ -84,10 +91,10 @@ def _normalize_endpoint(value: object, field_name: str) -> Optional[str]:
 def normalize_shared_hicache_server_config(
     *,
     enable_shared_hicache: bool,
-    raw_config: Optional[Union[str, Dict[str, Any]]],
+    raw_config: Optional[SharedHiCacheConfigInput],
     worker_id: Optional[int],
     enable_hierarchical_cache: bool,
-) -> tuple[bool, Optional[int], Optional[Dict[str, Any]]]:
+) -> tuple[bool, Optional[int], Optional[SharedHiCacheConfig]]:
     config_data = _load_json_object_config(raw_config, "--shared-hicache-config")
     if config_data is not None:
         enable_shared_hicache = True
@@ -97,6 +104,8 @@ def normalize_shared_hicache_server_config(
 
     if not enable_hierarchical_cache:
         raise ValueError("--enable-shared-hicache requires --enable-hierarchical-cache")
+    if isinstance(config_data, SharedHiCacheConfig):
+        return True, config_data.worker_id, config_data
 
     config: Dict[str, Any] = dict(config_data or {})
     if any(
@@ -177,7 +186,7 @@ def normalize_shared_hicache_server_config(
     if timeout_secs <= 0:
         raise ValueError("shared_hicache_config.timeout_secs must be > 0")
 
-    normalized = SharedHiCacheConfig(
+    return True, worker_id, SharedHiCacheConfig(
         worker_id=worker_id,
         control_endpoint=_normalize_endpoint(
             control_config.get("endpoint", config.get("control_endpoint")),
@@ -186,4 +195,3 @@ def normalize_shared_hicache_server_config(
         timeout_secs=timeout_secs,
         transfer_backend=transfer_backend,
     )
-    return True, worker_id, normalized.to_dict()

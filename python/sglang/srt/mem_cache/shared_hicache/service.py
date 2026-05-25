@@ -23,7 +23,7 @@ def endpoint_to_bind(endpoint: str) -> tuple[str, int]:
     return parsed.hostname, parsed.port
 
 
-def select_dp_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
+def format_control_endpoint(endpoint_spec: object, dp_rank: int) -> Optional[str]:
     if not endpoint_spec:
         return None
     if not isinstance(endpoint_spec, str):

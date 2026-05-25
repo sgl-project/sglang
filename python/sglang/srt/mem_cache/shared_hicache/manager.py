@@ -36,7 +36,7 @@ from sglang.srt.mem_cache.shared_hicache.plan import (
 )
 from sglang.srt.mem_cache.shared_hicache.service import (
     SharedHiCacheSourceService,
-    select_dp_endpoint,
+    format_control_endpoint,
 )
 from sglang.srt.mem_cache.shared_hicache.source import (
     ResolvedHostPage,
@@ -101,7 +101,7 @@ class SharedHiCacheManager:
             "control_endpoint",
             None,
         )
-        self.endpoint = select_dp_endpoint(endpoint_spec, dp_rank)
+        self.endpoint = format_control_endpoint(endpoint_spec, dp_rank)
         self.source_service: Optional[SharedHiCacheSourceService] = None
         self._shutdown = False
         worker_limit = max(
@@ -223,9 +223,11 @@ class SharedHiCacheManager:
                 "SharedHiCache fetch worker semaphore release ignored", exc_info=True
             )
 
-    def _on_fetch_worker_done(self, future: Future) -> None:
+    def _on_pending_fetch_done(
+        self, pending: SharedHiCachePendingFetch, future: Future
+    ) -> None:
         try:
-            setattr(future, "_shared_hicache_done_at", time.perf_counter())
+            pending.done_at = time.perf_counter()
         finally:
             self._release_fetch_worker()
 
@@ -477,7 +479,6 @@ class SharedHiCacheManager:
             self.target_cache.free_device_indices(device_indices)
             self._release_fetch_worker()
             raise
-        future.add_done_callback(self._on_fetch_worker_done)
         return future, device_indices
 
     def has_reuse_plan(self, req: "Req") -> bool:
@@ -701,7 +702,7 @@ class SharedHiCacheManager:
                 )
             except Exception:
                 bytes_per_page = 0
-        self._pending_fetches[str(req.rid)] = SharedHiCachePendingFetch(
+        pending = SharedHiCachePendingFetch(
             plan=plan,
             plan_offset=plan_offset,
             target_start_block=plan.start_block_index + plan_offset,
@@ -713,6 +714,12 @@ class SharedHiCacheManager:
             bytes_per_page=bytes_per_page,
             submitted_at=time.perf_counter(),
         )
+        self._pending_fetches[str(req.rid)] = pending
+        future.add_done_callback(
+            lambda done_future, pending=pending: self._on_pending_fetch_done(
+                pending, done_future
+            )
+        )
         return SharedHiCacheResult(pending=True)
 
     def _finish_pending_fetch(
@@ -720,6 +727,8 @@ class SharedHiCacheManager:
     ) -> SharedHiCacheResult:
         self._pending_fetches.pop(str(req.rid), None)
         plan = pending.plan
+        if pending.done_at <= 0:
+            pending.done_at = time.perf_counter()
 
         try:
             pages, reason = pending.future.result()

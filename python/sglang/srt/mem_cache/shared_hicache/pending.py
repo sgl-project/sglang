@@ -24,6 +24,7 @@ class SharedHiCachePendingFetch:
     backend: str = "unknown"
     bytes_per_page: int = 0
     submitted_at: float = 0.0
+    done_at: float = 0.0
 
 
 def format_optional_ms(value: Optional[float]) -> str:
@@ -38,7 +39,7 @@ def pending_wait_ms(pending: SharedHiCachePendingFetch) -> Optional[float]:
 
 
 def pending_ready_wait_ms(pending: SharedHiCachePendingFetch) -> Optional[float]:
-    done_at = getattr(pending.future, "_shared_hicache_done_at", 0.0)
+    done_at = pending.done_at
     if done_at <= 0:
         return None
     return max(0.0, (time.perf_counter() - done_at) * 1000)

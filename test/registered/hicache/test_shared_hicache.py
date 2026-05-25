@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_host_index import HiCacheHostBlockIndex
 from sglang.srt.mem_cache.radix_cache import RadixKey, TreeNode
 from sglang.srt.mem_cache.shared_hicache.manager import SharedHiCacheManager
 from sglang.srt.mem_cache.shared_hicache.pending import SharedHiCachePendingFetch
+from sglang.srt.mem_cache.shared_hicache.config import SharedHiCacheConfig
 from sglang.srt.mem_cache.shared_hicache.plan import (
     SHARED_HICACHE_DIRECT_TIMEOUT_REASON,
     SharedHiCachePlan,
@@ -582,15 +583,14 @@ class TestSharedHiCache(unittest.TestCase):
         self.assertTrue(server_args.enable_shared_hicache)
         self.assertTrue(server_args.enable_hierarchical_cache)
         self.assertEqual(server_args.shared_hicache_worker_id, 7)
-        self.assertEqual(server_args.shared_hicache_config["worker_id"], 7)
+        self.assertIsInstance(server_args.shared_hicache_config, SharedHiCacheConfig)
+        self.assertEqual(server_args.shared_hicache_config.worker_id, 7)
         self.assertEqual(
-            server_args.shared_hicache_config["control_endpoint"],
+            server_args.shared_hicache_config.control_endpoint,
             "http://127.0.0.1:39007",
         )
-        self.assertEqual(
-            server_args.shared_hicache_config["transfer_backend"], "mooncake"
-        )
-        self.assertEqual(server_args.shared_hicache_config["timeout_secs"], 2.5)
+        self.assertEqual(server_args.shared_hicache_config.transfer_backend, "mooncake")
+        self.assertEqual(server_args.shared_hicache_config.timeout_secs, 2.5)
 
     def test_server_args_rejects_static_peer_config_and_unknown_backend(self):
         parser = argparse.ArgumentParser()
@@ -688,8 +688,8 @@ class TestSharedHiCache(unittest.TestCase):
         plan_1 = _make_plan([2], plan_id="plan-2")
         req = GenerateReqInput(
             text=["hello", "world"],
-            sampling_params=[{}, {}],
-            rid=["r0", "r1"],
+            sampling_params={"n": 2},
+            rid="r",
             shared_hicache_plan=[plan_0, plan_1],
         )
 
@@ -697,6 +697,8 @@ class TestSharedHiCache(unittest.TestCase):
 
         self.assertEqual(req[0].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
         self.assertEqual(req[1].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
+        self.assertEqual(req[2].shared_hicache_plan, SharedHiCachePlan.coerce(plan_0))
+        self.assertEqual(req[3].shared_hicache_plan, SharedHiCachePlan.coerce(plan_1))
 
     def test_engine_async_generate_forwards_shared_hicache_plan(self):
         plan = _make_plan([11])

@@ -416,7 +416,7 @@ class GenerateReqInput(BaseReq):
         self._normalize_logprob_params(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_bootstrap_params(num)
-        self._normalize_shared_hicache_plan(self.batch_size)
+        self._normalize_shared_hicache_plan(num)
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -619,20 +619,20 @@ class GenerateReqInput(BaseReq):
         elif isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = self.bootstrap_pair_key * self.parallel_sample_num
 
-    def _normalize_shared_hicache_plan(self, batch_size):
+    def _normalize_shared_hicache_plan(self, num):
         if self.shared_hicache_plan is None:
-            self.shared_hicache_plan = [None] * batch_size
+            self.shared_hicache_plan = [None] * num
         elif isinstance(self.shared_hicache_plan, list):
-            if len(self.shared_hicache_plan) != batch_size:
+            if len(self.shared_hicache_plan) != self.batch_size:
                 raise ValueError(
                     "The length of shared_hicache_plan should be equal to the batch size."
                 )
             self.shared_hicache_plan = [
                 SharedHiCachePlan.coerce(plan) for plan in self.shared_hicache_plan
-            ]
+            ] * self.parallel_sample_num
         else:
             plan = SharedHiCachePlan.coerce(self.shared_hicache_plan)
-            self.shared_hicache_plan = [plan] * batch_size
+            self.shared_hicache_plan = [plan] * num
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""

@@ -40,6 +40,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.mem_cache.shared_hicache.config import (
+    SharedHiCacheConfig,
     normalize_shared_hicache_server_config,
 )
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -652,7 +653,7 @@ class ServerArgs:
     hicache_storage_backend_extra_config: Optional[str] = None
     enable_shared_hicache: bool = False
     shared_hicache_worker_id: Optional[int] = None
-    shared_hicache_config: Optional[Union[str, Dict[str, Any]]] = None
+    shared_hicache_config: Optional[Union[str, Dict[str, Any], SharedHiCacheConfig]] = None
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
