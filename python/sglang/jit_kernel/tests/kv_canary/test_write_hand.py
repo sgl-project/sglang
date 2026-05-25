@@ -68,7 +68,7 @@ class _WriteSingleSlotInput:
     position: int = 0
     enable_write_verify_inputs: bool = False
     real_kv_sources: tuple[RealKvSource, ...] = ()
-    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE
 
 
 class _RecordingWriteModule:
@@ -227,7 +227,7 @@ class TestSeedSlot:
                 kernel_run_counter=verify_log.kernel_run_counter,
                 enable_chain_position_assert=verify_log.enable_chain_position_assert,
                 real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
         )
@@ -620,7 +620,7 @@ class TestMockMode:
                 kernel_run_counter=verify_log.kernel_run_counter,
                 enable_chain_position_assert=verify_log.enable_chain_position_assert,
                 real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=verify_plan,
         )
@@ -883,7 +883,7 @@ class TestSlotHandling:
 
 class TestRealKvHash:
     def test_real_kv_mode_off_writes_zero(self) -> None:
-        """``consts.RealKvHashMode.OFF`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
+        """``consts.RealKvHashMode.NONE`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -1002,7 +1002,7 @@ class TestRealKvHash:
                     kernel_run_counter=log.kernel_run_counter,
                     enable_chain_position_assert=log.enable_chain_position_assert,
                     real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 ),
                 plan=plan,
                 input_ids=input_ids,
@@ -1236,7 +1236,7 @@ class TestRunCounter:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
 
@@ -1355,7 +1355,7 @@ class TestMisc:
             kernel_run_counter=log.kernel_run_counter,
             enable_chain_position_assert=log.enable_chain_position_assert,
             real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         )
         module = _RecordingWriteModule()
 

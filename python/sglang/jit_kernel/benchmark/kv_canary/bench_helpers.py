@@ -12,7 +12,7 @@ PREFIX_AXIS: list[int] = [0, 128, 1024, 4096, 10240, 16384]
 EXTEND_LEN_AXIS: list[int] = [128, 512, 4096, 16384]
 POOL_AXIS: list[str] = ["full", "swa_window_128"]
 REAL_KV_AXIS: list[str] = ["none", "small_1src", "med_2src", "max_4src"]
-HASH_MODE_AXIS: list[str] = ["off", "partial", "all"]
+HASH_MODE_AXIS: list[str] = ["none", "partial", "all"]
 SWA_WINDOW: int = 128
 RING_CAPACITY: int = 256
 MAX_EXTEND_TOKENS_PER_FORWARD: int = 4096
@@ -46,7 +46,7 @@ def _case(
     extend_len: int,
     pool_kind: str,
     real_kv_kind: str = "none",
-    hash_mode: str = "off",
+    hash_mode: str = "none",
 ) -> BenchCase:
     return BenchCase(
         scenario=scenario,
@@ -290,11 +290,11 @@ def build_full_matrix_cases() -> list[BenchCase]:
     fast_base_points = [
         (c.bs, c.prefix_len, c.mode, c.extend_len, c.pool_kind)
         for c in fast
-        if c.real_kv_kind == "none" and c.hash_mode == "off"
+        if c.real_kv_kind == "none" and c.hash_mode == "none"
     ]
     for bs, prefix_len, mode, extend_len, pool_kind in fast_base_points:
         for hash_mode in HASH_MODE_AXIS:
-            if hash_mode == "off":
+            if hash_mode == "none":
                 continue
             for real_kv_kind in REAL_KV_AXIS:
                 if real_kv_kind == "none":

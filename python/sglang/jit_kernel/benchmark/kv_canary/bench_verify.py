@@ -268,7 +268,7 @@ def benchmark_kernel_kind(
         extend_len=128,
         pool_kind="full",
         real_kv_kind="none",
-        hash_mode="off",
+        hash_mode="none",
     )
     device = torch.device(DEFAULT_DEVICE)
 

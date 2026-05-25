@@ -62,7 +62,7 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     enable_write_verify_inputs = rng.choice([False, True])
     hash_mode = rng.choice(
         [
-            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.NONE,
             consts.RealKvHashMode.PARTIAL,
             consts.RealKvHashMode.ALL,
         ]

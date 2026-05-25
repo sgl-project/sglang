@@ -751,8 +751,8 @@ class ServerArgs:
     rl_on_policy_target: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
-    kv_canary: str = "off"
-    kv_canary_real_data: str = "off"
+    kv_canary: str = "none"
+    kv_canary_real_data: str = "none"
     kv_canary_sweep_interval: int = 0
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_dsa_prefill_context_parallel: bool = False
@@ -5421,11 +5421,7 @@ class ServerArgs:
             type=str,
             choices=SAMPLING_BACKEND_CHOICES,
             default=ServerArgs.sampling_backend,
-            help=(
-                "Choose the kernels for sampling layers. "
-                "Set SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE=1 to expose the "
-                "'token_oracle' test backend used by --kv-canary."
-            ),
+            help="Choose the kernels for sampling layers. ",
         )
         parser.add_argument(
             "--grammar-backend",
@@ -6187,9 +6183,9 @@ class ServerArgs:
             "--kv-canary",
             type=str,
             default=ServerArgs.kv_canary,
-            choices=["off", "log", "raise"],
+            choices=["none", "log", "raise"],
             help=(
-                "KV cache canary mode. 'off' disables the canary (default). 'log' "
+                "KV cache canary mode. 'none' disables the canary (default). 'log' "
                 "records mismatches to a violation buffer and logs them while the "
                 "server keeps running (production-safe). 'raise' fails the server "
                 "on the first detected mismatch (CI lane)."
@@ -6202,7 +6198,7 @@ class ServerArgs:
             choices=[m.name.lower() for m in RealKvHashMode],
             help=(
                 "Mix a fingerprint of the real KV-cache slot into the canary's "
-                "chain hash. 'off' (default) "
+                "chain hash. 'none' (default) "
                 "leaves the real_kv_hash slot field at zero. 'partial' "
                 "splitmix64-folds the first 16 bytes of "
                 "each real-KV slot; useful when corruption is suspected but "
@@ -7258,7 +7254,7 @@ class ServerArgs:
                     "When setting gc_threshold, it must contain 1 to 3 integers."
                 )
 
-        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "off":
+        if self.kv_canary_sweep_interval > 0 and self.kv_canary == "none":
             raise ValueError(
                 "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
             )

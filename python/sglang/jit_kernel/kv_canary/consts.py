@@ -48,7 +48,7 @@ REAL_KV_SOURCE_FIELD_READ_BYTES: Final[int] = 2
 
 
 class RealKvHashMode(IntEnum):
-    OFF = 0
+    NONE = 0
     PARTIAL = 1
     ALL = 2
 

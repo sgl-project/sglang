@@ -176,7 +176,7 @@ def _compute_real_kv_hash_scalar(
     work_device: torch.device,
 ) -> int:
     mode = int(real_kv_hash_mode)
-    if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
+    if mode == int(consts.RealKvHashMode.NONE) or len(real_kv_sources) == 0:
         return 0
 
     acc: int = 0

@@ -30,7 +30,7 @@ def install_canary(
     token_oracle_manager: Optional["TokenOracleManager"] = None,
 ) -> Optional[CanaryManager]:
     config = CanaryConfig.from_env(server_args)
-    if config.mode == "off":
+    if config.mode == "none":
         return None
 
     assert server_args.disable_piecewise_cuda_graph, (

@@ -59,7 +59,7 @@ def _make_kernel_args(device):
         out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
         input_check_mode=False,
         expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
-        real_kv_hash_mode=RealKvHashMode.OFF,
+        real_kv_hash_mode=RealKvHashMode.NONE,
     )
 
 
@@ -146,12 +146,12 @@ class TestSelfUnitEndpoint(CustomTestCase):
             ep_a.launch_sweep(
                 verify_plan=plan,
                 violation_log=shared_log,
-                real_kv_hash_mode=RealKvHashMode.OFF,
+                real_kv_hash_mode=RealKvHashMode.NONE,
             )
             ep_b.launch_sweep(
                 verify_plan=plan,
                 violation_log=shared_log,
-                real_kv_hash_mode=RealKvHashMode.OFF,
+                real_kv_hash_mode=RealKvHashMode.NONE,
             )
         self.assertEqual(captured_rings[0], captured_rings[1])
         self.assertEqual(captured_rings[0], shared_log.violation_ring.data_ptr())

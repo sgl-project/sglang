@@ -92,7 +92,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
                     slot_run_counter=slot_run_counter,
                     kernel_run_counter=kernel_run_counter,
                     real_kv_sources=sources,
-                    real_kv_hash_mode=RealKvHashMode.OFF,
+                    real_kv_hash_mode=RealKvHashMode.NONE,
                 ),
                 plan=plan,
             )

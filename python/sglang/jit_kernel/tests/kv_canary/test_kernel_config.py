@@ -125,7 +125,7 @@ def test_verify_byte_equal_across_repeated_launches_10x() -> None:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
@@ -180,7 +180,7 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
@@ -287,7 +287,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
                 kernel_run_counter=cuda_log.kernel_run_counter,
                 enable_chain_position_assert=cuda_log.enable_chain_position_assert,
                 real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan_cuda,
         )

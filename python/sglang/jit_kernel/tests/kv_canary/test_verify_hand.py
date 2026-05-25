@@ -66,7 +66,7 @@ class _VerifySingleSlotInput:
     stored_prev_hash_signed: int
     stored_real_kv_hash_signed: int = 0
     real_kv_sources: tuple[RealKvSource, ...] = ()
-    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE
 
 
 def _run_verify_single_slot_byte_equal(case: _VerifySingleSlotInput) -> None:
@@ -562,7 +562,7 @@ class TestViolationField:
                 positions=positions,
                 slot_indices=slot_indices,
             )
-            real_kv_hash_mode = consts.RealKvHashMode.OFF
+            real_kv_hash_mode = consts.RealKvHashMode.NONE
             real_kv_sources_cuda = ()
             real_kv_sources_ref = ()
 
@@ -619,7 +619,7 @@ class TestViolationField:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
             assert int(cuda_log.write_index[0].item()) == ring_capacity
@@ -1104,7 +1104,7 @@ class TestRealKvSource:
                     kernel_run_counter=log.kernel_run_counter,
                     enable_chain_position_assert=log.enable_chain_position_assert,
                     real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 ),
                 plan=plan,
             )
@@ -1270,7 +1270,7 @@ class TestLayoutAndScheduling:
                 kernel_run_counter=log.kernel_run_counter,
                 enable_chain_position_assert=log.enable_chain_position_assert,
                 real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan,
         )
@@ -1326,7 +1326,7 @@ class TestLayoutAndScheduling:
                 kernel_run_counter=log.kernel_run_counter,
                 enable_chain_position_assert=log.enable_chain_position_assert,
                 real_kv_sources=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             ),
             plan=plan,
         )
@@ -1438,7 +1438,7 @@ class TestLayoutAndScheduling:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
 
@@ -1454,7 +1454,7 @@ class TestLayoutAndScheduling:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
 
@@ -1484,7 +1484,7 @@ class TestRunCounter:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             )
 
         assert int(cuda_log.kernel_run_counter[0].item()) == 3
@@ -1575,7 +1575,7 @@ class TestRunCounter:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
             )
 
         assert int(cuda_log.slot_run_counter[0].item()) == 2 * len(slot_indices)
@@ -1629,7 +1629,7 @@ class TestRunCounter:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
             after = int(cuda_log.slot_run_counter[0].item())
@@ -1661,7 +1661,7 @@ class TestRunCounter:
                 ref_log=ref_log,
                 real_kv_sources_cuda=(),
                 real_kv_sources_ref=(),
-                real_kv_hash_mode=consts.RealKvHashMode.OFF,
+                real_kv_hash_mode=consts.RealKvHashMode.NONE,
                 assert_equal=False,
             )
             assert int(cuda_log.kernel_run_counter[0].item()) == n
@@ -1732,7 +1732,7 @@ class TestViolationRing:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             assert_equal=False,
         )
 
@@ -1791,7 +1791,7 @@ class TestViolationRing:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
         )
 
@@ -1876,7 +1876,7 @@ class TestViolationRing:
             ref_log=ref_log,
             real_kv_sources_cuda=(),
             real_kv_sources_ref=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
             assert_equal=False,
         )
 

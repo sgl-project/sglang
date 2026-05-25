@@ -56,7 +56,7 @@ class VerifyFuzzInputs:
 def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
     hash_mode = rng.choice(
         [
-            consts.RealKvHashMode.OFF,
+            consts.RealKvHashMode.NONE,
             consts.RealKvHashMode.PARTIAL,
             consts.RealKvHashMode.ALL,
         ]
@@ -96,7 +96,7 @@ def _draw_random_verify_inputs(rng: random.Random) -> VerifyFuzzInputs:
         else:
             prev_slot_indices.append(slot_indices[i - 1])
 
-    if hash_mode == consts.RealKvHashMode.OFF and plan_size > 0:
+    if hash_mode == consts.RealKvHashMode.NONE and plan_size > 0:
         stamp_clean_chain(
             cuda_buf=cuda_buf,
             ref_buf=ref_buf,

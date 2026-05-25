@@ -174,7 +174,7 @@ def _run_both_and_assert_pipeline_equal(
     expected_input_positions: Optional[torch.Tensor] = None,
     real_kv_sources_real: tuple[RealKvSource, ...] = (),
     real_kv_sources_ref: tuple[RealKvSource, ...] = (),
-    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.OFF,
+    real_kv_hash_mode: consts.RealKvHashMode = consts.RealKvHashMode.NONE,
     ring_capacity: int = 64,
     verify_capacity: int = 256,
     write_req_capacity: int = 16,
@@ -446,7 +446,7 @@ def test_pipeline_sweep_no_write() -> None:
 @pytest.mark.parametrize(
     "real_kv_hash_mode",
     [
-        consts.RealKvHashMode.OFF,
+        consts.RealKvHashMode.NONE,
         consts.RealKvHashMode.PARTIAL,
         consts.RealKvHashMode.ALL,
     ],
@@ -721,7 +721,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             kernel_run_counter=log_real.kernel_run_counter,
             enable_chain_position_assert=log_real.enable_chain_position_assert,
             real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_real,
     )
@@ -737,7 +737,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
             kernel_run_counter=log_ref.kernel_run_counter,
             enable_chain_position_assert=log_ref.enable_chain_position_assert,
             real_kv_sources=(),
-            real_kv_hash_mode=consts.RealKvHashMode.OFF,
+            real_kv_hash_mode=consts.RealKvHashMode.NONE,
         ),
         plan=plan_v_ref,
     )

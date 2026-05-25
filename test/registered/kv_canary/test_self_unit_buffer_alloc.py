@@ -32,7 +32,7 @@ def _config(mode: RealKvHashMode) -> CanaryConfig:
 class TestResolveRealKvReadBytes(CustomTestCase):
     def test_resolve_real_kv_read_bytes_off_returns_zero(self) -> None:
         """Verify OFF mode disables real KV byte reads."""
-        self.assertEqual(resolve_real_kv_read_bytes(_config(RealKvHashMode.OFF)), 0)
+        self.assertEqual(resolve_real_kv_read_bytes(_config(RealKvHashMode.NONE)), 0)
 
     def test_resolve_real_kv_read_bytes_partial_returns_16(self) -> None:
         """Verify PARTIAL mode reads the fixed byte prefix."""

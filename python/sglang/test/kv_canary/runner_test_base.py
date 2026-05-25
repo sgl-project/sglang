@@ -27,7 +27,7 @@ def make_config(
     mode: CanaryMode = CanaryMode.RAISE,
     ring_capacity: int = 1024,
     sweep_interval: int = 0,
-    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.OFF,
+    real_kv_hash_mode: RealKvHashMode = RealKvHashMode.NONE,
     input_check_mode: bool = False,
     stats_print_every_n_steps: int = 100,
 ) -> CanaryConfig:

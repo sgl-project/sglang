@@ -140,7 +140,7 @@ class VerifyOrWriteContext:
         real_kv_sources: Real KV pieces folded into each slot's real_kv_hash, as a tuple of RealKvSource. Empty
             tuple disables the mixin. Multiple sources are folded sequentially via splitmix64 to produce one
             int64 fingerprint per slot.
-        real_kv_hash_mode: RealKvHashMode (OFF / PARTIAL / ALL). Applies uniformly across all sources.
+        real_kv_hash_mode: RealKvHashMode (NONE / PARTIAL / ALL). Applies uniformly across all sources.
         enable_chain_position_assert: int32 [1] device flag gating the write kernel's chain-step
             write_position assert. 0 during warmup / cuda-graph capture; flipped to 1 in
             CanaryManager.mark_init_finished().
