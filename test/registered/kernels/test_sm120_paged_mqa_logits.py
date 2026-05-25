@@ -121,9 +121,7 @@ def _build_inputs(
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
 
     # Each batch occupies its own slice of pages, randomized for realism.
-    page_table = torch.zeros(
-        (batch_size, max_pages), dtype=torch.int32, device=device
-    )
+    page_table = torch.zeros((batch_size, max_pages), dtype=torch.int32, device=device)
     for i in range(batch_size):
         page_table[i] = torch.arange(
             1 + i * max_pages, 1 + (i + 1) * max_pages, dtype=torch.int32, device=device
@@ -179,11 +177,25 @@ class TestSM120PagedMqaLogitsTorch(CustomTestCase):
         )
         # Reference (loopy)
         ref = fp8_paged_mqa_logits_torch(
-            q, kv, w, sl, pt, deep_gemm_metadata=None, max_seq_len=msl, clean_logits=False
+            q,
+            kv,
+            w,
+            sl,
+            pt,
+            deep_gemm_metadata=None,
+            max_seq_len=msl,
+            clean_logits=False,
         )
         # SM120 vectorized
         sm120 = fp8_paged_mqa_logits_torch_sm120(
-            q, kv, w, sl, pt, deep_gemm_metadata=None, max_seq_len=msl, clean_logits=False
+            q,
+            kv,
+            w,
+            sl,
+            pt,
+            deep_gemm_metadata=None,
+            max_seq_len=msl,
+            clean_logits=False,
         )
         _compare(ref, sm120, sl)
 

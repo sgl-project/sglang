@@ -21,7 +21,6 @@ DSv4 cache layout (per page):
 
 from __future__ import annotations
 
-import os
 import unittest
 from unittest import mock
 
@@ -81,16 +80,14 @@ def _build_kvcache(
 
     # ---- Rope BF16 region: per-token bytes [448:576] = 64 bf16 values ----
     rope_bf16_vals = (
-        torch.randn(
-            (num_pages, page_size, _ROPE_DIM), generator=g, dtype=torch.float32
-        )
+        torch.randn((num_pages, page_size, _ROPE_DIM), generator=g, dtype=torch.float32)
         .clamp(-2.0, 2.0)
         .to(torch.bfloat16)
         .to(device)
     )
     # View bf16 as 2 bytes per value -> 128 bytes per token rope region
-    rope_as_uint8 = (
-        rope_bf16_vals.contiguous().view(torch.uint8)
+    rope_as_uint8 = rope_bf16_vals.contiguous().view(
+        torch.uint8
     )  # (num_pages, page_size, 128)
     raw[:, :, _NOPE_DIM : _NOPE_DIM + _ROPE_DIM * 2] = rope_as_uint8
 
@@ -119,7 +116,9 @@ def _build_kvcache(
     # and scales per token.  Build a fresh buffer with the correct flat order.
     flat = torch.zeros(num_pages, page_size * bpt, dtype=torch.uint8, device=device)
     # Data: per-token 576 bytes contiguous
-    flat_data = raw[:, :, :_NOPE_ROPE_STRIDE].reshape(num_pages, page_size * _NOPE_ROPE_STRIDE)
+    flat_data = raw[:, :, :_NOPE_ROPE_STRIDE].reshape(
+        num_pages, page_size * _NOPE_ROPE_STRIDE
+    )
     flat[:, : page_size * _NOPE_ROPE_STRIDE] = flat_data
     # Scales: per-token 8 bytes (only first 7 written)
     scale_block = torch.zeros(
@@ -136,14 +135,18 @@ def _build_kvcache(
     assert k_cache.stride(0) == page_size * bpt
 
     # Reference dequant per token (matches what _gather_and_dequant should produce):
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn).float()  # (num_pages, page_size, 448)
-    scale_e8m0 = (
-        scale_bytes.view(torch.float8_e8m0fnu).float()
-    )  # (num_pages, page_size, 7)
+    nope_fp8 = nope_bytes.view(
+        torch.float8_e4m3fn
+    ).float()  # (num_pages, page_size, 448)
+    scale_e8m0 = scale_bytes.view(
+        torch.float8_e8m0fnu
+    ).float()  # (num_pages, page_size, 7)
     nope_dequant = (
         nope_fp8.view(num_pages, page_size, _NUM_TILES, _TILE_SIZE)
         * scale_e8m0.view(num_pages, page_size, _NUM_TILES, 1)
-    ).view(num_pages, page_size, _NOPE_DIM)  # float32
+    ).view(
+        num_pages, page_size, _NOPE_DIM
+    )  # float32
     ref_per_token = torch.cat(
         [nope_dequant.to(torch.bfloat16), rope_bf16_vals], dim=-1
     )  # (num_pages, page_size, 512) bf16
@@ -162,9 +165,7 @@ def _build_q_indices(
 ):
     g = torch.Generator(device="cpu").manual_seed(seed)
     q = (
-        torch.randn(
-            (batch_size, 1, num_heads, _D), generator=g, dtype=torch.float32
-        )
+        torch.randn((batch_size, 1, num_heads, _D), generator=g, dtype=torch.float32)
         .clamp(-1.5, 1.5)
         .to(torch.bfloat16)
         .to(device)
@@ -218,9 +219,9 @@ class TestGatherAndDequant(CustomTestCase):
         k_cache, ref_per_token = _build_kvcache(
             num_pages, page_size, device=self.device, seed=7
         )
-        token_ids = torch.arange(
-            page_size, dtype=torch.int32, device=self.device
-        ).view(1, page_size)
+        token_ids = torch.arange(page_size, dtype=torch.int32, device=self.device).view(
+            1, page_size
+        )
         out = _gather_and_dequant(k_cache, token_ids, page_size)
         torch.testing.assert_close(
             out, ref_per_token[0].unsqueeze(0), atol=1e-2, rtol=1e-2
@@ -326,10 +327,10 @@ class TestSparseDecodeTritonVsTorch(CustomTestCase):
         topk_length = torch.tensor([32, 32], dtype=torch.int32, device=self.device)
 
         ref_out, _ = _sm120_sparse_decode_fwd(
-            q, k_cache, indices, topk_length, None, _D, _D ** -0.5
+            q, k_cache, indices, topk_length, None, _D, _D**-0.5
         )
         tri_out, _ = flash_mla_sparse_decode_triton(
-            q, k_cache, indices, topk_length, None, _D, _D ** -0.5
+            q, k_cache, indices, topk_length, None, _D, _D**-0.5
         )
         torch.testing.assert_close(
             tri_out.to(torch.float32),
@@ -393,9 +394,7 @@ class TestMergePartialAttn(CustomTestCase):
         B, H, D = 1, 2, 4
         lse = torch.zeros(B, 1, H, device=self.device, dtype=torch.float32)
         out1 = torch.ones(B, 1, H, D, device=self.device, dtype=torch.bfloat16)
-        out2 = torch.full(
-            (B, 1, H, D), 3.0, device=self.device, dtype=torch.bfloat16
-        )
+        out2 = torch.full((B, 1, H, D), 3.0, device=self.device, dtype=torch.bfloat16)
         merged, merged_lse = _merge_partial_attn(out1, lse, out2, lse)
         torch.testing.assert_close(
             merged.float(),
@@ -414,17 +413,13 @@ class TestMergePartialAttn(CustomTestCase):
         """If lse2 == -inf, merged equals out1."""
         B, H, D = 1, 1, 4
         lse1 = torch.zeros(B, 1, H, device=self.device, dtype=torch.float32)
-        lse2 = torch.full((B, 1, H), float("-inf"), device=self.device, dtype=torch.float32)
-        out1 = torch.full(
-            (B, 1, H, D), 2.5, device=self.device, dtype=torch.bfloat16
+        lse2 = torch.full(
+            (B, 1, H), float("-inf"), device=self.device, dtype=torch.float32
         )
-        out2 = torch.full(
-            (B, 1, H, D), 99.0, device=self.device, dtype=torch.bfloat16
-        )
+        out1 = torch.full((B, 1, H, D), 2.5, device=self.device, dtype=torch.bfloat16)
+        out2 = torch.full((B, 1, H, D), 99.0, device=self.device, dtype=torch.bfloat16)
         merged, merged_lse = _merge_partial_attn(out1, lse1, out2, lse2)
-        torch.testing.assert_close(
-            merged.float(), out1.float(), atol=1e-3, rtol=1e-3
-        )
+        torch.testing.assert_close(merged.float(), out1.float(), atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(merged_lse, lse1, atol=1e-5, rtol=1e-5)
 
 
@@ -448,7 +443,7 @@ class TestEntryPointDispatch(CustomTestCase):
             topk_length=topk_length,
             attn_sink=None,
             head_dim_v=_D,
-            softmax_scale=_D ** -0.5,
+            softmax_scale=_D**-0.5,
         )
 
         with mock.patch.object(fmod, "_sm120_default_backend", "torch"):
