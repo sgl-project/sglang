@@ -126,6 +126,7 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.layers.torchao_utils import apply_torchao_config_to_model
+from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
@@ -2213,8 +2214,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
             )
 
-        log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
-
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""
         dtype = torch.float16
@@ -3266,6 +3265,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.hisparse_coordinator.wait_for_pending_backup()
                 self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+            if self.is_hybrid_swa:
+                self.token_to_kv_pool.invalidate_loc_cache()
+
             # Replay cuda graph if applicable
             if can_run_graph:
                 ret = self.graph_runner.replay(
@@ -3282,18 +3284,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.prepare_attn_tp_scatter_input(self)
 
             # Normalize num_token_non_padded to be local to this attention TP rank if needed.
+            # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
+            # flavors already feed a zigzag-split rank-local layout whose token count
+            # should not be further divided by attn_tp_size. MHA-arch prefill CP
+            # (Qwen3/Qwen2 MoE) keeps the attn_tp-replicated layout and wants the
+            # adjustment to run — see docs/design/prefill-cp-mla.md §Phase 5.
             if (
                 forward_batch.num_token_non_padded is not None
                 and forward_batch.global_num_tokens_gpu is not None
                 and require_gathered_buffer(self.server_args)
                 and not is_dsa_enable_prefill_cp()
+                and not is_mla_prefill_cp_enabled()
             ):
                 forward_batch.adjust_num_token_non_padded_for_attn_tp(
                     server_args=self.server_args,
                 )
-
-            if self.is_hybrid_swa:
-                self.token_to_kv_pool.invalidate_loc_cache()
 
             # Hisparse coordinator — backends now read it from self.model_runner.
             if self.hisparse_coordinator is not None:

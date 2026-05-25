@@ -60,7 +60,9 @@ def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
     return num_converted
 
 
-def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -> bool:
+def _should_use_channels_last_3d(
+    server_args: ServerArgs | None, component_name: str
+) -> bool:
     if component_name not in (
         "vae",
         "video_vae",
@@ -68,9 +70,18 @@ def _should_use_channels_last_3d(server_args: ServerArgs, component_name: str) -
         return False
 
     override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
-    if override is None or override.strip().lower() == "auto":
+    if override is not None and override.strip().lower() != "auto":
+        return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
+
+    if server_args is None:
+        return False
+
+    pipeline_name = server_args.pipeline_config.__class__.__name__
+    if pipeline_name.startswith("QwenImage"):
         return True
-    return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
+    if "Wan" in pipeline_name and server_args.num_gpus == 1:
+        return True
+    return False
 
 
 class VAELoader(ComponentLoader):
