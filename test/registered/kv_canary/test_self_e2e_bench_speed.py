@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import os
 import unittest
+import warnings
 from pathlib import Path
 from typing import ClassVar, Optional
 
@@ -153,6 +154,9 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
         f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
     )
     print(summary, flush=True)
+    # Surface in pytest's warnings summary so the overhead number appears even when the test
+    # passes (pytest captures plain ``print`` and discards on success).
+    warnings.warn(summary, stacklevel=2)
     assert overhead_pct < 5.0, f"{summary} — exceeds 5% budget"
 
 
