@@ -38,6 +38,7 @@ class DenseAttentionCase:
     page_size: int
     prefix_lens: tuple[int, ...]
     extend_lens: tuple[int, ...] = ()
+    sliding_window_size: int | None = None
 
     @property
     def batch_size(self) -> int:
@@ -66,6 +67,7 @@ class TinyModelConfig:
         num_kv_heads: int,
         head_dim: int,
         context_len: int,
+        sliding_window_size: int | None = None,
     ):
         self.attention_arch = AttentionArch.MHA
         self.context_len = context_len
@@ -77,9 +79,10 @@ class TinyModelConfig:
         self.is_encoder_decoder = False
         self.is_multimodal = False
         self.is_generation = True
-        self.is_hybrid_swa = False
-        self.is_local_attention_model = False
+        self.is_hybrid_swa = sliding_window_size is not None
+        self.is_local_attention_model = sliding_window_size is not None
         self.attention_chunk_size = None
+        self.sliding_window_size = sliding_window_size
         self.hf_config = SimpleNamespace(architectures=["TinyForCausalLM"])
         self.hf_text_config = self.hf_config
 
@@ -146,8 +149,8 @@ class MockModelRunner(ModelRunner):
         self.attention_chunk_size = None
         self.hisparse_coordinator = None
         self.init_new_workspace = False
-        self.is_hybrid_swa = False
-        self.sliding_window_size = None
+        self.is_hybrid_swa = case.sliding_window_size is not None
+        self.sliding_window_size = case.sliding_window_size
         self.use_mla_backend = False
 
     @property
@@ -185,6 +188,7 @@ class ProjectedDenseAttention(nn.Module):
         head_dim: int,
         dtype: torch.dtype,
         device: str,
+        sliding_window_size: int | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -225,6 +229,9 @@ class ProjectedDenseAttention(nn.Module):
             scaling=head_dim**-0.5,
             num_kv_heads=num_kv_heads,
             layer_id=0,
+            sliding_window_size=(
+                sliding_window_size if sliding_window_size is not None else -1
+            ),
         )
 
     def project_qkv(self, hidden_states: torch.Tensor):
@@ -355,8 +362,17 @@ def _dense_attention_reference(
 
         for offset, query in enumerate(q_parts[req_idx]):
             query_pos = case.prefix_lens[req_idx] + offset
-            keys = _expand_gqa(req_k[: query_pos + 1].movedim(0, 1), case.num_heads)
-            values = _expand_gqa(req_v[: query_pos + 1].movedim(0, 1), case.num_heads)
+            key_start = 0
+            if case.sliding_window_size is not None:
+                # SGLang stores model sliding-window sizes as the number of tokens
+                # to the left of the current query, so the current token is extra.
+                key_start = max(0, query_pos - case.sliding_window_size)
+            keys = _expand_gqa(
+                req_k[key_start : query_pos + 1].movedim(0, 1), case.num_heads
+            )
+            values = _expand_gqa(
+                req_v[key_start : query_pos + 1].movedim(0, 1), case.num_heads
+            )
             query = query.float()
             keys = keys.float()
             scores = torch.einsum("hd,hkd->hk", query, keys) * module.attn.scaling
@@ -426,6 +442,7 @@ def run_dense_attention_case(
         num_kv_heads=case.num_kv_heads,
         head_dim=head_dim,
         context_len=max_context_len,
+        sliding_window_size=case.sliding_window_size,
     )
     runner = MockModelRunner(
         case=case,
@@ -447,6 +464,7 @@ def run_dense_attention_case(
         head_dim=head_dim,
         dtype=dtype,
         device=device,
+        sliding_window_size=case.sliding_window_size,
     )
     prefix_hidden = [
         torch.randn(length, hidden_size, dtype=dtype, device=device)

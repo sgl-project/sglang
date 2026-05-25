@@ -6,8 +6,9 @@ Last updated: 2026-05-25
 
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
-  `test/manual/attention/unittest/utils.py`.
-- Backend-specific dense correctness files exist for `torch_native`, `triton`, and
+  `test/manual/attention/unittest/common/dense_attention.py`.
+- Dense attention backend correctness files exist under
+  `test/manual/attention/unittest/dense/` for `torch_native`, `triton`, and
   `flashinfer`.
 - The first representative cases cover extend, decode, GQA, paged KV, and exact
   page-size boundary inputs.
@@ -18,14 +19,19 @@ Implemented:
   reference.
 
 In progress:
-- None for the dense MHA/GQA split. The next work starts separate model-family files
-  for attention behavior that the dense target cannot represent.
+- Add the next attention method files for `torch_native`, `triton`, and
+  `flashinfer` where those backends support the method.
 
 Next implementation steps:
 - Add separate model-family files for MLA, SWA, sparse/chunked KV, linear attention,
   Mamba, and speculative draft/verify paths.
 
 Verified:
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/utils.py test/manual/attention/unittest/test_torch_native_backend_correctness.py test/manual/attention/unittest/test_triton_backend_correctness.py test/manual/attention/unittest/test_flashinfer_backend_correctness.py`
 - `python test/manual/attention/unittest/test_torch_native_backend_correctness.py -v`
 - `python test/manual/attention/unittest/test_triton_backend_correctness.py -v`
