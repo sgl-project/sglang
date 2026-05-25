@@ -38,7 +38,7 @@ class CustomAllReduceV2:
         max_pull_blocks: Optional[int] = None,
         max_push_blocks: Optional[int] = None,
     ) -> None:
-        _init_config()
+        _maybe_init_config()
         self.disabled = True
         if not can_use_custom_all_reduce_v2(group=group, device=device):
             return
@@ -166,8 +166,10 @@ class CustomAllReduceV2:
         self.close()
 
 
-def _init_config():
+def _maybe_init_config():
     global THRESHOLD_2_SHOT_MAP
+    if THRESHOLD_2_SHOT_MAP:
+        return
     KB, MB = 1024, 1024 * 1024
 
     if is_sm100_supported():
@@ -199,6 +201,8 @@ def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    # call _maybe_init_config() to ensure THRESHOLD_2_SHOT_MAP is initialized, since can_use_custom_all_reduce_v2 can be called before CustomAllReduceV2 is initialized
+    _maybe_init_config()
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
