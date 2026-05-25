@@ -166,9 +166,7 @@ def build_warmup_reqs(
     )
 
     warmup_reqs = []
-    include_warmup_image = should_include_warmup_image(
-        server_args, server_based_warmup
-    )
+    include_warmup_image = should_include_warmup_image(server_args, server_based_warmup)
     for width, height in resolutions:
         req_kwargs = dict(
             data_type=task_type.data_type(),

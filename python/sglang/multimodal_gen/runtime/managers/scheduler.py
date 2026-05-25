@@ -916,9 +916,7 @@ class Scheduler(SchedulerDisaggMixin):
         self._warmup_processed = 0
 
         warmup_input_path = None
-        if should_include_warmup_image(
-            self.server_args, server_based_warmup=False
-        ):
+        if should_include_warmup_image(self.server_args, server_based_warmup=False):
             warmup_input_path = self._prepare_shared_warmup_image_path()
 
         warmup_reqs = build_warmup_reqs(

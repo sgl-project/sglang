@@ -216,16 +216,12 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
             server_args.pipeline_config.task_type = task_type
 
             self.assertEqual(
-                should_include_warmup_image(
-                    server_args, server_based_warmup=True
-                ),
+                should_include_warmup_image(server_args, server_based_warmup=True),
                 server_based_expected[task_type],
                 task_type.name,
             )
             self.assertEqual(
-                should_include_warmup_image(
-                    server_args, server_based_warmup=False
-                ),
+                should_include_warmup_image(server_args, server_based_warmup=False),
                 task_type.accepts_image_input(),
                 task_type.name,
             )
