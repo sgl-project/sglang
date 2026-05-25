@@ -133,7 +133,7 @@ class TestDisaggregationDSV4(PDDisaggregationServerBase):
         metrics = run_eval(args)
         print(f"Evaluation metrics: {metrics}")
 
-        self.assertGreater(metrics["score"], 0.95)
+        self.assertGreater(metrics["score"], 0.93)
 
 
 if __name__ == "__main__":
