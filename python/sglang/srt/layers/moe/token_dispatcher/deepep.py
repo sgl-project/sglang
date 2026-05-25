@@ -330,7 +330,16 @@ class _DeepEPDispatcherImplBase:
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
 
-        self.params_bytes = 2
+        self.set_deepep_dispatcher_dtype()
+        # Set params_bytes based on the actual dispatch dtype so buffer size
+        # calculations are correct. FP8/INT8/NVFP4 use 1 byte, BF16 uses 2.
+        _dtype_to_bytes = {
+            DeepEPOutputDtype.BF16: 2,
+            DeepEPOutputDtype.FP8: 1,
+            DeepEPOutputDtype.INT8: 1,
+            DeepEPOutputDtype.NVFP4: 1,
+        }
+        self.params_bytes = _dtype_to_bytes.get(self.deepep_output_dtype, 2)
         # A large value will lead to large memory occupation, thus users should change it accordingly
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
@@ -345,8 +354,6 @@ class _DeepEPDispatcherImplBase:
 
         self.overlap_args: Optional[CombineOverlapArgs] = None
         self.meta_overlap_args: Optional[dict] = None
-
-        self.set_deepep_dispatcher_dtype()
 
     def dispatch_a(
         self,
