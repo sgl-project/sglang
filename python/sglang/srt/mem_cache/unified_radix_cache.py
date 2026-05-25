@@ -1268,7 +1268,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             return False
 
-        avail = self.token_to_kv_pool_allocator.available_size()
+        avail = self.token_to_kv_pool_allocator.full_available_size()
         if avail < kv_tokens:
             needed = kv_tokens - avail
             result = self.evict(EvictParams(num_tokens=needed))
@@ -1618,10 +1618,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self._all_component_values_flatten(ComponentType.SWA)
 
     def available_and_evictable_str(self) -> str:
-        if self.supports_swa():
-            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
-        else:
-            full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_available_size = self.token_to_kv_pool_allocator.full_available_size()
         full_evictable = self.component_evictable_size_[BASE_COMPONENT_TYPE]
         lines = [
             f"Available full tokens: {full_available_size + full_evictable} "

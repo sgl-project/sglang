@@ -65,6 +65,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def full_available_size(self):
+        """Available slots in the full-attention sub-pool.
+
+        For non-hybrid allocators this is the same as ``available_size()``.
+        SWA-hybrid allocators override to return only the full-attention
+        sub-pool's availability.
+        """
+        return self.available_size()
+
     def get_kvcache(self):
         return self._kvcache
 
