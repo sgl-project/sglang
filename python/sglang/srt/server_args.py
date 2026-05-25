@@ -3768,11 +3768,15 @@ class ServerArgs:
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
                     )
-                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
+                if self.disaggregation_transfer_backend not in (
+                    "nixl",
+                    "mooncake",
+                    "mori",
+                ):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache currently "
                         "requires --disaggregation-transfer-backend in "
-                        "('nixl', 'mooncake'), but got "
+                        "('nixl', 'mooncake', 'mori'), but got "
                         f"{self.disaggregation_transfer_backend!r}"
                     )
                 if self.speculative_algorithm is not None:
@@ -6686,7 +6690,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl, mooncake or mori and is incompatible with --enable-hisparse.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
