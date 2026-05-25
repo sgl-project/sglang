@@ -69,7 +69,7 @@ def ref_context_attention(q_packed, k_packed, v_packed, b_seq_len, is_causal):
 BATCH_SEQ_CONFIGS = get_ci_test_range(
     [
         ([64], 64),
-        ([128], 64),
+        ([128], 128),
         ([64, 32], 64),
         ([128, 64, 32], 128),
         ([512], 512),
