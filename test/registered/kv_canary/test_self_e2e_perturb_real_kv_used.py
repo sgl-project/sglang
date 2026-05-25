@@ -46,23 +46,17 @@ class TestPerturbRealKvUsedMhaFull(_PerturbRealKvUsedBase):
     target_group = TargetGroupKind.FULL
 
 
-class _PerturbRealKvUsedSwaBase(_PerturbRealKvUsedBase):
-    __test__ = False
-
-    model_mode = "swa"
-    workload_n_batches = 2
-    use_unique_prompts = True
-
-
-class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedSwaBase):
+class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
     __test__ = True
 
+    model_mode = "swa"
     target_group = TargetGroupKind.FULL
 
 
-class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedSwaBase):
+class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
     __test__ = True
 
+    model_mode = "swa"
     target_group = TargetGroupKind.SWA
 
 

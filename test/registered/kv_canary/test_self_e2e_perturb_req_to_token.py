@@ -36,7 +36,6 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"
-    use_unique_prompts = True
 
 
 if __name__ == "__main__":
