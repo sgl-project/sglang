@@ -165,6 +165,7 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
+            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             if not use_model_sampling_defaults:
                 req_kwargs["negative_prompt"] = ""
             req_kwargs["image_path"] = [warmup_input_path]

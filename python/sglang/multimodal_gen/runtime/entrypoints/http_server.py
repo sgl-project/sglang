@@ -42,6 +42,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
+SERVER_WARMUP_BYPASS_PATHS = (
+    "/health",
+    "/health_generate",
+    "/model_info",
+    "/server_info",
+)
 
 
 async def _wait_until_http_ready(server_args: ServerArgs) -> None:
@@ -59,13 +65,16 @@ async def _wait_until_http_ready(server_args: ServerArgs) -> None:
     raise RuntimeError(f"HTTP server did not become ready at {health_url}")
 
 
-async def _run_server_warmup_after_http_ready(server_args: ServerArgs) -> None:
+async def _run_server_warmup_after_http_ready(
+    server_args: ServerArgs, warmup_done: asyncio.Event
+) -> None:
     try:
         if (
             not server_args.warmup
             or not server_args.server_warmup
             or server_args.warmup_resolutions is not None
         ):
+            warmup_done.set()
             return
 
         await _wait_until_http_ready(server_args)
@@ -88,6 +97,7 @@ async def _run_server_warmup_after_http_ready(server_args: ServerArgs) -> None:
                 raise RuntimeError(response.error)
 
         logger.info("The server is fired up and ready to roll!")
+        warmup_done.set()
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -105,14 +115,18 @@ async def lifespan(app: FastAPI):
     # 1. Initialize the singleton client that connects to the backend Scheduler
     server_args = app.state.server_args
     async_scheduler_client.initialize(server_args)
+    warmup_done = asyncio.Event()
+    app.state.server_warmup_done = warmup_done
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     warmup_task = None
     if server_args.server_warmup:
         warmup_task = asyncio.create_task(
-            _run_server_warmup_after_http_ready(server_args)
+            _run_server_warmup_after_http_ready(server_args, warmup_done)
         )
+    else:
+        warmup_done.set()
 
     try:
         yield
@@ -366,6 +380,17 @@ def create_app(server_args: ServerArgs):
     Create and configure the FastAPI application instance.
     """
     app = FastAPI(lifespan=lifespan)
+
+    @app.middleware("http")
+    async def wait_for_server_warmup(request: Request, call_next):
+        warmup_done = getattr(request.app.state, "server_warmup_done", None)
+        if (
+            warmup_done is not None
+            and not warmup_done.is_set()
+            and request.url.path not in SERVER_WARMUP_BYPASS_PATHS
+        ):
+            await warmup_done.wait()
+        return await call_next(request)
 
     app.include_router(health_router)
     app.include_router(vertex_router)
