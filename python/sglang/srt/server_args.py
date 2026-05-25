@@ -723,8 +723,6 @@ class ServerArgs:
     disable_decode_cuda_graph: bool = False
     prefill_cuda_graph_backend: Optional[str] = None
     decode_cuda_graph_backend: Optional[str] = None
-    cuda_graph_max_bs: Optional[int] = None
-    cuda_graph_bs: Optional[List[int]] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
     tc_piecewise_cuda_graph_compiler: Optional[str] = None
@@ -1340,10 +1338,6 @@ class ServerArgs:
         if self.disable_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.cuda_graph_max_bs is not None:
-            _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs)
-        if self.cuda_graph_bs is not None:
-            _set(Phase.DECODE, "bs", self.cuda_graph_bs)
         if self.piecewise_cuda_graph_max_tokens is not None:
             _set(Phase.PREFILL, "max_bs", self.piecewise_cuda_graph_max_tokens)
         if self.piecewise_cuda_graph_tokens is not None:
@@ -1544,13 +1538,13 @@ class ServerArgs:
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
         Configure GPU memory-dependent settings including
-        chunked_prefill_size, cuda_graph_max_bs, and mem_fraction_static.
+        chunked_prefill_size, cuda_graph_config[decode].max_bs, and mem_fraction_static.
 
         Here are our heuristics:
-        - Set chunked_prefill_size and cuda_graph_max_bs based on the GPU memory capacity.
+        - Set chunked_prefill_size and cuda_graph_config[decode].max_bs based on the GPU memory capacity.
           This is because GPUs with more memory are generally more powerful, we need to use a larger
-          chunked_prefill_size and a larger cuda_graph_max_bs to fully utilize the GPU.
-        - Then set mem_fraction_static based on chunked_prefill_size and cuda_graph_max_bs.
+          chunked_prefill_size and a larger decode max_bs to fully utilize the GPU.
+        - Then set mem_fraction_static based on chunked_prefill_size and decode max_bs.
 
           GPU memory capacity = model weights + KV cache pool + activations + cuda graph buffers
 
@@ -1559,8 +1553,8 @@ class ServerArgs:
 
           In order to compute mem_fraction_static, we need to estimate the size of activations and cuda graph buffers.
           The activation memory is proportional to the chunked_prefill_size.
-          The cuda graph memory is proportional to the cuda_graph_max_bs.
-          We use reserved_mem = chunked_prefill_size * 1.5 + cuda_graph_max_bs * 2 to estimate the size of activations and cuda graph buffers in GB.
+          The cuda graph memory is proportional to the decode max_bs.
+          We use reserved_mem = chunked_prefill_size * 1.5 + max_bs * 2 to estimate the size of activations and cuda graph buffers in GB,
           and set mem_fraction_static = (GPU memory capacity - reserved_mem) / GPU memory capacity.
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
@@ -6415,9 +6409,9 @@ class ServerArgs:
         parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
-            default=ServerArgs.cuda_graph_max_bs,
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-max-bs-decode",
+            dest="cuda_graph_max_bs_decode",
             help="Deprecated alias for --cuda-graph-max-bs-decode.",
         )
         parser.add_argument(
@@ -6426,6 +6420,7 @@ class ServerArgs:
             nargs="+",
             action=DeprecatedAliasStoreAction,
             new_flag="--cuda-graph-bs-decode",
+            dest="cuda_graph_bs_decode",
             help="Deprecated alias for --cuda-graph-bs-decode.",
         )
         parser.add_argument(

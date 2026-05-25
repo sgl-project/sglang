@@ -926,7 +926,7 @@ def latency_test(
 
 
 def main(server_args, bench_args):
-    server_args.cuda_graph_max_bs = max(bench_args.batch_size)
+    server_args.cuda_graph_max_bs_decode = max(bench_args.batch_size)
 
     _set_envs_and_config(server_args)
 
