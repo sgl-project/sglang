@@ -31,6 +31,7 @@ MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
 CUSTOM_IMAGE=""
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
+IMAGE_SUFFIX="${IMAGE_SUFFIX:-}"   # honors workflow-level env var; --image-suffix CLI overrides below
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -39,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
     --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
+    --image-suffix) IMAGE_SUFFIX="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -54,11 +56,21 @@ while [[ $# -gt 0 ]]; do
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
+      echo "  --image-suffix SUFFIX      Append SUFFIX to the daily tag when discovering images (e.g. test-pr-22037)."
+      echo "                             Matches images published by the nightly workflows with tag_suffix set."
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
   esac
 done
+
+# Normalize the optional image suffix once. When set, every daily-tag candidate
+# below is rebuilt as ${base_tag}-${date}-${IMAGE_SUFFIX}.
+TAG_SUFFIX=""
+if [[ -n "${IMAGE_SUFFIX}" ]]; then
+  TAG_SUFFIX="-${IMAGE_SUFFIX}"
+  echo "Using image suffix: ${IMAGE_SUFFIX} (candidate tags will look like <base>-<DATE>${TAG_SUFFIX})"
+fi
 
 
 
@@ -145,7 +157,7 @@ find_latest_image() {
 
   # First, check local cache on the runner.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${TAG_SUFFIX}"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
     if [[ -n "$image_id" ]]; then
       echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
@@ -164,7 +176,7 @@ find_latest_image() {
   # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
   # docker daemon on the host and inherits its insecure-registries config.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${TAG_SUFFIX}"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
@@ -174,16 +186,25 @@ find_latest_image() {
   done
 
   # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch}${TAG_SUFFIX} image…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}${TAG_SUFFIX}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
       return 0
     fi
   done
+
+  # When an image suffix is requested (ad-hoc test image), do NOT fall back to
+  # any non-suffixed image: those are unrelated and would silently mask a
+  # missing test-image build. Fail loudly instead.
+  if [[ -n "${TAG_SUFFIX}" ]]; then
+    echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag} with suffix '${IMAGE_SUFFIX}'" >&2
+    echo "Hint: confirm the nightly build workflow was dispatched with tag_suffix=${IMAGE_SUFFIX} and finished successfully." >&2
+    return 1
+  fi
 
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local

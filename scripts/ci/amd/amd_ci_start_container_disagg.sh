@@ -28,11 +28,13 @@ LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
+IMAGE_SUFFIX="${IMAGE_SUFFIX:-}"   # honors workflow-level env var; --image-suffix CLI overrides below
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
+    --image-suffix) IMAGE_SUFFIX="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -40,12 +42,20 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION]"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--rocm-version VERSION] [--image-suffix SUFFIX]"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
   esac
 done
+
+# Normalize the optional image suffix once. When set, every daily-tag candidate
+# below is rebuilt as ${base_tag}-${date}-${IMAGE_SUFFIX}.
+TAG_SUFFIX=""
+if [[ -n "${IMAGE_SUFFIX}" ]]; then
+  TAG_SUFFIX="-${IMAGE_SUFFIX}"
+  echo "Using image suffix: ${IMAGE_SUFFIX} (candidate tags will look like <base>-<DATE>${TAG_SUFFIX})"
+fi
 
 
 
@@ -132,7 +142,7 @@ find_latest_image() {
 
   # First, check local cache on the runner.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${TAG_SUFFIX}"
     image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
     if [[ -n "$image_id" ]]; then
       echo "Found cached image locally: rocm/sgl-dev:${image_tag}" >&2
@@ -147,7 +157,7 @@ find_latest_image() {
   # the runner pod's network namespace; the actual local-registry pull
   # happens at the call site below via the docker daemon on the host.
   for days_back in {0..6}; do
-    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)"
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${TAG_SUFFIX}"
     echo "Checking for image: rocm/sgl-dev:${image_tag}" >&2
     if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
       echo "Found available image: rocm/sgl-dev:${image_tag}" >&2
@@ -157,16 +167,25 @@ find_latest_image() {
   done
 
   # If still not found, try finding any image matching ROCm+arch from remote registry
-  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch} image…" >&2
+  echo "Exact version not found. Searching remote registry for any ${ROCM_VERSION}-${gpu_arch}${TAG_SUFFIX} image…" >&2
   for days_back in {0..6}; do
     local target_date=$(date -d "${days_back} days ago" +%Y%m%d)
-    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
+    remote_tags=$(curl -s "https://registry.hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=${ROCM_VERSION}-${gpu_arch}-${target_date}${TAG_SUFFIX}" 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 | head -n 1 || true)
     if [[ -n "$remote_tags" ]]; then
       echo "Found available image: rocm/sgl-dev:${remote_tags}" >&2
       echo "rocm/sgl-dev:${remote_tags}"
       return 0
     fi
   done
+
+  # When an image suffix is requested (ad-hoc test image), do NOT fall back to
+  # any non-suffixed image: those are unrelated and would silently mask a
+  # missing test-image build. Fail loudly instead.
+  if [[ -n "${TAG_SUFFIX}" ]]; then
+    echo "Error: no ${gpu_arch} image found in the last 7 days for base ${base_tag} with suffix '${IMAGE_SUFFIX}'" >&2
+    echo "Hint: confirm the nightly build workflow was dispatched with tag_suffix=${IMAGE_SUFFIX} and finished successfully." >&2
+    return 1
+  fi
 
   echo "No recent images found. Searching any cached local images matching ROCm+arch…" >&2
   local any_local
@@ -203,12 +222,18 @@ find_latest_image() {
 
 # Pull and run the latest image
 IMAGE=$(find_latest_image "${GPU_ARCH}")
+# Ad-hoc suffixed test images are intentionally NOT mirrored to the local
+# registry by the nightly workflow, so skip that hop and pull straight from
+# Docker Hub to avoid a guaranteed-failure attempt.
+if [[ -n "${TAG_SUFFIX}" ]]; then
+  echo "Image suffix set; pulling suffixed image directly from public registry: ${IMAGE}"
+  retry_with_backoff 6 docker pull "${IMAGE}"
 # Try the local docker registry first (avoids Docker Hub rate limits and is
 # faster on the LAN); if that fails for any reason, fall back to the
 # public registry with exponential-backoff retries. Capture stderr so the
 # real failure reason (TLS handshake, 404, connection refused, etc.) is
 # visible in the job log instead of being silently swallowed.
-if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+elif local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
   echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
   docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
 else
