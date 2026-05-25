@@ -42,6 +42,7 @@ class KernelRunCounterHealthChecker:
         self._active_tags = active_tags
         self._outer_step_counter_getter = outer_step_counter_getter
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
+        self._prev_counters_host: Optional[list[int]] = None
 
     def step(self) -> None:
         self._handler.step(
@@ -62,12 +63,21 @@ class KernelRunCounterHealthChecker:
     def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
         counters = host_tensor.tolist()
         expected_tags = self._expected_active_tags_for_health_check()
-        zero_tags = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
-        if zero_tags:
-            names = ", ".join(tag.name for tag in zero_tags)
+        if self._prev_counters_host is None:
+            stalled = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
+        else:
+            stalled = [
+                tag
+                for tag in expected_tags
+                if int(counters[tag.value]) == int(self._prev_counters_host[tag.value])
+            ]
+        self._prev_counters_host = counters
+        if stalled:
+            names = ", ".join(tag.name for tag in stalled)
             raise RuntimeError(
-                f"kv-canary: kernel_run_counter is zero after warmup for tags=[{names}] "
-                f"at step={self._outer_step_counter_getter()}; canary path is not executing"
+                f"kv-canary: kernel_run_counter did not increase since previous check "
+                f"for tags=[{names}] at step={self._outer_step_counter_getter()}; "
+                f"canary path is not executing"
             )
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
