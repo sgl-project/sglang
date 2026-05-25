@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import struct
 from dataclasses import dataclass
 from typing import Callable
 
@@ -1765,8 +1766,6 @@ class TestViolationRing:
             assert kk == int(tag)
 
     def test_violation_ring_row_byte_layout_hardcoded(self) -> None:
-        import struct
-
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
