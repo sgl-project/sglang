@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -140,7 +141,17 @@ def validation_artifacts(args) -> dict[str, Path]:
     }
 
 
-def searched_pattern_artifact_failures(path: Path) -> list[str]:
+def searched_pattern_target_f_layers(num_c4_layers: int, retention: str) -> int:
+    if retention == "1/2":
+        return math.ceil(num_c4_layers / 2)
+    if retention == "1/4":
+        return math.ceil(num_c4_layers / 4)
+    raise ValueError(f"unsupported retention {retention}")
+
+
+def searched_pattern_artifact_failures(
+    path: Path, num_c4_layers: int | None = None, pp_block_c4_layers: int = 0
+) -> list[str]:
     try:
         data = json.loads(path.read_text())
     except FileNotFoundError:
@@ -161,8 +172,39 @@ def searched_pattern_artifact_failures(path: Path) -> list[str]:
             failures.append(f"{retention} search_method is not greedy_training_free")
         if result.get("uniform_candidate") is not False:
             failures.append(f"{retention} must be labeled uniform_candidate=false")
-        if not result.get("final_pattern"):
+        final_pattern = result.get("final_pattern")
+        if not final_pattern:
             failures.append(f"{retention} is missing final_pattern")
+            continue
+        if sorted(set(final_pattern) - {"F", "S"}):
+            failures.append(
+                f"{retention} final_pattern contains entries other than F/S"
+            )
+        if num_c4_layers is not None:
+            has_expected_length = len(final_pattern) == num_c4_layers
+            if not has_expected_length:
+                failures.append(
+                    f"{retention} final_pattern length {len(final_pattern)} "
+                    f"does not match num_c4_layers {num_c4_layers}"
+                )
+            target_f = searched_pattern_target_f_layers(num_c4_layers, retention)
+            if final_pattern.count("F") != target_f:
+                failures.append(
+                    f"{retention} final_pattern has {final_pattern.count('F')} F "
+                    f"layers, expected {target_f}"
+                )
+            protected = {0}
+            if pp_block_c4_layers > 0:
+                protected.update(range(0, num_c4_layers, pp_block_c4_layers))
+            if has_expected_length:
+                skipped_protected = [
+                    idx for idx in protected if final_pattern[idx] != "F"
+                ]
+                if skipped_protected:
+                    failures.append(
+                        f"{retention} final_pattern skips protected C4 indices "
+                        f"{skipped_protected}"
+                    )
     return failures
 
 
@@ -265,7 +307,9 @@ def main(argv: list[str] | None = None) -> None:
         result = {"phase": phase, **result}
         if phase == "search" and result["returncode"] == 0 and not args.dry_run:
             failures = searched_pattern_artifact_failures(
-                validation_artifacts(args)["searched_patterns"]
+                validation_artifacts(args)["searched_patterns"],
+                args.num_c4_layers,
+                args.pp_block_c4_layers,
             )
             result["artifact_validation"] = {
                 "passed": not failures,

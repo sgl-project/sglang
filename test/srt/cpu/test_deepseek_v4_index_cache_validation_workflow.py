@@ -138,6 +138,14 @@ def test_dsv4_index_cache_validation_workflow_validates_searched_pattern_artifac
     )
 
     assert workflow.searched_pattern_artifact_failures(path) == []
+    assert (
+        workflow.searched_pattern_artifact_failures(
+            path,
+            num_c4_layers=3,
+            pp_block_c4_layers=0,
+        )
+        == []
+    )
 
 
 def test_dsv4_index_cache_validation_workflow_rejects_missing_searched_quarter_artifact(
@@ -188,6 +196,73 @@ def test_dsv4_index_cache_validation_workflow_rejects_uniform_pattern_artifact(
 
     assert workflow.searched_pattern_artifact_failures(path) == [
         "1/4 must be labeled uniform_candidate=false"
+    ]
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_wrong_pattern_shape(
+    tmp_path,
+):
+    path = tmp_path / "searched_patterns.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retentions": {
+                    "1/2": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FFS",
+                    },
+                    "1/4": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FX",
+                    },
+                }
+            }
+        )
+    )
+
+    assert workflow.searched_pattern_artifact_failures(
+        path,
+        num_c4_layers=4,
+        pp_block_c4_layers=0,
+    ) == [
+        "1/2 final_pattern length 3 does not match num_c4_layers 4",
+        "1/4 final_pattern contains entries other than F/S",
+        "1/4 final_pattern length 2 does not match num_c4_layers 4",
+    ]
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_skipped_pp_anchor(
+    tmp_path,
+):
+    path = tmp_path / "searched_patterns.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retentions": {
+                    "1/2": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FSFSSF",
+                    },
+                    "1/4": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FSSSSF",
+                    },
+                }
+            }
+        )
+    )
+
+    assert workflow.searched_pattern_artifact_failures(
+        path,
+        num_c4_layers=6,
+        pp_block_c4_layers=3,
+    ) == [
+        "1/2 final_pattern skips protected C4 indices [3]",
+        "1/4 final_pattern skips protected C4 indices [3]",
     ]
 
 
