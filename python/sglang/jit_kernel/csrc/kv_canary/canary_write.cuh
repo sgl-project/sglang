@@ -87,8 +87,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   const bool do_chain_position_assert = (seed_slot_idx >= 0) && (*p.enable_chain_position_assert != 0);
   int64_t running_prev_position = 0;
   if (do_chain_position_assert) {
-    running_prev_position =
-        canary_load_field(p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
+    running_prev_position = canary_load_field(p.canary_buf, seed_slot_idx, p.slot_stride_bytes, kCanaryFieldPosition);
   }
 
   int64_t entries_written = 0;

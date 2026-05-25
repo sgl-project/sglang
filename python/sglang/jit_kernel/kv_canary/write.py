@@ -207,7 +207,9 @@ def launch_canary_write_kernel(
     _assert_contiguous(context.violation_write_index, "violation_write_index")
     _assert_contiguous(context.slot_run_counter, "slot_run_counter")
     _assert_contiguous(context.kernel_run_counter, "kernel_run_counter")
-    _assert_contiguous(context.enable_chain_position_assert, "enable_chain_position_assert")
+    _assert_contiguous(
+        context.enable_chain_position_assert, "enable_chain_position_assert"
+    )
 
     padded_bufs, source_params = _build_real_kv_source_abi(
         real_kv_sources=real_kv_sources, device=canary_buf.device

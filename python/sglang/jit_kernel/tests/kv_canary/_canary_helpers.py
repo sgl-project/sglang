@@ -63,7 +63,9 @@ class FakeViolationLog:
             write_index=torch.zeros(1, dtype=torch.int32, device=device),
             slot_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
             kernel_run_counter=torch.zeros(1, dtype=torch.int64, device=device),
-            enable_chain_position_assert=torch.ones(1, dtype=torch.int32, device=device),
+            enable_chain_position_assert=torch.ones(
+                1, dtype=torch.int32, device=device
+            ),
         )
 
 
