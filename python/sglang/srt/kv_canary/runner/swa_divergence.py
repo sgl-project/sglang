@@ -40,8 +40,6 @@ class SwaDivergenceReport:
         self._req_to_token_pool = req_to_token_pool
         self._forward_ct: int = 0
         # Per-group running total of verify entries (shape ``[2]``, int32).
-        # Read by :class:`SingleForwardManager` to snapshot into its per-step
-        # buffer at phase 3, so the name is public.
         self.verify_total_count_device: torch.Tensor = torch.zeros(
             2, dtype=torch.int32, device=device
         )
@@ -79,15 +77,10 @@ class SwaDivergenceReport:
         if outer_step_counter == 0 or outer_step_counter % self._interval != 0:
             return None
 
-        # Bundle forward_ct in as an int pass-through so the host log line reports
-        # the forward at which the snapshot was staged, not the one at which the
-        # drain happens (DelayedDeviceHostHandler runs postprocess one tick later).
         result: dict[str, Any] = {
             "forward_ct": self._forward_ct,
             "verify_total_count": self.verify_total_count_device,
         }
-        # ``maybe_inaccurate_forward_batch`` is the same (possibly already-advanced) instance
-        # passed to phase 4 — accurate enough for the coarse trend metric.
         if (
             self._swa_allocator is not None
             and maybe_inaccurate_forward_batch is not None

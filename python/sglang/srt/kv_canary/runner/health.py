@@ -107,10 +107,6 @@ class PeriodicCanaryStatsLogger:
         if outer_step_counter == 0 or outer_step_counter % period != 0:
             return None
         device_state = self._device_state
-        # Snapshot the step in the staged payload so the host log line reports the
-        # step that produced the stats, not the step at which the drain happens
-        # (which is one DelayedDeviceHostHandler tick later). The "step" key is a
-        # plain int and rides along via the pass-through path in FutureTensors.
         return {
             "step": outer_step_counter,
             "slot_sum": device_state.slot_run_counters.sum().view(1),
