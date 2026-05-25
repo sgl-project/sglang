@@ -109,9 +109,7 @@ def build_warmup_reqs(
         sampling_defaults.negative_prompt if use_model_sampling_defaults else None
     )
     cfg_scale = (
-        _effective_cfg_scale(sampling_defaults)
-        if use_model_sampling_defaults
-        else None
+        _effective_cfg_scale(sampling_defaults) if use_model_sampling_defaults else None
     )
 
     warmup_reqs = []

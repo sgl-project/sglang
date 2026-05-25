@@ -667,19 +667,6 @@ class ServerArgs(DisaggArgsMixin):
         if not self.warmup:
             self.server_warmup = False
 
-        if self.warmup and self.warmup_resolutions is not None:
-            logger.info(
-                "Resolution warmup enabled; server launch may take longer than usual"
-            )
-        elif self.warmup and self.server_warmup:
-            logger.info(
-                "Server warmup enabled; a lightweight warmup request will run after HTTP server is ready"
-            )
-        elif self.warmup:
-            logger.info(
-                "Request-based warmup enabled; the first generation request will run one warmup copy before processing"
-            )
-
     @staticmethod
     def _require_port(port: int, name: str) -> None:
         """Raise if *port* is occupied (used under ``--strict-ports``)."""
