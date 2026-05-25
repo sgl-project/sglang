@@ -537,7 +537,6 @@ class LongcatFlashDecoderLayer(nn.Module):
                         moe_hidden_states, moe_residual, forward_batch
                     )
                 )
-                moe_hidden_states.record_stream(self.double_stream_state.main_stream)
 
             self.double_stream_state.main_stream.wait_stream(
                 self.double_stream_state.moe_alt_stream
@@ -649,6 +648,8 @@ class LongcatFlashModel(nn.Module):
             self.double_stream_state = _LongcatDoubleStreamState()
             self.double_stream_state.first_attn_finished = device_module.Event()
             self.double_stream_state.moe_alt_stream = device_module.Stream()
+            if _is_npu:
+                torch.npu.set_stream_limit(self.double_stream_state.moe_alt_stream, 8, 16)
         else:
             self.double_stream_state = None
         self.layers = nn.ModuleList(
