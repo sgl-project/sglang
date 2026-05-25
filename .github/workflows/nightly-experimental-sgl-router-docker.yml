@@ -1,4 +1,4 @@
-name: Nightly Release sgl-router Docker Image
+name: Nightly Experimental sgl-router Docker Image
 
 on:
   schedule:
