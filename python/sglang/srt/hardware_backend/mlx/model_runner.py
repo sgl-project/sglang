@@ -16,7 +16,6 @@ state.
 
 import logging
 import time
-from sglang.srt.environ import envs
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -35,6 +34,7 @@ from sglang.srt.hardware_backend.mlx.kv_cache import (
     patch_model_attention,
     set_context,
 )
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.kv_cache.kv_pool import MlxKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
