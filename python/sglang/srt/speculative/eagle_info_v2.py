@@ -306,11 +306,9 @@ class EagleVerifyInputV2Mixin:
         )
         if can_run_cuda_graph:
             target_worker.model_runner.graph_runner.replay_prepare(verify_forward_batch)
-        else:
-            if not batch.forward_mode.is_idle():
-                target_worker.model_runner.attn_backend.init_forward_metadata(
-                    verify_forward_batch
-                )
+        # Non-cuda-graph: defer init to forward_extend, which runs after
+        # `_forward_raw -> prepare_mlp_sync_batch` pads the batch. Initing
+        # here would use pre-pad shapes and trip DSv4 indexer shape match.
 
         return verify_forward_batch, can_run_cuda_graph
 
