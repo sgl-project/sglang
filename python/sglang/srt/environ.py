@@ -734,10 +734,6 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
-    # When False, V-half canary kernels (HEAD/TAIL/SWEEP_V_*) are still constructed (pool patch,
-    # endpoints, IPC fields all stay attached so PD and other consumers see a stable surface) but
-    # their verify/write kernels do not launch. K-half coverage is preserved. Default off: V
-    # corruption is rare in practice and skipping it ~halves the per-forward canary cost.
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
