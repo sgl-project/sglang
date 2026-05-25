@@ -96,11 +96,6 @@ logger = logging.getLogger(__name__)
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
-
-_is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
-
-
 class Qwen3_VisionMLP(nn.Module):
 
     def __init__(

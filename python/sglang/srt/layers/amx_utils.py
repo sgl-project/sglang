@@ -1,6 +1,7 @@
 import logging
 
 import torch
+import transformers
 
 from sglang.srt.utils import cpu_has_amx_support
 
@@ -19,6 +20,48 @@ class CPUQuantMethod(IntEnum):
 class CPUQuantAlgo(IntEnum):
     AWQ = 0
     GPTQ = 1
+
+
+def fast_preprocess_cpu(
+    self,
+    images: list["torch.Tensor"],
+    do_resize: bool,
+    size,
+    interpolation,
+    do_rescale: bool,
+    rescale_factor: float,
+    do_normalize: bool,
+    image_mean,
+    image_std,
+    patch_size: int,
+    temporal_patch_size: int,
+    merge_size: int,
+    disable_grouping,
+    return_tensors,
+    **kwargs,
+):
+    pixel_values, image_grid_thw = torch.ops.sgl_kernel.image_preprocess_cpu(
+        images,
+        True,
+        do_resize,
+        size["shortest_edge"],
+        size["longest_edge"],
+        "bicubic",
+        do_rescale,
+        rescale_factor,
+        do_normalize,
+        image_mean,
+        image_std,
+        patch_size,
+        temporal_patch_size,
+        merge_size,
+        True,
+        torch.bfloat16,
+    )
+    return transformers.image_processing_base.BatchFeature(
+        data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw},
+        tensor_type=return_tensors,
+    )
 
 
 def amx_process_weight_after_loading(weight, is_conv=False):

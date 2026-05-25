@@ -65,50 +65,7 @@ _is_cpu = is_cpu()
 if _is_cpu and _is_cpu_amx_available:
     try:
         import transformers
-        from transformers.image_processing_base import BatchFeature
-
-        image_preprocess_cpu = torch.ops.sgl_kernel.image_preprocess_cpu
-
-        def fast_preprocess_cpu(
-            self,
-            images: list["torch.Tensor"],
-            do_resize: bool,
-            size,
-            interpolation,
-            do_rescale: bool,
-            rescale_factor: float,
-            do_normalize: bool,
-            image_mean,
-            image_std,
-            patch_size: int,
-            temporal_patch_size: int,
-            merge_size: int,
-            disable_grouping,
-            return_tensors,
-            **kwargs,
-        ):
-            pixel_values, image_grid_thw = image_preprocess_cpu(
-                images,
-                True,
-                do_resize,
-                size["shortest_edge"],
-                size["longest_edge"],
-                "bicubic",
-                do_rescale,
-                rescale_factor,
-                do_normalize,
-                image_mean,
-                image_std,
-                patch_size,
-                temporal_patch_size,
-                merge_size,
-                True,
-                torch.bfloat16,
-            )
-            return BatchFeature(
-                data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw},
-                tensor_type=return_tensors,
-            )
+        from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
         transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
             fast_preprocess_cpu

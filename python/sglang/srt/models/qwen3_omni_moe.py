@@ -54,6 +54,22 @@ from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
 
 _is_cpu = is_cpu()
 
+def get_head_dim_and_projection_size(
+    embed_dim: int,
+    num_heads: int,
+    original_num_heads: Optional[int] = None,
+) -> Tuple[Optional[int], int]:
+    if (not _is_cpu) or original_num_heads is None:
+        return None, embed_dim
+
+    # On CPU, TP may pad num_heads (e.g. for tp=3/6). In that case we keep the
+    # original per-head width (from original_num_heads) and recompute projection_size
+    # with padded num_heads, so attention tensor shapes stay TP-friendly while
+    # preserving checkpoint semantics.
+    head_dim = embed_dim // original_num_heads
+    projection_size = num_heads * head_dim
+    return head_dim, projection_size
+
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
     def __init__(
@@ -65,15 +81,15 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
-        head_size = None
-        projection_size = embed_dim
-        if _is_cpu and hasattr(config, "original_encoder_attention_heads"):
-            head_size = embed_dim // config.original_encoder_attention_heads
-            projection_size = config.encoder_attention_heads * head_size
+        head_dim, projection_size = get_head_dim_and_projection_size(
+            embed_dim=embed_dim,
+            num_heads=config.encoder_attention_heads,
+            original_num_heads=getattr(config, "original_encoder_attention_heads", None),
+        )
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
-            head_dim=head_size,
+            head_dim=head_dim,
             projection_size=projection_size,
             use_qkv_parallel=True,
             proj_bias=True,
