@@ -16,7 +16,8 @@ Implemented:
   `test/manual/attention/unittest/mla/` for `triton`.
 - GDN hybrid-linear attention backend correctness exists under
   `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
-  linear-attention kernel backend `triton`.
+  linear-attention kernel backend `triton`; its expected path is now a pure
+  PyTorch gated-delta recurrence, not the Triton/FLA GDN kernels.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
@@ -81,6 +82,8 @@ Verified:
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
 
 ---
 
@@ -199,8 +202,9 @@ Reference strategy by family:
   the same random projection/compression weights.
 - DSA/DSV4: model-family reference that builds the equivalent sparse or compressed
   attention mask/index result, then compares the final module output.
-- Linear KDA/Lightning/GDN and Mamba: family-specific reference kernels or compact
-  PyTorch implementations. Do not claim these are all SDPA references.
+- Linear KDA/Lightning/GDN and Mamba: compact PyTorch implementations whenever
+  feasible. Kernel-to-kernel comparisons are only smoke tests and must be labeled
+  as such.
 - Speculative verify: explicit causal/tree masks built from synthetic `SpecInput`
   objects, then compared at the same module boundary.
 

@@ -12,11 +12,6 @@ from sglang.srt.configs.mamba_utils import (
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers import dp_attention as _dp_attention
 from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-from sglang.srt.layers.attention.fla.chunk import chunk_gated_delta_rule
-from sglang.srt.layers.attention.fla.fused_gdn_gating import fused_gdn_gating
-from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
@@ -340,6 +335,12 @@ class GDNAttentionFixture:
     b: torch.Tensor
 
 
+@dataclass
+class GDNReferenceOutput:
+    output: torch.Tensor
+    final_states: torch.Tensor
+
+
 def _token_loc(req_idx: int, pos: int, *, page_size: int, max_context_len: int) -> int:
     return page_size + req_idx * max_context_len + pos
 
@@ -517,60 +518,74 @@ def run_gdn_fixture_eager(fixture: GDNAttentionFixture) -> torch.Tensor:
         )
 
 
-def expected_gdn_fixture_output(
+def _pure_torch_gdn_gating(
+    module: ProjectedGDNAttention,
+    a: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    g = -torch.exp(module.A_log.float()) * torch.nn.functional.softplus(
+        a.float() + module.dt_bias.float()
+    )
+    beta = torch.sigmoid(b.float())
+    return g, beta
+
+
+def _pure_torch_gdn_reference(
     fixture: GDNAttentionFixture,
     initial_ssm_states: torch.Tensor,
-) -> torch.Tensor:
+) -> GDNReferenceOutput:
     q, k, v = fixture.module.split_qkv(fixture.mixed_qkv)
     cache_indices = _cache_indices(fixture)
+    g, beta = _pure_torch_gdn_gating(fixture.module, fixture.a, fixture.b)
+    q = q.float()
+    k = k.float()
+    v = v.float()
 
-    if fixture.case.forward_mode.is_decode():
-        query_start_loc = torch.arange(
-            0,
-            fixture.case.batch_size + 1,
-            dtype=torch.int32,
-            device=fixture.runner.device,
-        )
-        return fused_sigmoid_gating_delta_rule_update(
-            A_log=fixture.module.A_log,
-            dt_bias=fixture.module.dt_bias,
-            q=q,
-            k=k,
-            v=v,
-            a=fixture.a,
-            b=fixture.b,
-            initial_state_source=initial_ssm_states,
-            initial_state_indices=cache_indices,
-            cu_seqlens=query_start_loc,
-            use_qk_l2norm_in_kernel=True,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-        )
+    outputs = torch.empty(
+        1,
+        fixture.case.num_input_tokens,
+        fixture.case.num_v_heads,
+        fixture.module.head_v_dim,
+        dtype=torch.float32,
+        device=fixture.runner.device,
+    )
+    final_states = initial_ssm_states.clone()
+    q_head_ratio = fixture.case.num_v_heads // fixture.case.num_k_heads
+    start = 0
 
-    g, beta = fused_gdn_gating(
-        fixture.module.A_log,
-        fixture.a,
-        fixture.b,
-        fixture.module.dt_bias,
+    for req_idx, input_len in enumerate(fixture.case.input_lens):
+        state_idx = cache_indices[req_idx]
+        state = initial_ssm_states[state_idx].float().clone()
+
+        for offset in range(input_len):
+            token_idx = start + offset
+            for v_head in range(fixture.case.num_v_heads):
+                k_head = v_head // q_head_ratio
+                q_vec = q[0, token_idx, k_head]
+                k_vec = k[0, token_idx, k_head]
+                v_vec = v[0, token_idx, v_head]
+
+                q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
+                k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
+                q_norm = q_norm * (fixture.module.head_k_dim**-0.5)
+
+                head_state = state[v_head]
+                head_state = head_state * torch.exp(g[token_idx, v_head])
+                residual_v = v_vec - torch.sum(head_state * k_norm.unsqueeze(0), dim=1)
+                residual_v = residual_v * beta[token_idx, v_head]
+                head_state = head_state + residual_v.unsqueeze(1) * k_norm.unsqueeze(0)
+                state[v_head] = head_state
+                outputs[0, token_idx, v_head] = torch.sum(
+                    head_state * q_norm.unsqueeze(0), dim=1
+                )
+
+        final_states[state_idx] = state.to(final_states.dtype)
+        start += input_len
+
+    return GDNReferenceOutput(
+        output=outputs.to(fixture.mixed_qkv.dtype),
+        final_states=final_states,
     )
-    query_start_loc = torch.empty(
-        fixture.case.batch_size + 1, dtype=torch.int32, device=fixture.runner.device
-    )
-    query_start_loc[:-1] = fixture.forward_batch.extend_start_loc
-    query_start_loc[-1] = fixture.case.num_input_tokens
-    output, _, _ = chunk_gated_delta_rule(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state=initial_ssm_states,
-        cu_seqlens=query_start_loc,
-        head_first=False,
-        use_qk_l2norm_in_kernel=True,
-        initial_state_indices=cache_indices,
-    )
-    return output
 
 
 def run_gdn_attention_case(
@@ -594,13 +609,13 @@ def run_gdn_attention_case(
     )
     initial_ssm_states = _ssm_states(fixture).clone()
     actual = run_gdn_fixture_eager(fixture)
-    expected = expected_gdn_fixture_output(fixture, initial_ssm_states)
+    expected = _pure_torch_gdn_reference(fixture, initial_ssm_states)
 
-    torch.testing.assert_close(actual, expected, atol=GDN_ATOL, rtol=GDN_RTOL)
+    torch.testing.assert_close(actual, expected.output, atol=GDN_ATOL, rtol=GDN_RTOL)
     if case.forward_mode.is_decode():
         torch.testing.assert_close(
             _ssm_states(fixture)[_cache_indices(fixture)],
-            initial_ssm_states[_cache_indices(fixture)],
+            expected.final_states[_cache_indices(fixture)],
             atol=GDN_ATOL,
             rtol=GDN_RTOL,
         )
