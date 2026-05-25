@@ -5996,7 +5996,7 @@ class ServerArgs:
                 "dynamic",
                 "eic",
                 "simm",
-                "umbp",
+                "mori",
             ],
             default=ServerArgs.hicache_storage_backend,
             help="The storage backend for hierarchical KV cache. "

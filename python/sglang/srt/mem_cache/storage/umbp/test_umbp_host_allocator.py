@@ -101,7 +101,7 @@ def test_umbp_allocator_dispatch_and_tensor_wrap(monkeypatch: pytest.MonkeyPatch
         UMBPHostTensorAllocator,
     )
 
-    allocator = get_allocator_from_storage("umbp")
+    allocator = get_allocator_from_storage("mori")
     assert isinstance(allocator, UMBPHostTensorAllocator)
 
     tensor = allocator.allocate((2, 3), dtype=torch.float16, device="cpu")
@@ -165,6 +165,6 @@ def test_get_allocator_from_storage_umbp_falls_back(monkeypatch, caplog):
         get_allocator_from_storage,
     )
 
-    allocator = get_allocator_from_storage("umbp")
+    allocator = get_allocator_from_storage("mori")
     assert type(allocator) is HostTensorAllocator
     assert "UMBPHostTensorAllocator unavailable" in caplog.text
