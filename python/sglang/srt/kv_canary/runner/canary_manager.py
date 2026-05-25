@@ -170,8 +170,6 @@ class CanaryManager:
 
     @contextlib.contextmanager
     def with_active_single_forward_manager(self, index: int) -> Iterator[None]:
-        """Mark SingleForwardManager ``index`` as active for the duration of the with-block.
-        Used by callers around each inner ``model.forward`` call."""
         assert (
             self._active_single_forward_manager_index is None
         ), "kv-canary: nested with_active_single_forward_manager is forbidden"
@@ -266,10 +264,6 @@ class CanaryManager:
             )
 
     def mark_init_finished(self) -> None:
-        """Reset every SingleForwardManager's phase tensor and enable its assert. Called
-        once after warmup / cuda graph capture / piecewise compile so any
-        residual phase state left by captured (init-time) kernels is
-        cleared and post-init lifecycle starts from a known good IDLE."""
         for single_forward_manager in self._single_forward_managers:
             single_forward_manager.phase_checker.enable_assert()
         self._device_state.enable_chain_position_assert.fill_(1)

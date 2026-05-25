@@ -16,12 +16,7 @@ _DUMMY_DICT_KEY = "__dummy_key__"
 class FutureTensors:
     _data: Optional[_PayloadDict]
     _event: Optional[torch.cuda.Event]
-    # Pinned-source clones must outlive the async d2h copy. PyTorch's CUDA
-    # caching allocator tracks cross-stream usage, but in practice the clones
-    # being freed before the d2h_stream copy completes has been observed to
-    # cause stale-memory reads on the host snapshot (PP test, HEAD_K_FULL
-    # counter snapshot showed 27M while live tensor showed 346). Keep the
-    # clones reachable until wait() drops the references.
+    # Pinned-source clones must outlive the async d2h copy.
     _retained_device_clones: Optional[dict[str, torch.Tensor]] = None
 
     @classmethod
@@ -103,18 +98,7 @@ class FutureTensors:
 
 @dataclass(slots=True, kw_only=True)
 class DelayedDeviceHostHandler:
-    """Stage device-side compute at step T, drain + postprocess host copy at step T+1.
-
-    Each call to :meth:`step` first drains the previous step's staged future (running
-    ``postprocess_on_host`` against the host snapshot) and then asks ``compute_on_device``
-    for fresh device data to stage. ``compute_on_device`` may return ``None`` to skip
-    staging (e.g. period gating). Both callables are passed per-call so the caller can
-    capture step-local state in a closure instead of stashing it on ``self``.
-
-    Upper-layer callers must ensure :meth:`step` is invoked OUTSIDE any cuda
-    graph capture region: both the drain (``event.synchronize()``) and the
-    staging (pinned-host alloc + d2h stream switch) are unsafe inside capture.
-    The asserts in :class:`FutureTensors` enforce this on the staging side."""
+    """Stage device-side compute at step T, drain + postprocess host copy at step T+1."""
 
     d2h_stream: torch.cuda.Stream
     _future: Optional[FutureTensors] = field(default=None)

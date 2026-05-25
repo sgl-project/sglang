@@ -12,7 +12,7 @@ from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
-logger = logging.getLogger("sglang.srt.kv_canary.runner.canary_manager")
+logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_EVERY_N_STEPS: int = 100
 _HEALTH_CHECK_WARMUP_STEPS: int = 100

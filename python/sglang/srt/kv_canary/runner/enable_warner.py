@@ -11,11 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 class _CanaryEnableWarner:
-    """Double-buffered host mirror of ``VerifyPlan.enable``. Each call to :meth:`tick` stages
-    a fresh async d2h and (on the next tick) drains the previous step's host snapshot,
-    warning when that step's plan kernel set enable=0 due to capacity overflow.
-    """
-
     def __init__(
         self, *, verify_capacity: int, d2h_stream: Optional[torch.cuda.Stream]
     ) -> None:
