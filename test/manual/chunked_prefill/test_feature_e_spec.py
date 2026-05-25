@@ -12,12 +12,12 @@ Server arg template borrowed from
 GPU requirement: 1 GPU (large; Llama-2-7b-chat-hf target + EAGLE draft).
 
 Not registered with CI. Run by hand from
-``test/manual/chunked_prefill_refactor/``.
+``test/manual/chunked_prefill/``.
 """
 
 import unittest
 
-from test.manual.chunked_prefill_refactor.common import ChunkedRefactorTestBase
+from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 
 from sglang.test.test_utils import DEFAULT_DRAFT_MODEL_EAGLE, DEFAULT_TARGET_MODEL_EAGLE
 

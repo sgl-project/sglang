@@ -103,7 +103,7 @@ class ChunkedRefactorTestBase(CustomTestCase):
       - ``score_threshold`` (default ``SCORE_THRESHOLD``)
 
     This base is **intentionally not registered with any CI runner**. Run it
-    by hand from ``test/manual/chunked_prefill_refactor/``.
+    by hand from ``test/manual/chunked_prefill/``.
     """
 
     # Subclass contract.
@@ -188,7 +188,7 @@ class ChunkedRefactorTestBase(CustomTestCase):
         )
 
         # Optional JSON dump for run_all.sh aggregation.
-        results_dir = os.environ.get("CHUNKED_REFACTOR_RESULTS_DIR")
+        results_dir = os.environ.get("CHUNKED_PREFILL_RESULTS_DIR")
         if results_dir:
             os.makedirs(results_dir, exist_ok=True)
             import json

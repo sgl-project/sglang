@@ -10,12 +10,12 @@ GPU requirement: 4 GPUs (TP=2 × PP=2). The PP-last-chunk-in-flight scenario
 manifests when PP>=2.
 
 Not registered with CI. Run by hand from
-``test/manual/chunked_prefill_refactor/``.
+``test/manual/chunked_prefill/``.
 """
 
 import unittest
 
-from test.manual.chunked_prefill_refactor.common import ChunkedRefactorTestBase
+from test.manual.chunked_prefill.common import ChunkedRefactorTestBase
 
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
