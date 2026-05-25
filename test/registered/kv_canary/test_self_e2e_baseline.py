@@ -41,9 +41,12 @@ class TestBaselineSwa(_BaselineBase):
     # Tight SWA pool (≈19K slots) forces window reorganization across sequential batches
     # so swa_full_idx_divergence > 0. Concurrency 4 keeps SWA in-flight footprint below
     # the pool cap; 16 sequential requests cycle the pool enough to surface divergence.
+    # use_unique_prompts isolates per-request slot tables so radix-shared prefixes don't
+    # trip the chunked-prefill chain_hash false-positive (same root cause as pr_25015).
     extra_server_args = ("--swa-full-tokens-ratio", "0.3")
     workload_n_requests = 16
     workload_max_concurrent = 4
+    use_unique_prompts = True
 
 
 if __name__ == "__main__":

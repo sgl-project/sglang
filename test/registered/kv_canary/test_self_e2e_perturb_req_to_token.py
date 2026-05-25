@@ -41,6 +41,7 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     extra_server_args = ("--swa-full-tokens-ratio", "0.3")
     workload_n_requests = 16
     workload_max_concurrent = 4
+    use_unique_prompts = True
 
 
 if __name__ == "__main__":

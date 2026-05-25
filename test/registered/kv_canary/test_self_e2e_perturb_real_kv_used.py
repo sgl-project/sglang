@@ -59,6 +59,7 @@ class _PerturbRealKvUsedSwaBase(_PerturbRealKvUsedBase):
     )
     workload_n_requests = 16
     workload_max_concurrent = 4
+    use_unique_prompts = True
 
 
 class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedSwaBase):
