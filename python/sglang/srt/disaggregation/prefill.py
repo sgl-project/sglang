@@ -485,24 +485,21 @@ class SchedulerDisaggregationPrefillMixin:
         if envs.SGLANG_PIPELINE_GROUP_SIZE.is_set():
             return envs.SGLANG_PIPELINE_GROUP_SIZE.get()
 
-        # Adaptive group_size: balance pipeline parallelism vs overhead.
+        # Adaptive group_size via continuous formula:
+        #   target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX)
+        #   where t = (avg_tokens - min_tokens) / (sat_tokens - min_tokens)
         #
-        # Fewer iterations (larger groups) → less pipeline overlap but lower
-        # per-group dispatch overhead. More iterations (smaller groups) → better
-        # overlap of transfer with GPU compute but more RDMA doorbell calls.
-        #
-        # For short prompts (<4096 tokens), prefill compute per group is small,
-        # so we use more groups (10 iterations) to maximize overlap opportunity.
-        # For long prompts (>=8192), each group already has enough compute to
-        # fully overlap transfer, so fewer groups (6 iterations) suffice and
-        # reduce dispatch overhead.
+        # Short prompts (near min_tokens) → more iterations (smaller groups)
+        # → better overlap of transfer with GPU compute.
+        # Long prompts (≥ sat_tokens) → fewer iterations (larger groups)
+        # → less per-group dispatch overhead since compute already dominates.
+        max_iters = envs.SGLANG_PIPELINE_MAX_ITERS.get()
+        min_iters = envs.SGLANG_PIPELINE_MIN_ITERS.get()
+        sat_tokens = min_tokens * 3  # saturation point
+        t = min(1.0, max(0.0, (avg_tokens - min_tokens) / (sat_tokens - min_tokens)))
+        target_iters = max(min_iters, round(max_iters - t * (max_iters - min_iters)))
+
         num_layers = self.model_config.num_hidden_layers
-        if avg_tokens < 4096:
-            target_iters = 10
-        elif avg_tokens < 8192:
-            target_iters = 8
-        else:
-            target_iters = 6
         return max(1, num_layers // target_iters)
 
     @torch.no_grad()

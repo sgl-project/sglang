@@ -290,6 +290,13 @@ class Envs:
     SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
     SGLANG_PIPELINE_GROUP_SIZE = EnvInt(10)
     SGLANG_PIPELINE_MIN_TOKENS = EnvInt(3072)
+    # Adaptive iteration bounds for the pipeline formula:
+    # target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX) where
+    # t = (avg_tokens - MIN_TOKENS) / (MIN_TOKENS * 2).
+    # MAX_ITERS: iteration count for shortest eligible prompts (more groups = more overlap).
+    # MIN_ITERS: floor for very long prompts (fewer groups = less overhead).
+    SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
+    SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.
