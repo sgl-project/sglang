@@ -1,40 +1,19 @@
+import sys
 import unittest
 from pathlib import Path
-import sys
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.dense_attention import DenseAttentionCase, run_dense_attention_case
+from common.dense_attention import make_dense_cases, run_dense_attention_case
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestTritonDenseAttentionBackendCorrectness(CustomTestCase):
-    CASES = (
-        DenseAttentionCase(
-            name="mha_extend_exact_page",
-            backend="triton",
-            forward_mode=ForwardMode.EXTEND,
-            num_heads=4,
-            num_kv_heads=4,
-            page_size=16,
-            prefix_lens=(0, 8),
-            extend_lens=(16, 8),
-        ),
-        DenseAttentionCase(
-            name="gqa_decode_page_boundary",
-            backend="triton",
-            forward_mode=ForwardMode.DECODE,
-            num_heads=4,
-            num_kv_heads=2,
-            page_size=16,
-            prefix_lens=(14, 15, 16),
-        ),
-    )
+    CASES = make_dense_cases("triton")
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:

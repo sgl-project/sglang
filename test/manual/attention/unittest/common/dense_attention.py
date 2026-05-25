@@ -59,6 +59,160 @@ class DenseAttentionCase:
         return sum(self.input_lens)
 
 
+def make_dense_input_config_cases(backend: str) -> tuple[DenseAttentionCase, ...]:
+    """MHA cases that focus on input-layout coverage, not head-layout coverage."""
+    common = dict(backend=backend, num_heads=4, num_kv_heads=4)
+    return (
+        DenseAttentionCase(
+            name="mha_extend_page_size_1",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=1,
+            prefix_lens=(2, 4),
+            extend_lens=(3, 1),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_zero_prefix_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0,),
+            extend_lens=(16,),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_zero_prefix_input_page_edges",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(15, 16, 17),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_prefix_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(16,),
+            extend_lens=(2,),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_total_exact_page",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(8,),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_cross_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(15,),
+            extend_lens=(2,),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_ragged_page_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=16,
+            prefix_lens=(0, 8, 16),
+            extend_lens=(15, 8, 1),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_extend_page32_cross_boundary",
+            forward_mode=ForwardMode.EXTEND,
+            page_size=32,
+            prefix_lens=(31,),
+            extend_lens=(2,),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_decode_page_boundary",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+            **common,
+        ),
+        DenseAttentionCase(
+            name="mha_decode_bsz1_nonzero_prefix",
+            forward_mode=ForwardMode.DECODE,
+            page_size=16,
+            prefix_lens=(7,),
+            **common,
+        ),
+    )
+
+
+def make_dense_attention_config_cases(backend: str) -> tuple[DenseAttentionCase, ...]:
+    """Head-layout variants. Keep these separate from input-layout coverage."""
+    return (
+        DenseAttentionCase(
+            name="gqa_decode_page_boundary",
+            backend=backend,
+            forward_mode=ForwardMode.DECODE,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(14, 15, 16),
+        ),
+        DenseAttentionCase(
+            name="mqa_extend_total_exact_page",
+            backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=1,
+            page_size=16,
+            prefix_lens=(8,),
+            extend_lens=(8,),
+        ),
+    )
+
+
+def make_dense_cases(backend: str) -> tuple[DenseAttentionCase, ...]:
+    return make_dense_input_config_cases(backend) + make_dense_attention_config_cases(
+        backend
+    )
+
+
+def make_swa_no_prefix_input_config_cases(
+    backend: str,
+) -> tuple[DenseAttentionCase, ...]:
+    """SWA no-prefix cases with lengths below, exactly at, and above the window."""
+    return (
+        DenseAttentionCase(
+            name="swa_extend_no_prefix_window_edges",
+            backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(0, 0, 0),
+            extend_lens=(3, 4, 5),
+            sliding_window_size=4,
+        ),
+    )
+
+
+def make_swa_prefix_input_config_cases(
+    backend: str,
+) -> tuple[DenseAttentionCase, ...]:
+    """SWA prefix cases with prefix lengths below, at, and above the window."""
+    return (
+        DenseAttentionCase(
+            name="swa_extend_prefix_window_edges",
+            backend=backend,
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=4,
+            page_size=16,
+            prefix_lens=(3, 4, 5),
+            extend_lens=(2, 2, 2),
+            sliding_window_size=4,
+        ),
+    )
+
+
 class TinyModelConfig:
     def __init__(
         self,
@@ -312,7 +466,9 @@ def _make_forward_batch(
             case.prefix_lens, dtype=torch.int32, device=device
         )
         batch.extend_prefix_lens_cpu = list(case.prefix_lens)
-        batch.extend_seq_lens = torch.tensor(input_lens, dtype=torch.int32, device=device)
+        batch.extend_seq_lens = torch.tensor(
+            input_lens, dtype=torch.int32, device=device
+        )
         batch.extend_seq_lens_cpu = list(input_lens)
         batch.extend_num_tokens = case.num_input_tokens
 
@@ -344,7 +500,9 @@ def _dense_attention_reference(
 ) -> torch.Tensor:
     dtype = input_hidden.dtype
     q, k, v = module.project_qkv(input_hidden)
-    q_parts = _split_by_lens(q.view(-1, case.num_heads, module.head_dim), case.input_lens)
+    q_parts = _split_by_lens(
+        q.view(-1, case.num_heads, module.head_dim), case.input_lens
+    )
     k_parts = _split_by_lens(
         k.view(-1, case.num_kv_heads, module.head_dim), case.input_lens
     )

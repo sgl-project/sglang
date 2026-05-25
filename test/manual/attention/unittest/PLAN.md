@@ -10,35 +10,77 @@ Implemented:
 - Dense attention backend correctness files exist under
   `test/manual/attention/unittest/dense/` for `torch_native`, `triton`, and
   `flashinfer`.
-- The first representative cases cover extend, decode, GQA, paged KV, and exact
-  page-size boundary inputs.
+- SWA attention backend correctness files exist under
+  `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
+- Dense input-config cases now cover page size 1, zero-prefix exact page,
+  zero-prefix input lengths below/equal/above a page, prefix-length exact page,
+  total-length exact page, total-length crossing a page boundary, ragged
+  below/equal/above page-boundary batches, representative page-size-32 crossing,
+  decode page-boundary batches, and bsz=1 decode with nonzero prefix.
+- Dense attention-config cases cover GQA and MQA separately from input-layout
+  coverage.
 - The `flashinfer` file uses `head_dim=64` because FlashInfer SM90 prefill kernels
   require value head dim in `{64, 128, 256}`.
+- SWA input-config cases cover no-prefix lengths below/equal/above the window for
+  `triton` and `flashinfer`; `triton` also covers prefix lengths below/equal/above
+  the window. Prefix+SWA for FlashInfer needs a more faithful metadata fixture
+  before enabling.
 - The harness uses a small projected attention module with random shared weights,
   real `ForwardBatch` metadata, real KV/request pools, and a dense PyTorch
   reference.
 
 In progress:
-- Add the next attention method files for `torch_native`, `triton`, and
-  `flashinfer` where those backends support the method.
+- No active dense/SWA work remains. The next implementation slice should start MLA
+  or another method that needs a real model-family module.
 
 Next implementation steps:
-- Add separate model-family files for MLA, SWA, sparse/chunked KV, linear attention,
-  Mamba, and speculative draft/verify paths.
+- Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
+  `trtllm_mla`.
+- Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
+  speculative draft/verify forward modes inside the affected method folders.
+- Keep `torch_native` SWA out of the matrix until the backend honors
+  `RadixAttention.sliding_window_size`.
 
 Verified:
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python test/manual/attention/unittest/swa/test_triton.py -v`
+- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
 - `python test/manual/attention/unittest/dense/test_torch_native.py -v`
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/utils.py test/manual/attention/unittest/test_torch_native_backend_correctness.py test/manual/attention/unittest/test_triton_backend_correctness.py test/manual/attention/unittest/test_flashinfer_backend_correctness.py`
-- `python test/manual/attention/unittest/test_torch_native_backend_correctness.py -v`
-- `python test/manual/attention/unittest/test_triton_backend_correctness.py -v`
-- `python test/manual/attention/unittest/test_flashinfer_backend_correctness.py -v`
-- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*_backend_correctness.py' -v`
 
 ---
+
+## Test File Layout
+
+Tests are organized by attention method first and attention backend second:
+
+```text
+test/manual/attention/unittest/
+  common/
+    dense_attention.py
+  dense/
+    test_torch_native.py
+    test_triton.py
+    test_flashinfer.py
+  swa/
+    test_triton.py
+    test_flashinfer.py
+  mla/
+    test_flashinfer.py
+    test_flashmla.py
+    test_trtllm_mla.py
+```
+
+Each `test_<attn_backend>.py` file verifies one attention method against one
+attention backend across supported runner modes, forward modes, and input configs.
+Speculative decoding is not an attention-method folder; it is represented as
+`ForwardMode`, runner mode, and synthetic spec metadata cases inside the affected
+attention-method folder.
 
 ## Problem
 
@@ -259,11 +301,11 @@ Represent each test case as:
 ```python
 @dataclass(frozen=True)
 class AttentionCase:
-    attention_family: str
+    attention_method: str
     config_variant: str
-    backend: str
+    attention_backend: str
     forward_mode: ForwardMode
-    graph_mode: str  # eager, cuda_graph, bcg, pcg
+    runner_mode: str  # eager, cuda_graph, bcg, pcg, worker-specific graph path
     input_shape: str
     page_size: int
     dtype: torch.dtype
@@ -376,7 +418,7 @@ speculative-only attention modes and metadata that Phase 2 cannot exercise.
 
 ## Implementation Phases
 
-### Phase 1 — Infrastructure (`test/manual/attention/unittest/utils.py`)
+### Phase 1 — Infrastructure (`test/manual/attention/unittest/common/`)
 
 #### 1a. Module target adapters
 
@@ -524,7 +566,7 @@ def assert_close(case, ref, out):
 
 ---
 
-### Phase 2 — Backend correctness tests (`test/manual/attention/unittest/test_<backend>_backend_correctness.py`)
+### Phase 2 — Backend correctness tests (`test/manual/attention/unittest/<attention_method>/test_<attention_backend>.py`)
 
 For each supported `AttentionCase`:
 
@@ -567,17 +609,24 @@ Required input cases:
 Invalid combinations are `skipIf`-guarded through the capability helper.
 
 Initial implementation slice:
-- `utils.py` contains a projected dense attention target that owns Q/K/V/O
-  projections and dispatches through `RadixAttention`.
-- Backend-specific files cover representative `torch_native`, `triton`, and
-  `flashinfer` backend cases for MHA and GQA.
-- It exercises page size 1, exact-page extend, page-boundary decode
+- `common/dense_attention.py` contains a projected attention target that owns
+  Q/K/V/O projections and dispatches through `RadixAttention`.
+- `dense/test_torch_native.py`, `dense/test_triton.py`, and
+  `dense/test_flashinfer.py` cover representative MHA and GQA cases.
+- Dense tests exercise page size 1, exact-page extend, page-boundary decode
   (`seq_len = page_size - 1`, `page_size`, `page_size + 1`), zero/nonzero prefix,
   and GQA head grouping as an attention-config case.
-- `flashinfer` cases use `head_dim=64` to match FlashInfer kernel constraints.
+- `swa/test_triton.py` covers no-prefix and prefix SWA extend with
+  `seq_len < window_size`, `seq_len == window_size`, and
+  `seq_len > window_size`.
+- `swa/test_flashinfer.py` covers no-prefix SWA extend across the same window
+  boundary cases. Prefix+SWA for FlashInfer is intentionally not enabled yet
+  because the current synthetic metadata fixture does not faithfully match that
+  production path.
+- FlashInfer cases use `head_dim=64` to match FlashInfer kernel constraints.
 - Future slices should replace or extend this tiny projected target with real
-  model-specific modules for SWA, MLA, DSA, DSV4, linear attention, Mamba, and spec
-  decode paths.
+  model-specific modules for MLA, DSA, DSV4, linear attention, Mamba, and spec
+  decode forward modes.
 
 ---
 
