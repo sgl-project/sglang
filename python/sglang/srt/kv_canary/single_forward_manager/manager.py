@@ -248,11 +248,7 @@ class SingleForwardManager:
             ),
         )
 
-    def post_ops_outside_graph(
-        self,
-        *,
-        maybe_inaccurate_forward_batch: "ForwardBatch",
-    ) -> None:
+    def post_ops_outside_graph(self) -> None:
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
             next_phase=_SingleForwardPhase.IDLE,

@@ -246,9 +246,7 @@ class CanaryManager:
         maybe_inaccurate_forward_batch: "ForwardBatch",
     ) -> None:
         for idx in single_forward_indices:
-            self._single_forward_managers[idx].post_ops_outside_graph(
-                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
-            )
+            self._single_forward_managers[idx].post_ops_outside_graph()
         self._perturb_manager.perturb_post_forward(
             maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch
         )
