@@ -2087,7 +2087,21 @@ class Scheduler(
                     )
             pending = False
         any_rank_pending, _ = self._sync_shared_hicache_bool(pending)
-        return not any_rank_pending
+        if any_rank_pending:
+            return False
+
+        local_prefix_len = int(getattr(result, "prefix_len", 0))
+        common_prefix_len = self._sync_shared_hicache_int_min(local_prefix_len)
+        if common_prefix_len > 0:
+            req.shared_hicache_max_prefix_len = common_prefix_len
+            if common_prefix_len != local_prefix_len:
+                logger.debug(
+                    "SharedHiCache clamped TP prefix for rid=%s local=%d common=%d",
+                    req.rid,
+                    local_prefix_len,
+                    common_prefix_len,
+                )
+        return True
 
     def _sync_shared_hicache_bool(self, value: bool) -> tuple[bool, bool]:
         group_size = 1
@@ -2109,6 +2123,49 @@ class Scheduler(
         )
         count = int(flag.item())
         return count > 0, count == group_size
+
+    def _sync_shared_hicache_int_min(self, value: int) -> int:
+        group_size = 1
+        group = None
+        if self.server_args.enable_dp_attention:
+            group_size = self.ps.attn_tp_size
+            group = self.attn_tp_cpu_group
+        else:
+            group_size = self.ps.tp_size
+            group = self.tp_cpu_group
+        if group_size <= 1:
+            return int(value)
+
+        tensor = torch.tensor([int(value)], dtype=torch.int64)
+        torch.distributed.all_reduce(
+            tensor,
+            op=torch.distributed.ReduceOp.MIN,
+            group=group,
+        )
+        return int(tensor.item())
+
+    def _shared_hicache_tp_sync_enabled(self) -> bool:
+        if getattr(self, "shared_hicache_manager", None) is None:
+            return False
+        if self.server_args.enable_dp_attention:
+            return self.ps.attn_tp_size > 1
+        return self.ps.tp_size > 1
+
+    def _init_next_round_input_with_shared_hicache_tp_sync(self, req: Req) -> None:
+        if not self._shared_hicache_tp_sync_enabled():
+            req.init_next_round_input(self.tree_cache)
+            req.shared_hicache_max_prefix_len = None
+            return
+
+        requested_cap = req.shared_hicache_max_prefix_len
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        common_prefix_len = self._sync_shared_hicache_int_min(len(req.prefix_indices))
+        if requested_cap is not None:
+            common_prefix_len = min(common_prefix_len, int(requested_cap))
+
+        req.shared_hicache_max_prefix_len = common_prefix_len
+        req.init_next_round_input(self.tree_cache)
+        req.shared_hicache_max_prefix_len = None
 
     def _release_shared_hicache_request(self, rid: str) -> None:
         shared_hicache_manager = getattr(self, "shared_hicache_manager", None)
@@ -2633,7 +2690,7 @@ class Scheduler(
             if not self._prepare_shared_hicache_for_schedule(req):
                 continue
 
-            req.init_next_round_input(self.tree_cache)
+            self._init_next_round_input_with_shared_hicache_tp_sync(req)
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

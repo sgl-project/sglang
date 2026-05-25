@@ -63,6 +63,7 @@ SHARED_HICACHE_MAX_CONTROL_BODY_BYTES = 16 * 1024 * 1024
 @dataclass(frozen=True)
 class SharedHiCacheResult:
     staged_tokens: int = 0
+    prefix_len: int = 0
     pending: bool = False
 
 
@@ -128,6 +129,7 @@ class SharedHiCacheManager:
             metrics_collector=metrics_collector,
         )
         self._finished_plan_keys: set[tuple[str, str]] = set()
+        self._finished_plan_prefix_lens: dict[tuple[str, str], int] = {}
         self.max_control_body_bytes = SHARED_HICACHE_MAX_CONTROL_BODY_BYTES
         self._direct_transfer_shutdown_done = False
         self._direct_transfer_shutdown_deferred = False
@@ -624,6 +626,11 @@ class SharedHiCacheManager:
         self._finished_plan_keys = {
             key for key in self._finished_plan_keys if key[0] != rid
         }
+        self._finished_plan_prefix_lens = {
+            key: prefix_len
+            for key, prefix_len in self._finished_plan_prefix_lens.items()
+            if key[0] != rid
+        }
 
     def prepare_reuse(self, req: "Req") -> SharedHiCacheResult:
         plan = getattr(req, "shared_hicache_plan", None)
@@ -661,7 +668,9 @@ class SharedHiCacheManager:
 
         plan_key = self._plan_key(req, plan)
         if plan_key in self._finished_plan_keys:
-            return SharedHiCacheResult()
+            return SharedHiCacheResult(
+                prefix_len=self._finished_plan_prefix_lens.get(plan_key, 0)
+            )
 
         page_size = self.tree_cache.page_size
         matched_tokens = len(req.prefix_indices) + req.host_hit_length
@@ -963,18 +972,6 @@ class SharedHiCacheManager:
                     wait_ms=pending_wait_ms(pending),
                 )
                 return SharedHiCacheResult()
-            device = pending.device_indices.device
-            if device.type == "cuda":
-                sync_start = time.perf_counter()
-                torch.cuda.synchronize(device)
-                logger.info(
-                    "Shared HiCache direct transfer target synchronized rid=%s plan_id=%s device=%s tokens=%d sync_ms=%.3f",
-                    req.rid,
-                    plan.plan_id,
-                    device,
-                    int(pending.device_indices.numel()),
-                    (time.perf_counter() - sync_start) * 1000,
-                )
             staged_tokens = self.target_cache.insert_device_pages(
                 req,
                 pages,
@@ -1002,6 +999,10 @@ class SharedHiCacheManager:
         finally:
             self._unlock_pending_prefix(pending)
         insert_ms = (time.perf_counter() - insert_start) * 1000
+        fetched_tokens = len(pages) * self.tree_cache.page_size
+        prefix_len = (
+            pending.target_start_block * self.tree_cache.page_size + fetched_tokens
+        )
         if staged_tokens > 0:
             req.shared_hicache_hit_length = (
                 getattr(req, "shared_hicache_hit_length", 0) + staged_tokens
@@ -1009,18 +1010,22 @@ class SharedHiCacheManager:
             wait_ms = pending_wait_ms(pending)
             ready_wait_ms = pending_ready_wait_ms(pending)
             logger.info(
-                "Shared HiCache staged %d tokens rid=%s plan_id=%s source=%s:%s wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
+                "Shared HiCache staged %d tokens rid=%s plan_id=%s source=%s:%s fetched_tokens=%d prefix_len=%d wait_ms=%s future_ready_wait_ms=%s insert_ms=%.3f direct=%s",
                 staged_tokens,
                 req.rid,
                 plan.plan_id,
                 plan.source_worker_id,
                 plan.source_attn_dp_rank,
+                fetched_tokens,
+                prefix_len,
                 format_optional_ms(wait_ms),
                 format_optional_ms(ready_wait_ms),
                 insert_ms,
                 pending.device_indices is not None,
             )
         self._finished_plan_keys.add(self._plan_key(req, plan))
+        if staged_tokens > 0:
+            self._finished_plan_prefix_lens[self._plan_key(req, plan)] = prefix_len
         outcome = "hit" if staged_tokens > 0 else "miss"
         observe_reuse(
             self.metrics_collector,
@@ -1032,4 +1037,4 @@ class SharedHiCacheManager:
             insert_ms=insert_ms,
             transfer_bytes=transfer_bytes_for_pages(pending, pages),
         )
-        return SharedHiCacheResult(staged_tokens=staged_tokens)
+        return SharedHiCacheResult(staged_tokens=staged_tokens, prefix_len=prefix_len)

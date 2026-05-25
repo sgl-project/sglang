@@ -811,6 +811,8 @@ class Req(ReqDllmMixin):
         self.storage_hit_length = 0
         # Tokens staged into local cache from a SharedHiCache plan.
         self.shared_hicache_hit_length = 0
+        # Temporary TP-wide cap applied while scheduling SharedHiCache reuse.
+        self.shared_hicache_max_prefix_len: Optional[int] = None
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
         # Whether the prefill-time SWA tree lock has been released early
@@ -1131,6 +1133,8 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.shared_hicache_max_prefix_len is not None:
+            max_prefix_len = min(max_prefix_len, self.shared_hicache_max_prefix_len)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
