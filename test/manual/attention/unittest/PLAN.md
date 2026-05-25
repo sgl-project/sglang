@@ -13,7 +13,10 @@ Implemented:
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
-  `test/manual/attention/unittest/mla/` for `triton`.
+  `test/manual/attention/unittest/mla/` for `triton`; its actual path follows a
+  small DeepSeek absorb-MLA variant (`q -> w_kc`, latent KV cache,
+  `attn_mqa`, `w_vc -> o_proj`) while its expected path is pure PyTorch dense
+  attention over the same latent KV tensors.
 - GDN hybrid-linear attention backend correctness exists under
   `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
   linear-attention kernel backend `triton`; its expected path is now a pure
@@ -81,6 +84,8 @@ Verified:
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
+- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
+- `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 - `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
 - `python test/manual/attention/unittest/gdn/test_triton.py -v`
@@ -199,7 +204,9 @@ Reference strategy by family:
   projections and RoPE as the SGLang module. Use `F.scaled_dot_product_attention`
   with causal or sliding-window masks.
 - MLA: explicit DeepSeek MLA math or a minimal HF-compatible attention module with
-  the same random projection/compression weights.
+  the same random projection/compression weights. The actual path should mirror
+  `deepseek_common/attention_forward_methods/forward_mla.py` closely enough to
+  exercise `q_nope -> w_kc`, latent KV cache, `attn_mqa`, and `w_vc`.
 - DSA/DSV4: model-family reference that builds the equivalent sparse or compressed
   attention mask/index result, then compares the final module output.
 - Linear KDA/Lightning/GDN and Mamba: compact PyTorch implementations whenever

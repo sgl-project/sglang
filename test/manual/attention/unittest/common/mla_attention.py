@@ -234,22 +234,48 @@ class ProjectedMLAAttention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = kv_lora_rank
+        self.v_head_dim = kv_lora_rank
+        self.rms_norm_eps = 1e-6
         self.q_proj = nn.Linear(
             hidden_size,
-            num_heads * kv_lora_rank,
+            num_heads * self.qk_nope_head_dim,
             bias=False,
             dtype=dtype,
             device=device,
         )
-        self.kv_proj = nn.Linear(
+        self.kv_a_proj = nn.Linear(
             hidden_size,
             kv_lora_rank,
             bias=False,
             dtype=dtype,
             device=device,
         )
+        self.kv_a_layernorm_weight = nn.Parameter(
+            torch.ones(kv_lora_rank, dtype=dtype, device=device)
+        )
+        self.w_kc = nn.Parameter(
+            torch.randn(
+                num_heads,
+                self.qk_nope_head_dim,
+                kv_lora_rank,
+                dtype=dtype,
+                device=device,
+            )
+            * 0.1
+        )
+        self.w_vc = nn.Parameter(
+            torch.randn(
+                num_heads,
+                kv_lora_rank,
+                self.v_head_dim,
+                dtype=dtype,
+                device=device,
+            )
+            * 0.1
+        )
         self.o_proj = nn.Linear(
-            num_heads * kv_lora_rank,
+            num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
             dtype=dtype,
@@ -264,15 +290,29 @@ class ProjectedMLAAttention(nn.Module):
             v_head_dim=kv_lora_rank,
         )
 
-    def project_qk(self, hidden_states: torch.Tensor):
-        q = self.q_proj(hidden_states)
-        k = self.kv_proj(hidden_states).unsqueeze(1)
-        return q, k
+    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x.float() * torch.rsqrt(variance + self.rms_norm_eps)
+        return (x.to(self.kv_a_layernorm_weight.dtype) * self.kv_a_layernorm_weight).to(
+            dtype=self.kv_a_layernorm_weight.dtype
+        )
+
+    def prepare_mla(self, hidden_states: torch.Tensor):
+        q_nope = self.q_proj(hidden_states).view(
+            -1, self.num_heads, self.qk_nope_head_dim
+        )
+        k_nope = self._rms_norm(self.kv_a_proj(hidden_states)).unsqueeze(1)
+        q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+        return q_nope_out, k_nope
 
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        q, k = self.project_qk(hidden_states)
-        attn_output = self.attn(q, k, k, forward_batch)
-        return self.o_proj(attn_output)
+        q_nope_out, k_nope = self.prepare_mla(hidden_states)
+        attn_output = self.attn(q_nope_out.flatten(1, 2), k_nope, k_nope, forward_batch)
+        attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
+        attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc).transpose(
+            0, 1
+        )
+        return self.o_proj(attn_bmm_output.flatten(1, 2))
 
 
 @dataclass
@@ -379,15 +419,13 @@ def _mla_attention_reference(
     input_hidden: torch.Tensor,
 ) -> torch.Tensor:
     dtype = input_hidden.dtype
-    q, k = module.project_qk(input_hidden)
-    q_parts = _split_by_lens(
-        q.view(-1, case.num_heads, module.kv_lora_rank), case.input_lens
-    )
+    q, k = module.prepare_mla(input_hidden)
+    q_parts = _split_by_lens(q, case.input_lens)
     k_parts = _split_by_lens(k, case.input_lens)
     outputs = []
 
     for req_idx, prefix in enumerate(prefix_hidden):
-        _, prefix_k = module.project_qk(prefix)
+        _, prefix_k = module.prepare_mla(prefix)
         req_k = torch.cat([prefix_k, k_parts[req_idx]], dim=0).squeeze(1)
 
         for offset, query in enumerate(q_parts[req_idx]):
@@ -398,10 +436,13 @@ def _mla_attention_reference(
             scores = torch.einsum("hd,dk->hk", query, keys) * module.attn.scaling
             probs = torch.softmax(scores, dim=-1)
             out = torch.einsum("hk,kd->hd", probs, req_k[: query_pos + 1].float())
-            outputs.append(out.reshape(-1))
+            outputs.append(out)
 
     attn_output = torch.stack(outputs, dim=0).to(dtype)
-    return F.linear(attn_output, module.o_proj.weight)
+    attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), module.w_vc).transpose(
+        0, 1
+    )
+    return F.linear(attn_bmm_output.flatten(1, 2), module.o_proj.weight)
 
 
 def _populate_prefix_kv(
@@ -417,7 +458,7 @@ def _populate_prefix_kv(
     for req_idx, prefix in enumerate(prefix_hidden):
         if prefix.shape[0] == 0:
             continue
-        _, k = module.project_qk(prefix)
+        _, k = module.prepare_mla(prefix)
         keys.append(k)
         for pos in range(prefix.shape[0]):
             locs.append(
