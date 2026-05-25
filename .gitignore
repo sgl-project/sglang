@@ -236,6 +236,8 @@ work_dirs/
 
 # Rust lib
 Cargo.lock
+# Keep the experimental/sgl-router lockfile so its Docker build is reproducible.
+!experimental/sgl-router/Cargo.lock
 
 # Generated vision test fixtures (regenerate with: python scripts/generate_vision_golden.py)
 sgl-model-gateway/tests/fixtures/golden/
