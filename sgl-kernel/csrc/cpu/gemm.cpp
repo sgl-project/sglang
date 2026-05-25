@@ -580,6 +580,7 @@ void weight_packed_linear_kernel_impl(
     });
   });
 }
+
 }  // anonymous namespace
 
 // tinygemm interface
