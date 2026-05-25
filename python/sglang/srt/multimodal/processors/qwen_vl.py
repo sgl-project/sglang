@@ -65,6 +65,7 @@ _is_cpu = is_cpu()
 if _is_cpu and _is_cpu_amx_available:
     try:
         import transformers
+
         from sglang.srt.layers.amx_utils import fast_preprocess_cpu
 
         transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (

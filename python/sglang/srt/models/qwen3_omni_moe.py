@@ -54,6 +54,7 @@ from sglang.srt.utils import add_prefix, is_cpu, is_npu, logger
 
 _is_cpu = is_cpu()
 
+
 def get_head_dim_and_projection_size(
     embed_dim: int,
     num_heads: int,
@@ -84,7 +85,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         head_dim, projection_size = get_head_dim_and_projection_size(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
-            original_num_heads=getattr(config, "original_encoder_attention_heads", None),
+            original_num_heads=getattr(
+                config, "original_encoder_attention_heads", None
+            ),
         )
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
