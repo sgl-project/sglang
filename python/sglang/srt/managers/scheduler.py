@@ -1742,6 +1742,29 @@ class Scheduler(
         else:
             return MultimodalInputs.from_processor_output(mm_inputs_dict)
 
+    @staticmethod
+    def _try_apply_padded_mm_input_ids(recv_req, req, image_inputs) -> bool:
+        """setup origin_input_ids with trying to reuse existing MultimodalInputs.padded_input_ids first,
+        if absent, call pad_input_ids_func"""
+        padded_input_ids = image_inputs.padded_input_ids
+        if padded_input_ids is None or recv_req.input_ids is None:
+            return False
+
+        recv_input_len = len(recv_req.input_ids)
+        if len(padded_input_ids) != recv_input_len:
+            return False
+
+        prefix_len = len(req.origin_input_ids) - recv_input_len
+        if prefix_len < 0:
+            return False
+
+        padded_input_ids = array("q", padded_input_ids)
+        if prefix_len == 0:
+            req.origin_input_ids = padded_input_ids
+        else:
+            req.origin_input_ids = req.origin_input_ids[:prefix_len] + padded_input_ids
+        return True
+
     def _maybe_compute_mrope_positions(self, req) -> None:
         """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
         if self._mm_processor is None:
@@ -1909,7 +1932,10 @@ class Scheduler(
             # The following steps are already fast, execute locally on each rank.
             # Expand a single image token into multiple dummy tokens for receiving image embeddings.
             # The pad function is model-specific and can be None for some backends.
-            if self.pad_input_ids_func:
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
                 req.origin_input_ids = array(
                     "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
                 )
@@ -2182,7 +2208,10 @@ class Scheduler(
             # The `pad_input_ids_func` is model-specific and may be None for
             # embedding models or models not requiring special padding.
             # If None, `req.origin_input_ids` is expected to be correctly populated already.
-            if self.pad_input_ids_func:
+            if (
+                not self._try_apply_padded_mm_input_ids(recv_req, req, image_inputs)
+                and self.pad_input_ids_func
+            ):
                 # See companion call site above for the array.array wrap rationale.
                 req.origin_input_ids = array(
                     "q", self.pad_input_ids_func(req.origin_input_ids, image_inputs)
