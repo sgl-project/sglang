@@ -7,16 +7,9 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from sglang.test.kv_canary.swa_test_pool_config import SWA_POOL_SERVER_ARGS
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
-
-
-_SWA_TIGHT_POOL_ARGS = (
-    "--max-total-tokens",
-    "32768",
-    "--swa-full-tokens-ratio",
-    "0.1",
-)
 
 
 class _PerturbRealKvUsedBase(CanaryE2EBase):
@@ -38,7 +31,8 @@ class _PerturbRealKvUsedBase(CanaryE2EBase):
 
     def test_real_kv_used_perturbation_reports_real_kv_hash_violation(self) -> None:
         """Verify active real KV perturbation reports a real KV hash violation."""
-        self.send_parallel_requests()
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",
             target_group=self.target_group,
@@ -58,7 +52,7 @@ class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
-    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *_SWA_TIGHT_POOL_ARGS)
+    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *SWA_POOL_SERVER_ARGS)
 
 
 class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
@@ -66,7 +60,7 @@ class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
-    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *_SWA_TIGHT_POOL_ARGS)
+    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *SWA_POOL_SERVER_ARGS)
 
 
 if __name__ == "__main__":

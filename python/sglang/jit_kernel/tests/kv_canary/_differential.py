@@ -111,7 +111,16 @@ def _assert_plans_byte_equal(
     assert (
         n_verify == n_verify_ref
     ), f"verify_num_valid diverged: triton={n_verify} ref={n_verify_ref}"
-    if n_verify > 0:
+    # When total_verify > VERIFY_CAPACITY the offsets kernel clears verify_enable and
+    # plan_entries skips its scatter — leaving verify_slot_indices/positions/prev_slot_indices
+    # as whatever the (torch.empty) allocation contained. Skip the byte-equal probe in that
+    # case; verify_num_valid being clamped + verify_enable=0 is the contract here.
+    triton_enable = int(triton_verify.enable[0].item())
+    ref_enable = int(ref_verify.enable[0].item())
+    assert (
+        triton_enable == ref_enable
+    ), f"verify_enable diverged: triton={triton_enable} ref={ref_enable}"
+    if n_verify > 0 and triton_enable != 0:
         assert torch.equal(
             triton_verify.verify_slot_indices[:n_verify],
             ref_verify.verify_slot_indices[:n_verify],

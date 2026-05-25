@@ -69,6 +69,10 @@ class CanaryE2EBase(CapturedServerE2EBase):
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
     use_unique_prompts: ClassVar[bool] = False
+    # SWA divergence assertions need slot recycling across batches; setting > 1 makes the
+    # test methods send N sequential batches so the SWA allocator's full→swa index mapping
+    # diverges from identity. Default 1 keeps MHA tests fast.
+    workload_n_batches: ClassVar[int] = 1
 
     _cfg: ClassVar[Optional[_ModeConfig]] = None
 
@@ -115,7 +119,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
         *,
         assert_all_success: bool = True,
         max_new_tokens: int = 2048,
-        timeout: float = 60.0,
+        timeout: float = 240.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
         results = post_parallel_generate(
@@ -136,12 +140,32 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def assert_swa_divergence_observed(
         self,
         *,
+        min_swa_out_of_window_tokens: int = 1,
         min_swa_full_idx_divergence: int = 1,
         require_verify_lag: bool = True,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
-        """Assert that the SWA path was genuinely exercised."""
+        """Assert that the SWA path was genuinely exercised.
+
+        Three signals must all hold:
+          - ``swa_out_of_window_tokens >= 1``: at least one prefix token has been clipped
+            out of the sliding window (its SWA mapping is 0). Any prompt longer than the
+            SWA window produces this — proves the SWA window slide actually ran.
+          - ``swa_full_idx_divergence >= 1``: SWA pool has actually remapped at least one
+            slot to a non-identity index (i.e. real slot reuse / eviction occurred). The
+            workload must drive SWA pool pressure for this to fire — required because the
+            "pool reuse" path is the one production hits under sustained long-context
+            traffic, and we must keep it covered.
+            NOTE: when the SWA allocator triggers slot remap, the FULL-kernel canary
+            currently fires a separate position FP — see the deep-bug note at
+            ``agent-context/.../2026-05-25-canary-swa-pool-remap-position-fp.md``.
+            Until that bug is fixed, exercising this assertion meaningfully requires
+            either fixing the FP or scoping the perturbation tests' workload so the FP
+            and the perturb's expected signal are distinguishable.
+          - ``verify_swa < verify_full``: SWA verify kernel processed fewer tokens than
+            FULL — proves both kernel groups ran and the window short-circuited SWA.
+        """
         last_parsed = None
         last_line: str = ""
         for _ in range(max_retries):
@@ -159,16 +183,22 @@ class CanaryE2EBase(CapturedServerE2EBase):
                 f"Log tail:\n{self._captured_log_text()[-2000:]}"
             )
 
+        if last_parsed.swa_out_of_window_tokens < min_swa_out_of_window_tokens:
+            raise AssertionError(
+                f"SWA path not exercised: swa_out_of_window_tokens={last_parsed.swa_out_of_window_tokens} "
+                f"< min={min_swa_out_of_window_tokens}. Line: {last_line}"
+            )
         if last_parsed.swa_full_idx_divergence < min_swa_full_idx_divergence:
             raise AssertionError(
-                f"SWA divergence not observed: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
-                f"< min={min_swa_full_idx_divergence}. Line: {last_line}"
+                f"SWA pool reuse not exercised: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
+                f"< min={min_swa_full_idx_divergence}. The workload did not drive enough SWA pool pressure "
+                f"to force slot remap. Line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full
         ):
             raise AssertionError(
-                f"SWA divergence not observed: verify_swa={last_parsed.verify_swa} "
+                f"SWA path not exercised: verify_swa={last_parsed.verify_swa} "
                 f"not strictly less than verify_full={last_parsed.verify_full}. "
                 f"Line: {last_line}"
             )

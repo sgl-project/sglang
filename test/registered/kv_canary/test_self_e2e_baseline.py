@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from sglang.test.kv_canary.swa_test_pool_config import SWA_POOL_SERVER_ARGS
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
@@ -20,7 +21,8 @@ class _BaselineBase(CanaryE2EBase):
 
     def test_no_violation(self) -> None:
         """Verify the baseline canary run completes without violations."""
-        self.send_parallel_requests()
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_no_violation(wait_seconds=2.0)
         self.maybe_assert_swa_divergence_observed()
 
@@ -35,17 +37,7 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
-    # Tight KV pool forces eviction under the 8 × ~7K parallel prompts, which slides the SWA
-    # window past the full-pool tail and produces non-zero swa_full_idx_divergence.
-    # 8 parallel ~7K-token prompts ≈ 56K total tokens. Squeeze the full pool with
-    # --swa-full-tokens-ratio=0.1 so it fills and evicts within the run, sliding the SWA
-    # window past the full tail (swa_full_idx_divergence > 0).
-    extra_server_args = (
-        "--max-total-tokens",
-        "32768",
-        "--swa-full-tokens-ratio",
-        "0.1",
-    )
+    extra_server_args = SWA_POOL_SERVER_ARGS
 
 
 if __name__ == "__main__":

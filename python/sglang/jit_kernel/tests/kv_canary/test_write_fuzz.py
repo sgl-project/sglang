@@ -108,15 +108,19 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         else:
             seed_slot_indices.append(slot_pool.pop())
 
+    # Real sglang only emits ``out_cache_loc[i] = -1`` for SWA endpoints on the
+    # out-of-window contiguous prefix of a req's entries (older tokens evicted, newer in
+    # window). The kernel's skip-on-negative path is covered by deterministic hand tests
+    # in test_write_hand.py (test_negative_slot_skips_entry,
+    # test_write_skip_when_out_cache_loc_is_minus_one); the fuzz keeps every entry valid
+    # so it can exercise the chain-step / pseudo-mismatch invariants without the random
+    # skip pattern (which doesn't match any real-world workload).
     out_cache_loc_list: list[int] = []
     for _ in range(total_tokens):
-        if rng.random() < 0.15 and total_tokens > 1:
+        if not slot_pool:
             out_cache_loc_list.append(-1)
         else:
-            if not slot_pool:
-                out_cache_loc_list.append(-1)
-            else:
-                out_cache_loc_list.append(slot_pool.pop())
+            out_cache_loc_list.append(slot_pool.pop())
 
     plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=write_offsets,

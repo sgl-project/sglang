@@ -7,6 +7,7 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from sglang.test.kv_canary.swa_test_pool_config import SWA_POOL_SERVER_ARGS
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
@@ -58,14 +59,6 @@ class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.FULL
 
 
-_SWA_TIGHT_POOL_ARGS = (
-    "--max-total-tokens",
-    "32768",
-    "--swa-full-tokens-ratio",
-    "0.1",
-)
-
-
 class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
@@ -73,7 +66,7 @@ class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.FULL
     extra_server_args = (
         *_PerturbRealKvUnusedCacheBase.extra_server_args,
-        *_SWA_TIGHT_POOL_ARGS,
+        *SWA_POOL_SERVER_ARGS,
     )
 
 
@@ -84,7 +77,7 @@ class TestPerturbRealKvUnusedCacheSwaSwa(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.SWA
     extra_server_args = (
         *_PerturbRealKvUnusedCacheBase.extra_server_args,
-        *_SWA_TIGHT_POOL_ARGS,
+        *SWA_POOL_SERVER_ARGS,
     )
 
 

@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
+from sglang.test.kv_canary.swa_test_pool_config import SWA_POOL_SERVER_ARGS
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
@@ -20,7 +21,8 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:
         """Verify req_to_token perturbation reports a chain hash violation."""
-        self.send_parallel_requests()
+        for _ in range(self.workload_n_batches):
+            self.send_parallel_requests()
         self.assert_per_forward_violation_reported(fail_reason="chain_hash")
         self.maybe_assert_swa_divergence_observed()
 
@@ -35,13 +37,7 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"
-    # Tight full-pool ratio forces SWA window sliding for maybe_assert_swa_divergence_observed().
-    extra_server_args = (
-        "--max-total-tokens",
-        "32768",
-        "--swa-full-tokens-ratio",
-        "0.1",
-    )
+    extra_server_args = SWA_POOL_SERVER_ARGS
 
 
 if __name__ == "__main__":
