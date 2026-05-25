@@ -12,9 +12,16 @@ import numpy as np
 import pybase64
 import requests
 import torch
-from torchcodec.decoders import AudioDecoder
 
 from sglang.utils import logger
+
+try:
+    from torchcodec.decoders import AudioDecoder
+except ImportError:
+    logger.warning(
+        "torchcodec is not installed; audio inputs will fail at request time"
+    )
+    AudioDecoder = None
 
 try:
     import torchaudio
@@ -202,6 +209,10 @@ class MiMoAudioPipeline:
                         raise
                 else:
                     file = audio
+            if AudioDecoder is None:
+                raise RuntimeError(
+                    "torchcodec is required for audio decoding; install with `pip install torchcodec`."
+                )
             try:
                 samples = AudioDecoder(file).get_all_samples()
             except RuntimeError as e:

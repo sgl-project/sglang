@@ -7,7 +7,7 @@ state_dict aligns 1:1 with ``self.named_parameters()``.
 """
 
 import logging
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 import torch
 
@@ -55,7 +55,7 @@ def _maybe_override_audio_attn_for_blackwell() -> None:
     _mimo_audio_module.flash_attn_varlen_func = flash_attn_varlen_func
 
 
-MiMoV2ASRConfig = None
+MiMoV2ASRConfig = Any
 
 # Top-level audio sub-module name prefixes (after AUDIO_WEIGHT_REMAP). Loaded
 # directly by default_weight_loader because the LM branch's qkv/gate-up fused
@@ -80,7 +80,7 @@ _SKIP_NAME_SUBSTRINGS: Tuple[str, ...] = (
 class MiMoV2ASRForCausalLM(MiMoForCausalLM, AudioEncoderMixin):
     def __init__(
         self,
-        config: MiMoV2ASRConfig,  # type: ignore
+        config: MiMoV2ASRConfig,
         quant_config=None,
         prefix: str = "",
     ) -> None:
