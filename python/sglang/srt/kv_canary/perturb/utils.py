@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 class WarmupGate:
     """Per-hook warmup window check + once-per-lifetime disable/enable log emission.
 
-    Shared across the three perturb-point hooks so warmup state is decided in one place
+    Shared across the four perturb-point hooks so warmup state is decided in one place
     rather than duplicated per hook.
     """
 
@@ -117,7 +117,7 @@ def flip_random_source_byte_and_log(
     group: CanaryBufferGroup,
     slot_idx: int,
 ) -> None:
-    """Pick a random K-half real_kv source on group, flip byte_offset=0 of slot_idx
+    """Pick a random K-half real_kv source on group, flip byte 0 of slot_idx's tile
     in it, and log the result. Logs and returns silently when the group has no
     real_kv_sources_k or the slot cannot be mapped into the chosen source."""
     if not group.real_kv_sources_k:
@@ -164,7 +164,8 @@ def flip_first_byte_in_source(
     slot_idx: int,
     slot_is_physical: bool = False,
 ) -> Optional[tuple[int, int, int]]:
-    """XOR 0xFF on byte_offset=0 of slot_idx in source.tensor.
+    """XOR 0xFF on byte 0 of slot_idx's tile in source.tensor (column
+    `(physical_slot % page_size) * num_bytes_per_token`, not row offset 0).
 
     For SWA groups, slot_idx is translated through group.swa_index_lut before computing
     (row, col). Returns (row, col, original_byte) for logging, or None if the slot is

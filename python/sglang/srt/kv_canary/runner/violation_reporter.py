@@ -109,9 +109,10 @@ def _format_violation(
     is_write = bool(bits_int & int(_WRITE_BITS))
     u64_mask = (1 << 64) - 1
 
-    # Stable single-line key=value summary, parsed by CanaryE2EBase.assert_violation_logged.
-    # Format frozen: do not reorder / rename / change separators without updating the test
-    # helper in python/sglang/test/kv_canary/e2e_base.py.
+    # Stable single-line key=value summary, parsed by the regex in
+    # python/sglang/test/kv_canary/violation_log_utils.py and asserted by
+    # assert_violation_logged_any in python/sglang/test/kv_canary/violation_assert_mixin.py.
+    # Format frozen: do not reorder / rename / change separators without updating those helpers.
     structured_line = (
         f"kv_canary violation: "
         f"launch_tag={tag_label} "

@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
 # Long prompt body shared by all canary e2e tests. The repetition count is chosen
 # so the tokenised prompt comfortably exceeds the SWA sliding window of swa-mode
 # fixtures (gemma-4-E2B); short prompts would never exercise the SWA-windowed
-# verify path. Token count is roughly 6k after BPE.
+# verify path. Token count is roughly 7k after BPE.
 _LONG_PROMPT_BODY = ("The quick brown fox jumps over the lazy dog. " * 700).strip()
 _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 

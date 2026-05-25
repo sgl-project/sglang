@@ -580,7 +580,7 @@ class TestSwa:
 
 class TestNoExtras:
     def test_plan_num_valid_counts_only_per_req_entries(self) -> None:
-        """Plan no longer appends sweep extras; radix sweep writes VerifyPlan directly."""
+        """Sweep extras are written directly into VerifyPlan; plan kernel does not append them."""
         req_to_token = make_req_to_token(
             kind="linear", max_reqs=4, max_seq_len=16, device=_DEVICE
         )

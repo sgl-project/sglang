@@ -6,10 +6,6 @@ namespace canary {
 
 constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 
-// Mirrors SGLang's ReqToTokenPool contract: req_pool_idx 0 is the CUDA-graph padding row, while real
-// request rows start at 1.
-constexpr int64_t kReqPoolIdxPadding = 0;
-
 // Mirrors SGLang's TokenToKVPoolAllocator contract: token-to-KV slot 0 is reserved for padded-token dummy
 // writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
 // instead of treating unfilled entries as real KV slots.

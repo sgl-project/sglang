@@ -11,7 +11,7 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PDPerturbBase(CanaryPDFixture):
-    """Perturb point (d): P-side post-forward flip; D surfaces the mismatch.
+    """P-side post-forward flip; D surfaces the mismatch.
 
     Both servers run kv-canary in log mode. The flip happens AFTER P's TAIL kernel
     has already captured the canary hash for the prefill batch's out_cache_loc slots,

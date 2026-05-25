@@ -16,10 +16,10 @@ class CanaryLaunchCapacities:
 
     Fields:
         per_forward_verify_capacity: VerifyPlan row capacity for the per-forward HEAD/TAIL
-            launches. Sized to pool_slot_count * 1.2 (radix prefix sharing across running reqs can
-            cause sum_r prefix_lens[r] to exceed the pool slot count). When the per-step actual
-            count exceeds this, the plan kernel sets VerifyPlan.enable=0 and the verify kernel
-            skips the step; host logs a warn (no install-time raise).
+            launches. Sized to pool_slot_count * 3 (3x headroom; radix prefix sharing across
+            running reqs can cause sum_r prefix_lens[r] to exceed the pool slot count). When
+            the per-step actual count exceeds this, the plan kernel sets VerifyPlan.enable=0
+            and the verify kernel skips the step; host logs a warn (no install-time raise).
         per_forward_write_req_capacity: WritePlan row capacity for per-forward writes, also used
             to size the static PlanInput buffers (= max batch size under cuda graph).
         per_forward_write_entry_capacity: Capacity for the expected_input_* placeholder tensors,

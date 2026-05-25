@@ -72,7 +72,7 @@ def _build_generalized_req_id_per_token(
         extend_seq_lens = forward_batch.extend_seq_lens
         if extend_seq_lens is None:
             raise RuntimeError(
-                "fill_expected_inputs: extend_seq_lens is None in extend mode"
+                "_build_generalized_req_id_per_token: extend_seq_lens is None in extend mode"
             )
         lens = extend_seq_lens.to(torch.int64)
         result = torch.repeat_interleave(generalized_req_ids_per_row, lens)

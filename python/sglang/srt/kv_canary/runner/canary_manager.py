@@ -70,7 +70,7 @@ class CanaryManager:
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
         # Disable the chain-step position assert until warmup / cuda-graph capture finishes
-        # (synthetic positions trip the +1 invariant). mark_init_finished() flips it back to 1.
+        # (synthetic positions trip the +1 invariant). mark_init_finished() sets it to 1.
         self._device_state.enable_chain_position_assert.fill_(0)
 
         self._endpoints: tuple[CanaryEndpoint, ...] = tuple(

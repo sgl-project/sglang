@@ -26,10 +26,13 @@ def walk_radix_cache_for_canary(
     unlocked_only: bool = False,
     swa_resident_only: bool = False,
 ) -> RadixCacheWalkResult:
-    """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors for
-    EVERY slot held by the radix cache (including slots whose tokens are also referenced by a
-    currently-running req — that overlap is harmless redundancy with the per-forward HEAD/TAIL
-    path)."""
+    """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors.
+
+    With both flags False (default), emits every slot held by the radix cache (including slots
+    also referenced by a currently-running req — that overlap is harmless redundancy with the
+    per-forward HEAD/TAIL path). ``unlocked_only=True`` skips nodes still locked by a running
+    req. ``swa_resident_only=True`` skips SWA-tombstoned nodes (slots evicted from the SWA
+    window)."""
     cache_type = type(radix_cache)
     if cache_type is not RadixCache and cache_type is not SWARadixCache:
         raise NotImplementedError(

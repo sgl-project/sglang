@@ -13,7 +13,7 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestCanaryE2EBase(CustomTestCase):
     def test_make_unique_prompts_have_distinct_first_characters(self) -> None:
-        """Verify generated prompts use distinct first characters."""
+        """Verify generated prompts use distinct first characters and all end with the shared long body."""
         prompts = _make_unique_prompts(8)
 
         self.assertEqual(len({prompt[0] for prompt in prompts}), len(prompts))

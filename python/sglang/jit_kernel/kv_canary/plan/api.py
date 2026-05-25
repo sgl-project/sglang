@@ -58,20 +58,23 @@ def launch_canary_plan_kernels(
             kernel and stored in the int64 plan schema.
 
     Implementation:
-        - Two sub-kernels with action-named identifiers, launched in sequence:
-          1. ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
+        - Two sub-kernels launched in sequence:
+          1. Triton ``_plan_offsets_kernel`` (1-D grid ``(1,)``, single program over all ``bs`` reqs):
              reads req_pool_indices[r], prefix_lens[r], extend_seq_lens[r] for each r; computes
              verify_count = (prefix_lens - window_start) and write_count = extend_seq_lens (both 0 if rp == 0
              padding); gathers seed_slot_full = req_to_token[rp, prefix_lens - 1] (or -1 if prefix_lens == 0),
              SWA-translates seed_slot via full_to_swa_index_mapping[seed_slot_full] if non-None; runs
-             block-level cumsum (``tl.cumsum``) to produce verify_offsets[bs+1] and
-             write_plan_out.write_offsets[bs+1] in-place; scatters write_seed slots; writes scalar totals
-             ``verify_plan_out.verify_num_valid`` and ``write_plan_out.write_num_valid_reqs``.
-          2. ``_plan_entries_kernel`` (2-D grid ``(bs, max_j_tiles)``, masked by per-req verify_count): for
-             each (r, j) with j < verify_count[r], gather slot = req_to_token[req_pool_indices[r],
-             window_start[r] + j] (SWA-translated), prev_slot = req_to_token[..., window_start[r] + j - 1]
-             when (window_start[r] + j) > 0 (also translated) else -1, position = window_start[r] + j;
-             scatter (slot, position, prev_slot) into verify_plan_out at flat index verify_offsets[r] + j.
+             block-level cumsum (``tl.cumsum``) to produce verify_offsets[_PLAN_BS_BLOCK_SIZE + 1] and
+             write_plan_out.write_offsets[write_req_capacity + 1] in-place; scatters write_seed slots; writes
+             scalar totals ``verify_plan_out.verify_num_valid`` and ``write_plan_out.write_num_valid_reqs``.
+          2. CUDA ``plan_entries_persistent_kernel`` (1-D persistent grid sized to ``num_sms *
+             kBlocksPerSm`` blocks of ``kBlockSize`` threads), wrapped by Python
+             ``launch_plan_entries_kernel``: each thread grid-strides over ``tid ∈ [0, total_verify)``,
+             locates its owning req via ``find_req_id`` (binary search on verify_offsets), computes
+             out_position = window_start[req_id] + (tid - verify_offsets[req_id]), gathers slot =
+             req_to_token[rp, out_position] (SWA-translated when ``HAS_SWA_LUT``), prev_slot =
+             req_to_token[rp, out_position - 1] when out_position > 0 (also translated) else -1, and
+             scatters (slot, position, prev_slot) into verify_plan_out at flat index tid.
         - All output tensors are addressed at addresses baked into the cuda-graph capture.
 
     Calling contract:

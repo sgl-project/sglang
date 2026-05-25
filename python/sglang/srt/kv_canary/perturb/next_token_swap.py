@@ -75,7 +75,7 @@ def maybe_perturb_swap_next_tokens(
     )
 
     logger.info(
-        "kv_canary mock_perturb next_token_swap: swapped i=%d j=%d step=%d",
+        "kv_canary perturb next_token_swap: swapped i=%d j=%d step=%d",
         i,
         j,
         step,
