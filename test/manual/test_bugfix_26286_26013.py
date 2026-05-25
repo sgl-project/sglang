@@ -4,10 +4,8 @@ Unit tests for bugfixes: #26286 (top_logprobs tensor crash) and #26013 (Gemma3 R
 These tests verify the specific fixes without requiring a GPU or full server.
 """
 
-import copy
 import unittest
-from unittest.mock import MagicMock, patch
-from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 
@@ -156,8 +154,6 @@ class TestGemma3RoPEKeyError(unittest.TestCase):
                 "rope_theta": 1000000.0,
             }
         )
-
-        from sglang.srt.models.gemma3_causal import Gemma3TextModel
 
         # We only need to test the rope_parameters construction logic,
         # not the full model init which requires weights.
