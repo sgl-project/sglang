@@ -558,8 +558,33 @@ class Scheduler(
         # Init the grammar backend for constrained generation
         self.grammar_manager = GrammarManager(self)
 
+        # Wire scripted runtime (test-only). When enabled, the scheduler's
+        # tokenizer-receive socket is replaced by a ``TokenizerRecvProxy``
+        # that serves in-process injections from the test script, and
+        # ``SchedulerRequestReceiver.recv_requests`` yields to the script
+        # before each iteration. See ``sglang.test.scripted_runtime``.
+        if server_args.scripted_runtime_fn_path is not None:
+            from sglang.test.scripted_runtime.runtime import ScriptedRuntime
+            from sglang.test.scripted_runtime.tokenizer_recv_proxy import (
+                TokenizerRecvProxy,
+            )
+
+            tokenizer_recv_proxy = TokenizerRecvProxy(
+                underlying=self.ipc_channels.recv_from_tokenizer,
+                test_mode=True,
+            )
+            self.scripted_runtime = ScriptedRuntime(
+                scheduler=self,
+                script_fn_path=server_args.scripted_runtime_fn_path,
+                tokenizer_recv_proxy=tokenizer_recv_proxy,
+            )
+            recv_from_tokenizer_for_receiver = tokenizer_recv_proxy
+        else:
+            self.scripted_runtime = None
+            recv_from_tokenizer_for_receiver = self.ipc_channels.recv_from_tokenizer
+
         self.request_receiver = SchedulerRequestReceiver(
-            recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
+            recv_from_tokenizer=recv_from_tokenizer_for_receiver,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
@@ -579,6 +604,7 @@ class Scheduler(
             get_last_forward_mode=lambda: (
                 self.last_batch.forward_mode if self.last_batch is not None else None
             ),
+            scripted_runtime=self.scripted_runtime,
         )
 
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
@@ -3794,6 +3820,22 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Lazy import to keep the test-only module off the production load path
+    # while still letting ``except`` clauses below name the class.
+    from sglang.test.scripted_runtime.runtime import (
+        ScriptedRuntimeFinished as _ScriptedRuntimeFinished,
+    )
+
+    # In scripted_runtime test mode, make the script module importable. Under
+    # spawn-mode mp the subprocess does not inherit the parent's sys.path, so
+    # a script defined in a pytest-collected file would otherwise be
+    # unimportable when ScriptedRuntime.__init__ calls importlib.import_module.
+    if (
+        server_args.scripted_runtime_fn_path is not None
+        and server_args.scripted_runtime_sys_path_entry
+        and server_args.scripted_runtime_sys_path_entry not in sys.path
+    ):
+        sys.path.insert(0, server_args.scripted_runtime_sys_path_entry)
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
@@ -3818,6 +3860,7 @@ def run_scheduler_process(
 
     # Create a scheduler and run the event loop
     scheduler = None
+    scripted_runtime_exit_code = 0
     try:
         scheduler = Scheduler(
             server_args,
@@ -3837,12 +3880,55 @@ def run_scheduler_process(
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
 
+    except _ScriptedRuntimeFinished as finished:
+        # Expected, cooperative termination from a test script. Each rank
+        # raises this after the cross-rank broadcast in
+        # ``ScriptedRuntime._yield_to_script``. Only the driver rank
+        # (world rank 0) writes the traceback file to avoid contention.
+        is_driver = (
+            scheduler is not None
+            and scheduler.ps.pp_rank == 0
+            and scheduler.ps.tp_rank == 0
+            and scheduler.ps.attn_cp_rank == 0
+        )
+        if (
+            not finished.ok
+            and is_driver
+            and server_args.scripted_runtime_traceback_path
+        ):
+            try:
+                with open(server_args.scripted_runtime_traceback_path, "w") as f:
+                    f.write(finished.exc_traceback or "<no traceback>")
+            except OSError:
+                logger.exception(
+                    "Failed to write scripted_runtime traceback to %s",
+                    server_args.scripted_runtime_traceback_path,
+                )
+        scripted_runtime_exit_code = 0 if finished.ok else 1
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
-        parent_process.send_signal(signal.SIGQUIT)
+        tb = get_exception_traceback()
+        logger.error(f"Scheduler hit an exception: {tb}")
+        if server_args.scripted_runtime_fn_path is not None:
+            # In scripted_runtime test mode the parent test process expects to
+            # observe failures via the traceback file + non-zero exit code,
+            # not via SIGQUIT (which would kill the test runner itself).
+            if server_args.scripted_runtime_traceback_path:
+                try:
+                    with open(server_args.scripted_runtime_traceback_path, "w") as f:
+                        f.write(tb)
+                except OSError:
+                    logger.exception(
+                        "Failed to write scripted_runtime traceback to %s",
+                        server_args.scripted_runtime_traceback_path,
+                    )
+            scripted_runtime_exit_code = 1
+        else:
+            parent_process.send_signal(signal.SIGQUIT)
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+
+    if scripted_runtime_exit_code != 0:
+        sys.exit(scripted_runtime_exit_code)
