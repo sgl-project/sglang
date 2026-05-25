@@ -363,18 +363,7 @@ class ModelRunnerKVCacheMixin:
                 ] * self.num_effective_layers
             else:
                 compression_ratios = self.model_config.compress_ratios
-            # NPU dispatches to the DSV4-NPU subclass that neutralizes the
-            # legacy in-pool c-page free-list allocator. c4/c128 page alloc
-            # then runs through DSV4NPUTokenToKVPoolAllocator (below).
-            v4_pool_cls = DeepSeekV4TokenToKVPool
-            if _is_npu:
-                from sglang.srt.hardware_backend.npu.dsv4_memory_pool import (
-                    DSV4NPUTokenToKVPool,
-                )
-
-                v4_pool_cls = DSV4NPUTokenToKVPool
-
-            self.token_to_kv_pool = v4_pool_cls(
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
                 max_num_reqs=self.max_running_requests,
                 swa_size=self.swa_max_total_num_tokens,
                 c4_size=self.c4_max_total_num_tokens,

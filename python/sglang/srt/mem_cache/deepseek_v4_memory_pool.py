@@ -544,11 +544,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
 
-        # Per-req c4/c128 page mapping is owned by DSV4NPUReqToTokenPool
-        # (5 per-req tables) and the c-pool token slots come from
-        # DSV4NPUTokenToKVPoolAllocator's NPUPagedTokenToKVPoolAllocator
-        # sub-allocators. See hardware_backend/npu/dsv4_*.py.
-
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
