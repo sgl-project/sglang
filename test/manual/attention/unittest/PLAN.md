@@ -59,10 +59,13 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- No active representative-reference split remains for dense/SWA/MLA/GDN.
-- Phase 2/3 representative coverage has been widened for dense, SWA, MLA, and GDN.
-  The next implementation slice is Phase 4 synthetic speculative metadata coverage
-  for representative valid backends.
+- Phase 2/3 representative coverage has been reviewed and is sufficient for the next
+  slice: dense `torch_native`/`triton`/`flashinfer`, SWA `triton`/`flashinfer`, MLA
+  `triton`, and GDN `triton` now cover the important runner/backend and input-layout
+  boundaries without expanding into every registered backend.
+- The next implementation slice is Phase 4 synthetic speculative metadata coverage
+  inside the affected attention-method folders, starting with dense
+  `triton`/`flashinfer`.
 
 Next implementation steps:
 - Finish Phase 4 speculative metadata coverage for representative valid backends
@@ -72,6 +75,8 @@ Next implementation steps:
   `trtllm_mla`, `fa3`, `fa4`, `dual_chunk_flash_attn`, and `flex_attention`.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
+- Defer Phase 2 expansion for additional backends and Phase 3 wrapper/BCG/PCG tests
+  until the representative Phase 4 tests are passing.
 
 Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
@@ -423,6 +428,14 @@ Two-step verification:
 
 Graph consistency does not replace the reference comparison; it validates runner and
 metadata bookkeeping after correctness has been established by the eager path.
+
+Representative Phase 3 status:
+- `torch_native` is covered in eager mode for decode, extend, GQA, and MQA because it
+  is the PyTorch baseline backend and does not exercise CUDA graph replay.
+- `triton` and `flashinfer` are covered in CUDA graph decode replay for MHA, GQA,
+  and MQA, using distinct capture and replay batches.
+- BCG/PCG, `hybrid_attn`, and TBO coverage remains intentionally deferred until
+  Phase 4 synthetic spec metadata coverage is stable.
 
 ### Phase 4 matrix: speculative decoding attention
 
