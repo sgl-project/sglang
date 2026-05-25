@@ -12,6 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 
+import re
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -41,9 +42,21 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         self.AUDIO_START_TOKEN_ID = hf_config.boa_token_id
         self.AUDIO_END_TOKEN_ID = hf_config.eoa_token_id
         self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|image|>",
             image_token_id=hf_config.image_token_id,
+            image_token_regex=re.compile(
+                r"<\|image>(?:<\|image\|>)+<image\|>|<\|image\|>"
+            ),
+            video_token="<|video|>",
             video_token_id=hf_config.video_token_id,
+            video_token_regex=re.compile(
+                r"<\|image>(?:<\|video\|>)+<image\|>|<\|video\|>"
+            ),
+            audio_token="<|audio|>",
             audio_token_id=hf_config.audio_token_id,
+            audio_token_regex=re.compile(
+                r"<\|audio>(?:<\|audio\|>)+<audio\|>|<\|audio\|>"
+            ),
         ).build(_processor)
 
         # Register image-processor and video-processor outputs so they are stored on
