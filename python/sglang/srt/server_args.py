@@ -882,6 +882,7 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "cache_aware",
             ],
         ),
     ] = "auto"
@@ -2254,6 +2255,17 @@ class ServerArgs:
         "Number of optimistic prefill retries that will skip the bootstrap wait. ",
     ] = 0
 
+    # Cache-aware DP routing (decode multi-DP)
+    dp_routing_digest_chunk_size: A[
+        int,
+        "Chunk size (in tokens) for CacheDigest prefix hashing. Default 256.",
+    ] = 256
+    dp_routing_max_extra_reqs: A[
+        int,
+        "Max extra requests a cache-preferred rank can have over the least-loaded "
+        "rank before falling back to load balance. Default 1.",
+    ] = 1
+
     # -------------------------------------------------------------------------
     # Encode prefill disaggregation
     # -------------------------------------------------------------------------
@@ -2627,12 +2639,18 @@ class ServerArgs:
             # Default behavior:
             # - non-PD: round_robin
             # - PD prefill: follow_bootstrap_room
-            # - PD decode: round_robin
-            self.load_balance_method = (
-                "follow_bootstrap_room"
-                if self.disaggregation_mode == "prefill"
-                else "round_robin"
-            )
+            # - PD decode + radix cache + dp > 1: cache_aware
+            # - PD decode (other): round_robin
+            if self.disaggregation_mode == "prefill":
+                self.load_balance_method = "follow_bootstrap_room"
+            elif (
+                self.disaggregation_mode == "decode"
+                and self.disaggregation_decode_enable_radix_cache
+                and self.dp_size > 1
+            ):
+                self.load_balance_method = "cache_aware"
+            else:
+                self.load_balance_method = "round_robin"
             return
 
     def _handle_ssl_validation(self):

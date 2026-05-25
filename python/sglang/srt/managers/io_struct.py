@@ -2104,6 +2104,16 @@ class GetLoadsReqInput(BaseReq):
 
 
 @dataclass
+class CacheDigest:
+    dp_rank: int
+    prefix_entries: Dict[bytes, int]
+    total_cached_tokens: int
+    evictable_tokens: int
+    protected_tokens: int
+    timestamp: float
+
+
+@dataclass
 class GetLoadsReqOutput(BaseReq):
     """Per-DP-rank load metrics for /v1/loads endpoint."""
 
@@ -2156,6 +2166,7 @@ class GetLoadsReqOutput(BaseReq):
     lora: Optional[LoRAMetrics] = None
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
+    cache_digest: Optional[CacheDigest] = None
 
 
 @dataclass
