@@ -157,26 +157,28 @@ def _materialize_verify_entries(
     if total_verify == 0:
         return 0
 
-    capped = min(total_verify, verify_capacity)
-    slots_t = torch.tensor(out_slots[:capped], dtype=torch.int64, device=work_device)
-    positions_t = torch.tensor(
-        out_positions[:capped], dtype=torch.int64, device=work_device
-    )
-    prev_slots_t = torch.tensor(
-        out_prev_slots[:capped], dtype=torch.int64, device=work_device
-    )
+    # Mirror the CUDA plan_entries kernel's verify_enable early-exit: on overflow the offsets
+    # writer clears enable to 0 and the entries kernel skips its scatter entirely, leaving
+    # out_verify_*[:verify_capacity] untouched. The reference must produce the same observable
+    # state so the differential fuzz tests stay byte-equal.
+    if total_verify > verify_capacity:
+        return total_verify
 
-    verify_plan_out.verify_slot_indices[:capped].copy_(
+    slots_t = torch.tensor(out_slots, dtype=torch.int64, device=work_device)
+    positions_t = torch.tensor(out_positions, dtype=torch.int64, device=work_device)
+    prev_slots_t = torch.tensor(out_prev_slots, dtype=torch.int64, device=work_device)
+
+    verify_plan_out.verify_slot_indices[:total_verify].copy_(
         slots_t.to(verify_plan_out.verify_slot_indices.dtype).to(
             verify_plan_out.verify_slot_indices.device
         )
     )
-    verify_plan_out.verify_positions[:capped].copy_(
+    verify_plan_out.verify_positions[:total_verify].copy_(
         positions_t.to(verify_plan_out.verify_positions.dtype).to(
             verify_plan_out.verify_positions.device
         )
     )
-    verify_plan_out.verify_prev_slot_indices[:capped].copy_(
+    verify_plan_out.verify_prev_slot_indices[:total_verify].copy_(
         prev_slots_t.to(verify_plan_out.verify_prev_slot_indices.dtype).to(
             verify_plan_out.verify_prev_slot_indices.device
         )
