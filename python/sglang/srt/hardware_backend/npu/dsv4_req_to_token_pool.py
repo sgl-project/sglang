@@ -60,6 +60,14 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
         # compressed pool stores 1 token per `ratio` raw tokens, so its
         # per-req table column count divides by ratio. State pools mirror
         # the raw token count (one state entry per raw position).
+        # Back-reference to the DSV4NPUTokenToKVPoolAllocator. Wired up via
+        # ``register_dsv4_allocator`` after both are constructed (see
+        # model_runner_kv_cache_mixin), so ``free(req)`` can release the
+        # c4/c128 pool pages held by the req before the req_pool_idx slot
+        # itself goes back to the free list. Stays None on construction so
+        # the base class clear() in __init__ can run safely.
+        self._dsv4_allocator = None
+
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             self.req_to_token_swa = torch.zeros(
                 (self._alloc_size, max_context_len),
@@ -115,3 +123,18 @@ class DSV4NPUReqToTokenPool(ReqToTokenPool):
         # active rows (via req_pool_idx) and only the [:seq_len] prefix
         # of each row is read. Stale entries past kv_committed_len are
         # unreachable by the attention metadata builder.
+
+    def register_dsv4_allocator(self, allocator) -> None:
+        """Wire the DSV4NPUTokenToKVPoolAllocator back-ref so ``free(req)``
+        can release c4/c128 pool pages alongside the req_pool_idx slot."""
+        self._dsv4_allocator = allocator
+
+    def free(self, req):
+        # Trigger c4/c128 pool free via the allocator's unified free path;
+        # the actual c-pool release logic lives in
+        # ``DSV4NPUTokenToKVPoolAllocator.free``. _dsv4_allocator may be
+        # None during the brief window between this pool's __init__ and
+        # register_dsv4_allocator — defensive None check.
+        if self._dsv4_allocator is not None:
+            self._dsv4_allocator.free(req=req, req_to_token_pool=self)
+        super().free(req)

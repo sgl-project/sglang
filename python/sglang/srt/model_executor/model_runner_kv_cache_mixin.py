@@ -351,7 +351,7 @@ class ModelRunnerKVCacheMixin:
 
         if is_dsv4_model:
             swa_page_size = self.page_size
-            assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
+            # assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
             if self.is_draft_worker:
                 from sglang.srt.models.deepseek_v4_nextn import (
@@ -777,6 +777,13 @@ class ModelRunnerKVCacheMixin:
                     DeepSeekV4HiSparseTokenToKVPoolAllocator(
                         self.token_to_kv_pool_allocator
                     )
+                )
+
+            # DSV4-NPU: wire allocator back-ref into req_to_token_pool so its
+            # free(req) can release c4/c128 pool pages alongside the slot.
+            if hasattr(self.req_to_token_pool, "register_dsv4_allocator"):
+                self.req_to_token_pool.register_dsv4_allocator(
+                    self.token_to_kv_pool_allocator
                 )
 
         else:

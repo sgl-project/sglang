@@ -646,6 +646,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+    # DSV4-NPU c4/c128 pool free piggy-backs on DSV4NPUReqToTokenPool.free —
+    # see hardware_backend/npu/dsv4_req_to_token_pool.py:free. No-op for
+    # other ReqToTokenPool subclasses.
     tree_cache.req_to_token_pool.free(req)
 
 

@@ -940,21 +940,21 @@ class DeepseekV4DecoderLayer(nn.Module):
                 "norm_eps": self.rms_norm_eps,
                 "hc_eps": self.hc_eps,
             }
-            import os as _os, time as _time, uuid as _uuid
-            try:
-                from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
-                _dp_rank = _get_dp_rank()
-            except Exception:
-                _dp_rank = 0
-            _dump_dir = _os.path.join(
-                "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
-            )
-            _os.makedirs(_dump_dir, exist_ok=True)
-            _dump_path = _os.path.join(
-                _dump_dir,
-                f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
-            )
-            torch.save(_hc_pre_inputs, _dump_path)
+            # import os as _os, time as _time, uuid as _uuid
+            # try:
+            #     from sglang.srt.layers.dp_attention import get_attention_dp_rank as _get_dp_rank
+            #     _dp_rank = _get_dp_rank()
+            # except Exception:
+            #     _dp_rank = 0
+            # _dump_dir = _os.path.join(
+            #     "/home/t00937989/logs/npu_hc_pre_input", f"dp_rank_{_dp_rank}"
+            # )
+            # _os.makedirs(_dump_dir, exist_ok=True)
+            # _dump_path = _os.path.join(
+            #     _dump_dir,
+            #     f"hc_pre_{_time.time_ns()}_{_uuid.uuid4().hex[:8]}.pt",
+            # )
+            # torch.save(_hc_pre_inputs, _dump_path)
             y, post, comb = torch.ops.custom.npu_hc_pre(
                 x,
                 hc_fn,

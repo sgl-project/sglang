@@ -20,9 +20,9 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     if server_args.device == "npu":
         if server_args.attention_backend not in ("ascend",):
             server_args.attention_backend = "ascend"
-        server_args.page_size = 256
+        server_args.page_size = 128
         logger.info(
-            f"NPU: keeping ascend attention backend for {model_arch}, page_size=256."
+            f"NPU: keeping ascend attention backend for {model_arch}, page_size=128."
         )
         if server_args.kv_cache_dtype == "auto":
             server_args.kv_cache_dtype = "bfloat16"

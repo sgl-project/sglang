@@ -145,7 +145,7 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         c_extend = self._compute_c_extend_counts(prefix_lens_cpu, seq_lens_cpu, ratio)
         if c_extend == 0:
             return self._empty_loc
-        return allocator.alloc_extend(
+        result = allocator.alloc_extend(
             c_prefix,
             c_prefix_cpu,
             c_seq,
@@ -153,6 +153,15 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             last_loc,
             c_extend,
         )
+        if result is None:
+            raise RuntimeError(
+                f"DSV4 c{ratio} pool exhausted: need {c_extend} new slots, "
+                f"available={allocator.available_size()}. "
+                f"Reduce --max-running-requests or raise --mem-fraction-static, "
+                f"or check that DSV4NPUTokenToKVPoolAllocator.free(req=...) is "
+                f"being driven from DSV4NPUReqToTokenPool.free."
+            )
+        return result
 
     # ------------------------------------------------------------------
     # alloc overrides
@@ -180,6 +189,10 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             return None
 
         out_swa_loc = self.translate_loc_from_full_to_swa(out_full_loc)
+        assert out_swa_loc is not None, (
+            "translate_loc_from_full_to_swa returned None — "
+            "full_to_swa_index_mapping not initialized?"
+        )
 
         # Pass a dummy last_loc tensor (one -1 per req) to the c-pool extend.
         # The compressed paged allocator uses last_loc to anchor the prefix
@@ -277,18 +290,62 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     def c128_available_size(self):
         return self.c128_attn_allocator.available_size()
 
-    def free(self, free_index: torch.Tensor):
-        # Free full + swa via the parent. c4/c128 pool pages are NOT
-        # released here — the per-req c-pool slot list is sliced from
-        # DSV4NPUReqToTokenPool.req_to_token_c{4,128} by req_pool_idx +
-        # committed compressed-len, but we don't currently track committed
-        # len per req at free time. Pages leak until the next clear().
-        # TODO: read req's compressed len, slice the c-table, and call
-        # c{4,128}_attn_allocator.free(unique_slot_ids // page_size).
-        super().free(free_index)
+    def free(
+        self,
+        free_index: Optional[torch.Tensor] = None,
+        *,
+        req=None,
+        req_to_token_pool=None,
+    ):
+        """Unified free path for full/swa/c4/c128 pools.
+
+        Two callable forms:
+          * ``free(free_index)`` — legacy SWA path. Releases full + SWA
+            slots only. Used by tail eviction, radix eviction, etc. (no
+            req identity available there, so c-pool free can't fire).
+          * ``free(req=req, req_to_token_pool=pool)`` — invoked from
+            :meth:`DSV4NPUReqToTokenPool.free` when a request finishes.
+            Reads the per-req c-pool slot lists from
+            ``req_to_token_c{4,128}[req.req_pool_idx, :kv_committed_len // ratio]``
+            and hands them to the c-pool
+            :class:`NPUPagedTokenToKVPoolAllocator.free`, which dedupes
+            by page and returns whole pages to the free list.
+
+        Both forms can fire in the same call (free_index + req kwargs);
+        each is processed independently.
+        """
+        if free_index is not None:
+            super().free(free_index)
+
+        if req is None or req_to_token_pool is None:
+            return
+
+        kv_len = req.kv_committed_len
+        if kv_len <= 0:
+            return
+        req_pool_idx = req.req_pool_idx
+        if req_pool_idx is None:
+            return
+
+        c4_n = kv_len // 4
+        if c4_n > 0 and hasattr(req_to_token_pool, "req_to_token_c4"):
+            c4_slots = req_to_token_pool.req_to_token_c4[req_pool_idx, :c4_n]
+            # to int64 — paged allocator's free does cpu()//page_size on it.
+            self.c4_attn_allocator.free(c4_slots.to(torch.int64))
+
+        c128_n = kv_len // 128
+        if c128_n > 0 and hasattr(req_to_token_pool, "req_to_token_c128"):
+            c128_slots = req_to_token_pool.req_to_token_c128[req_pool_idx, :c128_n]
+            self.c128_attn_allocator.free(c128_slots.to(torch.int64))
 
     def clear(self):
         super().clear()
-        self.c4_attn_allocator.clear()
-        self.c128_attn_allocator.clear()
+        # SWATokenToKVPoolAllocator.__init__ calls self.clear() at line 375,
+        # BEFORE our __init__ has created the c4/c128 sub-allocators. Guard
+        # against that early call — the sub-allocators are freshly initialized
+        # when __init__ later constructs them, so there's nothing to clear yet.
+        if hasattr(self, "c4_attn_allocator"):
+            self.c4_attn_allocator.clear()
+        if hasattr(self, "c128_attn_allocator"):
+            self.c128_attn_allocator.clear()
         self._last_dsv4_alloc = None

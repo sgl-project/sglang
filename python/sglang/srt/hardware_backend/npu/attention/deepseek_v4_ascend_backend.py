@@ -830,22 +830,31 @@ class DeepseekV4AscendAttnBackend(
                 # [bs]-shaped tensor (0 padding for non-compressing reqs);
                 # the allocator only emits slots for reqs that closed a ratio
                 # chunk, so we scatter into a [bs]-padded buffer here.
-                bundle_loc = (
-                    out_cache_loc_dsv4.out_c4_loc
-                    if ratio == 4
-                    else out_cache_loc_dsv4.out_c128_loc
-                )
-                should_compress = (seq_lens % ratio) == 0
+                #
+                # out_cache_loc_dsv4 is None on IDLE DP-attention ranks
+                # (alloc_decode short-circuited because there's no real batch
+                # to allocate). For those ranks the kernel still needs a
+                # shape-correct compress_out_loc buffer, so emit all zeros —
+                # the captured graph will run with no actual compress work.
                 compress_out_loc = torch.zeros(
                     bs, dtype=torch.int32, device=device,
                 )
-                if bundle_loc.numel() > 0:
-                    idx = torch.nonzero(should_compress, as_tuple=False).flatten()
-                    n_compress = idx.numel()
-                    if n_compress > 0:
-                        compress_out_loc[idx] = (
-                            bundle_loc[:n_compress].to(torch.int32)
-                        )
+                if out_cache_loc_dsv4 is not None:
+                    bundle_loc = (
+                        out_cache_loc_dsv4.out_c4_loc
+                        if ratio == 4
+                        else out_cache_loc_dsv4.out_c128_loc
+                    )
+                    if bundle_loc.numel() > 0:
+                        should_compress = (seq_lens % ratio) == 0
+                        idx = torch.nonzero(
+                            should_compress, as_tuple=False
+                        ).flatten()
+                        n_compress = idx.numel()
+                        if n_compress > 0:
+                            compress_out_loc[idx] = (
+                                bundle_loc[:n_compress].to(torch.int32)
+                            )
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:

@@ -161,8 +161,15 @@ def _write_per_req_slice(
     Skip-writes when a req contributes 0 new compressed tokens for this
     ratio (extend straddling a ratio boundary with prefix_len already past
     boundary, or seq_len < ratio).
+
+    flat_loc may be None when the upstream alloc path bypassed
+    DSV4NPUTokenToKVPoolAllocator.alloc_extend (e.g., page_size=1 path
+    going through allocator.alloc(), or HiSparse wrapper). In that case
+    skip — there's nothing to write, and the per-req table for this pool
+    keeps its stale prior content (attention backend tolerates this since
+    it slices [:seq_lens] only).
     """
-    if flat_loc.numel() == 0:
+    if flat_loc is None or flat_loc.numel() == 0:
         return
     pt = 0
     n_reqs = req_pool_indices_cpu.shape[0]
