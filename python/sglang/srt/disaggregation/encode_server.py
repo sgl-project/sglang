@@ -1836,6 +1836,25 @@ class EncoderScheduler:
                     if not p.future.done():
                         p.future.set_exception(e)
 
+    @staticmethod
+    def _validate_request_shape(req: dict) -> Optional[str]:
+        # Cheap pre-broadcast checks: shape errors that don't require running
+        # the HF processor. Once a request reaches TP workers they enter
+        # batch_encode and expect to join its collectives — a malformed batch
+        # that makes rank-0 bail mid-flight would deadlock the workers.
+        if not isinstance(req, dict):
+            return f"request is not a dict: {type(req).__name__}"
+        if not req.get("req_id"):
+            return "missing req_id"
+        if not req.get("mm_items"):
+            return "missing or empty mm_items"
+        if "num_parts" not in req or "part_idx" not in req:
+            return "missing num_parts / part_idx"
+        h = req.get("hashes")
+        if h is not None and not isinstance(h, (list, tuple, str, int, bytes)):
+            return f"hashes must be list/scalar, got {type(h).__name__}"
+        return None
+
     async def _dispatch_group(
         self, group: List[PendingRequest], modality: Modality
     ) -> None:
@@ -1843,6 +1862,24 @@ class EncoderScheduler:
         if modality not in _BATCHABLE_MODALITIES:
             await self._dispatch_per_request(group, modality)
             return
+
+        # Drop structurally-bad requests before broadcasting; otherwise TP
+        # workers would join batch_encode collectives that rank-0 has already
+        # abandoned.
+        valid: List[PendingRequest] = []
+        for p in group:
+            err = self._validate_request_shape(p.request)
+            if err is None:
+                valid.append(p)
+                continue
+            logger.error(
+                f"Dropping req_id={p.request.get('req_id')} from batch: {err}"
+            )
+            if not p.future.done():
+                p.future.set_exception(BadRequestError(err))
+        if not valid:
+            return
+        group = valid
 
         requests = [p.request for p in group]
         start = time.time()
