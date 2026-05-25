@@ -33,7 +33,13 @@ class AnthropicContentBlock(BaseModel):
     """Content block in message"""
 
     type: Literal[
-        "text", "image", "tool_use", "tool_result", "thinking", "redacted_thinking"
+        "text",
+        "image",
+        "tool_use",
+        "tool_result",
+        "tool_reference",
+        "thinking",
+        "redacted_thinking",
     ]
     text: Optional[str] = None
     # For image content
@@ -63,6 +69,7 @@ class AnthropicTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
     @classmethod

@@ -7,6 +7,9 @@ produce a non-noise image or video.
 
 - Add concrete GPU integration cases in `python/sglang/multimodal_gen/test/server/gpu_cases.py`.
 - Keep reusable dataclasses, constants, thresholds, and testcase factory helpers in `python/sglang/multimodal_gen/test/server/testcase_configs.py`.
+- Add the case id to `python/sglang/multimodal_gen/test/server/accuracy_testcase_configs.py`
+  only when it should be part of component-accuracy coverage. Adding a GPU case
+  alone does not enroll it there.
 - Let `python/sglang/multimodal_gen/test/run_suite.py` own suite selection, runtime-based partitioning, and standalone test files. Do not hard-code CI shard lists elsewhere.
 - If a new standalone test file is added to a suite, update `STANDALONE_FILE_EST_TIMES` after the first measured CI/runtime value is known.
 
@@ -22,8 +25,8 @@ PYTHONPATH=python python3 python/sglang/multimodal_gen/test/run_suite.py --suite
 
 If you add a new entry to `ONE_GPU_CASES`, `TWO_GPU_CASES`, or a B200-specific
 case group in `gpu_cases.py`, treat component accuracy as part of the
-model-adding workflow. Do not assume the new testcase will automatically fit the
-existing component-accuracy harness.
+model-adding workflow. Do not assume the new testcase will automatically fit or
+enter the existing component-accuracy harness.
 
 The component-accuracy harness compares SGLang components against Diffusers/HF
 reference components. This is stricter than pipeline-level inference. New GPU
@@ -46,9 +49,12 @@ cases commonly fail here for one of three reasons:
 
 When adding a new GPU case, make this decision explicitly:
 
+- if the case should have component-accuracy coverage, add its case id to
+  `accuracy_testcase_configs.py`
 - if the family needs minimal harness wiring, add the smallest possible change in `accuracy_hooks.py`
 - if the case is only a variant of an already covered source component and topology, add a skip in `accuracy_config.py`
 - if the HF/Diffusers reference component cannot be compared faithfully, add a skip in `accuracy_config.py`
+- if the case is intentionally GPU-smoke-only, leave it out of `accuracy_testcase_configs.py` and keep that choice explicit in the PR notes
 
 Do not add a new GPU case and wait for CI to discover missing component-accuracy
 wiring.
