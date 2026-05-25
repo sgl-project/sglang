@@ -44,10 +44,6 @@ class TestFrozenKVMTP(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
 
     @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-
-    @classmethod
     def _server_env(cls) -> dict[str, str]:
         env = dict(os.environ)
         env["SGLANG_ENABLE_SPEC_V2"] = "0"
@@ -154,7 +150,7 @@ class TestFrozenKVMTP(CustomTestCase):
         self.assertIsNotNone(avg_accept)
         self.assertGreaterEqual(
             avg_accept,
-            0.0,
+            1.5,
             f"E4B/topk{topk}: accept length too low",
         )
 

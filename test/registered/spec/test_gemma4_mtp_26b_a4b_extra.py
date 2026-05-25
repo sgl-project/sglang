@@ -1,6 +1,5 @@
 import os
 import unittest
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
@@ -37,21 +36,7 @@ SERVER_LAUNCH_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3
 # CI calibration data becomes available.
 OBSERVED_GSM8K_SCORES = {1: 0.450, 3: 0.450}
 GSM8K_SCORE_THRESHOLD = min(OBSERVED_GSM8K_SCORES.values()) - GSM8K_SCORE_MARGIN
-ACCEPT_LENGTH_THRESHOLD = 0.0
-
-
-def ensure_checkpoint(path: str, label: str) -> None:
-    """Allow HF repo IDs but validate local checkpoint paths when used."""
-    p = Path(path)
-    if not p.exists():
-        return
-    required = ["model.safetensors", "config.json"]
-    missing = [r for r in required if not (p / r).exists() and not list(p.glob(r))]
-    if missing:
-        raise FileNotFoundError(
-            f"{label} checkpoint is incomplete at {path}. "
-            "Expected config.json and model.safetensors."
-        )
+ACCEPT_LENGTH_THRESHOLD = 1.5
 
 
 def get_server_info(base_url: str) -> dict:
@@ -76,12 +61,6 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
 
 class TestGemma4MTP26BA4B(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
-
-    @classmethod
-    def setUpClass(cls):
-        super().setUpClass()
-        ensure_checkpoint(TARGET_PATH, MODEL_NAME + " target")
-        ensure_checkpoint(ASSISTANT_PATH, MODEL_NAME + " assistant")
 
     @classmethod
     def _server_env(cls) -> dict[str, str]:
