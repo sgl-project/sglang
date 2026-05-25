@@ -14,7 +14,9 @@ Implemented:
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
-  decode mode for `triton` and `flashinfer`.
+  decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
+  against a fixed padded decode batch and replay distinct request metadata/input
+  tensors, so capture data is not identical to forward data.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -61,6 +63,10 @@ Verified:
 - `python test/manual/attention/unittest/dense/test_triton.py -v`
 - `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---
 
