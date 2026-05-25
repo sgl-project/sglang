@@ -1,4 +1,5 @@
 name: Release SGLang ROCm Wheels (v3)
+# [TEST] This workflow is configured to run on PR updates to test wheel building
 
 on:
   # Run daily at 3 AM UTC (after sgl-kernel nightly at 1 AM)
