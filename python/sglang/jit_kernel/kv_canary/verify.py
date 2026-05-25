@@ -207,8 +207,21 @@ class VerifyPlan:
                 verify_capacity, dtype=torch.int64, device=device
             ),
             verify_num_valid=torch.empty(1, dtype=torch.int32, device=device),
-            enable=torch.empty(1, dtype=torch.int32, device=device),
+            # enable defaults to 1 ("run verify") so test helpers that build a VerifyPlan
+            # directly (no plan kernel) don't have to remember to set it. Plan kernel always
+            # overwrites this so the default is observable only when no plan kernel runs.
+            enable=torch.ones(1, dtype=torch.int32, device=device),
         )
+
+    def zero_for_testing_(self) -> "VerifyPlan":
+        """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
+        write kernel to avoid hiding bugs."""
+        self.verify_slot_indices.zero_()
+        self.verify_positions.zero_()
+        self.verify_prev_slot_indices.zero_()
+        self.verify_num_valid.zero_()
+        self.enable.zero_()
+        return self
 
 
 def launch_canary_verify_kernel(

@@ -33,10 +33,6 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     empty_extras,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
-    allocate_zeroed_verify_plan,
-    allocate_zeroed_write_plan,
-)
 
 register_cuda_ci(est_time=60, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=180, suite="nightly-kernel-1-gpu", nightly=True)
@@ -219,10 +215,10 @@ def test_plan_byte_equal_across_repeated_launches_10x() -> None:
     snapshot_write_offsets: list[torch.Tensor] = []
 
     for _ in range(num_launches):
-        triton_v = allocate_zeroed_verify_plan(verify_capacity=64, device=_DEVICE)
-        triton_w = allocate_zeroed_write_plan(write_req_capacity=8, device=_DEVICE)
-        ref_v = allocate_zeroed_verify_plan(verify_capacity=64, device=_DEVICE)
-        ref_w = allocate_zeroed_write_plan(write_req_capacity=8, device=_DEVICE)
+        triton_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE).zero_for_testing_()
+        triton_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE).zero_for_testing_()
+        ref_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE).zero_for_testing_()
+        ref_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE).zero_for_testing_()
 
         _run_both_plan(
             triton_verify=triton_v,
@@ -324,10 +320,10 @@ def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
         prefix_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
         extend_seq_lens = torch.tensor([0], dtype=torch.int64, device=_DEVICE)
 
-    triton_v = allocate_zeroed_verify_plan(verify_capacity=64, device=_DEVICE)
-    triton_w = allocate_zeroed_write_plan(write_req_capacity=8, device=_DEVICE)
-    ref_v = allocate_zeroed_verify_plan(verify_capacity=64, device=_DEVICE)
-    ref_w = allocate_zeroed_write_plan(write_req_capacity=8, device=_DEVICE)
+    triton_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE).zero_for_testing_()
+    triton_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE).zero_for_testing_()
+    ref_v = VerifyPlan.allocate(verify_capacity=64, device=_DEVICE).zero_for_testing_()
+    ref_w = WritePlan.allocate(write_req_capacity=8, device=_DEVICE).zero_for_testing_()
 
     _run_both_plan(
         triton_verify=triton_v,

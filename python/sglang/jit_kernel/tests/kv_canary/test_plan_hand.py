@@ -21,10 +21,6 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
 )
 from sglang.jit_kernel.tests.kv_canary._invariants import PlanInvariants
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
-    allocate_zeroed_verify_plan,
-    allocate_zeroed_write_plan,
-)
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
@@ -86,10 +82,12 @@ def _run_label(
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
     _ = extras
-    verify_plan = allocate_zeroed_verify_plan(verify_capacity=verify_capacity, device=_DEVICE)
-    write_plan = allocate_zeroed_write_plan(
+    verify_plan = VerifyPlan.allocate(
+        verify_capacity=verify_capacity, device=_DEVICE
+    ).zero_for_testing_()
+    write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=_DEVICE
-    )
+    ).zero_for_testing_()
     runner = (
         launch_canary_plan_kernels
         if label == "real"
@@ -800,12 +798,12 @@ class TestMisc:
             small_pfx = _tensor([5, 5, 5])
             small_ext = _tensor([1, 1, 1])
 
-            verify_plan = allocate_zeroed_verify_plan(
+            verify_plan = VerifyPlan.allocate(
                 verify_capacity=verify_capacity, device=_DEVICE
-            )
-            write_plan = allocate_zeroed_write_plan(
+            ).zero_for_testing_()
+            write_plan = WritePlan.allocate(
                 write_req_capacity=write_req_capacity, device=_DEVICE
-            )
+            ).zero_for_testing_()
             runner = (
                 launch_canary_plan_kernels
                 if label == "real"

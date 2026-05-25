@@ -22,14 +22,7 @@ from sglang.srt.kv_canary.state import (
     ViolationLog,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
-    allocate_zeroed_verify_plan,
-    allocate_zeroed_write_plan,
-    allocate_zeroed_expected_inputs,
-)
-from sglang.test.kv_canary.fixtures import (
-    DEFAULT_DEVICE,
-)
+from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
@@ -52,8 +45,8 @@ def _make_endpoint(*, device, kernel_kind=CanaryLaunchTag.HEAD_K_FULL, swa_lut=N
 
 
 def _make_kernel_args(device):
-    verify_plan = allocate_zeroed_verify_plan(verify_capacity=1, device=device)
-    write_plan = allocate_zeroed_write_plan(write_req_capacity=1, device=device)
+    verify_plan = VerifyPlan.allocate(verify_capacity=1, device=device)
+    write_plan = WritePlan.allocate(write_req_capacity=1, device=device)
     log = ViolationLog.allocate(ring_capacity=2, device=device)
     return SimpleNamespace(
         verify_plan=verify_plan,
@@ -63,7 +56,7 @@ def _make_kernel_args(device):
         positions=torch.zeros(1, dtype=torch.int64, device=device),
         out_cache_loc=torch.zeros(1, dtype=torch.int64, device=device),
         input_check_mode=False,
-        expected_inputs=allocate_zeroed_expected_inputs(capacity=1, device=device),
+        expected_inputs=ExpectedInputs.allocate(capacity=1, device=device),
         real_kv_hash_mode=RealKvHashMode.NONE,
     )
 
@@ -147,7 +140,7 @@ class TestSelfUnitEndpoint(CustomTestCase):
                 device=self.device, kernel_kind=CanaryLaunchTag.SWEEP_V_FULL
             )
 
-            plan = allocate_zeroed_verify_plan(verify_capacity=1, device=self.device)
+            plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
             ep_a.launch_sweep(
                 verify_plan=plan,
                 violation_log=shared_log,

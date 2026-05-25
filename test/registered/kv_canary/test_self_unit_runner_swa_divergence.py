@@ -16,9 +16,6 @@ from sglang.srt.kv_canary.runner.swa_divergence import (
     compute_swa_full_idx_divergence,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.kv_canary.fixtures import (
-    allocate_zeroed_verify_plan,
-)
 from sglang.test.kv_canary.fixtures import make_buffer_group
 from sglang.test.kv_canary.runner_test_base import CanaryManagerTestCase, make_manager
 from sglang.test.test_utils import CustomTestCase
@@ -34,7 +31,7 @@ _EMPTY_FORWARD_BATCH = SimpleNamespace(
 
 
 def _make_verify_plan(value: int) -> VerifyPlan:
-    plan = allocate_zeroed_verify_plan(verify_capacity=4, device=_DEVICE)
+    plan = VerifyPlan.allocate(verify_capacity=4, device=_DEVICE)
     plan.verify_num_valid.copy_(torch.tensor([value], dtype=torch.int32))
     return plan
 
