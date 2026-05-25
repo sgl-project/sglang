@@ -12,6 +12,9 @@ Implemented:
   `flashinfer`.
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
+- Phase 3 dense runner integration is implemented for representative attention
+  backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
+  decode mode for `triton` and `flashinfer`.
 - Dense input-config cases now cover page size 1, zero-prefix exact page,
   zero-prefix input lengths below/equal/above a page, prefix-length exact page,
   total-length exact page, total-length crossing a page boundary, ragged
@@ -30,18 +33,24 @@ Implemented:
   reference.
 
 In progress:
-- No active dense/SWA work remains. The next implementation slice should start MLA
-  or another method that needs a real model-family module.
+- No active dense/SWA/representative Phase 3 work remains. The next implementation
+  slice should start MLA or another method that needs a real model-family module.
 
 Next implementation steps:
 - Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
   `trtllm_mla`.
 - Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
   speculative draft/verify forward modes inside the affected method folders.
+- Add focused Phase 3 composition coverage for `hybrid_attn` and TBO after the
+  base method/backend files are stable.
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 
 Verified:
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
+- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
+- `python test/manual/attention/unittest/dense/test_triton.py -v`
+- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
 - `python test/manual/attention/unittest/swa/test_triton.py -v`
 - `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
