@@ -450,6 +450,24 @@ def _compute_num_split_for_mhc_pre(num_tokens: int, hc_hidden_size: int) -> int:
     return max(1, min(n_sms // max(grid_size, 1), num_block_k // 4))
 
 
+def get_mhc_pre_token_count_representatives(
+    max_num_tokens: int, hc_hidden_size: int
+) -> Tuple[int, ...]:
+    """Return one token-count representative for each MHC pre split bucket."""
+    if max_num_tokens <= 0:
+        return tuple()
+
+    representatives_by_split: dict[int, int] = {}
+    for num_tokens in range(1, max_num_tokens + 1):
+        n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
+        representatives_by_split[n_splits] = num_tokens
+
+    return tuple(
+        representatives_by_split[n_splits]
+        for n_splits in sorted(representatives_by_split)
+    )
+
+
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,

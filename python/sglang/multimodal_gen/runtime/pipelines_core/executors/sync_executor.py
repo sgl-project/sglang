@@ -33,7 +33,9 @@ class SyncExecutor(PipelineExecutor):
         try:
             for stage_index, stage in enumerate(stages):
                 self.before_stage(stage, stage_index, payload, server_args)
-                payload = run_stage(stage, payload)
+                payload = self.run_stage_with_context(
+                    stage, payload, server_args, run_stage
+                )
                 self.after_stage(stage_index)
                 profiler = SGLDiffusionProfiler.get_instance()
                 if profiler:
