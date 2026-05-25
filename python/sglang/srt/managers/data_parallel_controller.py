@@ -786,6 +786,16 @@ class DataParallelController:
                 )
 
         self.dp_budget.total_requests[best_rank] += 1
+        logger.debug(
+            "[CacheAware] req=%s input_len=%d -> rank=%d match=%d "
+            "matches=%s reqs=%s",
+            getattr(req, "rid", "?"),
+            len(token_ids),
+            best_rank,
+            match_info.get(best_rank, 0),
+            match_info,
+            {r: self.dp_budget.total_requests[r] for r in active_ranks},
+        )
         self.workers[best_rank].send_pyobj(req)
 
     def event_loop(self):
