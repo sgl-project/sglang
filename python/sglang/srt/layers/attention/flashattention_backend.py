@@ -206,12 +206,12 @@ class FlashAttentionBackend(AttentionBackend):
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
         if model_runner.server_args.enable_deterministic_inference:
             # FA3 supports static num_splits > 1 with batch-invariant scheduling.
-            import os
+            from sglang.srt.environ import envs
 
-            default_splits = 4 if self.fa_impl_ver == 3 else 1
-            self.num_splits = int(
-                os.environ.get("SGLANG_FA3_DETERMINISTIC_NUM_SPLITS", default_splits)
-            )
+            if self.fa_impl_ver == 3:
+                self.num_splits = envs.SGLANG_FA3_DETERMINISTIC_NUM_SPLITS.get()
+            else:
+                self.num_splits = 1
         elif self.fa_impl_ver == 4 and not model_runner.server_args.disable_cuda_graph:
             self.num_splits = 1
         else:

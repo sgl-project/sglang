@@ -16,8 +16,7 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
-def _call_fa3_kernel(kernel, *args, batch_invariant=False, out=None):
-    kwargs = {}
+def _call_fa3_kernel(kernel, *args, batch_invariant=False, out=None, **kwargs):
     if batch_invariant:
         kwargs["batch_invariant"] = batch_invariant
     if out is None:
