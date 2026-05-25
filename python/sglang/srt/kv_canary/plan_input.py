@@ -103,10 +103,9 @@ def _extract_prefix_lens_and_extend_seq_lens(
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
         # Anchor on ``positions`` (canonical write position) — eagle draft leaves seq_lens
-        # pre-bump so deriving prefix_lens from seq_lens is off-by-one. Padding tail (where
-        # positions runs short of bs under cuda-graph padding) is zeroed; the plan kernel filters
-        # those rows by req_pool_indices==PADDING anyway.
-        out_prefix_lens.zero_()
+        # pre-bump so deriving prefix_lens from seq_lens is off-by-one. Padding tail (positions
+        # shorter than bs under cuda-graph padding) keeps whatever stale data it had; the offsets
+        # kernel masks those rows via ``is_active`` before using prefix_lens.
         positions = forward_batch.positions
         out_prefix_lens[: positions.shape[0]].copy_(positions.to(torch.int64))
         out_extend_seq_lens.fill_(1)
