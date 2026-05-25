@@ -18,13 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 class SweepOrchestrator:
-    """Only walks the radix tree. Per-forward HEAD/TAIL covers running req KV slots every step;
-    sweep is purely for the radix-cached-but-not-in-running-batch slot set.
-
-    Runs host-side eager (post-replay), kernels are NOT captured into the cuda graph - sweep
-    cadence is host-side state and radix walker output size varies per cycle.
-    """
-
     def __init__(
         self,
         *,

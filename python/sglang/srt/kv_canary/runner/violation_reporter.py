@@ -29,12 +29,6 @@ class ViolationReporter:
         self._config = config
         self._device_state = device_state
         self._raised: bool = False
-        # In log mode, the kernel keeps appending to violation_ring across pumps
-        # (we never reset violation_write_index). Track how many ring entries we
-        # have already surfaced so each pump only logs the *new* ones; otherwise
-        # every pump after the first violation re-dumps the full ring (up to
-        # ring_capacity) and the host-side stderr flood blocks the main thread,
-        # causing HTTP timeouts on the test client.
         self._last_logged_write_index: int = 0
 
     @property
@@ -51,9 +45,6 @@ class ViolationReporter:
         valid_count = min(write_index, ring_capacity)
         ring_overflow = write_index > ring_capacity
 
-        # Only surface entries we have not surfaced before. Clamp the lower
-        # bound to valid_count so that if the kernel has overflowed and is now
-        # rolling over the ring, we don't accidentally re-emit the entire ring.
         start = min(self._last_logged_write_index, valid_count)
         if start >= valid_count:
             return
@@ -69,9 +60,7 @@ class ViolationReporter:
         ]
         self._last_logged_write_index = valid_count
 
-        # log mode: always surface every violation as WARNING. Never rate-limit or demote to
-        # DEBUG: if violation volume is high enough to feel like spam, that's a bug in whatever
-        # is producing them, not a reason to hide them.
+        # log mode: always surface every violation as WARNING.
         if self._config.mode == "log":
             for message in messages:
                 logger.warning(message)
@@ -147,9 +136,6 @@ def _format_violation(
     )
 
     if is_write:
-        # Write-path row layout: POSITION holds the actually-written position; EXPECTED_AUX holds
-        # the expected position (NOT a chain hash); EXPECTED_TOKEN holds the expected token.
-        # STORED_CHAIN_HASH is the running chain hash at write time (kept for debug context).
         running_prev_hash = int(stored_chain_hash) & u64_mask
         body = [
             (
@@ -161,8 +147,6 @@ def _format_violation(
             ),
         ]
     else:
-        # Verify-path row layout: POSITION holds the stored position; EXPECTED_AUX holds the
-        # expected chain hash; EXPECTED_TOKEN is unused (always 0) so don't print it.
         stored_prev_hash = int(stored_chain_hash) & u64_mask
         expected_prev_hash = int(expected_aux) & u64_mask
         body = [

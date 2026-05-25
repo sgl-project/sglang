@@ -7,20 +7,6 @@ import torch
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PostOpsInsideGraphOutputBuffer:
-    """Per-SingleForwardManager buffer holding the in-graph signals produced by phases 2-3.
-
-    Allocated once via :meth:`allocate`; written in-place by phase 3 via
-    :meth:`copy_from` (inside captured cuda graphs on DECODE), so every
-    write must be an in-place ``copy_`` into pre-allocated tensors — no
-    allocation, no shape change. Read by phase 4 outside the graph.
-
-    Holds only signals whose live device-state might be mutated by later
-    steps in the cycle (verify-plan enable, kernel / slot counters,
-    violation write index, swa verify totals). ForwardBatch fields are
-    NOT mirrored here — perturb / divergence consumers in phase 4 read
-    the live (possibly inaccurate) ``ForwardBatch`` instead.
-    """
-
     verify_plan_enable: torch.Tensor
     kernel_run_counters: torch.Tensor
     slot_run_counters: torch.Tensor

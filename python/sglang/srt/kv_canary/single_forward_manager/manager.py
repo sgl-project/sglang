@@ -1,31 +1,3 @@
-"""SingleForwardManager — per-step state of one inner ``model.forward``.
-
-One SingleForwardManager owns the per-step state of one inner
-``model.forward`` invocation inside an outer canary cycle. The outer
-``CanaryManager`` holds a static list of SingleForwardManagers (length
-``max(1, speculative_num_steps - 1)``) and dispatches the monkey-patched
-``model.forward`` wrap to the active SingleForwardManager through a
-context manager.
-
-Lifecycle (per SingleForwardManager, enforced by ``SimplePhaseChecker``):
-
-    IDLE
-      ── pre_ops_outside_graph(maybe_inaccurate_forward_batch)
-      → AFTER_PRE_OUT
-      ── pre_ops_maybe_inside_graph(forward_batch)
-      → AFTER_PRE_MAYBE_IN
-      ── (original model.forward runs)
-      ── post_ops_maybe_inside_graph(forward_batch)
-      → AFTER_POST_MAYBE_IN
-      ── post_ops_outside_graph(snapshot, maybe_inaccurate_forward_batch)
-      → IDLE
-
-Phase 1 and 4 are host-side outside any cuda graph; phase 2 and 3 are
-"maybe inside graph" — captured on the DECODE path, eager on EXTEND
-fallback. The source code in phase 2/3 is the same regardless: every op
-must be capture-safe.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
