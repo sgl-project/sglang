@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_r
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
 )
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mla_backend import (
@@ -592,20 +593,18 @@ class EagleDraftWorker(BaseDraftWorker):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
-        canary_outside_ctx = (
-            c.with_ops_outside_graph(
-                single_forward_indices=[0],
-                maybe_inaccurate_forward_batch=forward_batch,
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
             )
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        canary_index_ctx = (
-            c.with_active_single_forward_manager(0)
-            if c is not None
-            else contextlib.nullcontext()
-        )
-        with canary_outside_ctx, canary_index_ctx:
+        with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -660,20 +659,18 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
 
-        canary_outside_ctx = (
-            c.with_ops_outside_graph(
-                single_forward_indices=[0],
-                maybe_inaccurate_forward_batch=forward_batch,
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
             )
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        canary_index_ctx = (
-            c.with_active_single_forward_manager(0)
-            if c is not None
-            else contextlib.nullcontext()
-        )
-        with canary_outside_ctx, canary_index_ctx:
+        with canary_ctx:
             if can_cuda_graph:
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.replay(
                     forward_batch
