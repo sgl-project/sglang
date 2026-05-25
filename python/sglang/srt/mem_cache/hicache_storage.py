@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import threading
 import time
 import uuid
@@ -376,6 +377,217 @@ class MetadataCache:
     def clear(self):
         with self.lock:
             self.cache.clear()
+
+
+def _maybe_wrap_hicache_storage_failure_injector(
+    backend: HiCacheStorage,
+) -> HiCacheStorage:
+    """Wrap storage with random delay/failure injection when test env vars are set."""
+    random_delay_limit = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY.get()
+    failure_prob = envs.SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE.get()
+    if random_delay_limit is None and failure_prob is None:
+        return backend
+    assert random_delay_limit is None or random_delay_limit >= 0
+    assert failure_prob is None or 0 <= failure_prob <= 1
+    logger.info(
+        "HiCache storage test injector enabled "
+        f"(random_delay_limit={random_delay_limit or 0.0}s, "
+        f"failure_prob={failure_prob or 0.0})"
+    )
+    return HiCacheStorageFailureInjector(
+        backend,
+        random_delay_limit or 0.0,
+        failure_prob or 0.0,
+    )
+
+
+class HiCacheStorageFailureInjector(HiCacheStorage):
+    """Proxy that injects random delay and failures before each storage API call."""
+
+    _backend: HiCacheStorage
+    _random_delay_limit: float
+    _failure_prob: float
+    _thread_local = threading.local()
+
+    def __init__(
+        self,
+        backend: HiCacheStorage,
+        random_delay_limit: float,
+        failure_prob: float,
+    ):
+        self._backend = backend
+        self._random_delay_limit = random_delay_limit
+        self._failure_prob = failure_prob
+
+    def _thread_local_random(self) -> random.Random:
+        # We cannot use random.uniform() or random.random() directly, because
+        # TP/PP ranks have the same random seed at startup, so they would produce
+        # the same sequence of random numbers here.  We expect TP/PP ranks behave
+        # differently by injecting random failures and delays, in order to expose
+        # potential bugs.
+        if not hasattr(self._thread_local, "random"):
+            self._thread_local.random = random.Random()
+        return self._thread_local.random
+
+    def _inject_delay(self, func_name: str) -> None:
+        if self._random_delay_limit > 0:
+            r = self._thread_local_random()
+            delay_secs = r.uniform(0.0, self._random_delay_limit)
+            logger.debug(f"Inject delay {delay_secs}s in {func_name}")
+            time.sleep(delay_secs)
+
+    def _inject_failure(self, func_name: str) -> bool:
+        if self._failure_prob > 0:
+            r = self._thread_local_random()
+            if r.random() < self._failure_prob:
+                logger.debug(f"Inject failure in {func_name}")
+                return True
+        return False
+
+    def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        self._backend.register_mem_pool_host(mem_pool_host)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        self._backend.register_mem_host_pool_v2(host_pool, host_pool_name)
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        func_name = "batch_exists_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return PoolTransferResult.empty()
+        return self._backend.batch_exists_v2(keys, pool_transfers, extra_info)
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        func_name = "batch_get_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return {
+                transfer.name: [False] * len(transfer.keys or [])
+                for transfer in transfers
+            }
+        return self._backend.batch_get_v2(transfers, extra_info)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        func_name = "batch_set_v2"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return {
+                transfer.name: [False] * len(transfer.keys or [])
+                for transfer in transfers
+            }
+        return self._backend.batch_set_v2(transfers, extra_info)
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_get_v1"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(keys)
+        return self._backend.batch_get_v1(keys, host_indices, extra_info)
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        host_indices: torch.Tensor,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> List[bool]:
+        func_name = "batch_set_v1"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [False] * len(keys)
+        return self._backend.batch_set_v1(keys, host_indices, extra_info)
+
+    def get(
+        self,
+        key: str,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> torch.Tensor | None:
+        func_name = "get"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return None
+        return self._backend.get(key, target_location, target_sizes)
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[torch.Tensor | None] | int:
+        func_name = "batch_get"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return [None] * len(keys)
+        return self._backend.batch_get(keys, target_locations, target_sizes)
+
+    def set(
+        self,
+        key: str,
+        value: Optional[Any] = None,
+        target_location: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        func_name = "set"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.set(key, value, target_location, target_sizes)
+
+    def batch_set(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> bool:
+        func_name = "batch_set"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.batch_set(keys, values, target_locations, target_sizes)
+
+    def exists(self, key: str) -> bool:
+        func_name = "exists"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return False
+        return self._backend.exists(key)
+
+    def batch_exists(
+        self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
+    ) -> int:
+        func_name = "batch_exists"
+        self._inject_delay(func_name)
+        if self._inject_failure(func_name):
+            return 0
+        return self._backend.batch_exists(keys, extra_info)
+
+    def clear(self) -> None:
+        return self._backend.clear()
+
+    def get_stats(self):
+        return self._backend.get_stats()
+
+    def close(self):
+        self._backend.close()
 
 
 class HiCacheFile(HiCacheStorage):
