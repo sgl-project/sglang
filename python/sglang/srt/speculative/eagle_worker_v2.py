@@ -197,8 +197,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             self.init_cuda_graphs()
 
-        if self.draft_runner.canary_manager is not None:
-            self.draft_runner.canary_manager.mark_init_finished()
+        if (c := self.draft_runner.canary_manager) is not None:
+            c.mark_init_finished()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
@@ -464,8 +464,6 @@ class EagleDraftWorker(BaseDraftWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        canary_manager = self.draft_runner.canary_manager
-
         # Forward multiple steps
         scores = None
         for i in range(self.speculative_num_steps):
@@ -492,7 +490,7 @@ class EagleDraftWorker(BaseDraftWorker):
             # model.forward wrap which SingleForwardManager owns this step.
             sfm_index_ctx = (
                 canary_manager.with_active_single_forward_manager(i)
-                if canary_manager is not None
+                if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
             with forward_context(
