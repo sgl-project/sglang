@@ -486,16 +486,14 @@ class EagleDraftWorker(BaseDraftWorker):
             # Run forward under a per-step ForwardContext so the model layer
             # reads attn_backends[i] for the i-th draft step. ``_forward_raw``
             # honors the outer context and does not override.
-            # SingleForwardManager index ``i`` tells the monkey-patched
-            # model.forward wrap which SingleForwardManager owns this step.
-            sfm_index_ctx = (
-                canary_manager.with_active_single_forward_manager(i)
+            canary_index_ctx = (
+                c.with_active_single_forward_manager(i)
                 if (c := self.draft_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
             with forward_context(
                 ForwardContext(attn_backend=self.draft_attn_backend.attn_backends[i])
-            ), sfm_index_ctx:
+            ), canary_index_ctx:
                 logits_output = self.draft_runner.forward(
                     forward_batch, skip_attn_backend_init=True
                 ).logits_output
