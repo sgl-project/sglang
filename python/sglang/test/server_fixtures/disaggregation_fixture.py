@@ -133,7 +133,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         print("Starting load balancer:", shlex.join(lb_command))
         cls.process_lb = popen_with_error_check(lb_command)
         cls.wait_server_ready(cls.lb_url + "/health", process=cls.process_lb)
-        _start_fail_fast_watcher(
+        cls._fail_fast_stop = _start_fail_fast_watcher(
             [
                 ("prefill", cls.process_prefill),
                 ("decode", cls.process_decode),
@@ -150,6 +150,11 @@ class PDDisaggregationServerBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Stop the watcher BEFORE killing processes: kill_process_tree below
+        # makes them exit with a negative signal rc, which would otherwise
+        # trip the watcher and os._exit out of pytest mid-teardown.
+        if getattr(cls, "_fail_fast_stop", None) is not None:
+            cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
         for process in [cls.process_lb, cls.process_decode, cls.process_prefill]:
             if process:
@@ -164,14 +169,21 @@ class PDDisaggregationServerBase(CustomTestCase):
 
 def _start_fail_fast_watcher(named_procs):
     """Abort the test runner the moment any subprocess exits non-zero.
-    Without this the eval client retries connection-refused for 30s-2min."""
+    Without this the eval client retries connection-refused for 30s-2min.
+
+    Returns the threading.Event that callers should `.set()` before
+    intentionally terminating the watched processes (e.g. in tearDownClass)
+    so the watcher doesn't mistake a clean teardown for a failure."""
+    stop = threading.Event()
 
     def watcher():
-        while True:
+        while not stop.is_set():
             for name, proc in named_procs:
                 rc = proc.poll() if proc else None
                 if rc is None or rc == 0:
                     continue
+                if stop.is_set():
+                    return
                 sys.stderr.write(
                     f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
                     f"rc={rc}; aborting.\n"
@@ -187,6 +199,7 @@ def _start_fail_fast_watcher(named_procs):
             time.sleep(0.1)
 
     threading.Thread(target=watcher, daemon=True, name="PDProcExitWatcher").start()
+    return stop
 
 
 def _get_available_ib_devices():
