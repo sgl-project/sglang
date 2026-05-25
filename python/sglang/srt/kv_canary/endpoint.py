@@ -29,31 +29,6 @@ from sglang.srt.kv_canary.state import (
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CanaryEndpoint:
-    """One canary launch unit. Bundles everything a single (slot × K-half | V-half) launch needs.
-
-    A canary attached to one pool produces up to 12 endpoints: 3 slots (head / tail / sweep) × 2 halves
-    (K / V) × 2 groups (FULL / SWA). MLA-style pools have no V half (6 endpoints max). The SWA group
-    only exists on pools whose model has SWA layers.
-
-    Endpoints are constructed once at install time, frozen, and looked up by the runner per launch.
-
-    Fields:
-        kernel_kind: CanaryLaunchTag identifying this endpoint's slot × half × group. Stamped into every
-            violation row this endpoint produces.
-        canary_buf: This endpoint's canary buffer, shape [num_slots, CANARY_SLOT_BYTES], uint8.
-            head and tail endpoints on the same (half, group) hold DISTINCT buffers (so they can be
-            staged at different forward-pass points without overwriting); sweep endpoint shares its
-            buffer with one of head/tail (typically tail — sweep verifies the most recent canary state).
-        full_to_swa_index_mapping: SWA LUT, shape [full_pool_size + 1], int64, or None. None iff this
-            endpoint is on the FULL group.
-        real_kv_sources: RealKvSource tuple folded into real_kv_hash. Length 0..4.
-            Empty tuple disables the mixin for this endpoint.
-        slot_run_counter_view: One-element int64 view into CanaryDeviceState.slot_run_counters at
-            kernel_kind's slot index.
-        kernel_run_counter_view: One-element int64 view into CanaryDeviceState.kernel_run_counters at
-            kernel_kind's slot index.
-    """
-
     kernel_kind: CanaryLaunchTag
     canary_buf: torch.Tensor
     full_to_swa_index_mapping: Optional[torch.Tensor]
@@ -210,20 +185,7 @@ def build_endpoints_from_group(
     group: CanaryBufferGroup,
     device_state: CanaryDeviceState,
 ) -> tuple[CanaryEndpoint, ...]:
-    """Enumerate (slot × half) endpoints for one CanaryBufferGroup.
-
-    Produces up to 6 endpoints per group: 3 slots (HEAD / TAIL / SWEEP) × 2 halves (K / V). MLA-style
-    pools (group.has_v_half == False) skip the V half → 3 endpoints. Head and tail get distinct canary
-    buffers (group.k_head vs group.k_tail; group.v_head vs group.v_tail); the sweep endpoint shares its
-    canary buffer with the tail endpoint of the same half.
-
-    Counter views: slot_run_counter_view / kernel_run_counter_view are 1-element views into
-    device_state.slot_run_counters / device_state.kernel_run_counters at kernel_kind.value, so kernel
-    atomicAdd writes through to the original tensor.
-
-    The SWA LUT (group.swa_index_lut) is threaded into the endpoint's full_to_swa_index_mapping for SWA
-    groups and left None for FULL groups.
-    """
+    """Enumerate (slot × half) endpoints for one CanaryBufferGroup."""
     pool_kind = group.kind
     layout = _FULL_LAYOUT if pool_kind is PoolKind.FULL else _SWA_LAYOUT
 

@@ -29,30 +29,7 @@ def walk_radix_cache_for_canary(
     """Walk the radix tree and emit flat (slot_indices, positions, prev_slot_indices) tensors for
     EVERY slot held by the radix cache (including slots whose tokens are also referenced by a
     currently-running req — that overlap is harmless redundancy with the per-forward HEAD/TAIL
-    path).
-
-    For each radix tree node:
-    - Slots within the node are chained in order; slot at within-node index j has predecessor at
-      j - 1.
-    - The first slot of a non-root node's chain has predecessor = the last slot of the parent
-      node.
-    - The first slot of a root node's first child has predecessor = -1 (chain-seed anchor).
-    - Position = depth-from-root of the slot.
-
-    Returns host int64 tensors (then runner H2D-copies). NOT SWA-translated — caller does the LUT
-    lookup before writing the sweep VerifyPlan.
-
-    Args:
-        unlocked_only: When True, skip nodes whose cache-specific lock ref is positive (i.e.
-            currently referenced by a running req). Used by the perturb path which MUST NOT mutate
-            slots actively in use.
-            Default False: sweep emits every radix-tree slot (overlap with per-forward HEAD/TAIL
-            coverage is harmless redundancy).
-
-    Cost: O(total radix slots). Runs on host every sweep_interval; bounded by pool size.
-    If profiling shows this is the sweep hot path, future work can move it to a Triton kernel —
-    but for sweep cadences in the 64..1024 range, host walk is fine.
-    """
+    path)."""
     cache_type = type(radix_cache)
     if cache_type is not RadixCache and cache_type is not SWARadixCache:
         raise NotImplementedError(

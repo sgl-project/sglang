@@ -59,16 +59,6 @@ class PlanInput:
         )
 
     def fill_from_forward_batch(self, *, forward_batch: "ForwardBatch") -> None:
-        """Fill static per-forward buffers in place from a ForwardBatch.
-
-        This mutates the PlanInput's static buffers and does not allocate a new PlanInput.
-
-        - self.req_pool_indices[:bs] <- forward_batch.req_pool_indices; rows beyond bs
-          are zeroed (padding sentinel).
-        - self.prefix_lens[:bs] / extend_seq_lens[:bs] are dispatched per forward_mode. Rows beyond bs are zeroed
-          (padding skipped
-          via req_pool_indices sentinel; the lens value there is irrelevant).
-        """
         req_pool_indices = forward_batch.req_pool_indices
         bs = int(req_pool_indices.shape[0])
         capacity = int(self.req_pool_indices.shape[0])
