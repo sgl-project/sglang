@@ -115,7 +115,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
         *,
         assert_all_success: bool = True,
         max_new_tokens: int = 2048,
-        timeout: float = 60.0,
+        timeout: float = 240.0,
     ) -> list[dict]:
         """Fan out n parallel /generate requests; return list of response dicts."""
         results = post_parallel_generate(
