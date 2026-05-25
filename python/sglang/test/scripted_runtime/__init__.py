@@ -5,9 +5,9 @@ See ``docs`` and the project notes under
 for the design rationale.
 """
 
-from sglang.srt.test.scripted_runtime.entrypoint import execute_scripted_runtime
-from sglang.srt.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
-from sglang.srt.test.scripted_runtime.runtime import (
+from sglang.test.scripted_runtime.entrypoint import execute_scripted_runtime
+from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
+from sglang.test.scripted_runtime.runtime import (
     ScriptedRuntime,
     ScriptedRuntimeFinished,
 )

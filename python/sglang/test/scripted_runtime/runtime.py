@@ -22,8 +22,8 @@ from typing import TYPE_CHECKING, Callable, Generator, List, Optional, Tuple
 
 from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
-from sglang.srt.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
+from sglang.test.scripted_runtime.req_handle import ReqHandle, ReqStatus
+from sglang.test.scripted_runtime.tokenizer_recv_proxy import TokenizerRecvProxy
 from sglang.srt.utils.common import broadcast_pyobj
 
 if TYPE_CHECKING:

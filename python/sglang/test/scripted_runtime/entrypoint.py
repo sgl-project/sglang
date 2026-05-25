@@ -28,7 +28,7 @@ import tempfile
 from typing import Callable, Optional
 
 from sglang.srt.entrypoints.engine import Engine
-from sglang.srt.test.scripted_runtime.runtime import _resolve_fn
+from sglang.test.scripted_runtime.runtime import _resolve_fn
 
 
 def execute_scripted_runtime(
@@ -88,9 +88,7 @@ def execute_scripted_runtime(
         with open(tb_path) as f:
             tb_text = f.read()
         if tb_text.strip():
-            raise AssertionError(
-                f"ScriptedRuntime script failed:\n{tb_text}"
-            )
+            raise AssertionError(f"ScriptedRuntime script failed:\n{tb_text}")
     finally:
         try:
             os.unlink(tb_path)
