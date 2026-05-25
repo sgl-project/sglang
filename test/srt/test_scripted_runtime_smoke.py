@@ -21,9 +21,11 @@ def _smoke_script(t: ScriptedRuntime):
     r1 = t.start_req(prompt_len=10, max_new_tokens=4)
     yield  # let the scheduler pick up the injected request
     yield  # one more step so it has a chance to enter running
-    assert r1.status in ("waiting", "running", "unknown"), (
-        f"unexpected status: {r1.status!r}"
-    )
+    assert r1.status in (
+        "waiting",
+        "running",
+        "unknown",
+    ), f"unexpected status: {r1.status!r}"
 
 
 def test_smoke_scripted_runtime():
