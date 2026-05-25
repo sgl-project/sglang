@@ -539,9 +539,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert alloc_full_indices is not None
 
         if swa_tail_len == 0:
-            # Mirror the prefix-mapping reset below for consistency: every
-            # slot returned from this call has no SWA mapping when the
-            # caller asked for tail_len=0.
+            # tail_len=0: no slot has a SWA mapping. Mirror the prefix-reset below.
             self.full_to_swa_index_mapping[alloc_full_indices] = 0
             return alloc_full_indices
 
