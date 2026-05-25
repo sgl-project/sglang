@@ -111,6 +111,46 @@ def _resolve_profile_root() -> Optional[Path]:
     return Path(raw).expanduser().resolve() if raw else None
 
 
+_BENCH_REPORT_FIELDS: tuple[str, ...] = (
+    "latency",
+    "input_throughput",
+    "output_throughput",
+    "overall_throughput",
+    "last_ttft",
+    "last_gen_throughput",
+    "acc_length",
+    "cache_hit_rate",
+)
+
+
+def _format_bench_report(
+    *,
+    scenario_key: str,
+    off: BenchOneCaseResult,
+    on: BenchOneCaseResult,
+    overhead_pct: float,
+) -> str:
+    header = (
+        f"[canary self-bench] {scenario_key}: "
+        f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
+    )
+    col_w = 22
+    lines = [header, f"  {'field':<{col_w}}{'off':>14}{'on':>14}"]
+    for field in _BENCH_REPORT_FIELDS:
+        off_v = getattr(off, field)
+        on_v = getattr(on, field)
+        lines.append(
+            f"  {field:<{col_w}}{_fmt_metric(off_v):>14}{_fmt_metric(on_v):>14}"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_metric(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.4f}"
+
+
 class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
@@ -153,12 +193,21 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=output_len,
         )
         overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
-        summary = (
-            f"[canary self-bench] {scenario_key}: "
-            f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
+        report = _format_bench_report(
+            scenario_key=scenario_key,
+            off=off,
+            on=on,
+            overhead_pct=overhead_pct,
         )
-        print(summary, flush=True)
-        self.assertLess(overhead_pct, 5.0, msg=f"{summary} — exceeds 5% budget")
+        print(report, flush=True)
+        self.assertLess(
+            overhead_pct,
+            5.0,
+            msg=(
+                f"{scenario_key} overhead={overhead_pct:.2f}% exceeds 5% budget\n"
+                f"{report}"
+            ),
+        )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
         """Verify canary prefill overhead stays within the expected bound."""
