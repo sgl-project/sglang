@@ -16,14 +16,18 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import get_dcp_rank, get_dcp_world_size
+from sglang.srt.distributed import get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.layers.utils.dcp_utils import update_kv_lens_and_indices
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+    plan_dcp_decode_metadata,
+    update_local_kv_lens_for_dcp,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
@@ -471,11 +475,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
-            if get_dcp_world_size() > 1:
-                dcp_world_size = get_dcp_world_size()
-                dcp_rank = get_dcp_rank()
-                # Compute local lengths following the same formula as filter_seq_indices.
-                kv_len_arr_cpu = ((kv_len_arr_cpu - dcp_rank - 1) // dcp_world_size) + 1
+            update_local_kv_lens_for_dcp(kv_len_arr_cpu)
 
             self.cuda_graph_kv_indptr_cpu[1 : bs + 1] = torch.cumsum(
                 kv_len_arr_cpu, dim=0
@@ -662,8 +662,7 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             k_buffer[:, :, : layer.v_head_dim],
             k_buffer[:, :, layer.v_head_dim :],
             out=o,
-            return_lse=forward_batch.forward_mode.is_decode()
-            and get_dcp_world_size() > 1,
+            return_lse=forward_batch.forward_mode.is_decode() and dcp_enabled(),
         )
         return out
 
@@ -745,57 +744,15 @@ class FlashInferMLAIndicesUpdaterDecode:
                 self.req_to_token.shape[1],
             )
 
-            if get_dcp_world_size() > 1:
-                local_kv_lens = (
-                    (kv_lens - get_dcp_rank() - 1) // get_dcp_world_size() + 1
-                ).clamp_(min=0)
-
-                if not init_metadata_replay:
-                    max_local_len = (
-                        int(local_kv_lens.max().item())
-                        if local_kv_lens.numel() > 0
-                        else 0
-                    )
-                    total_local_len = (
-                        int(local_kv_lens.sum().item())
-                        if local_kv_lens.numel() > 0
-                        else 0
-                    )
-                else:
-                    max_local_len = (
-                        int(fast_decode_kwargs["kv_len_arr_cpu"].max().item())
-                        if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
-                        else 0
-                    )
-                    total_local_len = (
-                        int(fast_decode_kwargs["kv_len_arr_cpu"].sum().item())
-                        if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
-                        else 0
-                    )
-                local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
-                local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
-                local_kv_indices = kv_indices.new_empty(total_local_len)
-                BLOCK_SIZE = 128
-                num_blocks = (
-                    (max_local_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-                    if max_local_len > 0
-                    else 1
-                )
-                grid = (bs, num_blocks)
-                update_kv_lens_and_indices[grid](
+            if dcp_enabled():
+                plan_dcp_decode_metadata(
                     kv_lens,
                     kv_indptr,
                     kv_indices,
-                    local_kv_lens,
-                    local_kv_lens_cumsum,
-                    local_kv_indices,
-                    dcp_rank=get_dcp_rank(),
-                    dcp_world_size=get_dcp_world_size(),
-                    BLOCK_SIZE=BLOCK_SIZE,
+                    init_metadata_replay,
+                    fast_decode_kwargs,
+                    bs,
                 )
-                kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
-                kv_lens = local_kv_lens
-                kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
 

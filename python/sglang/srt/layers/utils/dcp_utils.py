@@ -545,3 +545,70 @@ def all_gather_kv_cache_for_mla_extend(
         ...,
         kv_lora_rank:,
     ] = k_pe
+
+
+def dcp_enabled() -> bool:
+    return get_dcp_world_size() > 1
+
+
+def update_local_kv_lens_for_dcp(kv_len_arr):
+    dcp_world_size = get_dcp_world_size()
+    if dcp_world_size <= 1:
+        return
+    dcp_rank = get_dcp_rank()
+    offset = dcp_rank + 1
+    kv_len_arr.sub(offset).div_(dcp_world_size, rounding_mode="floor").add_(1)
+
+
+def plan_dcp_decode_metadata(
+    kv_lens: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    init_metadata_replay: bool,
+    fast_decode_kwargs: dict,
+    bs: int,
+):
+    local_kv_lens = kv_lens.clone()
+    update_local_kv_lens_for_dcp(local_kv_lens)
+    local_kv_lens.clamp_(min=0)
+
+    if not init_metadata_replay:
+        max_local_len = (
+            int(local_kv_lens.max().item()) if local_kv_lens.numel() > 0 else 0
+        )
+        total_local_len = (
+            int(local_kv_lens.sum().item()) if local_kv_lens.numel() > 0 else 0
+        )
+    else:
+        max_local_len = (
+            int(fast_decode_kwargs["kv_len_arr_cpu"].max().item())
+            if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
+            else 0
+        )
+        total_local_len = (
+            int(fast_decode_kwargs["kv_len_arr_cpu"].sum().item())
+            if fast_decode_kwargs["kv_len_arr_cpu"].numel() > 0
+            else 0
+        )
+    local_kv_lens_cumsum = kv_indptr.new_zeros((bs + 1,))
+    local_kv_lens_cumsum[1 : bs + 1] = torch.cumsum(local_kv_lens, dim=0)
+    local_kv_indices = kv_indices.new_empty(total_local_len)
+    BLOCK_SIZE = 128
+    num_blocks = (
+        (max_local_len + BLOCK_SIZE - 1) // BLOCK_SIZE if max_local_len > 0 else 1
+    )
+    grid = (bs, num_blocks)
+    update_kv_lens_and_indices[grid](
+        kv_lens,
+        kv_indptr,
+        kv_indices,
+        local_kv_lens,
+        local_kv_lens_cumsum,
+        local_kv_indices,
+        dcp_rank=get_dcp_rank(),
+        dcp_world_size=get_dcp_world_size(),
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    kv_indices[:total_local_len] = local_kv_indices[:total_local_len]
+    kv_lens.copy_(local_kv_lens)
+    kv_indptr[: bs + 1] = local_kv_lens_cumsum[: bs + 1]
