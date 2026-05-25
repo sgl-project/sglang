@@ -29,6 +29,8 @@ LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
 CUSTOM_IMAGE=""
+MI30X_CUSTOM_IMAGE="${AMD_CI_MI30X_IMAGE:-}"
+MI35X_CUSTOM_IMAGE="${AMD_CI_MI35X_IMAGE:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -51,6 +53,8 @@ while [[ $# -gt 0 ]]; do
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
       echo "  --custom-image IMAGE       Use a specific Docker image directly"
+      echo "  AMD_CI_MI30X_IMAGE         Exact MI30x image to use when --custom-image is unset"
+      echo "  AMD_CI_MI35X_IMAGE         Exact MI35x image to use when --custom-image is unset"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
@@ -88,6 +92,23 @@ case "${GPU_ARCH}" in
     GPU_ARCH="mi30x"
     ;;
 esac
+
+if [[ -z "${CUSTOM_IMAGE}" ]]; then
+  case "${GPU_ARCH}" in
+    mi30x)
+      if [[ -n "${MI30X_CUSTOM_IMAGE}" ]]; then
+        CUSTOM_IMAGE="${MI30X_CUSTOM_IMAGE}"
+        echo "Using mi30x custom image from AMD_CI_MI30X_IMAGE: ${CUSTOM_IMAGE}"
+      fi
+      ;;
+    mi35x)
+      if [[ -n "${MI35X_CUSTOM_IMAGE}" ]]; then
+        CUSTOM_IMAGE="${MI35X_CUSTOM_IMAGE}"
+        echo "Using mi35x custom image from AMD_CI_MI35X_IMAGE: ${CUSTOM_IMAGE}"
+      fi
+      ;;
+  esac
+fi
 
 
 # Set up DEVICE_FLAG based on Kubernetes pod info
