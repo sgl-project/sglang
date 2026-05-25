@@ -146,7 +146,7 @@ def _build_write_inputs(
     violation_write_index = torch.zeros(1, dtype=torch.int32, device=device)
     slot_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
     kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=device)
-    enable_runtime_assert = torch.ones(1, dtype=torch.int32, device=device)
+    enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
 
     real_kv_sources = make_real_kv_sources(
         kind=case.real_kv_kind, num_slots=num_slots, device=device
@@ -164,7 +164,7 @@ def _build_write_inputs(
         violation_write_index=violation_write_index,
         slot_run_counter=slot_run_counter,
         kernel_run_counter=kernel_run_counter,
-        enable_runtime_assert=enable_runtime_assert,
+        enable_chain_position_assert=enable_chain_position_assert,
         real_kv_sources=real_kv_sources,
     )
 
@@ -184,7 +184,7 @@ def _build_context(
         kernel_run_counter=inputs["kernel_run_counter"],
         real_kv_sources=inputs["real_kv_sources"],
         real_kv_hash_mode=hash_mode,
-        enable_runtime_assert=inputs["enable_runtime_assert"],
+        enable_chain_position_assert=inputs["enable_chain_position_assert"],
     )
 
 

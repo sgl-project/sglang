@@ -77,15 +77,15 @@ class CanaryDeviceState:
         slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
             view-handed-to-kernel pattern as kernel_run_counters; each launch adds its active entry
             count to its slot. Used for periodic stats ("protected N tokens").
-        enable_runtime_assert: int32 [1] device flag. 0 during cuda-graph capture / warmup;
-            CanaryManager.mark_init_finished() flips to 1. Gates the write kernel's chain-step
-            write_position assert.
+        enable_chain_position_assert: int32 [1] device flag gating the write kernel's chain-step
+            write_position assert. allocate() defaults to 1; CanaryManager zeros it during
+            __init__ for the warmup window and mark_init_finished() flips it back to 1.
     """
 
     violation_log: ViolationLog
     kernel_run_counters: torch.Tensor
     slot_run_counters: torch.Tensor
-    enable_runtime_assert: torch.Tensor
+    enable_chain_position_assert: torch.Tensor
 
     @classmethod
     def allocate(
@@ -104,10 +104,10 @@ class CanaryDeviceState:
         )
         kernel_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
         slot_run_counters = torch.zeros(num_tags, dtype=torch.int64, device=device)
-        enable_runtime_assert = torch.zeros(1, dtype=torch.int32, device=device)
+        enable_chain_position_assert = torch.ones(1, dtype=torch.int32, device=device)
         return cls(
             violation_log=violation_log,
             kernel_run_counters=kernel_run_counters,
             slot_run_counters=slot_run_counters,
-            enable_runtime_assert=enable_runtime_assert,
+            enable_chain_position_assert=enable_chain_position_assert,
         )

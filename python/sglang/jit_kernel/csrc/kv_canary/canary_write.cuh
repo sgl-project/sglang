@@ -48,9 +48,9 @@ struct WriteKernelParams {
   int64_t* slot_run_counter;
   int64_t* kernel_run_counter;
 
-  // Starts at 0 during warmup / cuda-graph capture; flipped to 1 in
-  // CanaryManager.mark_init_finished(). Gates the chain-step position assert below.
-  const int32_t* enable_runtime_assert;
+  // Gates the chain-step position assert below. Default-on (1); CanaryManager zeros during the
+  // warmup window and flips back in mark_init_finished().
+  const int32_t* enable_chain_position_assert;
 
   // Real-KV sources.
   RealKvSourceHandle sources[kMaxRealKvSources];
@@ -88,7 +88,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
 
   // Assumes eagle topk=1 (linear chain). Under topk>1 target_verify would be a tree and
   // sibling positions share parent.pos+1, breaking this invariant.
-  const bool do_chain_position_assert = (seed_slot_idx >= 0) && (*p.enable_runtime_assert != 0);
+  const bool do_chain_position_assert = (seed_slot_idx >= 0) && (*p.enable_chain_position_assert != 0);
   int64_t running_prev_position = 0;
   if (do_chain_position_assert) {
     running_prev_position =
@@ -198,7 +198,7 @@ inline void canary_write_step_cuda(
     tvm::ffi::TensorView violation_write_index,
     tvm::ffi::TensorView slot_run_counter,
     tvm::ffi::TensorView kernel_run_counter,
-    tvm::ffi::TensorView enable_runtime_assert,
+    tvm::ffi::TensorView enable_chain_position_assert,
     tvm::ffi::TensorView real_kv_buf_0,
     tvm::ffi::TensorView real_kv_buf_1,
     tvm::ffi::TensorView real_kv_buf_2,
@@ -256,7 +256,7 @@ inline void canary_write_step_cuda(
       .with_device<kDLCUDA>(device_)
       .verify(slot_run_counter)
       .verify(kernel_run_counter);
-  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(enable_runtime_assert);
+  TensorMatcher({1}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(enable_chain_position_assert);
 
   SymbolicSize N_real_kv_rows_0 = {"real_kv_rows_0"};
   SymbolicSize N_real_kv_cols_0 = {"real_kv_cols_0"};
@@ -332,7 +332,7 @@ inline void canary_write_step_cuda(
   p.violation_sink.kernel_kind = static_cast<int32_t>(kernel_kind);
   p.slot_run_counter = static_cast<int64_t*>(slot_run_counter.data_ptr());
   p.kernel_run_counter = static_cast<int64_t*>(kernel_run_counter.data_ptr());
-  p.enable_runtime_assert = static_cast<const int32_t*>(enable_runtime_assert.data_ptr());
+  p.enable_chain_position_assert = static_cast<const int32_t*>(enable_chain_position_assert.data_ptr());
 
   const int32_t* params = static_cast<const int32_t*>(real_kv_source_params.data_ptr());
   tvm::ffi::TensorView source_bufs[kMaxRealKvSources] = {real_kv_buf_0, real_kv_buf_1, real_kv_buf_2, real_kv_buf_3};

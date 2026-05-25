@@ -285,7 +285,7 @@ def test_verify_multi_launch_100x_counter_linear() -> None:
                 violation_write_index=cuda_log.write_index,
                 slot_run_counter=cuda_log.slot_run_counter,
                 kernel_run_counter=cuda_log.kernel_run_counter,
-                enable_runtime_assert=cuda_log.enable_runtime_assert,
+                enable_chain_position_assert=cuda_log.enable_chain_position_assert,
                 real_kv_sources=(),
                 real_kv_hash_mode=consts.RealKvHashMode.OFF,
             ),

@@ -91,6 +91,9 @@ class CanaryManager:
         self._device_state = CanaryDeviceState.allocate(
             config=config, device=device, num_tags=len(CanaryLaunchTag)
         )
+        # Disable the chain-step position assert until warmup / cuda-graph capture finishes
+        # (synthetic positions trip the +1 invariant). mark_init_finished() flips it back to 1.
+        self._device_state.enable_chain_position_assert.fill_(0)
 
         self._endpoints: tuple[CanaryEndpoint, ...] = tuple(
             endpoint
@@ -291,7 +294,7 @@ class CanaryManager:
         cleared and post-init lifecycle starts from a known good IDLE."""
         for single_forward_manager in self._single_forward_managers:
             single_forward_manager.phase_checker.enable_assert()
-        self._device_state.enable_runtime_assert.fill_(1)
+        self._device_state.enable_chain_position_assert.fill_(1)
 
     def attach_radix_cache(self, radix_cache: "BasePrefixCache") -> None:
         self._sweep_orchestrator.attach_radix_cache(radix_cache)
