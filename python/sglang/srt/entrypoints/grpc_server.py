@@ -18,11 +18,11 @@ import json
 import logging
 import os
 import time
-from smg_grpc_servicer.sglang import servicer as grpc_servicer
 
 import grpc
 from aiohttp import web
 from smg_grpc_servicer.sglang import request_manager as grpc_request_manager
+from smg_grpc_servicer.sglang import servicer as grpc_servicer
 
 from sglang.srt.managers.io_struct import (
     ProfileReq,
