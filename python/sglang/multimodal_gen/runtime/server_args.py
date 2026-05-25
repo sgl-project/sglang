@@ -1220,7 +1220,7 @@ class ServerArgs(DisaggArgsMixin):
         )
         parser.add_argument(
             "--server-warmup",
-            type=int,
+            action=StoreBoolean,
             default=ServerArgs.server_warmup,
             help="Send a warmup request after server ready",
         )
