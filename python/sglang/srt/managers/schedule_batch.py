@@ -347,18 +347,23 @@ class MultimodalDataItem:
         ret.validate()
         return ret
 
-    def reconstruct(self):
-        if not isinstance(self.feature, CudaIpcTensorTransportProxy):
-            return
+    def has_cuda_ipc_proxy(self):
+        return (
+            isinstance(self.feature, CudaIpcTensorTransportProxy)
+            or isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy)
+            or any(
+                isinstance(value, CudaIpcTensorTransportProxy)
+                for value in self.model_specific_data.values()
+            )
+        )
 
-        reconstruct_device = torch.cuda.current_device()
+    def reconstruct(self, target_device: int):
+        """materialize cuda ipc proxy tensors in-place on target_device"""
         if isinstance(self.feature, CudaIpcTensorTransportProxy):
-            self.feature = self.feature.reconstruct_on_target_device(reconstruct_device)
+            self.feature = self.feature.reconstruct_on_target_device(target_device)
         if isinstance(self.precomputed_embeddings, CudaIpcTensorTransportProxy):
             self.precomputed_embeddings = (
-                self.precomputed_embeddings.reconstruct_on_target_device(
-                    reconstruct_device
-                )
+                self.precomputed_embeddings.reconstruct_on_target_device(target_device)
             )
         for extra_key in self.model_specific_data:
             if isinstance(
@@ -366,17 +371,18 @@ class MultimodalDataItem:
             ):
                 extra_data = self.model_specific_data[
                     extra_key
-                ].reconstruct_on_target_device(reconstruct_device)
+                ].reconstruct_on_target_device(target_device)
                 self.model_specific_data[extra_key] = extra_data
 
 
 @dataclasses.dataclass
 class MultimodalProcessorOutput:
-    """Raw output from multimodal processors, before pad/hash computation.
+    """Raw output from multimodal processors before scheduler-side preparation (pad, hash).
 
     This is the typed replacement for the dict previously returned by
-    ``BaseMultimodalProcessor.process_mm_data_async``.  Unlike
-    ``MultimodalInputs``, items here do NOT carry pad_value or hash yet.
+    ``BaseMultimodalProcessor.process_mm_data_async``.  Preprocessed inputs may
+    already carry ``pad_value`` and ``hash`` to avoid hashing the same tensor once
+    per scheduler TP rank.
     """
 
     mm_items: List[MultimodalDataItem]
@@ -496,16 +502,16 @@ class MultimodalInputs:
     @staticmethod
     def from_processor_output(obj: "MultimodalProcessorOutput"):
         mm_items = obj.mm_items
+        assert isinstance(mm_items, list)
+        mm_items = [item for item in mm_items if item.is_valid()]
+
+        # try reconstructing from cuda-ipc
+        reconstruct_device = None
         for mm_item in mm_items:
-            mm_item.reconstruct()
-
-        ret = MultimodalInputs(
-            mm_items=mm_items,
-            padded_input_ids=obj.padded_input_ids,
-        )
-
-        assert isinstance(ret.mm_items, list)
-        ret.mm_items = [item for item in ret.mm_items if item.is_valid()]
+            if mm_item.has_cuda_ipc_proxy():
+                if reconstruct_device is None:
+                    reconstruct_device = torch.cuda.current_device()
+                mm_item.reconstruct(reconstruct_device)
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
             # Multi-modal feature hashing optimization:
@@ -522,19 +528,23 @@ class MultimodalInputs:
             if not is_feature_buffer_initialized():
                 init_feature_buffer(device)
             reset_buffer_offset()
-            for item in ret.mm_items:
+            for item in mm_items:
                 if item.feature is not None:
                     if isinstance(item.feature, torch.Tensor):
                         item.feature = try_add_to_buffer(item.feature)
 
-        for item in ret.mm_items:
+        for item in mm_items:
             item.set_pad_value()
 
         if envs.SGLANG_MM_BUFFER_SIZE_MB.get() > 0:
-            for item in ret.mm_items:
+            for item in mm_items:
                 if item.feature is not None:
                     item.feature = item.feature.to("cpu", non_blocking=True)
 
+        mm_inputs = MultimodalInputs(
+            mm_items=mm_items,
+            padded_input_ids=obj.padded_input_ids,
+        )
         optional_args = [
             "mrope_positions",
             "mrope_position_delta",
@@ -554,9 +564,9 @@ class MultimodalInputs:
         for arg in optional_args:
             val = getattr(obj, arg, None)
             if val is not None:
-                setattr(ret, arg, val)
+                setattr(mm_inputs, arg, val)
 
-        return ret
+        return mm_inputs
 
     def contains_image_inputs(self) -> bool:
         return any(item.is_image() for item in self.mm_items)
