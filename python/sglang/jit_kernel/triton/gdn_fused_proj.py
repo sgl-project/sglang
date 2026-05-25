@@ -316,6 +316,8 @@ def fused_qkv_split_gdn_prefill_kernel(
     k,
     v,
     mixed_qkv,
+    MIXED_QKV_STRIDE_T: tl.constexpr,
+    MIXED_QKV_STRIDE_D: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
     NUM_V_HEADS: tl.constexpr,
@@ -334,7 +336,10 @@ def fused_qkv_split_gdn_prefill_kernel(
     qkv_dim: tl.constexpr = qk_dim + v_dim
 
     mask = offsets < qkv_dim
-    values = tl.load(mixed_qkv + i_t * qkv_dim + offsets, mask=mask)
+    values = tl.load(
+        mixed_qkv + i_t * MIXED_QKV_STRIDE_T + offsets * MIXED_QKV_STRIDE_D,
+        mask=mask,
+    )
 
     q_mask = offsets < q_dim
     tl.store(q + i_t * q_dim + offsets, values, mask=q_mask)
@@ -362,7 +367,7 @@ def fused_qkv_split_gdn_prefill(
     `mixed_qkv` is laid out per token as `[all_q | all_k | all_v]`. The FLA
     chunk kernels consume separate contiguous `[1, T, H, D]` tensors, so this
     fused split replaces three independent `aten::copy_` kernels from the
-    generic FLA input guard.
+    generic FLA input guard. `mixed_qkv` may be a strided `[T, qkv_dim]` view.
     """
     seq_len = mixed_qkv.shape[0]
     q = torch.empty(
@@ -387,6 +392,8 @@ def fused_qkv_split_gdn_prefill(
         k,
         v,
         mixed_qkv,
+        mixed_qkv.stride(0),
+        mixed_qkv.stride(1),
         num_q_heads,
         num_k_heads,
         num_v_heads,
