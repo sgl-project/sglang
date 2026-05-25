@@ -222,10 +222,16 @@ export const config = {
         { id: "mtp-112",    label: "EAGLE / MTP 1-1-2",
           flags: ["--speculative-algo EAGLE", "--speculative-num-steps 1",
                   "--speculative-eagle-topk 1", "--speculative-num-draft-tokens 2"] },
-        { id: "draftflash", label: "DraftFlash", disabled: true,
-          disabledReason: "Coming soon — pending DraftFlash kernel integration." },
-        { id: "nextn",      label: "NextN",      disabled: true,
-          disabledReason: "Coming soon — pending NextN algorithm support." },
+        // NGRAM — CUDA-only, no extra draft model. Does NOT currently
+        // support `--enable-dp-attention` (per SGLang docs), so users
+        // picking this for a DP-Attention base cell should also turn
+        // DP-Attention off in the Attention card above.
+        { id: "ngram",      label: "NGRAM",
+          flags: ["--speculative-algo NGRAM",
+                  "--speculative-num-draft-tokens 16",
+                  "--speculative-ngram-max-bfs-breadth 10"] },
+        { id: "dflash",     label: "DFlash", disabled: true,
+          disabledReason: "Coming soon — pending DFlash kernel integration." },
       ],
     },
 
