@@ -268,6 +268,31 @@ class TestSwaFullIdxDivergenceCompute(CustomTestCase):
             3,
         )
 
+    def test_compute_ignores_swa_mapping_zero(self) -> None:
+        # SWATokenToKVPoolAllocator writes 0 into full_to_swa_index_mapping for
+        # FULL pool slots beyond the sliding window. Those entries are expected,
+        # not real divergence, so the count must skip them.
+        mapping = _make_identity_mapping(size=64)
+        req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=16)
+
+        mapping[3] = 0
+        mapping[5] = 0
+        mapping[7] = 42
+
+        forward_batch = _make_forward_batch(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64, device=_DEVICE),
+            seq_lens=torch.tensor([8], dtype=torch.int64, device=_DEVICE),
+        )
+
+        self.assertEqual(
+            _run_compute(
+                swa_allocator=_make_allocator_stub(mapping),
+                req_to_token_pool=_make_req_to_token_pool_stub(req_to_token),
+                forward_batch=forward_batch,
+            ),
+            1,
+        )
+
     def test_compute_ignores_writes_outside_seq_lens(self) -> None:
         mapping = _make_identity_mapping(size=128)
         req_to_token = _make_identity_req_to_token(num_reqs=4, max_seq_len=32)

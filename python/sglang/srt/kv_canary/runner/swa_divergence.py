@@ -158,4 +158,12 @@ def compute_swa_full_idx_divergence(
     positions = torch.arange(rows.shape[1], device=rows.device)
     mask = positions[None, :] < seq_lens[:, None]
     swa_indices = full_to_swa_index_mapping[rows]
-    return ((swa_indices != rows) & mask).sum().to(torch.int32).view(1)
+    # FULL pool slots beyond the sliding window have their SWA mapping written
+    # to 0 (see SWATokenToKVPoolAllocator.alloc_extend); skip those so they
+    # don't get counted as divergence.
+    return (
+        ((swa_indices != rows) & mask & (swa_indices != 0))
+        .sum()
+        .to(torch.int32)
+        .view(1)
+    )
