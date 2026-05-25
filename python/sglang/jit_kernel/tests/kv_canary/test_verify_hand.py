@@ -142,17 +142,9 @@ def _stamp_clean_kv_chain(
     ref_buf.copy_(cuda_buf)
 
 
-# ---------------------------------------------------------------------------
-# Kernel-contract invariants (counter accounting, OFF-mode short-circuit,
-# chain-anchor, ring-reset). Each test asserts an absolute property of the
-# verify kernel that a CUDA-vs-ref diff cannot catch on its own.
-# ---------------------------------------------------------------------------
-
-
 class TestChain:
     def test_chain_head_anchor(self) -> None:
         """``prev_slot_idx == -1`` → kernel uses ``splitmix64(consts.CANARY_CHAIN_ANCHOR)`` as the expected prev_hash."""
-        # Step 1: stamp slot 5 such that stored.prev_hash already equals splitmix64(consts.CANARY_CHAIN_ANCHOR).
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -164,7 +156,6 @@ class TestChain:
             prev_hash=chain_anchor_signed(),
         )
 
-        # Step 2: a single-entry plan with prev_slot_idx = -1 should record no violation.
         plan_pair = make_verify_plan_pair(
             slot_indices=[5], positions=[0], prev_slot_indices=[-1], device=_DEVICE
         )
@@ -202,7 +193,6 @@ class TestChain:
         slot_indices = [1, 2, 3, 4, 5]
         real_kv_hashes = [0, 0, 0, 0, 0]
 
-        # Step 1: compute the expected stored prev_hash sequence in pure Python via splitmix64.
         expected_prev_hashes_u64: list[int] = []
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
@@ -212,7 +202,6 @@ class TestChain:
             to_signed_int64(h) for h in expected_prev_hashes_u64
         ]
 
-        # Step 2: stamp each slot manually with the hardcoded expected prev_hash.
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -228,7 +217,6 @@ class TestChain:
                 prev_hash=prev_hash,
             )
 
-        # Step 3: verify the 5-step chain — no violation expected and the ref vs CUDA state byte-equal.
         plan_pair = make_verify_plan_pair(
             slot_indices=slot_indices,
             positions=positions,
@@ -239,7 +227,6 @@ class TestChain:
 
         assert int(cuda_log.write_index[0].item()) == 0
 
-        # Step 4: also independently confirm the *stored* prev_hash at each slot matches the hardcoded sequence.
         for slot_idx, expected_signed in zip(slot_indices, expected_prev_hashes_signed):
             _, _, stored_prev_hash, _ = read_slot_fields(
                 canary_buf=cuda_buf, slot_idx=slot_idx
@@ -360,7 +347,6 @@ class TestViolationField:
             slot_indices=slot_indices,
         )
 
-        # Step: corrupt the stored token at slot 2 in both buffers — chain hash propagates downstream.
         stamp_pair(
             (cuda_buf, ref_buf),
             slot_idx=2,
@@ -382,7 +368,6 @@ class TestViolationField:
 
     def test_violation_position_mismatch(self) -> None:
         """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
-        # Stamp slot 7 with a valid head chain but stored position = 0; ask verify to expect position 5.
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -407,7 +392,6 @@ class TestViolationField:
 
     def test_violation_position_diverges_from_plan(self) -> None:
         """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
-        # Step: a clean chain head with stored position 0; plan claims position 99 — kernel must flag POSITION.
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -445,7 +429,6 @@ class TestViolationField:
             slot_indices=slot_indices,
         )
 
-        # Step: corrupt slot 2's stored prev_hash with a bogus signed int64.
         stamp_pair(
             (cuda_buf, ref_buf),
             slot_idx=2,
@@ -471,8 +454,6 @@ class TestViolationField:
         )
         sources_cuda = make_real_kv_sources(count=1, device=_DEVICE)
 
-        # Step: write a chain with real_kv_hash mixin, then mutate one byte in the source tensors so the next
-        # verify reconstructs a hash that differs from the stored one.
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources_cuda,
@@ -482,7 +463,6 @@ class TestViolationField:
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
-        # Mutate one byte in BOTH copies so the verify recomputed hash diverges from stored.
         sources_ref = clone_real_kv_sources(sources_cuda)
         sources_cuda[0].tensor[1, 0] ^= 0xFF
         sources_ref[0].tensor.copy_(sources_cuda[0].tensor)
@@ -740,7 +720,6 @@ class TestRealKvHash:
         sources_cuda = make_real_kv_sources(count=2, device=_DEVICE)
         sources_ref = clone_real_kv_sources(sources_cuda)
 
-        # Write a chain through the ref so both buffers are byte-equal post-write.
         _stamp_clean_kv_chain(
             buf_pair=buf_pair,
             sources_cuda=sources_cuda,
@@ -821,7 +800,6 @@ class TestRealKvHash:
         fold_fn: Callable[[bytes], int],
         expected_hash: int,
     ) -> None:
-        # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 1.
         _PATTERN = bytes(
             [
                 0x01,
@@ -861,10 +839,8 @@ class TestRealKvHash:
             read_bytes=source_cuda.read_bytes,
         )
 
-        # Step 2: verify hand-computed fold matches the hex literal.
         assert fold_fn(_PATTERN) == expected_hash
 
-        # Step 3: stamp slot 1 with a chain-head entry whose real_kv_hash equals the expected value.
         stamp_pair(
             buf_pair,
             slot_idx=1,
@@ -874,7 +850,6 @@ class TestRealKvHash:
             real_kv_hash=to_signed_int64(expected_hash),
         )
 
-        # Step 4: 1-entry verify plan; no violation because stored matches recomputed.
         plan_pair = make_verify_plan_pair(
             slot_indices=[1], positions=[0], prev_slot_indices=[-1], device=_DEVICE
         )
@@ -888,7 +863,6 @@ class TestRealKvHash:
 
         assert int(cuda_log.write_index[0].item()) == 0
 
-        # Step 5: mutate one byte in the source so the recomputed hash diverges from stored.
         source_cuda.tensor[1, 0] ^= 0xFF
         source_ref.tensor.copy_(source_cuda.tensor)
 
@@ -1355,7 +1329,6 @@ class TestLayoutAndScheduling:
         )
         sources_ref = clone_real_kv_sources(sources_cuda)
 
-        # Step: cross a page boundary by writing slots [15, 16] which straddle pages 0 and 1.
         slot_indices = [15, 16]
         tokens = [77, 88]
         positions = [0, 1]
@@ -1673,7 +1646,6 @@ class TestViolationRing:
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
-        # 3 chain-head entries with stored values that all yield POSITION mismatch (positions all 99).
         for slot_idx in (1, 2, 3):
             stamp_pair(
                 buf_pair,
@@ -1694,7 +1666,6 @@ class TestViolationRing:
         )
 
         assert int(cuda_log.write_index[0].item()) == 3
-        # row 0 is filled (slot 1 → POSITION bit).
         first_row_fail = int(
             cuda_log.ring[0, consts.VIOLATION_FIELD_FAIL_REASON_BITS].item()
         )
