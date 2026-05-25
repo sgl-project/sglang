@@ -131,7 +131,6 @@ class TensorDumper:
                 for item in input:
                     if isinstance(item, ForwardBatch):
                         self.add_tensor(tensor_name, item)
-                self.dump_current_tensors()
             if output is not None:
                 self.add_tensor(tensor_name, output)
 
@@ -161,4 +160,9 @@ def register_forward_hook_for_model(
     assert (
         model_top_level_module_matched
     ), f"model should have a module named {top_level_module_name}"
+
+    def _root_dump_hook(module, input, output):
+        tensor_dumper.dump_current_tensors()
+
+    model.register_forward_hook(_root_dump_hook)
     return tensor_dumper
