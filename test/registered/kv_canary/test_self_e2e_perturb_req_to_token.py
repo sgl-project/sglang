@@ -10,15 +10,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 class _PerturbReqToTokenBase(CanaryE2EBase):
-    """Perturb point (a): flip the req_to_token slot id of an active req's live position.
-
-    The KV bytes are untouched but the per-forward verify walks the wrong slot, so the
-    stored prev-hash chain cannot be reproduced. Expected detection path is the
-    per-forward chain_hash check (HEAD or TAIL kernel); since this perturb point is
-    group-agnostic, MHA fires only against the FULL group and SWA fires against either
-    FULL or SWA. We only assert that *some* per-forward chain_hash violation is logged.
-    """
-
     __test__ = False
 
     kv_canary_mode = CanaryMode.LOG

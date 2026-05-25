@@ -11,20 +11,6 @@ register_cuda_ci(est_time=180, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PDPerturbBase(CanaryPDFixture):
-    """P-side post-forward flip; D surfaces the mismatch.
-
-    Both servers run kv-canary in log mode. The flip happens AFTER P's TAIL kernel
-    has already captured the canary hash for the prefill batch's out_cache_loc slots,
-    so P itself has no further verify pass to catch it (sglang's PD prefill flow
-    samples + sends KV without an additional bonus-token forward on P). D-side's
-    first decode forward HEAD/TAIL kernels then re-verify the transferred prefix
-    slots and surface ``fail_reason=real_kv_hash``.
-
-    The test asserts BOTH that D-side detects the flip AND that P-side stays silent
-    (no false-positive violations on P). See PerturbConfig.real_kv_post_forward_prob
-    docstring for the design contract.
-    """
-
     __test__ = (
         False  # pytest must not collect the abstract base (target_group is unset)
     )
@@ -38,12 +24,6 @@ class _PDPerturbBase(CanaryPDFixture):
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
         }
-        # Explicitly zero out every perturb knob on the decode side so that no env value
-        # inherited from the parent process (whether from the pytest shell or from sglang's
-        # own subprocess env merge) can switch perturb on for D. The PD perturb scenario
-        # under test is "P-side flip, D surfaces the mismatch via verify on the
-        # transferred KV"; if D were also flipping its own KV it would silently rewrite
-        # canary metadata to match the local perturb and break that contract.
         cls.extra_decode_env = {
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB": "0",
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0",

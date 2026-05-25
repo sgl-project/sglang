@@ -11,18 +11,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 class TestPerturbRaiseMha(CanaryE2EBase):
-    """kv-canary=raise: the first violation must abort the server.
-
-    Uses perturb point (b) real_kv_used on FULL as the simplest deterministic trigger.
-    We don't assert process exit directly (race-prone — the tee thread may still be
-    draining); instead we assert the violation line landed in the captured log before
-    the abort propagated. Client-side, the request may either time out or come back
-    with a dropped connection, so the /generate call is wrapped in a best-effort try.
-
-    Server runs with ``--skip-server-warmup`` so the perturb trigger fires on real
-    user requests rather than warmup forwards.
-    """
-
     model_mode = "mha"
     kv_canary_mode = CanaryMode.RAISE
     extra_server_args = ("--kv-canary-real-data", "partial", "--skip-server-warmup")

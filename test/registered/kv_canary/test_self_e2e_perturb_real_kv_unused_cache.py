@@ -12,15 +12,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
-    """Perturb point (c): flip the first byte of a radix-cached but currently-unused
-    (orphan) KV slot.
-
-    Because the slot has no active reader, the per-forward HEAD/TAIL paths never touch
-    it; only the periodic sweep does. The test asserts a real_kv_hash violation under
-    a ``SWEEP_*_<GROUP>`` launch_tag. ``use_unique_prompts`` guarantees no prefix reuse
-    so orphan slots stay orphan throughout the run.
-    """
-
     __test__ = False
 
     kv_canary_mode = CanaryMode.LOG

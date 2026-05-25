@@ -12,14 +12,6 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 
 
 class _PerturbRealKvUsedBase(CanaryE2EBase):
-    """Perturb point (b): flip the first byte of an active req's currently-used KV slot.
-
-    With sweep OFF, the only way to surface this corruption is the per-forward
-    HEAD/TAIL real_kv_hash check on the targeted group (FULL or SWA). Subclasses set
-    ``model_mode`` and ``target_group``; the FULL/SWA suffix in the violation launch_tag must
-    match ``target_group``.
-    """
-
     __test__ = False
 
     kv_canary_mode = CanaryMode.LOG

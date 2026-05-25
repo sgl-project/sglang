@@ -125,13 +125,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_promotes_int32_boundary_tensors_to_int64(
         self,
     ) -> None:
-        """Verify int32 boundary tensors are promoted to int64 at the launch boundary.
-
-        The canonicalize helper runs ``.to(torch.int64).contiguous()`` on
-        each boundary tensor. Allocation inside cuda graph capture is
-        legal (the graph memory pool absorbs it — see qwen3.py forward
-        for the same pattern with ``.to(dtype)`` conversions).
-        """
+        """Verify int32 boundary tensors are promoted to int64 at the launch boundary."""
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -168,11 +162,7 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
     def test_launch_endpoints_per_forward_materializes_strided_boundary_tensors(
         self,
     ) -> None:
-        """Verify non-contiguous boundary views are materialized contiguous at launch.
-
-        ``.contiguous()`` allocates a fresh copy; that allocation is fine
-        inside cuda graph capture (graph memory pool absorbs it).
-        """
+        """Verify non-contiguous boundary views are materialized contiguous at launch."""
         group = make_buffer_group(device=self.device)
         endpoint = RecordingEndpoint(kernel_kind=CanaryLaunchTag.HEAD_K_FULL)
         forward_batch = make_forward_batch(self.device, bs=1, seq_lens_list=(1,))
@@ -260,10 +250,6 @@ class TestCanaryManagerActiveSingleForwardManagerDispatch(CanaryManagerTestCase)
     def test_pre_ops_maybe_inside_graph_asserts_outside_bracket(
         self,
     ) -> None:
-        """Every call to the patched model.forward must be inside a
-        with_active_single_forward_manager(i) bracket — including cuda
-        graph capture/warmup. The dispatcher protects against silent
-        contract violations."""
         manager = make_manager(device=self.device)
         forward_batch = make_forward_batch(self.device)
         with self.assertRaises(AssertionError):
