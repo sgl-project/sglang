@@ -199,17 +199,6 @@ class Envs:
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
-    # Gemma multimodal models shift positions by +1 before feeding them into
-    # RoPE (the pretrained checkpoint was trained against 1-indexed positions).
-    # Historically this was done in-place (``positions += 1``), which mutates
-    # ``forward_batch.positions`` for the rest of the request. kv_canary's
-    # WRITE kernels read ``forward_batch.positions`` directly while VERIFY
-    # derives expected positions from 0-indexed prefix arithmetic, so the
-    # in-place shift produces systematic position-mismatch violations on every
-    # Gemma multimodal forward. Setting this flag flips the shift to
-    # out-of-place so ``forward_batch.positions`` stays canonical 0-indexed.
-    # Default is False to preserve historical behavior; test harnesses that
-    # enable kv_canary on Gemma multimodal models must turn it on.
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # Logging Options
@@ -735,49 +724,13 @@ class Envs:
     # ===================================================================
     SGLANG_KV_CANARY_RING_CAPACITY = EnvInt(1024)
     SGLANG_KV_CANARY_STATS_PRINT_EVERY_N_STEPS = EnvInt(100)
-    # Input-id / position verification inside canary_write_step. Only useful
-    # when a token_oracle is feeding expected_input_* tensors per forward;
-    # production users never set this. Test harnesses flip it on via
-    # ``token_oracle_engine_kwargs`` (test/registered/token_oracle/utils.py).
     SGLANG_KV_CANARY_INPUT_CHECK = EnvBool(False)
-    # KV cache canary perturbation. When >0, the canary install hooks corrupt
-    # ``req_to_token_pool`` rows with this per-write probability so the canary
-    # should fire. Combined with ``--kv-canary=raise`` this gives a fault-injection
-    # harness for regression-testing the canary itself.
     SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB = EnvFloat(0.0)
-    # Number of initial forward steps during which all perturb hooks are
-    # gated off. Prevents perturb from firing during sglang warmup, where a
-    # garbage write can trip a CUDA error before the canary's deferred D2H
-    # violation pump has a chance to log the canary_kind line.
     SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS = EnvInt(50)
-    # Real-KV-used perturbation. When >0, the canary self-test flips byte 0 of
-    # an active req's currently-used KV slot with this probability per forward.
-    # Detection routes through the per-forward HEAD/TAIL verify kernel
-    # (real_kv_hash violation). Simulates CUDA-graph-idle-class bugs where a
-    # live slot's KV byte is silently overwritten.
     SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB = EnvFloat(0.0)
-    # Real-KV-unused-cache perturbation. When >0, the canary self-test flips
-    # byte 0 of a radix-cached but currently-unused (orphan) KV slot with this
-    # probability per forward. Detection routes through sweep verify only
-    # (per-forward HEAD/TAIL won't look at this slot). Requires
-    # --kv-canary-sweep-interval > 0.
     SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB = EnvFloat(0.0)
-    # Real-KV-post-forward perturbation. When >0, the canary self-test flips
-    # byte 0 of a slot picked from forward_batch.out_cache_loc (the slot just
-    # written by this forward) AFTER the TAIL kernel has captured its canary
-    # hash. Designed for PD disagg self-test: P-side perturbation lands in
-    # the slot's real KV right before send_kv_chunk transfers it to D, so D's
-    # first decode forward catches the real_kv_hash violation. 0 = disabled.
     SGLANG_KV_CANARY_PERTURB_REAL_KV_POST_FORWARD_PROB = EnvFloat(0.0)
-    # Which CanaryBufferGroup the real_kv_used / real_kv_unused_cache perturb
-    # targets: "full" / "swa" exact-match the PoolKind name. Used by per-group
-    # e2e tests to drive detection deterministically.
     SGLANG_KV_CANARY_PERTURB_TARGET_GROUP = EnvStr(None)
-    # Mock-model self-test next_token_swap perturb. When >0, the sampler exit
-    # swaps two requests' sampled next tokens with this per-step probability.
-    # KV path is untouched, so KV-side fail_reasons stay silent; the
-    # token-oracle input check downstream MUST report write_token violation.
-    # 0 = disabled.
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
