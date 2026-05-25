@@ -1146,10 +1146,9 @@ class CudaGraphRunner:
 
             self.deepep_adapter.capture(is_extend_in_batch=False)
 
-            canary_manager = self.model_runner.canary_runner
             canary_ctx = (
-                canary_manager.with_active_single_forward_manager(0)
-                if canary_manager is not None
+                c.with_active_single_forward_manager(0)
+                if (c := self.model_runner.canary_runner) is not None
                 else contextlib.nullcontext()
             )
             with canary_ctx:
