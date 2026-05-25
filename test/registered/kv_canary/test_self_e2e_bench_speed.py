@@ -129,12 +129,15 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         scenario_root = profile_root / f"{scenario_slug}_on"
 
         graph_dir = scenario_root / "cuda_graph"
+        # +3 to cover prefill chunks + tail; capped so long decode runs still stop after 30 steps.
+        graph_profile_steps = min(_PROFILE_STEPS, output_len + 3)
         graph_run = _run_one_canary_setting(
             canary_on=True,
             batch_size=batch_size,
             input_len=input_len,
             output_len=output_len,
             profile_output_dir=graph_dir,
+            profile_steps=graph_profile_steps,
         )
         print(
             f"[canary self-bench] {scenario_key} profile cuda_graph: "
