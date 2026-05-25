@@ -7,27 +7,30 @@ Last updated: 2026-05-25
 Implemented:
 - Shared dense MHA/GQA correctness helpers exist in
   `test/manual/attention/unittest/utils.py`.
-- Backend-specific dense correctness files exist for `torch_native` and `triton`.
+- Backend-specific dense correctness files exist for `torch_native`, `triton`, and
+  `flashinfer`.
 - The first representative cases cover extend, decode, GQA, paged KV, and exact
   page-size boundary inputs.
+- The `flashinfer` file uses `head_dim=64` because FlashInfer SM90 prefill kernels
+  require value head dim in `{64, 128, 256}`.
 - The harness uses a small projected attention module with random shared weights,
   real `ForwardBatch` metadata, real KV/request pools, and a dense PyTorch
   reference.
 
 In progress:
-- Add the next representative dense backend, starting with `flashinfer` when the
-  local environment supports it.
-- Keep input coverage separate from attention-config coverage. For example, GQA is
-  an attention config case, while exact page-size matching is an input case.
+- None for the dense MHA/GQA split. The next work starts separate model-family files
+  for attention behavior that the dense target cannot represent.
 
 Next implementation steps:
 - Add separate model-family files for MLA, SWA, sparse/chunked KV, linear attention,
   Mamba, and speculative draft/verify paths.
 
 Verified:
-- `python -m py_compile test/manual/attention/unittest/utils.py test/manual/attention/unittest/test_torch_native_backend_correctness.py test/manual/attention/unittest/test_triton_backend_correctness.py`
+- `python -m py_compile test/manual/attention/unittest/utils.py test/manual/attention/unittest/test_torch_native_backend_correctness.py test/manual/attention/unittest/test_triton_backend_correctness.py test/manual/attention/unittest/test_flashinfer_backend_correctness.py`
 - `python test/manual/attention/unittest/test_torch_native_backend_correctness.py -v`
 - `python test/manual/attention/unittest/test_triton_backend_correctness.py -v`
+- `python test/manual/attention/unittest/test_flashinfer_backend_correctness.py -v`
+- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*_backend_correctness.py' -v`
 
 ---
 
@@ -367,7 +370,7 @@ speculative-only attention modes and metadata that Phase 2 cannot exercise.
 
 ## Implementation Phases
 
-### Phase 1 — Infrastructure (`test/srt/attention/utils.py`)
+### Phase 1 — Infrastructure (`test/manual/attention/unittest/utils.py`)
 
 #### 1a. Module target adapters
 
@@ -515,7 +518,7 @@ def assert_close(case, ref, out):
 
 ---
 
-### Phase 2 — Backend correctness tests (`test/srt/attention/test_backend_correctness.py`)
+### Phase 2 — Backend correctness tests (`test/manual/attention/unittest/test_<backend>_backend_correctness.py`)
 
 For each supported `AttentionCase`:
 
@@ -558,19 +561,21 @@ Required input cases:
 Invalid combinations are `skipIf`-guarded through the capability helper.
 
 Initial implementation slice:
-- `test_backend_correctness.py` starts with a projected dense attention target that
-  owns Q/K/V/O projections and dispatches through `RadixAttention`.
-- It covers representative `torch_native` and `triton` backend cases for MHA and GQA.
+- `utils.py` contains a projected dense attention target that owns Q/K/V/O
+  projections and dispatches through `RadixAttention`.
+- Backend-specific files cover representative `torch_native`, `triton`, and
+  `flashinfer` backend cases for MHA and GQA.
 - It exercises page size 1, exact-page extend, page-boundary decode
   (`seq_len = page_size - 1`, `page_size`, `page_size + 1`), zero/nonzero prefix,
   and GQA head grouping as an attention-config case.
+- `flashinfer` cases use `head_dim=64` to match FlashInfer kernel constraints.
 - Future slices should replace or extend this tiny projected target with real
   model-specific modules for SWA, MLA, DSA, DSV4, linear attention, Mamba, and spec
   decode paths.
 
 ---
 
-### Phase 3 — Runner integration tests (`test/srt/attention/test_runner_integration.py`)
+### Phase 3 — Runner integration tests (`test/manual/attention/unittest/test_runner_integration.py`)
 
 Use a smaller representative subset from Phase 2. The goal is runner bookkeeping, not
 another full correctness matrix.
@@ -590,7 +595,7 @@ of as part of the full Cartesian product.
 
 ---
 
-### Phase 4 — Speculative decoding attention (`test/srt/attention/test_spec_decoding_attention.py`)
+### Phase 4 — Speculative decoding attention (`test/manual/attention/unittest/test_spec_decoding_attention.py`)
 
 #### 4a. Synthetic spec metadata correctness
 
