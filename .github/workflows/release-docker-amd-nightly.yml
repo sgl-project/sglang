@@ -123,14 +123,14 @@ jobs:
           retention-days: 1
 
       - name: Login to Docker Hub (lmsys)
-        if: inputs.tag_suffix == ''
+        if: github.event_name != 'workflow_dispatch' || inputs.tag_suffix == ''
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push to lmsysorg/sglang-rocm
-        if: inputs.tag_suffix == ''
+        if: github.event_name != 'workflow_dispatch' || inputs.tag_suffix == ''
         run: |
           docker tag rocm/sgl-dev:${{ env.IMAGE_TAG }} lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
           docker push lmsysorg/sglang-rocm:${{ env.IMAGE_TAG }}
@@ -145,7 +145,7 @@ jobs:
   push_local_registry:
     # Skip the local-registry mirror for ad-hoc suffixed test images so we don't
     # pollute the shared in-network registry that powers normal CI pulls.
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && inputs.tag_suffix == '' }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.tag_suffix == '') }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
