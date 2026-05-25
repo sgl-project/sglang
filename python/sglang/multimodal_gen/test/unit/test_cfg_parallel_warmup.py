@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import
     InputValidationStage,
 )
 from sglang.multimodal_gen.runtime.server_warmup import (
+    DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
     DEFAULT_PLACEHOLDER_PROMPT,
     build_warmup_reqs,
 )
@@ -138,6 +139,61 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertTrue(req.extra["return_warmup_result"])
         self.assertTrue(req.extra["server_based_warmup"])
+
+    def test_server_based_warmup_uses_model_default_resolution(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(width=640, height=640)
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(req.width, 640)
+        self.assertEqual(req.height, 640)
+
+    def test_server_based_warmup_keeps_lightweight_image_fallback(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        req = reqs[0]
+        self.assertEqual(
+            (req.width, req.height),
+            DEFAULT_LIGHTWEIGHT_IMAGE_RESOLUTION,
+        )
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):

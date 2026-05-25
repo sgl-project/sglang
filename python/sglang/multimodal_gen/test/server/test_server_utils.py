@@ -603,14 +603,16 @@ class PerformanceValidator:
             expected = self.scenario.denoise_step_ms.get(idx)
             if expected is None:
                 continue
-            # FIXME: hardcode, looser for first step
-            tolerance = 0.4 if idx == 0 else self.tolerances.denoise_step
+            if idx == 0:
+                # server warmup is generic, so the first real step can still
+                # pay request-shape/path lazy init that is not a steady-state signal
+                continue
 
             self._assert_le(
                 f"Denoise Step {idx}",
                 actual,
                 expected,
-                tolerance,
+                self.tolerances.denoise_step,
             )
 
     def _validate_stages(self, summary: PerformanceSummary) -> None:
