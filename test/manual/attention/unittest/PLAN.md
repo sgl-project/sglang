@@ -22,8 +22,9 @@ Implemented:
   `RadixAttention` or backend calls.
 - GDN hybrid-linear attention backend correctness exists under
   `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
-  linear-attention kernel backend `triton`; its expected path is now a pure
-  PyTorch gated-delta recurrence, not the Triton/FLA GDN kernels.
+  linear-attention kernel backend `triton`; its expected path is now a separate
+  reference module plus pure PyTorch gated-delta recurrence, not the Triton/FLA
+  GDN kernels.
 - Phase 3 dense runner integration is implemented for representative attention
   backends: eager mode for `torch_native`, and CUDA-graph metadata capture/replay
   decode mode for `triton` and `flashinfer`. The CUDA-graph tests now capture
@@ -52,13 +53,11 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Audit GDN against the stricter reference rule. Its recurrence is already pure
-  PyTorch, but the expected path still reads shapes/parameters from the actual
-  module object instead of a separate reference module with copied weights.
+- No active representative-reference split remains for dense/SWA/MLA/GDN. The next
+  implementation slice should either add MLA-specialized backends or replace the
+  tiny MLA actual module with direct `DeepseekV2AttentionMLA` instantiation.
 
 Next implementation steps:
-- Split GDN into explicit actual/reference modules with copied parameters, keeping
-  the existing pure PyTorch recurrence for expected outputs.
 - Decide whether the MLA actual target should move from the current tiny
   DeepSeek-shaped module to direct instantiation of `DeepseekV2AttentionMLA`; that
   stricter target requires more global server-args/config scaffolding but would
@@ -78,6 +77,8 @@ Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
 - `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
 - `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
+- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
+- `python test/manual/attention/unittest/gdn/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---

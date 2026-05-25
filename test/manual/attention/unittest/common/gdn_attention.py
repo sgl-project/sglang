@@ -323,12 +323,58 @@ class ProjectedGDNAttention(nn.Module):
         return self.attn(forward_batch, mixed_qkv=mixed_qkv, a=a, b=b)
 
 
+class ReferenceGDNAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_k_dim: int,
+        head_v_dim: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__()
+        self.num_k_heads = num_k_heads
+        self.num_v_heads = num_v_heads
+        self.head_k_dim = head_k_dim
+        self.head_v_dim = head_v_dim
+        self.A_log = nn.Parameter(
+            torch.empty(num_v_heads, dtype=torch.float32, device=device)
+        )
+        self.dt_bias = nn.Parameter(
+            torch.empty(num_v_heads, dtype=dtype, device=device)
+        )
+
+    @property
+    def mixed_qkv_dim(self) -> int:
+        return (
+            2 * self.num_k_heads * self.head_k_dim + self.num_v_heads * self.head_v_dim
+        )
+
+    def split_qkv(self, mixed_qkv: torch.Tensor):
+        q, k, v = torch.split(
+            mixed_qkv,
+            [
+                self.num_k_heads * self.head_k_dim,
+                self.num_k_heads * self.head_k_dim,
+                self.num_v_heads * self.head_v_dim,
+            ],
+            dim=-1,
+        )
+        q = q.view(1, mixed_qkv.shape[0], self.num_k_heads, self.head_k_dim)
+        k = k.view(1, mixed_qkv.shape[0], self.num_k_heads, self.head_k_dim)
+        v = v.view(1, mixed_qkv.shape[0], self.num_v_heads, self.head_v_dim)
+        return q, k, v
+
+
 @dataclass
 class GDNAttentionFixture:
     case: GDNAttentionCase
     runner: MockGDNModelRunner
     backend: HybridLinearAttnBackend
-    module: ProjectedGDNAttention
+    actual_module: ProjectedGDNAttention
+    reference_module: ReferenceGDNAttention
     forward_batch: ForwardBatch
     mixed_qkv: torch.Tensor
     a: torch.Tensor
@@ -462,7 +508,7 @@ def build_gdn_attention_fixture(
     initialize_linear_attn_config(runner.server_args)
     linear_backend = GDNAttnBackend(runner)
     backend = HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers=[])
-    module = ProjectedGDNAttention(
+    actual_module = ProjectedGDNAttention(
         num_k_heads=case.num_k_heads,
         num_v_heads=case.num_v_heads,
         head_k_dim=head_k_dim,
@@ -470,6 +516,15 @@ def build_gdn_attention_fixture(
         dtype=dtype,
         device=device,
     )
+    reference_module = ReferenceGDNAttention(
+        num_k_heads=case.num_k_heads,
+        num_v_heads=case.num_v_heads,
+        head_k_dim=head_k_dim,
+        head_v_dim=head_v_dim,
+        dtype=dtype,
+        device=device,
+    )
+    _copy_gdn_parameters(actual_module, reference_module)
     forward_batch = _make_forward_batch(
         case,
         runner,
@@ -478,7 +533,7 @@ def build_gdn_attention_fixture(
     )
     mixed_qkv = torch.randn(
         case.num_input_tokens,
-        module.mixed_qkv_dim,
+        actual_module.mixed_qkv_dim,
         dtype=dtype,
         device=device,
     )
@@ -489,12 +544,22 @@ def build_gdn_attention_fixture(
         case=case,
         runner=runner,
         backend=backend,
-        module=module,
+        actual_module=actual_module,
+        reference_module=reference_module,
         forward_batch=forward_batch,
         mixed_qkv=mixed_qkv,
         a=a,
         b=b,
     )
+
+
+def _copy_gdn_parameters(
+    actual: ProjectedGDNAttention,
+    reference: ReferenceGDNAttention,
+):
+    with torch.no_grad():
+        reference.A_log.copy_(actual.A_log)
+        reference.dt_bias.copy_(actual.dt_bias)
 
 
 def _ssm_states(fixture: GDNAttentionFixture) -> torch.Tensor:
@@ -510,7 +575,7 @@ def _cache_indices(fixture: GDNAttentionFixture) -> torch.Tensor:
 def run_gdn_fixture_eager(fixture: GDNAttentionFixture) -> torch.Tensor:
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        return fixture.module(
+        return fixture.actual_module(
             fixture.forward_batch,
             fixture.mixed_qkv,
             fixture.a,
@@ -519,7 +584,7 @@ def run_gdn_fixture_eager(fixture: GDNAttentionFixture) -> torch.Tensor:
 
 
 def _pure_torch_gdn_gating(
-    module: ProjectedGDNAttention,
+    module: ReferenceGDNAttention,
     a: torch.Tensor,
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -534,9 +599,10 @@ def _pure_torch_gdn_reference(
     fixture: GDNAttentionFixture,
     initial_ssm_states: torch.Tensor,
 ) -> GDNReferenceOutput:
-    q, k, v = fixture.module.split_qkv(fixture.mixed_qkv)
+    module = fixture.reference_module
+    q, k, v = module.split_qkv(fixture.mixed_qkv)
     cache_indices = _cache_indices(fixture)
-    g, beta = _pure_torch_gdn_gating(fixture.module, fixture.a, fixture.b)
+    g, beta = _pure_torch_gdn_gating(module, fixture.a, fixture.b)
     q = q.float()
     k = k.float()
     v = v.float()
@@ -545,7 +611,7 @@ def _pure_torch_gdn_reference(
         1,
         fixture.case.num_input_tokens,
         fixture.case.num_v_heads,
-        fixture.module.head_v_dim,
+        module.head_v_dim,
         dtype=torch.float32,
         device=fixture.runner.device,
     )
@@ -567,7 +633,7 @@ def _pure_torch_gdn_reference(
 
                 q_norm = q_vec / torch.sqrt(torch.sum(q_vec * q_vec) + 1e-6)
                 k_norm = k_vec / torch.sqrt(torch.sum(k_vec * k_vec) + 1e-6)
-                q_norm = q_norm * (fixture.module.head_k_dim**-0.5)
+                q_norm = q_norm * (module.head_k_dim**-0.5)
 
                 head_state = state[v_head]
                 head_state = head_state * torch.exp(g[token_idx, v_head])
