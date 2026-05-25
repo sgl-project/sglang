@@ -1753,9 +1753,7 @@ class EncoderScheduler:
             if err is None:
                 valid.append(p)
                 continue
-            logger.error(
-                f"Dropping req_id={p.request.get('req_id')} from batch: {err}"
-            )
+            logger.error(f"Dropping req_id={p.request.get('req_id')} from batch: {err}")
             if not p.future.done():
                 p.future.set_exception(BadRequestError(err))
         if not valid:
