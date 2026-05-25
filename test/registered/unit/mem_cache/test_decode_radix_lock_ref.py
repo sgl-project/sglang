@@ -26,11 +26,14 @@ register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.decode import (
+    DecodePreallocQueue,
+    _cleanup_decode_request_resources,
+)
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
@@ -94,6 +97,67 @@ def _make_req(fill_ids, req_pool_idx=0, cache_protected_len=0, last_node=None):
 
 class TestDecodeLockRefScenarios(unittest.TestCase):
     """Test lock_ref balance across decode transfer scenarios."""
+
+    def test_hisparse_cleanup_releases_all_decode_resources(self):
+        req = MagicMock()
+        req.req_pool_idx = 7
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.metadata_buffer_index = 3
+
+        scheduler = MagicMock()
+        scheduler.enable_hisparse = True
+        scheduler.hisparse_coordinator = MagicMock()
+        tree_cache = MagicMock()
+        metadata_allocator = MagicMock()
+        events = []
+
+        scheduler.hisparse_coordinator.request_finished.side_effect = (
+            lambda _: events.append("hisparse")
+        )
+        metadata_allocator.free.side_effect = lambda idx: events.append(
+            ("metadata", idx)
+        )
+
+        with patch("sglang.srt.disaggregation.decode.release_kv_cache") as release:
+            release.side_effect = lambda *args, **kwargs: events.append(
+                ("kv", kwargs["is_insert"])
+            )
+
+            _cleanup_decode_request_resources(
+                decode_req,
+                scheduler,
+                tree_cache,
+                metadata_allocator,
+                is_insert=False,
+            )
+
+        self.assertEqual(events, ["hisparse", ("kv", False), ("metadata", 3)])
+        self.assertEqual(decode_req.metadata_buffer_index, -1)
+
+    def test_prealloc_abort_removes_pending_and_cleans_allocated_req(self):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+
+        req = MagicMock()
+        req.rid = "req-abort"
+        req.return_logprob = False
+        decode_req = MagicMock()
+        decode_req.req = req
+        decode_req.kv_receiver.abort = MagicMock()
+
+        queue.queue = [decode_req]
+        queue.pending_reqs = [decode_req]
+        queue.scheduler = MagicMock()
+        queue.scheduler.stream_output = MagicMock()
+        queue._cleanup_decode_req = MagicMock()
+
+        queue.abort_requests("req-abort", abort_all=False)
+
+        self.assertEqual(queue.queue, [])
+        self.assertEqual(queue.pending_reqs, [])
+        decode_req.kv_receiver.abort.assert_called_once()
+        queue.scheduler.stream_output.assert_called_once_with([req], False)
+        queue._cleanup_decode_req.assert_called_once_with(decode_req)
 
     def _populate_prefix(self, cache, prefix_ids, prefix_values):
         """Insert a prefix into the tree so future requests can match it."""

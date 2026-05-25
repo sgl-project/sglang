@@ -172,6 +172,25 @@ class HiSparseCoordinator:
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
 
+        logger.info(
+            "HiSparse coordinator initialized: dsv4=%s top_k=%d "
+            "device_buffer_size=%d page_size=%d padded_buffer_size=%d "
+            "compress_ratio=%d logical_size=%d device_hot_size=%d "
+            "host_size=%d max_req_slots=%d max_context_len=%d item_size_bytes=%d",
+            self.is_dsv4_hisparse,
+            self.top_k,
+            self.device_buffer_size,
+            self.mem_pool_device.page_size,
+            self.padded_buffer_size,
+            self.compress_ratio,
+            self.token_to_kv_pool_allocator.size_full,
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.size,
+            self.mem_pool_host.size,
+            max_num_req_slots,
+            max_context_len,
+            self.item_size_bytes,
+        )
+
     def _round_up_to_host_page(self, size: int) -> int:
         return (size + self.page_size - 1) // self.page_size * self.page_size
 
