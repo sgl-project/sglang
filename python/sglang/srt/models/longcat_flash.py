@@ -494,24 +494,13 @@ class LongcatFlashDecoderLayer(nn.Module):
         )
 
         if enable_double_stream:
-            main_stream = self.device_module.current_stream()
-            first_attn_finished = self.device_module.Event()
-
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
                 hidden_states, residual, forward_batch
             )
-            first_attn_finished.record(main_stream)
 
-            moe_hidden_states = None
-            with self.device_module.stream(self.moe_alt_stream):
-                self.device_module.current_stream().wait_event(first_attn_finished)
-                moe_hidden_states = self.mlp(hidden_states)
-                moe_hidden_states, moe_residual = (
-                    self.moe_layer_communicator.postprocess_layer(
-                        moe_hidden_states, moe_residual, forward_batch
-                    )
-                )
-                moe_hidden_states.record_stream(main_stream)
+            main_stream = self.device_module.current_stream()
+            first_attn_finished = self.device_module.Event()
+            first_attn_finished.record(main_stream)
 
             mlp_hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states,
@@ -524,6 +513,16 @@ class LongcatFlashDecoderLayer(nn.Module):
                 mlp_hidden_states = mlp_hidden_states.tensor_split(self.attn_tp_size)[
                     self.attn_tp_rank
                 ]
+
+            with self.device_module.stream(self.moe_alt_stream):
+                self.device_module.current_stream().wait_event(first_attn_finished)
+                moe_hidden_states = self.mlp(hidden_states)
+                moe_hidden_states, moe_residual = (
+                    self.moe_layer_communicator.postprocess_layer(
+                        moe_hidden_states, moe_residual, forward_batch
+                    )
+                )
+                moe_hidden_states.record_stream(main_stream)
 
             main_stream.wait_stream(self.moe_alt_stream)
             hidden_states = moe_hidden_states + mlp_hidden_states
