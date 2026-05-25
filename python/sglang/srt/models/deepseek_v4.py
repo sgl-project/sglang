@@ -133,6 +133,177 @@ def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps):
     return x_quant, x_bf16
 
 
+_FUSED_HC_POST_PRE_M_THRESHOLD = 64
+_FUSED_HC_POST_PRE_CACHE: dict[tuple, dict[str, torch.Tensor]] = {}
+_TRITON_MHC_POST_PRE_OPS = None
+_TRITON_MHC_POST_PRE_RUNTIME_DISABLED = False
+
+
+def _get_triton_mhc_post_pre_ops():
+    global _TRITON_MHC_POST_PRE_OPS
+
+    if _TRITON_MHC_POST_PRE_OPS is not None:
+        return _TRITON_MHC_POST_PRE_OPS
+
+    try:
+        from aiter.ops.triton.fusions.mhc import mhc_post_pre
+        from aiter.ops.triton.utils.mhc_config_utils import get_mhc_config
+    except Exception as err:
+        logger.warning(
+            "Triton fused mHC (mhc_post_pre) is unavailable, falling back: %s", err
+        )
+        return None
+
+    _TRITON_MHC_POST_PRE_OPS = (mhc_post_pre, get_mhc_config)
+    return _TRITON_MHC_POST_PRE_OPS
+
+
+def _get_fused_hc_post_pre_buffers(
+    num_tokens: int,
+    hidden_size: int,
+    hc_mult: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Optional[dict[str, torch.Tensor]]:
+    ops = _get_triton_mhc_post_pre_ops()
+    if ops is None:
+        return None
+    _, get_mhc_config = ops
+
+    key = (num_tokens, hidden_size, hc_mult, dtype, device.type, device.index)
+    bufs = _FUSED_HC_POST_PRE_CACHE.get(key)
+    if bufs is not None:
+        return bufs
+
+    try:
+        cfg, _ = get_mhc_config("MHC_FUSED", num_tokens, hidden_size, mode="sinkhorn")
+    except Exception as err:
+        logger.warning("Failed to initialize fused mHC config, falling back: %s", err)
+        return None
+
+    n_total = 2 * hc_mult + hc_mult * hc_mult
+    k_dim = hc_mult * hidden_size
+    block_k = cfg.get("BLOCK_K", min(512, triton.next_power_of_2(k_dim)))
+    block_k = min(block_k, triton.next_power_of_2(k_dim))
+    block_c_split = max(block_k // hc_mult, 1)
+    num_ksplit = triton.cdiv(hidden_size, block_c_split)
+
+    bufs = {
+        "residual_out": torch.empty(
+            num_tokens, hc_mult, hidden_size, dtype=dtype, device=device
+        ),
+        "layer_input_out": torch.empty(
+            num_tokens, hidden_size, dtype=dtype, device=device
+        ),
+        "h_post": torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=device),
+        "h_res": torch.empty(
+            num_tokens, hc_mult, hc_mult, dtype=torch.float32, device=device
+        ),
+        "acc_partial": torch.empty(
+            num_ksplit, num_tokens, n_total, dtype=torch.float32, device=device
+        ),
+        "acc_sq_partial": torch.empty(
+            num_ksplit, num_tokens, dtype=torch.float32, device=device
+        ),
+    }
+    _FUSED_HC_POST_PRE_CACHE[key] = bufs
+    return bufs
+
+
+def _try_fused_hc_post_pre(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    hc_fn_t: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    norm_eps: float,
+    hc_eps: float,
+    hc_post_mult: float,
+    sinkhorn_iters: int,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    global _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
+
+    if (
+        _TRITON_MHC_POST_PRE_RUNTIME_DISABLED
+        or not envs.SGLANG_OPT_USE_TRITON_FUSED_MHC.get()
+        or not _is_gfx95_supported
+        or x.shape[0] == 0
+        or x.shape[0] > _FUSED_HC_POST_PRE_M_THRESHOLD
+        or x.dim() != 2
+        or residual.dim() != 3
+    ):
+        return None
+
+    ops = _get_triton_mhc_post_pre_ops()
+    if ops is None:
+        return None
+    mhc_post_pre, _ = ops
+
+    bufs = _get_fused_hc_post_pre_buffers(
+        x.shape[0], x.shape[1], hc_mult, residual.dtype, x.device
+    )
+    if bufs is None:
+        return None
+
+    try:
+        _, _, layer_input_out, new_residual = mhc_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            hc_fn_t,
+            hc_scale,
+            hc_base,
+            hc_mult,
+            norm_eps,
+            hc_eps,
+            hc_post_mult,
+            sinkhorn_iters,
+            # Match sglang's exp-domain asymmetric Sinkhorn used in hc_pre.
+            asymmetric_exp_domain=True,
+            hc_sinkhorn_eps=hc_eps,
+            residual_out=bufs["residual_out"],
+            h_post=bufs["h_post"],
+            h_res=bufs["h_res"],
+            layer_input_out=bufs["layer_input_out"],
+            acc_partial=bufs["acc_partial"],
+            acc_sq_partial=bufs["acc_sq_partial"],
+        )
+    except Exception as err:
+        logger.warning(
+            "Triton fused mHC kernel failed, disabling fallback path: %s", err
+        )
+        _TRITON_MHC_POST_PRE_RUNTIME_DISABLED = True
+        return None
+
+    return new_residual, layer_input_out, bufs["h_post"], bufs["h_res"]
+
+
+_FREQS_CIS_TO_COS_SIN: dict[
+    Tuple[int, torch.dtype, torch.device], Tuple[torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _freqs_cis_to_cos_sin(
+    freqs_cis: torch.Tensor, dtype: torch.dtype, device: torch.device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Derive (cos, sin) bf16 contiguous tables from a complex64 `freqs_cis`,
+    cached by `(id(freqs_cis), dtype, device)` so that all layers sharing the
+    same `freqs_cis` (via `precompute_freqs_cis`'s lru_cache) reuse one pair."""
+    key = (id(freqs_cis), dtype, device)
+    cached = _FREQS_CIS_TO_COS_SIN.get(key)
+    if cached is not None:
+        return cached
+    fr = torch.view_as_real(freqs_cis)
+    cos = fr[..., 0].to(device=device, dtype=dtype).contiguous()
+    sin = fr[..., 1].to(device=device, dtype=dtype).contiguous()
+    _FREQS_CIS_TO_COS_SIN[key] = (cos, sin)
+    return cos, sin
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
@@ -1189,17 +1360,29 @@ class DeepseekV4DecoderLayer(nn.Module):
             x_quant=x_quant,
         )
 
-        hidden_states = self.hc_post(hidden_states, residual, post, comb)
-        residual = hidden_states
-        hidden_states, post, comb, norm_fused = self.hc_pre(
+        fused_mhc = _try_fused_hc_post_pre(
             hidden_states,
-            self.hc_ffn_fn,
+            residual,
+            post,
+            comb,
+            self.hc_ffn_fn.T,
             self.hc_ffn_scale,
             self.hc_ffn_base,
-            norm=self.post_attention_layernorm,
+            self.hc_mult,
+            self.rms_norm_eps,
+            self.hc_eps,
+            2.0,
+            self.hc_sinkhorn_iters,
         )
-        if not norm_fused:
-            hidden_states = self.post_attention_layernorm(hidden_states)
+        if fused_mhc is not None:
+            residual, hidden_states, post, comb = fused_mhc
+        else:
+            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            residual = hidden_states  # [n, hc, d]
+            hidden_states, post, comb = self.hc_pre(
+                hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )  # -> [n, d]
+        hidden_states = self.post_attention_layernorm(hidden_states)
 
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _use_tp_moe_gather = (
