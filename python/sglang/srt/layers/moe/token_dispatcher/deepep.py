@@ -5,7 +5,10 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
-from sglang.srt.distributed.parallel_state import get_tp_group
+from sglang.srt.distributed.parallel_state import (
+    get_double_stream_ep_group,
+    get_tp_group,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
@@ -66,7 +69,12 @@ def _deepep_precompile_tp_barrier() -> None:
     # so if different ranks compile at different speeds, it may quickly trigger a timeout.
     # To avoid this, we use torch.distributed's barrier during the compile stage.
     # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
-    if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+    if not envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
+        return
+
+    if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+        get_double_stream_ep_group().barrier()
+    else:
         get_tp_group().barrier()
 
 
@@ -457,7 +465,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
-        # _deepep_precompile_tp_barrier()
+        _deepep_precompile_tp_barrier()
         (
             recv_x,
             recv_topk_ids,
@@ -518,7 +526,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
-        # _deepep_precompile_tp_barrier()
+        _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
@@ -644,7 +652,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
-        # _deepep_precompile_tp_barrier()
+        _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -724,7 +732,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args_dict = {}
 
         with ctx:
-            # _deepep_precompile_tp_barrier()
+            _deepep_precompile_tp_barrier()
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
