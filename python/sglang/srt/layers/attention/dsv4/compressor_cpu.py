@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.utils import cpu_has_amx_support
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 _cpu_amx = cpu_has_amx_support()
 
@@ -35,7 +36,9 @@ class CompressorCPU(_CompressorBase):
         super().__init__(*args, **kwargs)
 
     def _get_states(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> "KVAndScoreSeparate | CompressStatePool":
         """Return the per-layer compress-state for this Compressor.
 
@@ -43,14 +46,16 @@ class CompressorCPU(_CompressorBase):
         otherwise it is a ``KVAndScore`` / ``KVAndScoreSeparate`` view of the
         per-request non-paged buffer.
         """
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = attn_backend.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
             return token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         return token_to_kv_pool.get_attention_compress_states(self.layer_id)
 
-    def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
-        ret = self._get_states(forward_batch)
+    def get_state_pool(
+        self, forward_batch: ForwardBatch, attn_backend: AttentionBackend
+    ) -> CompressStatePool:
+        ret = self._get_states(forward_batch, attn_backend)
         assert isinstance(ret, CompressStatePool)
         return ret
 
@@ -75,18 +80,26 @@ class CompressorCPU(_CompressorBase):
     def compute_state_len(seq_len: int, ratio: int):
         return seq_len % ratio + (ratio == 4) * ratio
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
+    ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
         kv_score = self.compute_kv_score(x, forward_batch)
-        return self.compress_dispatch(kv_score, forward_batch)
+        return self.compress_dispatch(
+            kv_score, forward_batch, attn_backend=attn_backend
+        )
 
     def compress_decode_separate(
         self,
         kv_and_scores: "KVAndScoreSeparate",
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
@@ -96,7 +109,7 @@ class CompressorCPU(_CompressorBase):
 
         assert self.ape_converted
         seq_lens = forward_batch.seq_lens
-        pool = self._get_states(forward_batch)
+        pool = self._get_states(forward_batch, attn_backend)
         assert isinstance(pool, KVAndScoreSeparate)
         req_pool_indices = forward_batch.req_pool_indices
 
@@ -160,6 +173,7 @@ class CompressorCPU(_CompressorBase):
         self,
         kv_and_scores: "KVAndScoreSeparate",
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
@@ -168,7 +182,7 @@ class CompressorCPU(_CompressorBase):
         """
         assert self.ape_converted
 
-        kv_and_score_states = self._get_states(forward_batch)
+        kv_and_score_states = self._get_states(forward_batch, attn_backend)
         assert isinstance(kv_and_score_states, KVAndScoreSeparate)
         _, _, head_dim_times_coff = kv_and_score_states.kv.shape
 
@@ -277,6 +291,7 @@ class CompressorCPU(_CompressorBase):
         self,
         kv_score: torch.Tensor,
         forward_batch: ForwardBatch,
+        attn_backend: AttentionBackend,
     ) -> torch.Tensor:
         self.compress_decode = self.compress_decode_separate
         self.compress_extend = self.compress_extend_separate
@@ -286,7 +301,7 @@ class CompressorCPU(_CompressorBase):
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode() or forward_mode.is_target_verify():
             if _cpu_amx:
-                pool = self._get_states(forward_batch)
+                pool = self._get_states(forward_batch, attn_backend)
                 assert isinstance(pool, KVAndScoreSeparate)
                 freqs_real = self._get_freqs_cis_real()
                 norm_weight = self.norm.weight.float()
@@ -309,9 +324,9 @@ class CompressorCPU(_CompressorBase):
                     self.rotate,
                     self.norm.variance_epsilon,
                 )
-            return self.compress_decode(kv_and_scores, forward_batch)
+            return self.compress_decode(kv_and_scores, forward_batch, attn_backend)
         if forward_mode.is_extend():
-            return self.compress_extend(kv_and_scores, forward_batch)
+            return self.compress_extend(kv_and_scores, forward_batch, attn_backend)
         raise NotImplementedError(
             f"Forward mode {forward_mode} not supported in KVAndScoreSeparate compressor."
         )

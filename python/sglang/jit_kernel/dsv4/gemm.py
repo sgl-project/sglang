@@ -20,11 +20,11 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         return torch.ops.sgl_kernel.weight_packed_linear(
             x, y, None, True, torch.float32
         )
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
     elif _linear_bf16_fp32_algo == "deep_gemm":
         z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
-    elif _use_aiter:
-        return tgemm.mm(x, y, otype=torch.float32)
     else:
         return torch.mm(x, y.t(), out_dtype=torch.float32)

@@ -7,7 +7,29 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-b-test-cpu")
+register_cpu_ci(est_time=25, suite="base-b-test-cpu")
+
+torch.manual_seed(42)
+
+DEVICE = "cpu"
+CACHE_SIZE = 4096
+
+# for fp8 KV stored as uint8, e.g. float8_e4m3fn and float8_e5m2
+DTYPES = [torch.float16, torch.bfloat16, torch.uint8]
+DTYPE_IDS = ["float16", "bfloat16", "uint8"]
+
+
+def _store_cache_cpu(k, v, k_cache, v_cache, indices):
+    row_dim = k.size(1) * k.size(2)
+    torch.ops.sgl_kernel.store_cache_cpu(k, v, k_cache, v_cache, indices, row_dim)
+
+
+def _random_tensor(shape, dtype):
+    """FP8 KV is stored as uint8; randn is not implemented for Byte."""
+    if dtype == torch.uint8:
+        return torch.randint(0, 256, shape, dtype=torch.uint8, device=DEVICE)
+    return torch.randn(shape, dtype=dtype, device=DEVICE)
+
 
 torch.manual_seed(42)
 
@@ -78,6 +100,78 @@ def make_test_data(
     scale_k_nope = torch.randint(0, 256, (num_tokens, scale_dim), dtype=torch.uint8)
 
     return buf, loc, k_nope, k_rope, scale_k_nope
+
+
+class TestStoreCache(CustomTestCase):
+    def _test_store_cache(self, batch_size, num_heads, head_dim, dtype):
+        shape = (batch_size, num_heads, head_dim)
+        cache_shape = (CACHE_SIZE, num_heads, head_dim)
+        k = _random_tensor(shape, dtype)
+        v = _random_tensor(shape, dtype)
+        k_cache = _random_tensor(cache_shape, dtype)
+        v_cache = _random_tensor(cache_shape, dtype)
+        indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[
+            :batch_size
+        ]
+
+        k_cache_ref = k_cache.clone()
+        v_cache_ref = v_cache.clone()
+        k_cache_ref[indices] = k
+        v_cache_ref[indices] = v
+
+        _store_cache_cpu(k, v, k_cache, v_cache, indices)
+
+        assert torch.equal(k_cache, k_cache_ref)
+        assert torch.equal(v_cache, v_cache_ref)
+
+    def test_store_cache(self):
+        dtype = DTYPES
+        head_dim = [64, 128]
+        num_heads = [1, 8, 16, 32]
+        batch_size = [1, 7, 133]
+        for params in itertools.product(batch_size, num_heads, head_dim, dtype):
+            with self.subTest(
+                batch_size=params[0],
+                num_heads=params[1],
+                head_dim=params[2],
+                dtype=params[3],
+            ):
+                self._test_store_cache(*params)
+
+    def _test_store_cache_int32_indices(self, batch_size, num_heads, head_dim, dtype):
+        shape = (batch_size, num_heads, head_dim)
+        cache_shape = (CACHE_SIZE, num_heads, head_dim)
+        k = _random_tensor(shape, dtype)
+        v = _random_tensor(shape, dtype)
+        k_cache = _random_tensor(cache_shape, dtype)
+        v_cache = _random_tensor(cache_shape, dtype)
+        indices = torch.randperm(CACHE_SIZE, device=DEVICE, dtype=torch.int64)[
+            :batch_size
+        ].to(torch.int32)
+
+        k_cache_ref = k_cache.clone()
+        v_cache_ref = v_cache.clone()
+        k_cache_ref[indices.long()] = k
+        v_cache_ref[indices.long()] = v
+
+        _store_cache_cpu(k, v, k_cache, v_cache, indices)
+
+        assert torch.equal(k_cache, k_cache_ref)
+        assert torch.equal(v_cache, v_cache_ref)
+
+    def test_store_cache_int32_indices(self):
+        dtype = DTYPES
+        head_dim = [64, 128]
+        num_heads = [1, 8]
+        batch_size = [11]
+        for params in itertools.product(batch_size, num_heads, head_dim, dtype):
+            with self.subTest(
+                batch_size=params[0],
+                num_heads=params[1],
+                head_dim=params[2],
+                dtype=params[3],
+            ):
+                self._test_store_cache_int32_indices(*params)
 
 
 class TestSetKAndS(CustomTestCase):
