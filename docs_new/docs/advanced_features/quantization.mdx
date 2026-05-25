@@ -50,6 +50,13 @@ The following table summarizes quantization method support across NVIDIA and AMD
       <td>Requires CDNA3/CDNA4 with MXFP support; uses Aiter</td>
     </tr>
     <tr>
+      <td><code>mxfp8</code></td>
+      <td>No</td>
+      <td>No</td>
+      <td>Yes (A5)</td>
+      <td>MXFP8 on Ascend (Diffusion + LLM dense Linear). Requires Ascend A5 series; uses CANN <code>npu_dynamic_mx_quant</code> / <code>npu_quant_matmul</code> kernels</td>
+    </tr>
+    <tr>
       <td><code>blockwise_int8</code></td>
       <td>Yes</td>
       <td>Yes</td>
