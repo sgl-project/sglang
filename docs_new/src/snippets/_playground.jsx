@@ -22,7 +22,9 @@
 //   config.playgroundFeatures   — keyed map; presence of a key opts that axis
 //                                 in for this cookbook. Recognised keys
 //                                 (current set):
-//     attention   — knobs[] with TP/DP/CP/DP-Attention sub-controls
+//     attention   — knobs[] with TP/CP/DP-Attention sub-controls (DP-Attention
+//                   is a combined knob: numeric value sets --dp N AND
+//                   --enable-dp-attention; `false` strips both)
 //     moe         — backend.options[] + ep.values[]
 //     parsers     — items[] (each emits one toggle flag)
 //     speculative — options[] (single-select chip group)
@@ -412,11 +414,18 @@ export const Playground = ({ config }) => {
   const AXIS_HANDLERS = {
 
     // ---- Axis: Attention Parallelism ----------------------------------------
-    // Four sub-knobs (TP / DP / CP / DP-Attention). Per-knob state slot;
-    // `null` means inherit base. Each knob has its own strip prefix +
-    // insertion anchor so overrides land near their conceptual siblings.
+    // Three sub-knobs (TP / CP / DP-Attention). Per-knob state slot; `null`
+    // means inherit base. Each knob has its own strip prefix + insertion
+    // anchor so overrides land near their conceptual siblings.
+    //
+    // DP-Attention is a COMBINED knob: its numeric value is the DP degree
+    // AND simultaneously toggles `--enable-dp-attention`. Picking 4 emits
+    // `--dp 4 --enable-dp-attention`; picking `false` ("off") strips both;
+    // `null` ("auto") inherits the base cell verbatim. This matches the
+    // DeepSeek-V4 deployment convention where plain `--dp` without
+    // `--enable-dp-attention` is never used.
     attention: {
-      initState: () => ({ tp: null, dp: null, cp: null, dpAttn: null }),
+      initState: () => ({ tp: null, cp: null, dpAttn: null }),
 
       // Read the base cell's parallelism flags back into the same shape that
       // initState/apply use. The dropdowns DISPLAY this when the user hasn't
@@ -424,16 +433,25 @@ export const Playground = ({ config }) => {
       // — it still no-ops on null, so untouched slots leave the base cell's
       // flag in place at its original position and the diff stays clean.
       //
+      // For DP-Attention: if base has `--dp N --enable-dp-attention`, derive
+      // returns N. If base has neither, return false ("off"). The edge case
+      // of `--enable-dp-attention` without `--dp` collapses to 1.
+      //
       // CP currently emits no numeric arg in apply (`--nsa-prefill-cp-mode
       // round-robin-split`), so derivation can only tell you on/off — we
       // collapse a present `--enable-nsa-prefill-context-parallel` to 2.
       deriveFromBase: (cell, fc, h) => {
         const flags = (cell && cell.flags) || [];
+        const dpVal = h.parseIntFlag(flags, "--dp");
+        const hasDpAttn = h.hasFlag(flags, "--enable-dp-attention");
+        let dpAttn;
+        if (dpVal !== null) dpAttn = dpVal;
+        else if (hasDpAttn) dpAttn = 1;
+        else dpAttn = false;
         return {
           tp: h.parseIntFlag(flags, "--tp"),
-          dp: h.parseIntFlag(flags, "--dp"),
           cp: h.hasFlag(flags, "--enable-nsa-prefill-context-parallel") ? 2 : null,
-          dpAttn: h.hasFlag(flags, "--enable-dp-attention"),
+          dpAttn,
         };
       },
 
@@ -455,16 +473,16 @@ export const Playground = ({ config }) => {
           flags = h.stripFlagsByFirstToken(flags, ["--tp"]);
           flags = h.insertAfter(flags, h.ANCHOR_NEAR_MODEL_PATH, [`--tp ${value.tp}`]);
         }
-        if (value.dp !== null) {
-          flags = h.stripFlagsByFirstToken(flags, ["--dp"]);
-          if (value.dp > 1) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [`--dp ${value.dp}`]);
-          }
-        }
-        if (value.dpAttn !== null) {
-          flags = h.stripFlagsByFirstToken(flags, ["--enable-dp-attention"]);
-          if (value.dpAttn === true) {
-            flags = h.insertAfter(flags, h.ANCHOR_NEAR_DP, ["--enable-dp-attention"]);
+        // DP-Attention: a combined knob. value can be null (inherit), false
+        // (off — strip both flags), or a positive number (emit the --dp +
+        // --enable-dp-attention pair).
+        if (value.dpAttn !== null && value.dpAttn !== undefined) {
+          flags = h.stripFlagsByFirstToken(flags, ["--dp", "--enable-dp-attention"]);
+          if (typeof value.dpAttn === "number" && value.dpAttn > 0) {
+            flags = h.insertAfter(flags, h.ANCHOR_NEAR_TP, [
+              `--dp ${value.dpAttn}`,
+              "--enable-dp-attention",
+            ]);
           }
         }
         if (value.cp !== null) {
@@ -485,12 +503,16 @@ export const Playground = ({ config }) => {
         const knobs = fc.knobs || [];
         if (!knobs.length) return null;
         const setKnob = (k, v) => setValue({ ...value, [k]: v });
-        // DP-Attention labels are boolean-aware; numeric knobs default to
-        // "auto" for the null/inherit sentinel and the bare number otherwise.
+        // Label resolution. DP-Attention is the combined-DP knob — its
+        // value can be `null` (auto/inherit), `false` (off, both flags
+        // stripped), or a positive integer (the DP degree, which also
+        // turns on --enable-dp-attention). The `labels` map covers the
+        // sentinels (auto / off); numeric values fall through to their
+        // bare digits.
         const labelFor = (knob) => (c) => {
           if (c.label !== undefined) return c.label;
           if (knob.id === "dpAttn") {
-            const labelMap = knob.labels || { "auto": "auto", "true": "on", "false": "off" };
+            const labelMap = knob.labels || { "auto": "auto", "false": "off" };
             const k = c.value === null ? "auto" : String(c.value);
             return labelMap[k] || k;
           }

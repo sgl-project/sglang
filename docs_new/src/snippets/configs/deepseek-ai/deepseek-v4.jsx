@@ -118,7 +118,7 @@ export const config = {
   // -----------------------------------------------------------------------
   playgroundFeatures: {
 
-    // ----- Card 1: "Attention Parallelism" — 4 knobs (TP/DP/CP/DP-Attention) -----
+    // ----- Card 1: "Attention Parallelism" — 3 knobs (TP/CP/DP-Attention) -----
     //
     // Per-chip constraints (engine schema): an entry can be either a bare
     // value (`null`, `1`, ...) OR an object `{value, hide?, disable?,
@@ -137,7 +137,11 @@ export const config = {
     //   - TP=16 means 16 ranks → single-node has at most 8 GPUs, so
     //     TP=16 on single-node is impossible — disable (with a hint that
     //     they should switch §3.1's "Nodes" to multi-2 first).
-    //   - Same constraints mirror onto DP.
+    //   - DP-Attention is a COMBINED knob: its value is the DP degree AND
+    //     simultaneously toggles `--enable-dp-attention`. `off` strips
+    //     both flags; a number N emits `--dp N --enable-dp-attention` as
+    //     a pair. The engine never emits plain `--dp` without DP-Attention
+    //     for this cookbook — that combination isn't used in DSV4 cells.
     attention: {
       knobs: [
         { id: "tp", label: "TP", values: [
@@ -149,19 +153,19 @@ export const config = {
           { value: 16, disable: { nodes: ["single"] },
             disableReason: "TP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
         ]},
-        { id: "dp", label: "DP", values: [
-          null,
-          { value: 1, hide: { variant: ["pro"] } },
-          { value: 2, hide: { variant: ["pro"] } },
-          4,
-          8,
-          { value: 16, disable: { nodes: ["single"] },
-            disableReason: "DP=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
-        ]},
         { id: "cp",     label: "CP", values: [null, 1, 2, 4] },
         { id: "dpAttn", label: "DP-Attention",
-          values: [null, true, false],
-          labels: { "auto": "auto", "true": "on", "false": "off" } },
+          values: [
+            null,
+            false,
+            { value: 1, hide: { variant: ["pro"] } },
+            { value: 2, hide: { variant: ["pro"] } },
+            4,
+            8,
+            { value: 16, disable: { nodes: ["single"] },
+              disableReason: "DP-Attention=16 requires 16 ranks — switch §3.1's Nodes to multi-2 first." },
+          ],
+          labels: { "auto": "auto", "false": "off" } },
       ],
     },
 
