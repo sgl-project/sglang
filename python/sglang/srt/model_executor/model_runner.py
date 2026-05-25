@@ -3193,29 +3193,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        canary_manager = self.canary_runner if not self.is_draft_worker else None
-        canary_outside_ctx = (
-            canary_manager.with_ops_outside_graph(
+        if not self.is_draft_worker and (c := self.canary_runner is not None):
+            canary_outside_ctx = c.with_ops_outside_graph(
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if canary_manager is not None
-            else contextlib.nullcontext()
-        )
-        canary_index_ctx = (
-            canary_manager.with_active_single_forward_manager(0)
-            if canary_manager is not None
-            else contextlib.nullcontext()
-        )
+            canary_index_ctx = c.with_active_single_forward_manager(0)
+        else:
+            canary_outside_ctx = canary_index_ctx = contextlib.nullcontext()
 
         with (
             canary_outside_ctx,
+            canary_index_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,
             ) as recorder_outputs,
-            canary_index_ctx,
         ):
             output = self._forward_raw(
                 forward_batch,
