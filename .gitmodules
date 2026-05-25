@@ -1,0 +1,9 @@
+[submodule "development/past_implementations/Twilight"]
+	path = development/past_implementations/Twilight
+	url = https://github.com/tsinghua-ideal/Twilight
+[submodule "development/past_implementations/DoubleSparse"]
+	path = development/past_implementations/DoubleSparse
+	url = https://github.com/andy-yang-1/DoubleSparse
+[submodule "development/past_implementations/sglang-last-with-double-sparsity"]
+	path = development/past_implementations/sglang-last-with-double-sparsity
+	url = https://github.com/sgl-project/sglang
