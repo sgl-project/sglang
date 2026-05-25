@@ -47,7 +47,6 @@ from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cud
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -2023,14 +2022,10 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
-    # message queue broadcaster is only used in tensor model parallel group
     _DCP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
         backend,
-        use_message_queue_broadcaster=get_bool_env_var(
-            "SGLANG_USE_MESSAGE_QUEUE_BROADCASTER", "true"
-        ),
         group_name="dcp",
     )
 
