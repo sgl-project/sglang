@@ -2834,7 +2834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         # Disable piecewise CUDA graph for non capture size
-        if not self.server_args.cuda_graph_config[Phase.PREFILL]["num_tokens"]:
+        if not self.server_args.cuda_graph_config[Phase.PREFILL]["bs"]:
             logger.warning(
                 "Disable piecewise CUDA graph because the capture size is not set"
             )

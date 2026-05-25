@@ -47,16 +47,11 @@ ALLOWED_BACKENDS_PER_PHASE = {
 # Per-phase settings schema. Keys other than ``backend`` are runner-level
 # (read by any backend in that phase); ``tc_compiler`` is the lone
 # backend-specific knob (only meaningful when backend == tc_piecewise).
+# For prefill, ``bs`` carries the captured shape size (token count for
+# tc_piecewise, request count for breakable) — one shape knob per phase.
 ALLOWED_KEYS_PER_PHASE = {
-    Phase.DECODE: ("backend", "max_bs", "bs", "max_num_tokens", "num_tokens"),
-    Phase.PREFILL: (
-        "backend",
-        "max_bs",
-        "bs",
-        "max_num_tokens",
-        "num_tokens",
-        "tc_compiler",
-    ),
+    Phase.DECODE: ("backend", "max_bs", "bs"),
+    Phase.PREFILL: ("backend", "max_bs", "bs", "tc_compiler"),
 }
 
 DEFAULT_CUDA_GRAPH_CONFIG: Dict[str, Dict[str, Any]] = {
@@ -64,15 +59,11 @@ DEFAULT_CUDA_GRAPH_CONFIG: Dict[str, Dict[str, Any]] = {
         "backend": Backend.FULL,
         "max_bs": None,
         "bs": None,
-        "max_num_tokens": None,
-        "num_tokens": None,
     },
     Phase.PREFILL: {
         "backend": Backend.TC_PIECEWISE,
         "max_bs": None,
         "bs": None,
-        "max_num_tokens": None,
-        "num_tokens": None,
         # Only meaningful when ``backend == tc_piecewise``; ignored otherwise.
         "tc_compiler": "eager",
     },

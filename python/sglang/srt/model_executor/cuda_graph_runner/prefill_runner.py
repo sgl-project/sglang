@@ -93,12 +93,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # --- bucket sizes ---------------------------------------------
-        capture_tokens = model_runner.server_args.cuda_graph_config[Phase.PREFILL][
-            "num_tokens"
-        ]
-        assert (
-            capture_tokens is not None
-        ), "cuda_graph_config[prefill].num_tokens is not set"
+        # ``bs`` in prefill carries the captured shape (token count for
+        # tc_piecewise) — one shape knob per phase.
+        capture_tokens = model_runner.server_args.cuda_graph_config[Phase.PREFILL]["bs"]
+        assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192

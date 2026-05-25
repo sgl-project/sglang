@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import random
-import sys
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
@@ -715,10 +714,6 @@ class ServerArgs:
     cuda_graph_max_bs_prefill: Optional[int] = None
     cuda_graph_bs_decode: Optional[List[int]] = None
     cuda_graph_bs_prefill: Optional[List[int]] = None
-    cuda_graph_max_num_tokens_decode: Optional[int] = None
-    cuda_graph_max_num_tokens_prefill: Optional[int] = None
-    cuda_graph_num_tokens_decode: Optional[List[int]] = None
-    cuda_graph_num_tokens_prefill: Optional[List[int]] = None
     cuda_graph_tc_compiler_prefill: Optional[str] = None
 
     # Legacy CLI inputs that fold into ``cuda_graph_config`` (with a CLI
@@ -1350,9 +1345,9 @@ class ServerArgs:
         if self.cuda_graph_bs is not None:
             _set(Phase.DECODE, "bs", self.cuda_graph_bs)
         if self.piecewise_cuda_graph_max_tokens is not None:
-            _set(Phase.PREFILL, "max_num_tokens", self.piecewise_cuda_graph_max_tokens)
+            _set(Phase.PREFILL, "max_bs", self.piecewise_cuda_graph_max_tokens)
         if self.piecewise_cuda_graph_tokens is not None:
-            _set(Phase.PREFILL, "num_tokens", self.piecewise_cuda_graph_tokens)
+            _set(Phase.PREFILL, "bs", self.piecewise_cuda_graph_tokens)
         if self.tc_piecewise_cuda_graph_compiler is not None:
             _set(Phase.PREFILL, "tc_compiler", self.tc_piecewise_cuda_graph_compiler)
 
@@ -1379,16 +1374,6 @@ class ServerArgs:
             _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
         if self.cuda_graph_bs_prefill is not None:
             _set(Phase.PREFILL, "bs", self.cuda_graph_bs_prefill)
-        if self.cuda_graph_max_num_tokens_decode is not None:
-            _set(Phase.DECODE, "max_num_tokens", self.cuda_graph_max_num_tokens_decode)
-        if self.cuda_graph_max_num_tokens_prefill is not None:
-            _set(
-                Phase.PREFILL, "max_num_tokens", self.cuda_graph_max_num_tokens_prefill
-            )
-        if self.cuda_graph_num_tokens_decode is not None:
-            _set(Phase.DECODE, "num_tokens", self.cuda_graph_num_tokens_decode)
-        if self.cuda_graph_num_tokens_prefill is not None:
-            _set(Phase.PREFILL, "num_tokens", self.cuda_graph_num_tokens_prefill)
         if self.cuda_graph_tc_compiler_prefill is not None:
             _set(Phase.PREFILL, "tc_compiler", self.cuda_graph_tc_compiler_prefill)
 
@@ -1499,41 +1484,31 @@ class ServerArgs:
         settings = self.cuda_graph_config or {}
         for phase, phase_settings in settings.items():
             if phase not in ALLOWED_BACKENDS_PER_PHASE:
-                logger.error(
-                    "--cuda-graph-config: unknown phase %r; allowed: %s",
-                    phase,
-                    Phase.ALL,
+                raise ValueError(
+                    f"--cuda-graph-config: unknown phase {phase!r}; "
+                    f"allowed: {Phase.ALL}"
                 )
-                sys.exit(1)
             if not isinstance(phase_settings, dict):
-                logger.error(
-                    "--cuda-graph-config[%s] must be a dict, got %s",
-                    phase,
-                    type(phase_settings).__name__,
+                raise ValueError(
+                    f"--cuda-graph-config[{phase}] must be a dict, got "
+                    f"{type(phase_settings).__name__}"
                 )
-                sys.exit(1)
             allowed_keys = ALLOWED_KEYS_PER_PHASE[phase]
             for key, value in phase_settings.items():
                 if key not in allowed_keys:
-                    logger.error(
-                        "--cuda-graph-config[%s]: unknown key %r; allowed: %s",
-                        phase,
-                        key,
-                        allowed_keys,
+                    raise ValueError(
+                        f"--cuda-graph-config[{phase}]: unknown key {key!r}; "
+                        f"allowed: {allowed_keys}"
                     )
-                    sys.exit(1)
                 if (
                     key == "backend"
                     and value is not None
                     and value not in ALLOWED_BACKENDS_PER_PHASE[phase]
                 ):
-                    logger.error(
-                        "--cuda-graph-config[%s].backend=%r not allowed; allowed: %s",
-                        phase,
-                        value,
-                        ALLOWED_BACKENDS_PER_PHASE[phase],
+                    raise ValueError(
+                        f"--cuda-graph-config[{phase}].backend={value!r} not allowed; "
+                        f"allowed: {ALLOWED_BACKENDS_PER_PHASE[phase]}"
                     )
-                    sys.exit(1)
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
@@ -1679,29 +1654,27 @@ class ServerArgs:
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
             decode["max_bs"] = self.torch_compile_max_bs
 
-        if prefill["max_num_tokens"] is None:
-            # Refer to pr #15927, by default we set the prefill max num tokens to the chunked prefill size by default.
+        if prefill["max_bs"] is None:
+            # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
-            # To avoid the performance regression, we set the max tokens to 2048 by default.
+            # To avoid the performance regression, we set max_bs to 2048 by default.
             if not self.use_mla_backend():
-                prefill["max_num_tokens"] = self.chunked_prefill_size
+                prefill["max_bs"] = self.chunked_prefill_size
             else:
-                prefill["max_num_tokens"] = 2048
+                prefill["max_bs"] = 2048
 
-            # If max_total_tokens is set, cap pcg tokens to not exceed max_total_tokens
+            # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
             if self.max_total_tokens is not None:
-                prefill["max_num_tokens"] = min(
-                    prefill["max_num_tokens"], self.max_total_tokens
-                )
+                prefill["max_bs"] = min(prefill["max_bs"], self.max_total_tokens)
 
-            # For Llama2 series models, the max tokens is limited to 4096
+            # For Llama2 series models, max_bs is limited to 4096.
             # TODO(yuwei): remove this after the issue is fixed
             if "llama-2" in self.model_path.lower():
-                prefill["max_num_tokens"] = min(prefill["max_num_tokens"], 4096)
+                prefill["max_bs"] = min(prefill["max_bs"], 4096)
 
-        if prefill["num_tokens"] is None:
-            prefill["num_tokens"] = self._generate_piecewise_cuda_graph_tokens(
-                prefill["max_num_tokens"]
+        if prefill["bs"] is None:
+            prefill["bs"] = self._generate_piecewise_cuda_graph_tokens(
+                prefill["max_bs"]
             )
 
         if self.mem_fraction_static is None:
@@ -1731,7 +1704,7 @@ class ServerArgs:
             if prefill["backend"] != Backend.DISABLED:
                 if not self.use_mla_backend():
                     # Only calculate the memory overhead for Non-Torch Memory use since the Torch Memory can be reused with Cuda Graph Capture
-                    reserved_mem += len(prefill["num_tokens"]) * 8
+                    reserved_mem += len(prefill["bs"]) * 8
                 else:
                     # For MLA backend the memory overhead is much higher than expected with fa3
                     reserved_mem += 1.5 * 1024
@@ -6433,32 +6406,6 @@ class ServerArgs:
             help="Explicit list of batch sizes to capture for the prefill cuda graph.",
         )
         parser.add_argument(
-            "--cuda-graph-max-num-tokens-decode",
-            type=int,
-            default=ServerArgs.cuda_graph_max_num_tokens_decode,
-            help="Maximum num_tokens captured for the decode cuda graph.",
-        )
-        parser.add_argument(
-            "--cuda-graph-max-num-tokens-prefill",
-            type=int,
-            default=ServerArgs.cuda_graph_max_num_tokens_prefill,
-            help="Maximum num_tokens captured for the prefill cuda graph.",
-        )
-        parser.add_argument(
-            "--cuda-graph-num-tokens-decode",
-            type=int,
-            nargs="+",
-            default=ServerArgs.cuda_graph_num_tokens_decode,
-            help="Explicit list of num_tokens to capture for the decode cuda graph.",
-        )
-        parser.add_argument(
-            "--cuda-graph-num-tokens-prefill",
-            type=int,
-            nargs="+",
-            default=ServerArgs.cuda_graph_num_tokens_prefill,
-            help="Explicit list of num_tokens to capture for the prefill cuda graph.",
-        )
-        parser.add_argument(
             "--cuda-graph-tc-compiler-prefill",
             type=str,
             choices=["eager", "inductor"],
@@ -6696,8 +6643,8 @@ class ServerArgs:
             type=int,
             nargs="+",
             action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-num-tokens-prefill",
-            help="Deprecated alias for --cuda-graph-num-tokens-prefill.",
+            new_flag="--cuda-graph-bs-prefill",
+            help="Deprecated alias for --cuda-graph-bs-prefill.",
         )
         parser.add_argument(
             "--piecewise-cuda-graph-compiler",
@@ -6718,8 +6665,8 @@ class ServerArgs:
             "--piecewise-cuda-graph-max-tokens",
             type=int,
             action=DeprecatedAliasStoreAction,
-            new_flag="--cuda-graph-max-num-tokens-prefill",
-            help="Deprecated alias for --cuda-graph-max-num-tokens-prefill.",
+            new_flag="--cuda-graph-max-bs-prefill",
+            help="Deprecated alias for --cuda-graph-max-bs-prefill.",
         )
         parser.add_argument(
             "--torchao-config",
