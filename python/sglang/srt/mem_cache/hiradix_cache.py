@@ -1057,9 +1057,6 @@ class HiRadixCache(RadixCache):
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
             if loading_values is not None:
-                logger.debug(
-                    f"loading back {len(loading_values)} tokens for node {last_node.id}"
-                )
                 return loading_values, last_node
 
             while last_node.evicted:
@@ -1177,7 +1174,6 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
         # Synchronize workers before mutating host cache tree state.
@@ -1379,6 +1375,11 @@ class HiRadixCache(RadixCache):
             else:
                 if not child.evicted:
                     value.append(child.value)
+                else:
+                    # Stop at evicted boundary — continuing would create
+                    # a gap in device_indices if a descendant was re-filled.
+                    node = child
+                    break
                 node = child
                 key = key[prefix_len:]
 
@@ -1444,13 +1445,14 @@ class HiRadixCache(RadixCache):
 
             if prefix_len == len(node.key):
                 if node.evicted:
-                    # change the reference if the node is evicted
-                    # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
+                    if node.backuped:
+                        self.cache_controller.mem_pool_host.free(node.host_value)
+                        node.host_value = None
+                        node.backuped = False
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
-                    # update parent status as a new leaf is added into device
                     self._update_leaf_status(node.parent)
                 else:
                     self._inc_hit_count(node, chunked)
@@ -1462,10 +1464,13 @@ class HiRadixCache(RadixCache):
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
+                    if new_node.backuped:
+                        self.cache_controller.mem_pool_host.free(new_node.host_value)
+                        new_node.host_value = None
+                        new_node.backuped = False
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
-                    # update parent status as a new leaf is added into device
                     self._update_leaf_status(new_node.parent)
                 else:
                     self._inc_hit_count(new_node, chunked)
