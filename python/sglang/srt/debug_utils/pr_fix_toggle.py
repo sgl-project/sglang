@@ -6,11 +6,7 @@ from typing import Dict
 
 from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
 
-# Reverts PR #25015 ("Fix Eagle draft decode positions"). Re-introduces the
-# pre-fix positions.add_(1) location (start of inner loop body) and removes
-# the post-fix positions.add_(1) at the loop bottom and the cuda-graph
-# capture-side positions.sub_ tail compensation.
-_PR_25015_REVERT_YAML = """
+_PR_REVERT_YAML_25015 = """
 patches:
   - target: sglang.srt.speculative.eagle_worker.EAGLEWorker.draft_forward
     edits:
@@ -55,7 +51,7 @@ patches:
 
 
 _PR_FIX_REVERT_YAML: Dict[int, str] = {
-    25015: _PR_25015_REVERT_YAML,
+    25015: _PR_REVERT_YAML_25015,
 }
 
 
