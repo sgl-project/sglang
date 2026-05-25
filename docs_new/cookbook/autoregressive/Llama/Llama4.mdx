@@ -108,6 +108,25 @@ sglang serve \
   --trust-remote-code
 ```
 
+#### 4.2.3 EAGLE Speculative Decoding
+
+SGLang supports Llama 4 Maverick (400B) with [EAGLE speculative decoding](../../../docs/advanced_features/speculative_decoding). Enable with the EAGLE3 algorithm and the NVIDIA draft model:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path nvidia/Llama-4-Maverick-17B-128E-Eagle3 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --trust-remote-code \
+  --tp 8 \
+  --context-length 1000000
+```
+
+<Note>The draft model `nvidia/Llama-4-Maverick-17B-128E-Eagle3` only works in chat mode.</Note>
+
 ## 5. Benchmark
 ### 5.1 Speed Benchmark
 Test Environment:

@@ -200,6 +200,24 @@ python -m sglang.launch_server \
 ```
 
 
+**Quick Test (curl):**
+
+```shell Command
+curl "http://127.0.0.1:30000/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "temperature": 0,
+    "max_tokens": 100,
+    "model": "deepseek-ai/DeepSeek-V3",
+    "tools": [{"type": "function", "function": {"name": "query_weather", "description": "Get weather of a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+    "messages": [{"role": "user", "content": "How'\''s the weather in Beijing today?"}]
+  }'
+```
+
+<Note>
+Use a low `temperature` (e.g. `0`) for more consistent tool call results. The `--chat-template` flag above provides an improved unified prompt for tool use.
+</Note>
+
 **Python Example (with Thinking Process):**
 
 ```python Example
