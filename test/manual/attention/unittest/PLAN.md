@@ -396,6 +396,11 @@ Use real `ReqToTokenPool` and real KV pools (`MHATokenToKVPool`, `MLATokenToKVPo
 DSA/DSV4-specific pools) instead of ad hoc tensors. A real subclass means
 `isinstance` checks pass and missing fields surface as `AttributeError`.
 
+Unit fixtures run without distributed initialization. For single-rank unit tests,
+patch attention tensor-parallel helpers such as `get_attention_tp_size()` to return
+`1`, or initialize an equivalent local parallel-state fixture before constructing
+backends that size buffers from attention TP metadata.
+
 #### 1c. Forward context helper
 
 ```python
@@ -520,6 +525,17 @@ Required input cases:
 - DeepSeek chunked-KV path, triggered through the DeepSeek module.
 
 Invalid combinations are `skipIf`-guarded through the capability helper.
+
+Initial implementation slice:
+- `test_backend_correctness.py` starts with a projected dense attention target that
+  owns Q/K/V/O projections and dispatches through `RadixAttention`.
+- It covers representative `torch_native` and `triton` backend cases for MHA and GQA.
+- It exercises page size 1, exact-page extend, page-boundary decode
+  (`seq_len = page_size - 1`, `page_size`, `page_size + 1`), zero/nonzero prefix,
+  and GQA head grouping as an attention-config case.
+- Future slices should replace or extend this tiny projected target with real
+  model-specific modules for SWA, MLA, DSA, DSV4, linear attention, Mamba, and spec
+  decode paths.
 
 ---
 
