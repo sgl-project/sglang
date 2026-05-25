@@ -88,7 +88,6 @@ class TestDeepseekR1MXFP4MTP(CustomTestCase):
         cls.model = DEEPSEEK_R1_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
 
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
         envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.set(True)
 
         other_args = [

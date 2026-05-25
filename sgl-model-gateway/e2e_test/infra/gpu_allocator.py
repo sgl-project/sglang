@@ -74,12 +74,25 @@ class GPUSlot:
 
 
 def get_open_port() -> int:
-    """Get an available port by binding to port 0 and reading the assigned port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        s.listen(1)
-        port = s.getsockname()[1]
-    return port
+    """Get an available port by binding to port 0 and reading the assigned port.
+
+    Capped below 55536 so sglang's `--grpc-mode` default
+    `grpc_port = port + 10000` (in srt/server_args.py) cannot overflow
+    16-bit port range. The kernel's ephemeral range is typically
+    32768-60999, so a cap > 32768 keeps reasonable headroom while
+    avoiding the rare overflow that crashes worker startup.
+    """
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+        if port < 55536:
+            return port
+    raise RuntimeError(
+        "Failed to allocate an open port below 55536 after 20 attempts; "
+        "kernel ephemeral range may be unusually high"
+    )
 
 
 def get_physical_device_indices(devices: list[int]) -> list[int]:

@@ -16,7 +16,15 @@ use super::otel_trace::get_otel_layer;
 use crate::config::TraceConfig;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const TIME_FORMAT_MS: &str = "%Y-%m-%d %H:%M:%S%.3f";
 const DEFAULT_LOG_TARGET: &str = "smg";
+
+fn get_time_format() -> &'static str {
+    match std::env::var("SGLANG_LOG_MS") {
+        Ok(v) if matches!(v.trim().to_lowercase().as_str(), "true" | "1") => TIME_FORMAT_MS,
+        _ => TIME_FORMAT,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
@@ -102,11 +110,13 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     let mut layers = Vec::with_capacity(3);
 
+    let time_fmt = get_time_format();
+
     let stdout_layer = tracing_subscriber::fmt::layer()
         .with_ansi(config.colorize)
         .with_file(true)
         .with_line_number(true)
-        .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()));
+        .with_timer(ChronoUtc::new(time_fmt.to_string()));
 
     let stdout_layer = if config.json_format {
         stdout_layer.json().flatten_event(true).boxed()
@@ -138,7 +148,7 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
             .with_ansi(false)
             .with_file(true)
             .with_line_number(true)
-            .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+            .with_timer(ChronoUtc::new(time_fmt.to_string()))
             .with_writer(non_blocking);
 
         let file_layer = if config.json_format {
