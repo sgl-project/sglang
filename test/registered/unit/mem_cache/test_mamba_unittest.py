@@ -410,9 +410,11 @@ class TestMamba(unittest.TestCase):
 
     def _setup_tree_and_allocator(self, enable_kv_cache_events=False):
         """Helper to create a MambaRadixCache with allocator for testing."""
-        set_global_server_args_for_scheduler(
-            ServerArgs(model_path="dummy", page_size=1)
-        )
+        server_args = ServerArgs(model_path="dummy", page_size=1)
+        # MambaRadixCache reads mamba_cache_chunk_size, whose property otherwise
+        # loads the HF config for self.model_path — impossible for the dummy model.
+        server_args._mamba_cache_chunk_size = 1
+        set_global_server_args_for_scheduler(server_args)
         size = 128
         dtype = torch.bfloat16
         head_num = 2
