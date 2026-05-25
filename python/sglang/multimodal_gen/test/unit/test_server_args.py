@@ -306,6 +306,14 @@ class TestServerArgsPathExpansion(unittest.TestCase):
                         "sglang.multimodal_gen.registry.get_model_info",
                         return_value=None,
                     ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_device_total_memory",
+                        return_value=80 * 1024**3,
+                    ),
+                    patch(
+                        "sglang.multimodal_gen.runtime.server_args.current_platform.get_available_gpu_memory",
+                        return_value=80,
+                    ),
                 ):
                     server_args = ServerArgs.from_cli_args(args, unknown_args)
 
