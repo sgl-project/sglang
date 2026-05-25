@@ -35,21 +35,10 @@ def _make_server_args(
     *, canary_on: bool, disable_cuda_graph: bool = False
 ) -> ServerArgs:
     # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
-    # Fix --max-total-tokens so run_benchmark_internal's skip_token_capacity_threshold is
-    # deterministic — auto-detect flakily collapses to 65536 on some launches and skips bs=128.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
         "--disable-piecewise-cuda-graph",
-        "--max-total-tokens",
-        "524288",
-        # bs profile_max_total_num_tokens auto-detect collapses to ~64K under some launches;
-        # explicit floors prevent the bench's skip_token_capacity_threshold from skipping bs=128
-        # / prefill bs=32 scenarios.
-        "--mem-fraction-static",
-        "0.95",
-        "--cuda-graph-max-bs",
-        "128",
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")
