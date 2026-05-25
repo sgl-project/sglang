@@ -336,6 +336,7 @@ class _LongcatDoubleStreamState:
     def __init__(self):
         self.main_stream = None
         self.first_attn_finished = None
+        self.moe_alt_stream = None
 
 
 class LongcatFlashDecoderLayer(nn.Module):
@@ -347,7 +348,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[Any] = None,
-        moe_alt_stream: Optional[Any] = None,
         double_stream_state: Optional[_LongcatDoubleStreamState] = None,
     ) -> None:
         super().__init__()
@@ -355,7 +355,6 @@ class LongcatFlashDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.moe_alt_stream = moe_alt_stream
         self.double_stream_state = double_stream_state
         self.device_module = torch.get_device_module()
         self.is_first_layer = layer_id == 0
@@ -497,7 +496,8 @@ class LongcatFlashDecoderLayer(nn.Module):
         mlp_hidden_states = hidden_states.clone()
 
         enable_double_stream = (
-            self.moe_alt_stream is not None
+            self.double_stream_state is not None
+            and self.double_stream_state.moe_alt_stream is not None
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         )
 
@@ -506,9 +506,7 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-            main_stream = self.double_stream_state.main_stream
-            first_attn_finished = self.double_stream_state.first_attn_finished
-            first_attn_finished.record(main_stream)
+            self.double_stream_state.main_stream.record_event(self.double_stream_state.first_attn_finished)
 
             mlp_hidden_states, residual = self.forward_mlp(
                 mlp_hidden_states,
@@ -522,17 +520,17 @@ class LongcatFlashDecoderLayer(nn.Module):
                     self.attn_tp_rank
                 ]
 
-            with self.device_module.stream(self.moe_alt_stream):
-                first_attn_finished.wait()
+            with self.device_module.stream(self.double_stream_state.moe_alt_stream):
+                self.double_stream_state.moe_alt_stream.wait_event(self.double_stream_state.first_attn_finished)
                 moe_hidden_states = self.mlp(hidden_states)
                 moe_hidden_states, moe_residual = (
                     self.moe_layer_communicator.postprocess_layer(
                         moe_hidden_states, moe_residual, forward_batch
                     )
                 )
-                moe_hidden_states.record_stream(main_stream)
+                moe_hidden_states.record_stream(self.double_stream_state.main_stream)
 
-            main_stream.wait_stream(self.moe_alt_stream)
+            self.double_stream_state.main_stream.wait_stream(self.double_stream_state.moe_alt_stream)
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
@@ -637,11 +635,10 @@ class LongcatFlashModel(nn.Module):
         device_module = torch.get_device_module()
         self.alt_stream = device_module.Stream()
         if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
-            self.moe_alt_stream = device_module.Stream()
             self.double_stream_state = _LongcatDoubleStreamState()
             self.double_stream_state.first_attn_finished = device_module.Event()
+            self.double_stream_state.moe_alt_stream = device_module.Stream()
         else:
-            self.moe_alt_stream = None
             self.double_stream_state = None
         self.layers = nn.ModuleList(
             [
@@ -651,7 +648,6 @@ class LongcatFlashModel(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
-                    moe_alt_stream=self.moe_alt_stream,
                     double_stream_state=self.double_stream_state,
                 )
                 for layer_id in range(config.num_hidden_layers)
