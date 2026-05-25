@@ -15,8 +15,8 @@ state.
 """
 
 import logging
-import os
 import time
+from sglang.srt.environ import envs
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -199,7 +199,7 @@ class MlxModelRunner:
         # Optional: fuse SwitchGLU's up_proj + gate_proj into one gather_qmm
         # dispatch per layer per token. Activated by SGLANG_MLX_FUSE_SWITCHGLU=1.
         # See: python/sglang/srt/hardware_backend/mlx/moe/fused_switch_glu.py
-        if os.environ.get("SGLANG_MLX_FUSE_SWITCHGLU", "0") == "1":
+        if envs.SGLANG_MLX_FUSE_SWITCHGLU.get():
             from sglang.srt.hardware_backend.mlx.moe.fused_switch_glu import (
                 patch_switch_glu_with_fused_up_gate,
             )

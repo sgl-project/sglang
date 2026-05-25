@@ -328,6 +328,7 @@ class Envs:
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
+    SGLANG_MLX_FUSE_SWITCHGLU = EnvBool(False)
 
     # NPU
     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
