@@ -19,127 +19,48 @@ In SGLang HiCache, MemCache can be used as the L3 KV Cache backend to store and 
 
 ## Install Ascend Memcache
 
+[Memcache Official Document](https://gitcode.com/Ascend/memcache/blob/master/doc/install_run.md)
 
-### SGLang installation with NPUs support
-
-[SGLang NPU installation guide](https://github.com/nbbb24/sglang/blob/main/docs/platforms/ascend/ascend_npu.md)
-
-
-### Install MemCache
-[Official Document](https://gitcode.com/Ascend/memcache/blob/master/doc/build.md)
-
-#### Method 1: with pip
-
-whl [pypi](https://pypi.org/project/memcache-hybrid/#files)
 ```bash
 pip install memcache_hybrid
 ```
 
-#### Method 2: from source
-
-##### Clone MemCache
-
-```bash
-git clone https://gitcode.com/Ascend/memcache
-cd memcache
-git clean -xdf
-git reset --hard
-```
-
-Fetch third-party libraries
-```bash
-# Initialize and update only the required submodules (excluding test dependencies)
-git submodule update --init 3rdparty/
-
-# Update memfabric_hybrid to the latest version of a specific branch (e.g., master)
-# Replace 'master' with your target branch name
-git -c submodule.3rdparty/memfabric_hybrid.branch=master submodule update --remote 3rdparty/memfabric_hybrid
-```
-
-Notes:
-1. Use the `-c submodule.3rdparty/memfabric_hybrid.branch=<branch_name>` option to specify the target branch to fetch.
-
-2. To fetch all submodules (including test dependencies), you can use `git submodule update --recursive --init`.
-
-##### Install Memfabric
-
-[Memfabric Build Official Document](https://gitcode.com/Ascend/memfabric_hybrid/blob/master/doc/installation.md)
-```bash
-cd 3rdparty/memfabric_hybrid
-git clean -xdf
-git reset --hard
-```
-
-For build parameters, refer to [this document](https://gitcode.com/Ascend/memfabric_hybrid/blob/master/doc/installation.md#3-%E7%BC%96%E8%AF%91%E6%9E%84%E5%BB%BA)
-```bash
-bash script/build_and_pack_run.sh
-```
-
-The package will be saved at `output/memfabric-hybrid-${version}_${os}_${arch}.run`.
-
-Run:
-```bash
-cd output
-bash memfabric-hybrid-${version}_${os}_${arch}.run
-source /usr/local/memfabric_hybrid/set_env.sh
-```
-
-
-
-##### Build MemCache
-
-Change directory to the memcache folder and build:
-
-```bash
-bash script/build_and_pack_run.sh --build_mode RELEASE
-```
-
-Build and run unit tests
-
-```bash
-bash script/run_ut.sh
-```
-
-The package will be saved at `output/memcache_hybrid-${version}_${os}_${arch}.run`
-
-Run:
-```bash
-cd output
-bash memcache_hybrid-${version}_${os}_${arch}.run
-source /usr/local/memcache_hybrid/set_env.sh
-```
-
 ## Deploy MemCache
 ### Metaservice
-
-(1) Environment variables plus configuration file
-(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/install_run.md#%E5%90%AF%E5%8A%A8metaservice)
-
-Recommended approach: add `metaservice_config.json`
+add `metaservice_config.json`
 ```json
 {
-    "meta_service_url": " ",
-    ...
+    // Meta service start-up url; in K8s meta service master-standby HA, auto-set to Pod IP at startup
+    "meta_service_url": "tcp://127.0.0.1:5000",
+
+    // Config store url; in K8s, auto-set to Pod IP at startup
+    "config_store_url": "tcp://127.0.0.1:6000",
+
+    // HTTP metrics service url
+    "metrics_url": "http://127.0.0.1:8000",
+
+    // Log level: debug, info, warn, error
+    "log_level": "info"
 }
 ```
 
-### Localservice
+Pass MetaService options via `metaservice_config.json` (see above). Keys below match `memcache_hybrid.MetaConfig` field names.
 
-(1) Environment variables plus configuration file
-(2) Configure directly in Python [refer to this document](https://gitcode.com/Ascend/memcache/blob/master/doc/install_run.md#localservice)
+| Key | Type | Required | Default | Valid range | Description |
+| --- | --- | --- | --- | --- | --- |
+| `meta_service_url` | string | optional | `tcp://127.0.0.1:5000` | `tcp://<ip>:<port>` | Meta service listen address. Port in [1025, 65535]. |
+| `config_store_url` | string | optional | `tcp://127.0.0.1:6000` | `tcp://<ip>:<port>` | Config store address. Port in [1025, 65535]. |
+| `metrics_url` | string | optional | `http://127.0.0.1:8000` | `http://<ip>:<port>` | HTTP metrics endpoint. Port in [1025, 65535]. |
+| `ha_enable` | boolean | optional | `false` | `true` / `false` | Enable MetaService master/backup HA in a K8s cluster. |
+| `log_level` | string | optional | `info` | `debug` / `info` / `warn` / `error` | Log level. |
+| `log_path` | string | optional | `/var/log/memcache_hybrid` | relative or absolute path | Log directory. Absolute paths start with `/`. |
+| `log_rotation_file_size` | integer | optional | `20` | [1, 500] | Log rotation file size in MB. |
+| `log_rotation_file_count` | integer | optional | `50` | [1, 50] | Number of rotated log files to keep. |
+| `evict_threshold_high` | integer | optional | `90` | [1, 99] | Eviction high-water mark (%). Max is 99. Eviction is skipped when a single put exceeds 1% of capacity. |
+| `evict_threshold_low` | integer | optional | `80` | [0, 98] | Eviction low-water mark (%) after eviction completes. |
 
+For more options, see [MemCache Configuration Guide — MetaService Config](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_config.md#metaservice-config).
 
-Recommended approach: add `localservice_config.json`
-```json
-{
-    "protocol": " ",
-    ...
-}
-```
-
-```bash
-export SGLANG_HICACHE_MEMCACHE_CONFIG_PATH=${localservice_config_path}
-```
 
 ## Quick Start Ascend_memcache as L3 backend
 
@@ -159,5 +80,25 @@ python -m sglang.launch_server \
   --attention-backend ascend \
   --enable-hierarchical-cache \
   --hicache-storage-backend ascend_memcache \
-  --hicache-mem-layout page_first_kv_split
+  --hicache-mem-layout page_first_kv_split \
+  -- --hicache-storage-backend-extra-config '{"meta_service_url":"tcp://127.0.0.1:5000", "config_store_url":"tcp://127.0.0.1:6000", "log_level":"info", "world_size":256, "protocol": "device_sdma", "dram_size": "1GB"}'
 ```
+
+Pass LocalService options via `--hicache-storage-backend-extra-config` (JSON). Keys below match `memcache_hybrid.LocalConfig` field names.
+
+| Key | Type | Required | Default | Valid range | Description |
+| --- | --- | --- | --- | --- | --- |
+| `meta_service_url` | string | optional | `tcp://127.0.0.1:5000` | `tcp://<ip>:<port>` | Meta service address. Port in [1025, 65535]. In HA, `<ip>` is the cluster IP. |
+| `config_store_url` | string | optional | `tcp://127.0.0.1:6000` | `tcp://<ip>:<port>` | Config store address. Port in [1025, 65535]. |
+| `log_level` | string | optional | `info` | `debug` / `info` / `warn` / `error` | Log level. |
+| `world_size` | integer | optional | `256` | [1, 1024] | Max rank count. Cannot change after ranks connect; restart Meta to update. |
+| `protocol` | string | **required** | `host_rdma` | `host_rdma`, `host_urma`, `host_tcp`, `host_shm`, `device_sdma`, `device_rdma` | Transport protocol. `host_shm` requires `dram_size` > 0, `hbm_size` = 0, and no hcom. |
+| `hcom_url` | string | optional | `tcp://127.0.0.1:7000` | `tcp://<ip>:<port>` | HCOM address for the DRAM pool. Port in [1024, 65535]. |
+| `dram_size` | string / integer | **required** | `1GB` | [0, 1TB] | DRAM pool size. Accepts `134217728`, `2048KB`, `200mb`, `2.5G`, `1TB`, etc. Auto-aligned to 2MB (`host_rdma` / `host_tcp` / `host_shm`) or 1GB (`device_sdma` / `device_rdma`). |
+| `hbm_size` | string / integer | optional | `0` | [0, 1TB] | HBM pool size (same format as `dram_size`). Must be `0` when using `host_shm`. |
+| `max_dram_size` | string / integer | optional | `64GB` | [0, 1TB] | Max `dram_size` across all local processes. |
+| `max_hbm_size` | string / integer | optional | `0` | [0, 1TB] | Max `hbm_size` across all local processes. |
+
+
+For more options, see [MemCache Configuration Guide — LocalService Config](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_config.md#localservice-config).
+
