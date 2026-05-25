@@ -11,7 +11,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 MXFP8_BLOCK_SIZE = 32
-_FLOAT8_E8M0FNU_DTYPE = getattr(torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None))
+_FLOAT8_E8M0FNU_DTYPE = getattr(
+    torch_npu, "float8_e8m0fnu", getattr(torch, "float8_e8m0fnu", None)
+)
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -171,7 +173,9 @@ class NPUMXFP8LinearMethod(_NPULinearMethodBase):
         )
         # Pre-transpose to [in, out] for npu_quant_matmul (avoid per-call transpose)
         layer.weight = Parameter(qw.transpose(0, 1).contiguous(), requires_grad=False)
-        layer.weight_scale_inv = Parameter(w_scale.transpose(0, 1).contiguous(), requires_grad=False)
+        layer.weight_scale_inv = Parameter(
+            w_scale.transpose(0, 1).contiguous(), requires_grad=False
+        )
 
     def apply(
         self,
