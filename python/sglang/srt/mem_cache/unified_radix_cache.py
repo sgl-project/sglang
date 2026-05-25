@@ -784,6 +784,10 @@ class UnifiedRadixCache(BasePrefixCache):
             cur_time -= 0.00001
             node_update = node_update.parent
 
+        # last_host_node will be used as the starting node for the subsequent
+        # `prefetch_from_storage` flow. We directly use best_match_node here,
+        # because best_match_node represents the node where all components
+        # have reached consensus on both device & host availability.
         last_host_node = (
             best_match_node
             if self.cache_controller is not None

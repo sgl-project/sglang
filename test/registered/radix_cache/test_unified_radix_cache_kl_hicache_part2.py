@@ -20,7 +20,7 @@ MAMBA_TRACK_INTERVAL = 128
 register_cuda_ci(est_time=768, stage="base-c", runner_config="8-gpu-h200")
 
 
-class TestUnifiedMambaHiStorage(AccuracyTwoPassMixin, CustomTestCase):
+class TestUnifiedMambaHiCacheL3(AccuracyTwoPassMixin, CustomTestCase):
     """Mamba hybrid + HiCache L3 (file backend) + UnifiedRadixCache."""
 
     @classmethod
