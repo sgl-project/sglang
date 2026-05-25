@@ -23,24 +23,31 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
-# When set, every bench scenario captures a 30-step torch profile of the
-# canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. In this
-# mode the canary-off baseline run is skipped entirely (no overhead is
-# computed and the 200% assertion does not fire), so the bench finishes in
-# roughly half the time and the on-side trace is what you read.
-_PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
+# When set, every bench scenario captures torch profiles of the canary-on run only,
+# under `${SGLANG_KV_CANARY_PROFILE_DIR}/<scenario>_on/{cuda_graph,no_cuda_graph_osl3}/`. In
+# this mode the canary-off baseline run + overhead assertion are skipped. We capture two
+# variants per scenario:
+#   * `cuda_graph/`        — the production config (matches the assertion run).
+#   * `no_cuda_graph_osl3/` — diagnostic-only: `--disable-cuda-graph` (NEVER use this in the
+#     assertion path) and `output_len=3` so the trace shows raw kernel launches without graph
+#     replay folding everything into a single node.
+_PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
+_PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 
 
-def _make_server_args(*, canary_on: bool) -> ServerArgs:
+def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> ServerArgs:
     # canary requires --disable-piecewise-cuda-graph (install_canary asserts it). Pass it on both
-    # sides for apples-to-apples. Do NOT pass --disable-cuda-graph: canary must run inside the
-    # regular cuda graph for a representative measurement.
+    # sides for apples-to-apples. Do NOT pass --disable-cuda-graph in the assertion path: canary
+    # must run inside the regular cuda graph for a representative measurement. The flag is only
+    # honored in profile mode for the diagnostic no_cuda_graph_osl3 variant.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
         "--disable-piecewise-cuda-graph",
     ]
+    if disable_cuda_graph:
+        extra.append("--disable-cuda-graph")
     if canary_on:
         extra += ["--kv-canary", "raise"]
 
@@ -70,9 +77,12 @@ def _run_one_canary_setting(
     batch_size: int,
     input_len: int,
     output_len: int,
+    disable_cuda_graph: bool = False,
     profile_output_dir: Optional[Path] = None,
 ) -> BenchOneCaseResult:
-    server_args = _make_server_args(canary_on=canary_on)
+    server_args = _make_server_args(
+        canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
+    )
     bench_args = _make_bench_args(
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )
@@ -154,6 +164,48 @@ def _fmt_metric(value: Optional[float]) -> str:
 class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
+    def _capture_profiles(
+        self,
+        *,
+        scenario_key: str,
+        profile_root: Path,
+        batch_size: int,
+        input_len: int,
+        output_len: int,
+    ) -> None:
+        scenario_slug = scenario_key.replace("/", "_")
+        scenario_root = profile_root / f"{scenario_slug}_on"
+
+        graph_dir = scenario_root / "cuda_graph"
+        graph_run = _run_one_canary_setting(
+            canary_on=True,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+            profile_output_dir=graph_dir,
+        )
+        print(
+            f"[canary self-bench] {scenario_key} profile cuda_graph: "
+            f"on={graph_run.latency:.4f}s (trace under {graph_dir})",
+            flush=True,
+        )
+
+        no_graph_dir = scenario_root / "no_cuda_graph_osl3"
+        no_graph_run = _run_one_canary_setting(
+            canary_on=True,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=_PROFILE_NO_GRAPH_OUTPUT_LEN,
+            disable_cuda_graph=True,
+            profile_output_dir=no_graph_dir,
+        )
+        print(
+            f"[canary self-bench] {scenario_key} profile no_cuda_graph_osl3: "
+            f"on={no_graph_run.latency:.4f}s (trace under {no_graph_dir}); "
+            f"off baseline + overhead assertion skipped.",
+            flush=True,
+        )
+
     def _measure_overhead(
         self,
         *,
@@ -168,20 +220,12 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         profile_root = _resolve_profile_root()
 
         if profile_root is not None:
-            scenario_slug = scenario_key.replace("/", "_")
-            profile_output_dir = profile_root / f"{scenario_slug}_on"
-            on = _run_one_canary_setting(
-                canary_on=True,
+            self._capture_profiles(
+                scenario_key=scenario_key,
+                profile_root=profile_root,
                 batch_size=batch_size,
                 input_len=input_len,
                 output_len=output_len,
-                profile_output_dir=profile_output_dir,
-            )
-            print(
-                f"[canary self-bench] {scenario_key} profile mode: "
-                f"on={on.latency:.4f}s (trace under {profile_output_dir}); "
-                f"off baseline + overhead assertion skipped.",
-                flush=True,
             )
             return
 
