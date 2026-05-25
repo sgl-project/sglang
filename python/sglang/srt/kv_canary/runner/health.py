@@ -62,9 +62,9 @@ class KernelRunCounterHealthChecker:
             return None
         return self._device_state.kernel_run_counters
 
-    def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
-        delta = host_tensor - self._prev_counters_host
-        self._prev_counters_host = host_tensor
+    def _postprocess_on_host(self, new_counter_host: torch.Tensor) -> None:
+        delta = new_counter_host - self._prev_counters_host
+        self._prev_counters_host = new_counter_host
         expected_tags = self._expected_active_tags_for_health_check()
         stalled = [tag for tag in expected_tags if int(delta[tag.value]) == 0]
         if stalled:
