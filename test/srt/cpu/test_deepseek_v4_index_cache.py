@@ -472,3 +472,22 @@ def test_dsv4_index_cache_rejects_shape_mismatch():
     cached = index_cache.make_index_cache_from_metadata(source)
     with pytest.raises(AssertionError, match="raw index cache shape mismatch"):
         index_cache.assign_index_cache_to_metadata(cached, target, indexer_metadata)
+
+
+def test_dsv4_index_cache_profile_disabled_path_uses_cached_flag():
+    path = (
+        Path(__file__).parents[3]
+        / "python/sglang/srt/models/deepseek_v4_index_cache_profile.py"
+    )
+    source = path.read_text()
+    tree = ast.parse(source)
+
+    assert "_profile_enabled = envs.SGLANG_DSV4_INDEXCACHE_PROFILE.get()" in source
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "profile_region":
+            function_source = ast.get_source_segment(source, node)
+            assert function_source is not None
+            assert "envs.SGLANG_DSV4_INDEXCACHE_PROFILE.get()" not in function_source
+            break
+    else:
+        raise AssertionError("profile_region not found")

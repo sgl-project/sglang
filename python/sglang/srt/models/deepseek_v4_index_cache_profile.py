@@ -12,10 +12,12 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _graph_counts: Counter[str] = Counter()
+_profile_enabled = envs.SGLANG_DSV4_INDEXCACHE_PROFILE.get()
+_profile_log_interval = envs.SGLANG_DSV4_INDEXCACHE_PROFILE_LOG_INTERVAL.get()
 
 
 def is_dsv4_index_cache_profile_enabled() -> bool:
-    return envs.SGLANG_DSV4_INDEXCACHE_PROFILE.get()
+    return _profile_enabled
 
 
 def profile_region(name: str, layer_id: Optional[int] = None):
@@ -35,8 +37,7 @@ def record_cuda_graph_path(mode: str, can_run_graph: bool) -> None:
         pass
     _graph_counts[f"{mode}.{path}"] += 1
     total = sum(_graph_counts.values())
-    interval = envs.SGLANG_DSV4_INDEXCACHE_PROFILE_LOG_INTERVAL.get()
-    if interval > 0 and total % interval == 0:
+    if _profile_log_interval > 0 and total % _profile_log_interval == 0:
         logger.info(
             "[DSV4 IndexCache profile] CUDA graph path counts: %s",
             dict(_graph_counts),
