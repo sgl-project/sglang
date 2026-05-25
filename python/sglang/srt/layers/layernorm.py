@@ -780,25 +780,38 @@ class Gemma4RMSNorm(MultiPlatformOp):
             )
         return self.forward_native(x)
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(
+        self,
+        x: torch.Tensor,
+        supports_3d_strides: bool,
+    ) -> torch.Tensor:
         if x.numel() == 0:
             return x
         needs_reshape = x.dim() != 2
+        if supports_3d_strides:
+            needs_reshape = x.dim() not in (2, 3) or x.stride(-1) != 1
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
+
         if self.with_scale and self.scale_shift == 1.0:
             # gemma_rmsnorm: norm(x) * (1 + weight)
             out = gemma_rmsnorm(x, self.weight.data, self.eps)
         else:
             # rmsnorm: norm(x) * weight
-            # with_scale=False → weight is ones → norm(x) * 1 = norm(x)
-            # scale_shift=0.0 → standard RMSNorm without +1 shift
+            # with_scale=False -> weight is ones -> norm(x) * 1 = norm(x)
+            # scale_shift=0.0 -> standard RMSNorm without +1 shift
             out = rmsnorm(x, self.weight.data, self.eps)
 
         if needs_reshape:
             out = out.reshape(original_shape)
         return out
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x, supports_3d_strides=False)
+
+    def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_impl(x, supports_3d_strides=True)
 
     def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
