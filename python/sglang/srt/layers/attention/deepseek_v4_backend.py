@@ -20,11 +20,21 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsv4.compressor import (
-    CompressorBackendMixin,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
+
+if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+    # NOTE: should eventually be the only compressor backend
+    from sglang.srt.layers.attention.dsv4.compressor_v2 import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.dsv4.compressor import (
+        CompressorBackendMixin,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
@@ -43,6 +53,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
 
@@ -344,8 +355,10 @@ class DeepseekV4AttnBackend(
         self.page_size = model_runner.page_size
         assert self.page_size == 256, "the system hardcodes page_size=256"
 
-        self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool: DeepSeekV4TokenToKVPool = model_runner.token_to_kv_pool
+        self.hisparse_coordinator = model_runner.hisparse_coordinator
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -657,18 +670,29 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert forward_batch.req_to_token_pool.req_to_token is self.req_to_token
+        assert self.req_to_token_pool.req_to_token is self.req_to_token
 
         assert self.swa_page_size % SWA_WINDOW == 0 and self.page_size % 128 == 0
         assert seq_lens_cpu is not None
         max_seq_len = int(seq_lens_cpu.max().item())
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            # DSv4 bakes this step's KV write target (c4/c128) into metadata,
+            # so slice the shared multi-step out_cache_loc now rather than at
+            # forward time.
+            out_cache_loc = forward_batch.out_cache_loc
+            if self.topk > 0 and self.speculative_num_steps > 1:
+                out_cache_loc = per_step_draft_out_cache_loc(
+                    out_cache_loc,
+                    forward_batch.batch_size,
+                    self.topk,
+                    self.speculative_num_steps,
+                )[self.speculative_step_id]
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
             )
         elif forward_batch.forward_mode.is_target_verify():
             metadata = self.init_forward_metadata_target_verify(
@@ -950,7 +974,7 @@ class DeepseekV4AttnBackend(
         layer_id = layer.layer_id
         metadata = self.forward_metadata
         core_attn_metadata = metadata.core_attn_metadata
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         if isinstance(core_attn_metadata, DSV4AttnMetadata):
@@ -1173,7 +1197,6 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
     ):
         super().__init__(model_runner)
-        self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends: List[DeepseekV4AttnBackend] = []

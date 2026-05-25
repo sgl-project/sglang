@@ -20,6 +20,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 
 
@@ -35,6 +36,7 @@ def set_mla_kv_buffer_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
@@ -43,6 +45,9 @@ def set_mla_kv_buffer_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_ptr + loc * buffer_stride + offs
@@ -82,6 +87,16 @@ def set_mla_kv_buffer_kernel(
 
     tl.store(dst_ptr, src, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+# Above this loc count the TMA bulk-store path overtakes the single-CTA-per-loc
+# Triton kernel. Below it, Triton with BLOCK = next_pow2(total_dim) (one CTA
+# does the whole row in one tile, no boundary fan-out) is the winning fallback.
+# Tuned on GB300 with DSv4 row widths.
+_TMA_BULK_STORE_MIN_LOCS = 768
+
 
 def set_mla_kv_buffer_triton(
     kv_buffer: torch.Tensor,
@@ -89,13 +104,58 @@ def set_mla_kv_buffer_triton(
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
 ):
+    """Dispatch MLA paged-KV scatter writes to the fastest available path.
+
+    Two paths, chosen on ``n_loc``:
+
+    - ``n_loc >= 768`` (and SM90+ with TMA-compatible row widths): JIT CUDA
+      kernel where each warp loads one (nope, rope) row into shared memory and
+      issues a single ``cp.async.bulk.global.shared::cta`` store to scatter the
+      row at ``kv_buffer[loc[item]]``. Wins at large bs because it packs 4-8
+      items per CTA, drastically reducing the CTA count vs single-CTA-per-loc.
+    - Otherwise: Triton kernel with ``BLOCK = next_pow2(nope_dim + rope_dim)``,
+      i.e. one CTA per loc covering the entire row in one tile. Wins at small
+      bs because there's no per-loc CTA fan-out (5× fewer CTAs than the old
+      BLOCK=128 dispatch) and the row-spanning block makes the boundary branch
+      a one-shot per CTA. This is also the path for SM<90 and for shapes that
+      violate the TMA 16-byte alignment.
+
+    Speedup vs the legacy BLOCK=128 Triton kernel on GB300 (BF16, nope=512,
+    rope=64): ~1.05× at bs=8, ~1.5× at bs=128, 3.5× at bs=512, **11.7× at
+    bs=16384**.
+
+    Name retained for caller compatibility; the implementation is no longer
+    Triton-only.
+    """
+    from sglang.jit_kernel.set_mla_kv_buffer import (
+        can_use_set_mla_kv_buffer,
+    )
+    from sglang.jit_kernel.set_mla_kv_buffer import (
+        set_mla_kv_buffer as jit_set_mla_kv_buffer,
+    )
+
+    n_loc = loc.numel()
+    nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
+    rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
+    if (
+        n_loc >= _TMA_BULK_STORE_MIN_LOCS
+        and is_arch_support_pdl()
+        and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
+    ):
+        jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
+        return
+
+    # Fallback: Triton with BLOCK = next_pow2(total_dim). One CTA per loc; the
+    # whole row in one tile (the existing 3-way nope/rope/boundary branch in
+    # ``set_mla_kv_buffer_kernel`` handles the over-allocation past total_dim
+    # via the offs<total_dim mask). Beats BLOCK=128 by 60-2700 ns across the
+    # 2 ≤ bs ≤ 512 range on GB300.
     nope_dim = cache_k_nope.shape[-1]
     rope_dim = cache_k_rope.shape[-1]
     total_dim = nope_dim + rope_dim
-    BLOCK = 128
-    n_loc = loc.numel()
-    grid = (n_loc, triton.cdiv(total_dim, BLOCK))
-
+    BLOCK = triton.next_power_of_2(total_dim)
+    grid = (n_loc, 1)
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
     set_mla_kv_buffer_kernel[grid](
         kv_buffer,
         cache_k_nope,
@@ -107,6 +167,7 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        **pdl_kwargs,
     )
 
 
@@ -122,6 +183,7 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr = False,
 ):
     """Fuse BF16/FP16->FP8 cast with paged KV write."""
     pid_loc = tl.program_id(0)
@@ -131,6 +193,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     offs = base + tl.arange(0, BLOCK)
     total_dim = nope_dim + rope_dim
     mask = offs < total_dim
+
+    if USE_GDC:
+        tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
     dst_ptr = kv_buffer_fp8_ptr + loc * buffer_stride + offs
@@ -165,6 +230,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     # Destination pointer is FP8-typed view; tl.store performs downcast.
     tl.store(dst_ptr, src, mask=mask)
 
+    if USE_GDC:
+        tl.extra.cuda.gdc_launch_dependents()
+
 
 def set_mla_kv_buffer_triton_fp8_quant(
     kv_buffer: torch.Tensor,
@@ -183,6 +251,8 @@ def set_mla_kv_buffer_triton_fp8_quant(
     n_loc = loc.numel()
     grid = (n_loc, triton.cdiv(total_dim, BLOCK))
 
+    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+
     set_mla_kv_buffer_fp8_quant_kernel[grid](
         kv_buffer_fp8,
         cache_k_nope,
@@ -194,6 +264,7 @@ def set_mla_kv_buffer_triton_fp8_quant(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        **pdl_kwargs,
     )
 
 
@@ -352,16 +423,6 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
-def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
-    # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
-    if len(tokens) and isinstance(tokens[0], tuple):
-        return tokens
-    if len(tokens) < 2:
-        return []
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
-
-
 def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
     hasher = hashlib.sha256()
 
@@ -389,3 +450,50 @@ def hash_str_to_int64(hash_str: str) -> int:
     if uint64_val >= 2**63:
         return uint64_val - 2**64
     return uint64_val
+
+
+def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
+    """Compute SHA256-based hash values for position-aware KV block IDs."""
+    hash_values = []
+
+    parent_hash = None
+    if node.parent is not None and node.parent.hash_value is not None:
+        if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
+            parent_hash = node.parent.hash_value[-1]
+
+    logical_len = len(node.key)
+    for start in range(0, logical_len, page_size):
+        end = min(start + page_size, logical_len)
+        if end <= start:
+            continue
+        hash_val = node.key.hash_page(start, end, parent_hash)
+        hash_values.append(hash_val)
+        parent_hash = hash_val
+    return hash_values
+
+
+def split_node_hash_value(
+    child_hash_value: Optional[List[str]], split_len: int, page_size: int
+) -> tuple[Optional[List[str]], Optional[List[str]]]:
+    """Split hash_value between parent and child nodes during node splitting.
+
+    Args:
+        child_hash_value: The hash_value list from the child node being split
+        split_len: The length at which to split (in tokens)
+        page_size: The page size for calculating number of pages
+
+    Returns:
+        Tuple of (new_node_hash_value, updated_child_hash_value)
+    """
+    if child_hash_value is None:
+        return None, None
+
+    if page_size == 1:
+        split_pages = split_len
+    else:
+        split_pages = split_len // page_size
+
+    new_node_hash = child_hash_value[:split_pages]
+    child_hash = child_hash_value[split_pages:]
+
+    return new_node_hash, child_hash

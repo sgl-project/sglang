@@ -14,6 +14,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_cp_size,
     is_allocation_symmetric,
 )
+from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -67,15 +68,37 @@ def is_prefill_cp_in_seq_split():
     )
 
 
+def is_mla_prefill_cp_enabled() -> bool:
+    sa = get_global_server_args()
+    return sa.enable_prefill_context_parallel and sa.use_mla_backend
+
+
+def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
+    if mla_enable_prefill_cp is None:
+        mla_enable_prefill_cp = is_mla_prefill_cp_enabled()
+    return (
+        forward_batch.attn_cp_metadata is not None
+        and mla_enable_prefill_cp
+        and forward_batch.forward_mode.is_context_parallel_extend()
+    )
+
+
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
     # the load-balancing split into 2 * cp_size blocks is non-degenerate.
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
     cur_cp_seq_len = seq_len // (cp_size * 2)
     if not (
         cur_cp_seq_len != 0
         and cp_size > 1
+        # prepare_context_parallel_metadata hard-codes bs_per_cp_group = 1;
+        # guard explicitly to avoid silent mis-partitioning under continuous batching.
         and forward_batch.forward_mode.is_context_parallel_extend()
+        # is_context_parallel_extend() returns True for MIXED (prefill+decode
+        # in one step), but the zigzag split only makes sense on pure extend.
+        and forward_batch.forward_mode != ForwardMode.MIXED
         and is_prefill_context_parallel_enabled()
     ):
         return False
@@ -103,17 +126,17 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert (
             input_.shape[0] % cp_size == 0
         ), f"Expect input shape 0 can divided by cp size, but got input shape {input_.shape}, cp size {cp_size}"
-        return nsa_cp_round_robin_split_data(input_)
+        return dsa_cp_round_robin_split_data(input_)
 
     input_list = list(
         torch.split(input_, forward_batch.attn_cp_metadata.split_list, dim=0)
@@ -125,18 +148,18 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
 
 
 def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
-        nsa_cp_round_robin_split_data,
+    from sglang.srt.layers.attention.dsa.utils import (
+        dsa_cp_round_robin_split_data,
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         cp_size = get_attention_cp_size()
         assert positions.shape[0] % cp_size == 0, (
             f"Expect positions shape 0 can divided by cp size, but got positions shape {positions.shape}, "
             f"cp size {cp_size}"
         )
-        return nsa_cp_round_robin_split_data(positions)
+        return dsa_cp_round_robin_split_data(positions)
 
     position_id_list = list(
         torch.split(positions, forward_batch.attn_cp_metadata.split_list, dim=-1)
@@ -270,11 +293,11 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
     | token0, token1, token2, token3, token4, token5, token6, token7, ...
     |   +-------------------------+
     """
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
             get_attention_cp_group(), disabled=not is_allocation_symmetric()
         ):
@@ -372,7 +395,7 @@ def cp_allgather_and_save_kv_cache(forward_batch, layer, k, v, cp_size):
         v, cp_size, forward_batch, torch.cuda.current_stream()
     )
 
-    forward_batch.token_to_kv_pool.set_kv_buffer(
+    get_token_to_kv_pool().set_kv_buffer(
         layer,
         cache_loc,
         key_cache_full,
@@ -433,11 +456,11 @@ def prepare_context_parallel_metadata(
     extend_seqs_len=None,
     device="cuda",
 ):
-    from sglang.srt.layers.attention.nsa.utils import (
-        is_nsa_prefill_cp_round_robin_split,
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
     )
 
-    if is_nsa_prefill_cp_round_robin_split():
+    if is_dsa_prefill_cp_round_robin_split():
         return ContextParallelMetadata()
 
     """prepare_input_dp_with_cp_dsa-zigzag index
