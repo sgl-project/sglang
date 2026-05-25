@@ -47,17 +47,7 @@ def _phase_check_kernel(
 
 
 class SimplePhaseChecker:
-    """GPU-side state machine for any int-keyed phase sequence.
-
-    The check kernel is launched unconditionally on every ``update()`` call so
-    it is safely captured into cuda graphs. Whether the kernel actually
-    asserts on a phase mismatch is decided by a device-side flag
-    (``_enable_assert_device``), which can be toggled without re-recording any
-    graph. The flag is OFF at construction so init-time work (warmup, graph
-    capture, piecewise compile) that legitimately violates the strict
-    lifecycle does not raise. Call :meth:`enable_assert` once initialization
-    is finished to turn it on.
-    """
+    """GPU-side state machine for any int-keyed phase sequence."""
 
     def __init__(self, *, initial_phase: int | IntEnum, device: torch.device) -> None:
         self._initial_phase = int(initial_phase)
@@ -72,39 +62,11 @@ class SimplePhaseChecker:
             f"enable_assert=OFF (call enable_assert() after init is done)"
         )
 
-    def reset_to_idle(self) -> None:
-        """Reset the phase tensor to ``initial_phase`` without touching the
-        assert flag.
-
-        Useful for callers (such as ``CanaryManager.mark_init_finished``)
-        that need to bulk-reset many checkers and then enable asserts in a
-        separate loop, or to recover after a non-throwing lifecycle hiccup."""
-        self._phase.fill_(self._initial_phase)
-        _host_debug(
-            f"[SimplePhaseChecker.reset_to_idle] phase reset to "
-            f"{self._initial_phase}"
-        )
-
     def enable_assert(self) -> None:
-        """Turn on the device-side assert and reset phase to ``initial_phase``.
-
-        Called once after all init-time work (warmup, cuda graph capture,
-        piecewise compile, etc.) so the post-init phase sequence starts from a
-        known state regardless of what captured kernels left in the phase
-        tensor during init."""
-        self.reset_to_idle()
+        """Turn on the device-side assert and reset phase to ``initial_phase``."""
+        self._reset_to_idle()
         self._enable_assert_device.fill_(1)
         _host_debug(f"[SimplePhaseChecker.enable_assert] assert ENABLED")
-
-    def _resolve_caller_tag(self, caller_name: str) -> int:
-        registry = self._caller_tag_registry
-        if caller_name not in registry:
-            registry[caller_name] = len(registry) + 1
-            _host_debug(
-                f"[SimplePhaseChecker] registered caller_tag "
-                f"{registry[caller_name]} <- {caller_name!r}"
-            )
-        return registry[caller_name]
 
     def update(
         self,
@@ -128,3 +90,21 @@ class SimplePhaseChecker:
             NEXT_PHASE=int(next_phase),
             CALLER_TAG=caller_tag,
         )
+
+    def _reset_to_idle(self) -> None:
+        self._phase.fill_(self._initial_phase)
+        _host_debug(
+            f"[SimplePhaseChecker.reset_to_idle] phase reset to "
+            f"{self._initial_phase}"
+        )
+
+    def _resolve_caller_tag(self, caller_name: str) -> int:
+        registry = self._caller_tag_registry
+        if caller_name not in registry:
+            registry[caller_name] = len(registry) + 1
+            _host_debug(
+                f"[SimplePhaseChecker] registered caller_tag "
+                f"{registry[caller_name]} <- {caller_name!r}"
+            )
+        return registry[caller_name]
+
