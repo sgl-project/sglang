@@ -905,8 +905,14 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.register_buffer("recall_gate", torch.zeros(1))
         self.output_gate = nn.Linear(in_dim, out_dim, bias=True)
 
-        # Short convs on K (k_conv_only=True)
-        if conv_kernel_size > 0:
+        # Short convs on K (k_conv_only=True). The upstream softmax variant
+        # ``BidirectionalSoftmaxUCPESinglePathLiteLA`` does NOT carry these
+        # short convs in either the main or the cam branch, so the released
+        # checkpoint has no conv_k/conv_k_cam tensors for softmax blocks
+        # (indices {3, 7, 11, 15, 19} when softmax_every_n=4). Creating them
+        # here would leave the loader staring at missing checkpoint keys it
+        # cannot synthesize. Skip creation when softmax_main=True.
+        if conv_kernel_size > 0 and not softmax_main:
             self.conv_k = _ShortConvolution(out_dim, conv_kernel_size)
             if not k_conv_only:
                 self.conv_q = _ShortConvolution(out_dim, conv_kernel_size)
@@ -927,7 +933,7 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         self.out_proj_cam = nn.Linear(out_dim, out_dim, bias=True)
         nn.init.zeros_(self.out_proj_cam.weight)
         nn.init.zeros_(self.out_proj_cam.bias)
-        if conv_kernel_size > 0:
+        if conv_kernel_size > 0 and not softmax_main:
             self.conv_k_cam = _ShortConvolution(out_dim, conv_kernel_size)
             if not k_conv_only:
                 self.conv_q_cam = _ShortConvolution(out_dim, conv_kernel_size)
