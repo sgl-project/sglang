@@ -87,18 +87,12 @@ __global__ void plan_entries_persistent_kernel(
     return;
   }
 
-  // Honor the offsets kernel's disable signal: when total_verify exceeded verify_capacity on the
-  // previous step (overflow), the offsets kernel clears verify_enable to 0; the verify kernel will
-  // skip this step entirely, so scattering anything is wasted work.
   if (*params.verify_enable == 0) {
     return;
   }
 
-  // Contract: offsets kernel sets verify_enable=0 iff total_verify > verify_capacity, so reaching
-  // here means total_verify <= verify_capacity. Trap the invariant in release builds too (jit_kernel
-  // may compile with -DNDEBUG, which neuters cassert) — silent OOB scatter into
-  // out_verify_*[verify_capacity] would corrupt adjacent device memory and surface much later as a
-  // non-canary failure (e.g. CUBLAS_STATUS_EXECUTION_FAILED in a downstream kernel).
+  // Contract: offsets kernel clears verify_enable iff total_verify > verify_capacity, so reaching
+  // here implies total_verify <= verify_capacity. Trap on contract break (cassert is NDEBUG-gated).
   if (total_verify > params.verify_capacity) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       printf(

@@ -48,9 +48,8 @@ struct WriteKernelParams {
   int64_t* slot_run_counter;
   int64_t* kernel_run_counter;
 
-  // Runtime-only assert gate. Read by the kernel as a single int32 cell on every launch. Starts at 0
-  // during warmup / cuda-graph capture (writes use synthetic positions that may not be geometric); host
-  // flips to 1 in CanaryManager.mark_init_finished() to enable the geometric write_position check.
+  // Starts at 0 during warmup / cuda-graph capture; flipped to 1 in
+  // CanaryManager.mark_init_finished(). Gates the chain-step position assert below.
   const int32_t* enable_runtime_assert;
 
   // Real-KV sources.
@@ -87,16 +86,8 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
   uint64_t running_prev_hash =
       compute_slot_hash(p.canary_buf, p.slot_stride_bytes, static_cast<int64_t>(seed_slot_idx));
 
-  // Chain-step position assert (only enabled when:
-  //   1. after CanaryManager.mark_init_finished() — warmup / cuda-graph capture may write synthetic
-  //      positions whose seed has unrelated stored_position, which is not a real bug;
-  //   2. seed_slot_idx >= 0 — chain heads have no predecessor stored_position to compare against.
-  // Asserts ``position == running_prev_position + 1`` per chain step; running_prev_position starts at
-  // the seed's stored position and advances to ``position`` after each entry. Holds across DECODE,
-  // EXTEND prefill, DRAFT_EXTEND_V2, and TARGET_VERIFY since this branch only supports eagle topk=1
-  // — every multi-token write produces a strictly +1 sequential progression. (If topk>1 is added
-  // later, target_verify becomes a token tree with sibling positions sharing parent.pos+1; this
-  // assert would misfire there and needs gating via a per-launch tree flag.)
+  // Assumes eagle topk=1 (linear chain). Under topk>1 target_verify would be a tree and
+  // sibling positions share parent.pos+1, breaking this invariant.
   const bool do_chain_position_assert = (seed_slot_idx >= 0) && (*p.enable_runtime_assert != 0);
   int64_t running_prev_position = 0;
   if (do_chain_position_assert) {

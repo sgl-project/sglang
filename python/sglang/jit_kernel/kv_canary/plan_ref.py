@@ -157,10 +157,7 @@ def _materialize_verify_entries(
     if total_verify == 0:
         return 0
 
-    # Mirror the CUDA plan_entries kernel's verify_enable early-exit: on overflow the offsets
-    # writer clears enable to 0 and the entries kernel skips its scatter entirely, leaving
-    # out_verify_*[:verify_capacity] untouched. The reference must produce the same observable
-    # state so the differential fuzz tests stay byte-equal.
+    # On overflow CUDA plan_entries skips scatter (verify_enable=0); mirror that.
     if total_verify > verify_capacity:
         return total_verify
 

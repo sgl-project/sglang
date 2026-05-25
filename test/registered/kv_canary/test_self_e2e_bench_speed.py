@@ -33,14 +33,9 @@ _PROFILE_STEPS = 30
 
 
 def _make_server_args(*, canary_on: bool) -> ServerArgs:
-    # DO NOT add --disable-cuda-graph below: the canary kernel must run inside the regular cuda
-    # graph alongside the real attn kernel; an overhead measurement taken with that graph disabled
-    # does not represent the production path canary actually ships on.
-    #
-    # We DO pass --disable-piecewise-cuda-graph: this is the production canary configuration
-    # (install_canary asserts it because the current SingleForwardManager design doesn't support
-    # piecewise sub-graphs), so disabling it is what real canary deployments do. We disable it for
-    # both the on and off baseline runs to keep the comparison apples-to-apples.
+    # canary requires --disable-piecewise-cuda-graph (install_canary asserts it). Pass it on both
+    # sides for apples-to-apples. Do NOT pass --disable-cuda-graph: canary must run inside the
+    # regular cuda graph for a representative measurement.
     extra = [
         "--model-path",
         _QWEN3_MODEL,

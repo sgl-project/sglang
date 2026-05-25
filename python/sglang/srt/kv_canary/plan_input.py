@@ -102,14 +102,9 @@ def _extract_prefix_lens_and_extend_seq_lens(
     forward_mode = forward_batch.forward_mode
     spec_info = forward_batch.spec_info
     if forward_mode.is_decode_or_idle():
-        # Anchor prefix_lens on ``forward_batch.positions`` (one entry per active decode token)
-        # instead of ``seq_lens - 1``. Reason: ``seq_lens`` convention is path-dependent — regular
-        # decode bumps it pre-forward (so seq_lens - 1 = write_position), but the eagle draft path
-        # leaves seq_lens pre-bump (so seq_lens - 1 = write_position - 1, one slot behind the actual
-        # chain predecessor). ``positions[entry]`` is always the canonical write position regardless
-        # of mode. Positions can be shorter than ``bs`` when the batch is padded (cuda-graph capture
-        # with idle slots): seed the tail with the ``seq_lens - 1`` fallback so plan-kernel padding
-        # filters apply, then overlay the active prefix with positions.
+        # Anchor on ``positions`` (canonical write position) instead of seq_lens-1; eagle draft
+        # leaves seq_lens pre-bump so the seq_lens-1 form is off by one. positions can be shorter
+        # than bs under cuda-graph padding — fall back to seq_lens-1 for the inactive tail.
         seq_lens_i64 = forward_batch.seq_lens[:bs].to(torch.int64)
         out_prefix_lens.copy_((seq_lens_i64 - 1).clamp(min=0))
         positions = forward_batch.positions

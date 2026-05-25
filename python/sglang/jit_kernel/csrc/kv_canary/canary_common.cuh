@@ -161,17 +161,10 @@ canary_store_field(uint8_t* buf, int64_t slot_idx, int64_t slot_stride_bytes, in
   p[field] = value;
 }
 
-// Compute the chain-step hash of ``source_slot_idx``: load (token, position, prev_hash) from that slot
-// and fold them through splitmix64_mix3. The result is the chain hash that the slot immediately following
-// ``source_slot_idx`` should store as its prev_hash.
-//
-// real_kv_hash is intentionally NOT folded in: under radix prefix sharing, ``RadixCache.cache_unfinished_req``
-// remaps ``req_to_token[req, P]`` from a req's own freshly-written slot to a shared slot owned by another
-// req. The shared slot's (token, position, prev_hash) match by definition (same prompt → same content
-// chain), but its real_kv_hash reflects the donor req's KV values and would not equal the consumer req's
-// stored chain. Excluding real_kv_hash keeps the chain pure-content and immune to legitimate radix folding.
-// real_kv_hash field corruption is still caught by the standalone real_kv_hash field check on each slot
-// (per-forward verify + periodic sweep).
+// Compute the chain-step hash of ``source_slot_idx``: fold (token, position, prev_hash) of the slot
+// through splitmix64_mix3. real_kv_hash is intentionally excluded so radix prefix sharing (which
+// legally remaps to a slot with different KV bytes) doesn't break the chain — standalone
+// real_kv_hash field checks cover corruption there.
 //
 // ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on splitmix64(kCanaryChainAnchor).
 // Shared by the verify path (recompute expected prev_hash from a slot's predecessor) and the write path

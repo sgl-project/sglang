@@ -77,13 +77,9 @@ class CanaryDeviceState:
         slot_run_counters: Per-CanaryLaunchTag int64 counter array, shape [num_tags], device. Same
             view-handed-to-kernel pattern as kernel_run_counters; each launch adds its active entry
             count to its slot. Used for periodic stats ("protected N tokens").
-        enable_runtime_assert: int32 [1] device flag gating runtime-only assertions. Initialized
-            to 0 (disabled) so cuda-graph capture / warmup paths — which may legitimately write
-            canary slots with synthetic positions before any per-forward seed is established —
-            never trip the assert. CanaryManager.mark_init_finished() flips it to 1 once the
-            server is past warmup. Currently consumed by the write kernel's geometric
-            write_position check (compares stored_position + 1 + entry_offset against
-            forward_batch.positions[entry_idx]).
+        enable_runtime_assert: int32 [1] device flag. 0 during cuda-graph capture / warmup;
+            CanaryManager.mark_init_finished() flips to 1. Gates the write kernel's chain-step
+            write_position assert.
     """
 
     violation_log: ViolationLog

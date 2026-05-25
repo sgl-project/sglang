@@ -102,15 +102,9 @@ class CanaryLaunchCapacities:
             max_bs * num_tokens_per_bs, max_extend_tokens_per_forward
         )
 
-        # Per-forward verify entries = sum_r (prefix_lens[r] - SWA_window_start[r]); the FULL group
-        # never clips with a window, so the upper bound is sum_r prefix_lens[r]. Under radix prefix
-        # sharing, reqs can collectively reference more tokens than the pool holds. Realistic worst
-        # case under speculative decoding (e.g. 20 parallel 7000-token requests with deterministic
-        # token_oracle prompts producing perfect cross-request prefix duplication) drives
-        # sum(prefix_lens) past 2x pool_slot_count. Sizing at 3x keeps the partial-fallback path
-        # (plan kernel sets enable=0 + host warn-logs) genuinely exceptional rather than the
-        # steady-state — otherwise verify would skip every chunked step and lose its bug-detection
-        # signal entirely on these workloads (incl. eagle pr_25015 regression coverage).
+        # Radix prefix sharing lets sum_r prefix_lens[r] exceed pool_slot_count; observed up to ~2x
+        # on 20 parallel token-oracle prompts. 3x headroom keeps the partial-fallback path
+        # (plan kernel enable=0 + host warn) exceptional. Overflow does not raise at install time.
         per_forward_verify_capacity = int(pool_slot_count * 3)
 
         return cls(
