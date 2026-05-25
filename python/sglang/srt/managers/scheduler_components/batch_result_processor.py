@@ -610,6 +610,36 @@ class SchedulerBatchResultProcessor:
             # copies into fresh Python objects, so `.clone()` is unnecessary.
             spec_v1_hidden_states_list = logits_output.hidden_states.tolist()
 
+        # Spec-V2 verify keeps logits_output.hidden_states in its strided
+        # [bs * speculative_num_draft_tokens, hidden_dim] shape, so the legacy
+        # `hidden_states[i]` indexing picks the i-th row of that strided
+        # tensor instead of request i's slice.
+        spec_v2_hs_stride = None
+        spec_v2_hs_accept_lens = None
+        spec_v2_hidden_states_list = None
+        if (
+            batch.is_spec_v2
+            and logits_output.hidden_states is not None
+            and result.num_correct_drafts_per_req_cpu is not None
+        ):
+            spec_v2_hs_stride = result.speculative_num_draft_tokens
+            if spec_v2_hs_stride is None:
+                raise RuntimeError(
+                    "spec-v2 result missing speculative_num_draft_tokens"
+                )
+            # +1 for the bonus token, matching _resolve_spec_overlap_tokens.
+            spec_v2_hs_accept_lens = [
+                c + 1 for c in result.num_correct_drafts_per_req_cpu
+            ]
+            expected_rows = len(batch.reqs) * spec_v2_hs_stride
+            if logits_output.hidden_states.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"spec-v2 hidden_states shape[0] "
+                    f"{logits_output.hidden_states.shape[0]} != bs * stride "
+                    f"{expected_rows}"
+                )
+            spec_v2_hidden_states_list = logits_output.hidden_states.tolist()
+
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -627,9 +657,7 @@ class SchedulerBatchResultProcessor:
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     if spec_v1_hs_offsets is not None:
                         start, end = spec_v1_hs_offsets[i], spec_v1_hs_offsets[i + 1]
-                        req.hidden_states.extend(
-                            spec_v1_hidden_states_list[start:end]
-                        )
+                        req.hidden_states.extend(spec_v1_hidden_states_list[start:end])
                     else:
                         # Legacy single-row path for any spec-v1 worker that
                         # populates hidden_states without num_correct_drafts_per_req_cpu.
@@ -671,9 +699,15 @@ class SchedulerBatchResultProcessor:
                 )
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                req.hidden_states.append(
-                    logits_output.hidden_states[i].cpu().clone().tolist()
-                )
+                if spec_v2_hs_stride is not None:
+                    start = i * spec_v2_hs_stride
+                    end = start + spec_v2_hs_accept_lens[i]
+                    req.hidden_states.extend(spec_v2_hidden_states_list[start:end])
+                else:
+                    # Non-spec: hidden_states is [bs, hidden_dim], one row per req.
+                    req.hidden_states.append(
+                        logits_output.hidden_states[i].cpu().clone().tolist()
+                    )
 
             if req.grammar is not None:
                 self._apply_decode_grammar(
