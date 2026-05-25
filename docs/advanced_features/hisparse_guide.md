@@ -100,7 +100,7 @@ python3 -m sglang.launch_server \
     --hisparse-config='{"top_k": 2048, "device_buffer_size": 6144, "host_to_device_ratio": 10}'
 ```
 
-> **Note**: The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`). You can also explicitly set `--kv-cache-dtype bfloat16` or `--kv-cache-dtype fp8_e4m3` to override.
+> **Note**: For DSA models, `--kv-cache-dtype` defaults to `auto`, which resolves to `fp8_e4m3` on SM100+ (Blackwell) and `bfloat16` on older architectures. The DSA decode backend is automatically selected based on KV dtype (`bfloat16` → `flashmla_sparse`, `fp8_e4m3` → `flashmla_kv`). DSA backend flags apply only to DSA models; DeepSeek V4 uses its own `dsv4` attention backend.
 
 ### Benchmark
 
@@ -126,7 +126,7 @@ python3 -m sglang.bench_serving \
 - The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
 - On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
 - For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
-- For DeepSeek V4, do not pass DSA backend flags. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
+- For DeepSeek V4, DSA backend flags are not applicable. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
 - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
   - **~1 TB** host memory → `host_to_device_ratio: 5`
   - **~2 TB** host memory → `host_to_device_ratio: 10`
