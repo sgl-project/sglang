@@ -7,7 +7,7 @@ from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.perturb.config import TargetGroupKind
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase
-from sglang.test.kv_canary.swa_test_pool_config import SWA_POOL_SERVER_ARGS
+from sglang.test.kv_canary.consts import SWA_POOL_SERVER_ARGS
 
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
@@ -52,7 +52,10 @@ class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
-    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *SWA_POOL_SERVER_ARGS)
+    extra_server_args = (
+        *_PerturbRealKvUsedBase.extra_server_args,
+        *SWA_POOL_SERVER_ARGS,
+    )
 
 
 class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
@@ -60,7 +63,10 @@ class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
-    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *SWA_POOL_SERVER_ARGS)
+    extra_server_args = (
+        *_PerturbRealKvUsedBase.extra_server_args,
+        *SWA_POOL_SERVER_ARGS,
+    )
 
 
 if __name__ == "__main__":
