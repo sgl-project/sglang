@@ -108,15 +108,19 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         else:
             seed_slot_indices.append(slot_pool.pop())
 
+    # Real sglang only emits ``out_cache_loc[i] = -1`` for SWA endpoints on the
+    # out-of-window contiguous prefix of a req's entries (older tokens evicted, newer in
+    # window). The kernel's skip-on-negative path is covered by deterministic hand tests
+    # in test_write_hand.py (test_negative_slot_skips_entry,
+    # test_write_skip_when_out_cache_loc_is_minus_one); the fuzz keeps every entry valid
+    # so it can exercise the chain-step / pseudo-mismatch invariants without the random
+    # skip pattern (which doesn't match any real-world workload).
     out_cache_loc_list: list[int] = []
     for _ in range(total_tokens):
-        if rng.random() < 0.15 and total_tokens > 1:
+        if not slot_pool:
             out_cache_loc_list.append(-1)
         else:
-            if not slot_pool:
-                out_cache_loc_list.append(-1)
-            else:
-                out_cache_loc_list.append(slot_pool.pop())
+            out_cache_loc_list.append(slot_pool.pop())
 
     plan_cuda, plan_ref = make_write_plan_pair(
         write_offsets=write_offsets,
@@ -132,26 +136,12 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     )
     # Per-chain sequential positions so the write kernel's chain-step position assert holds.
     # For chains with a real seed slot, stamp the seed with (chain_start_position - 1) so the
-    # first written chain entry's position == seed.position + 1.
-    #
-    # The writer treats ``out_cache_loc[i] < 0`` entries as "skip": no canary write, and (by
-    # design) no running_prev_position bump. To keep the chain-step assert from firing on the
-    # next valid entry after a skip, the chain counter advances ONLY over written entries —
-    # skipped entries get a placeholder position the kernel never reads.
+    # first chain entry's position == seed.position + 1.
     chain_start_positions: list[int] = [rng.randint(0, 1024) for _ in range(n_reqs)]
-    positions_list: list[int] = [0] * total_tokens
+    positions_list: list[int] = []
     for r in range(n_reqs):
         start = chain_start_positions[r]
-        entry_start = write_offsets[r]
-        entry_end = write_offsets[r + 1]
-        valid_count = 0
-        for entry_idx in range(entry_start, entry_end):
-            if out_cache_loc_list[entry_idx] < 0:
-                # Placeholder — kernel skips before reading this entry's position.
-                positions_list[entry_idx] = -1
-            else:
-                positions_list[entry_idx] = start + valid_count
-                valid_count += 1
+        positions_list.extend(start + i for i in range(per_req_tokens[r]))
         seed_slot = seed_slot_indices[r]
         if seed_slot >= 0:
             stamp_pair(
