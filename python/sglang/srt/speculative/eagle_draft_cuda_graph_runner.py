@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.model_executor.cuda_graph_runner import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -49,7 +50,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     out_cache_loc: torch.Tensor
     positions: torch.Tensor
     mrope_positions: torch.Tensor
-    rids_int: torch.Tensor
+    rids_int: Optional[torch.Tensor]
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     extend_seq_lens: torch.Tensor
@@ -128,7 +129,11 @@ class EAGLEDraftCudaGraphRunner:
             )
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
-            rids_int = torch.zeros((self.max_bs,), dtype=torch.int64)
+            rids_int = (
+                torch.zeros((self.max_bs,), dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
@@ -265,7 +270,7 @@ class EAGLEDraftCudaGraphRunner:
         out_cache_loc = buffers.out_cache_loc[: num_tokens * self.speculative_num_steps]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        rids_int = buffers.rids_int[:num_seqs]
+        rids_int = buffers.rids_int[:num_seqs] if buffers.rids_int is not None else None
         hidden_states = (
             buffers.hidden_states[:num_seqs]
             if buffers.hidden_states is not None
@@ -420,7 +425,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
-            buffers.rids_int.zero_()
+            if buffers.rids_int is not None:
+                buffers.rids_int.zero_()
             buffers.topk_p.zero_()
             buffers.topk_index.zero_()
             if buffers.hidden_states is not None:
@@ -435,7 +441,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
-        if forward_batch.rids_int is not None:
+        if buffers.rids_int is not None and forward_batch.rids_int is not None:
             buffers.rids_int[:raw_bs].copy_(forward_batch.rids_int)
         maybe_detect_nan(
             forward_batch.spec_info.topk_p,
@@ -468,7 +474,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.seq_lens = buffers.seq_lens[:bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
             forward_batch.positions = buffers.positions[:num_tokens]
-            if forward_batch.rids_int is not None:
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
                 forward_batch.rids_int = buffers.rids_int[:bs]
 
         if forward_batch.seq_lens_cpu is not None:
@@ -494,7 +500,7 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.positions = buffers.positions[:raw_num_token]
             forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
             forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
-            if forward_batch.rids_int is not None:
+            if buffers.rids_int is not None and forward_batch.rids_int is not None:
                 forward_batch.rids_int = buffers.rids_int[:raw_bs]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
