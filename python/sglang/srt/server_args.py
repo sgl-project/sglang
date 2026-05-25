@@ -35,6 +35,9 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
+from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+    parse_ib_device_config,
+)
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
@@ -3870,37 +3873,14 @@ class ServerArgs:
         if len(available_devices) == 0:
             raise RuntimeError(f"No IB devices found in {ib_sysfs_path}")
 
-        mapping = None
-        if normalized_input.endswith(".json"):
-            if not os.path.isfile(normalized_input):
-                raise RuntimeError(
-                    f"IB device JSON file does not exist: {normalized_input}"
-                )
-            try:
-                with open(normalized_input, "r", encoding="utf-8") as file:
-                    mapping = json.load(file)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Failed to read IB device JSON file {normalized_input}: {exc}"
-                ) from exc
-        elif normalized_input.startswith("{"):
-            mapping = json.loads(normalized_input)
-
-        if mapping is None:
+        parsed_config = parse_ib_device_config(normalized_input)
+        if isinstance(parsed_config, str):
             return _normalize_device_group(normalized_input, "all GPUs")
-        if not isinstance(mapping, dict):
-            raise ValueError(
-                "Invalid IB device JSON format: expected a mapping from GPU id to device string"
-            )
+        assert parsed_config is not None
 
         normalized_mapping: Dict[str, str] = {}
-        for gpu_key, gpu_devices in mapping.items():
+        for gpu_key, gpu_devices in parsed_config.items():
             normalized_key = str(gpu_key)
-            if not normalized_key.isdigit():
-                raise ValueError(
-                    "Invalid IB device mapping key: expected an integer GPU id or its string representation, "
-                    f"got {gpu_key!r}"
-                )
             normalized_mapping[normalized_key] = _normalize_device_group(
                 gpu_devices, f"GPU {normalized_key}"
             )
