@@ -1,12 +1,12 @@
 import logging
 import math
 from copy import deepcopy
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import get_last_loc
@@ -73,10 +73,9 @@ class DFlashWorker:
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
+        # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
-            int(server_args.speculative_dflash_draft_window_size)
-            if server_args.speculative_dflash_draft_window_size is not None
-            else None
+            server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
@@ -570,7 +569,7 @@ class DFlashWorker:
 
         block_ids = self._draft_block_ids_buf[:bs]
         block_ids.fill_(int(self._mask_token_id))
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+        block_ids[:, 0].copy_(draft_input.bonus_tokens.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
@@ -647,9 +646,6 @@ class DFlashWorker:
                 seq_lens_sum=seq_lens_sum,
                 seq_lens_cpu=seq_lens_cpu,
                 positions=positions,
-                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-                attn_backend=self.draft_model_runner.attn_backend,
                 input_embeds=input_embeds,
                 spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=draft_spec_info,
@@ -738,7 +734,7 @@ class DFlashWorker:
         added_vocab_start = int(shard.added_vocab_start_index)
 
         num_tokens = int(hidden_states.shape[0])
-        out_token_ids = torch.empty(
+        out_tokens = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
 
@@ -753,13 +749,13 @@ class DFlashWorker:
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
+                    out_tokens[start:end] = (
                         torch.argmax(base_logits, dim=-1).to(torch.long)
                         + org_vocab_start
                     )
                 else:
-                    out_token_ids[start:end] = 0
-            return out_token_ids
+                    out_tokens[start:end] = 0
+            return out_tokens
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -812,7 +808,7 @@ class DFlashWorker:
                 )
 
             if tp_size == 1:
-                out_token_ids[start:end] = global_ids.to(torch.long)
+                out_tokens[start:end] = global_ids.to(torch.long)
                 continue
 
             # Gather per-rank maxima and associated global ids, then select the global max.
@@ -869,9 +865,9 @@ class DFlashWorker:
             rank_index[0].copy_(best_rank)
             selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
-            out_token_ids[start:end].copy_(selected_ids.view(-1))
+            out_tokens[start:end].copy_(selected_ids.view(-1))
 
-        return out_token_ids
+        return out_tokens
 
     def _append_target_hidden_to_draft_kv(
         self,
@@ -1080,7 +1076,7 @@ class DFlashWorker:
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        accepted_steps = commit_lens.to(torch.int64) - 1
+        last_correct_step_indices = commit_lens.to(torch.int64) - 1
         mamba_steps_to_track = None
 
         if batch.mamba_track_indices is not None:
@@ -1103,33 +1099,23 @@ class DFlashWorker:
             )
 
         attn_backend.update_mamba_state_after_mtp_verify(
-            accepted_steps=accepted_steps,
+            last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
         )
 
     def forward_batch_generation(
-        self,
-        batch: Union[ScheduleBatch, ModelWorkerBatch],
-        **kwargs,
+        self, batch: ScheduleBatch, **kwargs
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
-        if isinstance(batch, ModelWorkerBatch):
-            # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
-            return self.target_worker.forward_batch_generation(batch, **kwargs)
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            model_worker_batch = batch.get_model_worker_batch()
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
-            )
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch_result = self.target_worker.forward_batch_generation(batch, **kwargs)
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
@@ -1140,12 +1126,9 @@ class DFlashWorker:
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            if (
-                model_worker_batch.extend_seq_lens is None
-                or model_worker_batch.extend_prefix_lens is None
-            ):
+            if batch.extend_lens is None or batch.prefix_lens is None:
                 raise RuntimeError(
-                    "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
+                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, but got None."
                 )
 
             # Materialize the prompt tokens into the draft KV cache immediately. This is required
@@ -1159,17 +1142,15 @@ class DFlashWorker:
                     return x if x.dtype == torch.int32 else x.to(torch.int32)
                 return torch.tensor(x, dtype=torch.int32, device=device)
 
-            extend_seq_lens = _to_int32_device_tensor(
-                model_worker_batch.extend_seq_lens
-            )
+            extend_seq_lens = _to_int32_device_tensor(batch.extend_lens)
             draft_input = DFlashDraftInput(
-                verified_id=next_token_ids.to(torch.int64),
+                bonus_tokens=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
                 ctx_lens=extend_seq_lens,
                 draft_seq_lens=(
                     torch.zeros_like(extend_seq_lens)
                     if self.use_compact_draft_cache
-                    else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
+                    else _to_int32_device_tensor(batch.prefix_lens)
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -1178,7 +1159,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_correct_drafts=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
@@ -1192,9 +1173,8 @@ class DFlashWorker:
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.forward_mode.is_target_verify()
-        verify_input = model_worker_batch.spec_info
+        assert batch.forward_mode.is_target_verify()
+        verify_input = batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
         need_mamba_verify_commit = hasattr(
             self.target_worker.model_runner.attn_backend,
@@ -1205,7 +1185,7 @@ class DFlashWorker:
         )
 
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
+            batch, is_verify=True, **kwargs
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
@@ -1213,10 +1193,10 @@ class DFlashWorker:
         )
 
         (
-            new_verified_id,
+            new_bonus_tokens,
             commit_lens,
             next_target_hidden,
-            accept_length_per_req_cpu,
+            num_correct_drafts_per_req_cpu,
         ) = verify_input.verify(
             batch=batch,
             logits_output=logits_output,
@@ -1232,25 +1212,25 @@ class DFlashWorker:
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
-        draft_input.verified_id = new_verified_id
+        draft_input.bonus_tokens = new_bonus_tokens
         draft_input.target_hidden = next_target_hidden
         draft_input.ctx_lens = commit_lens
         self._append_target_hidden_to_draft_kv(batch, draft_input)
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
-        num_accepted_tokens = sum(accept_length_per_req_cpu)
+        num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
-                accept_length_per_req_cpu,
+                "DFLASH verify completed. num_correct_drafts_per_req=%s",
+                num_correct_drafts_per_req_cpu,
             )
             self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=new_verified_id,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            next_token_ids=new_bonus_tokens,
+            num_correct_drafts=num_correct_drafts,
+            num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )

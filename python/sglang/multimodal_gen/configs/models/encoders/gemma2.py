@@ -14,18 +14,11 @@ from sglang.multimodal_gen.configs.models.encoders.base import (
     TextEncoderArchConfig,
     TextEncoderConfig,
 )
-
-
-def _is_transformer_layer(n: str, m) -> bool:
-    return "layers" in n and str.isdigit(n.split(".")[-1])
-
-
-def _is_embeddings(n: str, m) -> bool:
-    return n.endswith("embed_tokens")
-
-
-def _is_final_norm(n: str, m) -> bool:
-    return n.endswith("norm")
+from sglang.multimodal_gen.configs.models.fsdp import (
+    is_embed_tokens,
+    is_final_norm,
+    is_layer,
+)
 
 
 @dataclass
@@ -77,7 +70,7 @@ class Gemma2ArchConfig(TextEncoderArchConfig):
         ]
     )
     _fsdp_shard_conditions: list = field(
-        default_factory=lambda: [_is_transformer_layer, _is_embeddings, _is_final_norm]
+        default_factory=lambda: [is_layer, is_embed_tokens, is_final_norm]
     )
 
 

@@ -57,8 +57,6 @@ def get_moe_configs(
             "Deterministic inference is enabled, using default MoE kernel config."
         )
         return None
-    # Supported Triton versions, should be sorted from the newest to the oldest
-    supported_triton_versions = ["3.4.0", "3.3.1", "3.2.0", "3.1.0"]
 
     # First look up if an optimized configuration is available in the configs
     # directory
@@ -96,13 +94,23 @@ def get_moe_configs(
             # If a configuration has been found, return it
             return {int(key): val for key, val in json.load(f).items()}
 
-    # Searching for other triton versions that supports the same config
-    for try_triton_version in supported_triton_versions:
+    # Discover available triton config dirs on disk and search newest-first.
+    configs_root = os.path.join(config_dir, "configs")
+    available_versions = sorted(
+        (
+            d.removeprefix("triton_").replace("_", ".")
+            for d in os.listdir(configs_root)
+            if d.startswith("triton_")
+        ),
+        key=lambda v: tuple(int(x) for x in v.split(".")),
+        reverse=True,
+    )
+
+    for try_triton_version in available_versions:
         if try_triton_version == triton_version:
             continue
         try_config_file_path = os.path.join(
-            config_dir,
-            "configs",
+            configs_root,
             f"triton_{try_triton_version.replace('.', '_')}",
             json_file_name,
         )

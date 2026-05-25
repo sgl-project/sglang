@@ -27,6 +27,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import (
@@ -80,8 +81,12 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.template_detection import resolve_auto_parsers
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
@@ -139,6 +144,33 @@ def init_tokenizer_manager(
         chat_template=server_args.chat_template,
         completion_template=server_args.completion_template,
     )
+
+    # Resolve any remaining auto parsers using template manager's detection results
+    for attr, suggested, label in (
+        (
+            "reasoning_parser",
+            template_manager.suggested_reasoning_parser,
+            "reasoning parser",
+        ),
+        (
+            "tool_call_parser",
+            template_manager.suggested_tool_call_parser,
+            "tool-call parser",
+        ),
+    ):
+        if getattr(server_args, attr) != "auto":
+            continue
+        if suggested is not None:
+            setattr(server_args, attr, suggested)
+            logger.info(
+                f"Auto-detected --{attr.replace('_', '-')} as '{suggested}' from chat template"
+            )
+        else:
+            logger.warning(
+                f"--{attr.replace('_', '-')}=auto specified but could not detect "
+                f"{label} from chat template. Disabling {label}."
+            )
+            setattr(server_args, attr, None)
 
     return tokenizer_manager, template_manager
 
@@ -213,11 +245,6 @@ class Engine(EngineScoreMixin, EngineBase):
         if tokenizer_manager is not None:
             tokenizer_manager._subprocess_watchdog = subprocess_watchdog
         self.port_args = port_args
-        # Access transfer engine info if bootstrap server is started.
-        if scheduler_init_result.engine_info_bootstrap_server is not None:
-            self.remote_instance_transfer_engine_info = (
-                scheduler_init_result.engine_info_bootstrap_server.transfer_engine_info
-            )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)
@@ -305,6 +332,7 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -341,6 +369,7 @@ class Engine(EngineScoreMixin, EngineBase):
             custom_logit_processor=custom_logit_processor,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             bootstrap_host=bootstrap_host,
             bootstrap_port=bootstrap_port,
@@ -395,6 +424,7 @@ class Engine(EngineScoreMixin, EngineBase):
         custom_logit_processor: Optional[Union[List[str], str]] = None,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        routed_experts_start_len: int = 0,
         stream: bool = False,
         bootstrap_host: Optional[Union[List[str], str]] = None,
         bootstrap_port: Optional[Union[List[int], int]] = None,
@@ -430,6 +460,7 @@ class Engine(EngineScoreMixin, EngineBase):
             lora_path=lora_path,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
+            routed_experts_start_len=routed_experts_start_len,
             stream=stream,
             custom_logit_processor=custom_logit_processor,
             bootstrap_host=bootstrap_host,
@@ -589,8 +620,9 @@ class Engine(EngineScoreMixin, EngineBase):
                                 writer,
                             ),
                         )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(server_args, gpu_id),
                         ):
                             proc.start()
 
@@ -641,6 +673,63 @@ class Engine(EngineScoreMixin, EngineBase):
             ),
             scheduler_procs,
         )
+
+    @classmethod
+    def _launch_detokenizer_subprocesses(
+        cls,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        run_detokenizer_process_func: Callable,
+    ) -> Tuple[List[mp.Process], List[str]]:
+        """Launch detokenizer worker(s).
+
+        - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
+          ``port_args.detokenizer_ipc_name`` (the original behavior).
+        - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
+          private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
+          original ``port_args.detokenizer_ipc_name`` and fans out to them.
+
+        Returns (processes, names) for SubprocessWatchdog.
+        """
+        processes: List[mp.Process] = []
+        names: List[str] = []
+
+        if server_args.detokenizer_worker_num <= 1:
+            proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, port_args),
+            )
+            proc.start()
+            processes.append(proc)
+            names.append("detokenizer")
+            return processes, names
+
+        router_ipc_name = port_args.detokenizer_ipc_name
+        worker_ipc_names: List[str] = []
+        try:
+            for i in range(server_args.detokenizer_worker_num):
+                worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+                port_args.detokenizer_ipc_name = worker_ipc
+                proc = mp.Process(
+                    target=run_detokenizer_process_func,
+                    args=(server_args, port_args),
+                )
+                proc.start()
+                processes.append(proc)
+                names.append(f"detokenizer_{i}")
+                worker_ipc_names.append(worker_ipc)
+        finally:
+            port_args.detokenizer_ipc_name = router_ipc_name
+
+        router_proc = mp.Process(
+            target=run_multi_detokenizer_router_process,
+            args=(worker_ipc_names, server_args, port_args),
+        )
+        router_proc.start()
+        processes.append(router_proc)
+        names.append("detokenizer_router")
+
+        return processes, names
 
     @classmethod
     def _launch_subprocesses(
@@ -695,6 +784,12 @@ class Engine(EngineScoreMixin, EngineBase):
                 host=server_args.host, port=bootstrap_port
             )
 
+        if (
+            server_args.reasoning_parser == "auto"
+            or server_args.tool_call_parser == "auto"
+        ):
+            resolve_auto_parsers(server_args)
+
         # Launch scheduler processes
         scheduler_init_result, scheduler_procs = cls._launch_scheduler_processes(
             server_args, port_args, run_scheduler_process_func
@@ -737,16 +832,15 @@ class Engine(EngineScoreMixin, EngineBase):
                 None,
             )
 
-        # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
+        # Launch detokenizer process(es) — optionally fronted by a router when
+        # detokenizer_worker_num > 1.
+        detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
+            server_args=server_args,
+            port_args=port_args,
+            run_detokenizer_process_func=run_detokenizer_process_func,
         )
-        detoken_proc.start()
-        scheduler_init_result.all_child_pids.append(detoken_proc.pid)
+        for p in detoken_procs:
+            scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:
@@ -770,8 +864,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
         processes = list(scheduler_procs or [])
         names = [f"scheduler_{i}" for i in range(len(processes))]
-        processes.append(detoken_proc)
-        names.append("detokenizer")
+        processes.extend(detoken_procs)
+        names.extend(detoken_names)
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )
@@ -1162,7 +1256,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if server_args.attention_backend == "flashinfer":
             assert_pkg_version(
                 "flashinfer_python",
-                "0.6.8.post1",
+                "0.6.11.post1",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -1170,7 +1264,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.1",
+                "0.4.2.post2",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

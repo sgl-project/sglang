@@ -187,6 +187,26 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn pool_idle_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.pool_idle_timeout_secs = timeout;
+        self
+    }
+
+    pub fn connect_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.connect_timeout_secs = timeout;
+        self
+    }
+
+    pub fn pool_max_idle_per_host(mut self, max: usize) -> Self {
+        self.config.pool_max_idle_per_host = max;
+        self
+    }
+
+    pub fn tcp_keepalive_secs(mut self, timeout: u64) -> Self {
+        self.config.tcp_keepalive_secs = timeout;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {

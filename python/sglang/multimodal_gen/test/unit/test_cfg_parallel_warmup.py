@@ -81,7 +81,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         scheduler.prepare_server_warmup_reqs()
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
-        _, req = scheduler.waiting_queue[0]
+        _, req, _ = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, True)
         self.assertEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 
@@ -95,7 +95,7 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         scheduler.prepare_server_warmup_reqs()
 
         self.assertEqual(len(scheduler.waiting_queue), 1)
-        _, req = scheduler.waiting_queue[0]
+        _, req, _ = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
 

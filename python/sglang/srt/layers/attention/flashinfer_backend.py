@@ -126,7 +126,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
 
-        # Store multi-item scoring flag for efficient access
+        self.req_to_token_pool = model_runner.req_to_token_pool
+        self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_mis = model_runner.server_args.enable_mis
 
         # FIXME: remove dllm workarounds from flashinfer
@@ -192,6 +193,8 @@ class FlashInferAttnBackend(AttentionBackend):
             self.disable_cuda_graph_kv_split = True
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
+        self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+
         # Allocate buffers
         global global_workspace_buffer
         if global_workspace_buffer is None:
@@ -240,12 +243,10 @@ class FlashInferAttnBackend(AttentionBackend):
 
         fmha_backend = "auto"
         if is_sm100_supported():
-            # Disable CUTLASS backend when piecewise cuda graph is enabled
-            # due to TMA descriptor initialization issues on B200
             if not model_runner.server_args.disable_piecewise_cuda_graph:
-                logger.warning(
+                logger.info(
                     "CUTLASS backend is disabled when piecewise cuda graph is enabled "
-                    "due to TMA descriptor initialization issues on B200. "
+                    "due to TMA descriptor initialization issues on SM100 GPUs. "
                     "Using auto backend instead for stability."
                 )
             else:
@@ -489,7 +490,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 extend_no_prefix = False
             else:
                 use_ragged = (
-                    not self.enable_deterministic and not is_in_piecewise_cuda_graph()
+                    not self.enable_deterministic
+                    and not is_in_piecewise_cuda_graph()
+                    and not self.use_paged
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
@@ -698,7 +701,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
@@ -762,7 +765,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
-                use_ragged=True,
+                use_ragged=not self.use_paged,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=None,
             )
@@ -798,7 +801,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                    self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
@@ -808,7 +811,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
@@ -832,12 +835,12 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             # If `k`/`v` are not explicitly provided, fall back to the KV cache stored in
-            # `forward_batch.token_to_kv_pool` for this layer. This enables attention over
+            # `self.token_to_kv_pool` for this layer. This enables attention over
             # previously cached context without re-materializing KV tensors (e.g., the
             # IQuestLoopCoder path uses token_to_kv_pool as the KV source).
             if k is None and v is None:
-                k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
-                v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
+                k = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
+                v = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
             causal = True
             if (
                 layer.is_cross_attention
@@ -871,7 +874,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
@@ -880,7 +883,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 o, _ = merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
@@ -908,14 +911,14 @@ class FlashInferAttnBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
         # Call the wrapped function
         o = decode_wrapper.forward(
             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
@@ -1543,6 +1546,7 @@ class FlashInferMultiStepDraftBackend:
 
         # Cached variables for generate_draft_decode_kv_indices
         self.pool_len = model_runner.req_to_token_pool.req_to_token.shape[1]
+        self.req_to_token_pool = model_runner.req_to_token_pool
 
     def common_template(
         self,
@@ -1558,7 +1562,7 @@ class FlashInferMultiStepDraftBackend:
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token_pool.req_to_token,
             forward_batch.seq_lens,
             kv_indices_buffer,
             self.kv_indptr,

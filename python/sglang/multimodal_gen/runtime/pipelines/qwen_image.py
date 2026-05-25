@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from diffusers.image_processor import VaeImageProcessor
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core import LoRAPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -13,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.q
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 # TODO(will): move PRECISION_TO_TYPE to better place
 
@@ -114,15 +116,25 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
     ]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
-        self.add_stage(
-            QwenImageLayeredBeforeDenoisingStage(
+        def create_before_denoising_stage():
+            return QwenImageLayeredBeforeDenoisingStage(
                 vae=self.get_module("vae"),
+                text_encoder=None,
                 tokenizer=self.get_module("tokenizer"),
                 processor=self.get_module("processor"),
                 transformer=self.get_module("transformer"),
                 scheduler=self.get_module("scheduler"),
                 model_path=self.model_path,
+                vae_dtype=PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision],
+                text_encoder_dtype=PRECISION_TO_TYPE[
+                    server_args.pipeline_config.text_encoder_precisions[0]
+                ],
             )
+
+        self.add_stage_factory(
+            RoleType.ENCODER,
+            create_before_denoising_stage,
+            "QwenImageLayeredBeforeDenoisingStage",
         )
 
         self.add_standard_timestep_preparation_stage(

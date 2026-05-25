@@ -5,12 +5,12 @@ Usage:
 
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
 # for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
-# ONE_GPU_MODELOPT_CASES, or TWO_GPU_CASES
+# ONE_GPU_MODELOPT_FP8_CASES, ONE_GPU_B200_CASES, or TWO_GPU_CASES
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_CASES`, or `TWO_GPU_CASES`
+1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_FP8_CASES`, `ONE_GPU_B200_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
@@ -186,7 +186,6 @@ class DiffusionServerArgs:
     dit_offload_prefetch_size: int | float | None = None
     enable_cache_dit: bool = False
     text_encoder_cpu_offload: bool = False
-    enable_warmup: bool = True
 
     extras: list[str] = field(default_factory=lambda: [])
     env_vars: dict[str, str] = field(default_factory=dict)
@@ -257,6 +256,7 @@ class DiffusionTestCase:
     sampling_params: DiffusionSamplingParams
     run_perf_check: bool = True
     run_consistency_check: bool = True
+    run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
@@ -367,6 +367,13 @@ MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     extras={"num_inference_steps": 12, "seed": 0},
 )
 
+MODELOPT_TI2I_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Convert 2D style to 3D style",
+    image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
+    output_size="512x512",
+    extras={"num_inference_steps": 8, "seed": 0},
+)
+
 TI2I_sampling_params = DiffusionSamplingParams(
     prompt="Convert 2D style to 3D style",
     image_path="https://github.com/lm-sys/lm-sys.github.io/releases/download/test/TI2I_Qwen_Image_Edit_Input.jpg",
@@ -431,15 +438,21 @@ HUNYUAN3D_SHAPE_sampling_params = DiffusionSamplingParams(
     image_path="https://raw.githubusercontent.com/sgl-project/sgl-test-files/main/diffusion-ci/consistency_gt/1-gpu/hunyuan3d_2_0/hunyuan3d.png",
 )
 
-MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
-MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
-MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
-MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
-MODELOPT_WAN22_NVFP4_TRANSFORMER = (
-    "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
+MODELOPT_FLUX1_FP8_TRANSFORMER = "lmsys/flux1-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_FLUX2_FP8_TRANSFORMER = "lmsys/flux2-dev-modelopt-fp8-sglang-transformer"
+MODELOPT_WAN22_FP8_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-FP8"
+MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER = (
+    "lmsys/hunyuanvideo-modelopt-fp8-sglang-transformer"
 )
-MODELOPT_NVFP4_B200_ENV_VARS = {"SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": "cudnn"}
+MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER = "lmsys/qwen-image-modelopt-fp8-sglang-transformer"
+MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER = (
+    "lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer"
+)
+MODELOPT_FLUX1_NVFP4_TRANSFORMER = "lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer"
+MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_WAN22_NVFP4_MODEL = "nvidia/Wan2.2-T2V-A14B-Diffusers-NVFP4"
+MODELOPT_NVFP4_B200_ENV_VARS = {}
+MODELOPT_WAN22_NVFP4_B200_ENV_VARS = {}
 
 
 def _make_modelopt_ci_case(
@@ -450,19 +463,20 @@ def _make_modelopt_ci_case(
     sampling_params: DiffusionSamplingParams,
     extras: list[str],
     env_vars: dict[str, str] | None = None,
+    run_consistency_check: bool = False,
 ) -> DiffusionTestCase:
     return DiffusionTestCase(
         case_id,
         DiffusionServerArgs(
             model_path=model_path,
             modality=modality,
-            enable_warmup=False,
             extras=extras,
             env_vars=env_vars or {},
         ),
         sampling_params,
         run_perf_check=False,
-        run_consistency_check=False,
+        run_consistency_check=run_consistency_check,
+        run_component_accuracy_check=False,
     )
 
 
@@ -476,6 +490,8 @@ def _with_default_num_gpus(
 
 
 # Load global configuration
-BASELINE_CONFIG = BaselineConfig.load(
-    Path(__file__).with_name("perf_baselines.json")
-).update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+BASELINE_CONFIG = (
+    BaselineConfig.load(Path(__file__).with_name("perf_baselines.json"))
+    .update(Path(__file__).parent / "ascend" / "perf_baselines_npu.json")
+    .update(Path(__file__).parent / "musa" / "perf_baselines_musa.json")
+)
