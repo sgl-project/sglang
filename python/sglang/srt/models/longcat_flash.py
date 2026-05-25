@@ -517,14 +517,14 @@ class LongcatFlashDecoderLayer(nn.Module):
             with self.device_module.stream(self.moe_alt_stream):
                 self.device_module.current_stream().wait_event(first_attn_finished)
                 moe_hidden_states = self.mlp(hidden_states)
-                moe_hidden_states, moe_residual = (
-                    self.moe_layer_communicator.postprocess_layer(
-                        moe_hidden_states, moe_residual, forward_batch
-                    )
-                )
                 moe_hidden_states.record_stream(main_stream)
 
             main_stream.wait_stream(self.moe_alt_stream)
+            moe_hidden_states, moe_residual = (
+                self.moe_layer_communicator.postprocess_layer(
+                    moe_hidden_states, moe_residual, forward_batch
+                )
+            )
             hidden_states = moe_hidden_states + mlp_hidden_states
         else:
             hidden_states, moe_residual = self.moe_layer_communicator.prepare_mlp(
