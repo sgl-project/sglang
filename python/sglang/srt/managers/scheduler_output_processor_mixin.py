@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorageFailureInjector
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 from sglang.srt.state_capturer.indexer_topk import (
     get_global_indexer_capturer,
@@ -54,6 +55,9 @@ class SchedulerOutputProcessorMixin:
         if cache_controller and hasattr(cache_controller, "storage_backend"):
             storage_backend = cache_controller.storage_backend
             if storage_backend is not None:
+                if isinstance(storage_backend, HiCacheStorageFailureInjector):
+                    # Report the class name of underlying backend instead of "HiCacheStorageFailureInjector".
+                    storage_backend = storage_backend.backend()
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
