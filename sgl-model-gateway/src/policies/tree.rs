@@ -628,6 +628,10 @@ impl Tree {
 
     #[allow(dead_code)]
     pub fn prefix_match_tenant(&self, text: &str, tenant: &str) -> String {
+        take_chars(text, self.prefix_match_tenant_count(text, tenant))
+    }
+
+    pub fn prefix_match_tenant_count(&self, text: &str, tenant: &str) -> usize {
         // Use slice-based traversal - no Vec<char> allocation
 
         // Intern tenant ID once for efficient lookups
@@ -688,8 +692,14 @@ impl Tree {
                 .insert(Arc::clone(&tenant_id), epoch);
         }
 
-        // Build result from original input using char count
-        take_chars(text, matched_chars)
+        matched_chars
+    }
+
+    pub fn tenant_char_count(&self, tenant: &str) -> usize {
+        self.tenant_char_count
+            .get(tenant)
+            .map(|count| *count)
+            .unwrap_or(0)
     }
 
     /// Return the list of tenants for which this node is a leaf.

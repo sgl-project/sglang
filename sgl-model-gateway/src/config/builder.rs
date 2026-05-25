@@ -118,6 +118,27 @@ impl RouterConfigBuilder {
     ) -> Self {
         self.config.policy = PolicyConfig::CacheAware {
             cache_threshold,
+            cache_balance_weight: 0.0,
+            balance_abs_threshold,
+            balance_rel_threshold,
+            eviction_interval_secs,
+            max_tree_size,
+        };
+        self
+    }
+
+    pub fn cache_aware_policy_with_balance(
+        mut self,
+        cache_threshold: f32,
+        cache_balance_weight: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+    ) -> Self {
+        self.config.policy = PolicyConfig::CacheAware {
+            cache_threshold,
+            cache_balance_weight,
             balance_abs_threshold,
             balance_rel_threshold,
             eviction_interval_secs,
@@ -859,6 +880,28 @@ mod tests {
                 cache_threshold, ..
             } => {
                 assert!((cache_threshold - 0.8).abs() < 0.0001);
+            }
+            _ => panic!("Expected CacheAware policy"),
+        }
+    }
+
+    /// Test cache-aware helper with cache balance weight
+    #[test]
+    fn test_builder_cache_aware_policy_with_balance() {
+        let config = RouterConfigBuilder::new()
+            .regular_mode(vec!["http://worker1:8000".to_string()])
+            .cache_aware_policy_with_balance(0.8, 0.25, 10, 1.5, 300, 1000)
+            .build()
+            .unwrap();
+
+        match config.policy {
+            PolicyConfig::CacheAware {
+                cache_threshold,
+                cache_balance_weight,
+                ..
+            } => {
+                assert!((cache_threshold - 0.8).abs() < 0.0001);
+                assert!((cache_balance_weight - 0.25).abs() < 0.0001);
             }
             _ => panic!("Expected CacheAware policy"),
         }

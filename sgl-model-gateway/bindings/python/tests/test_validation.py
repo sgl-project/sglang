@@ -121,6 +121,12 @@ class TestParameterValidation:
             args = RouterArgs(cache_threshold=threshold)
             assert args.cache_threshold == threshold
 
+    def test_cache_balance_weight_validation(self):
+        """Test cache balance weight parameter plumbing."""
+        for weight in [0.0, 0.1, 1.0]:
+            args = RouterArgs(cache_balance_weight=weight)
+            assert args.cache_balance_weight == weight
+
     def test_balance_threshold_validation(self):
         """Test load balancing threshold parameter validation."""
         # Valid absolute thresholds

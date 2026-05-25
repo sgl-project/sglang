@@ -25,9 +25,11 @@
     Process:
     a. For each request, find the worker with the highest prefix match
     b. If match rate > cache_threshold:
-    Route to the worker with highest match (likely has relevant data cached)
+    Route to the worker with highest match (likely has relevant data cached). When
+    cache_balance_weight > 0, subtract a shadow-cache-size penalty so common prefixes
+    can spread across workers instead of collapsing onto the first worker that saw them.
     c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
+    Route to the worker with the shortest queue.
     d. Background maintenance:
     Periodically evict least recently used leaf nodes to prevent memory overflow
 
@@ -57,9 +59,14 @@
     5. max_tree_size: (integer)
     Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
     during the next eviction cycle.
+
+    6. cache_balance_weight: (float, >= 0.0)
+    Penalty applied to workers with larger shadow cache footprints when cache
+    hits are available. 0.0 preserves strict best-prefix routing. Higher values
+    trade some cache reuse for more even DP/cache distribution.
 */
 
-use std::sync::Arc;
+use std::{cmp::Ordering, sync::Arc};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -325,11 +332,8 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
-        let min_load_idx = healthy_indices
-            .iter()
-            .min_by_key(|&&idx| workers[idx].load())
-            .copied()?;
+        // Use shortest queue when imbalanced.
+        let min_load_idx = Self::select_min_load(workers, healthy_indices)?;
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -368,6 +372,62 @@ impl CacheAwarePolicy {
         workers[min_load_idx].increment_processed();
 
         Some(min_load_idx)
+    }
+
+    fn select_min_load(
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> Option<usize> {
+        healthy_indices
+            .iter()
+            .min_by_key(|&&idx| workers[idx].load())
+            .copied()
+    }
+
+    fn select_cache_balanced_worker(
+        &self,
+        tree: &Tree,
+        text: &str,
+        workers: &[Arc<dyn Worker>],
+        healthy_indices: &[usize],
+    ) -> Option<(usize, usize)> {
+        let min_shadow_cache_chars = healthy_indices
+            .iter()
+            .map(|&idx| tree.tenant_char_count(workers[idx].url()))
+            .min()?;
+
+        let mut best_idx = None;
+        let mut best_score = f64::NEG_INFINITY;
+        let mut best_match_chars = 0usize;
+        let mut best_shadow_cache_chars = usize::MAX;
+        let mut best_load = usize::MAX;
+
+        for &idx in healthy_indices {
+            let worker = &workers[idx];
+            let matched_chars = tree.prefix_match_tenant_count(text, worker.url());
+            let shadow_cache_chars = tree.tenant_char_count(worker.url());
+            let balance_penalty = self.config.cache_balance_weight as f64
+                * shadow_cache_chars.saturating_sub(min_shadow_cache_chars) as f64;
+            let score = matched_chars as f64 - balance_penalty;
+            let load = worker.load();
+
+            let score_order = score.total_cmp(&best_score);
+            let is_better = best_idx.is_none()
+                || score_order == Ordering::Greater
+                || (score_order == Ordering::Equal
+                    && (shadow_cache_chars, load, idx)
+                        < (best_shadow_cache_chars, best_load, best_idx.unwrap()));
+
+            if is_better {
+                best_idx = Some(idx);
+                best_score = score;
+                best_shadow_cache_chars = shadow_cache_chars;
+                best_load = load;
+            }
+            best_match_chars = best_match_chars.max(matched_chars);
+        }
+
+        best_idx.map(|idx| (idx, best_match_chars))
     }
 }
 
@@ -420,7 +480,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let tree = self.trees.get(&tree_key).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
+            // Now we work with the tree without holding the HashMap lock.
             // Use prefix_match_with_counts to avoid redundant chars().count() calls
             let result = tree.prefix_match_with_counts(text);
             let match_rate = if result.input_char_count == 0 {
@@ -429,8 +489,21 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            // Select worker without String allocation
-            let selected_idx = if match_rate > self.config.cache_threshold {
+            let selected_idx = if self.config.cache_balance_weight > 0.0 {
+                self.select_cache_balanced_worker(&tree, text, workers, &healthy_indices)
+                    .and_then(|(idx, best_match_chars)| {
+                        let match_rate = if result.input_char_count == 0 {
+                            0.0
+                        } else {
+                            best_match_chars as f32 / result.input_char_count as f32
+                        };
+                        if match_rate > self.config.cache_threshold {
+                            Some(idx)
+                        } else {
+                            Self::select_min_load(workers, &healthy_indices)
+                        }
+                    })
+            } else if match_rate > self.config.cache_threshold {
                 // Cache hit path: find worker by URL (compare &str directly, no allocation)
                 let tenant_url: &str = &result.tenant;
                 workers
@@ -438,11 +511,8 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
-                healthy_indices
-                    .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
-                    .copied()
+                // Low cache match: use worker with minimum load.
+                Self::select_min_load(workers, &healthy_indices)
             };
 
             if let Some(idx) = selected_idx {
@@ -606,9 +676,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cache_aware_balance_weight_spreads_common_prefix() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.1,
+            cache_balance_weight: 1.0,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w3:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let common_prefix = "shared system prompt ".repeat(20);
+        let mut selected = Vec::new();
+        for suffix in ["conversation-a", "conversation-b", "conversation-c"] {
+            let prompt = format!("{common_prefix}{suffix}");
+            selected.push(
+                policy
+                    .select_worker(
+                        &workers,
+                        &SelectWorkerInfo {
+                            request_text: Some(&prompt),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        assert_eq!(selected, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_balance_weight_preserves_strong_cache_hit() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.1,
+            cache_balance_weight: 0.2,
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(
+                BasicWorkerBuilder::new("http://w1:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+            Arc::new(
+                BasicWorkerBuilder::new("http://w2:8000")
+                    .worker_type(WorkerType::Regular)
+                    .build(),
+            ),
+        ];
+        policy.init_workers(&workers);
+
+        let prompt = "large reusable conversation prefix ".repeat(50);
+        let first = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&prompt),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some(&prompt),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first, 0);
+        assert_eq!(second, first);
+    }
+
+    #[tokio::test]
     async fn test_cache_aware_with_imbalanced_load() {
         let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
+            cache_balance_weight: 0.0,
             balance_abs_threshold: 5,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0, // Disable eviction thread
@@ -958,10 +1125,10 @@ mod tests {
         decode_policy.init_workers(&decode_workers);
 
         let turns = [
-            "turn1",
             "turn1 turn2",
             "turn1 turn2 turn3",
             "turn1 turn2 turn3 turn4",
+            "turn1 turn2 turn3 turn4 turn5",
         ];
 
         let mut prefill_idx: Option<usize> = None;
@@ -983,14 +1150,16 @@ mod tests {
                 None => prefill_idx = Some(p),
                 Some(pinned) => assert_eq!(
                     p, pinned,
-                    "prefill should stay pinned across turns (prompt={prompt:?})"
+                    "prefill should stay pinned when reusable prefix exceeds threshold \
+                     (prompt={prompt:?})"
                 ),
             }
             match decode_idx {
                 None => decode_idx = Some(d),
                 Some(pinned) => assert_eq!(
                     d, pinned,
-                    "decode should stay pinned across turns (prompt={prompt:?})"
+                    "decode should stay pinned when reusable prefix exceeds threshold \
+                     (prompt={prompt:?})"
                 ),
             }
         }
@@ -1025,10 +1194,10 @@ mod tests {
         policy.init_workers(&combined);
 
         let turns = [
-            "turn1",
             "turn1 turn2",
             "turn1 turn2 turn3",
             "turn1 turn2 turn3 turn4",
+            "turn1 turn2 turn3 turn4 turn5",
         ];
 
         let mut prefill_idx: Option<usize> = None;
@@ -1062,14 +1231,16 @@ mod tests {
                 None => prefill_idx = Some(p),
                 Some(pinned) => assert_eq!(
                     p, pinned,
-                    "prefill should stay pinned across turns (prompt={prompt:?})"
+                    "prefill should stay pinned when reusable prefix exceeds threshold \
+                     (prompt={prompt:?})"
                 ),
             }
             match decode_idx {
                 None => decode_idx = Some(d),
                 Some(pinned) => assert_eq!(
                     d, pinned,
-                    "decode should stay pinned across turns (prompt={prompt:?})"
+                    "decode should stay pinned when reusable prefix exceeds threshold \
+                     (prompt={prompt:?})"
                 ),
             }
         }
