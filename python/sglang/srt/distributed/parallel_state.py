@@ -1845,6 +1845,19 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
+    if envs.SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM.get():
+        global _DOUBLE_STREAM_EP
+        assert (
+            _DOUBLE_STREAM_EP is None
+        ), "double stream expert parallel group is already initialized"
+        _DOUBLE_STREAM_EP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="double_stream_ep",
+            recovered_rank=recovered_rank,
+        )
+
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
         assert (
@@ -2019,15 +2032,6 @@ def initialize_model_parallel(
             group_name="moe_tp",
             recovered_rank=recovered_rank,
         )
-
-    global _DOUBLE_STREAM_EP
-    assert _DOUBLE_STREAM_EP is None, "double stream expert parallel group is already initialized"
-    _DOUBLE_STREAM_EP = init_model_parallel_group(
-        group_ranks,
-        get_world_group().local_rank,
-        backend,
-        group_name="double_stream_ep",
-    )
 
     # Build the pipeline model-parallel groups.
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
