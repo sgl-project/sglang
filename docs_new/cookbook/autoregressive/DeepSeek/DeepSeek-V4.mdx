@@ -20,15 +20,32 @@ import { benchmarks } from "/src/snippets/configs/deepseek-ai/deepseek-v4-benchm
 
 <Deployment config={config} benchmarks={benchmarks} />
 
+The panel generates the full launch command for your selected combo. Controls at the top of the command box:
+
+- **Python / Docker** — toggle between a bare `sglang serve …` invocation and a `docker run … sglang serve …` wrap against the per-hardware image listed in [§2](#2-sglang-installation).
+- **⧉ Copy** — copies the current command to your clipboard.
+- **$ cURL** — opens a sample request you can send to the running server (`localhost:30000` by default).
+- **⚙ Env** — edits the placeholder values (`HOST`, `PORT`, `HF_TOKEN`, `NODE_RANK`, `NODE0_IP`, …) that the command and the cURL example both interpolate. Values persist in your browser across visits and across cookbooks.
+- **Verified / Not Verified** badge — green when the exact `(hardware, variant, quant, strategy, nodes)` combination has been validated end-to-end on real hardware; yellow when no one has independently re-checked the auto-generated recipe yet.
+
 ## Playground
 
-The Deploy panel above emits only **verified** cells. Use the Playground below to layer additional toggles — parallelism overrides, parsers, speculative-decoding presets — on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection; only your overrides change.
+The Playground is where you experiment with **SGLang features beyond the verified matrix**. The Deploy panel above only emits combinations the SGLang team has signed off on; the Playground lets you turn on additional knobs on top of whichever cell the Deploy panel is currently showing. The base is read live from your Deploy selection — only your overrides change.
 
-Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Auto-Estimated** until the new configuration is verified end-to-end.
+The knobs come in two flavors:
+
+- **Built-in SGLang features** — parallelism overrides (TP / DP / CP / DP-Attention), MoE backend + EP, reasoning / tool-call parsers, speculative-decoding presets, prefill/decode disaggregation, HiCache tiers.
+- **DeepSeek-V4 specific features** — MegaMoE W4A8 / W4A4 fused kernel (Blackwell only).
+
+Lines highlighted **green** are added by your overrides; lines with **red strikethrough** were in the verified base but stripped by an override. When no override differs from the base cell, the playground inherits the base's **Verified** badge; any actual change flips it to **Not Verified** until the new configuration is run end-to-end and submitted back.
 
 import { Playground } from "/src/snippets/_playground.jsx";
 
 <Playground config={config} />
+
+The Playground panel reuses the same **Python / Docker**, **⧉ Copy**, **$ cURL**, and **⚙ Env** controls described in the Deploy section above, plus one extra:
+
+- **Submit ↗** — opens a pre-filled GitHub issue so you can submit your override combination as a new verified cookbook cell. Only visible while the badge says **Not Verified** (i.e. once you've changed at least one knob from the verified base); once you've actually run the command and confirmed it works, click it and we'll land the cell.
 
 ## 1. Model Introduction
 

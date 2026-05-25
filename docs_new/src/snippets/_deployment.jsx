@@ -290,13 +290,6 @@ export const Deployment = ({ config, benchmarks }) => {
       fontSize: "11px",
       color: isDark ? "#9ca3af" : "#6b7280",
     },
-    benchGrid: {
-      display: "grid",
-      // Two equal columns when both blocks present, single column otherwise.
-      // Use auto-fit + minmax for graceful narrow-viewport collapse.
-      gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-      gap: "12px",
-    },
     benchBlock: {
       border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
       borderRadius: "4px",
@@ -328,12 +321,6 @@ export const Deployment = ({ config, benchmarks }) => {
       fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
       fontWeight: 500,
     },
-    benchAccuracyRow: {
-      fontSize: "12px",
-      color: isDark ? "#9ca3af" : "#6b7280",
-      borderTop: `1px dashed ${isDark ? "#374151" : "#e5e7eb"}`,
-      paddingTop: "6px",
-    },
     benchNotes: {
       fontSize: "11px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
@@ -341,6 +328,71 @@ export const Deployment = ({ config, benchmarks }) => {
     benchEmpty: {
       fontSize: "12px", fontStyle: "italic",
       color: isDark ? "#9ca3af" : "#6b7280",
+    },
+
+    // Speed table — rows are metrics (TTFT, TPOT, …), columns are
+    // per-workload measurements (typically varying max-concurrency).
+    // Implemented as CSS grid on a <div>, NOT a real <table>: Mintlify's
+    // page renderer wraps every <table> element in two extra divs that
+    // apply `margin: 4px -20px 12px` (negative horizontal margins so the
+    // table can bleed into the page padding for horizontal scrolling)
+    // PLUS `[&_td]:min-w-[150px]` on the table itself — both fire even
+    // inside .not-prose, and the negative-margin trick mis-aligns the
+    // contents inside a nested card. Using a grid of plain divs
+    // sidesteps the entire <table> auto-wrapping pipeline.
+    //
+    // The grid columns are set inline (`gridTemplateColumns`) since they
+    // depend on `measurements.length`: 1 auto label col + N value cols.
+    benchTable: {
+      display: "grid",
+      // columnGap is 0 (not 16) so adjacent cells' bottom borders touch
+      // to form a single continuous line under the header row. Inter-
+      // column visual spacing comes from per-cell paddingLeft instead.
+      columnGap: 0,
+      rowGap: "3px",
+      marginTop: "4px",
+      alignItems: "baseline",
+    },
+    benchTableHead: {
+      textAlign: "right",
+      fontWeight: 500, fontSize: "11px",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      paddingLeft: "16px",
+      paddingBottom: "4px",
+      whiteSpace: "nowrap",
+    },
+    benchTableCornerHead: {
+      paddingBottom: "4px",
+    },
+    // Header underline. Single div that spans every column (gridColumn
+    // "1 / -1"), so the line is guaranteed continuous regardless of cell
+    // heights or column count. Previous approach (border-bottom per
+    // cell) broke when the empty corner cell collapsed shorter than the
+    // header cells under `alignItems: baseline`, putting their bottom
+    // borders at different Y positions.
+    benchTableSeparator: {
+      gridColumn: "1 / -1",
+      height: "1px",
+      background: isDark ? "#374151" : "#e5e7eb",
+      // Negate the rowGap above so the line sits right against the
+      // header row instead of floating 3px below it.
+      marginTop: "-3px",
+    },
+    benchTableLabel: {
+      textAlign: "left", fontSize: "12px",
+      color: isDark ? "#9ca3af" : "#6b7280",
+      whiteSpace: "nowrap",
+    },
+    benchTableValue: {
+      textAlign: "right", fontSize: "12px",
+      color: isDark ? "#e5e7eb" : "#111827",
+      fontFamily: "'Menlo', 'Monaco', 'Courier New', monospace",
+      fontWeight: 500,
+      paddingLeft: "16px",
+      whiteSpace: "nowrap",
+    },
+    benchTableValueMissing: {
+      color: isDark ? "#6b7280" : "#9ca3af",
     },
   });
 
@@ -363,19 +415,37 @@ export const Deployment = ({ config, benchmarks }) => {
   const findBenchmark = (list, sel) =>
     (list || []).find((b) => DIMENSIONS.every((d) => b.match[d] === sel[d])) || null;
 
+  // Normalize the `speed` slot. Cookbooks may supply either:
+  //   - a single measurement object (legacy single-workload form), or
+  //   - an array of measurements (one per workload, typically varying
+  //     max-concurrency for a Pareto-style sweep).
+  // The engine always works with an array internally.
+  const normalizeSpeed = (speed) => {
+    if (!speed) return [];
+    return Array.isArray(speed) ? speed : [speed];
+  };
+
   // True iff the entry has no numeric content worth rendering. Used to
   // decide between rendering the metric blocks vs the empty-state line.
-  // An entry is "empty" if it has no sub-blocks OR every sub-block's
-  // fields are all null/undefined.
+  // An entry is "empty" if every speed measurement is null-only AND
+  // accuracy is null-only. The `workload` slot is metadata about the
+  // test conditions (dataset / isl / osl / max_concurrency), not a
+  // measurement — skip it when deciding whether a measurement has
+  // data, otherwise a workload-only stub would falsely suppress the
+  // "pending" empty card.
   const benchmarkIsEmpty = (entry) => {
     if (!entry) return true;
-    const blocks = ["latency", "throughput", "accuracy"];
-    for (const k of blocks) {
-      const block = entry[k];
-      if (block && typeof block === "object") {
-        for (const v of Object.values(block)) {
+    for (const m of normalizeSpeed(entry.speed)) {
+      if (m && typeof m === "object") {
+        for (const [key, v] of Object.entries(m)) {
+          if (key === "workload") continue;
           if (v !== null && v !== undefined) return false;
         }
+      }
+    }
+    if (entry.accuracy && typeof entry.accuracy === "object") {
+      for (const v of Object.values(entry.accuracy)) {
+        if (v !== null && v !== undefined) return false;
       }
     }
     return true;
@@ -550,78 +620,230 @@ export const Deployment = ({ config, benchmarks }) => {
   // JSX tree. Engine consumer renders <renderBenchmarkCall(...)>{}</>
   // by inlining the return.
   //
-  // Layout:
+  // Layout (top → bottom):
   //   header   : "Benchmark"   "measured on sglang vX.Y.Z" (right-aligned)
-  //   grid     : latency block | throughput block (either collapses if absent)
-  //   accuracy : single row with present accuracy fields
+  //   accuracy : single row collapsing whatever accuracy fields are
+  //              present (GSM8K today; add more via ACCURACY_LABELS).
+  //              Comes BEFORE speed — model quality leads serving speed.
+  //   speed    : metric × workload table. Rows are TTFT / TPOT /
+  //              tokens/sec/GPU / interactivity (1000/TPOT_ms). Columns
+  //              are per-workload measurements (typically varying
+  //              max-concurrency). Shared workload context (dataset,
+  //              in/out) is lifted to an italic line above the table;
+  //              the differing parts become the column headers.
   //   notes    : optional italic line
   //   empty    : when the entry has no measured numbers
   //
-  // The version annotation lives at the header, NOT under accuracy, since
-  // every block in the entry is part of the same measurement run on the
-  // same sglang build.
+  // The version annotation lives at the header, NOT under accuracy,
+  // since every block in the entry is part of the same measurement run
+  // on the same sglang build.
+  //
+  // Schema (consumed from `benchmarks` prop entries):
+  //   {
+  //     match: { hw, variant, quant, strategy, nodes },   // REQUIRED
+  //     sglang_version: string,                           // header annotation
+  //     speed: [
+  //       { workload: { dataset, isl, osl, max_concurrency },
+  //         ttft_ms, tpot_ms, tokens_per_sec_per_gpu },
+  //       ...                                             // one per workload
+  //     ],                                                // also accepts a
+  //                                                       //   single object
+  //                                                       //   (wrapped to [obj])
+  //     accuracy: { gsm8k_pct, ... },                     // extensible — add
+  //                                                       //   more keys to
+  //                                                       //   ACCURACY_LABELS
+  //     notes:    string,                                 // italic caveat
+  //   }
+  // `interactivity` is derived from tpot_ms (1000 / tpot_ms in tok/s),
+  // not stored. Missing metrics render as "—". A measurement that
+  // carries only a workload (no measured numbers) doesn't count toward
+  // "has data" — the card falls back to the pending empty state when
+  // nothing across all measurements has a value.
   const renderBenchmarkCard = (entry) => {
-    // Per-block label maps. Engine renders only the fields that have a
-    // non-null value, so partial measurements (e.g. TTFT but not TPOT)
-    // surface cleanly.
-    const LATENCY_LABELS = [
-      ["ttft_ms",     "TTFT",    "ms"],
-      ["tpot_ms",     "TPOT",    "ms"],
-      ["e2e_ms_p50",  "e2e p50", "ms"],
+    // Speed labels. Four metrics measured per workload: TTFT, TPOT,
+    // tokens/sec/GPU (system aggregate), interactivity (per-user
+    // generation speed, derived as 1000 / TPOT_ms = tok/s). The 4th
+    // tuple slot is an optional `compute(measurement)` function used
+    // for derived metrics that aren't stored — engine prefers compute()
+    // over measurement[key] when present.
+    const SPEED_LABELS = [
+      ["ttft_ms",                "TTFT",            "ms"],
+      ["tpot_ms",                "TPOT",            "ms"],
+      ["tokens_per_sec_per_gpu", "tokens/sec/GPU",  ""],
+      ["interactivity",          "interactivity",   "tok/s",
+        (m) => (m.tpot_ms != null && m.tpot_ms !== 0)
+          ? Math.round((1000 / m.tpot_ms) * 10) / 10
+          : null],
     ];
-    const THROUGHPUT_LABELS = [
-      ["tokens_per_sec_per_gpu", "tokens/sec/GPU", ""],
-      ["p50_latency_ms",         "p50 latency",   "ms"],
-      ["max_concurrency",        "max concurrency", ""],
-    ];
+    // Accuracy labels. Starts with GSM8K; add new accuracy benchmarks
+    // here as they come online (e.g. MATH, HumanEval). The render
+    // collapses whichever fields are present into a single line, so
+    // partial coverage degrades gracefully.
     const ACCURACY_LABELS = [
       ["gsm8k_pct", "GSM8K", "%"],
-      ["mmlu_pct",  "MMLU",  "%"],
     ];
+
+    // Workload field keys, in display order. Used both for the shared
+    // workload line and to decide column headers via set diff.
+    const WORKLOAD_KEYS = ["dataset", "isl", "osl", "max_concurrency"];
 
     const fmt = (val, unit) => {
       if (val === null || val === undefined) return null;
       return `${val}${unit ? " " + unit : ""}`;
     };
-    const renderBlock = (title, block, labels) => {
-      if (!block) return null;
-      const rows = labels
-        .map(([key, label, unit]) => ({ label, value: fmt(block[key], unit) }))
-        .filter((r) => r.value !== null);
-      // Block renders if EITHER there's a workload description OR at least
-      // one measured metric. A workload-only block surfaces the "what was
-      // measured" intent before the numbers land — useful while filling in.
-      if (rows.length === 0 && !block.workload) return null;
+
+    // Format the given subset of workload keys into a comma-separated
+    // phrase. Used twice: once for the shared workload line above the
+    // table (with all shared `keys`), once for each column header
+    // (with only the `differing` keys). Same vocabulary in both spots
+    // so readers don't have to translate between abbreviations.
+    const formatWorkloadParts = (workload, keys) => {
+      if (!workload) return "";
+      const parts = [];
+      if (keys.has("dataset") && workload.dataset) parts.push(workload.dataset);
+      // in/out is rendered as a single token even if only one of
+      // isl/osl is in the keys set — they read better together.
+      if (keys.has("isl") || keys.has("osl")) {
+        if (workload.isl != null || workload.osl != null) {
+          parts.push(`in/out=${workload.isl != null ? workload.isl : "?"}/${workload.osl != null ? workload.osl : "?"}`);
+        }
+      }
+      if (keys.has("max_concurrency") && workload.max_concurrency != null) {
+        parts.push(`max-concurrency=${workload.max_concurrency}`);
+      }
+      return parts.join(", ");
+    };
+
+    // Split workload fields into "same across all measurements" (lifted
+    // out to the italic context line above the table) vs "differs"
+    // (becomes the per-column header). `max_concurrency` is forced
+    // into the per-column header regardless of whether it varies —
+    // it's the primary run-axis dimension and the reader needs to
+    // know at WHICH concurrency the numbers were measured, even when
+    // a cell ships with only one measurement. Other workload fields
+    // fall back to auto-decide (shared if uniform, differing if not).
+    const ALWAYS_PER_COLUMN = new Set(["max_concurrency"]);
+    const partitionWorkload = (measurements) => {
+      const shared = new Set();
+      const differing = new Set();
+      for (const k of WORKLOAD_KEYS) {
+        const seen = new Set();
+        let anyPresent = false;
+        for (const m of measurements) {
+          const v = m && m.workload ? m.workload[k] : undefined;
+          if (v != null) anyPresent = true;
+          seen.add(v);
+        }
+        if (!anyPresent) continue;
+        if (ALWAYS_PER_COLUMN.has(k) || seen.size > 1) differing.add(k);
+        else shared.add(k);
+      }
+      return { shared, differing };
+    };
+
+    // Generic table renderer. Both speed and accuracy blocks feed it
+    // a {title, sharedText, colHeaders, rows, colCount} structure —
+    // the visual output (gray benchBlock with a CSS grid inside) is
+    // identical, only the data shape differs.
+    //
+    // The grid uses divs (not <table>) because Mintlify's page
+    // renderer auto-wraps every <table> element in two scroll
+    // wrappers with negative horizontal margins, which mis-align
+    // inside our nested card. `.not-prose` only disables prose
+    // typography, NOT the table component wrapping.
+    const renderBenchTable = ({ title, sharedText, colHeaders, rows, colCount }) => {
+      if (rows.length === 0) return null;
+      const showColHeaders = colHeaders.length > 0
+        && colHeaders.some((h) => h !== "");
       return (
         <div style={s.benchBlock}>
           <div style={s.benchBlockTitle}>{title}</div>
-          {block.workload && (
-            <div style={s.benchWorkload}>{block.workload}</div>
+          {sharedText && (
+            <div style={s.benchWorkload}>{sharedText}</div>
           )}
-          {rows.map((r) => (
-            <div key={r.label} style={s.benchRow}>
-              <span style={s.benchKey}>{r.label}</span>
-              <span style={s.benchVal}>{r.value}</span>
-            </div>
-          ))}
+          <div
+            style={{
+              ...s.benchTable,
+              gridTemplateColumns:
+                `max-content repeat(${colCount}, minmax(0, 1fr))`,
+            }}
+          >
+            {showColHeaders && (
+              <div key="corner" style={s.benchTableCornerHead}></div>
+            )}
+            {showColHeaders && colHeaders.map((h, i) => (
+              <div key={`hdr-${i}`} style={s.benchTableHead}>{h}</div>
+            ))}
+            {showColHeaders && (
+              <div key="sep" style={s.benchTableSeparator}></div>
+            )}
+            {rows.map((r) => [
+              <div key={`lbl-${r.label}`} style={s.benchTableLabel}>{r.label}</div>,
+              ...r.values.map((v, i) => (
+                <div key={`val-${r.label}-${i}`} style={
+                  v === null
+                    ? { ...s.benchTableValue, ...s.benchTableValueMissing }
+                    : s.benchTableValue
+                }>
+                  {v !== null ? v : "—"}
+                </div>
+              )),
+            ])}
+          </div>
         </div>
       );
     };
 
-    const isEmpty = benchmarkIsEmpty(entry);
-    const latencyBlock = !isEmpty && renderBlock("Latency",    entry.latency,    LATENCY_LABELS);
-    const throughputBlock = !isEmpty && renderBlock("Throughput", entry.throughput, THROUGHPUT_LABELS);
+    // Build the speed-table data structure: rows are metrics (TTFT,
+    // TPOT, …), columns are per-workload measurements (typically
+    // varying max-concurrency). Drop metric rows where every
+    // measurement is null so partial sweeps stay tight.
+    const buildSpeedTable = (measurements) => {
+      if (measurements.length === 0) return null;
+      const { shared, differing } = partitionWorkload(measurements);
+      const sharedText = formatWorkloadParts(
+        measurements[0] && measurements[0].workload, shared);
+      const colHeaders = measurements.map((m) =>
+        formatWorkloadParts(m && m.workload, differing));
+      const rows = SPEED_LABELS
+        .map((tup) => {
+          const [key, label, unit, compute] = tup;
+          const values = measurements.map((m) => {
+            const raw = compute ? compute(m) : m[key];
+            return fmt(raw, unit);
+          });
+          if (values.every((v) => v === null)) return null;
+          return { label, values };
+        })
+        .filter((r) => r !== null);
+      if (rows.length === 0) return null;
+      return { title: "Speed", sharedText, colHeaders, rows,
+               colCount: measurements.length };
+    };
 
-    // Accuracy row: collapse the present fields into one line. If neither
-    // is present, the row is omitted.
-    const accuracyParts = !isEmpty && entry.accuracy
-      ? ACCURACY_LABELS
-          .map(([key, label, unit]) => {
-            const v = fmt(entry.accuracy[key], unit);
-            return v === null ? null : `${label} ${v}`;
-          })
-          .filter((s) => s !== null)
-      : [];
+    // Build the accuracy-table data structure. One row per benchmark
+    // in ACCURACY_LABELS that has a non-null value. Single value
+    // column today (no column header) — extend to multi-column if
+    // cookbooks ever need to compare eval configs (e.g. shots=0 vs
+    // shots=5) by changing the accuracy schema to an array.
+    const buildAccuracyTable = (accuracy) => {
+      if (!accuracy) return null;
+      const rows = ACCURACY_LABELS
+        .map(([key, label, unit]) => {
+          const v = fmt(accuracy[key], unit);
+          if (v === null) return null;
+          return { label, values: [v] };
+        })
+        .filter((r) => r !== null);
+      if (rows.length === 0) return null;
+      return { title: "Accuracy", sharedText: null, colHeaders: [],
+               rows, colCount: 1 };
+    };
+
+    const isEmpty = benchmarkIsEmpty(entry);
+    const measurements = !isEmpty ? normalizeSpeed(entry && entry.speed) : [];
+    const accuracyTable = !isEmpty ? buildAccuracyTable(entry.accuracy) : null;
+    const speedTable = !isEmpty ? buildSpeedTable(measurements) : null;
 
     return (
       <div style={s.benchCard}>
@@ -633,22 +855,12 @@ export const Deployment = ({ config, benchmarks }) => {
         </div>
         {isEmpty ? (
           <div style={s.benchEmpty}>
-            Benchmark data pending for this combination — submit yours via the Playground's Verified ↗ button.
+            Benchmark data pending for this combination — submit yours via the Playground's Submit ↗ button.
           </div>
         ) : (
           <>
-            {(latencyBlock || throughputBlock) && (
-              <div style={s.benchGrid}>
-                {latencyBlock}
-                {throughputBlock}
-              </div>
-            )}
-            {accuracyParts && accuracyParts.length > 0 && (
-              <div style={s.benchAccuracyRow}>
-                <span style={s.benchKey}>Accuracy: </span>
-                <span style={s.benchVal}>{accuracyParts.join(" · ")}</span>
-              </div>
-            )}
+            {accuracyTable && renderBenchTable(accuracyTable)}
+            {speedTable && renderBenchTable(speedTable)}
             {entry && entry.notes && (
               <div style={s.benchNotes}>{entry.notes}</div>
             )}
@@ -901,7 +1113,7 @@ export const Deployment = ({ config, benchmarks }) => {
             <div style={s.headerLeft}>
               <div style={s.badge(Boolean(cell && cell.verified))}>
                 <span style={s.badgeDot(Boolean(cell && cell.verified))} />
-                {cell && cell.verified ? "Verified" : "Auto-Estimated"}
+                {cell && cell.verified ? "Verified" : "Not Verified"}
               </div>
               <div style={s.runModeWrap} role="tablist" aria-label="Output format">
                 <span

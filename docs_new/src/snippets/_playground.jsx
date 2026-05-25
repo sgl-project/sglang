@@ -1894,7 +1894,7 @@ export const Playground = ({ config }) => {
             <div style={s.headerLeft}>
               <div style={s.badge(playgroundVerified)}>
                 <span style={s.badgeDot(playgroundVerified)} />
-                {playgroundVerified ? "Verified" : "Auto-Estimated"}
+                {playgroundVerified ? "Verified" : "Not Verified"}
               </div>
               {/* When the playground matches a sibling cell (different
                   `strategy`) — e.g. low-latency + MTP-1-1-2 on H200/FP4
@@ -1959,7 +1959,7 @@ export const Playground = ({ config }) => {
                   onClick={() => setModal("submit")}
                   title="I verified this command on my hardware — open a pre-filled GitHub issue to land it as a cookbook cell."
                 >
-                  Verified ↗
+                  Submit ↗
                 </button>
               )}
             </div>

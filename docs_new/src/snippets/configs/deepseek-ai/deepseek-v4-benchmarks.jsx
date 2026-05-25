@@ -12,40 +12,59 @@
 //
 //   {
 //     match:           { hw, variant, quant, strategy, nodes },     // REQUIRED
-//     sglang_version:  string,                                       // shown in card header
-//     latency:    { workload, ttft_ms, tpot_ms, e2e_ms_p50 },        // shown for low-latency / balanced
-//     throughput: { workload, tokens_per_sec_per_gpu,                // shown for max-throughput / balanced
-//                   p50_latency_ms, max_concurrency },
-//     accuracy:   { gsm8k_pct, mmlu_pct },                           // shown when present
-//     notes:      string,                                            // optional entry-level caveat
-//     sweep:      [{ tpot_ms, throughput_per_gpu_tps,                // RESERVED for the future Pareto
-//                    max_concurrency }, ...]                         // curve view — not rendered yet
+//     sglang_version:  string,                                       // card header
+//     speed: [
+//       {
+//         workload: { dataset, isl, osl, max_concurrency },          // structured
+//         ttft_ms, tpot_ms, tokens_per_sec_per_gpu,                  // measured
+//       },                                                           // one entry per
+//       ...                                                          //   workload (typically
+//                                                                    //   varying max-concurrency
+//                                                                    //   for a Pareto sweep)
+//     ],
+//     accuracy: { gsm8k_pct, ... },                                  // extensible — add
+//                                                                    //   more keys when new
+//                                                                    //   accuracy benches land
+//     notes:    string,                                              // optional caveat
 //   }
 //
-// `workload` (per-block) describes WHAT was measured (e.g. "ShareGPT,
-// in/out=1024/1024, bs=1" or "10 prompts at concurrency=1"). It renders
-// as a small italic line under the block title, between the heading and
-// the numeric rows. Leave it empty to defer; fill in when you know the
-// exact harness command.
+// The engine renders `speed` as a metric × workload table:
+//   - rows: TTFT, TPOT, tokens/sec/GPU, interactivity (1000/TPOT_ms)
+//   - columns: one per workload entry
+//   - shared workload parts (dataset, in/out) lift to an italic line above
+//   - per-column header shows the differing parts (typically `c=N`)
 //
-// Any field whose value is null renders as the empty state for that
-// slot. A whole sub-block (e.g. `latency`) set to null or omitted
-// collapses the corresponding column.
+// `interactivity` is derived from `tpot_ms` and never stored. Any
+// measured field set to null (or absent) renders as "—" in its cell —
+// so partial sweeps (only TTFT/TPOT at c=1; only tokens/sec at c=100)
+// degrade gracefully.
+//
+// `accuracy` renders as a single muted row ABOVE the speed table
+// (semantic priority — model quality leads serving speed). The engine
+// concatenates whichever accuracy fields are present, so adding a new
+// benchmark (e.g. `math_pct`) only requires updating ACCURACY_LABELS
+// in _deployment.jsx and adding the key here.
+//
+// `speed` also accepts a single object (e.g. `speed: { workload: ..., ttft_ms: ... }`)
+// for cookbooks that only measure one workload per cell; the engine
+// wraps it to `[speed]` internally.
 //
 // Editing policy: this file turns over independently of the cell
 // catalog (new sglang version → new numbers, but no flag changes).
 // Keep the entry count and ordering in sync with deepseek-v4.jsx's
 // `cells: [...]` so the two files diff cleanly side by side.
 
-// Workload strings repeat across cells — every entry uses the same
-// `sglang.bench_serving` invocation, only the numbers differ:
-//   latency    = "random dataset, in/out=1024/1024, 10 prompts at concurrency=1"
-//   throughput = "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100"
-// Mintlify strips module-level statements, so we inline both literally.
-//
-// All numbers below were measured on **sglang v0.5.12**. When that version is
-// updated, refresh the `sglang_version` field on every entry (or sweep it
+// All numbers below were measured on **sglang v0.5.12**. When that version
+// is updated, refresh the `sglang_version` field on every entry (or sweep
 // with a single find-and-replace).
+//
+// Historical note on the migration: cells originally carried separate
+// `latency` (concurrency=1) and `throughput` (concurrency=100) blocks.
+// These have been unified into the `speed` array — low-latency-only
+// cells now have one entry at c=1, max-throughput-only cells have one
+// entry at c=100, and balanced cells have both. The "—" cells in the
+// rendered table mark metrics not measured at that particular workload
+// and are candidates for the next benchmark sweep.
 export const benchmarks = [
   // ====================================================================
   // B200 + FP4
@@ -53,55 +72,56 @@ export const benchmarks = [
   {
     match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 86, tpot_ms: 3.42, e2e_ms_p50: 1174,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 86, tpot_ms: 3.42 },
+    ],
   },
   {
     match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 3464, tpot_ms: 5.63, e2e_ms_p50: 5284,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 677, p50_latency_ms: 12867, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 3464, tpot_ms: 5.63 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 677 },
+    ],
   },
   {
     match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 1215, p50_latency_ms: 9521, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 1215 },
+    ],
   },
   {
     match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 171, tpot_ms: 5.12, e2e_ms_p50: 1800,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 171, tpot_ms: 5.12 },
+    ],
   },
   {
     match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 183, tpot_ms: 8.49, e2e_ms_p50: 3407,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 183, tpot_ms: 8.49 },
+      // c=100 column shows up empty so the planned throughput slot is
+      // visible — refill numbers once the throughput bench re-runs.
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 } },
+    ],
     notes: "Throughput bench pending re-validation on this cell.",
   },
   {
     match: { hw: "b200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 372, p50_latency_ms: 15538, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 372 },
+    ],
   },
 
   // ====================================================================
@@ -110,56 +130,56 @@ export const benchmarks = [
   {
     match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 84, tpot_ms: 3.33, e2e_ms_p50: 1153,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 84, tpot_ms: 3.33 },
+    ],
   },
   {
     match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 157, tpot_ms: 5.59, e2e_ms_p50: 2039,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 1036, p50_latency_ms: 11167, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 157, tpot_ms: 5.59 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 1036 },
+    ],
   },
   {
     match: { hw: "b300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 1213, p50_latency_ms: 9473, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 1213 },
+    ],
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 115, tpot_ms: 5.04, e2e_ms_p50: 1768,
-    },
-    accuracy: { gsm8k_pct: 96.5, mmlu_pct: 87.9 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 115, tpot_ms: 5.04 },
+    ],
+    accuracy: { gsm8k_pct: 96.5 },
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 1507, tpot_ms: 8.43, e2e_ms_p50: 4151,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 1507, tpot_ms: 8.43 },
+      // c=100 placeholder — fill in when the throughput bench re-runs.
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 } },
+    ],
     notes: "Throughput bench pending re-validation on this cell.",
   },
   {
     match: { hw: "b300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 359, p50_latency_ms: 16336, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 359 },
+    ],
   },
 
   // ====================================================================
@@ -168,38 +188,36 @@ export const benchmarks = [
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 194, tpot_ms: 3.53, e2e_ms_p50: 1335,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 194, tpot_ms: 3.53 },
+    ],
   },
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 335, tpot_ms: 6.18, e2e_ms_p50: 2449,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 614, p50_latency_ms: 19129, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 335, tpot_ms: 6.18 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 614 },
+    ],
   },
   {
     match: { hw: "gb200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 718, p50_latency_ms: 16051, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 718 },
+    ],
   },
   {
     match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "multi-2" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 263, tpot_ms: 6.91, e2e_ms_p50: 2450,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 263, tpot_ms: 6.91 },
+    ],
   },
   // GB200 Pro balanced: no cookbook recipe completed both lat+thp on 2
   // nodes — §3.1 cell carries the yellow Auto-Estimated badge, no benchmark
@@ -208,10 +226,10 @@ export const benchmarks = [
   {
     match: { hw: "gb200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "multi-2" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 226, p50_latency_ms: 25926, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 226 },
+    ],
   },
 
   // ====================================================================
@@ -220,58 +238,54 @@ export const benchmarks = [
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 226, tpot_ms: 4.30, e2e_ms_p50: 1617,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 226, tpot_ms: 4.30 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 5131, tpot_ms: 6.43, e2e_ms_p50: 7095,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 373, p50_latency_ms: 25094, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 5131, tpot_ms: 6.43 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 373 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 682, p50_latency_ms: 17267, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 682 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 286, tpot_ms: 6.83, e2e_ms_p50: 2470,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 286, tpot_ms: 6.83 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 410, tpot_ms: 10.30, e2e_ms_p50: 3829,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 342, p50_latency_ms: 34191, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 410, tpot_ms: 10.30 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 342 },
+    ],
   },
   {
     match: { hw: "gb300", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 378, p50_latency_ms: 31197, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 378 },
+    ],
   },
 
   // ====================================================================
@@ -297,30 +311,28 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 132, tpot_ms: 3.48, e2e_ms_p50: 1274,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 132, tpot_ms: 3.48 },
+    ],
   },
   {
     match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 139, tpot_ms: 4.71, e2e_ms_p50: 1748,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 746, p50_latency_ms: 15858, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 139, tpot_ms: 4.71 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 746 },
+    ],
   },
   {
     match: { hw: "h200", variant: "flash", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 644, p50_latency_ms: 18329, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 644 },
+    ],
   },
   // H200 Pro on FP4: numbers transcribed from the dsv4-benchmark playground
   // sweep (TP=4, flashinfer-mxfp4 runner). The cookbook command in §3.1
@@ -329,31 +341,29 @@ export const benchmarks = [
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "low-latency", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 176, tpot_ms: 5.28, e2e_ms_p50: 1942,
-    },
-    accuracy: { gsm8k_pct: 97.5, mmlu_pct: 89.3 },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 176, tpot_ms: 5.28 },
+    ],
+    accuracy: { gsm8k_pct: 97.5 },
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "balanced", nodes: "single" },
     sglang_version: "0.5.12",
-    latency: {
-      workload: "random dataset, in/out=1024/1024, 10 prompts at concurrency=1",
-      ttft_ms: 190, tpot_ms: 7.47, e2e_ms_p50: 2721,
-    },
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 270, p50_latency_ms: 44226, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 1 },
+        ttft_ms: 190, tpot_ms: 7.47 },
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 270 },
+    ],
   },
   {
     match: { hw: "h200", variant: "pro", quant: "fp4", strategy: "max-throughput", nodes: "single" },
     sglang_version: "0.5.12",
-    throughput: {
-      workload: "random dataset, in/out=1024/1024, 1000 prompts at concurrency=100",
-      tokens_per_sec_per_gpu: 288, p50_latency_ms: 41262, max_concurrency: 100,
-    },
+    speed: [
+      { workload: { dataset: "random", isl: 1024, osl: 1024, max_concurrency: 100 },
+        tokens_per_sec_per_gpu: 288 },
+    ],
   },
 
   // ====================================================================
