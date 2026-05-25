@@ -910,7 +910,7 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "message_stop")
 
     def test_stream_parse_failure_closes_open_content_block(self):
-        """Unparseable mid-stream chunk must still close any open content_block."""
+        """Unparsable mid-stream chunk must still close any open content_block."""
         serving = self._serving(
             [
                 _chunk([_choice({"role": "assistant", "content": "first"})]),
