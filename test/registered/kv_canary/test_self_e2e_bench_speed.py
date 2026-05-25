@@ -34,6 +34,10 @@ _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 _PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
 _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
+# start_profile blocks until num_steps complete, so it must be <= the actual decode steps the
+# request produces. The no-graph variant runs only 3 decode steps; mirror that here so the
+# trace flushes.
+_PROFILE_NO_GRAPH_STEPS = 3
 
 
 def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> ServerArgs:
@@ -79,6 +83,7 @@ def _run_one_canary_setting(
     output_len: int,
     disable_cuda_graph: bool = False,
     profile_output_dir: Optional[Path] = None,
+    profile_steps: int = _PROFILE_STEPS,
 ) -> BenchOneCaseResult:
     server_args = _make_server_args(
         canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
@@ -91,7 +96,7 @@ def _run_one_canary_setting(
         bench_args = dataclasses.replace(
             bench_args,
             profile=True,
-            profile_steps=_PROFILE_STEPS,
+            profile_steps=profile_steps,
             profile_output_dir=str(profile_output_dir),
         )
 
@@ -198,6 +203,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=_PROFILE_NO_GRAPH_OUTPUT_LEN,
             disable_cuda_graph=True,
             profile_output_dir=no_graph_dir,
+            profile_steps=_PROFILE_NO_GRAPH_STEPS,
         )
         print(
             f"[canary self-bench] {scenario_key} profile no_cuda_graph_osl3: "
