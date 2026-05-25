@@ -111,57 +111,58 @@ def _resolve_profile_root() -> Optional[Path]:
     return Path(raw).expanduser().resolve() if raw else None
 
 
-def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> None:
-    scenario_key = _make_scenario_key(
-        batch_size=batch_size, input_len=input_len, output_len=output_len
-    )
-    profile_root = _resolve_profile_root()
+class TestCanarySelfBenchSpeed(unittest.TestCase):
+    bench_timeout: ClassVar[float] = 1800.0
 
-    if profile_root is not None:
-        scenario_slug = scenario_key.replace("/", "_")
-        profile_output_dir = profile_root / f"{scenario_slug}_on"
+    def _measure_overhead(
+        self, *, batch_size: int, input_len: int, output_len: int
+    ) -> None:
+        scenario_key = _make_scenario_key(
+            batch_size=batch_size, input_len=input_len, output_len=output_len
+        )
+        profile_root = _resolve_profile_root()
+
+        if profile_root is not None:
+            scenario_slug = scenario_key.replace("/", "_")
+            profile_output_dir = profile_root / f"{scenario_slug}_on"
+            on = _run_one_canary_setting(
+                canary_on=True,
+                batch_size=batch_size,
+                input_len=input_len,
+                output_len=output_len,
+                profile_output_dir=profile_output_dir,
+            )
+            print(
+                f"[canary self-bench] {scenario_key} profile mode: "
+                f"on={on.latency:.4f}s (trace under {profile_output_dir}); "
+                f"off baseline + overhead assertion skipped.",
+                flush=True,
+            )
+            return
+
+        off = _run_one_canary_setting(
+            canary_on=False,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+        )
         on = _run_one_canary_setting(
             canary_on=True,
             batch_size=batch_size,
             input_len=input_len,
             output_len=output_len,
-            profile_output_dir=profile_output_dir,
         )
-        print(
-            f"[canary self-bench] {scenario_key} profile mode: "
-            f"on={on.latency:.4f}s (trace under {profile_output_dir}); "
-            f"off baseline + overhead assertion skipped.",
-            flush=True,
+        overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
+        summary = (
+            f"[canary self-bench] {scenario_key}: "
+            f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
         )
-        return
-
-    off = _run_one_canary_setting(
-        canary_on=False,
-        batch_size=batch_size,
-        input_len=input_len,
-        output_len=output_len,
-    )
-    on = _run_one_canary_setting(
-        canary_on=True,
-        batch_size=batch_size,
-        input_len=input_len,
-        output_len=output_len,
-    )
-    overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
-    summary = (
-        f"[canary self-bench] {scenario_key}: "
-        f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
-    )
-    print(summary, flush=True)
-    assert overhead_pct < 5.0, f"{summary} — exceeds 5% budget"
-
-
-class TestCanarySelfBenchSpeed(unittest.TestCase):
-    bench_timeout: ClassVar[float] = 1800.0
+        print(summary, flush=True)
+        self.assertLess(overhead_pct, 5.0, msg=f"{summary} — exceeds 5% budget")
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
         """Verify canary prefill overhead stays within the expected bound."""
-        _measure_overhead(
+        self._measure_overhead(
             batch_size=32,
             input_len=16384,
             output_len=1,
@@ -169,7 +170,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
 
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
         """Verify canary decode overhead stays within the expected bound."""
-        _measure_overhead(
+        self._measure_overhead(
             batch_size=128,
             input_len=512,
             output_len=1024,
@@ -177,7 +178,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
 
     def test_qwen3_decode_overhead_bs1_isl512_osl1024(self) -> None:
         """Verify canary decode overhead stays within the expected bound."""
-        _measure_overhead(
+        self._measure_overhead(
             batch_size=1,
             input_len=512,
             output_len=1024,
