@@ -344,7 +344,9 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         server_args = dispatch_launch.call_args.args[0]
         self.assertTrue(server_args.warmup)
+        self.assertTrue(server_args.server_warmup)
         self.assertFalse(server_args.is_arg_explicitly_set("warmup"))
+        self.assertFalse(server_args.is_arg_explicitly_set("server_warmup"))
 
     def test_serve_cli_preserves_explicit_warmup_false(self):
         from sglang.multimodal_gen.runtime.entrypoints.cli.serve import (
@@ -375,6 +377,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         server_args = dispatch_launch.call_args.args[0]
         self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
         self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
 
     def test_serve_cli_preserves_config_warmup_false(self):
@@ -410,6 +413,7 @@ class TestServerArgsPathExpansion(unittest.TestCase):
 
         server_args = dispatch_launch.call_args.args[0]
         self.assertFalse(server_args.warmup)
+        self.assertFalse(server_args.server_warmup)
         self.assertTrue(server_args.is_arg_explicitly_set("warmup"))
 
 

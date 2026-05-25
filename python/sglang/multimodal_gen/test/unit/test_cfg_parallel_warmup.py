@@ -1,10 +1,12 @@
 """Unit tests for the --enable-cfg-parallel warmup fix and guard.
 
-Covers two code paths introduced alongside this file:
+Covers three code paths introduced alongside this file:
 - Scheduler.prepare_server_warmup_reqs synthesizes warmup Reqs that
   actually enable classifier-free guidance when cfg-parallel is on.
 - InputValidationStage.forward rejects non-CFG requests when the server
   has cfg-parallel on.
+- Server-based warmup can opt into model-default negative prompts so warmup
+  populates the negative text embedding cache.
 
 All tests are CPU-only; no model loading, no distributed init.
 """
@@ -14,13 +16,15 @@ from collections import deque
 from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-from sglang.multimodal_gen.runtime.managers.scheduler import (
-    DEFAULT_PLACEHOLDER_PROMPT,
-    Scheduler,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.input_validation import (
     InputValidationStage,
+)
+from sglang.multimodal_gen.runtime.server_warmup import (
+    DEFAULT_PLACEHOLDER_PROMPT,
+    build_warmup_reqs,
 )
 
 # Patch path for get_global_server_args used by Stage.__init__
@@ -98,6 +102,42 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
         _, req, _ = scheduler.waiting_queue[0]
         self.assertIs(req.do_classifier_free_guidance, False)
         self.assertNotEqual(req.negative_prompt, DEFAULT_PLACEHOLDER_PROMPT)
+
+    def test_server_based_warmup_uses_model_default_negative_prompt(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+
+        task_type = MagicMock()
+        task_type.accepts_image_input.return_value = False
+        task_type.is_image_gen.return_value = True
+        task_type.data_type.return_value = ModelTaskType.T2I.data_type()
+        server_args.pipeline_config.task_type = task_type
+
+        sampling_defaults = SamplingParams(
+            negative_prompt="model default negative",
+            guidance_scale=4.0,
+            num_inference_steps=20,
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=sampling_defaults,
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                use_model_sampling_defaults=True,
+                return_warmup_result=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(len(reqs), 1)
+        req = reqs[0]
+        self.assertTrue(req.is_warmup)
+        self.assertEqual(req.negative_prompt, "model default negative")
+        self.assertIs(req.do_classifier_free_guidance, True)
+        self.assertTrue(req.extra["return_warmup_result"])
+        self.assertTrue(req.extra["server_based_warmup"])
 
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):

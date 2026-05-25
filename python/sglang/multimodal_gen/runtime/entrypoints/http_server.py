@@ -3,10 +3,12 @@
 import asyncio
 import base64
 import os
+import signal
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING
 
+import httpx
 import torch
 from fastapi import APIRouter, FastAPI, Request
 
@@ -26,6 +28,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.server_warmup import (
+    build_warmup_reqs,
+    prepare_warmup_image_path,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils.json_response import orjson_response
 from sglang.version import __version__
@@ -36,6 +42,56 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
+
+
+async def _wait_until_http_ready(server_args: ServerArgs) -> None:
+    health_url = f"{server_args.url()}/health"
+    async with httpx.AsyncClient() as client:
+        for _ in range(120):
+            try:
+                response = await client.get(health_url, timeout=5.0)
+                if response.status_code == 200:
+                    return
+            except httpx.HTTPError:
+                pass
+            await asyncio.sleep(1.0)
+    raise RuntimeError(f"HTTP server did not become ready at {health_url}")
+
+
+async def _run_server_warmup_after_http_ready(server_args: ServerArgs) -> None:
+    try:
+        if (
+            not server_args.warmup
+            or not server_args.server_warmup
+            or server_args.warmup_resolutions is not None
+        ):
+            return
+
+        await _wait_until_http_ready(server_args)
+
+        warmup_input_path = None
+        if server_args.pipeline_config.task_type.accepts_image_input():
+            warmup_input_path = await prepare_warmup_image_path(server_args)
+
+        warmup_reqs = build_warmup_reqs(
+            server_args,
+            warmup_resolutions=None,
+            warmup_input_path=warmup_input_path,
+            return_warmup_result=True,
+            server_based_warmup=True,
+            use_model_sampling_defaults=True,
+        )
+        for req in warmup_reqs:
+            response = await async_scheduler_client.forward(req)
+            if response.error is not None:
+                raise RuntimeError(response.error)
+
+        logger.info("The server is fired up and ready to roll!")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error("Server warmup failed; aborting startup: %s", e, exc_info=True)
+        os.kill(os.getpid(), signal.SIGTERM)
 
 
 @asynccontextmanager
@@ -51,13 +107,24 @@ async def lifespan(app: FastAPI):
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    warmup_task = None
+    if server_args.server_warmup:
+        warmup_task = asyncio.create_task(
+            _run_server_warmup_after_http_ready(server_args)
+        )
 
-    yield
+    try:
+        yield
+    finally:
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await warmup_task
 
-    # On shutdown
-    logger.info("FastAPI app is shutting down...")
-    broker_task.cancel()
-    async_scheduler_client.close()
+        # On shutdown
+        logger.info("FastAPI app is shutting down...")
+        broker_task.cancel()
+        async_scheduler_client.close()
 
 
 # Health router

@@ -217,6 +217,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # warmup
     warmup: bool = False
+    server_warmup: bool = False
     warmup_resolutions: list[str] = None
     warmup_steps: int = 1
 
@@ -661,10 +662,18 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_warmup(self):
         if self.warmup_resolutions is not None:
             self.warmup = True
+            self.server_warmup = False
+
+        if not self.warmup:
+            self.server_warmup = False
 
         if self.warmup and self.warmup_resolutions is not None:
             logger.info(
                 "Resolution warmup enabled; server launch may take longer than usual"
+            )
+        elif self.warmup and self.server_warmup:
+            logger.info(
+                "Server warmup enabled; a lightweight warmup request will run after HTTP server is ready"
             )
         elif self.warmup:
             logger.info(
@@ -1199,9 +1208,15 @@ class ServerArgs(DisaggArgsMixin):
             "--warmup",
             action=StoreBoolean,
             default=ServerArgs.warmup,
-            help="Perform some warmup after server starts (if `--warmup-resolutions` is specified) or before processing the first request (if `--warmup-resolutions` is not specified)."
-            "Recommended to enable when benchmarking to ensure fair comparison and best performance."
-            "When enabled with `--warmup-resolutions` unspecified, look for the line ending with `(with warmup excluded)` for actual processing time.",
+            help=(
+                "Perform warmup before normal traffic. `sglang serve` runs a "
+                "lightweight server warmup after HTTP is ready; other entrypoints "
+                "use request-based warmup unless `--warmup-resolutions` is "
+                "specified. Recommended to enable when benchmarking to ensure fair "
+                "comparison and best performance. When enabled with "
+                "`--warmup-resolutions` unspecified, look for the line ending with "
+                "`(with warmup excluded)` for actual processing time."
+            ),
         )
         parser.add_argument(
             "--warmup-resolutions",
