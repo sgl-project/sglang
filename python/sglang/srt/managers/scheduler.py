@@ -61,7 +61,7 @@ from sglang.srt.disaggregation.utils import (
     TransferBackend,
     prepare_abort,
 )
-from sglang.srt.distributed import get_dcp_world_size, get_pp_group, get_world_group
+from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
@@ -78,6 +78,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.utils.dcp_utils import dcp_enabled, get_attention_dcp_world_size
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -768,15 +769,17 @@ class Scheduler(
             self.idle_sleeper = None
 
     def init_truncation_align_size_for_dcp(self):
-        if get_dcp_world_size() > 1:
+        if dcp_enabled():
             if self.truncation_align_size is None:
-                self.truncation_align_size = get_dcp_world_size()
+                self.truncation_align_size = get_attention_dcp_world_size()
             else:
                 import math
 
                 self.truncation_align_size = (
-                    self.truncation_align_size * get_dcp_world_size()
-                ) // (math.gcd(self.truncation_align_size, get_dcp_world_size()))
+                    self.truncation_align_size * get_attention_dcp_world_size()
+                ) // (
+                    math.gcd(self.truncation_align_size, get_attention_dcp_world_size())
+                )
 
     def init_tokenizer(self):
         server_args = self.server_args

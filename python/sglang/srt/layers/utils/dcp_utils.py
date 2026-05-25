@@ -20,6 +20,22 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 from sglang.srt.server_args import get_global_server_args
 
 
+def dcp_enabled() -> bool:
+    return get_dcp_world_size() > 1
+
+
+def get_attention_dcp_group() -> GroupCoordinator:
+    return get_dcp_group()
+
+
+def get_attention_dcp_world_size() -> int:
+    return get_dcp_world_size()
+
+
+def get_attention_dcp_rank() -> int:
+    return get_dcp_rank()
+
+
 @triton.jit
 def _correct_attn_cp_out_kernel(
     outputs_ptr,
@@ -331,7 +347,7 @@ def prepare_decode_context_parallel_metadata(
     kv_cache_dtype,
     kv_cache_device,
 ) -> Optional[DecodeContextParallelMetadata]:
-    if get_dcp_world_size() <= 1:
+    if not dcp_enabled():
         return None
     # dcp_kv_buffer tokens' layout
     # [ rank0_r1.prefix_tokens, rank0_r2.prefix_tokens,
@@ -440,7 +456,7 @@ def all_gather_kv_cache_for_mha_chunk_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    if get_dcp_world_size() > 1:
+    if dcp_enabled():
         return (
             _all_gather_dcp_kv_cache(kv_a).contiguous(),
             _all_gather_dcp_kv_cache(k_pe).contiguous(),
@@ -489,7 +505,7 @@ def all_gather_kv_cache_for_mha_extend(
 
 
 def filter_dcp_local_kv_indices(kv_indices: torch.Tensor):
-    if get_dcp_world_size() > 1:
+    if dcp_enabled():
         kv_indices = (
             kv_indices[kv_indices % get_dcp_world_size() == get_dcp_rank()]
             // get_dcp_world_size()
@@ -547,13 +563,9 @@ def all_gather_kv_cache_for_mla_extend(
     ] = k_pe
 
 
-def dcp_enabled() -> bool:
-    return get_dcp_world_size() > 1
-
-
 def update_local_kv_lens_for_dcp(kv_len_arr):
     dcp_world_size = get_dcp_world_size()
-    if dcp_world_size <= 1:
+    if not dcp_enabled():
         return
     dcp_rank = get_dcp_rank()
     offset = dcp_rank + 1

@@ -11,12 +11,15 @@ from sglang.srt.configs.model_config import (
     is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import (
-    get_dcp_rank,
-    get_dcp_world_size,
     get_world_group,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.mem_cache.allocator import (
     DcpTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
@@ -733,8 +736,8 @@ class ModelRunnerKVCacheMixin:
                             )
                         )
                     elif self.page_size == 1:
-                        if get_dcp_world_size() > 1:
-                            self.max_total_num_tokens *= get_dcp_world_size()
+                        if dcp_enabled():
+                            self.max_total_num_tokens *= get_attention_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
                                 1,
@@ -742,8 +745,8 @@ class ModelRunnerKVCacheMixin:
                                 device=self.device,
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
-                                dcp_rank=get_dcp_rank(),
-                                dcp_world_size=get_dcp_world_size(),
+                                dcp_rank=get_attention_dcp_rank(),
+                                dcp_world_size=get_attention_dcp_world_size(),
                             )
                         else:
                             self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
@@ -754,8 +757,8 @@ class ModelRunnerKVCacheMixin:
                                 need_sort=need_sort,
                             )
                     else:
-                        if get_dcp_world_size() > 1:
-                            self.max_total_num_tokens *= get_dcp_world_size()
+                        if dcp_enabled():
+                            self.max_total_num_tokens *= get_attention_dcp_world_size()
                             self.token_to_kv_pool_allocator = DcpTokenToKVPoolAllocator(
                                 self.max_total_num_tokens,
                                 self.page_size,
@@ -763,8 +766,8 @@ class ModelRunnerKVCacheMixin:
                                 device=self.device,
                                 kvcache=self.token_to_kv_pool,
                                 need_sort=need_sort,
-                                dcp_rank=get_dcp_rank(),
-                                dcp_world_size=get_dcp_world_size(),
+                                dcp_rank=get_attention_dcp_rank(),
+                                dcp_world_size=get_attention_dcp_world_size(),
                             )
                         else:
                             self.token_to_kv_pool_allocator = (

@@ -12,11 +12,14 @@ import torch
 import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
-from sglang.srt.distributed.parallel_state import get_dcp_rank, get_dcp_world_size
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+from sglang.srt.layers.utils.dcp_utils import (
+    get_attention_dcp_rank,
+    get_attention_dcp_world_size,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 logger = logging.getLogger(__name__)
@@ -89,8 +92,8 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.cuda_graph_num_splits_view = None
 
         # get dcp info
-        self.dcp_world_size = get_dcp_world_size()
-        self.dcp_rank = get_dcp_rank()
+        self.dcp_world_size = get_attention_dcp_world_size()
+        self.dcp_rank = get_attention_dcp_rank()
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size

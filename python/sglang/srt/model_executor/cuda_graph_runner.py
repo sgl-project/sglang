@@ -39,8 +39,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
-    get_dcp_group,
-    get_dcp_world_size,
     graph_capture,
     set_pdmux_status,
 )
@@ -59,6 +57,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.utils.dcp_utils import dcp_enabled, get_attention_dcp_group
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -800,11 +799,11 @@ class CudaGraphRunner:
         logger.info(log_message)
 
     def _prealloc_symmetric_memory_pool(self):
-        if get_dcp_world_size() < 2:
+        if not dcp_enabled():
             return
         with torch.get_device_module(self.device).stream(self.stream):
             logger.info(f"Pre-allocating symmetric memory pool for dcp")
-            with use_symmetric_memory(get_dcp_group()):
+            with use_symmetric_memory(get_attention_dcp_group()):
                 [
                     torch.empty(size, dtype=torch.uint8, device=self.device)
                     for j in range(8)

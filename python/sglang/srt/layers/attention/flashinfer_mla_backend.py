@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Callable, Optional, Union
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import get_dcp_world_size
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -25,6 +24,7 @@ from sglang.srt.layers.attention.flashinfer_backend import (
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.utils.dcp_utils import (
     dcp_enabled,
+    get_attention_dcp_world_size,
     plan_dcp_decode_metadata,
     update_local_kv_lens_for_dcp,
 )
@@ -673,7 +673,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         self.num_local_heads = (
             model_runner.model_config.num_attention_heads
             // get_attention_tp_size()
-            * get_dcp_world_size()
+            * get_attention_dcp_world_size()
         )
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim

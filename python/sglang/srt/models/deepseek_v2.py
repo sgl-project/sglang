@@ -47,7 +47,6 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     divide,
-    get_dcp_world_size,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
@@ -128,6 +127,10 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
     prepare_context_parallel_metadata,
+)
+from sglang.srt.layers.utils.dcp_utils import (
+    dcp_enabled,
+    get_attention_dcp_world_size,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -1503,9 +1506,9 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("attn_mqa", prefix),
         )
         # use num_local_heads * dcp_world_size because q_nope, q_rope is all gathered from dcp ranks
-        if get_dcp_world_size() > 1:
+        if dcp_enabled():
             self.attn_mqa_for_dcp_decode = RadixAttention(
-                self.num_local_heads * get_dcp_world_size(),
+                self.num_local_heads * get_attention_dcp_world_size(),
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 self.scaling,
                 num_kv_heads=1,

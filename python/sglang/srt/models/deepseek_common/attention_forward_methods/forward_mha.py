@@ -4,9 +4,6 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.distributed.parallel_state import (
-    get_dcp_world_size,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
@@ -15,6 +12,7 @@ from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.utils.dcp_utils import (
     all_gather_kv_cache_for_mha_chunk_extend,
     all_gather_kv_cache_for_mha_extend,
+    dcp_enabled,
     filter_dcp_local_kv_indices,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -271,7 +269,7 @@ class DeepseekMHAForwardMixin:
                 kv_a, k_pe = self._get_mla_kv_buffer_from_fp8_for_dsa(forward_batch)
             else:
                 # BF16/FP16 path: directly fetch from cache
-                if get_dcp_world_size() > 1:
+                if dcp_enabled():
                     kv_a, k_pe = all_gather_kv_cache_for_mha_extend(
                         get_token_to_kv_pool(),
                         self.attn_mha,

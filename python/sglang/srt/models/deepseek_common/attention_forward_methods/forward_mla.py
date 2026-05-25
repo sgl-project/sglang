@@ -6,10 +6,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
-from sglang.srt.distributed import (
-    get_dcp_group,
-    get_dcp_world_size,
-)
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -22,6 +18,9 @@ from sglang.srt.layers.utils.dcp_utils import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
     cp_lse_ag_out_rs,
+    dcp_enabled,
+    get_attention_dcp_group,
+    get_attention_dcp_world_size,
 )
 from sglang.srt.lora.deepseek_mla_correction import (
     apply_q_correction as apply_kv_b_lora_q_correction,
@@ -399,7 +398,7 @@ class DeepseekMLAForwardMixin:
             )
 
         # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [1, 8, 64], q_nope_out [1, 8, 512] gathered to [1, 64, 64] [1, 64, 512], k_pe [1, 1, 64], k_nope [1, 1, 512], that is to say gather along heads dim, from local_head_num 8 to all_head_num 64
-        if get_dcp_world_size() > 1:
+        if dcp_enabled():
             if forward_batch.forward_mode.is_decode():
                 # if forward_batch.forward_mode is decode, gather q
                 q_nope_out, q_pe = all_gather_q_for_mla_decode(
@@ -528,7 +527,7 @@ class DeepseekMLAForwardMixin:
                         "llama_4_scaling": llama_4_scaling,
                     }
                 # set return_lse=True to correct attn_output
-                if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+                if forward_batch.forward_mode.is_decode() and dcp_enabled():
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
                         k_nope,
@@ -601,11 +600,13 @@ class DeepseekMLAForwardMixin:
             )
 
         # correct attn_output with respect to lse from other ranks
-        if forward_batch.forward_mode.is_decode() and get_dcp_world_size() > 1:
+        if forward_batch.forward_mode.is_decode() and dcp_enabled():
             attn_output = attn_output.view(
-                -1, self.num_local_heads * get_dcp_world_size(), self.kv_lora_rank
+                -1,
+                self.num_local_heads * get_attention_dcp_world_size(),
+                self.kv_lora_rank,
             )
-            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_dcp_group())
+            attn_output = cp_lse_ag_out_rs(attn_output, lse, get_attention_dcp_group())
             attn_output = attn_output.transpose(0, 1)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
