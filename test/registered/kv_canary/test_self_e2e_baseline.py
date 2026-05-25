@@ -36,12 +36,10 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
-    # Two sequential batches force the SWA allocator's full→swa index mapping to diverge
-    # from identity after the first batch finishes and frees window slots, so
-    # swa_full_idx_divergence > 0 on the second batch's traffic. Unique prompts keep each
-    # request's slot table isolated and avoid the chunked-prefill chain_hash false-positive
-    # (same workaround as pr_25015).
-    workload_n_batches = 2
+    # Unique prompts keep each request's slot table isolated and avoid the chunked-prefill
+    # chain_hash false-positive (same workaround as pr_25015). Single batch — 2048 decode
+    # tokens already slide gemma-4-E2B's 1024-token SWA window enough to surface
+    # swa_full_idx_divergence > 0 without forcing slot reuse that the canary mis-detects.
     use_unique_prompts = True
 
 

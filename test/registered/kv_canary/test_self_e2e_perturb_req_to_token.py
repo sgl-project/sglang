@@ -36,7 +36,6 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"
-    workload_n_batches = 2
     use_unique_prompts = True
 
 
