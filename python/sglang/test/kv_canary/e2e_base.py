@@ -28,19 +28,6 @@ _UNIQUE_PROMPT_FIRST_CHARS = string.ascii_letters + string.digits
 
 
 class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
-    """E2E test base that owns the boilerplate around a launched server with
-    captured stdout/stderr:
-
-    - ``process`` / ``base_url`` / ``_stdout_buf`` / ``_stderr_buf`` ClassVars
-    - ``tearDownClass`` kills the process and closes the buffers
-    - ``_captured_log_text(side)`` concatenates the two buffers
-    - violation-log assertions inherited from ``CanaryViolationAssertMixin``
-    - ``assert_log_contains`` for free-form substring checks
-
-    Subclasses provide their own ``setUpClass`` that populates ``cls.process``,
-    ``cls._stdout_buf``, ``cls._stderr_buf``.
-    """
-
     process: ClassVar[Optional[object]] = None
     base_url: ClassVar[str] = DEFAULT_URL_FOR_TEST
     _stdout_buf: ClassVar[Optional[io.StringIO]] = None
@@ -77,17 +64,6 @@ class CapturedServerE2EBase(CanaryViolationAssertMixin, CustomTestCase):
 
 
 class CanaryE2EBase(CapturedServerE2EBase):
-    """Base for canary e2e tests. Subclasses set ``model_mode``, ``kv_canary_mode``,
-    ``extra_env``, ``extra_server_args``, ``use_unique_prompts``.
-
-    ``setUpClass`` launches the server with mode-specific args + canary env;
-    ``tearDownClass`` (inherited) kills the server.
-
-    Violation log assertions parse the stable one-line summary emitted by
-    ViolationReporter (see python/sglang/srt/kv_canary/runner/violation_reporter.py):
-        ``kv_canary violation: launch_tag=<TAG> fail_reason=<NAME[+NAME...]> ...``
-    """
-
     model_mode: ClassVar[Literal["mha", "swa"]]
     kv_canary_mode: ClassVar[CanaryMode]
     extra_env: ClassVar[dict[str, str]] = {}
@@ -117,13 +93,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            # per_forward_verify_capacity = pool_slot_count * 1.2 in
-            # CanaryLaunchCapacities, and a per-step overflow there causes the plan
-            # kernel to set enable=0 and skip verify — which makes perturb e2e tests
-            # silently lose all violation signal. Size the pool to cover the worst
-            # case sum_r prefix_lens across send_parallel_requests' default n=8 long
-            # prompts (8 * ~7000 = ~56000, → pool >= ~47k). 65536 leaves headroom
-            # and still fits Qwen3-0.6B / gemma-4-E2B KV cache on an H200.
             extra_server_args=("--max-total-tokens", "65536", *cls.extra_server_args),
         )
         cls.process = popen_launch_server(
@@ -172,15 +141,7 @@ class CanaryE2EBase(CapturedServerE2EBase):
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
-        """Assert that the SWA path was genuinely exercised: at least one
-        non-identity LUT entry (vs install-time baseline) and (when
-        require_verify_lag=True) SWA verify cumulative count strictly less than
-        FULL verify cumulative count.
-
-        Reads the latest ``kv_canary swa_divergence: ...`` line from the captured
-        server log. If no such line is present yet, sleeps flush_wait_seconds
-        and retries up to max_retries times before raising AssertionError.
-        """
+        """Assert that the SWA path was genuinely exercised."""
         last_parsed = None
         last_line: str = ""
         for _ in range(max_retries):
@@ -214,10 +175,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
 
 
 def _make_unique_prompts(n: int) -> list[str]:
-    """Each prompt has a unique high-entropy prefix so no two share a radix prefix path.
-    Used by perturb_real_kv_unused_cache tests so orphan slots actually stay orphan
-    (no future request will hit the corrupted KV). The body is the shared
-    _LONG_PROMPT_BODY so the prompt still exceeds the SWA sliding window."""
     if n > len(_UNIQUE_PROMPT_FIRST_CHARS):
         raise ValueError(
             f"unique prompt count {n} exceeds supported count "

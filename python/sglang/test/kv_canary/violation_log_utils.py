@@ -14,9 +14,6 @@ def find_violation_in_log(
     launch_tag_patterns: tuple[str, ...],
     fail_reason: str,
 ) -> bool:
-    """Return True if log_text contains a ``kv_canary violation:`` line whose
-    launch_tag matches any of launch_tag_patterns (fnmatch) and whose fail_reason
-    field contains fail_reason exactly (split on '+')."""
     for match in _VIOLATION_LINE_RE.finditer(log_text):
         tag = match.group(1)
         reason_field = match.group(2)
@@ -28,7 +25,6 @@ def find_violation_in_log(
 
 
 def assert_no_violation_in_log(log_text: str) -> None:
-    """Raise AssertionError if log_text contains any ``kv_canary violation:`` line."""
     if "kv_canary violation:" in log_text:
         raise AssertionError(
             f"Unexpected canary violation found. Log tail:\n{log_text[-2000:]}"

@@ -1,9 +1,3 @@
-"""Default args for launching a mock-model + canary test server.
-
-Mock-model mode is testing-only; the default-filling logic lives here so the
-main code (server_args) does not have to know about it.
-"""
-
 from __future__ import annotations
 
 import io

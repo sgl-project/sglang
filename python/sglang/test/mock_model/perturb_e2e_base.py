@@ -18,17 +18,6 @@ from sglang.test.test_utils import (
 
 
 class MockModelPerturbE2EBase(CapturedServerE2EBase):
-    """Base for mock-model self-test perturb e2e tests.
-
-    ``setUpClass`` launches the mock-model + canary server with subclass-provided
-    extra env / extra server args. Server lifecycle, log capture, and the generic
-    violation-log assertions are inherited from ``CapturedServerE2EBase``.
-
-    The canary mode is ``log`` (not ``raise``) so the server stays alive after
-    the first violation — clients get their responses, log keeps accumulating,
-    and the test's log-based assertions run without races.
-    """
-
     extra_env: ClassVar[dict[str, str]] = {}
     extra_server_args: ClassVar[tuple[str, ...]] = ()
 

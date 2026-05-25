@@ -13,12 +13,6 @@ _Side = Optional[Literal["prefill", "decode"]]
 
 
 class CanaryViolationAssertMixin:
-    """Canary-violation log assertions shared by single-server and PD test bases.
-
-    Subclasses implement ``_captured_log_text(side)``. For single-server bases ``side``
-    is always None; for PD bases it selects between prefill and decode captured logs.
-    """
-
     def _captured_log_text(self, side: _Side = None) -> str:
         raise NotImplementedError
 
@@ -61,12 +55,6 @@ class CanaryViolationAssertMixin:
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
-        """Wildcard-launch_tag wrapper: assert that *some* violation line with
-        the given fail_reason landed, regardless of which HEAD/TAIL/SWEEP/FULL/
-        SWA kernel produced it. Used by self-test perturb suites (mock-model)
-        that don't constrain the kernel scope. Defaults are biased towards
-        log mode, where the captured stdout buffer may not have flushed at
-        the first poll."""
         self.assert_violation_logged_any(
             launch_tag_patterns=("*",),
             fail_reason=fail_reason,
@@ -78,9 +66,6 @@ class CanaryViolationAssertMixin:
     def assert_any_launch_tag_violation_absent(
         self, *, fail_reason: str, side: _Side = None
     ) -> None:
-        """Symmetric negative of ``assert_any_launch_tag_violation_reported``:
-        no violation line with the given fail_reason may appear, regardless of
-        launch_tag."""
         self.assert_no_violation_matching(
             launch_tag_patterns=("*",), fail_reason=fail_reason, side=side
         )
@@ -94,11 +79,6 @@ class CanaryViolationAssertMixin:
         flush_wait_seconds: float = 2.0,
         max_retries: int = 1,
     ) -> None:
-        """Sleep ``flush_wait_seconds`` and check for a matching violation. With
-        ``max_retries > 1`` the sleep+check is repeated up to ``max_retries``
-        times, useful when the server is still running (log mode) and the
-        captured stdout/stderr buffer may not have flushed the violation line
-        yet at the first poll."""
         log_text = ""
         for _ in range(max_retries):
             time.sleep(flush_wait_seconds)
@@ -141,11 +121,6 @@ class CanaryViolationAssertMixin:
         fail_reason: str,
         side: _Side = None,
     ) -> None:
-        """Raise if any violation line in the captured log matches both
-        ``launch_tag_patterns`` and ``fail_reason``. Companion to
-        ``assert_violation_logged_any``: where that one says "must appear",
-        this one says "must not appear". Differs from ``assert_no_violation``
-        which rejects *any* violation regardless of launch_tag / fail_reason."""
         log_text = self._captured_log_text(side)
         if find_violation_in_log(
             log_text,

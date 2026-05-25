@@ -44,11 +44,6 @@ class FakeSwaSubPool:
 
 @dataclass
 class FakeSWAPool:
-    """Mirrors real SWAKVPool's method split: ``get_contiguous_buf_infos`` exposes the FULL
-    sub-pool, ``get_state_buf_infos`` exposes the SWA sub-pool. Combining them would force
-    canary attach to wrap one method twice, hitting :func:`wrap_method`'s idempotency guard.
-    """
-
     full_kv_pool: object
     swa_kv_pool: object
     full_to_swa_index_mapping: torch.Tensor
@@ -266,10 +261,6 @@ def make_buffer_group(
 def make_radix_cache(
     slot_lists: List[List[int]], device: torch.device = DEFAULT_DEVICE
 ):
-    """Build a real RadixCache by directly constructing TreeNodes, bypassing the heavy init path.
-
-    slot_lists[0] = root.value (usually empty), [1+] = children chained linearly.
-    """
     cache = RadixCache.__new__(RadixCache)
     cache.device = device
     cache.page_size = 1
