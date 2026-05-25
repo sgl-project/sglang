@@ -26,6 +26,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple, Union
@@ -34,6 +35,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from kv_canary.runner.canary_manager import context_tuple
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -3194,18 +3196,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
 
-        if not self.is_draft_worker and ((c := self.canary_manager) is not None):
-            canary_outside_ctx = c.with_ops_outside_graph(
-                single_forward_indices=[0],
-                maybe_inaccurate_forward_batch=forward_batch,
+        canary_ctx = (
+            context_tuple(
+                c.with_ops_outside_graph(
+                    single_forward_indices=[0],
+                    maybe_inaccurate_forward_batch=forward_batch,
+                ),
+                c.with_active_single_forward_manager(0),
             )
-            canary_index_ctx = c.with_active_single_forward_manager(0)
-        else:
-            canary_outside_ctx = canary_index_ctx = contextlib.nullcontext()
+            if not self.is_draft_worker and ((c := self.canary_manager) is not None)
+            else contextlib.nullcontext()
+        )
 
         with (
-            canary_outside_ctx,
-            canary_index_ctx,
+            canary_ctx,
             step_span_ctx,
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
