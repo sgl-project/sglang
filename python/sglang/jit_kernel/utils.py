@@ -177,7 +177,13 @@ def load_jit(
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load, load_inline
+    try:
+        from tvm_ffi.cpp import load, load_inline
+    except ImportError:
+        raise ImportError(
+            "tvm_ffi is not available. DSV4 JIT kernels require tvm_ffi to be built. "
+            "Please check the SGLang installation documentation."
+        )
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
