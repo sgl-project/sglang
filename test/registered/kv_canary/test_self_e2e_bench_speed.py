@@ -69,7 +69,7 @@ def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> Ben
         output_len=(output_len,),
         temperature=0.0,
         skip_warmup=False,
-        show_report=False,
+        show_report=True,
         dataset_name="random",
         seed=42,
     )
@@ -124,46 +124,6 @@ def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> s
 def _resolve_profile_root() -> Optional[Path]:
     raw = os.getenv(_PROFILE_DIR_ENV)
     return Path(raw).expanduser().resolve() if raw else None
-
-
-_BENCH_REPORT_FIELDS: tuple[str, ...] = (
-    "latency",
-    "input_throughput",
-    "output_throughput",
-    "overall_throughput",
-    "last_ttft",
-    "last_gen_throughput",
-    "acc_length",
-    "cache_hit_rate",
-)
-
-
-def _format_bench_report(
-    *,
-    scenario_key: str,
-    off: BenchOneCaseResult,
-    on: BenchOneCaseResult,
-    overhead_pct: float,
-) -> str:
-    header = (
-        f"[canary self-bench] {scenario_key}: "
-        f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
-    )
-    col_w = 22
-    lines = [header, f"  {'field':<{col_w}}{'off':>14}{'on':>14}"]
-    for field in _BENCH_REPORT_FIELDS:
-        off_v = getattr(off, field)
-        on_v = getattr(on, field)
-        lines.append(
-            f"  {field:<{col_w}}{_fmt_metric(off_v):>14}{_fmt_metric(on_v):>14}"
-        )
-    return "\n".join(lines)
-
-
-def _fmt_metric(value: Optional[float]) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.4f}"
 
 
 class TestCanarySelfBenchSpeed(unittest.TestCase):
@@ -248,19 +208,16 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             output_len=output_len,
         )
         overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
-        report = _format_bench_report(
-            scenario_key=scenario_key,
-            off=off,
-            on=on,
-            overhead_pct=overhead_pct,
+        summary = (
+            f"[canary self-bench] {scenario_key}: "
+            f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
         )
-        print(report, flush=True)
+        print(summary, flush=True)
         self.assertLess(
             overhead_pct,
             max_overhead_pct,
             msg=(
-                f"{scenario_key} overhead={overhead_pct:.2f}% exceeds "
-                f"{max_overhead_pct:.1f}% budget\n{report}"
+                f"{summary} — exceeds {max_overhead_pct:.1f}% budget"
             ),
         )
 
