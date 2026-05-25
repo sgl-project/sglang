@@ -9,7 +9,7 @@ import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.violation_log_utils import assert_no_violation_in_log
-from sglang.test.mock_model_utils import (
+from sglang.test.mock_model.utils import (
     MOCK_MODEL_PATH,
     mock_model_server_args,
     mock_model_server_env,

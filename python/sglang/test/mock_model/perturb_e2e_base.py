@@ -6,7 +6,7 @@ from typing import ClassVar
 
 from sglang.test.kv_canary.e2e_base import CapturedServerE2EBase
 from sglang.test.kv_canary.utils import post_parallel_generate
-from sglang.test.mock_model_utils import (
+from sglang.test.mock_model.utils import (
     MOCK_MODEL_PATH,
     mock_model_server_args,
     mock_model_server_env,
