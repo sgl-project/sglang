@@ -141,7 +141,6 @@ class TestSeedSlot:
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
 
-        # Step: pre-stamp slot 7 with a known chain link.
         seed_token, seed_position = 100, 4
         seed_prev_signed = to_signed_int64(splitmix64(consts.CANARY_CHAIN_ANCHOR))
         stamp_pair(
@@ -178,8 +177,6 @@ class TestSeedSlot:
 
     def test_seed_slot_chain_link_continuous(self) -> None:
         """After write, ``slot[0].prev_hash`` is consistent with verify's chain reconstruction from seed."""
-        # Step 1: write a chain from seed slot=7 → newly written slot=2. Then run verify with prev=7 and
-        # assert no violation — i.e., slot[2].prev_hash is the correct splitmix64-mix of seed's 4 fields.
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
@@ -212,7 +209,6 @@ class TestSeedSlot:
             assert_equal=False,
         )
 
-        # Step 2: verify slot[2] with prev=7 — expects no violation.
         verify_plan = make_verify_plan(
             slot_indices=[2], positions=[1], prev_slot_indices=[7], device=_DEVICE
         )
@@ -384,7 +380,6 @@ class TestChain:
         out_cache_loc = [0, 1, 2, 3, 4]
         real_kv_hashes = [0, 0, 0, 0, 0]
 
-        # Step 1: compute the expected stored prev_hash sequence in pure Python via splitmix64.
         expected_prev_hashes_u64: list[int] = []
         running = splitmix64(consts.CANARY_CHAIN_ANCHOR)
         for token, position, real_kv_hash in zip(tokens, positions, real_kv_hashes):
@@ -405,7 +400,6 @@ class TestChain:
             expected_input_positions=pseudo_positions,
         )
 
-        # Step 2: verify every slot's stored 4 fields match the hardcoded expected sequence.
         for slot_idx, expected_token, expected_position, expected_prev_signed in zip(
             out_cache_loc, tokens, positions, expected_prev_hashes_signed
         ):
@@ -588,7 +582,6 @@ class TestMockMode:
             num_valid_reqs=1,
             device=_DEVICE,
         )
-        # Every actual differs from expected.
         cuda_log, _ = run_write_diff(
             buf_pair=buf_pair,
             plan_pair=plan_pair,
@@ -600,7 +593,6 @@ class TestMockMode:
             expected_input_positions=_int32_tensor([999, 999, 999]),
         )
 
-        # All 3 entries should fire a violation row.
         assert int(cuda_log.write_index[0].item()) == 3
         # Run a downstream verify — it must see no chain mismatch because chain advanced on actuals.
         verify_plan = make_verify_plan(
@@ -705,7 +697,6 @@ class TestSlotHandling:
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
-        # Two entries: first writes to slot 4 normally; second has slot=-1 and must be skipped.
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 2],
             seed_slot_indices=[-1],
@@ -762,7 +753,6 @@ class TestSlotHandling:
         buf_pair = make_canary_buf_pair(
             num_slots=16, slot_stride_bytes=32, device=_DEVICE
         )
-        # Allocate plan with req_capacity=4 but only declare 1 active req.
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -781,7 +771,6 @@ class TestSlotHandling:
             expected_input_positions=pseudo_positions,
         )
 
-        # Only slot 0 should have been written; padding blocks 1..3 must not touch the buffer.
         stored_token, _, _, _ = read_slot_fields(canary_buf=buf_pair[0], slot_idx=0)
         assert stored_token == 1
         for slot_idx in (1, 2, 3):
@@ -1036,7 +1025,6 @@ class TestRealKvHash:
         fold_fn: Callable[[bytes], int],
         expected_hash: int,
     ) -> None:
-        # Step 1: build one RealKvSource with read_bytes=16 and a fixed byte pattern at slot 0.
         _PATTERN = bytes(
             [
                 0x01,
@@ -1058,7 +1046,6 @@ class TestRealKvHash:
             ]
         )
 
-        # Step 2: verify hand-computed fold matches the hex literal.
         assert fold_fn(_PATTERN) == expected_hash
 
         buf_pair = make_canary_buf_pair(
@@ -1079,7 +1066,6 @@ class TestRealKvHash:
             read_bytes=source_cuda.read_bytes,
         )
 
-        # Step 3: run write kernel on slot 0 with the given mode.
         plan_pair = make_write_plan_pair(
             write_offsets=[0, 1],
             seed_slot_indices=[-1],
@@ -1099,7 +1085,6 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
-        # Step 4: assert stored real_kv_hash equals the hand-computed hex literal.
         _, _, _, stored_real_kv_hash = read_slot_fields(
             canary_buf=buf_pair[0], slot_idx=0
         )
