@@ -381,5 +381,10 @@ class MlxAuxiliaryStateComponent(MambaComponent):
             self.cache.req_to_token_pool.free_auxiliary_state_cache(req)
         else:
             # The radix tree now owns the live auxiliary-state slot.
+            track_buffer = getattr(req, "mamba_ping_pong_track_buffer", None)
+            if track_buffer is not None:
+                self.cache.req_to_token_pool.auxiliary_state_pool.free(track_buffer)
+                req.mamba_ping_pong_track_buffer = None
+                req.mamba_next_track_idx = None
             req.mamba_pool_idx = None
         req.mamba_last_track_seqlen = None

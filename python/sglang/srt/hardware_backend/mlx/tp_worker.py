@@ -124,6 +124,14 @@ class MlxTpModelWorker(TpModelWorker):
         else:
             self._mlx_active_rids |= current_rids
 
+    def prepare_for_kv_cache_release(self, req) -> None:
+        """Snapshot MLX auxiliary state at the scheduler's radix insert point."""
+        if self._mlx_runner.has_request(req.rid):
+            self._mlx_runner.store_auxiliary_state_for_request(req.rid)
+            # Prefer the just-snapshotted live auxiliary state for the final
+            # insert. Any older tracked slot is released during component cleanup.
+            req.mamba_last_track_seqlen = None
+
     def _forward_batch_generation_mlx(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:

@@ -108,6 +108,13 @@ _MLX_QUANTIZATION_PRESETS: dict[str, tuple[int, int]] = {
     "mlx_q8": (8, 64),
 }
 _MLX_KV_FLOAT_DTYPES = {mx.float16, mx.bfloat16, mx.float32}
+_SLIDING_ATTENTION_MARKERS = (
+    "is_sliding",
+    "use_sliding",
+    "is_sliding_window",
+    "use_sliding_window",
+    "is_swa",
+)
 
 
 class MlxModelRunner:
@@ -254,6 +261,14 @@ class MlxModelRunner:
             cache,
             self._cache_layout.auxiliary_layer_indices,
         )
+
+    def store_auxiliary_state_for_request(self, req_id: str) -> None:
+        """Snapshot native auxiliary state before scheduler-owned radix insert."""
+        req_pool_idx = self._req_pool_idx.get(req_id)
+        cache = self._req_caches.get(req_id)
+        if req_pool_idx is None or cache is None:
+            return
+        self._store_auxiliary_state(req_pool_idx, cache)
 
     def _select_auxiliary_state_track_len(
         self,
@@ -452,25 +467,44 @@ class MlxModelRunner:
         load_time = time.time() - start_time
         logger.info(f"MLX model loaded in {load_time:.2f}s")
 
-    def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
-        """Return (n_kv_heads, head_dim, dtype) from the model."""
-        if self._cache_layout.num_attention_layers == 0:
-            raise RuntimeError(
-                "Cannot determine attention config: no attention module found"
-            )
-        layer_idx = self._cache_layout.first_attention_layer_index
-        sample_attn = getattr(
+    def _attention_module_for_layer(self, layer_idx: int) -> Any:
+        attn = getattr(
             self._cache_layout.layers[layer_idx],
             self._cache_layout.attention_attr(layer_idx),
         )
-        if isinstance(sample_attn, MLXAttentionWrapper):
-            sample_attn = sample_attn._inner
+        if isinstance(attn, MLXAttentionWrapper):
+            return attn._inner
+        return attn
+
+    @staticmethod
+    def _uses_sliding_window_attention(layer: Any, attn: Any) -> bool:
+        return any(
+            bool(getattr(obj, marker, False))
+            for obj in (layer, attn)
+            for marker in _SLIDING_ATTENTION_MARKERS
+        )
+
+    def _attention_kv_config_for_layer(
+        self, layer_idx: int
+    ) -> tuple[int, int, mx.Dtype]:
+        layer = self._cache_layout.layers[layer_idx]
+        sample_attn = self._attention_module_for_layer(layer_idx)
+        if self._uses_sliding_window_attention(layer, sample_attn):
+            raise NotImplementedError(
+                "MLX radix attention KV pool does not support sliding-window "
+                f"attention yet at layer {layer_idx}. Sliding-window KV needs "
+                "per-layer/window-aware pools."
+            )
         n_kv_heads = get_num_kv_heads(sample_attn)
         if n_kv_heads is None:
-            raise RuntimeError("Cannot determine n_kv_heads from attention module")
+            raise RuntimeError(
+                f"Cannot determine n_kv_heads from attention module at layer {layer_idx}"
+            )
         head_dim = get_head_dim(sample_attn)
         if head_dim is None:
-            raise RuntimeError("Cannot determine head_dim from attention module")
+            raise RuntimeError(
+                f"Cannot determine head_dim from attention module at layer {layer_idx}"
+            )
         dtype = mx.float16
         if hasattr(sample_attn, "k_proj") and hasattr(sample_attn.k_proj, "weight"):
             dtype = sample_attn.k_proj.weight.dtype
@@ -479,6 +513,27 @@ class MlxModelRunner:
             # cache stores dequantized projection outputs.
             dtype = mx.float32
         return n_kv_heads, head_dim, dtype
+
+    def _get_attn_config(self) -> tuple[int, int, mx.Dtype]:
+        """Return the uniform attention KV config used by the shared MLX pool."""
+        if self._cache_layout.num_attention_layers == 0:
+            raise RuntimeError(
+                "Cannot determine attention config: no attention module found"
+            )
+        first_layer_idx = self._cache_layout.first_attention_layer_index
+        first_config = self._attention_kv_config_for_layer(first_layer_idx)
+        for layer_idx in self._cache_layout.attention_layer_indices[1:]:
+            config = self._attention_kv_config_for_layer(layer_idx)
+            if config != first_config:
+                raise NotImplementedError(
+                    "MLX radix attention KV pool requires uniform softmax-attention "
+                    "KV shape across layers. "
+                    f"Layer {first_layer_idx} has {first_config}, "
+                    f"but layer {layer_idx} has {config}. "
+                    "Heterogeneous attention KV or sliding-window KV needs "
+                    "per-layer pools."
+                )
+        return first_config
 
     def _compute_pool_size(self, explicit_size: int | None) -> int:
         """Determine pool slot count (auto-size from available memory if needed)."""
@@ -1190,7 +1245,6 @@ class MlxModelRunner:
 
         for i, rid in enumerate(pending.req_ids):
             self._req_token_ids[rid].append(next_tokens[i])
-            self._store_auxiliary_state(self._req_pool_idx[rid], pending.caches[i])
 
         self._decode_step_ct += 1
         # TODO (changminbark): allow for flag configuration for clearing mx cache

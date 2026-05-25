@@ -40,6 +40,12 @@ if _HAS_MLX:
         MlxPendingJob,
         SchedulerMlxOverlapMixin,
     )
+    from sglang.srt.managers.scheduler_components import (
+        batch_result_processor as batch_result_processor_module,
+    )
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
+    )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -162,6 +168,40 @@ class TestMlxAttentionPatching(unittest.TestCase):
         self.assertEqual(n_kv_heads, 1)
         self.assertEqual(head_dim, 2)
         self.assertEqual(dtype, mx.float32)
+
+    def test_attn_config_rejects_heterogeneous_kv_shapes(self):
+        runner = object.__new__(MlxModelRunner)
+        first = FakeAttention()
+        second = FakeAttention()
+        second.n_kv_heads = 2
+        _set_runner_cache_layout(
+            runner,
+            num_layers=2,
+            attention_layer_indices=[0, 1],
+            attention_modules={0: first, 1: second},
+        )
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "uniform softmax-attention KV shape",
+        ):
+            MlxModelRunner._get_attn_config(runner)
+
+    def test_attn_config_rejects_sliding_window_attention(self):
+        runner = object.__new__(MlxModelRunner)
+        _set_runner_cache_layout(
+            runner,
+            num_layers=1,
+            attention_layer_indices=[0],
+            attention_modules={0: FakeAttention()},
+        )
+        runner._cache_layout.layers[0].use_sliding = True
+
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            "sliding-window attention",
+        ):
+            MlxModelRunner._get_attn_config(runner)
 
 
 @unittest.skipUnless(_HAS_MLX, _SKIP_REASON)
@@ -300,6 +340,41 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
 
         self.assertEqual(calls, [(1, [[7]])])
         self.assertEqual(pending.lazy_tokens.tolist(), [8])
+
+    def test_decode_finalize_does_not_snapshot_auxiliary_state(self):
+        runner = object.__new__(MlxModelRunner)
+        runner._req_token_ids = {"r0": [8]}
+        runner._decode_step_ct = 0
+        calls = []
+        runner._store_auxiliary_state = lambda req_pool_idx, cache: calls.append(
+            (req_pool_idx, cache)
+        )
+        pending = MlxPendingDecode(
+            lazy_tokens=mx.array([9], dtype=mx.int32),
+            req_ids=["r0"],
+            caches=[[object()]],
+        )
+
+        next_tokens = runner.decode_batch_finalize(pending)
+
+        self.assertEqual(next_tokens, [9])
+        self.assertEqual(runner._req_token_ids["r0"], [8, 9])
+        self.assertEqual(calls, [])
+
+    def test_store_auxiliary_state_for_request_snapshots_on_demand(self):
+        runner = object.__new__(MlxModelRunner)
+        cache = [object()]
+        runner._req_pool_idx = {"r0": 3}
+        runner._req_caches = {"r0": cache}
+        calls = []
+        runner._store_auxiliary_state = lambda req_pool_idx, cache_arg: calls.append(
+            (req_pool_idx, cache_arg)
+        )
+
+        runner.store_auxiliary_state_for_request("r0")
+        runner.store_auxiliary_state_for_request("missing")
+
+        self.assertEqual(calls, [(3, cache)])
 
     def test_dense_batched_attention_helper_supports_single_request(self):
         runner = object.__new__(MlxModelRunner)
@@ -816,6 +891,47 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         self.assertIsNone(req.mamba_pool_idx)
         self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
 
+    def test_auxiliary_state_component_frees_stale_track_slot_when_live_slot_inserted(
+        self,
+    ):
+        pool = MlxAuxiliaryStateReqToTokenPool(
+            size=2,
+            max_context_len=8,
+            device="cpu",
+            enable_memory_saver=False,
+            auxiliary_state_size=4,
+        )
+        req = FakeRequest()
+        pool.alloc([req])
+        req.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
+        req.mamba_next_track_idx = 0
+        component = MlxAuxiliaryStateComponent(
+            SimpleNamespace(req_to_token_pool=pool),
+            SimpleNamespace(enable_mamba_extra_buffer=False),
+        )
+        insert_params = InsertParams()
+
+        cache_len = component.prepare_for_caching_req(
+            req=req,
+            insert_params=insert_params,
+            token_ids_len=7,
+            is_finished=True,
+        )
+        component.cleanup_after_caching_req(
+            req=req,
+            is_finished=True,
+            insert_result=InsertResult(prefix_len=0, mamba_exist=False),
+            insert_params=insert_params,
+        )
+
+        self.assertEqual(cache_len, 7)
+        self.assertFalse(getattr(insert_params, "mlx_auxiliary_state_uses_track_slot"))
+        self.assertEqual(insert_params.mamba_value.tolist(), [1])
+        self.assertIsNone(req.mamba_pool_idx)
+        self.assertIsNone(req.mamba_ping_pong_track_buffer)
+        self.assertIsNone(req.mamba_next_track_idx)
+        self.assertEqual(pool.auxiliary_state_pool.available_size(), 3)
+
     def test_auxiliary_state_component_frees_duplicate_live_slot(self):
         pool = MlxAuxiliaryStateReqToTokenPool(
             size=2,
@@ -877,6 +993,74 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         self.assertTrue(torch.equal(schedule_batch.input_ids, token_ids))
         self.assertIs(scheduler.processed_batch, batch_copy)
         self.assertIs(scheduler.processed_result, scheduler.tp_worker.result)
+
+    def test_finished_request_snapshots_before_release(self):
+        events = []
+        tree_cache = object()
+        processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=None,
+            enable_overlap=False,
+            enable_overlap_mlx=False,
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_offload_kvcache=False,
+                enable_hisparse=False,
+            ),
+            model_config=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=tree_cache,
+            hisparse_coordinator=None,
+            req_to_token_pool=None,
+            decode_offload_manager=None,
+            metrics_collector=None,
+            metrics_reporter=None,
+            draft_worker=None,
+            model_worker=SimpleNamespace(
+                prepare_for_kv_cache_release=lambda req: events.append(
+                    ("prepare", req.rid)
+                )
+            ),
+            logprob_result_processor=None,
+            output_streamer=None,
+            abort_request=lambda req: None,
+        )
+        req = SimpleNamespace(
+            rid="r0",
+            finished=lambda: True,
+            multimodal_inputs=None,
+            session=None,
+            return_routed_experts=False,
+            time_stats=SimpleNamespace(
+                set_completion_time=lambda: events.append(("completion", "r0"))
+            ),
+        )
+        original_release = batch_result_processor_module.release_kv_cache
+        original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
+
+        def fake_release_kv_cache(release_req, tree_cache):
+            events.append(("release", release_req.rid))
+            self.assertIs(tree_cache, processor.tree_cache)
+
+        batch_result_processor_module.release_kv_cache = fake_release_kv_cache
+        batch_result_processor_module.get_global_indexer_capturer = lambda: None
+        try:
+            SchedulerBatchResultProcessor._handle_finished_req(
+                processor, req, 0, SimpleNamespace(customized_info=None)
+            )
+        finally:
+            batch_result_processor_module.release_kv_cache = original_release
+            batch_result_processor_module.get_global_indexer_capturer = (
+                original_get_indexer
+            )
+
+        self.assertEqual(
+            events,
+            [
+                ("prepare", "r0"),
+                ("release", "r0"),
+                ("completion", "r0"),
+            ],
+        )
 
 
 if _HAS_MLX:
