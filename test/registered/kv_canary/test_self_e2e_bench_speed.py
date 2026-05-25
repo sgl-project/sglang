@@ -148,15 +148,12 @@ def _measure_overhead(*, batch_size: int, input_len: int, output_len: int) -> No
         output_len=output_len,
     )
     overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
-    print(
+    summary = (
         f"[canary self-bench] {scenario_key}: "
-        f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%",
-        flush=True,
+        f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
     )
-    assert overhead_pct < 200.0, (
-        f"canary overhead {overhead_pct:.1f}% suspiciously high for "
-        f"{scenario_key} (off={off.latency:.4f}s, on={on.latency:.4f}s)"
-    )
+    print(summary, flush=True)
+    assert overhead_pct < 5.0, f"{summary} — exceeds 5% budget"
 
 
 class TestCanarySelfBenchSpeed(unittest.TestCase):
