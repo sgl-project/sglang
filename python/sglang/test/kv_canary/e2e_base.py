@@ -141,16 +141,28 @@ class CanaryE2EBase(CapturedServerE2EBase):
         self,
         *,
         min_swa_out_of_window_tokens: int = 1,
+        min_swa_full_idx_divergence: int = 1,
         require_verify_lag: bool = True,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
         """Assert that the SWA path was genuinely exercised.
 
-        Two complementary signals must both hold:
+        Three signals must all hold:
           - ``swa_out_of_window_tokens >= 1``: at least one prefix token has been clipped
             out of the sliding window (its SWA mapping is 0). Any prompt longer than the
             SWA window produces this — proves the SWA window slide actually ran.
+          - ``swa_full_idx_divergence >= 1``: SWA pool has actually remapped at least one
+            slot to a non-identity index (i.e. real slot reuse / eviction occurred). The
+            workload must drive SWA pool pressure for this to fire — required because the
+            "pool reuse" path is the one production hits under sustained long-context
+            traffic, and we must keep it covered.
+            NOTE: when the SWA allocator triggers slot remap, the FULL-kernel canary
+            currently fires a separate position FP — see the deep-bug note at
+            ``agent-context/.../2026-05-25-canary-swa-pool-remap-position-fp.md``.
+            Until that bug is fixed, exercising this assertion meaningfully requires
+            either fixing the FP or scoping the perturbation tests' workload so the FP
+            and the perturb's expected signal are distinguishable.
           - ``verify_swa < verify_full``: SWA verify kernel processed fewer tokens than
             FULL — proves both kernel groups ran and the window short-circuited SWA.
         """
@@ -175,6 +187,12 @@ class CanaryE2EBase(CapturedServerE2EBase):
             raise AssertionError(
                 f"SWA path not exercised: swa_out_of_window_tokens={last_parsed.swa_out_of_window_tokens} "
                 f"< min={min_swa_out_of_window_tokens}. Line: {last_line}"
+            )
+        if last_parsed.swa_full_idx_divergence < min_swa_full_idx_divergence:
+            raise AssertionError(
+                f"SWA pool reuse not exercised: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
+                f"< min={min_swa_full_idx_divergence}. The workload did not drive enough SWA pool pressure "
+                f"to force slot remap. Line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full
