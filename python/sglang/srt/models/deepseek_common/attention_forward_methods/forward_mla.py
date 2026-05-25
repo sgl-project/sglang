@@ -78,7 +78,21 @@ if _is_cuda:
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
 
-    @register_custom_op(mutates_args=["q_nope_out_buf", "attn_output_buf"])
+    # Fuses the absorb BMM (`q_nope @ w_kc`) with `unified_attention_with_output`
+    # into one eager split op. Without this, the bf16 fallback BMM was captured
+    # alone in its own single-kernel CUDA graph submodule, paying per-submodule
+    # host overhead with no fusion benefit. When this call is strictly adjacent
+    # to `dsa_indexer_pcg_dispatch` in FX, `split_graph` can place both calls in
+    # one eager submodule. That adjacency currently holds on the trtllm-FP8 DSA
+    # path where `_fuse_rope_for_trtllm_mla` skips the Python `rotary_emb` call.
+    # Gated by `_can_fuse_bmm_into_attention`.
+    # `q_nope_out_view` aliases `q_nope_out_buf` (transposed). The op writes
+    # `q_nope_out_buf` via `torch.bmm(..., out=...)` and then reads through
+    # `q_nope_out_view`, so the alias's storage is mutated too — declare it
+    # in `mutates_args` to keep the schema honest.
+    @register_custom_op(
+        mutates_args=["q_nope_out_buf", "q_nope_out_view", "attn_output_buf"]
+    )
     @register_split_op()
     def mla_bmm_then_unified_attention(
         q_nope_t: torch.Tensor,
@@ -174,6 +188,12 @@ class DeepseekMLAForwardMixin:
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
     ) -> bool:
         if not (_is_cuda and is_in_piecewise_cuda_graph()):
+            return False
+        # Keep this fusion on the same non-speculative extend PCG surface as
+        # dsa_indexer_pcg_dispatch. This path already goes through
+        # unified_attention_with_output via RadixAttention.forward, so bypassing
+        # RadixAttention does not change the backend call shape.
+        if not forward_batch.forward_mode.is_extend_without_speculative():
             return False
         if not self.use_dsa:
             return False

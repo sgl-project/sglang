@@ -611,9 +611,18 @@ class Indexer(MultiPlatformOp):
         *,
         num_tokens: Optional[int] = None,
     ) -> None:
+        # `num_tokens` selects between two mutually exclusive call shapes:
+        #   - None (non-PCG): use the full padded `key` and coerce
+        #     `forward_batch.out_cache_loc` to contiguous (legacy behavior).
+        #   - int  (PCG): slice `key` and `out_cache_loc` to the unpadded
+        #     count so padded slots are not written into the K cache. The PCG
+        #     caller passes a prefix view of its contiguous static out_cache_loc
+        #     buffer, so the legacy contiguity coercion is unnecessary there.
         key = self._get_k_bf16(x, positions, enable_dual_stream)
         out_cache_loc = None
         if num_tokens is not None:
+            assert num_tokens <= key.shape[0]
+            assert num_tokens <= forward_batch.out_cache_loc.shape[0]
             key = key[:num_tokens]
             out_cache_loc = forward_batch.out_cache_loc[:num_tokens]
         elif not forward_batch.out_cache_loc.is_contiguous():
