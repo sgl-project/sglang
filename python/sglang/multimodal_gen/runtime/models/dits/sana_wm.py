@@ -63,6 +63,7 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import get_1d_rotary_pos_embed
 
 from sglang.multimodal_gen.configs.models.dits.sana_wm import SanaWMConfig
+from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -937,6 +938,16 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         else:
             self.conv_k_cam = self.conv_q_cam = self.conv_v_cam = None
 
+        # Softmax-variant blocks (every Nth block, controlled by softmax_main)
+        # route attention through SGLang's pluggable backend (FA3 / FlashInfer /
+        # Triton / SDPA). GDN blocks compute attention via _gdn_scan_bidirectional
+        # and don't go through this path.
+        if softmax_main:
+            self.softmax_attn = LocalAttention(
+                num_heads=heads,
+                head_size=head_dim,
+            )
+
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -1025,7 +1036,8 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
         HW: Tuple[int, int, int],
         rotary_emb: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Softmax variant of the main branch (full SDPA over T*H*W).
+        """Softmax variant of the main branch, dispatched through SGLang's
+        pluggable attention backend.
 
         Returns ``(out_raw, beta, decay)`` so the cam branch can reuse the
         shared gates -- exactly like upstream
@@ -1039,14 +1051,20 @@ class BidirectionalGDNUCPESinglePathLiteLA(nn.Module):
             k = k.reshape(B, N, self.heads, self.dim)
         q = self.q_norm(q.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
         k = self.k_norm(k.reshape(B, N, C)).reshape(B, N, self.heads, self.dim)
+        # RoPE primitives are written for (B, H, N, D); LocalAttention takes
+        # (B, N, H, D). Permute for RoPE, then transpose back at the call site.
         q = q.permute(0, 2, 1, 3)  # (B, H, N, D)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
         if rotary_emb is not None:
             q = _apply_rotary_emb_bhnd(q, rotary_emb)
             k = _apply_rotary_emb_bhnd(k, rotary_emb)
-        out = F.scaled_dot_product_attention(q, k, v)
-        out = out.permute(0, 2, 1, 3).reshape(B, N, C)
+        out = self.softmax_attn(
+            q.transpose(1, 2).contiguous(),
+            k.transpose(1, 2).contiguous(),
+            v.transpose(1, 2).contiguous(),
+        )  # (B, N, H, D)
+        out = out.reshape(B, N, C)
 
         # Compute the gates anyway -- they are needed by the cam branch and
         # also exist in the softmax variant's state dict.
@@ -1163,6 +1181,13 @@ class MultiHeadCrossAttention(nn.Module):
         else:
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
+        # Cross-attention dispatched through SGLang's pluggable backend.
+        # The padding-mask path falls back to SDPA internally; the unmasked
+        # path can pick FA3 / FlashInfer / etc.
+        self.attn = LocalAttention(
+            num_heads=num_heads,
+            head_size=self.head_dim,
+        )
 
     def forward(
         self,
@@ -1175,15 +1200,14 @@ class MultiHeadCrossAttention(nn.Module):
         q = self.q_linear(x)
         kv = self.kv_linear(cond).view(B, -1, 2, D)
         k, v = kv.unbind(2)
-        q = self.q_norm(q).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # LocalAttention takes (B, N, H, D); skip the legacy BHND transpose.
+        q = self.q_norm(q).view(B, N, self.num_heads, self.head_dim)
+        k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim)
+        v = v.view(B, -1, self.num_heads, self.head_dim)
 
-        attn_mask = None
-        if mask is not None:
-            attn_mask = mask.bool()[:, None, None, :].expand(B, self.num_heads, N, mask.shape[-1])
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        out = out.transpose(1, 2).reshape(B, N, D)
+        attn_mask = mask.bool() if mask is not None else None
+        out = self.attn(q, k, v, attn_mask=attn_mask)  # (B, N, H, D)
+        out = out.reshape(B, N, D)
         return self.proj(out)
 
 
