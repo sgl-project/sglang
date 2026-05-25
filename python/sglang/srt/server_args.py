@@ -6463,7 +6463,7 @@ class ServerArgs:
             "Useful for debugging CUDA graph capture / replay issues.",
         )
 
-        # --- CUDA graph: deprecated aliases (kept for backward compat) ---
+        # --- CUDA graph related deprecated args. Remove them later. -----
         parser.add_argument(
             "--cuda-graph-max-bs",
             type=int,
