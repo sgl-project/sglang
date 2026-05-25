@@ -2089,7 +2089,7 @@ class AscendAttnBackend(AttentionBackend):
                         block_table=block_tables,
                         actual_seq_qlen=[1] * len(self.forward_metadata.seq_lens),
                         actual_seq_kvlen=actual_seq_len_kv,
-                        learnable_sinks=sinks,
+                        learnable_sink=sinks,
                     )
                     attn_out = attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
                 else:
