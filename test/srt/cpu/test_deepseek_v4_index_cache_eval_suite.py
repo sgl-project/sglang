@@ -114,6 +114,40 @@ def test_dsv4_index_cache_eval_suite_rejects_zero_repeats(tmp_path):
         )
 
 
+def test_dsv4_index_cache_eval_suite_rejects_duplicate_endpoint_labels(tmp_path):
+    output = tmp_path / "eval.json"
+
+    with pytest.raises(SystemExit, match="duplicate endpoint labels"):
+        eval_suite.parse_args(
+            [
+                "--endpoint",
+                "baseline=http://baseline-a",
+                "--endpoint",
+                "baseline=http://baseline-b",
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )
+
+
+def test_dsv4_index_cache_eval_suite_requires_baseline_endpoint_label(tmp_path):
+    output = tmp_path / "eval.json"
+
+    with pytest.raises(SystemExit, match="--baseline-label"):
+        eval_suite.parse_args(
+            [
+                "--endpoint",
+                "searched_1_2=http://searched-half",
+                "--baseline-label",
+                "baseline",
+                "--output",
+                str(output),
+                "--dry-run",
+            ]
+        )
+
+
 def test_dsv4_index_cache_eval_suite_rejects_speculative_endpoint():
     with pytest.raises(RuntimeError, match="quality eval endpoint 'searched_1_2'"):
         eval_suite.validate_server_info_for_base_path(

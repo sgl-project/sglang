@@ -418,6 +418,18 @@ def parse_args(argv: list[str] | None = None):
     args = parser.parse_args(argv)
     if args.repeats < 1:
         raise SystemExit("--repeats must be at least 1")
+    endpoint_labels = [label for label, _ in args.endpoint]
+    duplicate_labels = sorted(
+        label for label in set(endpoint_labels) if endpoint_labels.count(label) > 1
+    )
+    if duplicate_labels:
+        raise SystemExit(
+            f"duplicate endpoint labels are not allowed: {duplicate_labels}"
+        )
+    if args.baseline_label not in endpoint_labels:
+        raise SystemExit(
+            f"--baseline-label {args.baseline_label!r} must match one endpoint label"
+        )
     return args
 
 
