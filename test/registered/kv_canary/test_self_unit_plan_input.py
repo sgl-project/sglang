@@ -29,7 +29,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.device = DEFAULT_DEVICE
 
     def test_plan_input_fill_from_forward_batch_extend(self):
-        """Verify extend batches populate per-forward plan inputs."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(
@@ -52,7 +51,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.extend_seq_lens.dtype, torch.int64)
 
     def test_plan_input_fill_from_forward_batch_target_verify(self):
-        """Verify target-verify batches derive draft verification spans."""
         # TARGET_VERIFY writes spec_info.draft_token_num positions per req starting at the
         # current (un-bumped) seq_lens; extend_prefix_lens / extend_seq_lens are deliberately
         # NOT supplied because init_new does not populate them for this mode.
@@ -72,7 +70,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_plan_input_fill_from_forward_batch_draft_extend_v2(self):
-        """Verify draft-extend-v2 batches derive prefix lengths from sequence lengths."""
         # DRAFT_EXTEND_V2 has seq_lens already bumped by the per-req draft refill length;
         # extend_prefix_lens is intentionally absent (cuda-graph replay does not set it). The
         # builder must derive prefix as seq_lens - extend_seq_lens.
@@ -91,7 +88,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.extend_seq_lens[:2].tolist(), [4, 4])
 
     def test_plan_input_fill_from_forward_batch_decode(self):
-        """Verify decode batches populate one-token verification spans."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(
@@ -106,7 +102,6 @@ class TestSelfUnitPlanInput(CustomTestCase):
         self.assertEqual(plan.extend_seq_lens[:3].tolist(), [1, 1, 1])
 
     def test_plan_input_padding_dummy_sentinel(self):
-        """Verify padding sentinel rows remain valid plan input entries."""
         fb = make_forward_batch(
             self.device,
             req_pool_indices=torch.tensor(

@@ -46,10 +46,9 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
     def test_real_kv_unused_cache_perturbation_reports_sweep_real_kv_hash_violation(
         self,
     ) -> None:
-        """Verify cached unused KV perturbation is caught by sweep verification."""
-        # Step 1: first batch builds radix entries that will become orphans once finished.
+        # First batch builds radix entries that will become orphans once finished.
         self.send_parallel_requests(n=8)
-        # Step 2: second batch drives more forward passes so the sweep cadence fires
+        # Second batch drives more forward passes so the sweep cadence fires
         # while the orphan slots are still cached.
         self.send_parallel_requests(n=8)
         self.assert_sweep_violation_reported(

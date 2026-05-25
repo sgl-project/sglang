@@ -13,7 +13,6 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 class TestCanaryE2EBase(CustomTestCase):
     def test_make_unique_prompts_have_distinct_first_characters(self) -> None:
-        """Verify generated prompts use distinct first characters."""
         prompts = _make_unique_prompts(8)
 
         self.assertEqual(len({prompt[0] for prompt in prompts}), len(prompts))
@@ -22,7 +21,6 @@ class TestCanaryE2EBase(CustomTestCase):
     def test_make_unique_prompts_rejects_more_prompts_than_distinct_first_characters(
         self,
     ) -> None:
-        """Verify prompt generation rejects requests beyond the unique prefix budget."""
         with self.assertRaisesRegex(ValueError, "unique prompt count"):
             _make_unique_prompts(len(_UNIQUE_PROMPT_FIRST_CHARS) + 1)
 

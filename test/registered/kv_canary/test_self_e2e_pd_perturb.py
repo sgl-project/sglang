@@ -58,8 +58,6 @@ class _PDPerturbBase(CanaryPDFixture):
         # send_parallel_short_requests defaults to max_new_tokens=100 so D-side runs
         # decode forwards that exercise canary verify on the transferred prefix.
         self.send_parallel_short_requests(n=4)
-        # D-side: first decode forward re-verifies the transferred prefix slots,
-        # so the flip MUST surface as real_kv_hash violation.
         self.assert_per_forward_violation_reported(
             fail_reason="real_kv_hash",
             target_group=self.target_group,

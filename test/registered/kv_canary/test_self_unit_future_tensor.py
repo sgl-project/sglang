@@ -22,7 +22,6 @@ class _FakeEvent:
 
 class TestFutureTensors(CustomTestCase):
     def test_cuda_stage_then_wait_returns_host_copy(self) -> None:
-        """Verify staged CUDA tensors are copied back on wait."""
         device = torch.device("cuda")
         alt_stream = torch.cuda.Stream(device=device)
         default_stream = torch.cuda.current_stream(device)
@@ -43,7 +42,6 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(int(result_second.item()), 97)
 
     def test_cuda_pinned_when_stream_is_provided(self) -> None:
-        """Verify CUDA staging uses pinned host memory with a stream."""
         device = torch.device("cuda")
         alt_stream = torch.cuda.Stream(device=device)
         src = torch.tensor([5], dtype=torch.int32, device=device)
@@ -56,7 +54,6 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(int(future.wait().item()), 5)
 
     def test_cuda_each_call_allocates_fresh_host(self) -> None:
-        """Verify each CUDA staging call owns a fresh host buffer."""
         device = torch.device("cuda")
         alt_stream = torch.cuda.Stream(device=device)
         src_a = torch.tensor([13], dtype=torch.int32, device=device)
@@ -75,7 +72,6 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(int(future_b.wait().item()), 29)
 
     def test_dict_of_all_tensors_roundtrip(self) -> None:
-        """Verify a dict of multiple tensors round-trips entry-by-entry."""
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         src = {
@@ -91,7 +87,6 @@ class TestFutureTensors(CustomTestCase):
         self.assertTrue(out["y"].is_pinned())
 
     def test_dict_mixes_tensor_and_passthrough(self) -> None:
-        """Verify non-tensor dict entries ride through verbatim alongside staging."""
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         sentinel_obj = {"nested": [1, 2, 3]}
@@ -111,22 +106,19 @@ class TestFutureTensors(CustomTestCase):
         self.assertTrue(out["counter"].is_pinned())
 
     def test_dict_passthrough_preserves_tensor_value(self) -> None:
-        """Verify tensors share device memory but non-tensor types are not staged."""
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         src_tensor = torch.tensor([3], dtype=torch.int32, device=device)
         src = {"step": 100, "buf": src_tensor}
         future = FutureTensors.device_to_host(xs_device=src, d2h_stream=stream)
         out = future.wait()
-        # Tensor is staged to a fresh pinned-host buffer (different storage from src).
         self.assertNotEqual(out["buf"].data_ptr(), src_tensor.data_ptr())
         self.assertTrue(out["buf"].is_pinned())
-        # Non-tensor passes through with no copy.
         self.assertEqual(out["step"], 100)
         self.assertIsInstance(out["step"], int)
 
     def test_dict_without_tensor_raises(self) -> None:
-        """Verify a tensor-less dict raises (no device to anchor the d2h sync)."""
+        # No device tensor to anchor the d2h sync.
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         with self.assertRaises(ValueError):
@@ -135,7 +127,6 @@ class TestFutureTensors(CustomTestCase):
             )
 
     def test_wait_called_twice_raises(self) -> None:
-        """Verify wait() after the first drain raises (state cleared)."""
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         src = torch.tensor([3], dtype=torch.int32, device=device)
@@ -145,7 +136,6 @@ class TestFutureTensors(CustomTestCase):
             future.wait()
 
     def test_wait_clears_fields_and_rejects_second_wait(self) -> None:
-        """Verify wait() syncs the event exactly once and clears internal state."""
         tensor = torch.tensor([1, 2, 3])
         event = _FakeEvent()
         future = FutureTensors(
@@ -164,7 +154,7 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(event.synchronize_count, 1)
 
     def test_dict_anchor_picked_from_first_tensor(self) -> None:
-        """Verify staging works when the first key is a non-tensor (anchor must scan)."""
+        # Anchor must scan past leading non-tensor entries.
         device = torch.device("cuda")
         stream = torch.cuda.Stream(device=device)
         src = {

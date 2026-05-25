@@ -16,7 +16,6 @@ class _FakeObj:
 
 class TestPoolPatchUtils(CustomTestCase):
     def test_wrap_method_delegates_to_wrapper(self) -> None:
-        """Verify wrapped methods delegate through the wrapper."""
         obj = _FakeObj()
 
         def _with_validation(original, name: str) -> str:
@@ -26,7 +25,6 @@ class TestPoolPatchUtils(CustomTestCase):
         self.assertEqual(obj.greet("world"), "hello world!")
 
     def test_wrap_method_missing_method_raises_attribute_error(self) -> None:
-        """Verify wrapping a missing method raises AttributeError."""
         obj = _FakeObj()
         with self.assertRaisesRegex(AttributeError, "missing required method"):
             wrap_method(
@@ -34,14 +32,12 @@ class TestPoolPatchUtils(CustomTestCase):
             )
 
     def test_wrap_method_double_wrap_raises_runtime_error(self) -> None:
-        """Verify wrapping the same method twice raises RuntimeError."""
         obj = _FakeObj()
         wrap_method(obj, "greet", wrapper=lambda orig, *a, **kw: orig(*a, **kw))
         with self.assertRaisesRegex(RuntimeError, "already wrapped by kv-canary"):
             wrap_method(obj, "greet", wrapper=lambda orig, *a, **kw: orig(*a, **kw))
 
     def test_wrap_method_preserves_functools_wraps_metadata(self) -> None:
-        """Verify wrapping preserves method metadata."""
         obj = _FakeObj()
         original_name = obj.greet.__name__
         wrap_method(obj, "greet", wrapper=lambda orig, *a, **kw: orig(*a, **kw))

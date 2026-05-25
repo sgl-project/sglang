@@ -105,7 +105,6 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
     """PD standard scenario + canary all-on, no violation expected."""
 
     def test_pd_transfer_canary_clean(self) -> None:
-        # Step 1: send parallel requests through the LB to exercise PD transfer path.
         results = _send_parallel_requests(
             self.lb_url,
             n=_NUM_PROMPTS,
@@ -114,11 +113,9 @@ class TestPdTransferCanaryClean(_MockModelPDBase, unittest.TestCase):
             max_workers=_NUM_PROMPTS,
         )
 
-        # Step 2: every request must complete with status 200.
         for result in results:
             self.assertEqual(result.get("status_code"), 200, result)
 
-        # Step 3: servers must stay alive.
         self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
         self.assert_no_canary_violation()
@@ -144,7 +141,6 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
     )
 
     def test_pd_transfer_checksum_full_real_data(self) -> None:
-        # Step 1: drive traffic through the PD path with full real-KV hashing.
         results = _send_parallel_requests(
             self.lb_url,
             n=_NUM_PROMPTS,
@@ -153,11 +149,9 @@ class TestPdTransferChecksumFullRealData(_MockModelPDBase, unittest.TestCase):
             max_workers=_NUM_PROMPTS,
         )
 
-        # Step 2: all requests must succeed.
         for result in results:
             self.assertEqual(result.get("status_code"), 200, result)
 
-        # Step 3: servers must stay healthy.
         self.assertIsNone(self.process_prefill.poll(), "Prefill server died")
         self.assertIsNone(self.process_decode.poll(), "Decode server died")
         self.assert_no_canary_violation()
