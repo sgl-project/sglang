@@ -17,11 +17,10 @@ Not registered with CI. Run by hand from
 
 import unittest
 from test.manual.chunked_prefill.common import (
-    DEFAULT_CHUNKED_PREFILL_SIZE,
     KV_CANARY_ARGS,
     ChunkedRefactorTestBase,
 )
-from typing import ClassVar, List
+from typing import ClassVar
 
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -32,27 +31,30 @@ from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST, try_cached_model
 class TestChunkedFeatureB_Disagg(PDDisaggregationServerBase, ChunkedRefactorTestBase):
     """Disagg PD with chunked prefill on the prefill side.
 
-    Multiple inheritance: PDDisaggregationServerBase provides ``setUpClass``
-    and ``tearDownClass`` (which launch prefill/decode/LB and clean up);
-    ChunkedRefactorTestBase provides ``test_gsm8k_mixed_chunked`` and
-    ``_run_gsm8k_mixed``. The MRO puts PDDisaggregationServerBase first so
-    its setUpClass wins. We bind ``cls.base_url`` to the LB URL there
-    already.
+    Multiple inheritance: PDDisaggregationServerBase provides server launch
+    (prefill + decode + LB); ChunkedRefactorTestBase provides
+    ``test_gsm8k_mixed_chunked`` and ``_run_gsm8k_mixed``. We override
+    setUpClass to drive the disagg setup explicitly — the inherited
+    ChunkedRefactorTestBase.setUpClass is *not* called as it would try to
+    launch a single server.
     """
 
     model: ClassVar[str] = DEFAULT_MODEL_NAME_FOR_TEST
 
-    # PDDisaggregationServerBase reads these to pass per-side args.
-    extra_prefill_args: ClassVar[List[str]] = [
-        "--chunked-prefill-size",
-        str(DEFAULT_CHUNKED_PREFILL_SIZE),
-        "--disable-overlap-schedule",
-    ] + KV_CANARY_ARGS
-    extra_decode_args: ClassVar[List[str]] = list(KV_CANARY_ARGS)
-
     @classmethod
     def setUpClass(cls):
-        # Use the disagg path's setup, not ChunkedRefactorTestBase's.
+        # Compose disagg-side args here so subclasses overriding
+        # ``cls.chunked_prefill_size`` actually take effect (doing this at
+        # class-body time would freeze them at import). ``KV_CANARY_ARGS`` is
+        # re-read here so flipping that constant in common.py and re-running
+        # the suite sees the new value uniformly.
+        cls.extra_prefill_args = [
+            "--chunked-prefill-size",
+            str(cls.chunked_prefill_size),
+            "--disable-overlap-schedule",
+        ] + list(KV_CANARY_ARGS)
+        cls.extra_decode_args = list(KV_CANARY_ARGS)
+
         PDDisaggregationServerBase.setUpClass()
         cls.model = try_cached_model(DEFAULT_MODEL_NAME_FOR_TEST)
         cls.launch_all()

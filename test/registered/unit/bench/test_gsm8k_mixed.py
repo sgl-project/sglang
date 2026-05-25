@@ -54,9 +54,10 @@ class TestMixedPrefixGSM8KEval(CustomTestCase):
     def setUpClass(cls):
         cls._tmpdir = tempfile.TemporaryDirectory()
         cls._data_path = os.path.join(cls._tmpdir.name, "synthetic.jsonl")
-        # Pool = num_shots + num_shots * num_clusters + random_pool_size
-        #     = 4 + 12 + 12 = 28
-        # Plus 40 test questions => 68 total.
+        # Pool reservation = num_shots (standard) + num_shots*num_clusters
+        # (clusters) + random_pool_size = 4 + 12 + 12 = 28. We write 100
+        # records so the trailing 72 lines act as the test pool; the eval
+        # then slices it down to ``num_examples`` (40 by default below).
         _write_synthetic_dataset(cls._data_path, 100)
 
     @classmethod

@@ -176,9 +176,12 @@ class ChunkedRefactorTestBase(CustomTestCase):
         elapsed = time.perf_counter() - tic
 
         # Always log per-mode breakdown — useful when debugging which prefix
-        # pattern caused a regression.
+        # pattern caused a regression. ``score`` should always be a float
+        # (aggregate_results sets it from per-sample SingleEvalResult.score),
+        # but guard against None defensively so the print never crashes
+        # before the assertion below fires.
         print(
-            f"[{type(self).__name__}] gsm8k_mixed score={metrics.get('score'):.4f}",
+            f"[{type(self).__name__}] gsm8k_mixed score={metrics.get('score', float('nan')):.4f}",
             f"score_standard={metrics.get('score_standard', float('nan')):.4f}",
             f"score_cluster={metrics.get('score_cluster', float('nan')):.4f}",
             f"score_random={metrics.get('score_random', float('nan')):.4f}",
