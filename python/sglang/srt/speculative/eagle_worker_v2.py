@@ -197,8 +197,8 @@ class EagleDraftWorker(BaseDraftWorker):
                 )
             self.init_cuda_graphs()
 
-        if self.draft_runner.canary_runner is not None:
-            self.draft_runner.canary_runner.mark_init_finished()
+        if self.draft_runner.canary_manager is not None:
+            self.draft_runner.canary_manager.mark_init_finished()
 
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
@@ -364,7 +364,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 single_forward_indices=list(range(n_inner)),
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if (c := self.draft_runner.canary_runner) is not None
+            if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
 
@@ -464,7 +464,7 @@ class EagleDraftWorker(BaseDraftWorker):
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
 
-        canary_manager = self.draft_runner.canary_runner
+        canary_manager = self.draft_runner.canary_manager
 
         # Forward multiple steps
         scores = None
@@ -601,7 +601,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if (c := self.draft_runner.canary_runner) is not None
+            if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
         sfm_index_ctx = (
@@ -669,7 +669,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
             )
-            if (c := self.draft_runner.canary_runner) is not None
+            if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
         sfm_index_ctx = (

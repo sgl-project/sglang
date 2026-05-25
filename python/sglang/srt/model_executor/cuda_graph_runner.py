@@ -1148,7 +1148,7 @@ class CudaGraphRunner:
 
             canary_ctx = (
                 c.with_active_single_forward_manager(0)
-                if (c := self.model_runner.canary_runner) is not None
+                if (c := self.model_runner.canary_manager) is not None
                 else contextlib.nullcontext()
             )
             with canary_ctx:

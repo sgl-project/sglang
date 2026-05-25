@@ -757,7 +757,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
         # and BEFORE init_device_graphs (so the patched model.forward is what
         # ``patch_model`` yields and what runs during the warmup forward passes).
-        self.canary_runner = install_canary(
+        self.canary_manager = install_canary(
             server_args=server_args,
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
@@ -840,8 +840,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
-        if self.canary_runner is not None and not self.is_draft_worker:
-            self.canary_runner.mark_init_finished()
+        if self.canary_manager is not None and not self.is_draft_worker:
+            self.canary_manager.mark_init_finished()
 
     def adjust_hybrid_swa_layers_for_pp(self):
         if not self.is_hybrid_swa:
@@ -3193,7 +3193,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if torch.autograd._profiler_enabled()
             else contextlib.nullcontext()
         )
-        if not self.is_draft_worker and (c := self.canary_runner is not None):
+
+        if not self.is_draft_worker and (c := self.canary_manager is not None):
             canary_outside_ctx = c.with_ops_outside_graph(
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,

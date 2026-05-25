@@ -422,7 +422,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             )
             self.deepep_adapter.capture(is_extend_in_batch=True)
 
-            canary_manager = self.model_runner.canary_runner
+            canary_manager = self.model_runner.canary_manager
             canary_ctx = (
                 canary_manager.with_active_single_forward_manager(0)
                 if canary_manager is not None
