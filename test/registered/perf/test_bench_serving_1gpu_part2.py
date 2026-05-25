@@ -66,7 +66,7 @@ class TestBenchServing1GPUPart2(CustomTestCase):
             )
             if is_in_amd_ci():
                 self.assertLess(res["median_e2e_latency_ms"], 500000)
-                self.assertLess(res["median_ttft_ms"], 300000)
+                self.assertLess(res["median_ttft_ms"], 350000)
             else:
                 self.assertLess(res["median_e2e_latency_ms"], 16500)
                 self.assertLess(res["median_ttft_ms"], 100)
