@@ -255,8 +255,13 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
+        # AND across all groups' enable flags: the warner should fire when ANY group
+        # skipped verify (overflow), not just FULL group's view.
+        verify_plan_enable_combined = pre_ops_output.verify_plans[0].enable
+        for vp in pre_ops_output.verify_plans[1:]:
+            verify_plan_enable_combined = torch.minimum(verify_plan_enable_combined, vp.enable)
         self._output_buffer.copy_from(
-            verify_plan_enable=pre_ops_output.verify_plans[0].enable,
+            verify_plan_enable=verify_plan_enable_combined,
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
             violation_write_index=self._device_state.violation_log.violation_write_index,
