@@ -68,7 +68,7 @@ import requests
 url = "http://localhost:30000/v1/chat/completions"
 
 data = {
-    "model": "deepseek-ai/DeepSeek-OCR-2",
+    "model": "deepseek-ai/DeepSeek-OCR",
     "messages": [
         {
             "role": "user",
@@ -90,8 +90,6 @@ data = {
 response = requests.post(url, json=data)
 print(response.text)
 ```
-
-> Replace `deepseek-ai/DeepSeek-OCR-2` with `deepseek-ai/DeepSeek-OCR` to use the original OCR-1 model.
 
 ## 5. Benchmark
 

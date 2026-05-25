@@ -72,12 +72,10 @@ import { GLM46VDeployment } from "/src/snippets/autoregressive/glm-46v-deploymen
 - **Fast Model Loading**: For large models (like the 106B version), you can speed up model loading by using `--model-loader-extra-config='{"enable_multithread_load": "true","num_threads": 64}'`.
 - **Hardware Notes:**
   - **H100 (FP8):** Use the FP8 checkpoint for best memory efficiency.
-  - **A100 / H100 (BF16):** Use `--mm-max-concurrent-calls` to control parallel image/video processing and GPU memory usage.
+  - **A100 / H100 (BF16):** Use standard multimodal parameters to manage throughput and GPU memory usage.
   - **H200 / B200:** Runs out of the box, supporting full context length plus concurrent image + video processing.
 - **Additional Multimodal Parameters:**
   - `--mm-attention-backend fa3`: Specify multimodal attention backend (Flash Attention 3).
-  - `--mm-max-concurrent-calls <N>`: Maximum concurrent asynchronous multimodal data processing calls.
-  - `--mm-per-request-timeout <seconds>`: Per-request timeout for multimodal inputs (useful for large video inputs).
   - `--keep-mm-feature-on-device`: Retain multimodal feature tensors on GPU after processing to avoid D2H memory copies.
   - `SGLANG_USE_CUDA_IPC_TRANSPORT=1`: Use CUDA IPC shared memory for multimodal data transport to significantly improve E2E latency.
 
@@ -109,7 +107,7 @@ python -m sglang.launch_server \
 For basic API usage and request examples, please refer to:
 
 - [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
-- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_vision_api)
+- [SGLang OpenAI Vision API Guide](../../../docs/basic_usage/openai_api_vision)
 
 ### 4.2 Advanced Usage
 

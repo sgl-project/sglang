@@ -332,6 +332,36 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
+#### 4.2.3 Thinking Budget
+
+Limit the model's thinking token budget using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
+
+```shell Command
+python3 -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-R1 \
+  --tp 8 \
+  --port 30000 \
+  --reasoning-parser deepseek-r1 \
+  --enable-custom-logit-processor
+```
+
+```python Example
+import openai
+from sglang.srt.sampling.custom_logit_processor import DeepSeekR1ThinkingBudgetLogitProcessor
+
+client = openai.Client(base_url="http://127.0.0.1:30000/v1", api_key="*")
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[{"role": "user", "content": "Is Paris the Capital of France?"}],
+    max_tokens=1024,
+    extra_body={
+        "custom_logit_processor": DeepSeekR1ThinkingBudgetLogitProcessor().to_str(),
+        "custom_params": {"thinking_budget": 512},
+    },
+)
+print(response)
+```
+
 ## 5. Benchmark
 
 This section uses **industry-standard configurations** for comparable benchmark results.
