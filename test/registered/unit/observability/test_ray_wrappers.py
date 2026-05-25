@@ -241,6 +241,22 @@ class TestHistogramWrapper(TestRayWrapperBase):
         hist = self.rw.RayHistogramWrapper("sglang:ttft_seconds", "doc")
         self.assertEqual(hist.metric.boundaries, [])
 
+    def test_non_positive_boundaries_dropped(self):
+        # Ray.util.metrics rejects boundaries <= 0; sglang's queue_time and a
+        # few other histograms include 0.0 as their lowest bucket. The wrapper
+        # silently filters non-positive entries so engine startup never breaks
+        # when the Ray backend is in use.
+        hist = self.rw.RayHistogramWrapper(
+            "sglang:queue_time_seconds", "doc", buckets=[0.0, 0.001, 1.0]
+        )
+        self.assertEqual(hist.metric.boundaries, [0.001, 1.0])
+
+    def test_negative_boundaries_dropped(self):
+        hist = self.rw.RayHistogramWrapper(
+            "sglang:demo", "doc", buckets=[-1.0, 0.0, 0.5]
+        )
+        self.assertEqual(hist.metric.boundaries, [0.5])
+
 
 class TestSummaryWrapperFallback(TestRayWrapperBase):
     def test_observe_uses_default_boundaries(self):

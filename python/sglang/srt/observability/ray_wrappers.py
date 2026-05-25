@@ -47,6 +47,14 @@ except ImportError:  # pragma: no cover - covered by a dedicated test
     ray_serve = None
     Metric = None  # type: ignore[assignment]
 
+from sglang.srt.observability.metrics_collector import (
+    ExpertDispatchCollector,
+    RadixCacheMetricsCollector,
+    SchedulerMetricsCollector,
+    StorageMetricsCollector,
+    TokenizerMetricsCollector,
+)
+
 
 def _get_replica_id() -> Optional[str]:
     """Return the current Ray Serve replica ID, or ``None`` outside Serve."""
@@ -112,6 +120,16 @@ class RayPrometheusMetric:
         clone._tags = self._build_tags(*labels, **labelskwargs)
         clone._is_labeled = True
         return clone
+
+    @staticmethod
+    def _coerce_positive_boundaries(buckets):
+        # Ray (gRPC OpenCensus / OpenTelemetry export) rejects boundaries
+        # <= 0. sglang ships several histograms whose lowest bucket is 0.0
+        # (e.g. queue_time, e2e latency). Silently drop those so we never
+        # break engine startup when the metrics backend is Ray.
+        if not buckets:
+            return []
+        return [b for b in buckets if b > 0]
 
     @staticmethod
     def _get_sanitized_opentelemetry_name(name: str) -> str:
@@ -196,7 +214,7 @@ class RayHistogramWrapper(RayPrometheusMetric):
             name=name,
             description=documentation,
             tag_keys=tag_keys,
-            boundaries=list(buckets) if buckets else [],
+            boundaries=self._coerce_positive_boundaries(buckets),
         )
 
     def observe(self, value: float) -> None:
@@ -238,7 +256,7 @@ class RaySummaryWrapper(RayPrometheusMetric):
             name=name,
             description=documentation,
             tag_keys=tag_keys,
-            boundaries=list(self.DEFAULT_BOUNDARIES),
+            boundaries=self._coerce_positive_boundaries(self.DEFAULT_BOUNDARIES),
         )
 
     def observe(self, value: float) -> None:
@@ -251,14 +269,6 @@ class RaySummaryWrapper(RayPrometheusMetric):
 # Each subclass only overrides the ``_xxx_cls`` attributes its parent actually
 # uses; the parent's ``_StatLoggerDIMixin`` defaults handle the rest.
 # ---------------------------------------------------------------------------
-
-from sglang.srt.observability.metrics_collector import (
-    ExpertDispatchCollector,
-    RadixCacheMetricsCollector,
-    SchedulerMetricsCollector,
-    StorageMetricsCollector,
-    TokenizerMetricsCollector,
-)
 
 
 class RaySchedulerMetricsCollector(SchedulerMetricsCollector):
