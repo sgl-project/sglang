@@ -69,7 +69,7 @@ if _is_cpu and _is_cpu_amx_available:
 
         image_preprocess_cpu = torch.ops.sgl_kernel.image_preprocess_cpu
 
-        def hacked_preprocess(
+        def fast_preprocess_cpu(
             self,
             images: list["torch.Tensor"],
             do_resize: bool,
@@ -111,7 +111,7 @@ if _is_cpu and _is_cpu_amx_available:
             )
 
         transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
-            hacked_preprocess
+            fast_preprocess_cpu
         )
     except Exception as e:
         logger.warning(
