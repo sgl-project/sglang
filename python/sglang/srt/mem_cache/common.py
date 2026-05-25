@@ -491,13 +491,6 @@ def alloc_for_extend(
         batch.req_to_token_pool,
     )
 
-    # Legacy DSV4 c-page allocator (in-pool free-list, see commit 8c1e87b).
-    # Replaced by DSV4NPUTokenToKVPoolAllocator + DSV4NPUReqToTokenPool on
-    # NPU; on the new path this call is a no-op (subclass override).
-    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
-        req_pool_indices_cpu, batch.seq_lens_cpu,
-    )
-
     # DSV4-NPU hook: stash bundled per-pool slots on batch.out_cache_loc_dsv4
     # and write the c4/c128/swa per-req tables. No-op on non-DSV4 paths
     # (gated by `hasattr(allocator, 'get_last_dsv4_alloc')`).
@@ -584,11 +577,6 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )
 
-    # Legacy DSV4 c-page allocator hook (see alloc_for_extend comment).
-    batch.tree_cache.token_to_kv_pool_allocator.get_kvcache().alloc_c_pages_for_batch(
-        batch.req_pool_indices.cpu(), batch.seq_lens_cpu + token_per_req,
-    )
-
     # DSV4-NPU hook: post-decode write of per-req c4/c128/swa tables and
     # stash bundled slots on batch.out_cache_loc_dsv4. No-op on non-DSV4.
     if _is_npu:
@@ -658,10 +646,6 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
-    # Free per-req auxiliary pages (no-op for non-DSV4 pools). Must happen
-    # before the req_pool_idx slot itself is released, so the same slot can
-    # be re-admitted with a clean c-page table.
-    tree_cache.token_to_kv_pool_allocator.get_kvcache().free_c_pages(req.req_pool_idx)
     tree_cache.req_to_token_pool.free(req)
 
 

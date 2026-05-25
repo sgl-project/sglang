@@ -635,13 +635,6 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.full_to_swa_index_mapping[:-1].fill_(0)
         self.is_not_in_free_group = True
         self.free_group = []
-        # Reset per-req c-page tables in DSV4 pool (no-op elsewhere).
-        # __init__ calls self.clear() before assigning self._kvcache (line 375
-        # vs line 376), so guard against the early call; the kvcache that
-        # __init__ later attaches has a fresh state anyway.
-        kvcache = getattr(self, "_kvcache", None)
-        if kvcache is not None:
-            kvcache.clear_c_pages()
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

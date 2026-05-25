@@ -712,18 +712,21 @@ class Compressor(nn.Module):
             rope_slice.copy_(rope_rot.view_as(rope_slice))
             if self.rotate:
                 kv_out = _apply_hadamard(kv_out, self.hadamard_matrix)
-            # Slab → c{N}_kv_pool slot for each compressed token.
+            # c{N}_kv_pool slot for each compressed token. The per-req
+            # token-level slot id table on DSV4NPUReqToTokenPool is indexed
+            # directly by compressed-seq position — no page table indirection
+            # needed since the table elements already are c-pool slot ids.
             req_indices_flat = torch.cat(write_req_indices, dim=0)
             pos_in_req_flat = torch.cat(write_pos_in_req, dim=0)
             req_pool_flat = forward_batch.req_pool_indices[req_indices_flat]
-            kernel_page_size = forward_batch.attn_backend.page_size
-            page_seq = pos_in_req_flat // kernel_page_size
-            offset = pos_in_req_flat % kernel_page_size
-            pages_table = token_to_kv_pool.get_req_to_token_c_pages(ratio)
-            kernel_page = pages_table[req_pool_flat.to(torch.int64), page_seq]
-            write_locs = (kernel_page.to(torch.int64) * kernel_page_size + offset).to(
-                torch.int32
+            c_table = (
+                forward_batch.req_to_token_pool.req_to_token_c4
+                if ratio == 4
+                else forward_batch.req_to_token_pool.req_to_token_c128
             )
+            write_locs = c_table[
+                req_pool_flat.to(torch.int64), pos_in_req_flat.to(torch.int64)
+            ].to(torch.int32)
             self._compressor_epilog_npu(kv_out, forward_batch, override_loc=write_locs)
         return None
 

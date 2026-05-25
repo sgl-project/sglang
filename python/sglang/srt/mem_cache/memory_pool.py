@@ -781,22 +781,6 @@ class KVCache(abc.ABC):
     def maybe_get_custom_mem_pool(self):
         return self.custom_mem_pool
 
-    # Hooks for pools that maintain per-req auxiliary page tables alongside
-    # the raw KV pool (e.g. DeepSeek-V4 c4/c128 compressed-state pages).
-    # Default no-ops so generic alloc/free paths can call them unconditionally.
-    def alloc_c_pages_for_batch(
-        self,
-        req_pool_indices_cpu: torch.Tensor,
-        seq_lens_cpu: torch.Tensor,
-    ) -> None:
-        pass
-
-    def free_c_pages(self, req_pool_idx: int) -> None:
-        pass
-
-    def clear_c_pages(self) -> None:
-        pass
-
 
 class MHATokenToKVPool(KVCache):
 

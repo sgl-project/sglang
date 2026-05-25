@@ -278,11 +278,13 @@ class DSV4NPUTokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.c128_attn_allocator.available_size()
 
     def free(self, free_index: torch.Tensor):
-        # Free full + swa via the parent; c4/c128 pools are freed on
-        # release_kv_cache (via the per-req tables, see future D8 hook).
-        # For now we conservatively skip c-pool free here — c-pool capacity
-        # is sized for the worst case so memory pressure is unlikely.
-        # TODO: wire per-req c4/c128 free via DSV4NPUReqToTokenPool slices.
+        # Free full + swa via the parent. c4/c128 pool pages are NOT
+        # released here — the per-req c-pool slot list is sliced from
+        # DSV4NPUReqToTokenPool.req_to_token_c{4,128} by req_pool_idx +
+        # committed compressed-len, but we don't currently track committed
+        # len per req at free time. Pages leak until the next clear().
+        # TODO: read req's compressed len, slice the c-table, and call
+        # c{4,128}_attn_allocator.free(unique_slot_ids // page_size).
         super().free(free_index)
 
     def clear(self):

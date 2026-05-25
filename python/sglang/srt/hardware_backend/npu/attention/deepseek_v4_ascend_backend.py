@@ -762,31 +762,27 @@ class DeepseekV4AscendAttnBackend(
         is_decode: bool,
         bs: int,
         device: torch.device,
-        req_to_token_pool=None,
-        out_cache_loc_dsv4=None,
+        req_to_token_pool,
+        out_cache_loc_dsv4,
     ) -> dict:
         """Pure compress-loc computation shared by eager and graph-replay paths.
 
-        Two source paths for the c{ratio}_page_table and c{ratio}_loc fields:
+        Sources for the c{ratio}_page_table / c{ratio}_loc fields:
 
-          * **New path** (D2-D5 refactor): when ``req_to_token_pool`` is a
-            :class:`DSV4NPUReqToTokenPool` (has ``req_to_token_c4`` /
-            ``req_to_token_c128`` tables) and ``out_cache_loc_dsv4`` is a
-            populated :class:`DSV4OutCacheLoc`, page tables are sliced from
-            the per-req tables and converted to page ids via
-            ``// page_size``; c{ratio}_loc comes straight from the bundle.
-            This replaces the legacy in-pool free-list page allocator (see
-            commit ``8c1e87b``) with the upstream-aligned design.
+          * ``c{ratio}_page_table`` is sliced from
+            ``req_to_token_pool.req_to_token_c{4,128}`` (token-level c-pool
+            slot ids), then ``[:, :: page_size] // page_size`` converts to
+            page ids. This is the iforgetmyname/sglang dsv4_release pattern.
+          * ``c{ratio}_loc`` (decode only) comes straight from the
+            :class:`DSV4OutCacheLoc` bundle that
+            :class:`DSV4NPUTokenToKVPoolAllocator` produced during alloc.
 
-          * **Legacy path**: when the new tables aren't available, fall
-            back to ``pool.get_req_to_token_c_pages(ratio)`` and the
-            ``k_seq = seqlen // ratio - 1`` write-slot derivation that
-            depended on per-req c-page allocation inside the V4 KV pool.
+        State page tables / state_loc are derived on the fly via
+        ``pool.translate_kv_loc_to_compress_state_loc``; the state pool is
+        not allocated through ``DSV4NPUTokenToKVPoolAllocator`` (state ring
+        buffer is managed inside the V4 KV pool).
 
-        State page tables / state_loc always go through the legacy
-        ``translate_kv_loc_to_compress_state_loc`` derivation — the state
-        pool is not yet covered by the new allocator. Returns dict keys:
-
+        Returns dict keys:
           - c{ratio}_state_page_table  (always present for ratio in {4,128})
           - c{ratio}_state_loc         (decode only)
           - c{ratio}_loc               (decode only)
@@ -801,13 +797,6 @@ class DeepseekV4AscendAttnBackend(
 
         seq_lens_max = int(seq_lens.max().item()) if bs > 0 else 0
         n_pages = max(1, (seq_lens_max + self.page_size - 1) // self.page_size)
-
-        # Did the D2-D5 path wire up new per-req tables + bundled alloc loc?
-        use_new_tables = (
-            req_to_token_pool is not None
-            and hasattr(req_to_token_pool, "req_to_token_c4")
-            and hasattr(req_to_token_pool, "req_to_token_c128")
-        )
 
         # State page tables — for each request, for each page, the state-buffer
         # page index. Use the FIRST token of each page as the representative
@@ -827,9 +816,8 @@ class DeepseekV4AscendAttnBackend(
             if ratio not in (4, 128):
                 continue
             # State page table — translate each (bs, n_pages) raw kv slot to a
-            # state-buffer page id. State pool stays on the legacy derivation
-            # since the new allocator (D3-D5) doesn't allocate state slots
-            # explicitly — the ring buffer is managed inside the V4 pool.
+            # state-buffer page id. translate_kv_loc_to_compress_state_loc gives
+            # the flat state slot; divide by page_size for the page id.
             state_loc_2d = pool.translate_kv_loc_to_compress_state_loc(raw_loc, ratio)
             state_page_2d = (state_loc_2d // self.page_size).to(torch.int32)
 
@@ -837,51 +825,27 @@ class DeepseekV4AscendAttnBackend(
                 state_loc_decode = pool.translate_kv_loc_to_compress_state_loc(
                     out_cache_loc, ratio
                 )
-                if use_new_tables and out_cache_loc_dsv4 is not None:
-                    # New path: c{ratio}_loc is the slot id the allocator
-                    # handed out in alloc_decode, already stashed on the
-                    # bundle. No should_compress gating needed — the
-                    # allocator only allocates a slot when this token closes
-                    # a ratio chunk (empty tensor otherwise, see
-                    # DSV4NPUTokenToKVPoolAllocator.alloc_decode).
-                    bundle_loc = (
-                        out_cache_loc_dsv4.out_c4_loc
-                        if ratio == 4
-                        else out_cache_loc_dsv4.out_c128_loc
-                    )
-                    # The kernel still expects a [bs]-shaped tensor (with
-                    # 0 padding for non-compressing reqs); pad to [bs] here.
-                    should_compress = (seq_lens % ratio) == 0
-                    compress_out_loc = torch.zeros(
-                        bs, dtype=torch.int32, device=device,
-                    )
-                    if bundle_loc.numel() > 0:
-                        # bundle_loc has one entry per compressing req in
-                        # batch order; scatter into the [bs]-padded buffer.
-                        idx = torch.nonzero(should_compress, as_tuple=False).flatten()
-                        n_compress = idx.numel()
-                        if n_compress > 0:
-                            compress_out_loc[idx] = (
-                                bundle_loc[:n_compress].to(torch.int32)
-                            )
-                else:
-                    # Legacy path: derive write slot via in-pool c-page table.
-                    pages_table = pool.get_req_to_token_c_pages(ratio)
-                    should_compress = (seq_lens % ratio) == 0
-                    k_seq = (seq_lens.to(torch.int64) // ratio - 1).clamp(min=0)
-                    page_seq = (k_seq // self.page_size).to(torch.int64)
-                    offset = (k_seq % self.page_size).to(torch.int64)
-                    kernel_page = pages_table[
-                        req_pool.to(torch.int64), page_seq
-                    ].to(torch.int64)
-                    compress_out_loc = (
-                        kernel_page * self.page_size + offset
-                    ).to(torch.int32)
-                    compress_out_loc = torch.where(
-                        should_compress,
-                        compress_out_loc,
-                        torch.zeros_like(compress_out_loc),
-                    )
+                # c{ratio}_loc comes from the DSV4OutCacheLoc bundle the
+                # allocator stashed in alloc_decode. The kernel expects a
+                # [bs]-shaped tensor (0 padding for non-compressing reqs);
+                # the allocator only emits slots for reqs that closed a ratio
+                # chunk, so we scatter into a [bs]-padded buffer here.
+                bundle_loc = (
+                    out_cache_loc_dsv4.out_c4_loc
+                    if ratio == 4
+                    else out_cache_loc_dsv4.out_c128_loc
+                )
+                should_compress = (seq_lens % ratio) == 0
+                compress_out_loc = torch.zeros(
+                    bs, dtype=torch.int32, device=device,
+                )
+                if bundle_loc.numel() > 0:
+                    idx = torch.nonzero(should_compress, as_tuple=False).flatten()
+                    n_compress = idx.numel()
+                    if n_compress > 0:
+                        compress_out_loc[idx] = (
+                            bundle_loc[:n_compress].to(torch.int32)
+                        )
 
             result[f"c{ratio}_state_page_table"] = state_page_2d
             if is_decode:
@@ -889,34 +853,20 @@ class DeepseekV4AscendAttnBackend(
                 result[f"c{ratio}_loc"] = compress_out_loc
 
             # c{ratio}_page_table — kernel-view page table for c{N}_kv_pool.
-            if use_new_tables:
-                # New path: slice req_to_token_c{ratio} (token-level slot
-                # ids), take one slot per page (`::page_size`), convert to
-                # page id via `// page_size`. This is the
-                # iforgetmyname/sglang dsv4_release pattern.
-                c_table = (
-                    req_to_token_pool.req_to_token_c4
-                    if ratio == 4
-                    else req_to_token_pool.req_to_token_c128
-                )
-                # Per-req column count: one compressed token per `ratio` raw
-                # tokens. Cap by the table's actual width to avoid OOB on
-                # short max_context_len configs.
-                n_c_tokens = max(1, seq_lens_max // ratio)
-                n_c_tokens = min(n_c_tokens, c_table.shape[1])
-                # [bs, n_c_tokens] slot ids → [bs, n_pages_c] page ids.
-                slots = c_table[req_pool.to(torch.int64), :n_c_tokens]
-                c_page_table = (
-                    slots[:, :: self.page_size] // self.page_size
-                ).to(torch.int32)
-            else:
-                # Legacy path: read in-pool per-req c-page table directly.
-                pages_table = pool.get_req_to_token_c_pages(ratio)
-                n_pages_c = (n_pages + ratio - 1) // ratio
-                n_pages_c = max(1, min(n_pages_c, pages_table.shape[1]))
-                c_page_table = pages_table[req_pool.to(torch.int64), :n_pages_c].to(
-                    torch.int32
-                )
+            # Slice req_to_token_c{ratio} (token-level c-pool slot ids), take
+            # one slot per page (`::page_size`), convert to page id via
+            # `// page_size`. iforgetmyname/sglang dsv4_release pattern.
+            c_table = (
+                req_to_token_pool.req_to_token_c4
+                if ratio == 4
+                else req_to_token_pool.req_to_token_c128
+            )
+            n_c_tokens = max(1, seq_lens_max // ratio)
+            n_c_tokens = min(n_c_tokens, c_table.shape[1])
+            slots = c_table[req_pool.to(torch.int64), :n_c_tokens]
+            c_page_table = (
+                slots[:, :: self.page_size] // self.page_size
+            ).to(torch.int32)
             result[f"c{ratio}_page_table"] = c_page_table
 
         return result
