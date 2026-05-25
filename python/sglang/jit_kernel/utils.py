@@ -177,7 +177,13 @@ def load_jit(
     :rtype: Module
     """
 
-    from tvm_ffi.cpp import load, load_inline
+    try:
+        from tvm_ffi.cpp import load, load_inline
+    except ImportError:
+        raise ImportError(
+            "tvm_ffi is not available. DSV4 JIT kernels require tvm_ffi to be built. "
+            "Please check the SGLang installation documentation."
+        )
 
     cpp_files = cpp_files or []
     cuda_files = cuda_files or []
@@ -277,18 +283,7 @@ def _jit_compile_context():
 # NOTE: this might also be used in __main__.py for compile flags export
 def _get_default_target_flags() -> List[str]:
     if is_hip_runtime():
-        flags = ["-DUSE_ROCM", "-std=c++20", "-O3"]
-        # Detect FP8 type based on GPU architecture
-        try:
-            device = torch.cuda.current_device()
-            gcn_arch = torch.cuda.get_device_properties(device).gcnArchName
-            if "gfx942" in gcn_arch:
-                flags.append("-DHIP_FP8_TYPE_FNUZ=1")
-            else:
-                flags.append("-DHIP_FP8_TYPE_E4M3=1")
-        except Exception:
-            flags.append("-DHIP_FP8_TYPE_E4M3=1")
-        return flags
+        return ["-DUSE_ROCM", "-std=c++20", "-O3"]
     else:
         return [
             get_jit_cuda_arch().jit_flag,
