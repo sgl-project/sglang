@@ -20,7 +20,10 @@ class _BaselineBase(CanaryE2EBase):
 
     def test_no_violation(self) -> None:
         """Verify the baseline canary run completes without violations."""
-        self.send_parallel_requests()
+        self.send_parallel_requests(
+            n=self.workload_n_requests,
+            max_concurrent=self.workload_max_concurrent,
+        )
         self.assert_no_violation(wait_seconds=2.0)
         self.maybe_assert_swa_divergence_observed()
 
@@ -35,6 +38,12 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
+    # Tight SWA pool (≈19K slots) forces window reorganization across sequential batches
+    # so swa_full_idx_divergence > 0. Concurrency 4 keeps SWA in-flight footprint below
+    # the pool cap; 16 sequential requests cycle the pool enough to surface divergence.
+    extra_server_args = ("--swa-full-tokens-ratio", "0.3")
+    workload_n_requests = 16
+    workload_max_concurrent = 4
 
 
 if __name__ == "__main__":
