@@ -680,9 +680,13 @@ class KimiK25ForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).to(
             device=device, dtype=target_dtype
         )
-        grid_thws = torch.concat([item.image_grid_thw for item in items], dim=0).to(
-            device
-        )
+        image_grid_thws = []
+        for item in items:
+            grid_thw = item.model_specific_data.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = item.model_specific_data["grid_thws"]
+            image_grid_thws.append(grid_thw)
+        grid_thws = torch.concat(image_grid_thws, dim=0).to(device)
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
