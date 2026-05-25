@@ -31,7 +31,7 @@ class TestTritonMLAAttentionBackendCorrectness(CustomTestCase):
         ),
     )
 
-    def test_projected_mla_attention_cases(self):
+    def test_tiny_deepseek_mla_attention_cases(self):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_mla_attention_case(self, case)

@@ -13,10 +13,11 @@ Implemented:
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
-  `test/manual/attention/unittest/mla/` for `triton`; its actual path follows a
-  small DeepSeek absorb-MLA variant (`q -> w_kc`, latent KV cache,
-  `attn_mqa`, `w_vc -> o_proj`) while its expected path is pure PyTorch dense
-  attention over the same latent KV tensors.
+  `test/manual/attention/unittest/mla/` for `triton`; its actual path now uses a
+  small DeepSeek-shaped absorb-MLA module that explicitly writes latent KV through
+  `get_token_to_kv_pool()` before calling `attn_mqa`, while its expected path is a
+  separate HF-style PyTorch reference module with copied random weights and no
+  `RadixAttention` or backend calls.
 - GDN hybrid-linear attention backend correctness exists under
   `test/manual/attention/unittest/gdn/` for full-attention backend `triton` with
   linear-attention kernel backend `triton`; its expected path is now a pure
@@ -39,19 +40,28 @@ Implemented:
   `triton` and `flashinfer`; `triton` also covers prefix lengths below/equal/above
   the window. Prefix+SWA for FlashInfer needs a more faithful metadata fixture
   before enabling.
-- The harness uses a small projected attention module with random shared weights,
-  real `ForwardBatch` metadata, real KV/request pools, and a dense PyTorch
-  reference.
+- The harness uses random shared weights, real `ForwardBatch` metadata, and real
+  KV/request pools. Reference implementations must be independent HF-style
+  PyTorch modules or functions; they may receive copied weights from the actual
+  module, but must not call SGLang attention modules, SGLang backend wrappers, or
+  SGLang kernel helpers.
 - RoPE is intentionally omitted from the current unit-level runner x attention
   tests. These tests feed post-RoPE-equivalent Q/K tensors because rotary math is
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- No active dense/SWA/MLA/GDN representative Phase 3 work remains. The next
-  implementation slice should add the remaining MLA-specialized backends or a new
-  attention method.
+- Audit remaining dense/SWA/GDN helpers against the stricter reference rule. MLA
+  has been converted first because the old helper was the most misleading: it
+  shared the MLA preparation path and did not explicitly exercise the model-level
+  KV-pool write/read contract.
 
 Next implementation steps:
+- Split dense and SWA references into standalone HF-style modules/functions with
+  explicit weight copies instead of reusing actual-module projection helpers.
+- Decide whether the MLA actual target should move from the current tiny
+  DeepSeek-shaped module to direct instantiation of `DeepseekV2AttentionMLA`; that
+  stricter target requires more global server-args/config scaffolding but would
+  exercise dispatch decisions from `forward_mla.py` directly.
 - Add `mla/test_<attn_backend>.py` files for `flashinfer`, `flashmla`, and
   `trtllm_mla`.
 - Add separate method folders for sparse/chunked KV, linear attention, Mamba, and
@@ -61,34 +71,10 @@ Next implementation steps:
 - Keep `torch_native` SWA out of the matrix until the backend honors
   `RadixAttention.sliding_window_size`.
 
-Verified:
-- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
-- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
-- `python test/manual/attention/unittest/dense/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
-- `python test/manual/attention/unittest/swa/test_triton.py -v`
-- `python test/manual/attention/unittest/swa/test_flashinfer.py -v`
-- `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
-- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
-- `python test/manual/attention/unittest/dense/test_torch_native.py -v`
-- `python test/manual/attention/unittest/dense/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-- `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py`
-- `python test/manual/attention/unittest/dense/test_triton.py -v`
-- `python test/manual/attention/unittest/dense/test_flashinfer.py -v`
-- `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
-- `python test/manual/attention/unittest/mla/test_triton.py -v`
-- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
-- `python test/manual/attention/unittest/gdn/test_triton.py -v`
+Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
-- `python -m py_compile test/manual/attention/unittest/common/gdn_attention.py test/manual/attention/unittest/gdn/test_triton.py`
-- `python test/manual/attention/unittest/gdn/test_triton.py -v`
 
 ---
 
@@ -195,18 +181,25 @@ Recommended targets:
 
 ### Reference implementations
 
-Use a reference at the same module boundary whenever practical. No checkpoint
-download is required: configs are hardcoded, and weights are random but shared between
-the SGLang module and the reference.
+Use an independent reference at the same module boundary whenever practical. No
+checkpoint download is required: configs are hardcoded, and weights are random but
+copied from the SGLang module into the reference.
+
+Rule: correctness tests must not compare one SGLang/backend implementation against
+another SGLang/backend implementation. The expected path may share tensors by
+explicit copy, but it must not call `RadixAttention`, `RadixLinearAttention`,
+attention backend wrappers, Triton/FlashInfer/FLA kernels, or SGLang helper methods
+that encode backend-specific attention behavior.
 
 Reference strategy by family:
 - MHA/GQA/SWA: explicit PyTorch reference using dense Q/K/V after the same random
   projections and RoPE as the SGLang module. Use `F.scaled_dot_product_attention`
   with causal or sliding-window masks.
 - MLA: explicit DeepSeek MLA math or a minimal HF-compatible attention module with
-  the same random projection/compression weights. The actual path should mirror
+  copied random projection/compression weights. The actual path should mirror
   `deepseek_common/attention_forward_methods/forward_mla.py` closely enough to
-  exercise `q_nope -> w_kc`, latent KV cache, `attn_mqa`, and `w_vc`.
+  exercise `q_nope -> w_kc`, latent KV cache writes through
+  `get_token_to_kv_pool()`, `attn_mqa`, and `w_vc`.
 - DSA/DSV4: model-family reference that builds the equivalent sparse or compressed
   attention mask/index result, then compares the final module output.
 - Linear KDA/Lightning/GDN and Mamba: compact PyTorch implementations whenever

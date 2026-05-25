@@ -12,7 +12,11 @@ from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_context import (
+    ForwardContext,
+    forward_context,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 _dp_attention.get_attention_tp_size = lambda: 1
@@ -220,7 +224,7 @@ class MockMLAModelRunner(ModelRunner):
         return None
 
 
-class ProjectedMLAAttention(nn.Module):
+class TinyDeepseekMLAAttention(nn.Module):
     def __init__(
         self,
         *,
@@ -235,6 +239,7 @@ class ProjectedMLAAttention(nn.Module):
         self.num_heads = num_heads
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = kv_lora_rank
+        self.qk_rope_head_dim = 0
         self.v_head_dim = kv_lora_rank
         self.rms_norm_eps = 1e-6
         self.q_proj = nn.Linear(
@@ -281,7 +286,7 @@ class ProjectedMLAAttention(nn.Module):
             dtype=dtype,
             device=device,
         )
-        self.attn = RadixAttention(
+        self.attn_mqa = RadixAttention(
             num_heads=num_heads,
             head_dim=kv_lora_rank,
             scaling=kv_lora_rank**-0.5,
@@ -297,17 +302,47 @@ class ProjectedMLAAttention(nn.Module):
             dtype=self.kv_a_layernorm_weight.dtype
         )
 
-    def prepare_mla(self, hidden_states: torch.Tensor):
+    def forward_absorb_prepare(self, hidden_states: torch.Tensor):
         q_nope = self.q_proj(hidden_states).view(
             -1, self.num_heads, self.qk_nope_head_dim
         )
         k_nope = self._rms_norm(self.kv_a_proj(hidden_states)).unsqueeze(1)
         q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
-        return q_nope_out, k_nope
+        k_rope = k_nope.new_empty(k_nope.shape[:-1] + (self.qk_rope_head_dim,))
+        return q_nope_out, k_nope, k_rope
+
+    def write_kv_cache(
+        self,
+        cache_locs: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+    ):
+        token_to_kv_pool = get_token_to_kv_pool()
+        if self.qk_rope_head_dim:
+            token_to_kv_pool.set_mla_kv_buffer(
+                self.attn_mqa,
+                cache_locs,
+                k_nope,
+                k_rope,
+            )
+        else:
+            token_to_kv_pool.set_kv_buffer(
+                self.attn_mqa,
+                cache_locs,
+                k_nope,
+                k_nope,
+            )
 
     def forward(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
-        q_nope_out, k_nope = self.prepare_mla(hidden_states)
-        attn_output = self.attn(q_nope_out.flatten(1, 2), k_nope, k_nope, forward_batch)
+        q_nope_out, k_nope, k_rope = self.forward_absorb_prepare(hidden_states)
+        self.write_kv_cache(forward_batch.out_cache_loc, k_nope, k_rope)
+        attn_output = self.attn_mqa(
+            q_nope_out.flatten(1, 2),
+            None,
+            None,
+            forward_batch,
+            save_kv_cache=False,
+        )
         attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
         attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc).transpose(
             0, 1
@@ -315,12 +350,96 @@ class ProjectedMLAAttention(nn.Module):
         return self.o_proj(attn_bmm_output.flatten(1, 2))
 
 
+class ReferenceDeepseekMLAAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = kv_lora_rank
+        self.v_head_dim = kv_lora_rank
+        self.scaling = kv_lora_rank**-0.5
+        self.rms_norm_eps = 1e-6
+        self.q_proj = nn.Linear(
+            hidden_size,
+            num_heads * self.qk_nope_head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.kv_a_proj = nn.Linear(
+            hidden_size,
+            kv_lora_rank,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.kv_a_layernorm_weight = nn.Parameter(
+            torch.ones(kv_lora_rank, dtype=dtype, device=device)
+        )
+        self.w_kc = nn.Parameter(
+            torch.empty(
+                num_heads,
+                self.qk_nope_head_dim,
+                kv_lora_rank,
+                dtype=dtype,
+                device=device,
+            )
+        )
+        self.w_vc = nn.Parameter(
+            torch.empty(
+                num_heads,
+                kv_lora_rank,
+                self.v_head_dim,
+                dtype=dtype,
+                device=device,
+            )
+        )
+        self.o_proj = nn.Linear(
+            num_heads * self.v_head_dim,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+
+    def _rms_norm(self, x: torch.Tensor) -> torch.Tensor:
+        variance = x.float().pow(2).mean(dim=-1, keepdim=True)
+        x = x.float() * torch.rsqrt(variance + self.rms_norm_eps)
+        return (x.to(self.kv_a_layernorm_weight.dtype) * self.kv_a_layernorm_weight).to(
+            dtype=self.kv_a_layernorm_weight.dtype
+        )
+
+    def project_latent_qk(self, hidden_states: torch.Tensor):
+        q_nope = self.q_proj(hidden_states).view(
+            -1, self.num_heads, self.qk_nope_head_dim
+        )
+        k_nope = self._rms_norm(self.kv_a_proj(hidden_states)).unsqueeze(1)
+        q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc).transpose(0, 1)
+        return q_nope_out, k_nope
+
+    def reconstruct_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc).transpose(
+            0, 1
+        )
+        return F.linear(attn_bmm_output.flatten(1, 2), self.o_proj.weight)
+
+
 @dataclass
 class MLAAttentionFixture:
     case: MLAAttentionCase
     runner: MockMLAModelRunner
     backend: object
-    module: ProjectedMLAAttention
+    actual_module: TinyDeepseekMLAAttention
+    reference_module: ReferenceDeepseekMLAAttention
     forward_batch: ForwardBatch
     prefix_hidden: list[torch.Tensor]
     input_hidden: torch.Tensor
@@ -413,19 +532,19 @@ def _split_by_lens(tensor: torch.Tensor, lens: tuple[int, ...]):
 
 
 def _mla_attention_reference(
-    module: ProjectedMLAAttention,
+    module: ReferenceDeepseekMLAAttention,
     case: MLAAttentionCase,
     prefix_hidden: list[torch.Tensor],
     input_hidden: torch.Tensor,
 ) -> torch.Tensor:
     dtype = input_hidden.dtype
-    q, k = module.prepare_mla(input_hidden)
+    q, k = module.project_latent_qk(input_hidden)
     q_parts = _split_by_lens(q, case.input_lens)
     k_parts = _split_by_lens(k, case.input_lens)
     outputs = []
 
     for req_idx, prefix in enumerate(prefix_hidden):
-        _, prefix_k = module.prepare_mla(prefix)
+        _, prefix_k = module.project_latent_qk(prefix)
         req_k = torch.cat([prefix_k, k_parts[req_idx]], dim=0).squeeze(1)
 
         for offset, query in enumerate(q_parts[req_idx]):
@@ -433,33 +552,33 @@ def _mla_attention_reference(
             keys = req_k[: query_pos + 1].movedim(0, 1)
             query = query.float()
             keys = keys.float()
-            scores = torch.einsum("hd,dk->hk", query, keys) * module.attn.scaling
+            scores = torch.einsum("hd,dk->hk", query, keys) * module.scaling
             probs = torch.softmax(scores, dim=-1)
             out = torch.einsum("hk,kd->hd", probs, req_k[: query_pos + 1].float())
             outputs.append(out)
 
     attn_output = torch.stack(outputs, dim=0).to(dtype)
-    attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), module.w_vc).transpose(
-        0, 1
-    )
-    return F.linear(attn_bmm_output.flatten(1, 2), module.o_proj.weight)
+    return module.reconstruct_output(attn_output)
 
 
 def _populate_prefix_kv(
-    module: ProjectedMLAAttention,
+    module: TinyDeepseekMLAAttention,
     case: MLAAttentionCase,
     runner: MockMLAModelRunner,
+    backend: object,
     prefix_hidden: list[torch.Tensor],
     *,
     max_context_len: int,
 ):
     locs = []
     keys = []
+    ropes = []
     for req_idx, prefix in enumerate(prefix_hidden):
         if prefix.shape[0] == 0:
             continue
-        _, k = module.prepare_mla(prefix)
+        _, k, k_rope = module.forward_absorb_prepare(prefix)
         keys.append(k)
+        ropes.append(k_rope)
         for pos in range(prefix.shape[0]):
             locs.append(
                 _token_loc(
@@ -475,7 +594,22 @@ def _populate_prefix_kv(
 
     loc_tensor = torch.tensor(locs, dtype=torch.int64, device=runner.device)
     cache_k = torch.cat(keys, dim=0)
-    runner.token_to_kv_pool.set_kv_buffer(module.attn, loc_tensor, cache_k, cache_k)
+    cache_k_rope = torch.cat(ropes, dim=0)
+    with forward_context(ForwardContext(attn_backend=backend)):
+        module.write_kv_cache(loc_tensor, cache_k, cache_k_rope)
+
+
+def _copy_mla_weights(
+    actual: TinyDeepseekMLAAttention,
+    reference: ReferenceDeepseekMLAAttention,
+):
+    with torch.no_grad():
+        reference.q_proj.weight.copy_(actual.q_proj.weight)
+        reference.kv_a_proj.weight.copy_(actual.kv_a_proj.weight)
+        reference.kv_a_layernorm_weight.copy_(actual.kv_a_layernorm_weight)
+        reference.w_kc.copy_(actual.w_kc)
+        reference.w_vc.copy_(actual.w_vc)
+        reference.o_proj.weight.copy_(actual.o_proj.weight)
 
 
 def build_mla_attention_fixture(
@@ -516,13 +650,21 @@ def build_mla_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    module = ProjectedMLAAttention(
+    actual_module = TinyDeepseekMLAAttention(
         hidden_size=hidden_size,
         num_heads=case.num_heads,
         kv_lora_rank=kv_lora_rank,
         dtype=dtype,
         device=device,
     )
+    reference_module = ReferenceDeepseekMLAAttention(
+        hidden_size=hidden_size,
+        num_heads=case.num_heads,
+        kv_lora_rank=kv_lora_rank,
+        dtype=dtype,
+        device=device,
+    )
+    _copy_mla_weights(actual_module, reference_module)
     prefix_hidden = [
         torch.randn(length, hidden_size, dtype=dtype, device=device)
         for length in case.prefix_lens
@@ -540,9 +682,10 @@ def build_mla_attention_fixture(
         device=device,
     )
     _populate_prefix_kv(
-        module,
+        actual_module,
         case,
         runner,
+        backend,
         prefix_hidden,
         max_context_len=max_context_len,
     )
@@ -551,7 +694,8 @@ def build_mla_attention_fixture(
         case=case,
         runner=runner,
         backend=backend,
-        module=module,
+        actual_module=actual_module,
+        reference_module=reference_module,
         forward_batch=forward_batch,
         prefix_hidden=prefix_hidden,
         input_hidden=input_hidden,
@@ -561,12 +705,12 @@ def build_mla_attention_fixture(
 def run_mla_fixture_eager(fixture: MLAAttentionFixture) -> torch.Tensor:
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        return fixture.module(fixture.input_hidden, fixture.forward_batch)
+        return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
 
 
 def expected_mla_fixture_output(fixture: MLAAttentionFixture) -> torch.Tensor:
     return _mla_attention_reference(
-        fixture.module,
+        fixture.reference_module,
         fixture.case,
         fixture.prefix_hidden,
         fixture.input_hidden,
@@ -671,9 +815,10 @@ def run_mla_cuda_graph_decode_case(
         device=device,
     )
     _populate_prefix_kv(
-        graph_fixture.module,
+        graph_fixture.actual_module,
         capture_case,
         graph_fixture.runner,
+        backend,
         capture_prefix_hidden,
         max_context_len=max_context_len,
     )
@@ -692,10 +837,13 @@ def run_mla_cuda_graph_decode_case(
             forward_mode=capture_batch.forward_mode,
             spec_info=capture_batch.spec_info,
         )
-        capture_actual = graph_fixture.module(capture_input_hidden, capture_batch)
+        capture_actual = graph_fixture.actual_module(
+            capture_input_hidden,
+            capture_batch,
+        )
         backend.on_after_cuda_graph_warmup()
         capture_expected = _mla_attention_reference(
-            graph_fixture.module,
+            graph_fixture.reference_module,
             capture_case,
             capture_prefix_hidden,
             capture_input_hidden,
@@ -733,9 +881,10 @@ def run_mla_cuda_graph_decode_case(
             device=device,
         )
         _populate_prefix_kv(
-            graph_fixture.module,
+            graph_fixture.actual_module,
             replay_case,
             graph_fixture.runner,
+            backend,
             replay_prefix_hidden,
             max_context_len=max_context_len,
         )
@@ -749,13 +898,13 @@ def run_mla_cuda_graph_decode_case(
             spec_info=replay_batch.spec_info,
             seq_lens_cpu=replay_batch.seq_lens_cpu,
         )
-        replay_actual = graph_fixture.module(replay_input_hidden, replay_batch)
+        replay_actual = graph_fixture.actual_module(replay_input_hidden, replay_batch)
 
     torch.testing.assert_close(
         capture_actual, capture_expected, atol=MLA_ATOL, rtol=MLA_RTOL
     )
     replay_expected = _mla_attention_reference(
-        graph_fixture.module,
+        graph_fixture.reference_module,
         replay_case,
         replay_prefix_hidden,
         replay_input_hidden,
