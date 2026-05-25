@@ -58,11 +58,23 @@ class TestPerturbRealKvUnusedCacheMhaFull(_PerturbRealKvUnusedCacheBase):
     target_group = TargetGroupKind.FULL
 
 
+_SWA_TIGHT_POOL_ARGS = (
+    "--max-total-tokens",
+    "32768",
+    "--swa-full-tokens-ratio",
+    "0.1",
+)
+
+
 class TestPerturbRealKvUnusedCacheSwaFull(_PerturbRealKvUnusedCacheBase):
     __test__ = True
 
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
+    extra_server_args = (
+        *_PerturbRealKvUnusedCacheBase.extra_server_args,
+        *_SWA_TIGHT_POOL_ARGS,
+    )
 
 
 class TestPerturbRealKvUnusedCacheSwaSwa(_PerturbRealKvUnusedCacheBase):
@@ -70,6 +82,10 @@ class TestPerturbRealKvUnusedCacheSwaSwa(_PerturbRealKvUnusedCacheBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
+    extra_server_args = (
+        *_PerturbRealKvUnusedCacheBase.extra_server_args,
+        *_SWA_TIGHT_POOL_ARGS,
+    )
 
 
 if __name__ == "__main__":

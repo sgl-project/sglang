@@ -11,6 +11,14 @@ from sglang.test.kv_canary.e2e_base import CanaryE2EBase
 register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-small")
 
 
+_SWA_TIGHT_POOL_ARGS = (
+    "--max-total-tokens",
+    "32768",
+    "--swa-full-tokens-ratio",
+    "0.1",
+)
+
+
 class _PerturbRealKvUsedBase(CanaryE2EBase):
     __test__ = False
 
@@ -50,6 +58,7 @@ class TestPerturbRealKvUsedSwaFull(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.FULL
+    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *_SWA_TIGHT_POOL_ARGS)
 
 
 class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
@@ -57,6 +66,7 @@ class TestPerturbRealKvUsedSwaSwa(_PerturbRealKvUsedBase):
 
     model_mode = "swa"
     target_group = TargetGroupKind.SWA
+    extra_server_args = (*_PerturbRealKvUsedBase.extra_server_args, *_SWA_TIGHT_POOL_ARGS)
 
 
 if __name__ == "__main__":

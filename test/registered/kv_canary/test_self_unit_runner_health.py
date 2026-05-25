@@ -8,7 +8,7 @@ import torch
 
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
-from sglang.srt.kv_canary.runner import canary_manager as manager_module
+from sglang.srt.kv_canary.runner import health as health_module
 from sglang.srt.kv_canary.runner.health import KernelRunCounterHealthChecker
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -59,7 +59,7 @@ class TestSelfUnitManagerHealth(CanaryManagerTestCase):
         manager = make_manager(device=self.device, config=config)
         manager._device_state.slot_run_counters.fill_(7)
 
-        with self.assertLogs(manager_module.logger.name, level=logging.INFO) as cm:
+        with self.assertLogs(health_module.logger.name, level=logging.INFO) as cm:
             for _ in range(11):
                 manager._stats_logger.step()
                 manager._outer_step_counter += 1

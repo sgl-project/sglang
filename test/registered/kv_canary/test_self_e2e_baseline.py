@@ -35,6 +35,17 @@ class TestBaselineSwa(_BaselineBase):
     __test__ = True
 
     model_mode = "swa"
+    # Tight KV pool forces eviction under the 8 × ~7K parallel prompts, which slides the SWA
+    # window past the full-pool tail and produces non-zero swa_full_idx_divergence.
+    # 8 parallel ~7K-token prompts ≈ 56K total tokens. Squeeze the full pool with
+    # --swa-full-tokens-ratio=0.1 so it fills and evicts within the run, sliding the SWA
+    # window past the full tail (swa_full_idx_divergence > 0).
+    extra_server_args = (
+        "--max-total-tokens",
+        "32768",
+        "--swa-full-tokens-ratio",
+        "0.1",
+    )
 
 
 if __name__ == "__main__":

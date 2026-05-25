@@ -35,6 +35,13 @@ class TestPerturbReqToTokenSwa(_PerturbReqToTokenBase):
     __test__ = True
 
     model_mode = "swa"
+    # Tight full-pool ratio forces SWA window sliding for maybe_assert_swa_divergence_observed().
+    extra_server_args = (
+        "--max-total-tokens",
+        "32768",
+        "--swa-full-tokens-ratio",
+        "0.1",
+    )
 
 
 if __name__ == "__main__":

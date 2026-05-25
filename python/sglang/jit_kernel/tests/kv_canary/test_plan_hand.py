@@ -82,10 +82,12 @@ def _run_label(
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
     _ = extras
-    verify_plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
+    verify_plan = VerifyPlan.allocate(
+        verify_capacity=verify_capacity, device=_DEVICE
+    ).zero_for_testing_()
     write_plan = WritePlan.allocate(
         write_req_capacity=write_req_capacity, device=_DEVICE
-    )
+    ).zero_for_testing_()
     runner = (
         launch_canary_plan_kernels
         if label == "real"
@@ -798,10 +800,10 @@ class TestMisc:
 
             verify_plan = VerifyPlan.allocate(
                 verify_capacity=verify_capacity, device=_DEVICE
-            )
+            ).zero_for_testing_()
             write_plan = WritePlan.allocate(
                 write_req_capacity=write_req_capacity, device=_DEVICE
-            )
+            ).zero_for_testing_()
             runner = (
                 launch_canary_plan_kernels
                 if label == "real"

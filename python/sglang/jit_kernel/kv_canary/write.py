@@ -67,6 +67,14 @@ class WritePlan:
             write_num_valid_reqs=torch.empty(1, dtype=torch.int32, device=device),
         )
 
+    def zero_for_testing_(self) -> "WritePlan":
+        """WARN: ONLY use it when testing plan kernel. Do not use it when testing verify or
+        write kernel to avoid hiding bugs."""
+        self.write_offsets.zero_()
+        self.write_seed_slot_indices.zero_()
+        self.write_num_valid_reqs.zero_()
+        return self
+
 
 def launch_canary_write_kernel(
     *,
