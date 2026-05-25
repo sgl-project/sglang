@@ -90,6 +90,11 @@ class SwaDivergenceReport:
                 req_to_token_pool=self._req_to_token_pool,
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             )
+            result["swa_out_of_window_tokens"] = compute_swa_out_of_window_tokens(
+                swa_allocator=self._swa_allocator,
+                req_to_token_pool=self._req_to_token_pool,
+                maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
+            )
         return result
 
     def _postprocess_on_host(self, host_data: dict[str, Any]) -> None:
@@ -99,12 +104,18 @@ class SwaDivergenceReport:
             if "swa_full_idx_divergence" in host_data
             else 0
         )
+        swa_out_of_window_tokens = (
+            int(host_data["swa_out_of_window_tokens"].item())
+            if "swa_out_of_window_tokens" in host_data
+            else 0
+        )
         logger.info(
             SwaDivergenceLog(
                 forward_ct=host_data["forward_ct"],
                 verify_full=int(verify_totals[_FULL_IDX]),
                 verify_swa=int(verify_totals[_SWA_IDX]),
                 swa_full_idx_divergence=swa_full_idx_divergence,
+                swa_out_of_window_tokens=swa_out_of_window_tokens,
             ).format()
         )
 
@@ -115,6 +126,7 @@ class SwaDivergenceLog:
     verify_full: int
     verify_swa: int
     swa_full_idx_divergence: int
+    swa_out_of_window_tokens: int = 0
 
     def format(self) -> str:
         return _SWA_DIVERGENCE_LOG_PREFIX + json.dumps(
@@ -136,6 +148,35 @@ class SwaDivergenceLog:
         if last_match is None:
             return None
         return cls(**json.loads(last_match.group(1))), last_match.group(0)
+
+
+def compute_swa_out_of_window_tokens(
+    *,
+    swa_allocator: "SWATokenToKVPoolAllocator",
+    req_to_token_pool: "ReqToTokenPool",
+    maybe_inaccurate_forward_batch: "ForwardBatch",
+) -> torch.Tensor:
+    """Count tokens in the live req_to_token range whose SWA mapping is 0 (out-of-window).
+
+    Complements compute_swa_full_idx_divergence: this counts the SWA-evicted tail (any
+    prompt longer than the sliding window produces ≥1 such token), while the divergence
+    counter only fires when the SWA pool has actually been remapped to a non-identity
+    index. Together they distinguish "SWA path was exercised at all" from "SWA pool
+    eviction reused slots". Used by the e2e SWA divergence assertion to prove the SWA
+    code path ran even when the workload doesn't drive SWA pool eviction.
+    """
+    full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
+    device = full_to_swa_index_mapping.device
+    req_pool_indices = maybe_inaccurate_forward_batch.req_pool_indices
+    seq_lens = maybe_inaccurate_forward_batch.seq_lens
+    if req_pool_indices.numel() == 0:
+        return torch.zeros(1, dtype=torch.int32, device=device)
+    req_to_token = req_to_token_pool.req_to_token
+    rows = req_to_token[req_pool_indices]
+    positions = torch.arange(rows.shape[1], device=rows.device)
+    mask = positions[None, :] < seq_lens[:, None]
+    swa_indices = full_to_swa_index_mapping[rows]
+    return ((swa_indices == 0) & mask).sum().to(torch.int32).view(1)
 
 
 def compute_swa_full_idx_divergence(

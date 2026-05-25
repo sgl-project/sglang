@@ -140,19 +140,19 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def assert_swa_divergence_observed(
         self,
         *,
-        min_swa_full_idx_divergence: int = 0,
+        min_swa_out_of_window_tokens: int = 1,
         require_verify_lag: bool = True,
         flush_wait_seconds: float = 3.0,
         max_retries: int = 10,
     ) -> None:
         """Assert that the SWA path was genuinely exercised.
 
-        The `verify_swa < verify_full` check is the durable signal — gemma's 1024-token SWA
-        window naturally produces fewer SWA verify entries than FULL entries as soon as any
-        prompt exceeds the window. `swa_full_idx_divergence >= 1` would additionally require
-        non-identity SWA-pool remapping (i.e. actual eviction), but triggering that in a
-        non-flaky way also drives the canary into a known FULL-kernel position false-positive
-        path; default min is 0 to keep the broader signal as the gate.
+        Two complementary signals must both hold:
+          - ``swa_out_of_window_tokens >= 1``: at least one prefix token has been clipped
+            out of the sliding window (its SWA mapping is 0). Any prompt longer than the
+            SWA window produces this — proves the SWA window slide actually ran.
+          - ``verify_swa < verify_full``: SWA verify kernel processed fewer tokens than
+            FULL — proves both kernel groups ran and the window short-circuited SWA.
         """
         last_parsed = None
         last_line: str = ""
@@ -171,16 +171,16 @@ class CanaryE2EBase(CapturedServerE2EBase):
                 f"Log tail:\n{self._captured_log_text()[-2000:]}"
             )
 
-        if last_parsed.swa_full_idx_divergence < min_swa_full_idx_divergence:
+        if last_parsed.swa_out_of_window_tokens < min_swa_out_of_window_tokens:
             raise AssertionError(
-                f"SWA divergence not observed: swa_full_idx_divergence={last_parsed.swa_full_idx_divergence} "
-                f"< min={min_swa_full_idx_divergence}. Line: {last_line}"
+                f"SWA path not exercised: swa_out_of_window_tokens={last_parsed.swa_out_of_window_tokens} "
+                f"< min={min_swa_out_of_window_tokens}. Line: {last_line}"
             )
         if require_verify_lag and not (
             last_parsed.verify_swa < last_parsed.verify_full
         ):
             raise AssertionError(
-                f"SWA divergence not observed: verify_swa={last_parsed.verify_swa} "
+                f"SWA path not exercised: verify_swa={last_parsed.verify_swa} "
                 f"not strictly less than verify_full={last_parsed.verify_full}. "
                 f"Line: {last_line}"
             )
