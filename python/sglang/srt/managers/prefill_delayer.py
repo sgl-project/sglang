@@ -33,6 +33,8 @@ class _NegotiateOutput(NamedTuple):
     output_reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
+    wait_forward_passes: int = 0
+    wait_seconds: float = 0.0
 
 
 class PrefillDelayer:
@@ -175,6 +177,12 @@ class PrefillDelayer:
             num_token_watermark_force_allow=global_token_watermark_force_allow.sum().item(),
         )
 
+        wait_forward_passes = 0
+        wait_seconds = 0.0
+        if prev_state is not None:
+            wait_forward_passes = prev_state.delayed_count
+            wait_seconds = time.perf_counter() - prev_state.start_time
+
         # Compute outputs
         if prefillable_status == "all":
             # Safety valve: low KV usage means GPU is underutilized, skip
@@ -184,6 +192,8 @@ class PrefillDelayer:
                     next_state=None,
                     output_allow=True,
                     output_reason="token_watermark",
+                    wait_forward_passes=wait_forward_passes,
+                    wait_seconds=wait_seconds,
                     **debug_info,
                 )
 
@@ -241,6 +251,8 @@ class PrefillDelayer:
                 next_state=None,
                 output_allow=True,
                 output_reason="wait_success" if exist_previous_wait else "no_wait",
+                wait_forward_passes=wait_forward_passes,
+                wait_seconds=wait_seconds,
                 **debug_info,
             )
         elif prefillable_status == "none":
@@ -249,6 +261,8 @@ class PrefillDelayer:
                 # It does not matter whether we allow or not, thus we allow for simplicity
                 output_allow=True,
                 output_reason="",
+                wait_forward_passes=wait_forward_passes,
+                wait_seconds=wait_seconds,
                 **debug_info,
             )
         elif prefillable_status == "mixed":
@@ -257,6 +271,8 @@ class PrefillDelayer:
                     next_state=None,
                     output_allow=True,
                     output_reason="token_watermark",
+                    wait_forward_passes=wait_forward_passes,
+                    wait_seconds=wait_seconds,
                     **debug_info,
                 )
 
@@ -275,6 +291,8 @@ class PrefillDelayer:
                     next_state=None,
                     output_allow=True,
                     output_reason="wait_timeout",
+                    wait_forward_passes=wait_forward_passes,
+                    wait_seconds=wait_seconds,
                     **debug_info,
                 )
         else:
@@ -376,14 +394,9 @@ def _record_single_pass_result(
             }
 
     if metrics_collector is not None:
-        if (s := output.next_state) is not None:
-            wait_seconds = time.perf_counter() - s.start_time
-            forward_passes = s.delayed_count
-        else:
-            wait_seconds = forward_passes = 0
         metrics_collector.observe_prefill_delayer_outcome(
-            forward_passes=forward_passes,
-            wait_seconds=wait_seconds,
+            forward_passes=output.wait_forward_passes,
+            wait_seconds=output.wait_seconds,
             input_estimation=output.input_estimation,
             output_allow=output.output_allow,
             output_reason=output.output_reason,
