@@ -42,7 +42,9 @@ class KernelRunCounterHealthChecker:
         self._active_tags = active_tags
         self._outer_step_counter_getter = outer_step_counter_getter
         self._handler = DelayedDeviceHostHandler(d2h_stream=d2h_stream)
-        self._prev_counters_host: Optional[list[int]] = None
+        self._prev_counters_host: torch.Tensor = torch.zeros_like(
+            device_state.kernel_run_counters, device="cpu"
+        )
 
     def step(self) -> None:
         self._handler.step(
@@ -61,17 +63,10 @@ class KernelRunCounterHealthChecker:
         return self._device_state.kernel_run_counters
 
     def _postprocess_on_host(self, host_tensor: torch.Tensor) -> None:
-        counters = host_tensor.tolist()
+        delta = host_tensor - self._prev_counters_host
+        self._prev_counters_host = host_tensor
         expected_tags = self._expected_active_tags_for_health_check()
-        if self._prev_counters_host is None:
-            stalled = [tag for tag in expected_tags if int(counters[tag.value]) == 0]
-        else:
-            stalled = [
-                tag
-                for tag in expected_tags
-                if int(counters[tag.value]) == int(self._prev_counters_host[tag.value])
-            ]
-        self._prev_counters_host = counters
+        stalled = [tag for tag in expected_tags if int(delta[tag.value]) == 0]
         if stalled:
             names = ", ".join(tag.name for tag in stalled)
             raise RuntimeError(
