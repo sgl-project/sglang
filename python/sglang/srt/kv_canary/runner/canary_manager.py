@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import torch
@@ -302,3 +303,9 @@ class CanaryManager:
 
     def _get_outer_step_counter(self) -> int:
         return self._outer_step_counter
+
+
+@contextmanager
+def context_tuple(ctx_a, ctx_b):
+    with ctx_a, ctx_b:
+        yield
