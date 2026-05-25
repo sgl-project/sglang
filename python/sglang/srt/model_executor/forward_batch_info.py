@@ -63,11 +63,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.schedule_batch import MultimodalInputs, ScheduleBatch
-    from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
@@ -369,11 +366,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Sampling info
     sampling_info: SamplingBatchInfo = None
 
-    # Attention backend
-    req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: KVCache = None
-    attn_backend: AttentionBackend = None
-
     # For DP attention
     original_global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_cpu: Optional[List[int]] = None
@@ -431,9 +423,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
-
-    # For hisparse
-    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -536,9 +525,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=[req.lora_id for req in batch.reqs],
             sampling_info=batch.sampling_info,
-            req_to_token_pool=model_runner.req_to_token_pool,
-            token_to_kv_pool=model_runner.token_to_kv_pool,
-            attn_backend=model_runner.attn_backend,
             spec_algorithm=batch.spec_algorithm,
             spec_info=batch.spec_info,
             capture_hidden_mode=capture_hidden_mode,
