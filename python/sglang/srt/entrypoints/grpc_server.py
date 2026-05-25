@@ -18,18 +18,22 @@ import logging
 import os
 import time
 
+import grpc
 from aiohttp import web
+from smg_grpc_servicer.sglang import request_manager as grpc_request_manager
 
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.mm_utils import wrap_shm_features
 from sglang.srt.server_args import set_global_server_args_for_tokenizer
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+# 512 MB
 _DEFAULT_GRPC_MAX_MESSAGE_MB = 512
 
 
@@ -62,8 +66,6 @@ def _with_grpc_message_size_options(options, max_message_bytes: int):
 
 
 def _patch_grpc_message_size_options() -> None:
-    import grpc
-
     if getattr(grpc, "_sglang_message_size_options_patched", False):
         return
 
@@ -93,14 +95,11 @@ def _patch_grpc_message_size_options() -> None:
 
 
 def _patch_grpc_request_manager_shm_transport() -> None:
-    from smg_grpc_servicer.sglang import request_manager as grpc_request_manager
-
+    """wrap shm/cuda-ipc features before sending to scheduler"""
     cls = grpc_request_manager.GrpcRequestManager
     original_send = cls._send_to_scheduler
     if getattr(original_send, "_sglang_wraps_shm_features", False):
         return
-
-    from sglang.srt.managers.mm_utils import wrap_shm_features
 
     def copy_multimodal_request(obj):
         if not isinstance(obj, TokenizedGenerateReqInput) or obj.mm_inputs is None:
@@ -139,7 +138,8 @@ def _encode_grpc_shape(shape) -> bytes:
     )
 
 
-def _hash_grpc_mm_proto(mm_proto):
+def _hash_grpc_mm_proto(mm_proto) -> int | None:
+    """hash for multimodal data"""
     if mm_proto.image_data:
         return _hash_grpc_bytes(mm_proto.image_data)
 
