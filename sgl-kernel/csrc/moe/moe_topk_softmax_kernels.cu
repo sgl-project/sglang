@@ -830,4 +830,7 @@ void topk_softmax(
   } else {
     TORCH_CHECK(false, "Unsupported gating_output dtype: ", dtype);
   }
+
+  auto launch_error = cudaGetLastError();
+  TORCH_CHECK(launch_error == cudaSuccess, "topk_softmax launch error: ", cudaGetErrorString(launch_error));
 }
