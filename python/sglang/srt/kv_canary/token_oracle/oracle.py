@@ -17,6 +17,7 @@ class TokenOracle(Protocol):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class HashOracle:
     """token_id = splitmix64(generalized_req_id XOR position) % vocab_size."""
+
     vocab_size: int
 
     def expected_tokens(

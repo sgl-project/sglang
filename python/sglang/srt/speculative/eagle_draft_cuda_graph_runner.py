@@ -502,9 +502,9 @@ class EAGLEDraftCudaGraphRunner:
                 buffers.bootstrap_room_ids_int is not None
                 and forward_batch.bootstrap_room_ids_int is not None
             ):
-                forward_batch.bootstrap_room_ids_int = (
-                    buffers.bootstrap_room_ids_int[:bs]
-                )
+                forward_batch.bootstrap_room_ids_int = buffers.bootstrap_room_ids_int[
+                    :bs
+                ]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
@@ -535,9 +535,9 @@ class EAGLEDraftCudaGraphRunner:
                 buffers.bootstrap_room_ids_int is not None
                 and forward_batch.bootstrap_room_ids_int is not None
             ):
-                forward_batch.bootstrap_room_ids_int = (
-                    buffers.bootstrap_room_ids_int[:raw_bs]
-                )
+                forward_batch.bootstrap_room_ids_int = buffers.bootstrap_room_ids_int[
+                    :raw_bs
+                ]
             if forward_batch.seq_lens_cpu is not None:
                 forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
 

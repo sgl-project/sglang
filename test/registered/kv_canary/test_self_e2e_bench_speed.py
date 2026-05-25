@@ -32,7 +32,9 @@ _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 _PROFILE_NO_GRAPH_STEPS = 3
 
 
-def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> ServerArgs:
+def _make_server_args(
+    *, canary_on: bool, disable_cuda_graph: bool = False
+) -> ServerArgs:
     # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
     extra = [
         "--model-path",
@@ -211,9 +213,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         self.assertLess(
             overhead_pct,
             max_overhead_pct,
-            msg=(
-                f"{summary} — exceeds {max_overhead_pct:.1f}% budget"
-            ),
+            msg=(f"{summary} — exceeds {max_overhead_pct:.1f}% budget"),
         )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
