@@ -76,10 +76,6 @@ class CanaryE2EBase(CapturedServerE2EBase):
     def setUpClass(cls) -> None:
         cls._cfg = _MODE_CONFIGS[cls.model_mode]
         server_env = os.environ.copy()
-        # Default canary V-half kernels ON for e2e tests so the V kernel paths get coverage;
-        # production default (envs.SGLANG_KV_CANARY_ENABLE_MHA_V default False) skips V kernels
-        # to ~halve per-forward canary cost. Tests can override via extra_env.
-        server_env.setdefault("SGLANG_KV_CANARY_ENABLE_MHA_V", "1")
         server_env.update(cls.extra_env)
         if cls.model_mode == "swa":
             server_env.setdefault(
