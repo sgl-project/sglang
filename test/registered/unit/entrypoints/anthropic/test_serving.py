@@ -1083,10 +1083,12 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
-        roles = [m["role"] for m in chat_request.messages]
+        # chat_request.messages items are Pydantic ChatCompletionMessage*Param
+        # variants — use attribute access, not subscripts.
+        roles = [m.role for m in chat_request.messages]
         self.assertEqual(roles, ["user", "tool", "user"])
-        self.assertEqual(chat_request.messages[0]["content"], "first")
-        self.assertEqual(chat_request.messages[2]["content"], "second")
+        self.assertEqual(chat_request.messages[0].content, "first")
+        self.assertEqual(chat_request.messages[2].content, "second")
 
     def test_empty_text_assistant_turn_preserves_role_alternation(self):
         """Assistant turn with only empty text must NOT vanish from the wire."""
@@ -1100,7 +1102,7 @@ class TestAnthropicServing(unittest.TestCase):
             ],
         )
         chat_request = serving._convert_to_chat_completion_request(request)
-        roles = [m["role"] for m in chat_request.messages]
+        roles = [m.role for m in chat_request.messages]
         # Without the fix this collapses to ['user', 'user'] and breaks
         # strict role-alternation chat templates (qwen, llama, mistral).
         self.assertEqual(roles, ["user", "assistant", "user"])
@@ -1125,7 +1127,7 @@ class TestAnthropicServing(unittest.TestCase):
         )
         # Must convert successfully; the thinking block is silently dropped.
         chat_request = serving._convert_to_chat_completion_request(request)
-        roles = [m["role"] for m in chat_request.messages]
+        roles = [m.role for m in chat_request.messages]
         self.assertIn("user", roles)
         # The assistant turn was rendered (as empty placeholder) so
         # alternation is preserved.
