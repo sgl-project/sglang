@@ -82,12 +82,14 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
+    is_npu,
     make_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 
 class NemotronHMLP(nn.Module):
@@ -417,7 +419,14 @@ class NemotronHMambaDecoderLayer(nn.Module):
         output = torch.empty_like(hidden_states)
         attn_backend = get_attn_backend()
         assert isinstance(attn_backend, HybridLinearAttnBackend)
-        assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
+        if _is_npu:
+            from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
+                AscendMamba2AttnBackend,
+            )
+
+            assert isinstance(attn_backend.linear_attn_backend, AscendMamba2AttnBackend)
+        else:
+            assert isinstance(attn_backend.linear_attn_backend, Mamba2AttnBackend)
         attn_backend.linear_attn_backend.forward(
             mixer=self.mixer,
             layer_id=self.layer_id,

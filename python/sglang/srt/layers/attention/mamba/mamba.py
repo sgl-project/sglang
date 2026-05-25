@@ -58,6 +58,8 @@ elif is_npu():
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
 
+_is_npu = is_npu()
+
 logger = logging.getLogger(__name__)
 
 
@@ -519,9 +521,11 @@ class MambaMixer2(torch.nn.Module):
             )  # this is the form that causal-conv see
             ccfn = (
                 causal_conv1d_fn
-                if not use_triton_causal_conv
+                if not use_triton_causal_conv or _is_npu
                 else causal_conv1d_fn_triton
             )
+            if _is_npu:
+                conv_state = conv_state.transpose(-2, -1)
             hidden_states_B_C_p = ccfn(
                 x,
                 conv_weights,
@@ -618,9 +622,11 @@ class MambaMixer2(torch.nn.Module):
             else:
                 ccu = (
                     causal_conv1d_update
-                    if not use_triton_causal_conv
+                    if not use_triton_causal_conv or _is_npu
                     else causal_conv1d_update_triton
                 )
+                if _is_npu:
+                    conv_state = conv_state.transpose(-2, -1)
                 hidden_states_B_C_d = ccu(
                     hidden_states_B_C_d,
                     conv_state,
