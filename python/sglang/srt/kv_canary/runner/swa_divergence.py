@@ -156,15 +156,7 @@ def compute_swa_out_of_window_tokens(
     req_to_token_pool: "ReqToTokenPool",
     maybe_inaccurate_forward_batch: "ForwardBatch",
 ) -> torch.Tensor:
-    """Count tokens in the live req_to_token range whose SWA mapping is 0 (out-of-window).
-
-    Complements compute_swa_full_idx_divergence: this counts the SWA-evicted tail (any
-    prompt longer than the sliding window produces ≥1 such token), while the divergence
-    counter only fires when the SWA pool has actually been remapped to a non-identity
-    index. Together they distinguish "SWA path was exercised at all" from "SWA pool
-    eviction reused slots". Used by the e2e SWA divergence assertion to prove the SWA
-    code path ran even when the workload doesn't drive SWA pool eviction.
-    """
+    """Count tokens in the live req_to_token range whose SWA mapping is 0 (out-of-window)."""
     full_to_swa_index_mapping = swa_allocator.full_to_swa_index_mapping
     device = full_to_swa_index_mapping.device
     req_pool_indices = maybe_inaccurate_forward_batch.req_pool_indices
