@@ -162,6 +162,12 @@ def test_dsv4_index_cache_min_seq_len_gate_uses_raw_token_length():
     )
 
 
+def test_dsv4_index_cache_min_seq_len_gate_accepts_plain_sequences():
+    assert index_cache.index_cache_enabled_for_seq_lens([75000, 80000], 75000)
+    assert not index_cache.index_cache_enabled_for_seq_lens((75000, 74999), 75000)
+    assert not index_cache.index_cache_enabled_for_seq_lens([], 75000)
+
+
 def test_dsv4_index_cache_graph_gate_disables_short_context_graphs():
     config = SimpleNamespace(
         index_topk_freq=2,

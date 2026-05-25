@@ -103,11 +103,13 @@ def should_return_index_cache(
 
 
 def index_cache_enabled_for_seq_lens(
-    seq_lens: torch.Tensor,
+    seq_lens,
     min_seq_len: int,
 ) -> bool:
     if min_seq_len <= 0:
         return True
+    if not isinstance(seq_lens, torch.Tensor):
+        seq_lens = torch.as_tensor(seq_lens)
     if seq_lens.numel() == 0:
         return False
     return int(seq_lens.min().item()) >= min_seq_len
