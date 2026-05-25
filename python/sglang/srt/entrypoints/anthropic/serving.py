@@ -59,16 +59,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Map OpenAI finish reasons to Anthropic stop reasons.
-# ``content_filter`` maps to ``refusal`` per Anthropic's documented enum;
-# ``abort`` has no Anthropic equivalent so we surface it as ``end_turn``
-# but log a warning at the call site so operators don't lose the signal.
+# Map OpenAI finish reasons to Anthropic stop reasons. Only the four
+# values in ``AnthropicMessagesResponse.stop_reason``'s Literal are valid
+# on the wire; ``content_filter`` and ``abort`` have no perfect mapping
+# so they fall through to the ``end_turn`` default with a WARNING at the
+# call site so operators don't lose the safety/abort signal in logs.
 STOP_REASON_MAP = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",
-    "content_filter": "refusal",
-    "abort": "end_turn",
 }
 
 ERROR_TYPE_MAP = {

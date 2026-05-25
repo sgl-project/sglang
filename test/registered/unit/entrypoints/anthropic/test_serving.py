@@ -1133,8 +1133,17 @@ class TestAnthropicServing(unittest.TestCase):
         # alternation is preserved.
         self.assertIn("assistant", roles)
 
-    def test_stop_reason_content_filter_maps_to_refusal(self):
-        """OpenAI 'content_filter' must surface as Anthropic 'refusal'."""
+    def test_stop_reason_content_filter_falls_back_with_warning(self):
+        """Unmapped OpenAI finish_reasons default to 'end_turn' + log a warning.
+
+        ``content_filter`` and ``abort`` have no entry in STOP_REASON_MAP
+        because Anthropic's ``stop_reason`` Literal (end_turn/max_tokens/
+        stop_sequence/tool_use) has no perfect target. The fallback must
+        produce a spec-valid stop_reason and a WARNING so operators don't
+        silently lose the safety/abort signal.
+        """
+        import logging
+
         response = ChatCompletionResponse.model_validate(
             {
                 "id": "chatcmpl-test",
@@ -1156,8 +1165,15 @@ class TestAnthropicServing(unittest.TestCase):
             }
         )
         serving = self._serving()
-        anthropic_response = serving._convert_response(response)
-        self.assertEqual(anthropic_response.stop_reason, "refusal")
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.serving", level=logging.WARNING
+        ) as log:
+            anthropic_response = serving._convert_response(response)
+        self.assertEqual(anthropic_response.stop_reason, "end_turn")
+        self.assertTrue(
+            any("content_filter" in rec for rec in log.output),
+            f"expected a warning mentioning the unmapped finish_reason: {log.output}",
+        )
 
 
 if __name__ == "__main__":
