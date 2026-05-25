@@ -168,6 +168,25 @@ def test_dsv4_index_cache_search_rejects_invalid_runtime_args():
         search_mod.validate_args(args)
 
 
+def test_dsv4_index_cache_search_rejects_duplicate_retentions():
+    args = type(
+        "Args",
+        (),
+        {
+            "command_template": "deploy --pattern {pattern}",
+            "num_c4_layers": 21,
+            "pp_block_c4_layers": 0,
+            "startup_timeout": 1,
+            "request_timeout": 1,
+            "min_indexcache_prompt_tokens": 75000,
+            "retention": ["1/2", "1/2"],
+        },
+    )()
+
+    with pytest.raises(SystemExit, match="duplicate retentions"):
+        search_mod.validate_args(args)
+
+
 def test_dsv4_index_cache_search_surfaces_failed_candidate_deploy():
     proc = subprocess.Popen(["sh", "-c", "exit 7"])
     proc.wait(timeout=5)

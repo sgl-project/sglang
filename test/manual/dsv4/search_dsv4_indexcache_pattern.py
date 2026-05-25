@@ -256,6 +256,15 @@ def validate_args(args) -> None:
         raise SystemExit("--request-timeout must be at least 1 second")
     if args.min_indexcache_prompt_tokens < 0:
         raise SystemExit("--min-indexcache-prompt-tokens must be non-negative")
+    duplicate_retentions = sorted(
+        retention
+        for retention in set(args.retention)
+        if args.retention.count(retention) > 1
+    )
+    if duplicate_retentions:
+        raise SystemExit(
+            f"duplicate retentions are not allowed: {duplicate_retentions}"
+        )
 
 
 def main() -> None:
@@ -284,6 +293,7 @@ def main() -> None:
         "search_method": "greedy_training_free",
         "uniform_1_4_candidate": "not generated; only searched 1/4 is produced",
         "min_indexcache_prompt_tokens": args.min_indexcache_prompt_tokens,
+        "requested_retentions": args.retention,
         "retentions": {
             retention: search(args, retention) for retention in args.retention
         },
