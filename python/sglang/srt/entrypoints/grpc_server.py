@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from smg_grpc_servicer.sglang import servicer as grpc_servicer
 
 import grpc
 from aiohttp import web
@@ -165,8 +166,7 @@ def _hash_grpc_mm_proto(mm_proto) -> int | None:
 
 
 def _patch_grpc_multimodal_hashes() -> None:
-    from smg_grpc_servicer.sglang import servicer as grpc_servicer
-
+    """for processed-vlm input, hash on raw proto bytes is faster than hashing before scheduler dispatch (on python objects)"""
     cls = grpc_servicer.SGLangSchedulerServicer
     original_parse = cls._parse_mm_inputs
     if getattr(original_parse, "_sglang_sets_mm_hash", False):
