@@ -16,7 +16,8 @@ class _BaselineBase(CanaryE2EBase):
     __test__ = False
 
     kv_canary_mode = CanaryMode.LOG
-    extra_env = {}
+    # V coverage needed for SwaBase's SWA-divergence assertion to see V-side divergences.
+    extra_env = {"SGLANG_KV_CANARY_ENABLE_MHA_V": "1"}
 
     def test_no_violation(self) -> None:
         """Verify the baseline canary run completes without violations."""

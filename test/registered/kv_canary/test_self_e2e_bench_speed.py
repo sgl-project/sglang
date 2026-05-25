@@ -43,6 +43,13 @@ def _make_server_args(
         "--disable-piecewise-cuda-graph",
         "--max-total-tokens",
         "524288",
+        # bs profile_max_total_num_tokens auto-detect collapses to ~64K under some launches;
+        # explicit floors prevent the bench's skip_token_capacity_threshold from skipping bs=128
+        # / prefill bs=32 scenarios.
+        "--mem-fraction-static",
+        "0.95",
+        "--cuda-graph-max-bs",
+        "128",
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")

@@ -18,6 +18,7 @@ class TestPerturbRaiseMha(CanaryE2EBase):
         "SGLANG_KV_CANARY_PERTURB_REAL_KV_USED_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": "full",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+        "SGLANG_KV_CANARY_ENABLE_MHA_V": "1",
     }
 
     def test_real_kv_used_perturbation_raises_in_raise_mode(self) -> None:

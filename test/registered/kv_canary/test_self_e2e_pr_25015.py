@@ -14,6 +14,8 @@ register_cuda_ci(est_time=60, stage="extra-a", runner_config="1-gpu-large")
 _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
     "SGLANG_KV_CANARY_INPUT_CHECK": "0",
     "SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE": "1",
+    # Eagle position assert fires per launch tag; need V-half kernels to catch V tags too.
+    "SGLANG_KV_CANARY_ENABLE_MHA_V": "1",
 }
 _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,

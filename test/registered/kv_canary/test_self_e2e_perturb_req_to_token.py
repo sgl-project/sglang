@@ -16,6 +16,7 @@ class _PerturbReqToTokenBase(CanaryE2EBase):
     extra_env = {
         "SGLANG_KV_CANARY_PERTURB_REQ_TO_TOKEN_PROB": "0.1",
         "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+        "SGLANG_KV_CANARY_ENABLE_MHA_V": "1",
     }
 
     def test_req_to_token_perturbation_reports_chain_hash_violation(self) -> None:

@@ -31,6 +31,7 @@ class _PerturbRealKvUnusedCacheBase(CanaryE2EBase):
             "SGLANG_KV_CANARY_PERTURB_REAL_KV_UNUSED_CACHE_PROB": "0.1",
             "SGLANG_KV_CANARY_PERTURB_TARGET_GROUP": str(cls.target_group),
             "SGLANG_KV_CANARY_PERTURB_WARMUP_STEPS": "0",
+            "SGLANG_KV_CANARY_ENABLE_MHA_V": "1",
         }
         super().setUpClass()
 
