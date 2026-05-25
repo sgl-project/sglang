@@ -20,10 +20,12 @@ register_cuda_ci(est_time=600, stage="extra-a", runner_config="1-gpu-large")
 register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 
 
-_QWEN3_MODEL = "Qwen/Qwen3-0.6B"
-_QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
+_QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
+_QWEN3_SCENARIO_MODEL = "qwen3-30b-a3b"
 
 _PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
+# Override server port so parallel runs (one per GPU) don't collide on 30000.
+_PORT_ENV = "SGLANG_KV_CANARY_BENCH_PORT"
 _PROFILE_STEPS = 30
 _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 # start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
@@ -41,6 +43,9 @@ def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> S
         extra.append("--disable-cuda-graph")
     if canary_on:
         extra += ["--kv-canary", "raise"]
+    port = os.getenv(_PORT_ENV)
+    if port is not None:
+        extra += ["--port", port]
 
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
