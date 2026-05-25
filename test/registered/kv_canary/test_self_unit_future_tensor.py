@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from typing import cast
 
 import torch
 
@@ -9,6 +10,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="extra-a", runner_config="1-gpu-large")
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.synchronize_count = 0
+
+    def synchronize(self) -> None:
+        self.synchronize_count += 1
 
 
 class TestFutureTensors(CustomTestCase):
@@ -134,6 +143,25 @@ class TestFutureTensors(CustomTestCase):
         self.assertEqual(int(future.wait().item()), 3)
         with self.assertRaises(RuntimeError):
             future.wait()
+
+    def test_wait_clears_fields_and_rejects_second_wait(self) -> None:
+        """Verify wait() syncs the event exactly once and clears internal state."""
+        tensor = torch.tensor([1, 2, 3])
+        event = _FakeEvent()
+        future = FutureTensors(
+            _data={"x": tensor}, _event=cast(torch.cuda.Event, event)
+        )
+
+        result = future.wait()
+        self.assertIs(result["x"], tensor)
+        self.assertEqual(event.synchronize_count, 1)
+        self.assertIsNone(future._data)
+        self.assertIsNone(future._event)
+
+        with self.assertRaisesRegex(RuntimeError, "called more than once"):
+            future.wait()
+        # Failed wait must not re-trigger event.synchronize.
+        self.assertEqual(event.synchronize_count, 1)
 
     def test_dict_anchor_picked_from_first_tensor(self) -> None:
         """Verify staging works when the first key is a non-tensor (anchor must scan)."""
