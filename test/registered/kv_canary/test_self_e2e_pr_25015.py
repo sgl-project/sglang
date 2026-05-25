@@ -18,8 +18,6 @@ _SPEC_EAGLE_TOKEN_ORACLE_ENV = {
 _SPEC_EAGLE_REVERT_PR_ENV = {
     **_SPEC_EAGLE_TOKEN_ORACLE_ENV,
     "SGLANG_DEBUG_REVERT_PR": "25015",
-    # Misalign-regression case needs V coverage to surface eagle position violations on V tags.
-    "SGLANG_KV_CANARY_ENABLE_MHA_V": "1",
 }
 _CUDA_GRAPH_MAX_BS = 1
 _EAGER_DRAFT_REQUEST_COUNT = 20
