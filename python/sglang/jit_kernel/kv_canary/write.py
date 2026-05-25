@@ -58,13 +58,13 @@ class WritePlan:
                 f"kv-canary: WritePlan write_req_capacity must be positive, got {write_req_capacity}"
             )
         return cls(
-            write_offsets=torch.zeros(
+            write_offsets=torch.empty(
                 write_req_capacity + 1, dtype=torch.int64, device=device
             ),
-            write_seed_slot_indices=torch.zeros(
+            write_seed_slot_indices=torch.empty(
                 write_req_capacity, dtype=torch.int64, device=device
             ),
-            write_num_valid_reqs=torch.zeros(1, dtype=torch.int32, device=device),
+            write_num_valid_reqs=torch.empty(1, dtype=torch.int32, device=device),
         )
 
 

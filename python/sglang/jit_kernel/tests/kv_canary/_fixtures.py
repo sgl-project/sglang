@@ -11,6 +11,10 @@ from sglang.jit_kernel.kv_canary.verify import (
 )
 from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.jit_kernel.tests.kv_canary._constants import DEFAULT_NUM_SLOTS
+from sglang.test.kv_canary.fixtures import (
+    allocate_zeroed_verify_plan,
+    allocate_zeroed_write_plan,
+)
 
 _DEVICE = torch.device("cuda")
 
@@ -208,10 +212,10 @@ def allocate_plan_pair(
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan, VerifyPlan, WritePlan]:
     return (
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
+        allocate_zeroed_verify_plan(verify_capacity=verify_capacity, device=_DEVICE),
+        allocate_zeroed_write_plan(write_req_capacity=write_req_capacity, device=_DEVICE),
+        allocate_zeroed_verify_plan(verify_capacity=verify_capacity, device=_DEVICE),
+        allocate_zeroed_write_plan(write_req_capacity=write_req_capacity, device=_DEVICE),
     )
 
 

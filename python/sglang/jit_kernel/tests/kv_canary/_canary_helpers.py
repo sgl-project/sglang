@@ -121,6 +121,12 @@ def make_verify_plan(
         )
     cap = capacity if capacity is not None else max(n_active, 1)
     plan = VerifyPlan.allocate(verify_capacity=cap, device=device)
+    # Production VerifyPlan.allocate uses torch.empty; test helpers seed only [0, n_active) so
+    # zero the tail + scalar fields to keep deterministic content for byte-compare tests.
+    plan.verify_slot_indices.zero_()
+    plan.verify_positions.zero_()
+    plan.verify_prev_slot_indices.zero_()
+    plan.enable.zero_()
     if n_active > 0:
         plan.verify_slot_indices[:n_active] = torch.tensor(
             slot_indices, dtype=torch.int64, device=device
@@ -180,6 +186,10 @@ def make_write_plan(
         )
     cap = req_capacity if req_capacity is not None else max(n_active, 1)
     plan = WritePlan.allocate(write_req_capacity=cap, device=device)
+    # Production WritePlan.allocate uses torch.empty; test helpers seed only [0, n_active) so
+    # zero the tail to keep deterministic content for byte-compare tests.
+    plan.write_offsets.zero_()
+    plan.write_seed_slot_indices.zero_()
     if n_active > 0:
         plan.write_seed_slot_indices[:n_active] = torch.tensor(
             seed_slot_indices, dtype=torch.int64, device=device

@@ -10,6 +10,9 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
+    allocate_zeroed_expected_inputs,
+)
 from sglang.test.kv_canary.fixtures import DEFAULT_DEVICE
 from sglang.test.test_utils import CustomTestCase
 
@@ -37,7 +40,7 @@ class TestTokenOracleManager(CustomTestCase):
             positions=torch.arange(8, dtype=torch.int64, device=self.device),
             extend_seq_lens=torch.tensor([1, 1], dtype=torch.int64, device=self.device),
         )
-        expected_inputs = ExpectedInputs.allocate(capacity=8, device=self.device)
+        expected_inputs = allocate_zeroed_expected_inputs(capacity=8, device=self.device)
         manager = TokenOracleManager(oracle=HashOracle(vocab_size=32000))
 
         manager.fill_expected_inputs(

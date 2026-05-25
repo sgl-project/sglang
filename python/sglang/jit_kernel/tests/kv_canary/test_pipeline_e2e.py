@@ -39,6 +39,10 @@ from sglang.jit_kernel.tests.kv_canary._fixtures import (
     make_req_to_token,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
+    allocate_zeroed_verify_plan,
+    allocate_zeroed_write_plan,
+)
 
 register_cuda_ci(est_time=30, suite="base-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=120, suite="nightly-kernel-1-gpu", nightly=True)
@@ -72,8 +76,8 @@ def _run_pipeline(
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan]:
     _ = extras
-    plan_v = VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE)
-    plan_w = WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE)
+    plan_v = allocate_zeroed_verify_plan(verify_capacity=verify_capacity, device=_DEVICE)
+    plan_w = allocate_zeroed_write_plan(write_req_capacity=write_req_capacity, device=_DEVICE)
 
     plan_fn = (
         launch_canary_plan_kernels
@@ -683,10 +687,10 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     ring_capacity = 4
     log_real = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
     log_ref = FakeViolationLog.allocate(capacity=ring_capacity, device=_DEVICE)
-    plan_v_real = VerifyPlan.allocate(verify_capacity=256, device=_DEVICE)
-    plan_w_real = WritePlan.allocate(write_req_capacity=4, device=_DEVICE)
-    plan_v_ref = VerifyPlan.allocate(verify_capacity=256, device=_DEVICE)
-    plan_w_ref = WritePlan.allocate(write_req_capacity=4, device=_DEVICE)
+    plan_v_real = allocate_zeroed_verify_plan(verify_capacity=256, device=_DEVICE)
+    plan_w_real = allocate_zeroed_write_plan(write_req_capacity=4, device=_DEVICE)
+    plan_v_ref = allocate_zeroed_verify_plan(verify_capacity=256, device=_DEVICE)
+    plan_w_ref = allocate_zeroed_write_plan(write_req_capacity=4, device=_DEVICE)
 
     launch_canary_plan_kernels(
         verify_plan_out=plan_v_real,

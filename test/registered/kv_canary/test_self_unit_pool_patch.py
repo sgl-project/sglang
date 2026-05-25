@@ -17,6 +17,9 @@ from sglang.srt.kv_canary.buffer_group import PoolKind
 from sglang.srt.kv_canary.pool_patch.api import attach_canary_buffers
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kv_canary.fixtures import (
+    allocate_zeroed_verify_plan,
+)
+from sglang.test.kv_canary.fixtures import (
     DEFAULT_DEVICE,
     make_base_config,
     make_mha_pool,
@@ -76,7 +79,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
         canary_buf = torch.zeros(
             4, CANARY_SLOT_BYTES, dtype=torch.uint8, device=self.device
         )
-        plan = VerifyPlan.allocate(verify_capacity=1, device=self.device)
+        plan = allocate_zeroed_verify_plan(verify_capacity=1, device=self.device)
         violation_ring = torch.zeros(2, 8, dtype=torch.int64, device=self.device)
         violation_write_index = torch.zeros(1, dtype=torch.int32, device=self.device)
         slot_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)

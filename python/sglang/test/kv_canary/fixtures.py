@@ -7,15 +7,57 @@ from typing import List, Optional
 import torch
 
 from sglang.jit_kernel.kv_canary import consts
-from sglang.jit_kernel.kv_canary.verify import CANARY_SLOT_BYTES, RealKvSource
+from sglang.jit_kernel.kv_canary.verify import (
+    CANARY_SLOT_BYTES,
+    RealKvSource,
+    VerifyPlan,
+)
+from sglang.jit_kernel.kv_canary.write import WritePlan
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
 from sglang.srt.kv_canary.config import CanaryConfig, CanaryMode
+from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.pool_patch.adapters.mha import attach_mha
 from sglang.srt.kv_canary.pool_patch.adapters.swa import attach_swa
 from sglang.srt.kv_canary.pool_patch.api import register_pool_attacher
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 
 DEFAULT_DEVICE: torch.device = torch.device("cuda")
+
+
+def allocate_zeroed_verify_plan(
+    *, verify_capacity: int, device: torch.device
+) -> VerifyPlan:
+    # Production VerifyPlan.allocate uses torch.empty for perf. Tests byte-compare full tensors
+    # (incl. padding tail beyond verify_num_valid), so zero everything for determinism here.
+    plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=device)
+    plan.verify_slot_indices.zero_()
+    plan.verify_positions.zero_()
+    plan.verify_prev_slot_indices.zero_()
+    plan.verify_num_valid.zero_()
+    plan.enable.zero_()
+    return plan
+
+
+def allocate_zeroed_write_plan(
+    *, write_req_capacity: int, device: torch.device
+) -> WritePlan:
+    # Production WritePlan.allocate uses torch.empty for perf. Tests byte-compare full tensors,
+    # so zero everything for determinism here.
+    plan = WritePlan.allocate(write_req_capacity=write_req_capacity, device=device)
+    plan.write_offsets.zero_()
+    plan.write_seed_slot_indices.zero_()
+    plan.write_num_valid_reqs.zero_()
+    return plan
+
+
+def allocate_zeroed_expected_inputs(
+    *, capacity: int, device: torch.device
+) -> ExpectedInputs:
+    # Production ExpectedInputs.allocate uses torch.empty for perf. Zero in tests for determinism.
+    expected = ExpectedInputs.allocate(capacity=capacity, device=device)
+    expected.tokens.zero_()
+    expected.positions.zero_()
+    return expected
 
 
 @dataclass

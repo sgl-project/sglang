@@ -13,6 +13,11 @@ from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.runner import kernel_launch as kernel_launch_module
 from sglang.srt.kv_canary.state import ViolationLog
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kv_canary.fixtures import (
+    allocate_zeroed_verify_plan,
+    allocate_zeroed_write_plan,
+    allocate_zeroed_expected_inputs,
+)
 from sglang.test.kv_canary.fixtures import make_buffer_group, make_forward_batch
 from sglang.test.kv_canary.runner_test_base import (
     CanaryManagerTestCase,
@@ -92,10 +97,10 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
-            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
-            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            verify_plan=allocate_zeroed_verify_plan(verify_capacity=1, device=self.device),
+            write_plan=allocate_zeroed_write_plan(write_req_capacity=1, device=self.device),
             forward_batch=forward_batch,
-            expected_inputs=ExpectedInputs.allocate(capacity=3, device=self.device),
+            expected_inputs=allocate_zeroed_expected_inputs(capacity=3, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
             input_check_mode=False,
@@ -144,10 +149,10 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
-            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
-            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            verify_plan=allocate_zeroed_verify_plan(verify_capacity=1, device=self.device),
+            write_plan=allocate_zeroed_write_plan(write_req_capacity=1, device=self.device),
             forward_batch=forward_batch,
-            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            expected_inputs=allocate_zeroed_expected_inputs(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
             input_check_mode=False,
@@ -181,10 +186,10 @@ class TestLaunchEndpointsPerForward(CanaryManagerTestCase):
             endpoints=(endpoint,),
             group=group,
             tag_filter=lambda tag: True,
-            verify_plan=VerifyPlan.allocate(verify_capacity=1, device=self.device),
-            write_plan=WritePlan.allocate(write_req_capacity=1, device=self.device),
+            verify_plan=allocate_zeroed_verify_plan(verify_capacity=1, device=self.device),
+            write_plan=allocate_zeroed_write_plan(write_req_capacity=1, device=self.device),
             forward_batch=forward_batch,
-            expected_inputs=ExpectedInputs.allocate(capacity=1, device=self.device),
+            expected_inputs=allocate_zeroed_expected_inputs(capacity=1, device=self.device),
             violation_log=ViolationLog.allocate(ring_capacity=2, device=self.device),
             real_kv_hash_mode=RealKvHashMode.NONE,
             input_check_mode=False,
