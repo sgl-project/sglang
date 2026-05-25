@@ -5,6 +5,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
+import torch_npu
+import numpy as np
 
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     _NPULinearMethodBase,
@@ -20,6 +22,14 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
+from sglang.srt.layers.parameter import ChannelQuantScaleParameter, _ColumnvLLMParameter
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -139,7 +149,7 @@ class ModelSlimConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-
+        print(f"Layer type: {type(layer).__name__}")
         if isinstance(layer, LinearBase):
             # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
             key = "model"
@@ -166,6 +176,9 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             layer.scheme = self.get_moe_scheme(layer, prefix)
             return ModelSlimFusedMoEMethod(self)
+        elif isinstance(layer, RadixAttention):
+            print(f"In radix attention quant method")
+            return ModelSlimKVCacheMethod(self)
         return None
 
     def get_linear_scheme(
@@ -380,3 +393,171 @@ class ModelSlimFusedMoEMethod(FusedMoEMethodBase):
             group_list,
             output_dtype,
         )
+
+
+class ModelSlimKVCacheMethod(BaseKVCacheMethod):
+    def __init__(self, config):
+        super().__init__(config)
+
+    def rmse(self, predictions, targets):
+        return np.sqrt(((predictions.reshape(-1).float().cpu().numpy() - targets.reshape(-1).float().cpu().numpy()) ** 2).mean())
+
+    def create_weights(
+        self,
+        layer: nn.Module,
+        head_size: int,
+        num_kv_heads: int,
+        tp_rank: int,
+        **extra_weight_attrs,
+    ):
+        del layer.k_scale
+        del layer.v_scale
+        #print(f"Layer prefix: {layer.prefix}")
+        self.kv_size = num_kv_heads * head_size
+        #self.num_kv_heads_replicas = num_kv_heads_replicas
+        self.tp_rank = tp_rank
+
+        k_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_scale", k_scale)
+        v_scale = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_scale", v_scale)
+        k_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("k_offset", k_offset)
+        v_offset = ChannelQuantScaleParameter(
+            data=torch.full([self.kv_size], fill_value=-1, dtype=torch.float32),
+            output_dim=0,
+            weight_loader=self.weight_loader,
+        )
+        layer.register_parameter("v_offset", v_offset)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        print(f"-1 in k_scale: {(layer.k_scale == -1).all().item()}")
+        print(f"-1 in v_scale: {(layer.v_scale == -1).all().item()}")
+        device = layer.k_scale.device
+        dtype = torch.bfloat16
+
+        k_offset = torch.from_numpy(np.frombuffer(layer.k_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+        v_offset = torch.from_numpy(np.frombuffer(layer.v_offset.to(torch.float32).cpu().numpy().tobytes(), dtype=np.int32
+        ).copy()).to(device)
+
+        layer.k_quant_offset = torch.nn.Parameter(k_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_offset = torch.nn.Parameter(v_offset.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_dequant_scale = torch.nn.Parameter(layer.k_scale.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_dequant_scale = torch.nn.Parameter(layer.v_scale.to(dtype), requires_grad=False).unsqueeze(0)
+        layer.k_quant_scale = torch.nn.Parameter(layer.k_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+        layer.v_quant_scale = torch.nn.Parameter(layer.v_scale.reciprocal().to(dtype), requires_grad=False).unsqueeze(0)
+
+    def anti_quant_int8(self, k_cache, v_cache, layer):
+        old_shape = k_cache.shape
+        #print(f"k cache shape: {k_cache.shape}")
+        #print(f"k scale shape: {layer.k_scale.shape}")
+        k_cache = k_cache.view(-1, self.kv_size)
+        v_cache = v_cache.view(-1, self.kv_size)
+        print(f"new k cache shape: {k_cache.shape}")
+        k_cache = torch_npu.npu_anti_quant(
+            x=k_cache,
+            scale=layer.k_scale,
+            dst_dtype=torch.bfloat16
+        )
+        v_cache = torch_npu.npu_anti_quant(
+            x=v_cache,
+            scale=layer.v_scale,
+            dst_dtype=torch.bfloat16
+        )
+        k_cache = k_cache.view(old_shape)
+        v_cache = v_cache.view(old_shape)
+
+        #print(f"RMSE of k cache before and after anti quant: {self.rmse(k_cache, k_cache_anti_quant)}")
+        #print(f"RMSE of v cache before and after anti quant: {self.rmse(v_cache, v_cache_anti_quant)}")
+        return k_cache, v_cache
+
+    def apply(self, k_cache, v_cache, layer):
+        #print(f"k_cache shape:{k_cache.shape}")
+        #print(f"k quant scale shape: {layer.k_quant_scale.shape}")
+        old_shape = k_cache.shape
+        k_cache = k_cache.view(-1, self.kv_size)
+        #print(f"new k_cache shape: {k_cache.shape}")
+        v_cache = v_cache.view(-1, self.kv_size)
+
+        key_int8 = torch_npu.npu_quantize(
+                    k_cache,
+                    layer.k_quant_scale.squeeze(),
+                    layer.k_quant_offset.squeeze() if hasattr(layer,"k_quant_offset") else None,
+                    torch.qint8,
+                    -1,
+                    False)
+
+        value_int8 = torch_npu.npu_quantize(
+                    v_cache,
+                    layer.v_quant_scale.squeeze(),
+                    layer.v_quant_offset.squeeze() if hasattr(layer,"v_quant_offset") else None,
+                    torch.qint8,
+                    -1,
+                    False)
+        
+        # key_bf16 = torch_npu.npu_anti_quant(
+        #     x=key_int8,
+        #     scale=layer.k_scale,
+        #     dst_dtype=torch.bfloat16
+        # )
+
+        # value_bf16 = torch_npu.npu_anti_quant(
+        #     x=value_int8,
+        #     scale=layer.v_scale,
+        #     dst_dtype=torch.bfloat16
+        # )
+
+        # key_bf16 = key_bf16.view(old_shape)
+        # value_bf16 = value_bf16.view(old_shape)
+
+        #key_int8_dynamic, layer.k_quant_scale = torch_npu.npu_dynamic_quant(k_cache)
+        #value_int8_dynamic, layer.v_quant_scale = torch_npu.npu_dynamic_quant(v_cache)
+        #layer.k_quant_scale = layer.k_quant_scale.to(torch.bfloat16).unsqueeze(1)
+        #layer.v_quant_scale = layer.v_quant_scale.to(torch.bfloat16).unsqueeze(1)
+        #print(f"layer k_quant_scale dtype: {layer.k_quant_scale.dtype}")
+        #print(f"layer v_quant_scale dtype: {layer.v_quant_scale.dtype}")
+        # k_cache = k_cache.view(old_shape)
+        # v_cache = v_cache.view(old_shape)
+
+        key_int8 = key_int8.view(old_shape)
+        value_int8 = value_int8.view(old_shape)
+
+        #key_int8_dynamic = key_int8_dynamic.view(old_shape)
+        #value_int8_dynamic = value_int8_dynamic.view(old_shape)
+
+        # print(f"k_cache shape: {k_cache.shape}")
+        # print(f"v_cache shape: {v_cache.shape}")
+        # print(f"key_int8 shape: {key_int8.shape}")
+        # print(f"value_int8 shape: {value_int8.shape}")
+        # print(f"RMSE of k cache before and after quant: {self.rmse(k_cache, key_int8)}")
+        # print(f"RMSE of v cache before and after quant: {self.rmse(v_cache, value_int8)}")
+
+        # print(f"RMSE of k cache before and after dynamic quant: {self.rmse(k_cache, key_int8_dynamic)}")
+        # print(f"RMSE of v cache before and after dynamic quant: {self.rmse(v_cache, value_int8_dynamic)}")
+
+        #return key_bf16, value_bf16
+        return key_int8, value_int8
+        #return key_int8_dynamic, value_int8_dynamic
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if isinstance(param, _ColumnvLLMParameter):
+            print(f"Loading kv cache scales...")
+            param.load_column_parallel_weight(
+                loaded_weight,
+                tp_rank=self.tp_rank,
+                use_presharded_weights=False,
+            )
+        

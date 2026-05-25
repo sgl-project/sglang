@@ -1384,6 +1384,16 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
     for quark_scale_name, sglang_scale_name in quark_scale_names.items():
         if name.endswith(quark_scale_name):
             return name.replace(quark_scale_name, sglang_scale_name)
+    
+    modelslim_scale_names = {
+        ".k_proj.kv_cache_scale" : ".attn.k_scale",
+        ".v_proj.kv_cache_scale" : ".attn.v_scale",
+        ".k_proj.kv_cache_offset" : ".attn.k_offset",
+        ".v_proj.kv_cache_offset" : ".attn.v_offset",
+    }
+    for modelslim_scale_name, sglang_scale_name in modelslim_scale_names.items():
+        if name.endswith(modelslim_scale_name):
+            return name.replace(modelslim_scale_name, sglang_scale_name)
 
     # If there were no matches, return the untouched param name
     return name

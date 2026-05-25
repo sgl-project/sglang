@@ -147,6 +147,8 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            tp_rank=attn_tp_rank,
+            quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
         )
         self.alt_stream = alt_stream
@@ -636,7 +638,7 @@ class Qwen3ForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            if "scale" in name:
+            if ("kv_cache_offset" in name) or ("scale" in name):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
