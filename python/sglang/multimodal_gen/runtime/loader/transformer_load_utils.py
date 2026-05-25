@@ -497,7 +497,11 @@ def _resolve_quant_config(
             return get_quant_config(hf_config, component_model_path)
 
         quant_cls = get_quantization_config(server_args.quantization)
-        return quant_cls.from_config({})
+        try:
+            return quant_cls.from_config({})
+        except (ValueError, KeyError):
+            ignored = getattr(server_args, "quantization_ignored_layers", None)
+            return quant_cls(ignored_layers=ignored)
 
     quant_config = get_quant_config(hf_config, component_model_path)
     if quant_config is None and server_args.transformer_weights_path:
