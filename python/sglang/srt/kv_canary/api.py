@@ -94,12 +94,6 @@ def install_canary(
     return manager
 
 
-def get_canary_manager(model_runner: "ModelRunner") -> Optional[CanaryManager]:
-    """Return the manager attached to this ModelRunner, or None if canary
-    was not installed."""
-    return model_runner.canary_runner
-
-
 def _patch_model_forward(
     *, model_runner: "ModelRunner", manager: CanaryManager
 ) -> None:

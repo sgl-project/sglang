@@ -69,7 +69,6 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.kv_canary.api import get_canary_manager
 from sglang.srt.layers.attention.mamba.ops import (
     initialize_mamba_selective_state_update_backend,
 )
@@ -453,10 +452,8 @@ class Scheduler(
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
 
-        if (
-            canary_manager := get_canary_manager(self.tp_worker.model_runner)
-        ) is not None:
-            canary_manager.attach_radix_cache(self.tree_cache)
+        if (c := self.tp_worker.model_runner.canary_runner) is not None:
+            c.attach_radix_cache(self.tree_cache)
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
