@@ -332,7 +332,11 @@ print(final_response.choices[0].message.content)
 # Output: "The weather in Beijing is currently 22°C and sunny."
 ```
 
-#### 4.2.3 Thinking Budget
+#### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
+
+DeepSeek-R1 supports EAGLE-based Multi-Token Prediction (MTP), the same mechanism as DeepSeek-V3. Refer to [DeepSeek-V3 §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#multi-token-prediction-eagle-speculative-decoding) for the complete launch command, flag reference, tuning guidance (`--speculative-num-steps`, `--speculative-eagle-topk`, `--max-running-requests`), and `bench_speculative.py` link. R1's speed benchmark commands that include `--speculative-*` flags use this mechanism.
+
+#### 4.2.4 Thinking Budget
 
 Limit the model's thinking token budget using `CustomLogitProcessor`. Launch with `--enable-custom-logit-processor`:
 

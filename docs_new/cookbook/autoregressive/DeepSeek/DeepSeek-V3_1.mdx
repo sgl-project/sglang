@@ -368,6 +368,10 @@ print(final_response.choices[0].message.content)
 # Output: "Currently, it is **22°C and sunny** in Beijing."
 ```
 
+#### 4.2.3 Multi-Token Prediction (EAGLE Speculative Decoding)
+
+DeepSeek-V3.1 shares the same architecture as DeepSeek-V3 and supports the same EAGLE-based MTP speculative decoding path. Refer to [DeepSeek-V3 §4.2.3](/cookbook/autoregressive/DeepSeek/DeepSeek-V3#multi-token-prediction-eagle-speculative-decoding) for the full configuration, tuning guidance, and `bench_speculative.py` reference. The `--speculative-num-steps`, `--speculative-eagle-topk`, and `--max-running-requests` recommendations apply equally to V3.1.
+
 ## 5. Benchmark
 
 ### 5.1 Speed Benchmark

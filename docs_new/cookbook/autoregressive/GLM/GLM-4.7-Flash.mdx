@@ -146,6 +146,10 @@ The answer is 36. To find 15% of 240, we multiply 240 by 0.15, which equals 36.
 
 #### 4.2.2 Tool Calling
 
+<Note>
+**Parser names by model:** GLM-4.5 and GLM-4.6 use `--tool-call-parser glm45`. GLM-4.7 and GLM-4.7-Flash use `--tool-call-parser glm47`. The same applies to `--reasoning-parser`. Do not mix parsers across model generations.
+</Note>
+
 GLM-4.7-Flash supports tool calling capabilities. Enable the tool call parser:
 
 ```shell Command

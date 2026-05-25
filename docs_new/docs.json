@@ -203,35 +203,35 @@
     },
     {
       "source": "/basic_usage/deepseek_ocr.html",
-      "destination": "/docs/basic_usage/deepseek_ocr"
+      "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR"
     },
     {
       "source": "/basic_usage/deepseek_v3.html",
-      "destination": "/docs/basic_usage/deepseek_v3"
+      "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3"
     },
     {
       "source": "/basic_usage/deepseek_v32.html",
-      "destination": "/docs/basic_usage/deepseek_v32"
+      "destination": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2"
     },
     {
       "source": "/basic_usage/glm45.html",
-      "destination": "/docs/basic_usage/glm45"
+      "destination": "/cookbook/autoregressive/GLM/GLM-4.5"
     },
     {
       "source": "/basic_usage/glmv.html",
-      "destination": "/docs/basic_usage/glmv"
+      "destination": "/cookbook/autoregressive/GLM/GLM-4.6V"
     },
     {
       "source": "/basic_usage/gpt_oss.html",
-      "destination": "/docs/basic_usage/gpt_oss"
+      "destination": "/cookbook/autoregressive/OpenAI/GPT-OSS"
     },
     {
       "source": "/basic_usage/llama4.html",
-      "destination": "/docs/basic_usage/llama4"
+      "destination": "/cookbook/autoregressive/Llama/Llama4"
     },
     {
       "source": "/basic_usage/minimax_m2.html",
-      "destination": "/docs/basic_usage/minimax_m2"
+      "destination": "/cookbook/autoregressive/MiniMax/MiniMax-M2"
     },
     {
       "source": "/basic_usage/native_api.html",
@@ -263,19 +263,19 @@
     },
     {
       "source": "/basic_usage/popular_model_usage.html",
-      "destination": "/docs/basic_usage/popular_model_usage"
+      "destination": "/cookbook/autoregressive/intro"
     },
     {
       "source": "/basic_usage/qwen3.html",
-      "destination": "/docs/basic_usage/qwen3"
+      "destination": "/cookbook/autoregressive/Qwen/Qwen3"
     },
     {
       "source": "/basic_usage/qwen3_5.html",
-      "destination": "/docs/basic_usage/qwen3_5"
+      "destination": "/cookbook/autoregressive/Qwen/Qwen3.5"
     },
     {
       "source": "/basic_usage/qwen3_vl.html",
-      "destination": "/docs/basic_usage/qwen3_vl"
+      "destination": "/cookbook/autoregressive/Qwen/Qwen3-VL"
     },
     {
       "source": "/basic_usage/sampling_params.html",
