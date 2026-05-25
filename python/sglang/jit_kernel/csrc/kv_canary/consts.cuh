@@ -10,6 +10,7 @@ constexpr uint64_t kCanaryChainAnchor = 0xC0FFEE1234567890ULL;
 // writes. Since req_to_token stores token-to-KV slot ids and is zero-initialized, canary slot 0 is skipped
 // instead of treating unfilled entries as real KV slots.
 constexpr int64_t kTokenToKvSlotPadding = 0;
+constexpr int64_t kReqPoolIdxPadding = 0;
 
 constexpr int kCanaryFieldsPerSlot = 4;
 constexpr int kCanaryFieldToken = 0;
@@ -45,7 +46,7 @@ constexpr FailReason& operator|=(FailReason& a, FailReason b) {
 }
 
 enum class RealKvHashMode : int32_t {
-  kOff = 0,
+  kNone = 0,
   kPartial = 1,
   kAll = 2,
 };

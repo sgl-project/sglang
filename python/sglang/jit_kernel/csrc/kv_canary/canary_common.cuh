@@ -67,7 +67,7 @@ SGL_DEVICE uint64_t real_kv_fold_one_source(const RealKvSourceHandle& src, int64
 // field is always 0).
 SGL_DEVICE uint64_t
 real_kv_fold_sources(const RealKvSourceHandle* sources, int num_sources, int64_t slot_idx, RealKvHashMode mode) {
-  if (mode == RealKvHashMode::kOff || num_sources <= 0) {
+  if (mode == RealKvHashMode::kNone || num_sources <= 0) {
     return 0ULL;
   }
   uint64_t acc = 0ULL;
