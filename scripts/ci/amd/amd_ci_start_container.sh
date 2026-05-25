@@ -278,12 +278,18 @@ elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then
 else
   # Find the latest pre-built image
   IMAGE=$(find_latest_image "${GPU_ARCH}")
+  # Ad-hoc suffixed test images are intentionally NOT mirrored to the local
+  # registry by the nightly workflow, so skip that hop and pull straight from
+  # Docker Hub to avoid a guaranteed-failure attempt.
+  if [[ -n "${TAG_SUFFIX}" ]]; then
+    echo "Image suffix set; pulling suffixed image directly from public registry: ${IMAGE}"
+    retry_with_backoff 6 docker pull "${IMAGE}"
   # Try the local docker registry first (avoids Docker Hub rate limits and is
   # faster on the LAN); if that fails for any reason, fall back to the
   # public registry with exponential-backoff retries. Capture stderr so the
   # real failure reason (TLS handshake, 404, connection refused, etc.) is
   # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+  elif local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
     echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
     docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
