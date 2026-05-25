@@ -40,6 +40,8 @@ Prefill GPU  ──RDMA──▶  Decode Host Pool (CPU pinned memory)
                      swap-in kernel (on-demand top-k)
 ```
 
+For DeepSeek V4, the direct-to-host path writes only C4 KV into the decode host pool. The c4_indexer and C128 KV remain device-to-device transfers.
+
 ## Server Arguments
 
 | Argument | Type / Default | Description |
@@ -122,15 +124,12 @@ python3 -m sglang.bench_serving \
 ### Key Notes
 
 - The prefill instance does not need `--enable-hisparse`; it is unaware of HiSparse.
-- On the decode instance, the following flags are **required** for HiSparse:
-  - `--kv-cache-dtype` — supports `bfloat16` or `fp8_e4m3`:
-    - `bfloat16` → automatically uses `flashmla_sparse` as DSA decode backend.
-    - `fp8_e4m3` → automatically uses `flashmla_kv` as DSA decode backend.
-  - `--enable-hisparse` — enables HiSparse.
-  - `--hisparse-config` — HiSparse configuration (top_k, device_buffer_size, host_to_device_ratio).
-    - `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
-      - **~1 TB** host memory → `host_to_device_ratio: 5`
-      - **~2 TB** host memory → `host_to_device_ratio: 10`
+- On the decode instance, `--enable-hisparse` and `--hisparse-config` are required for HiSparse.
+- For DSA models, `--kv-cache-dtype bfloat16` uses `flashmla_sparse`, and `--kv-cache-dtype fp8_e4m3` uses `flashmla_kv`.
+- For DeepSeek V4, do not pass DSA backend flags. DeepSeek V4 uses the `dsv4` attention backend and `fp8_e4m3` KV cache by default.
+- `host_to_device_ratio` should be configured based on the host machine's available memory. For example:
+  - **~1 TB** host memory → `host_to_device_ratio: 5`
+  - **~2 TB** host memory → `host_to_device_ratio: 10`
 
 ## Acknowledgments
 
