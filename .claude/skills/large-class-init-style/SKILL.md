@@ -1,5 +1,5 @@
 ---
-name: scheduler-init-style
+name: large-class-init-style
 description: '`__init__` style for SGLang `Scheduler`, `TokenizerManager`, and `ModelRunner`. Use when modifying the `__init__` of any of these three classes, or reviewing changes that add new construction logic to them.'
 ---
 
