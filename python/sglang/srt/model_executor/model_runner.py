@@ -3194,7 +3194,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
 
-        if not self.is_draft_worker and (c := self.canary_manager is not None):
+        if not self.is_draft_worker and ((c := self.canary_manager) is not None):
             canary_outside_ctx = c.with_ops_outside_graph(
                 single_forward_indices=[0],
                 maybe_inaccurate_forward_batch=forward_batch,
