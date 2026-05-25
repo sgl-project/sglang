@@ -47,7 +47,7 @@ if _is_hip:
     )
 
 if _is_xpu:
-    from sgl_kernel import fused_qk_rope_with_cos_sin_cache
+    from sgl_kernel import fused_qk_rope_with_cos_sin_cache_inplace
 
 
 class RotaryEmbedding(MultiPlatformOp):
@@ -430,7 +430,7 @@ class RotaryEmbedding(MultiPlatformOp):
             if self.head_size != self.rotary_dim:
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]
-            fused_qk_rope_with_cos_sin_cache(
+            fused_qk_rope_with_cos_sin_cache_inplace(
                 q_rope,
                 k_rope,
                 self.cos_sin_cache,
