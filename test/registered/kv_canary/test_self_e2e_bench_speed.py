@@ -217,27 +217,33 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
+        # TODO: tighten further once the per-forward elementwise glue + plan_offsets
+        # single-program kernel are optimized (observed ~2.17% on Qwen3-30B-A3B, H200).
         self._measure_overhead(
             batch_size=32,
             input_len=16384,
             output_len=1,
-            max_overhead_pct=5.0,
+            max_overhead_pct=3.0,
         )
 
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
+        # TODO: tighten further once per-forward canary glue is reduced (observed ~0.52% on
+        # Qwen3-30B-A3B, H200 — already amortizes well at bs=128).
         self._measure_overhead(
             batch_size=128,
             input_len=512,
             output_len=1024,
-            max_overhead_pct=5.0,
+            max_overhead_pct=1.0,
         )
 
     def test_qwen3_decode_overhead_bs1_isl512_osl1024(self) -> None:
+        # TODO: tighten further once the per-forward elementwise glue + plan_offsets
+        # single-program kernel are optimized (observed ~2.10% on Qwen3-30B-A3B, H200).
         self._measure_overhead(
             batch_size=1,
             input_len=512,
             output_len=1024,
-            max_overhead_pct=5.0,
+            max_overhead_pct=3.0,
         )
 
 
