@@ -566,6 +566,16 @@ class DecodePreallocQueue:
 
                 self.tree_cache.ready_to_load_host_cache()
 
+        logger.debug(
+            "[HiCache][load_back_and_lock] req=%s L1_gpu_hit=%d "
+            "L2_host_hit=%d L2_load_back=%d total_prefix=%d",
+            req.rid,
+            len(match_result.device_indices),
+            host_hit_length,
+            load_back_tokens,
+            len(prefix_indices),
+        )
+
         lock_delta = 0
         if len(prefix_indices) > 0:
             lock_result = self.tree_cache.inc_lock_ref(last_device_node)
