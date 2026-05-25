@@ -709,6 +709,8 @@ class MQALayer(nn.Module):
         ) and self._index_cache_enabled_for_batch(forward_batch)
 
     def _index_cache_enabled_for_batch(self, forward_batch: ForwardBatch) -> bool:
+        if forward_batch.forward_mode.is_target_verify():
+            return False
         if self.index_topk_min_seq_len <= 0:
             return True
         if get_is_capture_mode():

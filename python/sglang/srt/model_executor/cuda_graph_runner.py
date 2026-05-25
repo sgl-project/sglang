@@ -801,7 +801,7 @@ class CudaGraphRunner:
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -818,6 +818,9 @@ class CudaGraphRunner:
 
     def capture(self) -> None:
         def _capture_one_stream(stream_idx: Optional[int] = None):
+            index_cache_graph_key = getattr(
+                self, "_index_cache_graph_key", lambda key, _: key
+            )
             avail_mem = get_available_gpu_memory(
                 self.model_runner.device,
                 self.model_runner.gpu_id,
@@ -852,7 +855,7 @@ class CudaGraphRunner:
                     ) = self.capture_one_batch_size(bs, forward, stream_idx)
                     # For pd_multiplexing, we need to save the graph and output buffers
                     key = bs if stream_idx is None else f"{stream_idx}_{bs}"
-                    key = self._index_cache_graph_key(
+                    key = index_cache_graph_key(
                         key,
                         self.index_cache_capture_enabled,
                     )
@@ -860,7 +863,10 @@ class CudaGraphRunner:
                     self.output_buffers[key] = output_buffers
 
         try:
-            for index_cache_enabled in self._index_cache_capture_variants():
+            index_cache_capture_variants = getattr(
+                self, "_index_cache_capture_variants", lambda: (None,)
+            )
+            for index_cache_enabled in index_cache_capture_variants():
                 profile_context = empty_context()
                 if self.enable_profile_cuda_graph:
                     profile_context = self._init_profile_context_and_memory_record()

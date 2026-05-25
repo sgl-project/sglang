@@ -491,3 +491,41 @@ def test_dsv4_index_cache_profile_disabled_path_uses_cached_flag():
             break
     else:
         raise AssertionError("profile_region not found")
+
+
+def test_dsv4_index_cache_cuda_graph_capture_supports_pseudo_runners():
+    path = (
+        Path(__file__).parents[3]
+        / "python/sglang/srt/model_executor/cuda_graph_runner.py"
+    )
+    source = path.read_text()
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "capture":
+            function_source = ast.get_source_segment(source, node)
+            assert function_source is not None
+            assert '"_index_cache_capture_variants", lambda: (None,)' in function_source
+            assert '"_index_cache_graph_key", lambda key, _: key' in function_source
+            break
+    else:
+        raise AssertionError("CudaGraphRunner.capture not found")
+
+
+def test_dsv4_index_cache_is_disabled_for_target_verify():
+    path = Path(__file__).parents[3] / "python/sglang/srt/models/deepseek_v4.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "_index_cache_enabled_for_batch"
+        ):
+            function_source = ast.get_source_segment(source, node)
+            assert function_source is not None
+            assert "forward_batch.forward_mode.is_target_verify()" in function_source
+            assert "return False" in function_source
+            break
+    else:
+        raise AssertionError("_index_cache_enabled_for_batch not found")
