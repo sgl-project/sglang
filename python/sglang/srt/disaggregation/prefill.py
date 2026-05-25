@@ -489,10 +489,14 @@ class SchedulerDisaggregationPrefillMixin:
         #   target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX)
         #   where t = (avg_tokens - min_tokens) / (sat_tokens - min_tokens)
         #
-        # Short prompts (near min_tokens) → more iterations (smaller groups)
-        # → better overlap of transfer with GPU compute.
-        # Long prompts (≥ sat_tokens) → fewer iterations (larger groups)
-        # → less per-group dispatch overhead since compute already dominates.
+        # Pipeline total time:
+        #   Good bandwidth (T<C): total = C + T/N  (last group's xfer exposed)
+        #   Poor bandwidth (T>C): total = C/N + T  (first group's compute exposed)
+        #
+        # Short prompts: T/C ratio is high (attention is O(n²), xfer is O(n)),
+        #   need more groups to reduce exposed time (T/N or C/N).
+        # Long prompts: compute dominates (T<<C), even few groups hide most
+        #   transfer; extra groups only add per-group overhead for little gain.
         max_iters = envs.SGLANG_PIPELINE_MAX_ITERS.get()
         min_iters = envs.SGLANG_PIPELINE_MIN_ITERS.get()
         sat_tokens = min_tokens * 3  # saturation point

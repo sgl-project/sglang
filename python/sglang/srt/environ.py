@@ -293,8 +293,8 @@ class Envs:
     # Adaptive iteration bounds for the pipeline formula:
     # target_iters = clamp(MAX - t*(MAX-MIN), MIN, MAX) where
     # t = (avg_tokens - MIN_TOKENS) / (MIN_TOKENS * 2).
-    # MAX_ITERS: iteration count for shortest eligible prompts (more groups = more overlap).
-    # MIN_ITERS: floor for very long prompts (fewer groups = less overhead).
+    # MAX_ITERS: more groups for short prompts (reduces exposed T/N or C/N).
+    # MIN_ITERS: fewer groups for long prompts (compute already hides transfer).
     SGLANG_PIPELINE_MAX_ITERS = EnvInt(10)
     SGLANG_PIPELINE_MIN_ITERS = EnvInt(4)
 
