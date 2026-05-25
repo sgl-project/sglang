@@ -1000,9 +1000,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     )
                 else:
                     layer.w13_weight = Parameter(
-                        torch.nn.functional.pad(
-                            w13_data, (0, 0, 0, pad_amount)
-                        ),
+                        torch.nn.functional.pad(w13_data, (0, 0, 0, pad_amount)),
                         requires_grad=False,
                     )
                 layer.w2_weight = Parameter(
