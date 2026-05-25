@@ -417,6 +417,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use deterministic FlashInfer topk kernels when <code>--dsa-topk-backend=flashinfer</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Tie-break mode for FlashInfer DSA topk when <code>--dsa-topk-backend=flashinfer</code>: unset disables explicit tie-breaking, <code>small</code> prefers the smaller candidate index for equal scores, and <code>large</code> prefers the larger candidate index for equal scores. Setting this variable makes FlashInfer use deterministic topk.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>unset</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Precompute metadata that can be shared among different draft steps when MTP is enabled. <code>SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA</code> is a deprecated alias.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
