@@ -107,4 +107,3 @@ class SimplePhaseChecker:
                 f"{registry[caller_name]} <- {caller_name!r}"
             )
         return registry[caller_name]
-

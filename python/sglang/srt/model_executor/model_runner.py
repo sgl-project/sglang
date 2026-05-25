@@ -35,7 +35,6 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.jit_kernel.ngram_embedding import update_token_table
-from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
@@ -107,6 +106,7 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.api import install_canary
+from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.kv_canary.token_oracle.install import install_token_oracle_from_env
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (

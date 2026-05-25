@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from typing import Dict
 
-from sglang.srt.environ import envs
-
 from sglang.srt.debug_utils.source_patcher import apply_patches_from_config
+from sglang.srt.environ import envs
 
 _PR_REVERT_YAML_25015 = """
 patches:

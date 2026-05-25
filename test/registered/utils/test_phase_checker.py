@@ -75,18 +75,14 @@ class TestUpdateAssertDisabled(CustomTestCase):
 
     def test_update_advances_phase_on_match(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
-        checker.update(
-            expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t"
-        )
+        checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t")
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
     def test_update_advances_phase_on_mismatch(self) -> None:
         """assert OFF tolerates mismatches — store still happens unconditionally."""
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
-        checker.update(
-            expect_phase=_Phase.C, next_phase=_Phase.B, caller_name="t"
-        )
+        checker.update(expect_phase=_Phase.C, next_phase=_Phase.B, caller_name="t")
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
@@ -94,9 +90,7 @@ class TestUpdateAssertDisabled(CustomTestCase):
         """Documented use case: pre-enable_assert work may freely violate the lifecycle."""
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         # Bogus sequence — would all mismatch if assert were on.
-        checker.update(
-            expect_phase=_Phase.B, next_phase=_Phase.C, caller_name="warmup"
-        )
+        checker.update(expect_phase=_Phase.B, next_phase=_Phase.C, caller_name="warmup")
         checker.update(
             expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="warmup"
         )
@@ -117,9 +111,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
     def test_update_advances_phase_on_match(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.enable_assert()
-        checker.update(
-            expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t"
-        )
+        checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="t")
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.A))
 
@@ -131,12 +123,8 @@ class TestUpdateAssertEnabled(CustomTestCase):
             checker.update(
                 expect_phase=_Phase.IDLE, next_phase=_Phase.A, caller_name="p1"
             )
-            checker.update(
-                expect_phase=_Phase.A, next_phase=_Phase.B, caller_name="p2"
-            )
-            checker.update(
-                expect_phase=_Phase.B, next_phase=_Phase.C, caller_name="p3"
-            )
+            checker.update(expect_phase=_Phase.A, next_phase=_Phase.B, caller_name="p2")
+            checker.update(expect_phase=_Phase.B, next_phase=_Phase.C, caller_name="p3")
             checker.update(
                 expect_phase=_Phase.C, next_phase=_Phase.IDLE, caller_name="p4"
             )
@@ -148,8 +136,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
 
         Run in a subprocess because device-side asserts poison the CUDA context.
         """
-        script = textwrap.dedent(
-            """
+        script = textwrap.dedent("""
             import sys
 
             import torch
@@ -171,8 +158,7 @@ class TestUpdateAssertEnabled(CustomTestCase):
                 sys.exit(2)
             print("expected RuntimeError but none was raised", file=sys.stderr)
             sys.exit(1)
-            """
-        )
+            """)
         result = subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True,
@@ -243,9 +229,7 @@ class TestResetToIdle(CustomTestCase):
 
     def test_reset_after_update_restores_initial_phase(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
-        checker.update(
-            expect_phase=_Phase.IDLE, next_phase=_Phase.B, caller_name="t"
-        )
+        checker.update(expect_phase=_Phase.IDLE, next_phase=_Phase.B, caller_name="t")
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
@@ -316,9 +300,7 @@ class TestCallerTagRegistry(CustomTestCase):
             expect_phase=_Phase.A, next_phase=_Phase.IDLE, caller_name="beta"
         )
         torch.cuda.synchronize()
-        self.assertEqual(
-            checker._caller_tag_registry, {"alpha": 1, "beta": 2}
-        )
+        self.assertEqual(checker._caller_tag_registry, {"alpha": 1, "beta": 2})
 
 
 class TestMultipleInstances(CustomTestCase):
