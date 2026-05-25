@@ -17,12 +17,7 @@ CANARY_SLOT_BYTES: Final[int] = consts.CANARY_FIELDS_PER_SLOT * 8
 
 
 class CanaryLaunchTag(IntEnum):
-    """Unique tag per (head | tail | sweep) × (K | V) × (FULL | SWA) launch.
-
-    **Python-only — no C++ mirror.** Kernel just stamps the int value into every violation row's kernel_kind
-    field; only the Python host reader decodes the tag to attribute violations back to launch slots. Runner
-    assigns one tag per launch slot it owns.
-    """
+    """Unique tag per (head | tail | sweep) × (K | V) × (FULL | SWA) launch."""
 
     HEAD_K_FULL = 0
     HEAD_V_FULL = 1
@@ -39,12 +34,6 @@ class CanaryLaunchTag(IntEnum):
 
 
 def _assert_contiguous(tensor: torch.Tensor, name: str) -> None:
-    """Fail loud when a tensor whose data_ptr() flows into the canary CUDA ABI is non-contiguous.
-
-    The CUDA kernels treat every input tensor as a raw byte/word buffer indexed by element offsets, so a
-    non-contiguous input would silently corrupt the read/write. We refuse rather than silently call
-    ``.contiguous()`` so the caller fixes the upstream allocation.
-    """
     if not tensor.is_contiguous():
         raise ValueError(f"kv-canary: {name} must be contiguous")
 
@@ -111,9 +100,6 @@ class RealKvSource:
                 f"kv-canary: RealKvSource.num_bytes_per_token must be a positive multiple of 16, "
                 f"got {self.num_bytes_per_token}"
             )
-        # ``read_bytes`` must be positive and a multiple of 16. Callers that want "no contribution" omit
-        # the source from the tuple entirely (see make_row_source / make_packed_source, which return an
-        # empty tuple for the zero-byte case) — there is no zero-sentinel.
         if (
             self.read_bytes <= 0
             or self.read_bytes > self.num_bytes_per_token
@@ -350,18 +336,6 @@ def _build_real_kv_source_abi(
     real_kv_sources: tuple[RealKvSource, ...],
     device: torch.device,
 ) -> tuple[list[torch.Tensor], torch.Tensor]:
-    """Pad a RealKvSource tuple up to consts.MAX_REAL_KV_SOURCES dummy entries and build the (bufs, params) ABI.
-
-    The kernel iterates only ``sources[0..num_sources)`` (caller passes ``num_sources = len(real_kv_sources)``
-    separately), so trailing padding bufs/params are never dereferenced; their contents are arbitrary.
-
-    Returns:
-        padded_bufs: list of length consts.MAX_REAL_KV_SOURCES; uint8 2-D tensors on ``device``. Padding
-            tail is filled with a tiny 1-byte placeholder that the kernel never reads.
-        source_params: int32 tensor on CPU, shape [consts.MAX_REAL_KV_SOURCES, 3]. Leading rows hold each
-            source's (page_size, num_bytes_per_token, read_bytes); padding rows are left as the initial
-            zeros and never read.
-    """
     padded_bufs: list[torch.Tensor] = []
     params = torch.zeros(
         (consts.MAX_REAL_KV_SOURCES, consts.REAL_KV_SOURCE_FIELDS_PER_ENTRY),

@@ -160,22 +160,6 @@ def _to_signed_int64(value: int) -> int:
 
 
 def compute_slot_hash(buf_i64: torch.Tensor, source_slot_idx: int) -> int:
-    """Compute the chain-step hash of ``source_slot_idx``: load (token, position, prev_hash) from that slot
-    and fold them through splitmix64_mix3. The result is the chain hash that the slot immediately following
-    ``source_slot_idx`` should store as its prev_hash.
-
-    real_kv_hash is intentionally NOT folded in: under radix prefix sharing,
-    ``RadixCache.cache_unfinished_req`` remaps ``req_to_token[req, P]`` from a req's own freshly-written
-    slot to a shared slot owned by another req. The shared slot's (token, position, prev_hash) match by
-    definition (same prompt → same content chain), but its real_kv_hash reflects the donor req's KV values
-    and would not equal the consumer req's stored chain. Excluding real_kv_hash keeps the chain pure-content
-    and immune to legitimate radix folding. real_kv_hash field corruption is still caught by the standalone
-    real_kv_hash field check on each slot (per-forward verify + periodic sweep).
-
-    ``source_slot_idx < 0`` signals "no predecessor"; the chain anchors on ``splitmix64(CANARY_CHAIN_ANCHOR)``.
-    Output is a uint64; the caller applies ``_to_signed_int64`` if a signed-storage view is needed. Mirrors
-    ``compute_slot_hash`` in csrc/kv_canary/canary_common.cuh.
-    """
     if source_slot_idx < 0:
         return splitmix64(consts.CANARY_CHAIN_ANCHOR)
     token = int(buf_i64[source_slot_idx, consts.CANARY_FIELD_TOKEN].item())
@@ -191,14 +175,6 @@ def _compute_real_kv_hash_scalar(
     real_kv_hash_mode: consts.RealKvHashMode,
     work_device: torch.device,
 ) -> int:
-    """Compute one uint64 real-KV fingerprint for a single slot index.
-
-    Off mode or no sources -> 0. PARTIAL mode -> splitmix64-fold exactly the first 16 bytes
-    (little-endian word-pack, 2 words). ALL mode -> splitmix64-fold every 8-byte little-endian word.
-    Each source's contribution is mixed into the running accumulator via splitmix64(acc ^ source_hash).
-    With the 16B-aligned contract, read_bytes is always >= 16 when non-zero, so PARTIAL collapses to a
-    constant 16B prefix.
-    """
     mode = int(real_kv_hash_mode)
     if mode == int(consts.RealKvHashMode.OFF) or len(real_kv_sources) == 0:
         return 0
