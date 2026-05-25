@@ -742,8 +742,8 @@ class SkillLoadError(Exception):
 
 
 # Required sections to extract from SKILL.md. If any are missing after a
-# rename or restructuring, the script raises SkillLoadError so the team
-# gets a Slack notification instead of silently falling back.
+# rename or restructuring, the script raises SkillLoadError instead of
+# silently falling back.
 _REQUIRED_SKILL_SECTIONS = {
     "Key Patterns to Recognize": r"## Key Patterns to Recognize\n(.*?)(?=\n## |\Z)",
     "Important Notes": r"## Important Notes\n(.*?)(?=\n## |\Z)",
@@ -1280,8 +1280,8 @@ def main():
 
         traceback.print_exc()
 
-        # Write an error result file so the Slack notification step can
-        # report the failure instead of silently skipping
+        # Write an error result file so downstream consumers can report
+        # the failure instead of silently skipping
         if args.output:
             error_output = {
                 "analysis_timestamp": datetime.now().isoformat(),

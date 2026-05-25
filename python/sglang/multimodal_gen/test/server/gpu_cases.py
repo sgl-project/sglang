@@ -11,8 +11,9 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
     MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
-    MODELOPT_WAN22_FP8_TRANSFORMER,
-    MODELOPT_WAN22_NVFP4_TRANSFORMER,
+    MODELOPT_WAN22_FP8_MODEL,
+    MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+    MODELOPT_WAN22_NVFP4_MODEL,
     T2V_PROMPT,
     DiffusionSamplingParams,
     DiffusionServerArgs,
@@ -35,6 +36,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
@@ -121,6 +123,15 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             model_path=DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
         ),
         T2I_sampling_params,
+    ),
+    DiffusionTestCase(
+        "flux_2_klein_base_image_t2i",
+        DiffusionServerArgs(
+            model_path=DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
+        ),
+        T2I_sampling_params,
+        run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     # TODO: replace with a faster model to test the --dit-layerwise-offload
     # TODO: currently, we don't support sending more than one request in test, and setting `num_outputs_per_prompt` to 2 doesn't guarantee the denoising be executed twice,
@@ -387,7 +398,6 @@ if not current_platform.is_hip():
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
                 model_path="tencent/Hunyuan3D-2",
-                enable_warmup=False,
             ),
             HUNYUAN3D_SHAPE_sampling_params,
             run_consistency_check=False,
@@ -405,17 +415,21 @@ if not current_platform.is_hip():
         )
     )
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
-# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only).
+# Run FP8 cases on the regular H100 1-GPU CI shard and keep only B200-only
+# quantization coverage in the B200 suite.
 if current_platform.is_hip():
-    ONE_GPU_MODELOPT_CASES = []
+    ONE_GPU_MODELOPT_FP8_CASES = []
+    ONE_GPU_MODELOPT_NVFP4_CASES = []
 else:
-    ONE_GPU_MODELOPT_CASES = [
+    ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_fp8_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_fp8_t2i",
@@ -423,13 +437,15 @@ else:
             modality="image",
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_FP8_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+            extras=[],
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "hunyuanvideo_modelopt_fp8_t2v",
@@ -457,6 +473,8 @@ else:
             sampling_params=MODELOPT_TI2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
+    ]
+    ONE_GPU_MODELOPT_NVFP4_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -464,6 +482,7 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
@@ -472,16 +491,20 @@ else:
             sampling_params=MODELOPT_T2I_CI_sampling_params,
             extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
             env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
         _make_modelopt_ci_case(
             "wan22_modelopt_nvfp4_t2v",
-            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            model_path=MODELOPT_WAN22_NVFP4_MODEL,
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+            extras=[],
+            env_vars=MODELOPT_WAN22_NVFP4_B200_ENV_VARS,
+            run_consistency_check=True,
         ),
     ]
+
+ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
 TWO_GPU_CASES = [
     DiffusionTestCase(
@@ -727,5 +750,5 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+ONE_GPU_CASES += ONE_GPU_MODELOPT_FP8_CASES
 TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)

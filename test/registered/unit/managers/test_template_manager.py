@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.managers.template_detection import (
+    TOOL_CALL_PARSER_RULES,
     ReasoningToggleConfig,
     detect_reasoning_parser,
     detect_reasoning_pattern,
@@ -10,7 +11,7 @@ from sglang.srt.managers.template_detection import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(2.0, "stage-a-test-cpu")
+register_cpu_ci(2.0, "base-a-test-cpu")
 
 
 class _DummyTokenizer:
@@ -265,6 +266,23 @@ class TestToolCallParserDetection(unittest.TestCase):
                 ["<|tool_calls_section_begin|>"],
                 "kimi_k2",
             ),
+            (
+                "minicpm5",
+                (
+                    "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+                    '\n<function name="{{ tool.name }}">'
+                    '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+                    "\n</function>"
+                ),
+                ["<function", "<param"],
+                "minicpm5",
+            ),
+            (
+                "xml_kv_tool_call_via_vocab",
+                "{% set reasoning_effort = reasoning_effort | default('high', true) %}\n<think>",
+                ["<tool_call>", "<arg_key>", "<arg_value>", "<|endoftext|>"],
+                "glm45",
+            ),
         ]
         for name, template, vocab, expected in cases:
             with self.subTest(name=name):
@@ -274,6 +292,23 @@ class TestToolCallParserDetection(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_glm45_rule_precedes_xml_kv_fallback(self):
+        # The specific GLM-4.5 family check must run before the generic
+        # xml_kv_tool_call fallback. Both currently map to "glm45", so the
+        # value-based test above can't catch a swap — assert positions directly.
+        rule_index = {rule.name: i for i, rule in enumerate(TOOL_CALL_PARSER_RULES)}
+        self.assertLess(rule_index["glm45"], rule_index["xml_kv_tool_call"])
+
+    def test_xml_kv_requires_both_arg_tokens(self):
+        template = "Hello {{ user }}"
+        force, config = detect_reasoning_pattern(template)
+        for vocab in (["<arg_key>"], ["<arg_value>"], []):
+            with self.subTest(vocab=vocab):
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer(vocab), config, force
+                )
+                self.assertIsNone(result)
+
     def test_none_template_returns_none(self):
         self.assertIsNone(detect_tool_call_parser(None, None))
 
@@ -281,6 +316,25 @@ class TestToolCallParserDetection(unittest.TestCase):
         force, config = detect_reasoning_pattern("Hello {{ user }}")
         result = detect_tool_call_parser("Hello {{ user }}", None, config, force)
         self.assertIsNone(result)
+
+    def test_minicpm5_rule_precedes_broad_fallback_rules(self):
+        rule_names = [rule.name for rule in TOOL_CALL_PARSER_RULES]
+        minicpm5_idx = rule_names.index("minicpm5")
+        self.assertLess(minicpm5_idx, rule_names.index("mimo"))
+        self.assertLess(minicpm5_idx, rule_names.index("qwen"))
+
+    def test_minicpm5_not_misclassified_as_qwen(self):
+        template = (
+            "{% set enable_thinking = enable_thinking if enable_thinking is defined else true %}"
+            '\n<function name="{{ tool.name }}">'
+            '\n<param name="{{ param.name }}">{{ param.value }}</param>'
+            "\n</function>"
+        )
+        force, config = detect_reasoning_pattern(template)
+        result = detect_tool_call_parser(
+            template, _DummyTokenizer(["<function", "<param"]), config, force
+        )
+        self.assertEqual(result, "minicpm5")
 
 
 class TestResolveAutoParsers(unittest.TestCase):
