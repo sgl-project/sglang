@@ -62,7 +62,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 COPY experimental/sgl-router/Cargo.toml ./
 COPY experimental/sgl-router/src ./src
 
-RUN cargo build --release --locked --bin sgl-router \
+# --locked is intentionally omitted: the lockfile is generated in-container
+# (gitignored upstream) and `cargo chef cook` may have mutated it during the
+# dep-cook step, so a strict --locked check would spuriously fail.
+RUN cargo build --release --bin sgl-router \
     && strip target/release/sgl-router
 
 ######################## STAGE 3 — runtime ##############################
