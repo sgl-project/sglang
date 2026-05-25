@@ -40,13 +40,6 @@ class _SingleForwardPhase(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PreOpsMaybeInsideGraphOutput:
-    # Per-group VerifyPlan and WritePlan: FULL and SWA groups write different slot-translated
-    # indices into their plans (SWA goes through full_to_swa_index_mapping; FULL doesn't),
-    # and TAIL endpoints in post_ops re-read these plans. A shared plan would let SWA's
-    # invoke_plan in pre_ops overwrite FULL's plan, so TAIL_K_FULL in post_ops reads SWA-translated
-    # slot indices and looks them up in the FULL canary_buf — silently reading garbage / a
-    # different req's old data, surfacing as TAIL_K_FULL position FPs whenever the SWA mapping
-    # is non-identity (i.e. SWA pool < FULL pool).
     verify_plans: tuple[VerifyPlan, ...]
     write_plans: tuple[WritePlan, ...]
     expected_inputs: ExpectedInputs
@@ -149,10 +142,6 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        # One VerifyPlan / WritePlan per group: FULL and SWA write group-specific slot indices
-        # (FULL slots vs SWA-mapped slots). A shared plan would have SWA's invoke_plan overwrite
-        # FULL's, then TAIL_K_FULL in post_ops would read SWA-mapped slot indices but look them
-        # up in FULL canary_buf — the source of the SWA-mode TAIL_K_FULL position FP.
         verify_plans = tuple(
             VerifyPlan.allocate(
                 verify_capacity=self._verify_capacity, device=self._device
@@ -255,8 +244,6 @@ class SingleForwardManager:
                 input_check_mode=input_check_mode,
             )
 
-        # AND across all groups' enable flags: the warner should fire when ANY group
-        # skipped verify (overflow), not just FULL group's view.
         verify_plan_enable_combined = pre_ops_output.verify_plans[0].enable
         for vp in pre_ops_output.verify_plans[1:]:
             verify_plan_enable_combined = torch.minimum(verify_plan_enable_combined, vp.enable)
