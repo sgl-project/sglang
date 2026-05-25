@@ -74,6 +74,7 @@ class TestNPUDeepSeekR1_W8A8_MLAPO(unittest.TestCase):
     [Test Category] Feature
     [Test Target] SGLANG_NPU_USE_MLAPO
     """
+
     baseline_tpot = None
     base_url = "http://127.0.0.1:20166"
     parsed_url = urlparse(base_url)
@@ -120,9 +121,9 @@ class TestNPUDeepSeekR1_W8A8_MLAPO(unittest.TestCase):
         return metrics
 
     def test_01_baseline_performance(self):
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("stage1：base performance line")
-        print("="*80)
+        print("=" * 80)
 
         metrics = self._launch_server_and_run_test()
         self.__class__.baseline_tpot = float(metrics["mean_tpot"])
@@ -131,14 +132,11 @@ class TestNPUDeepSeekR1_W8A8_MLAPO(unittest.TestCase):
         time.sleep(20)
 
     def test_02_mlapo_optimization(self):
-        self.assertIsNotNone(
-            self.__class__.baseline_tpot,
-            "there is no base line "
-        )
+        self.assertIsNotNone(self.__class__.baseline_tpot, "there is no base line ")
 
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print("🔹 stage2：MLAPO performance")
-        print("="*80)
+        print("=" * 80)
 
         metrics = self._launch_server_and_run_test(
             extra_envs={"SGLANG_NPU_USE_MLAPO": "1"}
@@ -146,17 +144,17 @@ class TestNPUDeepSeekR1_W8A8_MLAPO(unittest.TestCase):
         mlapo_tpot = float(metrics["mean_tpot"])
 
         tpot_reduction = self.__class__.baseline_tpot - mlapo_tpot
-        print("\n" + "="*80)
+        print("\n" + "=" * 80)
         print(f"base tpot: {self.__class__.baseline_tpot:.2f} ms")
         print(f"MLAPOtpot: {mlapo_tpot:.2f} ms")
         print(f"Reduce: {tpot_reduction:.2f} ms")
         print(f"required: ≥ 2.00 ms")
-        print("="*80)
+        print("=" * 80)
 
         self.assertGreater(
             tpot_reduction,
             2.0,
-            f"MLAPO didn't match the requirement：tpot reduced {tpot_reduction:.2f}ms，at least 2ms"
+            f"MLAPO didn't match the requirement：tpot reduced {tpot_reduction:.2f}ms，at least 2ms",
         )
 
         print(f"\n MLAPO match the requirement！tpot reduced{tpot_reduction:.2f} ms")
