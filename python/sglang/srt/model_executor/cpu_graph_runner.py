@@ -94,7 +94,7 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # torch compile speeds up decoding by reducing python overhead on CPU
-    from sglang.srt.model_executor.cuda_graph_mode import Phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     server_args = model_runner.server_args
     # Reuse cuda_graph_config[decode].bs here.

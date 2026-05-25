@@ -14,7 +14,7 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

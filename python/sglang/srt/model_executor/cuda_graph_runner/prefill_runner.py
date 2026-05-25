@@ -13,7 +13,7 @@
 # ==============================================================================
 """PrefillCudaGraphRunner — runs the EXTEND phase under a pluggable backend.
 
-Backend selection comes from ``cuda_graph_mode[Phase.PREFILL]``:
+Backend selection comes from ``cuda_graph_config[Phase.PREFILL]``:
   - ``"tc_piecewise"``     — default, ``TcPiecewiseCudaGraphBackend``: torch.compile
                       wraps the model; per-shape graphs live in
                       torch.compile's internal cache. Multi-batch supported.
@@ -49,7 +49,7 @@ from sglang.srt.model_executor.cuda_graph_backend.factory import (
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
     set_forward_context,
 )
-from sglang.srt.model_executor.cuda_graph_mode import Phase
+from sglang.srt.model_executor.cuda_graph_config import Phase
 from sglang.srt.model_executor.cuda_graph_runner.base_runner import (
     BaseCudaGraphRunner,
     freeze_gc,

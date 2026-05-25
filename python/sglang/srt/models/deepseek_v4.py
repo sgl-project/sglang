@@ -75,7 +75,7 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

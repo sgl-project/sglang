@@ -1,9 +1,9 @@
-"""Factory: ``cuda_graph_mode`` → ``BaseCudaGraphBackend`` instance.
+"""Factory: ``cuda_graph_config`` → ``BaseCudaGraphBackend`` instance.
 
 Centralizes per-phase backend resolution so platform overrides (NPU,
 out-of-tree) and future backend additions can plug in without
 modifying the runner files. Phase / backend identifiers used here
-live in :mod:`.cuda_graph_mode`.
+live in :mod:`.cuda_graph_config`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from sglang.srt.model_executor.cuda_graph_backend.full_cudagraph_backend import 
 from sglang.srt.model_executor.cuda_graph_backend.tc_piecewise_cudagraph_backend import (
     TcPiecewiseCudaGraphBackend,
 )
-from sglang.srt.model_executor.cuda_graph_mode import Backend, Phase
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -61,7 +61,7 @@ def resolve_decode_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
         global _TC_PIECEWISE_DECODE_FALLBACK_LOGGED
         if not _TC_PIECEWISE_DECODE_FALLBACK_LOGGED:
             logger.warning(
-                "cuda_graph_mode decode='tc_piecewise' is not yet implemented; "
+                "cuda_graph_config decode='tc_piecewise' is not yet implemented; "
                 "falling back to 'full'."
             )
             _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = True

@@ -71,7 +71,7 @@ def get_batch_sizes_to_capture(
     Filters ``cuda_graph_config[decode].bs`` by attention-tp/cp alignment
     constraints and clamps to req_to_token_pool.size.
     """
-    from sglang.srt.model_executor.cuda_graph_mode import Phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_config[Phase.DECODE]["bs"]

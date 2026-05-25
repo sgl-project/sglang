@@ -30,7 +30,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

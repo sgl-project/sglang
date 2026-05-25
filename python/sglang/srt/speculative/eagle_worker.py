@@ -25,7 +25,7 @@ from sglang.srt.mem_cache.common import (
     alloc_token_slots,
     get_last_loc,
 )
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

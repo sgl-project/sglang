@@ -14,7 +14,7 @@
 """DecodeCudaGraphRunner — runs DECODE / TARGET_VERIFY / DLLM_EXTEND under
 a pluggable backend.
 
-Backend selection comes from ``cuda_graph_mode[Phase.DECODE]``:
+Backend selection comes from ``cuda_graph_config[Phase.DECODE]``:
   - ``"full"``      — default, ``FullCudaGraphBackend``: one
                       ``torch.cuda.CUDAGraph`` per shape.
   - ``"breakable"`` — experimental, ``BreakableCudaGraphBackend``:

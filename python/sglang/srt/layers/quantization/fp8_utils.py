@@ -1495,7 +1495,7 @@ def apply_fp8_linear(
         # GEMM epilogue, not in the activation quant fusion. Only activates when
         # cuda_graph_config[prefill].tc_compiler=inductor; eager PCG and
         # decode both use the faster custom kernel.
-        from sglang.srt.model_executor.cuda_graph_mode import Phase
+        from sglang.srt.model_executor.cuda_graph_config import Phase
 
         if (
             input_scale is not None

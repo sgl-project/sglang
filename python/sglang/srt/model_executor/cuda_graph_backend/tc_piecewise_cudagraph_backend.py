@@ -93,7 +93,7 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
         the config, and registers the MoE A2A split-op when DeepEP /
         Mooncake is in use.
         """
-        from sglang.srt.model_executor.cuda_graph_mode import Phase
+        from sglang.srt.model_executor.cuda_graph_config import Phase
 
         prefill = server_args.cuda_graph_config[Phase.PREFILL]
         num_tokens = prefill["bs"]

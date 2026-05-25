@@ -406,7 +406,7 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     inputs and fault on strided tensors (root cause of the #21734 revert
     in #23159).
     """
-    from sglang.srt.model_executor.cuda_graph_mode import Phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     if (
         _is_cuda
@@ -446,7 +446,7 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
-    from sglang.srt.model_executor.cuda_graph_mode import Phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends

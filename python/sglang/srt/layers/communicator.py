@@ -69,7 +69,7 @@ from sglang.srt.layers.utils.cp_utils import (
     is_mla_prefill_cp_enabled,
     mla_use_prefill_cp,
 )
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

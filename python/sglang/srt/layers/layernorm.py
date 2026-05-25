@@ -26,7 +26,7 @@ from sglang.srt.batch_invariant_ops import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

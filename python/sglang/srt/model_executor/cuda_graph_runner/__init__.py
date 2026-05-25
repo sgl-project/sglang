@@ -3,7 +3,7 @@
 One concrete runner per phase. Each runner owns its phase-specific
 shape semantics (decode → batch size; prefill → token count) and
 delegates capture/replay mechanics to a pluggable
-``BaseCudaGraphBackend`` chosen via ``cuda_graph_mode``.
+``BaseCudaGraphBackend`` chosen via ``cuda_graph_config``.
 
 Public API:
   - ``BaseCudaGraphRunner`` — abstract base; shared init + bucket

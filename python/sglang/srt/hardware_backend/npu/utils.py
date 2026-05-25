@@ -56,7 +56,7 @@ def set_default_server_args(args: "ServerArgs"):
         args.page_size = 128
 
     # NPU memory settings
-    from sglang.srt.model_executor.cuda_graph_mode import Phase
+    from sglang.srt.model_executor.cuda_graph_config import Phase
 
     decode = args.cuda_graph_config[Phase.DECODE]
     npu_mem = get_npu_memory_capacity()

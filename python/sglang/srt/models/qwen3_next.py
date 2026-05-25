@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 from sglang.jit_kernel.triton.gdn_fused_proj import fused_qkvzba_split_reshape_cat
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,

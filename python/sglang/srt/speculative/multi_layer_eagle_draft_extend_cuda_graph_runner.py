@@ -32,7 +32,7 @@ from sglang.srt.model_executor.cuda_graph_backend import FullCudaGraphBackend
 from sglang.srt.model_executor.cuda_graph_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
 )
-from sglang.srt.model_executor.cuda_graph_mode import (
+from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
