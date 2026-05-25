@@ -82,6 +82,10 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
         slot_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
         kernel_run_counter = torch.zeros(1, dtype=torch.int64, device=self.device)
 
+        enable_chain_position_assert = torch.ones(
+            1, dtype=torch.int32, device=self.device
+        )
+
         with self.assertRaises(ValueError):
             launch_canary_verify_kernel(
                 context=VerifyOrWriteContext(
@@ -93,6 +97,7 @@ class TestRealKvSources(PoolPatchHelper, CustomTestCase):
                     kernel_run_counter=kernel_run_counter,
                     real_kv_sources=sources,
                     real_kv_hash_mode=RealKvHashMode.NONE,
+                    enable_chain_position_assert=enable_chain_position_assert,
                 ),
                 plan=plan,
             )

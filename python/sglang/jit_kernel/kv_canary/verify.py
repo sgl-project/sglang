@@ -197,17 +197,17 @@ class VerifyPlan:
                 f"kv-canary: VerifyPlan verify_capacity must be positive, got {verify_capacity}"
             )
         return cls(
-            verify_slot_indices=torch.empty(
+            verify_slot_indices=torch.zeros(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_positions=torch.empty(
+            verify_positions=torch.zeros(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_prev_slot_indices=torch.empty(
+            verify_prev_slot_indices=torch.zeros(
                 verify_capacity, dtype=torch.int64, device=device
             ),
-            verify_num_valid=torch.empty(1, dtype=torch.int32, device=device),
-            enable=torch.empty(1, dtype=torch.int32, device=device),
+            verify_num_valid=torch.zeros(1, dtype=torch.int32, device=device),
+            enable=torch.zeros(1, dtype=torch.int32, device=device),
         )
 
 
