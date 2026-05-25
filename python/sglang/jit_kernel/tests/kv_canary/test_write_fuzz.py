@@ -17,6 +17,7 @@ from sglang.jit_kernel.tests.kv_canary._canary_helpers import (
     make_canary_buf,
     make_log_pair,
     make_write_plan_pair,
+    stamp_pair,
 )
 from sglang.jit_kernel.tests.kv_canary._differential import _run_both_write
 from sglang.jit_kernel.tests.kv_canary._fixtures import (
@@ -129,11 +130,24 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
         dtype=torch.int64,
         device=_DEVICE,
     )
-    positions = torch.tensor(
-        [rng.randint(0, 1024) for _ in range(total_tokens)],
-        dtype=torch.int64,
-        device=_DEVICE,
-    )
+    # Per-chain sequential positions so the write kernel's chain-step position assert holds.
+    # For chains with a real seed slot, stamp the seed with (chain_start_position - 1) so the
+    # first chain entry's position == seed.position + 1.
+    chain_start_positions: list[int] = [rng.randint(0, 1024) for _ in range(n_reqs)]
+    positions_list: list[int] = []
+    for r in range(n_reqs):
+        start = chain_start_positions[r]
+        positions_list.extend(start + i for i in range(per_req_tokens[r]))
+        seed_slot = seed_slot_indices[r]
+        if seed_slot >= 0:
+            stamp_pair(
+                (cuda_buf, ref_buf),
+                slot_idx=seed_slot,
+                token=0,
+                position=start - 1,
+                prev_hash=0,
+            )
+    positions = torch.tensor(positions_list, dtype=torch.int64, device=_DEVICE)
     out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int64, device=_DEVICE)
     expected_input_tokens = input_ids.clone()
     expected_input_positions = positions.clone()
