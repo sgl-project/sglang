@@ -22,6 +22,7 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def __init__(self, max_loras_per_batch: int, device: torch.device):
         self.max_loras_per_batch = max_loras_per_batch
         self.device = device
+        self.batch_info = None
         self.init_lm_head_config()
         self._is_moe_lora = False
 
@@ -188,10 +189,12 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         base = moe_layer.base_layer
         top_k = base.top_k
-        qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        # Derive dims from the base FusedMoE rather than quant-specific tensors,
+        # so this works for any scheme (FP, WNA16, Marlin-packed, etc.).
+        E = base.num_local_experts
+        hidden_dim = base.hidden_size
+        N = 2 * base.intermediate_size_per_partition
+        device = next(base.parameters()).device
         dtype = compute_dtype
         num_experts = base.num_experts
 
