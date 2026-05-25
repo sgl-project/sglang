@@ -32,11 +32,6 @@ _SPEC_EAGLE_SERVER_ARGS = (
     str(_CUDA_GRAPH_MAX_BS),
     "--max-running-requests",
     "32",
-    # Skip server-stage warmup: under revert_pr=True the eagle-draft position mismatch fires the
-    # canary on the first warmup decode request, which kills the server in CanaryMode.RAISE before
-    # setUpClass even returns. The test sends its own parallel requests after the server is up; the
-    # geometric assert still triggers there and surfaces the regression.
-    "--skip-server-warmup",
 )
 
 
@@ -44,13 +39,10 @@ class _EaglePositionsBase(CanaryE2EBase):
     __test__ = False  # pytest must not collect the abstract base (revert_pr is unset)
 
     model_mode = "mha"
-    kv_canary_mode = CanaryMode.RAISE
+    # LOG mode keeps the server alive after the first violation so server warmup + this test's
+    # parallel requests both run; we then read the violation log to assert the position bit fired.
+    kv_canary_mode = CanaryMode.LOG
     extra_server_args = _SPEC_EAGLE_SERVER_ARGS
-    # Use unique-prefix prompts so each request keeps its own KV-cache slots
-    # without radix folding. This isolates the eagle position-mismatch
-    # detection path from the prefix-share verify path, which has subtle
-    # chain-hash recomputation timing that's outside the scope of this test.
-    use_unique_prompts: ClassVar[bool] = True
     revert_pr: ClassVar[bool]
 
     @classmethod
@@ -69,46 +61,17 @@ class _EaglePositionsBase(CanaryE2EBase):
         )
 
         if self.revert_pr:
-            # Reverting PR #25015 shifts every eagle draft position by +1. The
-            # mismatch manifests as either a direct ``position`` bit (if the
-            # write-side stored_position differs from verify-side
-            # expected_position on a slot that gets per-forward-verified) or a
-            # propagated ``chain_hash`` bit (if the affected slot is reached
-            # transitively through the per-forward chain on a sibling slot
-            # — happens when canary mode is RAISE so the first detected
-            # violation kills the scheduler before the draft slot itself
-            # appears in a later prefix). Either signal proves canary caught
-            # the regression; accept whichever fires first.
-            for reason in ("position", "chain_hash"):
-                try:
-                    self.assert_violation_logged_any(
-                        launch_tag_patterns=("*",),
-                        fail_reason=reason,
-                        flush_wait_seconds=0.0,
-                    )
-                    return
-                except AssertionError:
-                    continue
-            raise AssertionError(
-                "Expected canary to fire one of fail_reason ∈ {position, chain_hash} "
-                "after reverting PR #25015, but neither was logged."
+            self.assert_violation_logged_any(
+                launch_tag_patterns=("*",),
+                fail_reason="position",
+                flush_wait_seconds=0.0,
             )
         else:
             self.assert_no_violation(wait_seconds=2.0)
 
 
 class TestEaglePositionsMisalignRegression(_EaglePositionsBase):
-    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation.
-
-    Caught at write-time by the kernel's init-gated geometric write_position
-    assert (canary_write.cuh): single-entry decode writes must satisfy
-    ``position == seed.position + 1 + entry_offset``. Eagle DRAFT under the
-    reverted PR perturbs position by +1, breaking that arithmetic and firing
-    ``fail_reason = position``. The assert is gated on
-    ``CanaryDeviceState.enable_chain_position_assert`` (flipped from 0 to 1 in
-    ``CanaryManager.mark_init_finished()``) so warmup / cuda-graph capture
-    paths — whose seed slots may hold synthetic positions — don't misfire.
-    """
+    """Revert PR #25015 fix and expect canary to fire a position-mismatch violation."""
 
     __test__ = True  # re-enable collection (base sets __test__ = False, inherited)
     revert_pr = True
