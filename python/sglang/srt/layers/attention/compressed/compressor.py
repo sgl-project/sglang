@@ -87,6 +87,7 @@ class CompressorBackend:
 
             from sglang.srt.layers.attention.compressed.fused_compress_triton import (
                 hip_compress_forward,
+                hip_compress_fused_norm_rope_hadamard_inplace,
                 hip_compress_fused_norm_rope_inplace,
             )
 
@@ -103,14 +104,24 @@ class CompressorBackend:
             norm_eps = (
                 norm.variance_epsilon if hasattr(norm, "variance_epsilon") else norm.eps
             )
-            hip_compress_fused_norm_rope_inplace(
-                kv_compressed,
-                norm.weight,
-                norm_eps,
-                freqs_cis_cache,
-                plan,
-            )
-            return rotate_activation(kv_compressed) if rotate else kv_compressed
+            if rotate:
+                hip_compress_fused_norm_rope_hadamard_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                    head_dim,
+                )
+            else:
+                hip_compress_fused_norm_rope_inplace(
+                    kv_compressed,
+                    norm.weight,
+                    norm_eps,
+                    freqs_cis_cache,
+                    plan,
+                )
+            return kv_compressed
 
         # NOTE: shape [num_q_tokens, head_dim]
         kv_compressed = compress_forward(
