@@ -140,6 +140,32 @@ def validation_artifacts(args) -> dict[str, Path]:
     }
 
 
+def searched_pattern_artifact_failures(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return [f"searched pattern artifact is missing: {path}"]
+    except json.JSONDecodeError as exc:
+        return [f"searched pattern artifact is not valid JSON: {exc}"]
+
+    failures = []
+    retentions = data.get("retentions")
+    if not isinstance(retentions, dict):
+        return ["searched pattern artifact is missing retentions"]
+    for retention in ("1/2", "1/4"):
+        result = retentions.get(retention)
+        if not isinstance(result, dict):
+            failures.append(f"missing searched retention {retention}")
+            continue
+        if result.get("search_method") != "greedy_training_free":
+            failures.append(f"{retention} search_method is not greedy_training_free")
+        if result.get("uniform_candidate") is not False:
+            failures.append(f"{retention} must be labeled uniform_candidate=false")
+        if not result.get("final_pattern"):
+            failures.append(f"{retention} is missing final_pattern")
+    return failures
+
+
 def validate_args(args) -> None:
     if not args.dry_run and not args.eagle_off_confirmed:
         raise SystemExit(
@@ -237,6 +263,17 @@ def main(argv: list[str] | None = None) -> None:
     for phase, cmd in commands:
         result = run_command(cmd, args.timeout, args.dry_run)
         result = {"phase": phase, **result}
+        if phase == "search" and result["returncode"] == 0 and not args.dry_run:
+            failures = searched_pattern_artifact_failures(
+                validation_artifacts(args)["searched_patterns"]
+            )
+            result["artifact_validation"] = {
+                "passed": not failures,
+                "failures": failures,
+            }
+            if failures:
+                result["returncode"] = 1
+                result["output"] = "; ".join(failures)
         results.append(result)
         print(json.dumps(result), flush=True)
         if result["returncode"] != 0:

@@ -114,6 +114,83 @@ def test_dsv4_index_cache_validation_workflow_labels_artifacts(tmp_path):
     }
 
 
+def test_dsv4_index_cache_validation_workflow_validates_searched_pattern_artifact(
+    tmp_path,
+):
+    path = tmp_path / "searched_patterns.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retentions": {
+                    "1/2": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FFS",
+                    },
+                    "1/4": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FSS",
+                    },
+                }
+            }
+        )
+    )
+
+    assert workflow.searched_pattern_artifact_failures(path) == []
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_missing_searched_quarter_artifact(
+    tmp_path,
+):
+    path = tmp_path / "searched_patterns.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retentions": {
+                    "1/2": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FFS",
+                    }
+                }
+            }
+        )
+    )
+
+    assert workflow.searched_pattern_artifact_failures(path) == [
+        "missing searched retention 1/4"
+    ]
+
+
+def test_dsv4_index_cache_validation_workflow_rejects_uniform_pattern_artifact(
+    tmp_path,
+):
+    path = tmp_path / "searched_patterns.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retentions": {
+                    "1/2": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": False,
+                        "final_pattern": "FFS",
+                    },
+                    "1/4": {
+                        "search_method": "greedy_training_free",
+                        "uniform_candidate": True,
+                        "final_pattern": "FSFS",
+                    },
+                }
+            }
+        )
+    )
+
+    assert workflow.searched_pattern_artifact_failures(path) == [
+        "1/4 must be labeled uniform_candidate=false"
+    ]
+
+
 def test_dsv4_index_cache_validation_workflow_passes_eagle_confirmation_to_profile(
     tmp_path,
 ):
