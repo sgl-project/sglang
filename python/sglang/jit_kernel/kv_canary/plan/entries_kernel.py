@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 
 @cache_once
 def _jit_plan_entries_module() -> "Module":
-    """Compile and cache the JIT kv_canary plan-entries CUDA module."""
     return load_jit(
         "kv_canary_plan_entries",
         cuda_files=["kv_canary/canary_plan_entries.cuh"],
