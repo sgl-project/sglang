@@ -235,7 +235,7 @@
     },
     {
       "source": "/basic_usage/kimi_k2_5.html",
-      "destination": "/docs/basic_usage/kimi_k2_5"
+      "destination": "/cookbook/autoregressive/Moonshotai/Kimi-K2.5"
     },
     {
       "source": "/basic_usage/native_api.html",
@@ -710,8 +710,7 @@
               "docs/basic_usage/ollama_api",
               "docs/basic_usage/offline_engine_api",
               "docs/basic_usage/native_api",
-              "docs/basic_usage/sampling_params",
-              "docs/basic_usage/kimi_k2_5"
+              "docs/basic_usage/sampling_params"
             ]
           },
           {

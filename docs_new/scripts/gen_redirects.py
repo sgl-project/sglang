@@ -95,6 +95,7 @@ EXPLICIT = {
     "/diffusion/support_new_models": "/docs/sglang-diffusion/installation",
     "/diffusion/usage": "/docs/sglang-diffusion/installation",
     # basic_usage pages migrated to cookbook
+    "/basic_usage/kimi_k2_5": "/cookbook/autoregressive/Moonshotai/Kimi-K2.5",
     "/basic_usage/deepseek_ocr": "/cookbook/autoregressive/DeepSeek/DeepSeek-OCR",
     "/basic_usage/deepseek_v3": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3",
     "/basic_usage/deepseek_v32": "/cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
