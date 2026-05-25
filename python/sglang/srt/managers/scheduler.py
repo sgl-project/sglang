@@ -1522,8 +1522,8 @@ class Scheduler(
     def init_lora_drainer(self) -> None:
         if self.server_args.lora_drain_wait_threshold > 0.0:
             self.lora_drainer = LoRADrainer(
-                server_args.max_loras_per_batch,
-                server_args.lora_drain_wait_threshold,
+                self.server_args.max_loras_per_batch,
+                self.server_args.lora_drain_wait_threshold,
             )
         else:
             self.lora_drainer = None
