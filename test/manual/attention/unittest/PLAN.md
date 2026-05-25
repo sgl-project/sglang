@@ -9,7 +9,9 @@ Implemented:
   `test/manual/attention/unittest/common/dense_attention.py`.
 - Dense attention backend correctness files exist under
   `test/manual/attention/unittest/dense/` for `torch_native`, `triton`, and
-  `flashinfer`.
+  `flashinfer`. Dense/SWA expected paths now use separate HF-style reference
+  modules with copied random projection weights instead of calling projection
+  helpers on the SGLang actual module.
 - SWA attention backend correctness files exist under
   `test/manual/attention/unittest/swa/` for `triton` and `flashinfer`.
 - MLA attention backend correctness exists under
@@ -50,14 +52,13 @@ Implemented:
   orthogonal to runner/backend metadata compatibility.
 
 In progress:
-- Audit remaining dense/SWA/GDN helpers against the stricter reference rule. MLA
-  has been converted first because the old helper was the most misleading: it
-  shared the MLA preparation path and did not explicitly exercise the model-level
-  KV-pool write/read contract.
+- Audit GDN against the stricter reference rule. Its recurrence is already pure
+  PyTorch, but the expected path still reads shapes/parameters from the actual
+  module object instead of a separate reference module with copied weights.
 
 Next implementation steps:
-- Split dense and SWA references into standalone HF-style modules/functions with
-  explicit weight copies instead of reusing actual-module projection helpers.
+- Split GDN into explicit actual/reference modules with copied parameters, keeping
+  the existing pure PyTorch recurrence for expected outputs.
 - Decide whether the MLA actual target should move from the current tiny
   DeepSeek-shaped module to direct instantiation of `DeepseekV2AttentionMLA`; that
   stricter target requires more global server-args/config scaffolding but would
@@ -74,6 +75,9 @@ Next implementation steps:
 Latest verification:
 - `python -m py_compile test/manual/attention/unittest/common/mla_attention.py test/manual/attention/unittest/mla/test_triton.py`
 - `python test/manual/attention/unittest/mla/test_triton.py -v`
+- `python -m py_compile test/manual/attention/unittest/common/dense_attention.py test/manual/attention/unittest/dense/test_torch_native.py test/manual/attention/unittest/dense/test_triton.py test/manual/attention/unittest/dense/test_flashinfer.py test/manual/attention/unittest/swa/test_triton.py test/manual/attention/unittest/swa/test_flashinfer.py`
+- `python -m unittest discover -s test/manual/attention/unittest/dense -p 'test_*.py' -v`
+- `python -m unittest discover -s test/manual/attention/unittest/swa -p 'test_*.py' -v`
 - `python -m unittest discover -s test/manual/attention/unittest -p 'test_*.py' -v`
 
 ---

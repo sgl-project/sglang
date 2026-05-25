@@ -405,12 +405,70 @@ class ProjectedDenseAttention(nn.Module):
         return self.o_proj(attn_output)
 
 
+class ReferenceDenseAttention(nn.Module):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: str,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+        self.scaling = head_dim**-0.5
+        self.q_proj = nn.Linear(
+            hidden_size,
+            num_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.k_proj = nn.Linear(
+            hidden_size,
+            num_kv_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.v_proj = nn.Linear(
+            hidden_size,
+            num_kv_heads * head_dim,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+        self.o_proj = nn.Linear(
+            num_heads * head_dim,
+            hidden_size,
+            bias=False,
+            dtype=dtype,
+            device=device,
+        )
+
+    def project_qkv(self, hidden_states: torch.Tensor):
+        return (
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        )
+
+    def reconstruct_output(self, attn_output: torch.Tensor) -> torch.Tensor:
+        return F.linear(attn_output, self.o_proj.weight)
+
+
 @dataclass
 class DenseAttentionFixture:
     case: DenseAttentionCase
     runner: MockModelRunner
     backend: object
-    module: ProjectedDenseAttention
+    actual_module: ProjectedDenseAttention
+    reference_module: ReferenceDenseAttention
     forward_batch: ForwardBatch
     prefix_hidden: list[torch.Tensor]
     input_hidden: torch.Tensor
@@ -509,7 +567,7 @@ def _expand_gqa(x: torch.Tensor, num_heads: int) -> torch.Tensor:
 
 
 def _dense_attention_reference(
-    module: ProjectedDenseAttention,
+    module: ReferenceDenseAttention,
     case: DenseAttentionCase,
     prefix_hidden: list[torch.Tensor],
     input_hidden: torch.Tensor,
@@ -549,13 +607,24 @@ def _dense_attention_reference(
             )
             query = query.float()
             keys = keys.float()
-            scores = torch.einsum("hd,hkd->hk", query, keys) * module.attn.scaling
+            scores = torch.einsum("hd,hkd->hk", query, keys) * module.scaling
             probs = torch.softmax(scores, dim=-1)
             out = torch.einsum("hk,hkd->hd", probs, values.float())
             outputs.append(out.reshape(-1))
 
     attn_output = torch.stack(outputs, dim=0).to(dtype)
-    return F.linear(attn_output, module.o_proj.weight)
+    return module.reconstruct_output(attn_output)
+
+
+def _copy_dense_weights(
+    actual: ProjectedDenseAttention,
+    reference: ReferenceDenseAttention,
+):
+    with torch.no_grad():
+        reference.q_proj.weight.copy_(actual.q_proj.weight)
+        reference.k_proj.weight.copy_(actual.k_proj.weight)
+        reference.v_proj.weight.copy_(actual.v_proj.weight)
+        reference.o_proj.weight.copy_(actual.o_proj.weight)
 
 
 def _populate_prefix_kv(
@@ -637,7 +706,7 @@ def build_dense_attention_fixture(
     except (AssertionError, ImportError, ModuleNotFoundError) as exc:
         testcase.skipTest(f"{case.backend} backend is not available: {exc}")
 
-    module = ProjectedDenseAttention(
+    actual_module = ProjectedDenseAttention(
         hidden_size=hidden_size,
         num_heads=case.num_heads,
         num_kv_heads=case.num_kv_heads,
@@ -646,6 +715,15 @@ def build_dense_attention_fixture(
         device=device,
         sliding_window_size=case.sliding_window_size,
     )
+    reference_module = ReferenceDenseAttention(
+        hidden_size=hidden_size,
+        num_heads=case.num_heads,
+        num_kv_heads=case.num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    _copy_dense_weights(actual_module, reference_module)
     prefix_hidden = [
         torch.randn(length, hidden_size, dtype=dtype, device=device)
         for length in case.prefix_lens
@@ -663,7 +741,7 @@ def build_dense_attention_fixture(
         device=device,
     )
     _populate_prefix_kv(
-        module,
+        actual_module,
         case,
         runner,
         prefix_hidden,
@@ -674,7 +752,8 @@ def build_dense_attention_fixture(
         case=case,
         runner=runner,
         backend=backend,
-        module=module,
+        actual_module=actual_module,
+        reference_module=reference_module,
         forward_batch=forward_batch,
         prefix_hidden=prefix_hidden,
         input_hidden=input_hidden,
@@ -684,12 +763,12 @@ def build_dense_attention_fixture(
 def run_dense_fixture_eager(fixture: DenseAttentionFixture) -> torch.Tensor:
     with torch.no_grad(), forward_context(ForwardContext(attn_backend=fixture.backend)):
         fixture.backend.init_forward_metadata(fixture.forward_batch)
-        return fixture.module(fixture.input_hidden, fixture.forward_batch)
+        return fixture.actual_module(fixture.input_hidden, fixture.forward_batch)
 
 
 def expected_dense_fixture_output(fixture: DenseAttentionFixture) -> torch.Tensor:
     return _dense_attention_reference(
-        fixture.module,
+        fixture.reference_module,
         fixture.case,
         fixture.prefix_hidden,
         fixture.input_hidden,
@@ -796,7 +875,7 @@ def run_dense_cuda_graph_decode_case(
         device=device,
     )
     _populate_prefix_kv(
-        graph_fixture.module,
+        graph_fixture.actual_module,
         capture_case,
         graph_fixture.runner,
         capture_prefix_hidden,
@@ -817,10 +896,13 @@ def run_dense_cuda_graph_decode_case(
             forward_mode=capture_batch.forward_mode,
             spec_info=capture_batch.spec_info,
         )
-        capture_actual = graph_fixture.module(capture_input_hidden, capture_batch)
+        capture_actual = graph_fixture.actual_module(
+            capture_input_hidden,
+            capture_batch,
+        )
         backend.on_after_cuda_graph_warmup()
         capture_expected = _dense_attention_reference(
-            graph_fixture.module,
+            graph_fixture.reference_module,
             capture_case,
             capture_prefix_hidden,
             capture_input_hidden,
@@ -860,7 +942,7 @@ def run_dense_cuda_graph_decode_case(
             device=device,
         )
         _populate_prefix_kv(
-            graph_fixture.module,
+            graph_fixture.actual_module,
             replay_case,
             graph_fixture.runner,
             replay_prefix_hidden,
@@ -876,13 +958,13 @@ def run_dense_cuda_graph_decode_case(
             spec_info=replay_batch.spec_info,
             seq_lens_cpu=replay_batch.seq_lens_cpu,
         )
-        replay_actual = graph_fixture.module(replay_input_hidden, replay_batch)
+        replay_actual = graph_fixture.actual_module(replay_input_hidden, replay_batch)
 
     torch.testing.assert_close(
         capture_actual, capture_expected, atol=DENSE_ATOL, rtol=DENSE_RTOL
     )
     replay_expected = _dense_attention_reference(
-        graph_fixture.module,
+        graph_fixture.reference_module,
         replay_case,
         replay_prefix_hidden,
         replay_input_hidden,
