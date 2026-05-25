@@ -182,6 +182,8 @@ class DeepseekV4ModelNextN(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
 
         if dsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
