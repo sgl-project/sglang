@@ -50,6 +50,9 @@ logger = init_logger(__name__)
 
 globally_suppress_loggers()
 
+FIRST_DENOISE_STEP_TOLERANCE = 4.0
+FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS = 80.0
+
 # Tracks mesh output file paths from generate_mesh for later correctness validation.
 # Keyed by case_id, cleaned up after use.
 MESH_OUTPUT_PATHS: dict[str, str] = {}
@@ -606,6 +609,13 @@ class PerformanceValidator:
             if idx == 0:
                 # server warmup is generic, so the first real step can still
                 # pay request-shape/path lazy init that is not a steady-state signal
+                self._assert_le(
+                    f"Denoise Step {idx}",
+                    actual,
+                    expected,
+                    FIRST_DENOISE_STEP_TOLERANCE,
+                    min_abs_tolerance_ms=FIRST_DENOISE_STEP_MIN_ABS_TOLERANCE_MS,
+                )
                 continue
 
             self._assert_le(
