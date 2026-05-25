@@ -29,12 +29,14 @@ def allocate_zeroed_verify_plan(
 ) -> VerifyPlan:
     # Production VerifyPlan.allocate uses torch.empty for perf. Tests byte-compare full tensors
     # (incl. padding tail beyond verify_num_valid), so zero everything for determinism here.
+    # enable defaults to 1 (run verify) so tests that skip the plan kernel still execute the
+    # verify kernel; the plan kernel always overwrites enable when present.
     plan = VerifyPlan.allocate(verify_capacity=verify_capacity, device=device)
     plan.verify_slot_indices.zero_()
     plan.verify_positions.zero_()
     plan.verify_prev_slot_indices.zero_()
     plan.verify_num_valid.zero_()
-    plan.enable.zero_()
+    plan.enable.fill_(1)
     return plan
 
 
