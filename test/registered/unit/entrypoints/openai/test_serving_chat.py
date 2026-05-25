@@ -73,6 +73,7 @@ class _MockTokenizerManager:
                     "finish_reason": {"type": "stop", "matched": None},
                     "output_token_logprobs": [(0.1, 1, "Test"), (0.2, 2, "response")],
                     "output_top_logprobs": None,
+                    "weight_version": "default",
                 },
                 "index": 0,
             }
@@ -912,6 +913,7 @@ class ServingChatTestCase(unittest.TestCase):
                         }
                     ],
                 },
+                {"role": "user", "content": "What did the tool return?"},
             ],
         )
 
