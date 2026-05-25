@@ -173,7 +173,7 @@ class SWAKVPool(BaseSWAKVPool):
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
-                logger.warning(
+                logger.debug(
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
