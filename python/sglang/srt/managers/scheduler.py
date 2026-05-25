@@ -81,10 +81,12 @@ from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.elastic_ep_status import (
+    create_elastic_ep_status_publisher,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
@@ -209,6 +211,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
+from sglang.srt.managers.scheduler_elastic_ep_mixin import SchedulerElasticEPMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.scheduler_recv_skipper import SchedulerRecvSkipper
@@ -288,6 +291,7 @@ class Scheduler(
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
     SchedulerPPMixin,
+    SchedulerElasticEPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -747,6 +751,9 @@ class Scheduler(
                 self.ps.attn_tp_rank == 0
                 or self.server_args.enable_metrics_for_all_schedulers
             ),
+        )
+        self.elastic_ep_status_publisher = create_elastic_ep_status_publisher(
+            self.server_args, self.ipc_channels.send_to_controller
         )
 
     def init_idle_sleeper(self) -> None:
@@ -1524,6 +1531,11 @@ class Scheduler(
             # Launch the current batch
             if batch:
                 result = self.run_batch(batch)
+                if (
+                    self.server_args.elastic_ep_backend is not None
+                    and not self._handle_elastic_ep_result_boundary(result)
+                ):
+                    continue
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -1541,10 +1553,20 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
-            # Process the results of the last batch
+        def pop_and_process() -> bool:
+            """Commit the oldest result_queue entry. Returns True normally.
+            When elastic EP is enabled, syncing copy_done also flushes the
+            submit_active_snapshot async copy (same forward_stream, recorded
+            earlier); fault and recovery paths retract in-flight batches and
+            return False so the caller skips the rest of the iteration."""
             tmp_batch, tmp_result = self.result_queue.popleft()
+            if (
+                self.server_args.elastic_ep_backend is not None
+                and not self._handle_elastic_ep_result_boundary(tmp_result)
+            ):
+                return False
             self.process_batch_result(tmp_batch, tmp_result)
+            return True
 
         while True:
             # Receive requests
@@ -1561,7 +1583,8 @@ class Scheduler(
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
             if disable_overlap_for_batch:
-                pop_and_process()
+                if not pop_and_process():
+                    continue
 
             # Launch the current batch
             if batch:
@@ -1573,7 +1596,8 @@ class Scheduler(
             # Process the last batch
             if self.last_batch:
                 if not disable_overlap_for_batch:
-                    pop_and_process()
+                    if not pop_and_process():
+                        continue
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.on_idle()
@@ -2948,24 +2972,7 @@ class Scheduler(
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
 
-        self._maybe_report_active_ranks()
-
         return ret
-
-    def _maybe_report_active_ranks(self) -> None:
-        if not (
-            self.server_args.enable_dp_attention
-            and self.server_args.elastic_ep_backend is not None
-        ):
-            return
-        # Get the tensors indicating rank activeness
-        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-        tp_active_ranks &= tp_active_ranks_cpu
-        dp_active_ranks = tp_active_ranks.reshape(self.ps.dp_size, -1).prod(axis=1)
-        self.ipc_channels.send_to_tokenizer.send_output(
-            ActiveRanksOutput(status=dp_active_ranks.tolist())
-        )
 
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult

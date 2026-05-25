@@ -260,6 +260,11 @@ class Envs:
     SGLANG_NEW_TOKEN_RATIO_DECAY_STEPS = EnvInt(600)
     SGLANG_RETRACT_DECODE_STEPS = EnvInt(20)
     SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION = EnvInt(4096)
+    # Elastic EP: max times a single request can be transparently retracted
+    # and re-prefilled on rank fault before giving up and aborting it with
+    # FINISH_ABORT. Prevents infinite loops when a fault keeps re-triggering.
+    SGLANG_ELASTIC_EP_MAX_RETRACTION = EnvInt(3)
+    SGLANG_ELASTIC_EP_SEND_TIMEOUT_MS = EnvInt(10)
 
     # Scheduler: recv interval
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_DEFAULT = EnvInt(1000)
