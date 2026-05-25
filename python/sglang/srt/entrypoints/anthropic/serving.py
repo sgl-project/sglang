@@ -586,8 +586,12 @@ class AnthropicServing:
                     chat_request.tool_choice = "required"
                 elif tc_type == "tool":
                     tool_name = anthropic_request.tool_choice.name
+                    # ``Tool.function`` is a ``Function`` Pydantic model, not
+                    # a dict — access by attribute. A dict ``.get`` would
+                    # AttributeError and surface as a 500 instead of the
+                    # intended 400 / happy path.
                     if not any(
-                        t.function.get("name") == tool_name for t in chat_request.tools
+                        t.function.name == tool_name for t in chat_request.tools
                     ):
                         raise ValueError(
                             f"tool_choice references tool {tool_name!r} but it "

@@ -981,6 +981,47 @@ class TestAnthropicServing(unittest.TestCase):
         chat_request = serving._convert_to_chat_completion_request(request)
         self.assertIsNone(chat_request.tools)
 
+    def test_tool_choice_named_custom_tool_is_resolved(self):
+        """tool_choice={type:'tool', name:'X'} where X is a custom tool wires through."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "lookup",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                    },
+                }
+            ],
+            tool_choice={"type": "tool", "name": "lookup"},
+        )
+        # Must not AttributeError: Tool.function is a Pydantic model, not a
+        # dict — access must be via .name, never .get("name").
+        chat_request = serving._convert_to_chat_completion_request(request)
+        self.assertEqual(chat_request.tool_choice.type, "function")
+        self.assertEqual(chat_request.tool_choice.function.name, "lookup")
+
+    def test_tool_choice_named_unknown_tool_raises_400(self):
+        """tool_choice={type:'tool', name:'X'} where X is missing must raise."""
+        serving = self._serving()
+        request = self._anthropic_request(
+            stream=False,
+            tools=[
+                {
+                    "type": "custom",
+                    "name": "lookup",
+                    "input_schema": {"type": "object", "properties": {}},
+                }
+            ],
+            tool_choice={"type": "tool", "name": "nonexistent"},
+        )
+        with self.assertRaises(ValueError) as ctx:
+            serving._convert_to_chat_completion_request(request)
+        self.assertIn("nonexistent", str(ctx.exception))
+
     def test_convert_response_non_streaming_empty_content_keeps_block(self):
         """Empty-string completion must still produce a content list of len 1."""
         response = ChatCompletionResponse.model_validate(
