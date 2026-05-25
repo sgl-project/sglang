@@ -149,7 +149,15 @@ class SanaWMPipelineConfig(PipelineConfig):
 
     # --- Conditioning kwargs for DenoisingStage ---
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Build positive conditioning kwargs passed to SanaWMTransformer3DModel.forward."""
+        """Build positive conditioning kwargs passed to SanaWMTransformer3DModel.forward.
+
+        The DiT forward signature consumes:
+          * encoder_hidden_states  -- Gemma-2 embeddings (set by DenoisingStage)
+          * timestep               -- diffusion step (set by DenoisingStage)
+          * encoder_attention_mask -- text padding mask
+          * camera_conditions      -- (B, F_orig, 20) UCPE input
+          * chunk_plucker          -- (B, 48, T_lat, H, W) packed Plücker raymap
+        """
         out = {}
 
         # Text attention mask
@@ -159,29 +167,27 @@ class SanaWMPipelineConfig(PipelineConfig):
         elif m is not None:
             out["encoder_attention_mask"] = m
 
-        # Camera conditioning (stored on batch.extra during BeforeDenoisingStage)
+        # Camera conditioning (built by SanaWMBeforeDenoisingStage)
         if hasattr(batch, "extra") and batch.extra:
-            cam = batch.extra.get("camera_to_world", None)
-            intr = batch.extra.get("intrinsics", None)
-            plucker = batch.extra.get("plucker", None)
-            if cam is not None:
-                out["camera_to_world"] = cam
-            if intr is not None:
-                out["intrinsics"] = intr
-            if plucker is not None:
-                out["plucker"] = plucker
+            cc = batch.extra.get("camera_conditions", None)
+            cp = batch.extra.get("chunk_plucker", None)
+            if cc is not None:
+                out["camera_conditions"] = cc
+            if cp is not None:
+                out["chunk_plucker"] = cp
 
         return out
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        """Build negative conditioning kwargs for CFG (no camera for negative pass)."""
+        """Build negative conditioning kwargs for CFG (no camera on the negative pass)."""
         out = {}
         m = batch.negative_attention_mask
         if isinstance(m, (list, tuple)):
             out["encoder_attention_mask"] = m[0] if m else None
         elif m is not None:
             out["encoder_attention_mask"] = m
-        # Camera conditioning is typically not applied to the negative pass
+        # Intentionally omit camera_conditions / chunk_plucker -- the negative
+        # pass uses the text-unconditional baseline without camera control.
         return out
 
     # --- Post-processing ---

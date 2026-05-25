@@ -7,10 +7,11 @@
 #   2. Initialize random noise latents (5D: B, 128, T_latent, H_sp, W_sp)
 #   3. VAE-encode the first-frame conditioning image and splice into noisy latents
 #      (replaces latent[:, :, 0] with the encoded first-frame latent)
-#   4. Compute Plücker Raymap tensors (48-channel packed per latent frame)
-#      and store in batch.extra["plucker"]
-#   5. Store camera_to_world + intrinsics in batch.extra for prepare_pos_cond_kwargs
-#   6. Prepare FlowMatch timesteps and sigmas (uses flow_shift=9.95)
+#   4. Build the (B, F_orig, 20) ``camera_conditions`` tensor consumed by the
+#      UCPE camera branch (16 c2w flat + 4 intrinsics ``fx,fy,cx,cy``).
+#   5. Compute the 48-channel packed Plücker raymap consumed by the
+#      ``plucker_embedder`` (one chunk = vae_temporal_stride original frames).
+#   6. Prepare FlowMatch timesteps and sigmas (uses flow_shift=9.95).
 #
 # Text encoding is handled upstream by the standard TextEncodingStage (Gemma-2).
 # After this stage, the Req batch contains all fields needed by DenoisingStage.
@@ -239,61 +240,107 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
 
         batch.latents = latents
 
-        # --- 4. Camera conditioning: store in batch.extra for prepare_pos_cond_kwargs ---
+        # --- 4. Camera conditioning ---
+        # The DiT consumes two tensors:
+        #   * ``camera_conditions``: (B, F_orig, 20) -- 16 c2w flat + (fx, fy, cx, cy).
+        #     This drives the UCPE camera-branch attention.
+        #   * ``chunk_plucker``:      (B, 48, T_lat, H_sp, W_sp) -- packed Plücker
+        #     coords for the post-attention plucker_embedder.
+        #
+        # Inputs from the user (via batch.extra) may be:
+        #   - camera_conditions: pre-built (B, F_orig, 20) tensor
+        #   - OR camera_to_world (B, F_orig, 4, 4) + intrinsics (B, F_orig, 3, 3)
         if not hasattr(batch, "extra") or batch.extra is None:
             batch.extra = {}
 
-        # Extract camera tensors from the request (set via SamplingParams or by server input parsing)
+        camera_conditions = batch.extra.get("camera_conditions", None)
         camera_to_world = batch.extra.get("camera_to_world", None)
         intrinsics = batch.extra.get("intrinsics", None)
 
-        # If camera data is available, pre-compute Plücker for efficiency
+        # Build ``camera_conditions`` from c2w + intrinsics if not already provided.
         if (
-            camera_to_world is not None
+            camera_conditions is None
+            and camera_to_world is not None
             and intrinsics is not None
+        ):
+            try:
+                if not isinstance(camera_to_world, torch.Tensor):
+                    camera_to_world = torch.as_tensor(camera_to_world)
+                if not isinstance(intrinsics, torch.Tensor):
+                    intrinsics = torch.as_tensor(intrinsics)
+                if camera_to_world.dim() == 3:        # (F, 4, 4) -> (1, F, 4, 4)
+                    camera_to_world = camera_to_world.unsqueeze(0)
+                if intrinsics.dim() == 2:             # (3, 3) -> (1, 1, 3, 3)
+                    intrinsics = intrinsics.unsqueeze(0).unsqueeze(0)
+                elif intrinsics.dim() == 3:           # (F, 3, 3) or (B, 3, 3)?
+                    # if matches F, treat as per-frame; else broadcast
+                    F_dim = camera_to_world.shape[1]
+                    if intrinsics.shape[0] == F_dim:
+                        intrinsics = intrinsics.unsqueeze(0)
+                    else:
+                        intrinsics = intrinsics.unsqueeze(1)
+                # Broadcast intrinsics across frames if single per batch
+                if intrinsics.shape[1] == 1 and camera_to_world.shape[1] > 1:
+                    intrinsics = intrinsics.expand(-1, camera_to_world.shape[1], -1, -1)
+
+                camera_to_world = camera_to_world.to(device=device, dtype=dtype)
+                intrinsics = intrinsics.to(device=device, dtype=dtype)
+
+                B = camera_to_world.shape[0]
+                F_dim = camera_to_world.shape[1]
+                c2w_flat = camera_to_world.reshape(B, F_dim, 16)
+                fx = intrinsics[..., 0, 0]
+                fy = intrinsics[..., 1, 1]
+                cx = intrinsics[..., 0, 2]
+                cy = intrinsics[..., 1, 2]
+                camera_conditions = torch.cat([
+                    c2w_flat,
+                    torch.stack([fx, fy, cx, cy], dim=-1),
+                ], dim=-1)
+            except Exception as e:
+                logger.warning(f"Failed to build camera_conditions from c2w+intrinsics: {e}.")
+                camera_conditions = None
+
+        # Optionally compute the chunk-packed Plücker raymap. This is what
+        # the plucker_embedder consumes -- shape (B, 48, T_lat, H_sp, W_sp).
+        chunk_plucker = batch.extra.get("chunk_plucker", None)
+        if (
+            chunk_plucker is None
+            and camera_conditions is not None
             and self.pipeline_config.camera_conditioning
         ):
             try:
                 from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
-                    SanaWMTransformer3DModel,
+                    compute_chunk_plucker,
                 )
                 T_lat = latent_shape[2]
                 sp_h = latent_shape[3]
                 sp_w = latent_shape[4]
                 vae_temporal_stride = self.pipeline_config.vae_stride[0]
-
-                # Coerce to torch.Tensor so list/numpy inputs from API users work.
-                if not isinstance(camera_to_world, torch.Tensor):
-                    camera_to_world = torch.as_tensor(camera_to_world)
-                if not isinstance(intrinsics, torch.Tensor):
-                    intrinsics = torch.as_tensor(intrinsics)
-                # Add batch dim if missing: (T, 4, 4) -> (1, T, 4, 4)
-                if camera_to_world.dim() == 3:
-                    camera_to_world = camera_to_world.unsqueeze(0)
-                if intrinsics.dim() == 3:
-                    intrinsics = intrinsics.unsqueeze(0)
-
-                camera_to_world = camera_to_world.to(device=device, dtype=dtype)
-                intrinsics = intrinsics.to(device=device, dtype=dtype)
-
-                plucker = SanaWMTransformer3DModel.compute_plucker(
-                    camera_to_world=camera_to_world,
-                    intrinsics=intrinsics,
-                    sp_h=sp_h,
-                    sp_w=sp_w,
-                    vae_temporal_stride=vae_temporal_stride,
-                )
-                batch.extra["plucker"] = plucker
-                batch.extra["camera_to_world"] = camera_to_world
-                batch.extra["intrinsics"] = intrinsics
-                self.log_info(
-                    "Plücker raymaps computed: shape %s", str(plucker.shape)
-                )
+                F_orig = camera_conditions.shape[1]
+                if F_orig != T_lat * vae_temporal_stride:
+                    logger.warning(
+                        f"camera_conditions has {F_orig} frames but expected "
+                        f"T_lat*stride = {T_lat}*{vae_temporal_stride} = "
+                        f"{T_lat * vae_temporal_stride}. Disabling Plücker."
+                    )
+                    chunk_plucker = None
+                else:
+                    chunk_plucker = compute_chunk_plucker(
+                        camera_conditions=camera_conditions.to(dtype),
+                        HW=(T_lat, sp_h, sp_w),
+                        vae_temporal_stride=vae_temporal_stride,
+                        patch_size=(1, 1, 1),
+                    )
+                    self.log_info("Plücker raymaps computed: shape %s", str(chunk_plucker.shape))
             except Exception as e:
-                logger.warning(f"Plücker/camera conditioning setup failed: {e}. Disabling camera branch.")
-                batch.extra.pop("plucker", None)
-                batch.extra.pop("camera_to_world", None)
-                batch.extra.pop("intrinsics", None)
+                logger.warning(f"chunk_plucker computation failed: {e}. Disabling Plücker mixing.")
+                chunk_plucker = None
+
+        if camera_conditions is not None:
+            batch.extra["camera_conditions"] = camera_conditions.to(device=device, dtype=dtype)
+        if chunk_plucker is not None:
+            batch.extra["chunk_plucker"] = chunk_plucker.to(device=device, dtype=dtype)
 
         # --- 5. Prepare timesteps and sigmas ---
         batch = self._prepare_timesteps(batch, server_args, device)
@@ -320,6 +367,6 @@ class SanaWMBeforeDenoisingStage(PipelineStage):
             latent_shape[3],
             latent_shape[4],
             batch.num_inference_steps,
-            "yes" if batch.extra.get("camera_to_world") is not None else "no",
+            "yes" if batch.extra.get("camera_conditions") is not None else "no",
         )
         return batch
