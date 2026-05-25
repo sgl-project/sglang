@@ -10,7 +10,7 @@ from sglang.srt.kv_canary.token_oracle.oracle import HashOracle
 from sglang.srt.kv_canary.token_oracle.sampler import install_oracle_sampler
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
-    _stable_hash_rid_i64,
+    _stable_hash_str_to_i64,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mock_model_utils import mock_model_server_args, mock_model_server_env
@@ -48,7 +48,7 @@ class TestFillExpectedInputs(CustomTestCase):
         hook = install_oracle_sampler(oracle=oracle)
 
         rid_a = "req-a"
-        hashed_a = _stable_hash_rid_i64(rid_a)
+        hashed_a = _stable_hash_str_to_i64(rid_a)
         out = hook.sample_next_tokens(
             generalized_req_ids=torch.tensor([hashed_a], dtype=torch.int64),
             logits_positions=torch.tensor([5], dtype=torch.int64),
@@ -73,7 +73,7 @@ class TestFillExpectedInputs(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             extend_seq_lens=None,
             rids_int=torch.tensor(
-                [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
+                [_stable_hash_str_to_i64(rid_a), _stable_hash_str_to_i64(rid_b)],
                 dtype=torch.int64,
             ),
         )
@@ -91,12 +91,12 @@ class TestFillExpectedInputs(CustomTestCase):
             [
                 _scalar_expected_token(
                     oracle,
-                    generalized_req_id=_stable_hash_rid_i64(rid_a),
+                    generalized_req_id=_stable_hash_str_to_i64(rid_a),
                     position=10,
                 ),
                 _scalar_expected_token(
                     oracle,
-                    generalized_req_id=_stable_hash_rid_i64(rid_b),
+                    generalized_req_id=_stable_hash_str_to_i64(rid_b),
                     position=20,
                 ),
             ],
@@ -110,8 +110,8 @@ class TestFillExpectedInputs(CustomTestCase):
 
         rid_a = "prefill-local-rid"
         rid_b = "regular-rid"
-        hashed_a = _stable_hash_rid_i64(rid_a)
-        hashed_b = _stable_hash_rid_i64(rid_b)
+        hashed_a = _stable_hash_str_to_i64(rid_a)
+        hashed_b = _stable_hash_str_to_i64(rid_b)
         fb = _StubForwardBatch(
             input_ids=torch.tensor([0, 0], dtype=torch.int64),
             positions=torch.tensor([10, 20], dtype=torch.int64),
@@ -149,8 +149,8 @@ class TestFillExpectedInputs(CustomTestCase):
 
         rid_a = "req-a"
         rid_b = "req-b"
-        hashed_a = _stable_hash_rid_i64(rid_a)
-        hashed_b = _stable_hash_rid_i64(rid_b)
+        hashed_a = _stable_hash_str_to_i64(rid_a)
+        hashed_b = _stable_hash_str_to_i64(rid_b)
         fb = _StubForwardBatch(
             input_ids=torch.tensor([101, 102, 103, 201], dtype=torch.int64),
             positions=torch.tensor([0, 1, 2, 0], dtype=torch.int64),
@@ -189,7 +189,7 @@ class TestFillExpectedInputs(CustomTestCase):
             forward_mode=ForwardMode.DECODE,
             extend_seq_lens=None,
             rids_int=torch.tensor(
-                [_stable_hash_rid_i64(rid_a), _stable_hash_rid_i64(rid_b)],
+                [_stable_hash_str_to_i64(rid_a), _stable_hash_str_to_i64(rid_b)],
                 dtype=torch.int64,
             ),
         )

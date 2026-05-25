@@ -546,11 +546,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         device = model_runner.device
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-            hashed = _hash_rids_to_i64_tensor(
+            hashed = _hash_rids_to_tensor(
                 rids=[req.rid for req in batch.reqs],
                 device=device,
             )
-            bootstrap_room_ids = _bootstrap_rooms_to_i64_tensor(
+            bootstrap_room_ids = _bootstrap_rooms_to_tensor(
                 bootstrap_rooms=[req.bootstrap_room for req in batch.reqs],
                 device=device,
             )
@@ -1284,18 +1284,18 @@ else:
     clamp_position = _clamp_position_native
 
 
-def _hash_rids_to_i64_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
-    values: List[int] = [_stable_hash_rid_i64(rid) for rid in rids]
+def _hash_rids_to_tensor(*, rids: List[str], device: torch.device) -> torch.Tensor:
+    values: List[int] = [_stable_hash_str_to_i64(rid) for rid in rids]
     return torch.tensor(values, dtype=torch.int64, device=device)
 
 
-def _bootstrap_rooms_to_i64_tensor(
+def _bootstrap_rooms_to_tensor(
     *, bootstrap_rooms: List[Optional[int]], device: torch.device
 ) -> torch.Tensor:
     values: List[int] = [room if room is not None else -1 for room in bootstrap_rooms]
     return torch.tensor(values, dtype=torch.int64, device=device)
 
 
-def _stable_hash_rid_i64(rid: str) -> int:
+def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
