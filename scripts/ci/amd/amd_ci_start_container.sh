@@ -285,6 +285,7 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   --ulimit nofile=65536:65536 \
   -v "${GITHUB_WORKSPACE:-$PWD}:/sglang-checkout" \
   $CACHE_VOLUME \
+  --privileged \
   --group-add video \
   --shm-size 32g \
   --cap-add=SYS_PTRACE \
@@ -299,6 +300,31 @@ docker run -dt --user root --device=/dev/kfd ${DEVICE_FLAG} \
   -w /sglang-checkout \
   --name ci_sglang \
   "${IMAGE}"
+
+docker exec ci_sglang bash -lc '
+  numa_balancing_path=/proc/sys/kernel/numa_balancing
+
+  if [[ ! -r "${numa_balancing_path}" ]]; then
+    echo "WARNING: ${numa_balancing_path} is not readable; skipping NUMA balancing check" >&2
+    exit 0
+  fi
+
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+
+  if [[ "$(cat "${numa_balancing_path}")" != "0" ]]; then
+    if [[ -w "${numa_balancing_path}" ]]; then
+      if echo 0 > "${numa_balancing_path}"; then
+        echo "Disabled kernel.numa_balancing for AMD CI"
+      else
+        echo "WARNING: failed to disable kernel.numa_balancing" >&2
+      fi
+    else
+      echo "WARNING: ${numa_balancing_path} is not writable; unable to disable NUMA balancing" >&2
+    fi
+  fi
+
+  echo "kernel.numa_balancing=$(cat "${numa_balancing_path}")"
+'
 
 # The checkout is owned by the runner (non-root) but the container runs as
 # root.  Git >= 2.35.2 rejects cross-user repos; mark the mount as safe so
