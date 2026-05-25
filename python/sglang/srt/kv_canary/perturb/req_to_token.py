@@ -1,13 +1,8 @@
-"""Perturb point (a): flip the req_to_token pointer of a currently-active req.
+"""Flip the req_to_token pointer of a currently-active req.
 
 The hook picks a random (req_pool_idx, position, value) from active reqs and
 overwrites req_to_token[req_pool_idx, position] with another active req's slot id.
 KV bytes are not touched.
-
-Modeled after the bug class: req_to_token bookkeeping (out_cache_loc updates,
-sequence batching, prefix accounting) silently writes a wrong slot id. The
-canary catches it via per-forward chain_hash violation because stored
-prev_hash was computed against the correct slot.
 """
 
 from __future__ import annotations

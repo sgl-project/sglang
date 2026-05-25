@@ -1,18 +1,3 @@
-"""CanaryManager: top-level canary state holder under the
-SingleForwardManager design.
-
-Holds a static list of :class:`SingleForwardManager` instances (one per
-inner forward step) and the per-cycle shared facilities (sweep,
-violation, health, stats, swa-divergence). Replaces the previous
-``CanaryRunner`` wholesale — there is no backward-compat shim.
-
-Dispatch model: the monkey-patched ``model.forward`` wrap calls into
-``pre_ops_maybe_inside_graph`` / ``post_ops_maybe_inside_graph`` to fire
-phase 2/3 on the currently-active SingleForwardManager. The caller marks
-the active SingleForwardManager with
-``with_active_single_forward_manager(i)``.
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -58,11 +43,6 @@ logger = logging.getLogger(__name__)
 
 
 class CanaryManager:
-    """Owns canary state for one ModelRunner: a static list of SingleForwardManagers plus
-    the per-cycle shared facilities (violation / health / stats / sweep /
-    swa-divergence).
-    """
-
     def __init__(
         self,
         *,

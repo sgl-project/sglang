@@ -38,15 +38,7 @@ def attach_canary_buffers(
     config: CanaryConfig,
     device: torch.device,
 ) -> tuple[CanaryBufferGroup, ...]:
-    """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple
-    (1 entry per pool sub-group: FULL only, or FULL + SWA). Patches the pool's
-    ``get_contiguous_buf_infos`` (and ``get_state_buf_infos`` for SWA pools) to expose canary slots
-    at head and tail so the rest of sglang's plumbing (PD transfer, hicache, etc.) sees them as
-    first-class KV bytes.
-
-    Per-pool dispatch is via a small ``type(pool) -> attacher`` table. New pool classes (including
-    test fakes) register via :func:`register_pool_attacher`.
-    """
+    """Install canary buffers on a KV pool and return the resulting CanaryBufferGroup tuple."""
     attacher = _POOL_ATTACHERS.get(type(pool))
     if attacher is None:
         raise NotImplementedError(

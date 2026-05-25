@@ -1,5 +1,4 @@
-"""Perturb point (c): flip the first byte of a radix-cached but currently-unused
-(orphan) slot.
+"""Flip the first byte of a radix-cached but currently-unused (orphan) slot.
 
 Detection should come from sweep (per-forward verify won't even look at this
 slot). Designed to surface bugs where cached KV is silently corrupted and

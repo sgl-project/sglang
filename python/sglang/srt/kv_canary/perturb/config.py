@@ -17,32 +17,6 @@ class TargetGroupKind(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PerturbConfig:
-    """Fault-injection knobs for the canary self-test path. Separate from CanaryConfig because
-    production never touches these — only the canary's own e2e tests flip them on via env vars.
-
-    Fields:
-        req_to_token_prob: per-forward probability of trampling a random req_to_token entry to
-            drive a violation. 0 = disabled.
-        real_kv_used_prob: per-forward probability of flipping byte_offset=0 of an active req's
-            currently-used KV slot. Detection routes through the per-forward HEAD/TAIL verify
-            kernel (real_kv_hash violation). 0 = disabled.
-        real_kv_unused_cache_prob: per-forward probability of flipping byte_offset=0 of a radix-
-            cached but currently-unused (orphan) KV slot. Detection routes through sweep verify
-            (per-forward never looks at this slot). 0 = disabled.
-        real_kv_post_forward_prob: per-forward probability of flipping byte_offset=0 of a slot
-            picked from forward_batch.out_cache_loc AFTER the TAIL kernel has captured its canary
-            hash. Designed for PD disagg self-test: P-side runs the flip just before
-            ``send_kv_chunk`` so D's first decode forward HEAD/TAIL kernel catches the
-            real_kv_hash violation. 0 = disabled.
-        target_group_kind: which CanaryBufferGroup to target with real_kv_used /
-            real_kv_unused perturb. FULL / SWA exact-match the PoolKind name. None means
-            real-KV perturbation is disabled and no target was configured.
-        warmup_steps: number of initial forward steps to gate off all perturb hooks. Prevents
-            perturb from firing during sglang warmup, where a garbage write can trip a CUDA error
-            before the canary's deferred D2H violation pump has a chance to log the canary_kind
-            line.
-    """
-
     req_to_token_prob: float
     real_kv_used_prob: float
     real_kv_unused_cache_prob: float

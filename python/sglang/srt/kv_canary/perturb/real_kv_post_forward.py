@@ -1,4 +1,4 @@
-"""Perturb point (d): flip the first byte of a slot in maybe_inaccurate_forward_batch.out_cache_loc
+"""Flip the first byte of a slot in maybe_inaccurate_forward_batch.out_cache_loc
 AFTER the TAIL kernel has captured its canary hash.
 
 The flip is a PyTorch indexed write on the current CUDA stream; because TAIL is

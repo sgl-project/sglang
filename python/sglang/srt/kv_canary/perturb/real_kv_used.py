@@ -1,5 +1,4 @@
-"""Perturb point (b): flip the first byte of a slot currently being used by an
-active req.
+"""Flip the first byte of a slot currently being used by an active req.
 
 Detection should come from per-forward verify (HEAD/TAIL kernel), NOT from
 sweep. Designed to surface CUDA-graph-idle-class bugs where production reads

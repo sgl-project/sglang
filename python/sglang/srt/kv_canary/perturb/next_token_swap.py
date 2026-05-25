@@ -1,5 +1,4 @@
-"""Mock-model self-test perturb: swap two requests' sampled next tokens at the
-sampler exit.
+"""Swap two requests' sampled next tokens at the sampler exit.
 
 KV path is untouched, so kv_canary KV-side fail_reasons stay silent. The
 token-oracle input check downstream MUST report fail_reason=write_token — this

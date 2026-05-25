@@ -20,15 +20,6 @@ if TYPE_CHECKING:
 
 
 class PerturbManager:
-    """Thin orchestrator that owns the per-canary-runner state (config, buffer groups,
-    req-to-token pool, radix cache handle, warmup gate) and dispatches each per-forward
-    invocation to the four perturb-point modules.
-
-    Per-perturb logic lives in :mod:`sglang.srt.kv_canary.perturb.req_to_token`,
-    :mod:`...perturb.real_kv_used`, :mod:`...perturb.real_kv_unused_cache`,
-    :mod:`...perturb.real_kv_post_forward`.
-    """
-
     def __init__(
         self,
         *,
@@ -58,10 +49,6 @@ class PerturbManager:
         *,
         maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
-        """Phase 1 entrypoint. The argument name flags that only batch-level
-        fields (active req set, base out_cache_loc) are safe to consume —
-        step-specific ForwardBatch fields may not yet be filled when an
-        EAGLE outer cycle calls this before any inner draft step has run."""
         self.perturb_req_to_token(maybe_inaccurate_forward_batch)
         self.perturb_real_kv_used(maybe_inaccurate_forward_batch)
         self.perturb_real_kv_unused_cache(maybe_inaccurate_forward_batch)
@@ -71,10 +58,6 @@ class PerturbManager:
         *,
         maybe_inaccurate_forward_batch: Optional["ForwardBatch"],
     ) -> None:
-        """Phase 4 entrypoint. Fires the real_kv_post_forward perturb against
-        the same ForwardBatch the outer cycle handed in at phase 1 (possibly
-        mutated by inner forwards in between). Tail-after ordering means
-        this MUST fire after the captured forward writes have completed."""
         self.perturb_real_kv_post_forward(maybe_inaccurate_forward_batch)
 
     def perturb_req_to_token(

@@ -1,15 +1,3 @@
-"""Slot pickers used by perturb hooks to choose a target slot to corrupt.
-
-Two picking modes:
-
-- :func:`pick_active_slot` (via :func:`collect_active_slots`): random pick from
-  slots currently held by an active req, modeling "corrupt KV that production
-  is about to read." Used by perturb_req_to_token and perturb_real_kv_used.
-- :func:`pick_orphan_slot`: random pick from slots cached in the radix tree
-  but not locked by any active req, modeling "corrupt KV that will only be
-  read much later via prefix reuse." Used by perturb_real_kv_unused_cache.
-"""
-
 from __future__ import annotations
 
 import random
