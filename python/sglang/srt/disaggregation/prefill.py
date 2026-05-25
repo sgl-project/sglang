@@ -499,6 +499,8 @@ class SchedulerDisaggregationPrefillMixin:
         #   transfer; extra groups only add per-group overhead for little gain.
         max_iters = envs.SGLANG_PIPELINE_MAX_ITERS.get()
         min_iters = envs.SGLANG_PIPELINE_MIN_ITERS.get()
+        if min_iters > max_iters:
+            min_iters, max_iters = max_iters, min_iters
         sat_tokens = min_tokens * 3  # saturation point
         t = min(1.0, max(0.0, (avg_tokens - min_tokens) / (sat_tokens - min_tokens)))
         target_iters = max(min_iters, round(max_iters - t * (max_iters - min_iters)))
