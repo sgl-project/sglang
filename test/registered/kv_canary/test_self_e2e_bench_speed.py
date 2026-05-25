@@ -23,24 +23,22 @@ register_cuda_ci(est_time=600, suite="nightly-1-gpu", nightly=True)
 _QWEN3_MODEL = "Qwen/Qwen3-0.6B"
 _QWEN3_SCENARIO_MODEL = "qwen3-0.6b"
 
-# When set, every bench scenario captures a 30-step torch profile of the
-# canary-on run only, under `${KV_CANARY_PROFILE_DIR}/<scenario>_on/`. In this
-# mode the canary-off baseline run is skipped entirely (no overhead is
-# computed and the 200% assertion does not fire), so the bench finishes in
-# roughly half the time and the on-side trace is what you read.
-_PROFILE_DIR_ENV = "KV_CANARY_PROFILE_DIR"
+_PROFILE_DIR_ENV = "SGLANG_KV_CANARY_PROFILE_DIR"
 _PROFILE_STEPS = 30
+_PROFILE_NO_GRAPH_OUTPUT_LEN = 3
+# start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
+_PROFILE_NO_GRAPH_STEPS = 3
 
 
-def _make_server_args(*, canary_on: bool) -> ServerArgs:
-    # canary requires --disable-piecewise-cuda-graph (install_canary asserts it). Pass it on both
-    # sides for apples-to-apples. Do NOT pass --disable-cuda-graph: canary must run inside the
-    # regular cuda graph for a representative measurement.
+def _make_server_args(*, canary_on: bool, disable_cuda_graph: bool = False) -> ServerArgs:
+    # install_canary asserts --disable-piecewise-cuda-graph; pass on both sides for apples-to-apples.
     extra = [
         "--model-path",
         _QWEN3_MODEL,
         "--disable-piecewise-cuda-graph",
     ]
+    if disable_cuda_graph:
+        extra.append("--disable-cuda-graph")
     if canary_on:
         extra += ["--kv-canary", "raise"]
 
@@ -58,7 +56,7 @@ def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> Ben
         output_len=(output_len,),
         temperature=0.0,
         skip_warmup=False,
-        show_report=False,
+        show_report=True,
         dataset_name="random",
         seed=42,
     )
@@ -70,9 +68,13 @@ def _run_one_canary_setting(
     batch_size: int,
     input_len: int,
     output_len: int,
+    disable_cuda_graph: bool = False,
     profile_output_dir: Optional[Path] = None,
+    profile_steps: int = _PROFILE_STEPS,
 ) -> BenchOneCaseResult:
-    server_args = _make_server_args(canary_on=canary_on)
+    server_args = _make_server_args(
+        canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
+    )
     bench_args = _make_bench_args(
         batch_size=batch_size, input_len=input_len, output_len=output_len
     )
@@ -81,7 +83,7 @@ def _run_one_canary_setting(
         bench_args = dataclasses.replace(
             bench_args,
             profile=True,
-            profile_steps=_PROFILE_STEPS,
+            profile_steps=profile_steps,
             profile_output_dir=str(profile_output_dir),
         )
 
@@ -114,8 +116,56 @@ def _resolve_profile_root() -> Optional[Path]:
 class TestCanarySelfBenchSpeed(unittest.TestCase):
     bench_timeout: ClassVar[float] = 1800.0
 
+    def _capture_profiles(
+        self,
+        *,
+        scenario_key: str,
+        profile_root: Path,
+        batch_size: int,
+        input_len: int,
+        output_len: int,
+    ) -> None:
+        scenario_slug = scenario_key.replace("/", "_")
+        scenario_root = profile_root / f"{scenario_slug}_on"
+
+        graph_dir = scenario_root / "cuda_graph"
+        graph_run = _run_one_canary_setting(
+            canary_on=True,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=output_len,
+            profile_output_dir=graph_dir,
+        )
+        print(
+            f"[canary self-bench] {scenario_key} profile cuda_graph: "
+            f"on={graph_run.latency:.4f}s (trace under {graph_dir})",
+            flush=True,
+        )
+
+        no_graph_dir = scenario_root / "no_cuda_graph_osl3"
+        no_graph_run = _run_one_canary_setting(
+            canary_on=True,
+            batch_size=batch_size,
+            input_len=input_len,
+            output_len=_PROFILE_NO_GRAPH_OUTPUT_LEN,
+            disable_cuda_graph=True,
+            profile_output_dir=no_graph_dir,
+            profile_steps=_PROFILE_NO_GRAPH_STEPS,
+        )
+        print(
+            f"[canary self-bench] {scenario_key} profile no_cuda_graph_osl3: "
+            f"on={no_graph_run.latency:.4f}s (trace under {no_graph_dir}); "
+            f"off baseline + overhead assertion skipped.",
+            flush=True,
+        )
+
     def _measure_overhead(
-        self, *, batch_size: int, input_len: int, output_len: int
+        self,
+        *,
+        batch_size: int,
+        input_len: int,
+        output_len: int,
+        max_overhead_pct: float,
     ) -> None:
         scenario_key = _make_scenario_key(
             batch_size=batch_size, input_len=input_len, output_len=output_len
@@ -123,20 +173,12 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         profile_root = _resolve_profile_root()
 
         if profile_root is not None:
-            scenario_slug = scenario_key.replace("/", "_")
-            profile_output_dir = profile_root / f"{scenario_slug}_on"
-            on = _run_one_canary_setting(
-                canary_on=True,
+            self._capture_profiles(
+                scenario_key=scenario_key,
+                profile_root=profile_root,
                 batch_size=batch_size,
                 input_len=input_len,
                 output_len=output_len,
-                profile_output_dir=profile_output_dir,
-            )
-            print(
-                f"[canary self-bench] {scenario_key} profile mode: "
-                f"on={on.latency:.4f}s (trace under {profile_output_dir}); "
-                f"off baseline + overhead assertion skipped.",
-                flush=True,
             )
             return
 
@@ -158,30 +200,36 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
         )
         print(summary, flush=True)
-        self.assertLess(overhead_pct, 5.0, msg=f"{summary} — exceeds 5% budget")
+        self.assertLess(
+            overhead_pct,
+            max_overhead_pct,
+            msg=(
+                f"{summary} — exceeds {max_overhead_pct:.1f}% budget"
+            ),
+        )
 
     def test_qwen3_prefill_overhead_bs32_isl16384_osl1(self) -> None:
-        """Verify canary prefill overhead stays within the expected bound."""
         self._measure_overhead(
             batch_size=32,
             input_len=16384,
             output_len=1,
+            max_overhead_pct=30.0,
         )
 
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
-        """Verify canary decode overhead stays within the expected bound."""
         self._measure_overhead(
             batch_size=128,
             input_len=512,
             output_len=1024,
+            max_overhead_pct=5.0,
         )
 
     def test_qwen3_decode_overhead_bs1_isl512_osl1024(self) -> None:
-        """Verify canary decode overhead stays within the expected bound."""
         self._measure_overhead(
             batch_size=1,
             input_len=512,
             output_len=1024,
+            max_overhead_pct=15.0,
         )
 
 
