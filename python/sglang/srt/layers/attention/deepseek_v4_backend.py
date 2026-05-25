@@ -816,14 +816,15 @@ class DeepseekV4AttnBackend(
                 f"local_seq_lens_len={len(seq_lens)}, "
                 f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
             )
-            device = seq_lens.device
-            seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
+            # GPU buffers (seq_lens, req_pool_indices, out_cache_loc) are
+            # already filled with safe IDLE defaults by populate_from_forward_batch
+            # when bs != raw_bs. The local re-assignments here used to allocate
+            # fresh tensors that never reached the captured graph (which reads
+            # from the original buffer slices), so this branch only needs to
+            # fix up CPU-side state.
             seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
             seq_lens_sum = bs
-            req_pool_indices = torch.zeros(
-                bs, dtype=req_pool_indices.dtype, device=device
-            )
-            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=device)
+            out_cache_loc = torch.zeros(bs, dtype=torch.int64, device=seq_lens.device)
 
         assert seq_lens_cpu is not None
         seq_lens = seq_lens[:bs]
