@@ -106,13 +106,9 @@ def launch_canary_plan_kernels(
             f"kv-canary: launch_canary_plan_kernels verify_capacity={verify_capacity} does not match "
             f"verify_plan_out.verify_slot_indices.shape[0]={plan_verify_capacity}"
         )
-    # Match the ref's tail-reset semantics: write_offsets positions past index bs are zeroed so a smaller
-    # batch never leaks stale prefix-sum entries from a larger previous call. In-place .zero_() is
-    # cuda-graph-safe (no allocation) and avoids one Triton launch.
+
     write_plan_out.write_offsets.zero_()
 
-    # Offsets kernel: per-req count + seed gather + block-level cumsum, single program; the num_valid
-    # scalars are written by the same program (it has the totals in registers already).
     launch_plan_offsets_kernel(
         req_pool_indices=req_pool_indices,
         prefix_lens=prefix_lens,
@@ -129,9 +125,6 @@ def launch_canary_plan_kernels(
         verify_capacity=verify_capacity,
     )
 
-    # Entries kernel: per-(req, j-tile) verify entry materialization. The j-axis upper bound is
-    # verify_capacity (each req cannot contribute more than verify_capacity entries); we mask per-req actual
-    # count read back from verify_offsets_scratch inside the kernel.
     launch_plan_entries_kernel(
         req_pool_indices=req_pool_indices,
         prefix_lens=prefix_lens,

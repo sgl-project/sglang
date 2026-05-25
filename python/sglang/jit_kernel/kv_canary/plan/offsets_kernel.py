@@ -263,11 +263,6 @@ def _plan_offsets_kernel(
     REQ_POOL_IDX_PADDING: tl.constexpr,
     TOKEN_TO_KV_SLOT_PADDING: tl.constexpr,
 ):
-    """Offsets kernel: per-req counts, seeds, exclusive-prefix-sum offsets, scalar totals.
-
-    Single program; BLOCK_BS-wide tiles cover the full bs (caller ensures bs <= BS_BLOCK). All cumsum is done
-    via block-level ``tl.cumsum`` in one program — no cross-program sync needed.
-    """
     bs_offs = tl.arange(0, BS_BLOCK)  # [BS_BLOCK]
     bs_mask = bs_offs < bs  # [BS_BLOCK] bool
 
