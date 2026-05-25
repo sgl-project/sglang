@@ -7,6 +7,9 @@ import torch
 from torch import nn
 
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
@@ -127,7 +130,7 @@ class HashTopK(nn.Module):
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
-            from sglang.jit_kernel.deepseek_v4 import hash_topk
+            from sglang.jit_kernel.dsv4 import hash_topk
 
             topk_weights, topk_ids = hash_topk(
                 router_logits=router_logits,
@@ -145,6 +148,7 @@ class HashTopK(nn.Module):
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )

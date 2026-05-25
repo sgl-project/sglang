@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.piecewise_cuda_graph_runner import (
     PiecewiseCudaGraphRunner,
     freeze_gc,
@@ -179,11 +180,6 @@ class BreakableCudaGraphRunner:
                 (self.max_num_tokens,),
                 dtype=torch.int64 if not is_npu() else torch.int32,
             )
-            out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
-                if model_runner.is_hybrid_swa
-                else None
-            )
             positions = torch.zeros((self.max_num_tokens,), dtype=torch.int64)
             if self.is_multimodal:
                 input_embeds = torch.zeros(
@@ -210,7 +206,6 @@ class BreakableCudaGraphRunner:
         self.buffers = PrefillInputBuffers(
             input_ids=input_ids,
             out_cache_loc=out_cache_loc,
-            out_cache_loc_swa=out_cache_loc_swa,
             mamba_track_indices=None,
             mamba_track_mask=None,
             mamba_track_seqlens=None,
@@ -298,15 +293,7 @@ class BreakableCudaGraphRunner:
             next_token_logits_buffer=None,
             orig_seq_lens=orig_seq_lens,
             seq_lens_cpu=torch.tensor([num_tokens], device="cpu"),
-            req_to_token_pool=self.model_runner.req_to_token_pool,
-            token_to_kv_pool=self.model_runner.token_to_kv_pool,
-            attn_backend=self.model_runner.attn_backend,
             out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            out_cache_loc_swa=(
-                buffers.out_cache_loc_swa[:num_tokens]
-                if buffers.out_cache_loc_swa is not None
-                else None
-            ),
             seq_lens_sum=num_tokens,
             mamba_track_indices=None,
             mamba_track_mask=None,
@@ -340,8 +327,11 @@ class BreakableCudaGraphRunner:
         """Warmup the model with a forward pass."""
         num_tokens = self.capture_num_tokens[0]
         forward_batch = self._build_capture_forward_batch(num_tokens)
-        self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-        self._run_forward(forward_batch, num_tokens)
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+            self._run_forward(forward_batch, num_tokens)
 
     def _capture_all(self):
         """Capture breakable CUDA graphs for all token sizes."""
@@ -400,16 +390,22 @@ class BreakableCudaGraphRunner:
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
 
         def run_once():
+            # Invalidate SWA loc cache — same fix as in cuda_graph_runner.run_once.
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
             return self._run_forward(forward_batch, num_tokens)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend)
+        ):
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
-        graph = BreakableCUDAGraph()
-        with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
-            output = run_once()
+            graph = BreakableCUDAGraph()
+            with BreakableCUDAGraphCapture(cuda_graph=graph, pool=pool, stream=stream):
+                output = run_once()
 
         return graph, output
 
