@@ -583,6 +583,9 @@ class DecodePreallocQueue:
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
+            if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
+                req.last_node = self.tree_cache.root_node
+                self.tree_cache.inc_lock_ref(self.tree_cache.root_node)
             self._pre_alloc(req)
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
