@@ -132,12 +132,26 @@ def _draw_random_write_inputs(rng: random.Random) -> WriteFuzzInputs:
     )
     # Per-chain sequential positions so the write kernel's chain-step position assert holds.
     # For chains with a real seed slot, stamp the seed with (chain_start_position - 1) so the
-    # first chain entry's position == seed.position + 1.
+    # first written chain entry's position == seed.position + 1.
+    #
+    # The writer treats ``out_cache_loc[i] < 0`` entries as "skip": no canary write, and (by
+    # design) no running_prev_position bump. To keep the chain-step assert from firing on the
+    # next valid entry after a skip, the chain counter advances ONLY over written entries —
+    # skipped entries get a placeholder position the kernel never reads.
     chain_start_positions: list[int] = [rng.randint(0, 1024) for _ in range(n_reqs)]
-    positions_list: list[int] = []
+    positions_list: list[int] = [0] * total_tokens
     for r in range(n_reqs):
         start = chain_start_positions[r]
-        positions_list.extend(start + i for i in range(per_req_tokens[r]))
+        entry_start = write_offsets[r]
+        entry_end = write_offsets[r + 1]
+        valid_count = 0
+        for entry_idx in range(entry_start, entry_end):
+            if out_cache_loc_list[entry_idx] < 0:
+                # Placeholder — kernel skips before reading this entry's position.
+                positions_list[entry_idx] = -1
+            else:
+                positions_list[entry_idx] = start + valid_count
+                valid_count += 1
         seed_slot = seed_slot_indices[r]
         if seed_slot >= 0:
             stamp_pair(
