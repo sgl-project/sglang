@@ -221,7 +221,7 @@ class TestEnableAssert(CustomTestCase):
 
 
 class TestResetToIdle(CustomTestCase):
-    """reset_to_idle only touches the phase tensor; the assert flag is untouched."""
+    """_reset_to_idle only touches the phase tensor; the assert flag is untouched."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -233,27 +233,27 @@ class TestResetToIdle(CustomTestCase):
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
-        checker.reset_to_idle()
+        checker._reset_to_idle()
         self.assertEqual(_phase_value(checker), int(_Phase.IDLE))
 
     def test_reset_does_not_toggle_assert_flag_when_off(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         self.assertEqual(_assert_flag(checker), 0)
-        checker.reset_to_idle()
+        checker._reset_to_idle()
         self.assertEqual(_assert_flag(checker), 0)
 
     def test_reset_does_not_toggle_assert_flag_when_on(self) -> None:
         checker = SimplePhaseChecker(initial_phase=_Phase.IDLE, device=self.device)
         checker.enable_assert()
         self.assertEqual(_assert_flag(checker), 1)
-        checker.reset_to_idle()
+        checker._reset_to_idle()
         self.assertEqual(_assert_flag(checker), 1)
 
     def test_reset_with_nonzero_initial_phase(self) -> None:
         checker = SimplePhaseChecker(initial_phase=5, device=self.device)
         checker.update(expect_phase=5, next_phase=9, caller_name="t")
         torch.cuda.synchronize()
-        checker.reset_to_idle()
+        checker._reset_to_idle()
         self.assertEqual(_phase_value(checker), 5)
 
 
@@ -396,7 +396,7 @@ class TestCudaGraphCapture(CustomTestCase):
         self.assertEqual(_phase_value(checker), int(_Phase.B))
 
         # Reset + replay again — same result, no raise.
-        checker.reset_to_idle()
+        checker._reset_to_idle()
         graph.replay()
         torch.cuda.synchronize()
         self.assertEqual(_phase_value(checker), int(_Phase.B))
