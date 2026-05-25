@@ -16,13 +16,13 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/2c58742dff8613a3bd7496f2008ce927e18d38d1/vllm/model_executor/layers/mamba/mamba2_metadata.py
 
 
-import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.utils.common import is_pin_memory_available
 
 
 @dataclass(kw_only=True)
@@ -63,9 +63,9 @@ class Mamba2Metadata(ForwardMetadata):
         prep_initial_states: bool
 
         chunk_size: int
+        cu_chunk_seqlens: torch.Tensor
         seq_idx: torch.Tensor
-        chunk_indices: torch.Tensor
-        chunk_offsets: torch.Tensor
+        last_chunk_indices: torch.Tensor
 
         extend_seq_lens_cpu: list[int]
 
@@ -73,88 +73,63 @@ class Mamba2Metadata(ForwardMetadata):
     """`mixed_metadata` is used for extend/mixed requests"""
 
     @staticmethod
-    def _query_start_loc_to_chunk_indices_offsets(
-        query_start_loc: torch.Tensor, chunk_size: int, total_seqlens: int
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            query_start_loc (torch.Tensor): 1D tensor of cumulative sequence
-                lengths, shape (num_seqs + 1,).
-                The first element should be 0. Each entry represents the starting
-                index of a sequence in the flattened token array.
-            chunk_size (int): The size of each physical mamba chunk
-                (number of tokens per chunk).
-            total_seqlens (int): The total number of tokens in the batch.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-                - chunk_indices (torch.Tensor): 1D tensor of indices
-                    indicating the physical chunk for each logical chunk.
-                - chunk_offsets (torch.Tensor): 1D tensor of offsets
-                    indicating the starting index of each logical chunk within
-                    its physical chunk.
-
-        This function computes the chunk indices and offsets for the given
-        query_start_loc and chunk_size. Both are tensors of integers with length N,
-        where N is the number of logical (pseudo) chunks.
-        A logical chunk is a sequence of tokens that are all part of the same
-        sequence and are all in the same physical mamba chunk.
-        In other words, a logical chunk changes every time we cross a sequence
-        boundary or a physical mamba chunk boundary.
-        Logical chunks are needed to handle batched requests with initial states
-        (see _state_passing_fwd and _chunk_scan_fwd).
-        The chunk_indices tensor contains the index of the physical chunk for each
-        logical chunk.
-        The chunk_offsets tensor contains the offset (AKA starting index) of the
-        logical chunk in the physical chunk.
-
-        Example:
-        query_start_loc = [0, 5, 10]
-        chunk_size = 8
-        total_seqlens = 10
-        -> chunk_indices = [0, 0, 1]
-        -> chunk_offsets = [0, 5, 0]
-
-        In this example, we have 2 sequences, each with 5 tokens. The physical
-        chunk size is 8 tokens.
-        We have three logical chunks:
-        - the first logical chunk starts at token 0 in the first physical chunk
-            and contains all 5 tokens from the first sequence
-        - the second logical chunk starts at token 5 in the first physical chunk
-            and contains first 3 tokens from the second sequence
-        - the third logical chunk starts at token 0 in the second physical chunk
-            and contains the remaining 2 tokens from the second sequence
-        """
-
-        cu_seqlens = query_start_loc[1:]  # remove prepended 0
-
-        # outputs will have length expansion of chunks that do not divide
-        # chunk_size
-        N = (
-            math.ceil(total_seqlens / chunk_size)
-            + (cu_seqlens[:-1] % chunk_size > 0).sum()
+    def _async_tensor_h2d(data: list[int], device: torch.device) -> torch.Tensor:
+        t = torch.tensor(
+            data,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=is_pin_memory_available(device),
         )
-        chunk_indices = torch.arange(N, dtype=torch.int, device=query_start_loc.device)
-        chunk_offsets = torch.zeros(
-            (N,), dtype=torch.int, device=query_start_loc.device
+        return t.to(device=device, non_blocking=True)
+
+    @staticmethod
+    def _seq_lens_to_logical_chunks(
+        extend_seq_lens_cpu: list[int],
+        chunk_size: int,
+        device: torch.device,
+        extend_prefix_lens_cpu: Optional[list[int]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cu_chunk_seqlens: list[int] = [0]
+        seq_idx: list[int] = []
+        last_chunk_indices: list[int] = []
+
+        if extend_prefix_lens_cpu is None:
+            extend_prefix_lens_cpu = [0] * len(extend_seq_lens_cpu)
+
+        start = 0
+        for seq_i, (prefix_len, seq_len) in enumerate(
+            zip(extend_prefix_lens_cpu, extend_seq_lens_cpu, strict=True)
+        ):
+            remaining_len = seq_len
+            chunk_start = start
+            first_chunk_len = chunk_size - (prefix_len % chunk_size)
+            if first_chunk_len == 0:
+                first_chunk_len = chunk_size
+
+            while remaining_len > 0:
+                chunk_len = min(first_chunk_len, remaining_len)
+                seq_idx.append(seq_i)
+                chunk_start += chunk_len
+                remaining_len -= chunk_len
+                first_chunk_len = chunk_size
+                cu_chunk_seqlens.append(chunk_start)
+
+            last_chunk_indices.append(len(cu_chunk_seqlens) - 2)
+            start += seq_len
+
+        return (
+            Mamba2Metadata._async_tensor_h2d(cu_chunk_seqlens, device),
+            Mamba2Metadata._async_tensor_h2d(seq_idx, device),
+            Mamba2Metadata._async_tensor_h2d(last_chunk_indices, device),
         )
 
-        p = 0  # num of insertions
-        for s, e in zip(cu_seqlens[:-1], cu_seqlens[1:]):
-
-            # if does not divide chunk_size, then there is one chunk insertion
-            p += s % chunk_size > 0
-
-            # get the dimensions
-            # - the + 1 for _e is to shift the boundary by one chunk
-            # - this shifting is not needed if chunk_size divides e
-            _s, _e = s // chunk_size + p, e // chunk_size + p + (e % chunk_size > 0)
-
-            # adjust indices and offsets
-            chunk_indices[_s:_e] -= p
-            chunk_offsets[_s] = s % chunk_size
-
-        return chunk_indices, chunk_offsets
+    @staticmethod
+    def _to_cpu_len_list(seq_lens: list[int] | torch.Tensor | None) -> list[int]:
+        assert seq_lens is not None
+        if isinstance(seq_lens, torch.Tensor):
+            assert seq_lens.device.type == "cpu"
+            return seq_lens.tolist()
+        return seq_lens
 
     @staticmethod
     def prepare_decode(
@@ -203,30 +178,23 @@ class Mamba2Metadata(ForwardMetadata):
         num_decodes = len(forward_batch.seq_lens) - num_prefills
         context_lens_tensor = forward_batch.extend_prefix_lens
         assert context_lens_tensor is not None
+        extend_seq_lens_cpu = cls._to_cpu_len_list(forward_batch.extend_seq_lens_cpu)
+        extend_prefix_lens_cpu = cls._to_cpu_len_list(
+            forward_batch.extend_prefix_lens_cpu
+        )
         # precompute flag to avoid device syncs later
         has_initial_states = context_lens_tensor > 0
-        prep_initial_states = torch.any(has_initial_states[:num_prefills]).item()
+        prep_initial_states = any(
+            prefix_len > 0 for prefix_len in extend_prefix_lens_cpu
+        )
 
         query_start_loc = forward_metadata.query_start_loc[: num_prefills + 1]
-        seq_idx = torch.repeat_interleave(
-            torch.arange(
-                num_prefills, dtype=torch.int32, device=query_start_loc.device
-            ),
-            query_start_loc.diff(),
-            output_size=num_prefill_tokens,
+        cu_chunk_seqlens, seq_idx, last_chunk_indices = cls._seq_lens_to_logical_chunks(
+            extend_seq_lens_cpu,
+            chunk_size,
+            query_start_loc.device,
+            extend_prefix_lens_cpu,
         )
-        seq_idx.unsqueeze_(0)
-
-        # We compute metadata for chunked prefill once at the top level model
-        # forward and reuse them in mamba layers. If not needed, they will be
-        # ignored inside mamba kernels.
-        chunk_offsets, chunk_indices = None, None
-        if prep_initial_states:
-            chunk_indices, chunk_offsets = (
-                cls._query_start_loc_to_chunk_indices_offsets(
-                    query_start_loc, chunk_size, num_prefill_tokens
-                )
-            )
 
         draft_token_num = (
             getattr(forward_batch.spec_info, "draft_token_num", 1)
@@ -248,9 +216,9 @@ class Mamba2Metadata(ForwardMetadata):
                 has_initial_states=has_initial_states,
                 prep_initial_states=prep_initial_states,
                 chunk_size=chunk_size,
+                cu_chunk_seqlens=cu_chunk_seqlens,
                 seq_idx=seq_idx,
-                chunk_indices=chunk_indices,
-                chunk_offsets=chunk_offsets,
-                extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                last_chunk_indices=last_chunk_indices,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
             ),
         )

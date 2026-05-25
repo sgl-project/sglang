@@ -102,7 +102,44 @@ def ssd_minimal_discrete(
     return Y, final_state
 
 
-def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=None):
+def ssd_minimal_discrete_packed(
+    X,
+    A,
+    B,
+    C,
+    block_len,
+    initial_states=None,
+    return_intermediate_states=False,
+):
+    result = ssd_minimal_discrete(
+        X.unsqueeze(0),
+        A.unsqueeze(0),
+        B.unsqueeze(0),
+        C.unsqueeze(0),
+        block_len,
+        initial_states=initial_states,
+        return_intermediate_states=return_intermediate_states,
+    )
+    if return_intermediate_states:
+        Y, final_state, states = result
+        return Y.squeeze(0), final_state, states.squeeze(0)
+    Y, final_state = result
+    return Y.squeeze(0), final_state
+
+
+def cu_seqlens_to_logical_chunks(cu_seqlens, chunk_size, prefix_lens_cpu=None):
+    extend_seq_lens_cpu = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
+    return Mamba2Metadata._seq_lens_to_logical_chunks(
+        extend_seq_lens_cpu,
+        chunk_size,
+        cu_seqlens.device,
+        extend_prefix_lens_cpu=prefix_lens_cpu,
+    )
+
+
+def generate_random_batched_inputs(
+    batch_size, seqlen, n_heads, d_head, itype, device=None
+):
 
     if device is None:
         device = get_device()
@@ -119,6 +156,19 @@ def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=No
     C = torch.randn((batch_size, seqlen, n_heads, d_head), dtype=itype, device=device)
 
     return A, dt, X, B, C
+
+
+def generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype, device=None):
+    A, dt, X, B, C = generate_random_batched_inputs(
+        batch_size, seqlen, n_heads, d_head, itype, device
+    )
+    return (
+        A,
+        dt.reshape(batch_size * seqlen, n_heads),
+        X.reshape(batch_size * seqlen, n_heads, d_head),
+        B.reshape(batch_size * seqlen, n_heads, d_head),
+        C.reshape(batch_size * seqlen, n_heads, d_head),
+    )
 
 
 def generate_continuous_batched_examples(
@@ -142,7 +192,7 @@ def generate_continuous_batched_examples(
     # reference output.
 
     # generate the full-length example
-    A, dt, X, B, C = generate_random_inputs(
+    A, dt, X, B, C = generate_random_batched_inputs(
         num_examples, full_length, n_heads, d_head, itype, device
     )
     # Capture the resolved device from the tensors
@@ -167,7 +217,7 @@ def generate_continuous_batched_examples(
             exhausted[i] = last_taken[i] == 0
 
         return (
-            torch.concat([x[i, s:e] for i, (s, e) in enumerate(indices)]).unsqueeze(0)
+            torch.concat([x[i, s:e] for i, (s, e) in enumerate(indices)])
             for x in (dt, X, B, C)
         )
 
@@ -185,18 +235,7 @@ def generate_continuous_batched_examples(
         # get the (maybe partial) example seen in this cont batch
         dt2, X2, B2, C2 = get_continuous_batch(spec)
 
-        # get the metadata
         cu_seqlens = torch.tensor((0,) + spec, device=device).cumsum(dim=0)
-        seq_idx = torch.zeros(
-            cu_seqlens[-1], dtype=torch.int32, device=cu_seqlens.device
-        )
-        for i, (srt, end) in enumerate(
-            zip(
-                cu_seqlens,
-                cu_seqlens[1:],
-            )
-        ):
-            seq_idx[srt:end] = i
 
         # for cont batch
         if IND_E is None:
@@ -212,7 +251,6 @@ def generate_continuous_batched_examples(
                 else None
             ),
             cu_seqlens,
-            seq_idx.unsqueeze(0),
             (A, dt2, X2, B2, C2),
         )
 
@@ -227,6 +265,27 @@ if is_in_ci():
     SINGLE_NHEADS = [3, 32]
     SINGLE_DHEAD = [5, 128]
     SINGLE_SEQ_LEN_CHUNK_SIZE = [(112, 16)]
+
+
+def test_mamba2_metadata_logical_chunks_use_prefix_lens():
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = (
+        Mamba2Metadata._seq_lens_to_logical_chunks(
+            extend_seq_lens_cpu=[10, 7, 8],
+            chunk_size=8,
+            device=torch.device("cpu"),
+            extend_prefix_lens_cpu=[5, 16, 31],
+        )
+    )
+
+    torch.testing.assert_close(
+        cu_chunk_seqlens, torch.tensor([0, 3, 10, 17, 18, 25], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        seq_idx, torch.tensor([0, 0, 1, 2, 2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        last_chunk_indices, torch.tensor([1, 2, 4], dtype=torch.int32)
+    )
 
 
 @pytest.mark.parametrize("itype", SINGLE_ITYPE)
@@ -256,21 +315,35 @@ def test_mamba_chunk_scan_single_example(d_head, n_heads, seq_len_chunk_size, it
 
     A, dt, X, B, C = generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype)
 
-    Y_min, final_state_min = ssd_minimal_discrete(
+    Y_min, final_state_min = ssd_minimal_discrete_packed(
         X * dt.unsqueeze(-1), A * dt, B, C, chunk_size
+    )
+    cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=X.device)
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        cu_seqlens, chunk_size
     )
     Y = torch.empty_like(X)
     final_state = mamba_chunk_scan_combined(
-        X, dt, A, B, C, chunk_size, D=None, return_final_states=True, out=Y
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
+        D=None,
+        out=Y,
     )
 
     # just test the last in sequence
-    torch.testing.assert_close(Y[:, -1], Y_min[:, -1], atol=atol, rtol=rtol)
+    torch.testing.assert_close(Y[-1], Y_min[-1], atol=atol, rtol=rtol)
 
     # just test the last head
-    # NOTE, in the kernel we always cast states to fp32
     torch.testing.assert_close(
-        final_state[:, -1],
+        final_state[:, -1].to(torch.float32),
         final_state_min[:, -1].to(torch.float32),
         atol=atol,
         rtol=rtol,
@@ -351,16 +424,12 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
     for (
         Y_min,
         cu_seqlens,
-        seq_idx,
         (A, dt, X, B, C),
     ) in generate_continuous_batched_examples(
         cases, num_examples, seqlen, last_taken, exhausted, n_heads, d_head, itype
     ):
-
-        chunk_indices, chunk_offsets = (
-            Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
-                cu_seqlens, chunk_size, cu_seqlens[-1]
-            )
+        cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+            cu_seqlens, chunk_size
         )
 
         Y = torch.empty_like(X)
@@ -373,10 +442,9 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
             chunk_size,
             D=None,
             cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
             seq_idx=seq_idx,
-            chunk_indices=chunk_indices,
-            chunk_offsets=chunk_offsets,
-            return_varlen_states=True,
             initial_states=states,
             out=Y,
         )
@@ -385,7 +453,7 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
         for i in range(num_examples):
 
             # just test one dim and dstate
-            Y_eg = Y[0, cu_seqlens[i] : cu_seqlens[i + 1], 0, 0]
+            Y_eg = Y[cu_seqlens[i] : cu_seqlens[i + 1], 0, 0]
             Y_min_eg = Y_min[i][:, 0, 0]
             torch.testing.assert_close(Y_eg, Y_min_eg, atol=atol, rtol=rtol)
 
@@ -395,6 +463,75 @@ def test_mamba_chunk_scan_cont_batch(d_head, n_heads, seq_len_chunk_size_cases, 
             if clear:
                 states[i].fill_(0.0)
                 exhausted[i] = False
+
+
+@pytest.mark.parametrize("chunk_size", [8, 32])
+@pytest.mark.parametrize("seqlens", [(16, 12, 20), (16, 20)])
+def test_mamba_chunk_scan_packed_initial_states_without_varlen_return(
+    chunk_size, seqlens
+):
+    """Regression: packed initial_states return final states from chunk states."""
+    device = get_device()
+    if device not in ["cuda", "xpu"]:
+        pytest.skip("Test only supports CUDA and XPU devices")
+
+    itype = torch.float32
+    n_heads = 4
+    d_head = 32
+    num_sequences = len(seqlens)
+    total_seqlen = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        [0, *torch.cumsum(torch.tensor(seqlens), dim=0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    A, dt, X, B, C = generate_random_inputs(
+        1, total_seqlen, n_heads, d_head, itype, device=device
+    )
+    initial_states = torch.randn(
+        (num_sequences, n_heads, d_head, d_head), dtype=itype, device=device
+    )
+
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        cu_seqlens, chunk_size
+    )
+
+    Y_ref = torch.empty_like(X)
+    final_states_ref = mamba_chunk_scan_combined(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
+        initial_states=initial_states,
+        out=Y_ref,
+    )
+
+    Y = torch.empty_like(X)
+    _, final_states = mamba_chunk_scan_combined(
+        X,
+        dt,
+        A,
+        B,
+        C,
+        chunk_size,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
+        initial_states=initial_states,
+        return_intermediate_states=True,
+        out=Y,
+    )
+
+    torch.testing.assert_close(Y, Y_ref, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(final_states, final_states_ref, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.parametrize("chunk_size", [8, 256])
@@ -438,7 +575,7 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     # example has been exhausted and needs to cycle
     last_taken: dict = {}  # map: eg -> pointer to last taken sample
     exhausted: dict = {}  # map: eg -> boolean indicating example is exhausted
-    _, cu_seqlens, seq_idx, (A, dt, X, B, C) = next(
+    _, cu_seqlens, (A, dt, X, B, C) = next(
         generate_continuous_batched_examples(
             [seqlens],
             num_sequences,
@@ -455,10 +592,8 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     device = X.device
 
     ## full seqlen computation
-    chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
-            cu_seqlens, chunk_size, cu_seqlens[-1]
-        )
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        cu_seqlens, chunk_size
     )
     Y_ref = torch.empty_like(X)
     state_ref = mamba_chunk_scan_combined(
@@ -470,10 +605,9 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         chunk_size,
         D=None,
         cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
         seq_idx=seq_idx,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        return_varlen_states=True,
         initial_states=None,
         out=Y_ref,
     )
@@ -484,34 +618,23 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     chunked_cu_seqlens = torch.cat(
         [torch.tensor([0], device=device), torch.cumsum(chunked_seqlens, dim=0)], dim=0
     )
-    chunked_seq_idx = (
-        torch.repeat_interleave(
-            torch.arange(len(chunked_seqlens), device=device),
-            chunked_seqlens,
-            output_size=chunked_cu_seqlens[-1],
-        )
-        .unsqueeze(0)
-        .to(torch.int32)
-    )
     chunked_input_seq_len = chunked_cu_seqlens[-1]
-    X_chunked = torch.zeros_like(X)[:, :chunked_input_seq_len, ...]
-    dt_chunked = torch.zeros_like(dt)[:, :chunked_input_seq_len, ...]
-    B_chunked = torch.zeros_like(B)[:, :chunked_input_seq_len, ...]
-    C_chunked = torch.zeros_like(C)[:, :chunked_input_seq_len, ...]
+    X_chunked = torch.zeros_like(X)[:chunked_input_seq_len, ...]
+    dt_chunked = torch.zeros_like(dt)[:chunked_input_seq_len, ...]
+    B_chunked = torch.zeros_like(B)[:chunked_input_seq_len, ...]
+    C_chunked = torch.zeros_like(C)[:chunked_input_seq_len, ...]
     for i in range(num_sequences):
         # fmt: off
-        chunk_f = lambda x, i: x[:, cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]  # noqa: E501
+        chunk_f = lambda x, i: x[cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]  # noqa: E501
 
-        X_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(X, i)  # noqa: E501
-        dt_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(dt, i)  # noqa: E501
-        B_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(B, i)  # noqa: E501
-        C_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(C, i)  # noqa: E501
+        X_chunked[chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(X, i)  # noqa: E501
+        dt_chunked[chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(dt, i)  # noqa: E501
+        B_chunked[chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(B, i)  # noqa: E501
+        C_chunked[chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(C, i)  # noqa: E501
         # fmt: on
 
-    chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
-            chunked_cu_seqlens, chunk_size, chunked_cu_seqlens[-1]
-        )
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        chunked_cu_seqlens, chunk_size
     )
     Y_partial = torch.empty_like(X_chunked)
     partial_state = mamba_chunk_scan_combined(
@@ -523,10 +646,9 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         chunk_size,
         D=None,
         cu_seqlens=chunked_cu_seqlens,
-        seq_idx=chunked_seq_idx,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        return_varlen_states=True,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
         initial_states=None,
         out=Y_partial,
     )
@@ -540,36 +662,27 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         ],
         dim=0,
     )
-    remaining_chunked_seq_idx = (
-        torch.repeat_interleave(
-            torch.arange(len(remaining_chunked_seqlens), device=device),
-            remaining_chunked_seqlens,
-            output_size=remaining_chunked_cu_seqlens[-1],
-        )
-        .unsqueeze(0)
-        .to(torch.int32)
-    )
     remaining_chunked_input_seq_len = remaining_chunked_cu_seqlens[-1]
     # fmt: off
-    remaining_X_chunked = torch.zeros_like(X)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
-    remaining_dt_chunked = torch.zeros_like(dt)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
-    remaining_B_chunked = torch.zeros_like(B)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
-    remaining_C_chunked = torch.zeros_like(C)[:, :remaining_chunked_input_seq_len, ...]  # noqa: E501
+    remaining_X_chunked = torch.zeros_like(X)[:remaining_chunked_input_seq_len, ...]  # noqa: E501
+    remaining_dt_chunked = torch.zeros_like(dt)[:remaining_chunked_input_seq_len, ...]  # noqa: E501
+    remaining_B_chunked = torch.zeros_like(B)[:remaining_chunked_input_seq_len, ...]  # noqa: E501
+    remaining_C_chunked = torch.zeros_like(C)[:remaining_chunked_input_seq_len, ...]  # noqa: E501
     for i in range(num_sequences):
-        remaining_chunk_f = lambda x, i: x[:, cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]  # noqa: E501
+        remaining_chunk_f = lambda x, i: x[cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]  # noqa: E501
 
-        remaining_X_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(X, i)  # noqa: E501
-        remaining_dt_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(dt, i)  # noqa: E501
-        remaining_B_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(B, i)  # noqa: E501
-        remaining_C_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(C, i)  # noqa: E501
+        remaining_X_chunked[remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(X, i)  # noqa: E501
+        remaining_dt_chunked[remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(dt, i)  # noqa: E501
+        remaining_B_chunked[remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(B, i)  # noqa: E501
+        remaining_C_chunked[remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(C, i)  # noqa: E501
 
     # assert input chunking is correct
     concat_chunk_f = lambda pt1, pt2, i: torch.cat([
-        pt1[:,chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1],...],
-        pt2[:,remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
+        pt1[chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1],...],
+        pt2[remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
         ],
-        dim=1)
-    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=1)  # noqa: E501
+        dim=0)
+    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=0)  # noqa: E501
     # fmt: on
 
     assert concat_batch_f(X_chunked, remaining_X_chunked).equal(X)
@@ -577,10 +690,10 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
     assert concat_batch_f(B_chunked, remaining_B_chunked).equal(B)
     assert concat_batch_f(C_chunked, remaining_C_chunked).equal(C)
 
-    chunk_indices, chunk_offsets = (
-        Mamba2Metadata._query_start_loc_to_chunk_indices_offsets(
-            remaining_chunked_cu_seqlens, chunk_size, remaining_chunked_cu_seqlens[-1]
-        )
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        remaining_chunked_cu_seqlens,
+        chunk_size,
+        prefix_lens_cpu=chunked_seqlens.cpu().tolist(),
     )
 
     Y_chunked = torch.empty_like(remaining_X_chunked)
@@ -593,10 +706,9 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
         chunk_size,
         D=None,
         cu_seqlens=remaining_chunked_cu_seqlens,
-        seq_idx=remaining_chunked_seq_idx,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        return_varlen_states=True,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
         initial_states=partial_state,
         out=Y_chunked,
     )
@@ -604,18 +716,18 @@ def test_mamba_chunk_scan_cont_batch_prefill_chunking(chunk_size, seqlens):
 
     # kernel chunked is same as kernel overall
     for i in range(num_sequences):
-        Y_seq = Y[:, cu_seqlens[i] : cu_seqlens[i + 1], ...]
-        Y_ref_seq = Y_ref[:, cu_seqlens[i] : cu_seqlens[i + 1], ...]
+        Y_seq = Y[cu_seqlens[i] : cu_seqlens[i + 1], ...]
+        Y_ref_seq = Y_ref[cu_seqlens[i] : cu_seqlens[i + 1], ...]
         torch.testing.assert_close(
-            Y_seq[:, : chunked_seqlens[i], ...],
-            Y_ref_seq[:, : chunked_seqlens[i], ...],
+            Y_seq[: chunked_seqlens[i], ...],
+            Y_ref_seq[: chunked_seqlens[i], ...],
             atol=atol,
             rtol=rtol,
             msg=lambda x: f"seq{i} output part1 " + x,
         )  # noqa: B023
         torch.testing.assert_close(
-            Y_seq[:, chunked_seqlens[i] :, ...],
-            Y_ref_seq[:, chunked_seqlens[i] :, ...],
+            Y_seq[chunked_seqlens[i] :, ...],
+            Y_ref_seq[chunked_seqlens[i] :, ...],
             atol=atol,
             rtol=rtol,
             msg=lambda x: f"seq{i} output part2 " + x,
@@ -656,10 +768,14 @@ def test_mamba_chunk_scan_intermediate_states(
 
     A, dt, X, B, C = generate_random_inputs(batch_size, seqlen, n_heads, d_head, itype)
 
-    _, ref_final_state, ref_states = ssd_minimal_discrete(
+    _, ref_final_state, ref_states = ssd_minimal_discrete_packed(
         X * dt.unsqueeze(-1), A * dt, B, C, chunk_size, return_intermediate_states=True
     )
 
+    cu_seqlens = torch.tensor([0, seqlen], dtype=torch.int32, device=X.device)
+    cu_chunk_seqlens, seq_idx, last_chunk_indices = cu_seqlens_to_logical_chunks(
+        cu_seqlens, chunk_size
+    )
     Y = torch.empty_like(X)
     states, final_state = mamba_chunk_scan_combined(
         X,
@@ -668,18 +784,22 @@ def test_mamba_chunk_scan_intermediate_states(
         B,
         C,
         chunk_size,
+        cu_seqlens=cu_seqlens,
+        cu_chunk_seqlens=cu_chunk_seqlens,
+        last_chunk_indices=last_chunk_indices,
+        seq_idx=seq_idx,
         D=None,
         return_intermediate_states=True,
-        return_final_states=True,
         out=Y,
     )
 
     num_chunks = seqlen // chunk_size
-    assert states.shape == (batch_size, num_chunks, n_heads, d_head, d_head)
+    assert states.shape == (num_chunks, n_heads, d_head, d_head)
     assert ref_states.shape == states.shape
+    assert final_state.dtype == itype
 
     torch.testing.assert_close(
-        final_state[:, -1],
+        final_state[:, -1].to(torch.float32),
         ref_final_state[:, -1].to(torch.float32),
         atol=atol,
         rtol=rtol,
@@ -687,8 +807,8 @@ def test_mamba_chunk_scan_intermediate_states(
 
     for chunk_idx in range(num_chunks):
         torch.testing.assert_close(
-            states[:, chunk_idx, -1],
-            ref_states[:, chunk_idx, -1].to(states.dtype),
+            states[chunk_idx, -1],
+            ref_states[chunk_idx, -1].to(states.dtype),
             atol=atol,
             rtol=rtol,
             msg=lambda x: f"chunk {chunk_idx} " + x,
