@@ -303,7 +303,7 @@ class TestBreakableCudaGraph(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=[
-                "--enable-breakable-cuda-graph",
+                "--cuda-graph-backend-prefill=breakable",
             ],
         )
 

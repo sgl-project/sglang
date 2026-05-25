@@ -75,6 +75,11 @@ from sglang.srt.layers.utils.cp_utils import (
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
+from sglang.srt.model_executor.cuda_graph_mode import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.cuda_graph_runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -1273,7 +1278,7 @@ class DeepseekV4Model(nn.Module):
             layer = self.layers[i]
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:

@@ -21,7 +21,7 @@ SWA_MODEL = "openai/gpt-oss-20b"
 SWA_COMMON_ARGS = [
     "--mem-fraction-static",
     "0.70",
-    "--disable-piecewise-cuda-graph",
+    "--cuda-graph-backend-prefill=disabled",
 ]
 
 

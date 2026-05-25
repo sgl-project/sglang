@@ -89,21 +89,26 @@ class TcPiecewiseCudaGraphBackend(BaseCudaGraphBackend):
     def build_compilation_config(server_args: "ServerArgs") -> CompilationConfig:
         """Construct the ``CompilationConfig`` from ``ServerArgs``.
 
-        Validates the ``--piecewise-cuda-graph-compiler`` choice, builds
+        Validates the ``--cuda-graph-tc-compiler-prefill`` choice, builds
         the config, and registers the MoE A2A split-op when DeepEP /
         Mooncake is in use.
         """
+        from sglang.srt.model_executor.cuda_graph_mode import Phase
+
+        prefill = server_args.cuda_graph_settings[Phase.PREFILL]
+        num_tokens = prefill["num_tokens"]
+        compiler = prefill["tc_compiler"]
         assert (
-            server_args.piecewise_cuda_graph_tokens is not None
-        ), "piecewise_cuda_graph_tokens is not set"
-        assert server_args.piecewise_cuda_graph_compiler in _VALID_COMPILERS, (
-            f"By now, only {_VALID_COMPILERS} are supported for piecewise "
-            "cuda graph compiler."
+            num_tokens is not None
+        ), "cuda_graph_settings[prefill].num_tokens is not set"
+        assert compiler in _VALID_COMPILERS, (
+            f"By now, only {_VALID_COMPILERS} are supported for the "
+            "tc_piecewise prefill compiler."
         )
 
         config = CompilationConfig(
-            server_args.piecewise_cuda_graph_tokens,
-            server_args.piecewise_cuda_graph_compiler,
+            num_tokens,
+            compiler,
             server_args.enable_torch_compile_debug_mode,
         )
 

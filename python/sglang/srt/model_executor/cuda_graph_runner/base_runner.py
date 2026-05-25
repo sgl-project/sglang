@@ -68,11 +68,13 @@ def get_batch_sizes_to_capture(
 ) -> Tuple[List[int], List[int]]:
     """Build the (capture_bs, compile_bs) lists for the decode runner.
 
-    Filters server_args.cuda_graph_bs by attention-tp/cp alignment
+    Filters ``cuda_graph_settings[decode].bs`` by attention-tp/cp alignment
     constraints and clamps to req_to_token_pool.size.
     """
+    from sglang.srt.model_executor.cuda_graph_mode import Phase
+
     server_args = model_runner.server_args
-    capture_bs = server_args.cuda_graph_bs
+    capture_bs = server_args.cuda_graph_settings[Phase.DECODE]["bs"]
     num_max_requests = model_runner.req_to_token_pool.size
 
     mul_base = 1

@@ -35,13 +35,13 @@ _TC_PIECEWISE_DECODE_FALLBACK_LOGGED = False
 
 
 def resolve_decode_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
-    """Pick a backend instance from ``cuda_graph_mode['decode']``.
+    """Pick a backend instance from ``cuda_graph_settings['decode']['backend']``.
 
     NPU device returns ``NPUCudaGraphBackend`` regardless of mode (only
     the Full-style backend is wired for NPU today).
     """
-    mode = model_runner.server_args.cuda_graph_mode or {}
-    backend_name = mode.get(Phase.DECODE, Backend.FULL)
+    settings = model_runner.server_args.cuda_graph_settings or {}
+    backend_name = settings.get(Phase.DECODE, {}).get("backend", Backend.FULL)
 
     enable_memory_saver = model_runner.server_args.enable_memory_saver
 
@@ -69,9 +69,9 @@ def resolve_decode_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
 
 
 def resolve_prefill_backend(model_runner: "ModelRunner") -> BaseCudaGraphBackend:
-    """Pick a backend instance from ``cuda_graph_mode['prefill']``."""
-    mode = model_runner.server_args.cuda_graph_mode or {}
-    backend_name = mode.get(Phase.PREFILL, Backend.TC_PIECEWISE)
+    """Pick a backend instance from ``cuda_graph_settings['prefill']['backend']``."""
+    settings = model_runner.server_args.cuda_graph_settings or {}
+    backend_name = settings.get(Phase.PREFILL, {}).get("backend", Backend.TC_PIECEWISE)
 
     if backend_name == Backend.BREAKABLE:
         return BreakableCudaGraphBackend(

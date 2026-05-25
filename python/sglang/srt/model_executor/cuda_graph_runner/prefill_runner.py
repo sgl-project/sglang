@@ -49,6 +49,7 @@ from sglang.srt.model_executor.cuda_graph_backend.factory import (
 from sglang.srt.model_executor.cuda_graph_backend_utils.tc_piecewise_cuda_graph import (
     set_forward_context,
 )
+from sglang.srt.model_executor.cuda_graph_mode import Phase
 from sglang.srt.model_executor.cuda_graph_runner.base_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -92,8 +93,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_return_pooled_hidden_states = not model_runner.is_generation
 
         # --- bucket sizes ---------------------------------------------
-        capture_tokens = model_runner.server_args.piecewise_cuda_graph_tokens
-        assert capture_tokens is not None, "piecewise_cuda_graph_tokens is not set"
+        capture_tokens = model_runner.server_args.cuda_graph_settings[Phase.PREFILL][
+            "num_tokens"
+        ]
+        assert (
+            capture_tokens is not None
+        ), "cuda_graph_settings[prefill].num_tokens is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
