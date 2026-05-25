@@ -91,7 +91,9 @@ from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.plugins import load_plugins
+from sglang.srt.reasoning_utils import resolve_require_reasoning
 from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.structured_output_utils import apply_response_format_to_sampling_params
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     assert_pkg_version,
@@ -306,6 +308,20 @@ class Engine(EngineScoreMixin, EngineBase):
         logger.debug(f"routed_dp_rank: {routed_dp_rank}")
         return routed_dp_rank
 
+    def _resolve_require_reasoning(
+        self,
+        require_reasoning: Optional[bool],
+        chat_template_kwargs: Optional[Dict[str, Any]],
+        reasoning_effort: Optional[str],
+    ) -> bool:
+        if require_reasoning is not None:
+            return require_reasoning
+        return resolve_require_reasoning(
+            self.server_args.reasoning_parser,
+            chat_template_kwargs=chat_template_kwargs,
+            reasoning_effort=reasoning_effort,
+        )
+
     def generate(
         self,
         # The input prompt. It can be a single prompt or a batch of prompts.
@@ -346,6 +362,10 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        require_reasoning: Optional[bool] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
         priority: Optional[int] = None,
     ) -> Union[Dict, Iterator[Dict]]:
         """
@@ -354,6 +374,15 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
+        )
+        require_reasoning = self._resolve_require_reasoning(
+            require_reasoning,
+            chat_template_kwargs,
+            reasoning_effort,
+        )
+        sampling_params = apply_response_format_to_sampling_params(
+            sampling_params,
+            response_format,
         )
 
         obj = GenerateReqInput(
@@ -382,6 +411,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            require_reasoning=require_reasoning,
             priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
@@ -446,6 +476,10 @@ class Engine(EngineScoreMixin, EngineBase):
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
+        require_reasoning: Optional[bool] = None,
+        chat_template_kwargs: Optional[Dict[str, Any]] = None,
+        reasoning_effort: Optional[str] = None,
+        response_format: Optional[Dict[str, Any]] = None,
         priority: Optional[int] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
         """
@@ -454,6 +488,15 @@ class Engine(EngineScoreMixin, EngineBase):
         """
         routed_dp_rank = self._resolve_routed_dp_rank(
             routed_dp_rank, data_parallel_rank
+        )
+        require_reasoning = self._resolve_require_reasoning(
+            require_reasoning,
+            chat_template_kwargs,
+            reasoning_effort,
+        )
+        sampling_params = apply_response_format_to_sampling_params(
+            sampling_params,
+            response_format,
         )
 
         obj = GenerateReqInput(
@@ -482,6 +525,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_params=session_params,
+            require_reasoning=require_reasoning,
             priority=priority,
         )
         generator = self.tokenizer_manager.generate_request(obj, None)
