@@ -3841,6 +3841,16 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
+        # Opt-in fail-fast: a single scheduler exception otherwise cascades
+        # into thousands of lines of NCCL HeartbeatMonitor / TCPStore
+        # tracebacks from sibling ranks before they finally die. SIGKILLing
+        # the whole process group right after logging the real exception
+        # leaves only that one error in the log.
+        if os.getenv("SGLANG_FAIL_FAST_ON_SCHEDULER_EXCEPTION", "0") == "1":
+            try:
+                os.killpg(os.getpgrp(), signal.SIGKILL)
+            except Exception:
+                pass
     finally:
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
