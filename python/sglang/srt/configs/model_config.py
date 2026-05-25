@@ -451,6 +451,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
+        ):
+            self.hf_config = self.hf_text_config
+            self.hf_config.architectures = ["Step3p5MTP"]
         if is_draft_model and self.hf_config.architectures[0] in [
             "BailingMoeV2ForCausalLM",
             "BailingMoeForCausalLM",
@@ -888,8 +894,6 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/config.py
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
-        if quant_cfg is None:
-            quant_cfg = getattr(self.hf_text_config, "quantization_config", None)
         if quant_cfg is not None and not isinstance(quant_cfg, dict):
             quant_cfg = quant_cfg.to_dict()
         if quant_cfg is not None:
@@ -1044,11 +1048,6 @@ class ModelConfig:
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
         # Check for quantization in hf_config (config.json)
-        # Also check text_config for multimodal models
-        if getattr(self.hf_text_config, "quantization_config", None) or getattr(
-            self.hf_text_config, "compression_config", None
-        ):
-            return True
         if getattr(self.hf_config, "quantization_config", None) or getattr(
             self.hf_config, "compression_config", None
         ):

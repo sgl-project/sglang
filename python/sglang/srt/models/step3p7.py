@@ -132,6 +132,12 @@ class Step3p7ForConditionalGeneration(nn.Module):
         )
         return hidden_states
 
+    def get_embed_and_head(self):
+        return self.language_model.get_embed_and_head()
+
+    def set_embed_and_head(self, embed, head):
+        self.language_model.set_embed_and_head(embed, head)
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = list(weights)
 

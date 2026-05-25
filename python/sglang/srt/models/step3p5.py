@@ -518,10 +518,6 @@ class Step3p5DecoderLayer(nn.Module):
                 "num_attention_groups"
             ]
 
-        # Only MoE experts use fp8 quantization; attention, shared expert,
-        # and dense MLP weights are always bf16 in Step3p5 checkpoints.
-        non_moe_quant_config = None
-
         self.self_attn = Step3p5Attention(
             hidden_size=self.hidden_size,
             num_heads=self.num_attention_heads,
@@ -537,7 +533,7 @@ class Step3p5DecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             sliding_window_size=self.sliding_window,
             partial_rotary_factor=config.partial_rotary_factors[layer_id],
-            quant_config=non_moe_quant_config,
+            quant_config=quant_config,
             rms_norm_eps=config.rms_norm_eps,
             use_head_wise_attn_gate=config.use_head_wise_attn_gate,
             prefix=add_prefix("self_attn", prefix),
@@ -558,7 +554,7 @@ class Step3p5DecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=config.share_expert_dim,
                 swiglu_limit=swiglu_limit_shared,
-                quant_config=non_moe_quant_config,
+                quant_config=quant_config,
                 prefix=add_prefix("share_expert", prefix),
                 reduce_results=False,
             )
@@ -568,7 +564,7 @@ class Step3p5DecoderLayer(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 swiglu_limit=swiglu_limit_shared,
-                quant_config=non_moe_quant_config,
+                quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
 
