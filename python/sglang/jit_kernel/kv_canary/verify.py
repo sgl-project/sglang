@@ -364,7 +364,7 @@ def _build_real_kv_source_abi(
         params[i, consts.REAL_KV_SOURCE_FIELD_READ_BYTES] = source.read_bytes
 
     # Pad bufs (never read by the kernel — num_sources bounds the iteration); params already zero.
-    dummy = torch.zeros((1, 1), dtype=torch.uint8, device=device)
+    dummy = torch.empty((1, 1), dtype=torch.uint8, device=device)
     for _ in range(len(real_kv_sources), consts.MAX_REAL_KV_SOURCES):
         padded_bufs.append(dummy)
 
