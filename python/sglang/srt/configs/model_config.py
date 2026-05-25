@@ -220,7 +220,7 @@ class ModelConfig:
                 "Gemma3ForConditionalGeneration",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
-                "Step3p6ForConditionalGeneration",
+                "Step3p7ForConditionalGeneration",
             ]
             if (
                 self.hf_config.architectures[0] in mm_disabled_models
@@ -1559,7 +1559,7 @@ multimodal_model_archs = [
     "PaddleOCRVLForConditionalGeneration",
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
-    "Step3p6ForConditionalGeneration",
+    "Step3p7ForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
 ]
 
@@ -1674,7 +1674,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
-        "Step3p6ForConditionalGeneration",
+        "Step3p7ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
         "LagunaForCausalLM",
@@ -1715,7 +1715,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = []
     elif (
         "Step3p5ForCausalLM" in model_architectures
-        or "Step3p6ForConditionalGeneration" in model_architectures
+        or "Step3p7ForConditionalGeneration" in model_architectures
     ):
         layer_types = hf_text_config.layer_types
         swa_attention_layer_ids = [

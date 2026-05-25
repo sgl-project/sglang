@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from transformers.activations import ACT2FN
 
-from sglang.srt.configs.step3p6 import Step3p6Config
+from sglang.srt.configs.step3p7 import Step3p7Config
 from sglang.srt.layers.linear import ColumnParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -23,11 +23,11 @@ from sglang.srt.models.step3p5 import Step3p5ForCausalLM
 from sglang.srt.utils import add_prefix
 
 
-class Step3p6ForConditionalGeneration(nn.Module):
+class Step3p7ForConditionalGeneration(nn.Module):
 
     def __init__(
         self,
-        config: Step3p6Config,
+        config: Step3p7Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -164,4 +164,4 @@ class Step3p6ForConditionalGeneration(nn.Module):
             self.language_model.load_weights(language_weights)
 
 
-EntryClass = Step3p6ForConditionalGeneration
+EntryClass = Step3p7ForConditionalGeneration
