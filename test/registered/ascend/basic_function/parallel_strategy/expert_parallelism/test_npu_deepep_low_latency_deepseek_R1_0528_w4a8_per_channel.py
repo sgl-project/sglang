@@ -130,6 +130,7 @@ class TestDeepepLowlatencyDeepseekR1(CustomTestCase):
             num_threads=300,
             num_shots=5,
             max_tokens=512,
+            api="completion",
         )
         # Execute GSM8K evaluation and get metrics
         metrics = run_eval(args)
