@@ -29,6 +29,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_runner_backend,
     is_tbo_enabled,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     get_bool_env_var,
     is_blackwell,
@@ -72,7 +73,7 @@ def _deepep_precompile_tp_barrier() -> None:
     if not envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         return
 
-    if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
+    if get_global_server_args().enable_longcat_double_stream:
         get_double_stream_ep_group().barrier()
     else:
         get_tp_group().barrier()

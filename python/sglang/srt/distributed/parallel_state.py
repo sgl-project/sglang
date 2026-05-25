@@ -1846,7 +1846,9 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
-    if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
+    from sglang.srt.server_args import get_global_server_args
+
+    if get_global_server_args().enable_longcat_double_stream:
         global _DOUBLE_STREAM_EP
         assert (
             _DOUBLE_STREAM_EP is None

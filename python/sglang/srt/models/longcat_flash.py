@@ -639,7 +639,7 @@ class LongcatFlashModel(nn.Module):
 
         device_module = torch.get_device_module()
         self.alt_stream = device_module.Stream()
-        if get_bool_env_var("SGLANG_ENABLE_LONGCAT_DOUBLE_STREAM", "false"):
+        if get_global_server_args().enable_longcat_double_stream:
             self.double_stream_state = _LongcatDoubleStreamState()
             self.double_stream_state.first_attn_finished = device_module.Event()
             self.double_stream_state.moe_alt_stream = device_module.Stream()
