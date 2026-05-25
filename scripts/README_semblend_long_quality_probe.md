@@ -38,7 +38,7 @@ From the SGLang checkout:
 
 ```bash
 pip install -e "python[all]"
-pip install -U "semblend[onnx-gpu]>=0.3.10" aiohttp
+pip install -U "semblend[onnx-gpu]>=0.3.11" aiohttp
 ```
 
 The `onnx-gpu` extra is recommended for long contexts. Without
