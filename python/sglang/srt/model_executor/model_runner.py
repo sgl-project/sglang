@@ -143,6 +143,9 @@ from sglang.srt.model_executor.cuda_graph_runner import (
     DecodeInputBuffers,
     set_torch_compile_config,
 )
+from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -3088,6 +3091,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 get_token_to_kv_pool().get_key_buffer(0).shape,
                 self.kv_cache_dtype,
                 self.device,
+                create_chunked_prefix_cache_kv_indices,
             )
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,

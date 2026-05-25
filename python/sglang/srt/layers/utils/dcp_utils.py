@@ -14,9 +14,6 @@ from sglang.srt.distributed.parallel_state import (
     get_dcp_rank,
     get_dcp_world_size,
 )
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
 from sglang.srt.server_args import get_global_server_args
 
 
@@ -346,6 +343,7 @@ def prepare_decode_context_parallel_metadata(
     kv_buffer_shape: torch.Size,
     kv_cache_dtype,
     kv_cache_device,
+    create_chunked_prefix_cache_kv_indices_fn,
 ) -> Optional[DecodeContextParallelMetadata]:
     if not dcp_enabled():
         return None
@@ -373,7 +371,7 @@ def prepare_decode_context_parallel_metadata(
         dtype=torch.int32,
         device=get_global_server_args().device,
     )
-    create_chunked_prefix_cache_kv_indices[(len(seq_lens),)](
+    create_chunked_prefix_cache_kv_indices_fn[(len(seq_lens),)](
         req_to_token,
         req_pool_indices,
         extend_prefix_starts,
