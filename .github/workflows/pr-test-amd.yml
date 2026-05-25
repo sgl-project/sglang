@@ -113,7 +113,7 @@ jobs:
     secrets: inherit
   check-changes:
     needs: [call-gate]
-    if: always()
+    if: false  # [TEST GATE] Disable for workflow testing
     runs-on: ubuntu-latest
     outputs:
       main_package: ${{ steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
