@@ -9,6 +9,7 @@ import torch
 from sglang.jit_kernel.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
+from sglang.srt.kv_canary.runner.kernel_launch import passes_v_half_gate
 from sglang.srt.kv_canary.runner.sweep import SweepOrchestrator
 from sglang.srt.kv_canary.state import CanaryDeviceState
 
@@ -70,9 +71,10 @@ class KernelRunCounterHealthChecker:
             )
 
     def _expected_active_tags_for_health_check(self) -> tuple[CanaryLaunchTag, ...]:
-        if self._config.sweep_interval > 0:
-            return self._active_tags
-        return tuple(tag for tag in self._active_tags if tag not in _SWEEP_TAGS)
+        tags = self._active_tags
+        if self._config.sweep_interval <= 0:
+            tags = tuple(tag for tag in tags if tag not in _SWEEP_TAGS)
+        return tuple(tag for tag in tags if passes_v_half_gate(tag))
 
 
 class PeriodicCanaryStatsLogger:
