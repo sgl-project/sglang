@@ -506,6 +506,8 @@ class LongcatFlashDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+            device_module = torch.get_device_module()
+            self.double_stream_state.first_attn_finished = device_module.Event()
             self.double_stream_state.main_stream.record_event(self.double_stream_state.first_attn_finished)
 
             mlp_hidden_states, residual = self.forward_mlp(
