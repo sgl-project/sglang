@@ -4,8 +4,8 @@
 
 ### Issue 1 — Coverage gaps
 Current tests do not cover arbitrary combinations of:
-- Runners (eager, cuda_graph, PCG/BCG, EAGLE runner)
-- Attention backends (with different page sizes or config variants)
+- Runners (eager, cuda_graph, PCG/BCG, EAGLE and MTP runners with variants)
+- Attention backends (many exist; most are untested at the unit level)
 - Input cases (various bsz, input len, KV cache size)
 
 ### Issue 2 — Test expense
@@ -17,182 +17,318 @@ verifying attention backend correctness.
 ## Approach
 
 ### Reference implementation
-Use `torch_native` (SDPA) in eager mode as the universal reference instead of HuggingFace.
+Use the HuggingFace attention implementation for each attention type as the reference.
 
 Rationale:
-- No external dependency.
-- No need to bridge paged-KV vs. dense-KV layouts.
-- Validates all other backends against a known-correct, simple code path.
-- HF comparison is reserved for SWA-specific logic where sglang's sliding-window mask
-  semantics need external validation.
+- There is no universal sglang reference backend — `torch_native` does not support SWA,
+  Mamba, DeepSeek-V4-style sparse attention, or linear attention variants.
+- HF implementations serve as an independent ground truth per attention type.
+- Preparing HF inputs is straightforward: populate the paged KV pool from dense tensors
+  before the forward pass, or read them back from the pool afterwards. This is a
+  one-time `reconstruct_dense_kv` helper, not a per-test burden.
+- Model configs (head counts, head dim, window size, etc.) are hardcoded in the test
+  file. No network access to HuggingFace is required. Only the attention math logic
+  from transformers (or a small hand-written reference kernel) is used.
 
-### Test structure
-- No server launch, no model download, no eval harness.
-- Random weights and random Q/K/V inputs.
-- Synthetic `ForwardBatch` built from a helper, backed by real pool objects.
-- Numerical comparison: sglang backend output vs. `torch_native` reference.
+### Test target: complete attention layer, not just the backend
+Tests must exercise the full attention layer (e.g., `RadixAttention` or the
+model-specific class), not just `backend.forward_decode/extend()` directly.
+
+Reason: some attention paths call additional backend methods during the model forward
+that are not invoked by calling the backend directly. For example, `forward_mha.py`
+calls `get_attn_backend().init_mha_chunk_metadata(forward_batch)` for the chunked-KV
+path. Bypassing these calls produces a silently wrong test.
+
+### Mock model runner
+Backends are instantiated with a `model_runner` that supplies configuration
+(`page_size`, `sliding_window_size`, pool handles, dtype, etc.). Tests construct a
+lightweight mock/stub with exactly the fields each backend reads in `__init__` and
+`init_forward_metadata`. These config values live on the mock runner, not as parameters
+of `make_forward_batch`.
+
+### Random weights, real model configs
+Attention layer weights are randomly initialized (no checkpoint download needed).
+Model configs (num_heads, num_kv_heads, head_dim, window_size, etc.) are copied from
+real HuggingFace model cards and hardcoded in the test file. This is sufficient because
+attention correctness does not depend on the specific weight values.
+
+---
+
+## Full list of attention backends
+
+### Registered backends (from `attention_registry.py`)
+
+| Name | Class | Notes |
+|---|---|---|
+| `flashinfer` | `FlashInferAttnBackend` / `FlashInferMLABackend` | Primary CUDA backend; dispatches to MLA variant for MLA models |
+| `triton` | `TritonAttnBackend` | Pure Triton kernels |
+| `torch_native` | `TorchNativeAttnBackend` | PyTorch SDPA |
+| `flex_attention` | `TorchFlexAttnBackend` | PyTorch flex attention |
+| `fa3` | `FlashAttentionBackend` (v3) | SM90+ only |
+| `fa4` | `FlashAttentionBackend` (v4) | SM90+ only |
+| `flashmla` | `FlashMLABackend` | MLA-only, SM90+ |
+| `cutlass_mla` | `CutlassMLABackend` | MLA-only |
+| `trtllm_mha` | `TrtllmMHABackend` | TensorRT-LLM MHA |
+| `trtllm_mla` | `TrtllmMLABackend` | TensorRT-LLM MLA |
+| `tokenspeed_mla` | `TokenSpeedMLABackend` | MLA variant |
+| `aiter` | `AiterAttnBackend` | AMD ROCm |
+| `wave` | `WaveAttnBackend` | Wave attention |
+| `ascend` | — | Ascend NPU |
+| `dsa` | `DSABackend` | DeepSeek Sparse Attention |
+| `dsv4` | `DeepseekV4Backend` | DeepSeek V4 CUDA (HIP variant: `deepseek_v4_backend_hip_radix`) |
+| `dual_chunk_flash_attn` | `DualChunkFlashAttentionBackend` | Long-context chunked |
+| `intel_amx` | `IntelAMXBackend` | Intel CPU AMX |
+| `intel_xpu` | `IntelXPUBackend` | Intel XPU |
+
+### Wrapper / hybrid backends (not in registry; composed at runtime)
+
+| Name | Class | Notes |
+|---|---|---|
+| `hybrid_attn` | `HybridAttnBackend` | Configurable prefill+decode split (e.g., FA3 prefill + FlashInfer decode) |
+| `tbo` | `TboAttnBackend` | Two-batch overlap backend; wraps a primary backend |
+| `hybrid_linear_attn` | `MambaAttnBackendBase` | Wraps any attention backend with Mamba/linear-attention layers |
+
+### Linear / state-space attention backends (under `linear/`)
+
+| Name | Class | Notes |
+|---|---|---|
+| `kda` | `KDABackend` | KDA linear attention |
+| `lightning_attn` | `LightningAttnBackend` | Lightning attention |
+| `gdn` | `GDNBackend` | GDN linear attention |
+
+---
+
+## Full list of speculative decoding workers and runners
+
+### Workers (draft model inference)
+
+| Worker | Description |
+|---|---|
+| `EAGLEWorker` | EAGLE v1 draft worker |
+| `EAGLEWorkerV2` | EAGLE v2 draft worker (tree-based, supports `topk > 1`) |
+| `StandaloneWorker` / `StandaloneWorkerV2` | Self-speculative (draft = target) |
+| `MultiLayerEagleWorker` / `MultiLayerEagleDraftWorker` (v2) | Multi-layer EAGLE |
+| `FrozenKVMTPWorker` / `FrozenKVMTPWorkerV2` | Frozen-KV MTP |
+| `DFlashWorker` | DFlash speculative worker |
+| `NGRAMWorker` | N-gram draft worker |
+
+### CUDA graph runners (for draft phase)
+
+| Runner | Description |
+|---|---|
+| `EAGLEDraftCudaGraphRunner` | EAGLE v1 decode draft |
+| `EAGLEDraftExtendCudaGraphRunner` | EAGLE v1/v2 extend draft |
+| `MultiLayerEagleDraftExtendCudaGraphRunner` | Multi-layer EAGLE extend |
+| `MultiLayerEagleMultiStepDraftExtendCudaGraphRunner` | Multi-layer, multi-step extend |
+| `FrozenKVMTPCudaGraphRunner` | Frozen-KV MTP decode |
 
 ---
 
 ## Dimensions to enumerate
 
+### Phase 2 matrix (attention backend correctness)
+
 | Dimension | Values |
 |---|---|
-| Attention backend | `flashinfer`, `triton`, `torch_native`, `flashattention` (fa3/fa4), `flashinfer_mla`, `cutlass_mla` |
-| Runner | eager, cuda_graph (regular / BCG), piecewise_cuda_graph (PCG) |
-| Forward mode | `DECODE`, `EXTEND`, `MIXED` (chunked prefill) |
-| Head config | Standard MHA, GQA (num_kv_heads < num_heads), SWA (sliding window) |
-| Input shape | small bsz + short seq, large bsz + long seq, bsz=1 decode |
+| **Attention type** | Standard MHA, GQA, SWA, MLA (DeepSeek), DSA, DSV4, linear (KDA/Lightning/GDN), Mamba |
+| **Backend** | See full list above; one or more per attention type |
+| **Forward mode** | `DECODE`, `EXTEND`, `MIXED`, chunked-KV (`MHA_CHUNKED_KV` path) |
+| **Input shape** | small bsz + short seq, large bsz + long seq, bsz=1 decode |
 
-Not all combinations are valid. Constraints:
-- MLA backends only apply to MLA model configs.
-- SWA requires a window_size parameter.
-- FA3/FA4 require SM90+.
-- Some backends are HIP-only or XPU-only.
+Representative model configs (hardcoded, no download):
 
-These are encoded as skip conditions (`skipIf`), not silently omitted.
+| Attention type | Representative model | Key config |
+|---|---|---|
+| Standard MHA | GPT-2 small | `num_heads=12, head_dim=64` |
+| GQA | LLaMA-3-8B | `num_heads=32, num_kv_heads=8, head_dim=128` |
+| SWA | Gemma-3 / Mistral | `num_heads=8, num_kv_heads=4, head_dim=256, window_size=4096` |
+| MLA | DeepSeek-V2-Lite | `qk_nope_head_dim=128, qk_rope_head_dim=64, kv_lora_rank=512` |
+| DSA | DeepSeek-V3 | DSA-specific head config |
+| DSV4 | DeepSeek-V4 | DSV4-specific config |
+| Linear (KDA) | Kimi model | KDA linear config |
+| Linear (Lightning) | Bailing model | Lightning config |
+| Mamba | Mamba-2 | SSM config |
 
-Speculative decoding modes (`TARGET_VERIFY`, `DRAFT_EXTEND`) are a separate matrix
-covered in Phase 4.
+### Phase 3 matrix (runner integration)
+
+| Dimension | Values |
+|---|---|
+| **Runner** | eager, cuda_graph (regular / BCG), piecewise_cuda_graph (PCG) |
+| **Backend** | flashinfer, triton, torch_native, flex_attention, fa3, fa4 (SM90+), flashmla, cutlass_mla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn, tbo |
+| **Forward mode** | DECODE, EXTEND |
+
+Not all (runner, backend) pairs are valid — e.g., PCG is only used with certain MLA
+backends; TBO wraps another backend and is tested in composition.
+
+### Phase 4 matrix (speculative decoding attention)
+
+| Dimension | Values |
+|---|---|
+| **Spec worker** | EAGLEWorker, EAGLEWorkerV2, StandaloneWorker, StandaloneWorkerV2, MultiLayerEagleWorker, MultiLayerEagleDraftWorker, FrozenKVMTPWorker, FrozenKVMTPWorkerV2, DFlashWorker, NGRAMWorker |
+| **Execution mode** | eager (no CUDA graph), cuda_graph |
+| **Draft runner (cuda_graph only)** | EAGLEDraftCudaGraphRunner, EAGLEDraftExtendCudaGraphRunner, MultiLayerEagleDraftExtendCudaGraphRunner, MultiLayerEagleMultiStepDraftExtendCudaGraphRunner, FrozenKVMTPCudaGraphRunner |
+| **topk** | 1 (greedy / chain draft), >1 (tree draft) |
+| **num_draft_steps** | 1, >1 (multi-step draft) |
+| **Forward mode** | `DRAFT_EXTEND`, `TARGET_VERIFY` |
+| **Backend** | flashinfer, triton, fa3, fa4, cutlass_mla, flashmla, trtllm_mha, trtllm_mla, dual_chunk_flash_attn, hybrid_attn |
+
+`topk=1` vs `topk>1` and `num_draft_steps=1` vs `>1` are explicit axes because they
+change code paths in `eagle_info.py`/`eagle_info_v2.py` (different tensor layouts,
+different acceptance kernel branches).
+
+Eager execution (no CUDA graph) is tested separately from the CUDA graph runners
+because it exercises a different code path in both the worker and the attention backend.
 
 ---
 
 ## Implementation phases
 
-### Phase 1 — Infrastructure
+### Phase 1 — Infrastructure (`test/srt/attention/utils.py`)
 
-**File**: `test/srt/attention/utils.py`
+#### 1a. Mock model runner
 
-Functions to implement:
+```python
+def make_mock_model_runner(
+    page_size: int,          # backend config, NOT a ForwardBatch param
+    sliding_window_size: int | None,
+    max_total_num_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: str,
+    **extra_fields,          # backend-specific (e.g., kv_lora_rank for MLA)
+) -> SimpleNamespace:
+    """
+    Lightweight mock of ModelRunner. Allocates real ReqToTokenPool and
+    TokenToKVPool. page_size and sliding_window_size live here.
+    """
+```
+
+#### 1b. Forward batch factory
 
 ```python
 def make_forward_batch(
     mode: ForwardMode,
     bsz: int,
     seq_lens: list[int],
-    num_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    window_size: int | None = None,
-) -> tuple[ForwardBatch, torch.Tensor, torch.Tensor, torch.Tensor]:
+    model_runner: SimpleNamespace,
+) -> ForwardBatch:
     """
-    Build a minimal ForwardBatch with random KV data loaded into real
-    ReqToTokenPool / TokenToKVPool instances. Also returns random Q, K, V tensors
-    that match the batch layout.
+    Build a minimal ForwardBatch with random KV data pre-loaded into the pools.
+    Does NOT accept page_size or window_size — those come from model_runner.
     """
-
-def run_backend(
-    backend: AttentionBackend,
-    batch: ForwardBatch,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Call init_forward_metadata + the appropriate forward_decode / forward_extend /
-    forward_mixed method. Returns the output tensor.
-    """
-
-def assert_close_backends(
-    ref_output: torch.Tensor,
-    test_output: torch.Tensor,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-) -> None:
-    """Numerical comparison with configurable tolerance."""
 ```
 
-Validation: replicate one existing triton decode test using these helpers to confirm
-the infrastructure is correct before scaling.
+#### 1c. KV reconstruction
+
+```python
+def reconstruct_dense_kv(
+    forward_batch: ForwardBatch,
+    model_runner: SimpleNamespace,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Read K and V back from the paged pool in (bsz, seq_len, num_kv_heads, head_dim)
+    dense layout for feeding into HF reference attention.
+    """
+```
+
+#### 1d. HF reference kernels (hardcoded, no network access)
+
+```python
+def hf_mha_reference(q, k, v, causal=True) -> torch.Tensor: ...
+def hf_gqa_reference(q, k, v, causal=True) -> torch.Tensor: ...
+def hf_swa_reference(q, k, v, window_size: int) -> torch.Tensor: ...
+def hf_mla_reference(q, k_compressed, v_compressed, W_kv_up, ...) -> torch.Tensor: ...
+# etc. per attention type
+```
+
+Each calls `F.scaled_dot_product_attention` with the appropriate mask, or a small
+hand-written kernel. No checkpoint downloads.
+
+#### 1e. Assertion helper
+
+```python
+def assert_close(ref, out, atol=1e-2, rtol=1e-2): ...
+```
 
 ---
 
-### Phase 2 — Kernel-level unit tests (fast, no server)
+### Phase 2 — Backend correctness tests (`test/srt/attention/test_backend_correctness.py`)
 
-**File**: `test/srt/attention/test_backend_correctness.py`
+For each valid (attention_type, backend, mode, input_shape) combination:
 
-For each valid (backend, mode, head_config) combination:
-1. Build `ForwardBatch` via `make_forward_batch`.
-2. Run `torch_native` → reference output.
-3. Run test backend → test output.
-4. `assert_close_backends(reference, test)`.
-5. Assert output shape and dtype.
+1. Build mock model runner with hardcoded model config.
+2. Instantiate backend via `Backend.__init__(model_runner)`.
+3. Instantiate attention layer (`RadixAttention` for standard types;
+   model-specific class for MLA/DSA/DSV4/linear).
+4. Build `ForwardBatch` via `make_forward_batch`.
+5. Call `backend.init_forward_metadata(forward_batch)`.
+6. Call `attention_layer.forward(q, k, v, forward_batch)` — dispatches to correct
+   backend method plus any auxiliary calls (e.g., `init_mha_chunk_metadata`).
+7. Reconstruct dense K, V from pool via `reconstruct_dense_kv`.
+8. Run HF reference on the same Q, dense K, dense V.
+9. `assert_close(hf_output, sglang_output)`.
 
-Estimated matrix: ~6 backends × 3 modes × 3 head configs ≈ 54 combinations;
-~25 valid after exclusions.
-
-Target tolerance: atol=1e-2, rtol=1e-2 for float16; tighter for bfloat16 where
-backends agree more closely.
-
-SWA exception: compare sglang triton SWA kernel against
-`torch.nn.functional.scaled_dot_product_attention` with an explicit causal+window mask,
-not against `torch_native` backend (which may not implement SWA natively).
+Invalid combinations are `skipIf`-guarded, not silently dropped.
 
 ---
 
-### Phase 3 — Runner integration tests (medium cost)
+### Phase 3 — Runner integration tests (`test/srt/attention/test_runner_integration.py`)
 
-**File**: `test/srt/attention/test_runner_integration.py`
+Tests that runner bookkeeping does not corrupt attention outputs.
 
-For each valid (runner, backend) pair:
+**Eager**: `init_forward_metadata` → `attention_layer.forward`. Assert vs. HF reference.
 
-**Eager path**:
-- Call `init_forward_metadata` directly.
-- Assert output matches Phase 2 reference.
+**CUDA graph / BCG**:
+1. `init_cuda_graph_state` → warmup capture → `on_after_cuda_graph_warmup`.
+2. Replay → forward.
+3. Assert replayed output matches eager output.
 
-**CUDA graph path** (regular / BCG):
-1. `init_cuda_graph_state(max_bs, max_num_tokens)`
-2. Warmup: `init_forward_metadata_capture_cuda_graph(...)` + forward pass.
-3. `on_after_cuda_graph_warmup()`
-4. Replay: `init_forward_metadata_replay_cuda_graph(...)` + forward pass.
-5. Assert replayed output matches eager output.
-
-**PCG path**:
-- Same pattern as CUDA graph but using piecewise capture/replay API.
-
-This phase tests that runner bookkeeping (graph capture, metadata buffer fill, replay)
-does not corrupt results. The attention math itself is already validated in Phase 2.
+**PCG**: same pattern with piecewise capture/replay API.
 
 ---
 
-### Phase 4 — Speculative decoding attention paths
+### Phase 4 — Speculative decoding (`test/srt/attention/test_spec_decoding_attention.py`)
 
-**File**: `test/srt/attention/test_spec_decoding_attention.py`
+Enumerate (spec_worker, draft_runner, topk, num_draft_steps, forward_mode, backend):
 
-Separate matrix for `TARGET_VERIFY` and `DRAFT_EXTEND` modes.
+1. Construct `SpecInfo` / `EagleInfo` / `FrozenKVMTPInfo` fixture with synthetic draft
+   tree matching the (topk, num_draft_steps) parameters.
+2. Build `ForwardBatch` for `DRAFT_EXTEND` or `TARGET_VERIFY`.
+3. `backend.init_forward_metadata(batch)` → `attention_layer.forward(...)`.
+4. Compare output against HF reference with the same Q/K/V.
 
-For each spec mode × backend combination:
-1. Construct `SpecInfo` fixture with synthetic draft tree / draft tokens.
-2. Build `ForwardBatch` with spec mode.
-3. Compare output against eager `torch_native` reference with same inputs.
-
-Also test:
-- `get_verify_buffers_to_fill_after_draft()` returns correct buffer shapes.
-- `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` fills buffers
-  without error.
+Explicitly test:
+- `topk=1` (greedy chain) vs `topk=4` (tree draft) — different tensor layouts in
+  `eagle_info_v2.py`.
+- `num_draft_steps=1` vs `num_draft_steps=4` — multi-step draft extend paths.
+- `get_verify_buffers_to_fill_after_draft()` shape correctness.
+- `update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)` correctness.
 
 ---
 
 ## Open questions
 
-1. **Page size axis**: FlashInfer requires specific page sizes (16, 32, 64). Add page size
-   as a parameter in Phase 2, or fix one representative size per backend?
+1. **Linear / Mamba backends**: Their `forward` signature differs (they use
+   `RadixLinearAttention` not `RadixAttention`). Should the Phase 1 helper accept
+   a layer type parameter, or should linear attention have a separate helper?
 
-2. **SWA reference**: Validate sglang SWA against SDPA+explicit mask (simpler) or keep a
-   small HF-based check for Gemma/Mistral configs?
+2. **DSA / DSV4**: These use model-specific indexer metadata
+   (`get_indexer_metadata`). Should Phase 2 tests use the actual model class
+   (DeepSeek forward path) or stub out the indexer?
 
-3. **MLA backends**: `flashinfer_mla` and `cutlass_mla` use a compressed KV format.
-   `make_forward_batch` may need an MLA variant. Include in Phase 2 or defer?
+3. **TBO backend**: It wraps another backend. Should it be tested as a composition
+   (primary=flashinfer wrapped in TBO) or deferred?
 
-4. **Non-CUDA backends** (XPU, AMX, HIP): same framework with `skipIf` guards, or
-   separate registration block?
+4. **HIP-only backends** (`aiter`, HIP DSV4): Same framework with `skipIf` guards,
+   or separate AMD CI registration block?
 
 ---
 
 ## CI registration
 
-- Phase 2 tests: register with `register_cuda_ci()`, mark fast (< 60 s total).
-- Phase 3 tests: register with `register_cuda_ci()`, medium tier.
-- Phase 4 tests: register with `register_cuda_ci()` under speculative decoding group.
-- AMD/HIP variants: add `register_amd_ci()` where backends support HIP.
+- Phase 2: `register_cuda_ci()`, fast tier (target < 60 s total).
+- Phase 3: `register_cuda_ci()`, medium tier.
+- Phase 4: `register_cuda_ci()` under speculative decoding group.
+- AMD variants: `register_amd_ci()` where applicable.
