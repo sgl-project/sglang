@@ -7,6 +7,7 @@ import tempfile
 from copy import copy
 from typing import Any
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
@@ -126,6 +127,8 @@ def _should_include_warmup_image(
 ) -> bool:
     task_type = server_args.pipeline_config.task_type
     if task_type.requires_image_input():
+        return True
+    if server_based_warmup and task_type == ModelTaskType.TI2V:
         return True
     if server_based_warmup:
         return False

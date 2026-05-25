@@ -238,6 +238,26 @@ class TestWarmupReqCfgParallel(unittest.TestCase):
 
         self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
 
+    def test_server_based_warmup_keeps_ti2v_image_input(self):
+        server_args = MagicMock()
+        server_args.warmup_steps = 1
+        server_args.enable_cfg_parallel = False
+        server_args.pipeline_config.task_type = ModelTaskType.TI2V
+
+        with patch(
+            "sglang.multimodal_gen.runtime.server_warmup.get_model_sampling_defaults",
+            return_value=SamplingParams(width=512, height=512),
+        ):
+            reqs = build_warmup_reqs(
+                server_args,
+                warmup_resolutions=None,
+                warmup_input_path="/tmp/warmup.png",
+                use_model_sampling_defaults=True,
+                server_based_warmup=True,
+            )
+
+        self.assertEqual(reqs[0].image_path, ["/tmp/warmup.png"])
+
 
 class TestInputValidationCfgParallelGuard(unittest.TestCase):
     """Commit 2: per-request cfg-parallel check.
