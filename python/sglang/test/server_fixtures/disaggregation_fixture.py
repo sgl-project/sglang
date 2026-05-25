@@ -1,8 +1,6 @@
 import logging
 import os
 import shlex
-import sys
-import threading
 import time
 import warnings
 from urllib.parse import urlparse
@@ -16,6 +14,7 @@ from sglang.test.test_utils import (
     is_in_ci,
     popen_launch_pd_server,
     popen_with_error_check,
+    start_subprocess_fail_fast_watcher,
 )
 from sglang.utils import wait_for_http_ready
 
@@ -113,7 +112,7 @@ class PDDisaggregationServerBase(CustomTestCase):
         cls.wait_server_ready(cls.prefill_url + "/health", process=cls.process_prefill)
         cls.wait_server_ready(cls.decode_url + "/health", process=cls.process_decode)
         cls.launch_lb()
-        cls._fail_fast_stop = _start_fail_fast_watcher(
+        cls._fail_fast_stop = start_subprocess_fail_fast_watcher(
             [
                 ("prefill", cls.process_prefill),
                 ("decode", cls.process_decode),
@@ -166,43 +165,6 @@ class PDDisaggregationServerBase(CustomTestCase):
 
         # wait for 5 seconds
         time.sleep(5)
-
-
-def _start_fail_fast_watcher(named_procs):
-    """Abort the test runner the moment any subprocess exits non-zero.
-    Without this the eval client retries connection-refused for 30s-2min.
-
-    Returns the threading.Event that callers should `.set()` before
-    intentionally terminating the watched processes (e.g. in tearDownClass)
-    so the watcher doesn't mistake a clean teardown for a failure."""
-    stop = threading.Event()
-
-    def watcher():
-        while not stop.is_set():
-            for name, proc in named_procs:
-                rc = proc.poll() if proc else None
-                if rc is None or rc == 0:
-                    continue
-                if stop.is_set():
-                    return
-                sys.stderr.write(
-                    f"[FIXTURE FAIL-FAST] {name} (pid={proc.pid}) exited "
-                    f"rc={rc}; aborting.\n"
-                )
-                sys.stderr.flush()
-                for _, sib in named_procs:
-                    if sib and sib is not proc:
-                        try:
-                            kill_process_tree(sib.pid, wait_timeout=10)
-                        except Exception:
-                            pass
-                # POSIX convention: signal N -> exit code 128+N.
-                # (os._exit masks negatives via & 0xff, losing the signal.)
-                os._exit(rc if rc >= 0 else 128 + (-rc))
-            time.sleep(0.1)
-
-    threading.Thread(target=watcher, daemon=True, name="PDProcExitWatcher").start()
-    return stop
 
 
 def _get_available_ib_devices():

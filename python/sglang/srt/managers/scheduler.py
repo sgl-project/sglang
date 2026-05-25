@@ -3841,9 +3841,8 @@ def run_scheduler_process(
         traceback = get_exception_traceback()
         logger.error(f"Scheduler hit an exception: {traceback}")
         parent_process.send_signal(signal.SIGQUIT)
-        # Opt-in: SIGKILL the process group so sibling ranks don't spew
-        # thousands of NCCL/TCPStore tracebacks before they finally die.
-        # Skips the `finally` FPM shutdown; acceptable -- we're crashing.
+        # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
+        # of NCCL/TCPStore tracebacks before they finally die.
         if envs.SGLANG_FAIL_FAST_SCHEDULER.get():
             try:
                 os.killpg(os.getpgrp(), signal.SIGKILL)
