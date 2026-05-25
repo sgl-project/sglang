@@ -1606,8 +1606,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "Dequantizing GPTQ weights for unquantized layers "
                 "(wo_a, compressor, weights_proj)"
             )
-            _bits = getattr(self.quant_config, "weight_bits", 4)
-            _gs = getattr(self.quant_config, "group_size", 128)
+            _bits = getattr(self.quant_config, "weight_bits", 4) if self.quant_config is not None else 4
+            _gs = getattr(self.quant_config, "group_size", 128) if self.quant_config is not None else 128
             weights = list(_dequant_gptq_for_unquant_layers(weights, _bits, _gs))
 
         stacked_params_mapping = [
