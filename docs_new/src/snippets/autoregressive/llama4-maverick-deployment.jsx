@@ -29,7 +29,7 @@ export const Llama4MaverickDeployment = () => {
     const { hardware, quantization, toolcall, speculative, host, port } = values;
 
     let cmd = 'python -m sglang.launch_server \\\n';
-    cmd += `  --model-path meta-llama/Llama-4-Scout-17B-16E-Instruct`;
+    cmd += `  --model-path meta-llama/Llama-4-Maverick-17B-128E-Instruct`;
 
     if (hardware === 'h100' || hardware === 'h200') {
       cmd += ` \\\n  --tp 8`;
@@ -49,7 +49,7 @@ export const Llama4MaverickDeployment = () => {
 
     if (speculative === 'enabled') {
       cmd += ` \\\n  --speculative-algorithm EAGLE3 \\\n`;
-      cmd += `  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Scout-17B-16E-Instruct-v1 \\\n`;
+      cmd += `  --speculative-draft-model-path lmsys/sglang-EAGLE3-Llama-4-Maverick-17B-128E-Instruct-v1 \\\n`;
       cmd += `  --speculative-num-steps 3 \\\n`;
       cmd += `  --speculative-eagle-topk 1 \\\n`;
       cmd += `  --speculative-num-draft-tokens 4 \\\n`;
