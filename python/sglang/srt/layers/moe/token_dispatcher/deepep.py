@@ -457,7 +457,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         # However, doing this would incur an unknown synchronization error, but keeping
         # `handle` as a member variable works.
 
-        _deepep_precompile_tp_barrier()
+        # _deepep_precompile_tp_barrier()
         (
             recv_x,
             recv_topk_ids,
@@ -518,7 +518,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
-        _deepep_precompile_tp_barrier()
+        # _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
@@ -644,7 +644,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
         buffer = self._get_buffer()
-        _deepep_precompile_tp_barrier()
+        # _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.low_latency_dispatch(
                 hidden_states,
@@ -724,7 +724,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             overlap_args_dict = {}
 
         with ctx:
-            _deepep_precompile_tp_barrier()
+            # _deepep_precompile_tp_barrier()
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
