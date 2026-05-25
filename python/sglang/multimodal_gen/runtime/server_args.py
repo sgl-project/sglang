@@ -1218,6 +1218,12 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.warmup_steps,
             help="The number of warmup steps to perform for each resolution.",
         )
+        parser.add_argument(
+            "--server-warmup",
+            type=int,
+            default=ServerArgs.server_warmup,
+            help="Send a warmup request after server ready",
+        )
 
         # layerwise offload
         parser.add_argument(
