@@ -133,6 +133,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -207,6 +208,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -282,6 +284,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -357,6 +360,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
@@ -432,6 +436,7 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          TRANSFORMERS_VERBOSITY: "error"
         run: |
           pip install sglang_router
           hf download lmms-lab/MMMU --repo-type dataset
