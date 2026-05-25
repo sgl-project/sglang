@@ -32,17 +32,6 @@ if TYPE_CHECKING:
 
 
 class _SingleForwardPhase(IntEnum):
-    """Per-SingleForwardManager 4-state lifecycle used with :class:`SimplePhaseChecker`.
-
-    Enforced order::
-
-        IDLE
-          -> AFTER_PRE_OUT       (pre_ops_outside_graph)
-          -> AFTER_PRE_MAYBE_IN  (pre_ops_maybe_inside_graph)
-          -> AFTER_POST_MAYBE_IN (post_ops_maybe_inside_graph)
-          -> IDLE                (post_ops_outside_graph)
-    """
-
     IDLE = 0
     AFTER_PRE_OUT = 1
     AFTER_PRE_MAYBE_IN = 2
@@ -51,27 +40,13 @@ class _SingleForwardPhase(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PreOpsMaybeInsideGraphOutput:
-    """Phase-2 staged buffers threaded to phase 3."""
-
     verify_plan: VerifyPlan
     write_plan: WritePlan
     expected_inputs: ExpectedInputs
 
 
 class SingleForwardManager:
-    """Owns the per-step state of one inner ``model.forward`` invocation.
-
-    All static buffers (VerifyPlan, WritePlan, ExpectedInputs, PlanInput,
-    snapshot tensors) are allocated once at construction. Phase 1 fills
-    them outside the graph; phase 2/3 read/write them inside the captured
-    region; phase 4 consumes the snapshot outside the graph.
-
-    KV-cache / device-state / endpoints / buffer groups are shared with
-    the owning :class:`CanaryManager`. Perturb (cycle-level fault
-    injection) is dispatched by the CanaryManager itself in its
-    ``_pre_ops_outside_graph`` / ``_post_ops_outside_graph`` —
-    SingleForwardManager does not own perturb dispatch.
-    """
+    """Owns the state of one inner ``model.forward`` invocation."""
 
     def __init__(
         self,
@@ -136,15 +111,6 @@ class SingleForwardManager:
     def pre_ops_outside_graph(
         self, *, maybe_inaccurate_forward_batch: "ForwardBatch"
     ) -> None:
-        """Phase 1. Host-side outside any cuda graph.
-
-        The input ``maybe_inaccurate_forward_batch`` may be the OUTER batch
-        for an EAGLE draft step — its step-specific fields (seq_lens after
-        increment, out_cache_loc slice for step i, ...) may not yet hold
-        the values this SingleForwardManager will actually see by phase 2.
-        Callers in this phase should treat the batch as a coarse cycle-
-        level view.
-        """
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.IDLE,
             next_phase=_SingleForwardPhase.AFTER_PRE_OUT,
@@ -170,12 +136,6 @@ class SingleForwardManager:
     def pre_ops_maybe_inside_graph(
         self, forward_batch: "ForwardBatch"
     ) -> "_PreOpsMaybeInsideGraphOutput":
-        """Phase 2. Capture-safe ops only (DECODE path is inside cuda graph;
-        EXTEND / eager fallback is outside). Fired by monkey-patched
-        ``model.forward`` wrap BEFORE the original forward.
-
-        Returns the staged plan + expected_inputs threaded to phase 3.
-        """
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_OUT,
             next_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
@@ -252,14 +212,6 @@ class SingleForwardManager:
         forward_batch: "ForwardBatch",
         pre_ops_output: "_PreOpsMaybeInsideGraphOutput",
     ) -> None:
-        """Phase 3. Same capture regime as phase 2. Fired by monkey-patched
-        ``model.forward`` wrap AFTER the original forward.
-
-        Launches TAIL kernels reusing the plan + expected_inputs staged in
-        phase 2 (threaded via ``pre_ops_output``), then copies every
-        observable into the per-SingleForwardManager output buffer so
-        phase 4 sees a dead view immune to later step mutation.
-        """
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_PRE_MAYBE_IN,
             next_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
@@ -301,13 +253,6 @@ class SingleForwardManager:
         *,
         maybe_inaccurate_forward_batch: "ForwardBatch",
     ) -> None:
-        """Phase 4. Host-side outside cuda graph. Reads in-graph signals
-        from ``self._output_buffer`` (immune to later-step mutation) plus
-        the live (possibly already-advanced) ``ForwardBatch`` for the
-        tail-after perturb that needs to flip a byte in the slot the
-        forward just wrote to. The forward_batch arg is named
-        ``maybe_inaccurate_`` because by phase 4 the outer cycle may
-        already have mutated its step-specific fields."""
         self._phase_checker.update(
             expect_phase=_SingleForwardPhase.AFTER_POST_MAYBE_IN,
             next_phase=_SingleForwardPhase.IDLE,
