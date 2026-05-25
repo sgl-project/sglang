@@ -579,6 +579,15 @@ def assemble_chunk_embedding(
     return torch.cat(chunk_slices, dim=0)
 
 
+def _can_use_per_item_chunked_prefill(
+    embedding_items: List[MultimodalDataItem],
+) -> bool:
+    """The batched miss path assumes each item maps to exactly one token span."""
+    return len(embedding_items) > 0 and all(
+        item.offsets is not None and len(item.offsets) == 1 for item in embedding_items
+    )
+
+
 def get_chunked_prefill_embedding_legacy(
     data_embedding_func: DataEmbeddingFunc,
     embedding_items: List[MultimodalDataItem],
@@ -640,11 +649,7 @@ def _get_chunked_prefill_embedding(
     # FIXME(yhyang201): check this
     max_iterations = min(len(items_size) - 1, len(prefix_length))
 
-    per_image_process = (
-        len(embedding_items) > 0 and len(embedding_items[0].offsets) == 1
-    )
-
-    if not per_image_process:
+    if not _can_use_per_item_chunked_prefill(embedding_items):
         return get_chunked_prefill_embedding_legacy(
             data_embedding_func,
             embedding_items,
