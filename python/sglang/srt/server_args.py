@@ -3754,10 +3754,16 @@ class ServerArgs:
         Validate IB devices before passing to mooncake.
 
         Args:
-            device_str: Comma-separated IB device names (e.g., "mlx5_0,mlx5_1")
+            device_str: Either a comma-separated string of IB device names
+                (e.g., "mlx5_0,mlx5_1") or a JSON dict mapping GPU IDs to
+                per-GPU device strings (e.g., '{"0":"mlx5_0,mlx5_1","1":"mlx5_2,mlx5_3"}').
+                The JSON dict format allows assigning different IB devices to
+                different GPU/TP/DP ranks and was introduced in PR #12817.
 
         Returns:
-            Normalized comma-separated string of validated device names, or None if input is None.
+            The validated device string unchanged (for JSON dict format) or a
+            normalized comma-separated string (for flat format), or None if
+            input is None.
         """
         if device_str is None:
             logger.warning(
@@ -3765,7 +3771,43 @@ class ServerArgs:
             )
             return None
 
-        # Strip whitespace from device names
+        # JSON dict format: per-GPU device mapping, e.g. '{"0":"mlx5_0,mlx5_1","1":"mlx5_2"}'.
+        # Deduplication across GPU entries is intentional (e.g. two GPUs sharing
+        # the same HCA), so we skip the flat-format dedup check and validate each
+        # per-GPU device list independently.
+        stripped = device_str.strip()
+        if stripped.startswith("{"):
+            try:
+                gpu_device_map = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Invalid JSON format for IB devices: {device_str!r}"
+                ) from e
+            if not isinstance(gpu_device_map, dict):
+                raise ValueError(
+                    f"IB device JSON must be a dict mapping GPU IDs to device strings, got: {device_str!r}"
+                )
+            # Validate each per-GPU device list
+            ib_sysfs_path = "/sys/class/infiniband"
+            if os.path.isdir(ib_sysfs_path):
+                available_devices = set(os.listdir(ib_sysfs_path))
+                all_devices = [
+                    d.strip()
+                    for v in gpu_device_map.values()
+                    for d in str(v).split(",")
+                    if d.strip()
+                ]
+                invalid_devices = [
+                    d for d in all_devices if d not in available_devices
+                ]
+                if invalid_devices:
+                    raise ValueError(
+                        f"Invalid IB devices specified: {invalid_devices}. "
+                        f"Available devices: {sorted(available_devices)}"
+                    )
+            return device_str
+
+        # Flat comma-separated format: "mlx5_0,mlx5_1"
         devices = [d.strip() for d in device_str.split(",") if d.strip()]
         if len(devices) == 0:
             raise ValueError("No valid IB devices specified")

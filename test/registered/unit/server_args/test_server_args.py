@@ -477,5 +477,66 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestValidateIbDevices(unittest.TestCase):
+    """Tests for ServerArgs._validate_ib_devices (fixes #20241 regression)."""
+
+    def _make_args(self) -> ServerArgs:
+        return ServerArgs(model_path="dummy")
+
+    def test_none_returns_none(self):
+        args = self._make_args()
+        self.assertIsNone(args._validate_ib_devices(None))
+
+    def test_flat_format_returned_unchanged(self):
+        args = self._make_args()
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.listdir", return_value=["mlx5_0", "mlx5_1"]),
+        ):
+            result = args._validate_ib_devices("mlx5_0,mlx5_1")
+        self.assertEqual(result, "mlx5_0,mlx5_1")
+
+    def test_flat_format_deduplicates(self):
+        args = self._make_args()
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.listdir", return_value=["mlx5_0", "mlx5_1"]),
+        ):
+            result = args._validate_ib_devices("mlx5_0,mlx5_1,mlx5_0")
+        self.assertEqual(result, "mlx5_0,mlx5_1")
+
+    def test_json_format_returned_unchanged(self):
+        # Regression test for #20241: JSON dict format with duplicate device names
+        # across GPU entries must not raise ValueError.
+        args = self._make_args()
+        device_str = '{"0":"mlx5_0,mlx5_1","1":"mlx5_0,mlx5_1","2":"mlx5_2,mlx5_3","3":"mlx5_2,mlx5_3"}'
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch(
+                "os.listdir",
+                return_value=["mlx5_0", "mlx5_1", "mlx5_2", "mlx5_3"],
+            ),
+        ):
+            result = args._validate_ib_devices(device_str)
+        self.assertEqual(result, device_str)
+
+    def test_json_format_invalid_device_raises(self):
+        args = self._make_args()
+        device_str = '{"0":"mlx5_0,mlx5_bad"}'
+        with (
+            patch("os.path.isdir", return_value=True),
+            patch("os.listdir", return_value=["mlx5_0"]),
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                args._validate_ib_devices(device_str)
+        self.assertIn("mlx5_bad", str(ctx.exception))
+
+    def test_json_format_malformed_raises(self):
+        args = self._make_args()
+        with self.assertRaises(ValueError) as ctx:
+            args._validate_ib_devices("{not valid json")
+        self.assertIn("Invalid JSON", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
