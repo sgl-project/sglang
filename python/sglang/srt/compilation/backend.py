@@ -236,6 +236,7 @@ def split_graph(
     num_adjacent_split_op_merges = 0
     for node in graph.graph.nodes:
         if node.op in ("output", "placeholder"):
+            last_split_id = None
             continue
         is_split_op = node.op == "call_function" and str(node.target) in ops
         if is_split_op:
