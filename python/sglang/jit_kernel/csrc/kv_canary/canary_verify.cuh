@@ -97,17 +97,13 @@ __global__ void canary_verify_kernel(const VerifyKernelParams __grid_constant__ 
     }
 
     if (fail_reason_bits != FailReason{}) {
-      // DIAGNOSTIC: stash expected_position in the unused expected_token slot so position FPs can
-      // be debugged from the violation log. verify never has a real expected_token (its oracle is
-      // implicit in the chain), so this slot is always 0 in verify rows; hijacking it costs nothing
-      // and lets the host reporter print `expected_position` for Position-fail rows.
       record_violation(
           p.violation_sink,
           ViolationRow{
               /* slot_idx = */ slot_idx,
               /* position = */ stored_position,
               /* stored_token = */ stored_token,
-              /* expected_token = */ expected_position,
+              /* expected_token = */ 0,
               /* stored_chain_hash = */ stored_chain_hash,
               /* expected_aux = */ expected_chain_hash,
               /* fail_reason_bits = */ static_cast<int64_t>(fail_reason_bits),

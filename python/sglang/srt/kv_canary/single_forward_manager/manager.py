@@ -40,8 +40,15 @@ class _SingleForwardPhase(IntEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _PreOpsMaybeInsideGraphOutput:
-    verify_plan: VerifyPlan
-    write_plan: WritePlan
+    # Per-group VerifyPlan and WritePlan: FULL and SWA groups write different slot-translated
+    # indices into their plans (SWA goes through full_to_swa_index_mapping; FULL doesn't),
+    # and TAIL endpoints in post_ops re-read these plans. A shared plan would let SWA's
+    # invoke_plan in pre_ops overwrite FULL's plan, so TAIL_K_FULL in post_ops reads SWA-translated
+    # slot indices and looks them up in the FULL canary_buf — silently reading garbage / a
+    # different req's old data, surfacing as TAIL_K_FULL position FPs whenever the SWA mapping
+    # is non-identity (i.e. SWA pool < FULL pool).
+    verify_plans: tuple[VerifyPlan, ...]
+    write_plans: tuple[WritePlan, ...]
     expected_inputs: ExpectedInputs
 
 
@@ -142,11 +149,21 @@ class SingleForwardManager:
             caller_name="SingleForwardManager.pre_ops_maybe_inside_graph",
         )
 
-        verify_plan = VerifyPlan.allocate(
-            verify_capacity=self._verify_capacity, device=self._device
+        # One VerifyPlan / WritePlan per group: FULL and SWA write group-specific slot indices
+        # (FULL slots vs SWA-mapped slots). A shared plan would have SWA's invoke_plan overwrite
+        # FULL's, then TAIL_K_FULL in post_ops would read SWA-mapped slot indices but look them
+        # up in FULL canary_buf — the source of the SWA-mode TAIL_K_FULL position FP.
+        verify_plans = tuple(
+            VerifyPlan.allocate(
+                verify_capacity=self._verify_capacity, device=self._device
+            )
+            for _ in self._buffer_groups
         )
-        write_plan = WritePlan.allocate(
-            write_req_capacity=self._write_req_capacity, device=self._device
+        write_plans = tuple(
+            WritePlan.allocate(
+                write_req_capacity=self._write_req_capacity, device=self._device
+            )
+            for _ in self._buffer_groups
         )
         expected_inputs = ExpectedInputs.allocate(
             capacity=self._write_entry_capacity, device=self._device
@@ -174,7 +191,9 @@ class SingleForwardManager:
         violation_log = self._device_state.violation_log
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = expected_inputs.slice(num_tokens)
-        for group in self._buffer_groups:
+        for group_idx, group in enumerate(self._buffer_groups):
+            verify_plan = verify_plans[group_idx]
+            write_plan = write_plans[group_idx]
             invoke_plan(
                 plan_input=plan_input,
                 verify_plan=verify_plan,
@@ -202,8 +221,8 @@ class SingleForwardManager:
             )
 
         return _PreOpsMaybeInsideGraphOutput(
-            verify_plan=verify_plan,
-            write_plan=write_plan,
+            verify_plans=verify_plans,
+            write_plans=write_plans,
             expected_inputs=expected_inputs,
         )
 
@@ -222,13 +241,13 @@ class SingleForwardManager:
         num_tokens = int(forward_batch.positions.shape[0])
         expected_inputs_slice = pre_ops_output.expected_inputs.slice(num_tokens)
         input_check_mode = self._should_enable_input_check_for_launch(forward_batch)
-        for group in self._buffer_groups:
+        for group_idx, group in enumerate(self._buffer_groups):
             launch_endpoints_per_forward(
                 endpoints=self._endpoints,
                 group=group,
                 tag_filter=_is_tail_tag,
-                verify_plan=pre_ops_output.verify_plan,
-                write_plan=pre_ops_output.write_plan,
+                verify_plan=pre_ops_output.verify_plans[group_idx],
+                write_plan=pre_ops_output.write_plans[group_idx],
                 forward_batch=forward_batch,
                 expected_inputs=expected_inputs_slice,
                 violation_log=violation_log,
@@ -237,7 +256,7 @@ class SingleForwardManager:
             )
 
         self._output_buffer.copy_from(
-            verify_plan_enable=pre_ops_output.verify_plan.enable,
+            verify_plan_enable=pre_ops_output.verify_plans[0].enable,
             kernel_run_counters=self._device_state.kernel_run_counters,
             slot_run_counters=self._device_state.slot_run_counters,
             violation_write_index=self._device_state.violation_log.violation_write_index,
