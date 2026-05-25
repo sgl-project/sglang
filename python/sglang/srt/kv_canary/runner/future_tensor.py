@@ -16,7 +16,7 @@ _DUMMY_DICT_KEY = "__dummy_key__"
 class FutureTensors:
     _data: Optional[_PayloadDict]
     _event: Optional[torch.cuda.Event]
-    # Pinned-source clones must outlive the async d2h copy.
+    # Device-source clones must outlive the async d2h copy.
     _retained_device_clones: Optional[dict[str, torch.Tensor]] = None
 
     @classmethod

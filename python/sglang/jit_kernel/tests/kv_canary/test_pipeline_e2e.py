@@ -531,7 +531,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
 
 
 def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
-    """enable_write_verify_inputs=ON, expected tokens all wrong: write records N violations, verify does not cascade CHAIN_HASH."""
+    """enable_write_verify_inputs=ON, expected tokens all wrong: write records N violations."""
     max_seq_len = 16
     req_to_token = make_req_to_token(
         kind="linear", max_reqs=4, max_seq_len=max_seq_len, device=_DEVICE

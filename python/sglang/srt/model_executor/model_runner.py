@@ -755,9 +755,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init memory pool and attention backends
         self.init_memory_pool(pre_model_load_memory)
 
-        # Must be called AFTER init_memory_pool (pool object exists to monkey-patch)
-        # and BEFORE init_device_graphs (so the patched model.forward is what
-        # ``patch_model`` yields and what runs during the warmup forward passes).
+        # Must be called AFTER init_memory_pool so the pool object exists for
+        # canary to monkey-patch, and BEFORE init_device_graphs so warmup
+        # forwards captured into the graph see the patched pool methods.
         self.canary_manager = install_canary(
             server_args=server_args,
             model_runner=self,

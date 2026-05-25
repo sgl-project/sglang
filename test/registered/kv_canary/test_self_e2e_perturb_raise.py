@@ -18,6 +18,9 @@ class TestPerturbRaiseMha(CanaryE2EBase):
     draining); instead we assert the violation line landed in the captured log before
     the abort propagated. Client-side, the request may either time out or come back
     with a dropped connection, so the /generate call is wrapped in a best-effort try.
+
+    Server runs with ``--skip-server-warmup`` so the perturb trigger fires on real
+    user requests rather than warmup forwards.
     """
 
     model_mode = "mha"

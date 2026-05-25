@@ -33,7 +33,11 @@ def alloc_canary_buf(
 
 
 def _clip_read_bytes_aligned(*, requested: int, num_bytes_per_token: int) -> int:
-    """Validate read_bytes for the CUDA fold kernel's 128-bit aligned loads."""
+    """Validate and clip read_bytes for the CUDA fold kernel's 128-bit aligned loads.
+
+    Normalizes sentinels (``sys.maxsize`` -> ``num_bytes_per_token``, ``0`` -> ``0``) and
+    rejects negative / unaligned / oversized requests.
+    """
     if num_bytes_per_token <= 0 or num_bytes_per_token % _REAL_KV_READ_ALIGN != 0:
         raise ValueError(
             "kv-canary: num_bytes_per_token must be a positive multiple of "

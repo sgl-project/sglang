@@ -16,7 +16,8 @@ def wrap_method(
 
     ``wrapper(original, *args, **kwargs)`` receives the original bound method as its first arg and the
     call-site args/kwargs as the rest. It decides when (and whether) to call ``original`` and what to
-    return. The patched method preserves the original's metadata via :func:`functools.wraps`.
+    return. The patched callable is installed as a plain function; :func:`functools.wraps` preserves
+    ``__name__`` / ``__doc__`` but the bound-method nature of the original is not retained.
 
     Raises:
         AttributeError: ``obj`` has no attribute ``method_name``.

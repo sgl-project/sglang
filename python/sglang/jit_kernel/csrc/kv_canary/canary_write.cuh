@@ -124,8 +124,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
                 /* position = */ position,
                 /* stored_token = */ token,
                 /* expected_token = */ expected_token,
-                /* stored_chain_hash (running running_prev_hash about to be written) = */
-                static_cast<int64_t>(running_prev_hash),
+                /* stored_chain_hash = */ static_cast<int64_t>(running_prev_hash),
                 /* expected_aux = expected_position */ expected_position,
                 /* fail_reason_bits = */ static_cast<int64_t>(mismatch_bits),
             });
@@ -142,8 +141,7 @@ __global__ void canary_write_kernel(const WriteKernelParams __grid_constant__ p)
                 /* position = */ position,
                 /* stored_token = */ token,
                 /* expected_token = */ token,
-                /* stored_chain_hash (running running_prev_hash about to be written) = */
-                static_cast<int64_t>(running_prev_hash),
+                /* stored_chain_hash = */ static_cast<int64_t>(running_prev_hash),
                 /* expected_aux = expected_position */ expected_position_chain,
                 /* fail_reason_bits = */ static_cast<int64_t>(FailReason::kWritePositionMismatch),
             });

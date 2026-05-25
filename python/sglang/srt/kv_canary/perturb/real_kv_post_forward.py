@@ -1,9 +1,11 @@
-"""Flip the first byte of a slot in maybe_inaccurate_forward_batch.out_cache_loc
-AFTER the TAIL kernel has captured its canary hash.
+"""Pick a random real-KV source byte derived from out_cache_loc and flip it
+in-place AFTER the TAIL kernel has captured its canary hash.
 
-The flip is a PyTorch indexed write on the current CUDA stream; because TAIL is
-launched on the same stream, stream ordering guarantees it happens-after TAIL's
-canary write.
+The slot id is taken from maybe_inaccurate_forward_batch.out_cache_loc and used
+only as a lookup into the target group's real-KV source buffer; the actual flip
+happens inside that buffer. The flip is a PyTorch indexed write on the current
+CUDA stream; because TAIL is launched on the same stream, stream ordering
+guarantees it happens-after TAIL's canary write.
 """
 
 from __future__ import annotations

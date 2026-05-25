@@ -20,10 +20,11 @@ register_cuda_ci(est_time=45, stage="extra-a", runner_config="1-gpu-large")
 
 
 def _run_one_cycle(manager, forward_batch) -> None:
-    """Drive one full outer canary cycle on the manager: phase 1 ->
-    phase 2 (via the SingleForwardManager's pre_ops_maybe_inside_graph) -> phase 3 ->
-    phase 4 -> shared facilities. Mirrors the production caller
-    sequence for SingleForwardManager(0) (target / single-step case)."""
+    """Drive one full outer canary cycle on the manager by invoking each of the
+    four manager entry points in production order: with_ops_outside_graph ->
+    with_active_single_forward_manager -> pre_ops_maybe_inside_graph ->
+    post_ops_maybe_inside_graph. Mirrors the production caller sequence for
+    SingleForwardManager(0) (target / single-step case)."""
     with manager.with_ops_outside_graph(
         single_forward_indices=[0],
         maybe_inaccurate_forward_batch=forward_batch,
