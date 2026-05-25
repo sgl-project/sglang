@@ -221,7 +221,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             batch_size=32,
             input_len=16384,
             output_len=1,
-            max_overhead_pct=30.0,
+            max_overhead_pct=5.0,
         )
 
     def test_qwen3_decode_overhead_bs128_isl512_osl1024(self) -> None:
@@ -237,7 +237,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             batch_size=1,
             input_len=512,
             output_len=1024,
-            max_overhead_pct=15.0,
+            max_overhead_pct=5.0,
         )
 
 

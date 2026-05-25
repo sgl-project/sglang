@@ -734,6 +734,7 @@ class Envs:
     SGLANG_KV_CANARY_PERTURB_NEXT_TOKEN_SWAP_PROB = EnvFloat(0.0)
     SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
+    SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
     # ===================================================================
     # /KV-Canary / Token-Oracle
     # ===================================================================
